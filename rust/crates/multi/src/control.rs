@@ -67,6 +67,12 @@ pub enum Request {
     Subscribe { name: String },
     /// Serve a deployment using a read index before capturing an implicit basis.
     SubscribeFresh { name: String },
+    SubscribeOrderedFresh {
+        name: String,
+        placement: ordered_logkeeper::ordered::Placement,
+        enrollment: ordered_logkeeper::ordered::Enrollment,
+        epoch: u64,
+    },
     /// Serve the deployment's reads as of its checkpoint, from object storage alone.
     Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
@@ -147,6 +153,7 @@ pub enum Response {
     Redirect { holder: String, address: String },
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.
     Subscribed { address: String },
+    OrderedRead { address: String, flight: Option<String>, proof: [u8; 32] },
     FlightEndpoint { address: String },
     HoldingLoads { holdings: Vec<crate::load::HoldingLoad> },
     ReadLoads { loads: Vec<crate::read_width::ReadLoad> },
@@ -158,6 +165,14 @@ pub enum Response {
     Fragment { batches: String },
     FragmentIpc { bytes: u64 },
     Refused { code: String, message: String },
+}
+
+pub(crate) fn ordered_read_binding(
+    name: &str, placement: ordered_logkeeper::ordered::Placement,
+    enrollment: ordered_logkeeper::ordered::Enrollment, epoch: u64, address: &str, flight: Option<&str>,
+) -> Vec<u8> {
+    serde_json::to_vec(&("rtdb.multi/ordered-reader/v1", name, placement, enrollment, epoch, address, flight))
+        .expect("ordered reader coordinates encode")
 }
 
 /// The secret a cell's members sign their control requests with; a cell without one sends them unsigned, to nodes that take them unsigned.
@@ -302,7 +317,7 @@ async fn serve_on(listener: TcpListener, handler: Arc<dyn Handler>, key: Control
                                 }
                             }
                             let reports_probe = matches!(request, Request::Ping | Request::Activate { .. } | Request::Subscribe { .. }
-                                | Request::SubscribeFresh { .. } | Request::Snapshot { .. });
+                                | Request::SubscribeFresh { .. } | Request::SubscribeOrderedFresh { .. } | Request::Snapshot { .. });
                             let response = handler.handle(request).await;
                             if reports_probe {
                                 startup_probe_overflows = pgwire.as_ref().map(|endpoint| endpoint.status.borrow().startup_probe_overflows);

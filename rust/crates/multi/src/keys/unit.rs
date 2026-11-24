@@ -52,6 +52,26 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
+    pub(crate) fn replay_objects(provider: [u8; 32], residence: &str, log_epoch: i32) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/replay-object-scope/v1\0");
+        digest.update(&provider);
+        digest.update(&log_epoch.to_be_bytes());
+        digest.update(residence.as_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
+    pub(crate) fn ordered_index(residence: &str, index: &str, generation: u64) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/ordered-index-key-scope/v1\0");
+        digest.update(residence.as_bytes());
+        digest.update(b"\0");
+        digest.update(index.as_bytes());
+        digest.update(b"\0");
+        digest.update(&generation.to_be_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {
@@ -149,6 +169,8 @@ impl UnitLedger {
 
 #[async_trait::async_trait]
 impl ObjectCipher for UnitLedger {
+    fn delivery_deadline(&self) -> Option<Instant> { self.deadline }
+
     async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
         UnitLedger::operate(self, name, operation).await
     }
@@ -205,6 +227,10 @@ impl LocalKeyService {
         let result = io
             .run_blocking(move || {
                 let vault = service.archive_vault().map_err(key_error)?;
+                if matches!(operation, UnitOperation::Grant) {
+                    let custody = Arc::new(vault.hold_local_unit_delivery(&slot)?);
+                    return Ok(UnitOutput::HeldGrant { until: None, custody });
+                }
                 vault.with_local_slot(&slot, operation.provisions(), deadline, |material| {
                     with_material(material, deadline, |key| operation.apply(key, &name))
                 })
@@ -214,6 +240,19 @@ impl LocalKeyService {
             return Err(expired());
         }
         result
+    }
+
+    pub(super) fn hold_local_unit_delivery(&self, slot: &UnitSlot) -> rtdb_storage::Result<(File, File)> {
+        let scope = self.path(&slot.scope.namespace()).map_err(key_error)?;
+        let scope_hold = self.lock_key_shared(&scope).map_err(key_error)?;
+        if local_scope_closed(&scope).map_err(key_error)? {
+            return Err(Error::ErasedUnderView);
+        }
+        let path = self.path(&slot.id()).map_err(key_error)?;
+        let slot_hold = self.lock_key_shared(&path).map_err(key_error)?;
+        let mut material = self.read_or_create_key(&path, false).map_err(key_error)?;
+        material.fill(0);
+        Ok((scope_hold, slot_hold))
     }
 
     pub(super) fn with_local_slot<T>(
@@ -287,7 +326,8 @@ impl LocalKeyService {
             };
             Ok(complete())
         })
-        .await?
+        .await??;
+        Ok(())
     }
 
     pub(super) async fn withdraw_local_unit(
@@ -307,7 +347,8 @@ impl LocalKeyService {
             };
             Ok(complete())
         })
-        .await?
+        .await??;
+        Ok(())
     }
 }
 

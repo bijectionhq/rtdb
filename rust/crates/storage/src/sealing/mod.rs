@@ -2,8 +2,10 @@
 
 pub mod cipher;
 mod classic;
+mod delivery;
+pub use delivery::{DeliveryDeadline, DeliveryIo, current_delivery_deadline, PlaintextDelivery, PlaintextDependencies, PlaintextScopes, PlaintextView, drain_unit_delivery};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
-pub use classic::{ClassicKeyVault, ClassicObjectKeys};
+pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD};
 
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 
@@ -29,10 +31,18 @@ pub trait ObjectCipher: Send + Sync {
         operation: UnitOperation,
     ) -> crate::Result<UnitOutput>;
 
+    /// An enclosing provider lease can shorten a unit delivery grant.
+    fn delivery_deadline(&self) -> Option<std::time::Instant> { None }
+
     async fn withdraw(&self, _name: &ObjectKey) -> crate::Result<()> {
         Err(Error::Closed(
             "The object cipher has no Classic withdrawal authority".into(),
         ))
+    }
+
+    async fn withdraw_all(&self, names: &[ObjectKey]) -> crate::Result<()> {
+        for name in names { self.withdraw(name).await?; }
+        Ok(())
     }
 }
 
@@ -44,6 +54,7 @@ pub enum UnitOperation {
     Frames(FramedObject, Range<usize>, Bytes),
     SealValue(String, Bytes),
     OpenValue(String, Bytes),
+    Grant,
 }
 
 impl UnitOperation {
@@ -53,6 +64,7 @@ impl UnitOperation {
 
     pub fn apply(self, key: &Cipher, name: &ObjectKey) -> crate::Result<UnitOutput> {
         match self {
+            Self::Grant => Ok(UnitOutput::Granted),
             Self::Seal(body) => key.seal_object(name, &body).map(UnitOutput::Bytes),
             Self::Open(sealed) => key.open_object(name, &sealed).map(UnitOutput::Bytes),
             Self::OpenRetained(sealed) => key
@@ -77,20 +89,30 @@ impl UnitOperation {
 pub enum UnitOutput {
     Bytes(Bytes),
     Header(FramedObject),
+    Granted,
+    HeldGrant { until: Option<std::time::Instant>, custody: Arc<dyn Send + Sync> },
 }
 
 impl UnitOutput {
     pub fn bytes(self) -> crate::Result<Bytes> {
         match self {
             Self::Bytes(bytes) => Ok(bytes),
-            Self::Header(_) => Err(Error::Task("Expected unit bytes".into())),
+            _ => Err(Error::Task("Expected unit bytes".into())),
+        }
+    }
+
+    fn granted(self) -> crate::Result<(Option<std::time::Instant>, Option<Arc<dyn Send + Sync>>)> {
+        match self {
+            Self::Granted => Ok((None, None)),
+            Self::HeldGrant { until, custody } => Ok((until, Some(custody))),
+            _ => Err(Error::Task("Expected a key owner’s delivery grant".into())),
         }
     }
 
     pub fn header(self) -> crate::Result<FramedObject> {
         match self {
             Self::Header(header) => Ok(header),
-            Self::Bytes(_) => Err(Error::Task("Expected a sealed unit header".into())),
+            _ => Err(Error::Task("Expected a sealed unit header".into())),
         }
     }
 }
@@ -98,12 +120,11 @@ impl UnitOutput {
 pub struct EncryptingStore {
     inner: Arc<dyn ObjectStore>,
     keys: ObjectKeys,
-    replica_publications: bool,
     classic_control: Option<ObjectKey>,
 }
 
 enum ObjectKeys {
-    Deployment(Cipher),
+    Deployment { cipher: Cipher, delivery: Option<Arc<dyn ObjectCipher>> },
     Units(Arc<dyn ObjectCipher>),
 }
 
@@ -111,8 +132,18 @@ impl EncryptingStore {
     pub fn new(inner: Arc<dyn ObjectStore>, key: &[u8]) -> Result<Self> {
         Ok(Self {
             inner,
-            keys: ObjectKeys::Deployment(Cipher::new(key)?),
-            replica_publications: false,
+            keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: None },
+            classic_control: None,
+        })
+    }
+
+    /// Opens a deployment-key store whose custody owner can confirm answer delivery.
+    pub fn with_deployment_delivery(
+        inner: Arc<dyn ObjectStore>, key: &[u8], authority: Arc<dyn ObjectCipher>,
+    ) -> Result<Self> {
+        Ok(Self {
+            inner,
+            keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: Some(authority) },
             classic_control: None,
         })
     }
@@ -121,16 +152,9 @@ impl EncryptingStore {
         Self {
             inner,
             keys: ObjectKeys::Units(ledger),
-            replica_publications: false,
             classic_control: None,
         }
     }
-
-    pub fn with_replica_publications(mut self, enabled: bool) -> Self {
-        self.replica_publications = enabled;
-        self
-    }
-
     fn with_classic_control(mut self, marker: ObjectKey) -> Self {
         self.classic_control = Some(marker);
         self
@@ -138,8 +162,20 @@ impl EncryptingStore {
 
     async fn crypt(&self, name: &ObjectKey, operation: UnitOperation) -> crate::Result<UnitOutput> {
         match &self.keys {
-            ObjectKeys::Deployment(cipher) => operation.apply(cipher, name),
-            ObjectKeys::Units(ledger) => ledger.operate(name, operation).await,
+            ObjectKeys::Deployment { cipher, delivery } => {
+                let reads_plaintext = !operation.provisions();
+                let output = operation.apply(cipher, name)?;
+                if reads_plaintext && let Some(authority) = delivery {
+                    PlaintextView::track(authority, name)?;
+                }
+                Ok(output)
+            }
+            ObjectKeys::Units(ledger) => {
+                let reads_plaintext = !operation.provisions();
+                let output = ledger.operate(name, operation).await?;
+                if reads_plaintext { PlaintextView::track(ledger, name)?; }
+                Ok(output)
+            }
         }
     }
 
@@ -222,6 +258,9 @@ fn plain(stored: StoredObject) -> crate::Result<StoredObject> {
 
 #[async_trait]
 impl ObjectStore for EncryptingStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        self.inner.s3_publication_address(key)
+    }
     fn local_maintenance_store(&self) -> Option<&crate::LocalStore> {
         if self.classic_control.is_some() {
             self.inner.local_maintenance_store()
@@ -234,21 +273,6 @@ impl ObjectStore for EncryptingStore {
         self.classic_control.is_some() && self.inner.syncs_checkpoints()
     }
 
-    async fn put_replica_payload(
-        &self,
-        key: &ObjectKey,
-        bytes: Bytes,
-    ) -> crate::Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        if !self.replica_publications {
-            self.put(key, bytes).await?;
-            return Ok(None);
-        }
-        Ok(self
-            .put_with_publication(key, bytes)
-            .await?
-            .and_then(rtdb_types::PhysicalObjectPublication::into_version))
-    }
-
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> {
         self.inner.index_page_lifecycle()
     }
@@ -258,8 +282,11 @@ impl ObjectStore for EncryptingStore {
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog(cut).await
     }
-    async fn retain_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
-        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+    async fn retain_catalog_with_primary(
+        &self,
+        cut: Option<rtdb_types::CatalogCut>,
+        paths: Arc<[String]>,
+    ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         self.inner.retain_catalog_with_primary(cut, paths).await
     }
     fn defers_trie_releases(&self) -> bool {
@@ -281,7 +308,6 @@ impl ObjectStore for EncryptingStore {
             ));
         }
         if self.classic_control.is_some()
-            && self.inner.local_maintenance_store().is_some()
             && let ObjectKeys::Units(ledger) = &self.keys
         {
             return crate::classic_retirement::retire_with_keys(
@@ -293,6 +319,21 @@ impl ObjectStore for EncryptingStore {
             .await;
         }
         self.inner.release_trie_files(receipt, contents).await
+    }
+
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
+        self.inner.close_classic_trie_admission(cut, paths).await
+    }
+
+    async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> Result<bool> {
+        self.inner.classic_trie_retirement_ready(key, version).await
+    }
+
+    async fn settle_classic_trie(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> Result<()> {
+        if self.classic_control.as_ref() == Some(key) {
+            return Err(Error::InvalidKey(key.to_string()).into());
+        }
+        self.inner.settle_classic_trie(key, version).await
     }
 
     async fn release_search_run(

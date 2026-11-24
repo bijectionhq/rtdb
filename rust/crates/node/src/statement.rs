@@ -16,6 +16,7 @@ struct PreparedData {
     parameters: Vec<LogicalType>,
     notices: Vec<SqlNotice>,
     ordered_index_command_tag: Option<&'static str>,
+    snapshot_selector: rtdb_plan::QuerySettings,
     result: PreparedResult,
     policy: ResultSignaturePolicy,
     _reservation: Arc<MemoryReservation>,
@@ -115,6 +116,7 @@ impl PreparedSql {
         let source = parsed.source();
         let count = parsed.parameter_count();
         let ordered_index_command_tag = parsed.ordered_index_command_tag();
+        let snapshot_selector = parsed.snapshot_selector()?;
         if options.parameter_types.keys().any(|index| *index >= count) { return Err(parameter_error("Declared parameter lies outside the statement")); }
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
         let _parameters = context.memory.reserve(parameter_bytes)?;
@@ -144,9 +146,10 @@ impl PreparedSql {
         };
         let source = source.to_owned();
         let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
+        let bytes = bytes.checked_add(snapshot_selector.retained_bytes()?).ok_or_else(size_error)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, result, policy, _reservation: reservation, plan: Default::default() })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, ordered_index_command_tag, snapshot_selector, result, policy, _reservation: reservation, plan: Default::default() })))
     }
 
     pub fn source(&self) -> &str { &self.0.source }
@@ -205,6 +208,19 @@ impl PreparedSql {
                 Err(error) => return Err(error),
             }
         };
+        let selector = &self.0.snapshot_selector;
+        let context = if let Some(rtdb_plan::SettingValue::Parameter { index }) = &selector.snapshot_token {
+            let batch = arguments.batch();
+            let width = index.checked_add(1).ok_or_else(size_error)?;
+            let scratch = width.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
+            let cell = rtdb_columnar::estimate_read_cell_bytes(batch.schema_ref().field(*index), batch.column(*index).as_ref(), 0)?;
+            let _charge = context.memory.reserve(scratch.checked_add(cell).ok_or_else(size_error)?)?;
+            let mut values = vec![Value::Null; width];
+            values[*index] = rtdb_columnar::read_execution_value(batch.schema_ref().field(*index), batch.column(*index).as_ref(), 0)?;
+            context.reopen_sql_snapshot(selector, rtdb_expr::Parameters::Values(&values)).await?
+        } else {
+            context.reopen_sql_snapshot(selector, rtdb_expr::Parameters::Values(&[])).await?
+        };
         let query = deep(self.source(), || self.bind(&context, types, true))?;
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = query.execute_arrow_columns(context, arguments, 0, types, Some(self.source())).await?;
@@ -233,6 +249,7 @@ impl PreparedSql {
         if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
         arguments.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
         for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
+        let context = context.reopen_sql_snapshot(&self.0.snapshot_selector, rtdb_expr::Parameters::Values(&arguments)).await?;
         let query = deep(self.source(), || self.bind(&context, types, true))?;
         if self.0.policy == ResultSignaturePolicy::Exact { self.check_signature(query.schema())?; }
         let cursor = if columnar {
@@ -296,6 +313,17 @@ fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptio
     options.default_timezone = context.timezone.clone();
     options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
     context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)
+}
+
+pub(crate) async fn prepare_query_at_snapshot(
+    source: &str, context: Arc<QueryContext>, options: &PrepareOptions, arguments: &[Value],
+) -> Result<(PreparedQuery, Arc<QueryContext>)> {
+    let _syntax = admit_sql_syntax(source, &context.memory)?;
+    let memory = Arc::clone(&context.memory);
+    let parsed = one_statement(source, &memory)?;
+    let context = context.reopen_sql_snapshot(&parsed.snapshot_selector()?, rtdb_expr::Parameters::Values(arguments)).await?;
+    let prepared = parsed.bind(&context.catalog, options)?;
+    Ok((PreparedQuery::from_prepared(prepared, &memory)?, context))
 }
 
 pub(crate) fn prepare_query(source: &str, context: &QueryContext, options: &PrepareOptions) -> Result<PreparedQuery> {

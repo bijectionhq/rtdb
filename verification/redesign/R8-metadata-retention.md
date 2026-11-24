@@ -148,9 +148,25 @@ Classic loose receipt tries additionally require a retained repair anchor coveri
 Directory-managed local receipt tries use the existing local custodian and certified recovery exclusion.
 The old-pack grant can settle a mixed pack whose independent replay manifest omits covered receipt L0 and authenticates every retained ordinary member.
 
-M1 remains open for still-held archives, Classic remote receipt objects without exact provider disposal, active installed journal grant files, offloaded or legacy copies outside these grants, and untracked media snapshots.
-Closure needs exact custodian settlement after the successor and all such references are released.
+The Classic trie deletion grant settles S3 compacted receipt files by the exact versions captured at publication and retained in the installed retirement.
+The provider inventories the exact version before and after deletion, blocks a deletion that would expose older data, and refuses to withdraw a path slot while another version is visible.
+Classic streamed file publication also settles the private staging version after the conditional copy completes.
+The versioned grant requires original publication evidence for both the file and its release record.
+Other Classic providers lack this version-bound settlement.
+
+Maintenance on an active installed grant records receipt L0 publication identities and sends files from its installed trie-removal receipt to the existing reclamation queue.
+An inherited member remains the responsibility of its original grant.
+For versioned and enrolled terminal S3, the consumer authenticates the installed removal and successor and asks the installed journal to fence that exact publication. Only an ordered fence permits withdrawing its key slot and settling the recorded version or conditional terminal identity. The journal refuses while roots, suffixes or preparations are opaque or retain the object.
+
+The v3 suffix cutover resets installed data. V2 suffixes are outside the reader contract.
+M1 remains open for unbound Classic remote objects, installed providers without an exact publication witness, incomplete installed journal reference publication, and untracked media snapshots.
+Closure needs exact custodian settlement after the successor and its references are released.
 A captured archive's existing whole-capture settlement can run after release of its last entitlement.
-An archive that must still provide exact business history needs independent receipt custody before those receipt bytes can be withdrawn.
+Held-world suffixes verify the original certified journal interval and all placed transaction witnesses before materializing the business projection.
+The archive manifest authenticates the original transaction coordinates and the original business table batches, including detached payloads.
+The source authority keeps retry state, and the held-world copy omits retry tables, attempt identities and their acceptance witnesses.
+An exact published checkpoint used for an owned held read verifies the original manifest digest and opens only its business members.
+Full checkpoint restores still require their complete replay inventory.
+Retiring a receipt-only checkpoint member requires its original custodian and a grant that accounts for its recovery entitlements.
 A quiet history still needs ordered receipt-clock progress to trigger collection.
 Early erasure of associated metadata enters the same copy-settlement path as expiry.

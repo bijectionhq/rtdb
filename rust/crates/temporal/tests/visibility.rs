@@ -17,7 +17,7 @@ fn history(random: &mut Seeded) -> Vec<EventHeader> {
             let lower = random.below(40);
             let upper = if random.below(5) == 0 { i64::MAX } else { lower + 1 + random.below(30) };
             let op = match random.below(20) { 0 => EventOp::Erase, 1..=4 => EventOp::Delete, _ => EventOp::Put };
-            events.push(EventHeader { commit_position: 0, iid: Iid([iid as u8; 16]), system_from: Timestamp(system), valid_time: Interval::from_micros(lower, upper).unwrap(), op });
+            events.push(EventHeader { position: None, commit_position: 0, iid: Iid([iid as u8; 16]), system_from: Timestamp(system), valid_time: Interval::from_micros(lower, upper).unwrap(), op });
         }
     }
     events
@@ -46,7 +46,7 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
         .unwrap_or_else(|| include_str!("../../../../verification/traces/temporal.tsv").to_string());
     for line in input.lines() {
         let fields: Vec<_> = line.split('\t').collect();
-        let event = |system, key, valid_time, op| EventHeader {
+        let event = |system, key, valid_time, op| EventHeader { position: None,
             commit_position: 0,
             system_from: Timestamp(number(system)), iid: iid(key), valid_time, op,
         };
@@ -98,20 +98,20 @@ fn the_production_resolver_agrees_with_the_reference_trace() {
 #[test]
 fn redaction_refuses_only_where_the_original_assertion_wins() {
     let span = |from, to| Interval::from_micros(from, to).unwrap();
-    let old = EventHeader {
+    let old = EventHeader { position: None,
         iid: Iid([1; 16]),
         system_from: Timestamp(10),
         commit_position: 1,
         valid_time: span(0, 100),
         op: EventOp::Put,
     };
-    let redacted = EventHeader {
+    let redacted = EventHeader { position: None,
         system_from: Timestamp(20),
         valid_time: span(20, 80),
         op: EventOp::Redacted,
         ..old
     };
-    let newer = EventHeader {
+    let newer = EventHeader { position: None,
         system_from: Timestamp(30),
         valid_time: span(40, 60),
         ..old
@@ -144,15 +144,15 @@ fn redaction_refuses_only_where_the_original_assertion_wins() {
 #[test]
 fn window_keeps_erased_retracted_and_readable_winners_at_their_positions() {
     let span = |from, to| Interval::from_micros(from, to).unwrap();
-    let old = EventHeader {
+    let old = EventHeader { position: None,
         iid: Iid([1; 16]), system_from: Timestamp(10), commit_position: 1,
         valid_time: span(0, 100), op: EventOp::Put,
     };
-    let erased = EventHeader {
+    let erased = EventHeader { position: None,
         system_from: Timestamp(20), commit_position: 2,
         valid_time: span(20, 80), op: EventOp::Redacted, ..old
     };
-    let retraction = EventHeader {
+    let retraction = EventHeader { position: None,
         commit_position: 3, valid_time: span(40, 60), op: EventOp::Delete, ..erased
     };
     let bounds = TemporalBounds { valid_time: span(10, 90), system_time: span(20, 21) };

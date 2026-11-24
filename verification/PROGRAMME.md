@@ -121,11 +121,13 @@ Goal: every successful acknowledgement names an admitted, applied batch that rec
 
 **Already in place:** Verus checks replica admission, system-time assignment (including the bound by the log clock) and the first-required-offset rule; compiler controls reject forging the admission witness; TLC compares serialized, validated and blind resolution.
 
+Enrolled Classic journals sign the exact candidate digest with retained Ed25519 keys. The writer acknowledges after quorum installation, and authenticated fresh probes can stabilize a decision on journals that lack its bytes. Replay checks the actual digest or a local original vote. The directory records portable coverage with a checkpoint and checks that coverage on startup and trim. Sealed recovery checks retained decisions before copying the selected history. The ordered provider binds its protected barrier to the reader's enrollment and invocation. The Classic successor's inherited floor, cold ordered reader attachment and full applied-answer correspondence remain open proof obligations.
+
 **Start from:** `replication/src/{admission,admission_step,driver,appender}.rs`, `tx/src/{resolver,system_time}.rs`; Verus areas `replica_admission`, `system_time`.
 
 **Open obligations:**
 
-1. Model exact payload votes, partial decision installation, quorum-stable decisions, delayed replies, fresh probes and write-back, exact applied capture under a hold, and disjoint-config handoff. Check acknowledgement and prior-read coverage, prefix agreement, strict original acceptance and permanent exclusion. Reach a read with a silent writer and a stalled minority tail, a read stabilizing a partial installation, and an advancing clock with ambiguous guarded settlement. Mutate payload-only acknowledgement, single-copy read exposure, digest and journal identity binding, probe replay, skip-apply, hold bypass, witness loss on trim, prepared-epoch reads, incomplete activation, copied or cutoff-equal timed votes, and exclusion inferred from silence.
+1. Check `ActiveLogletReadIndex` and its controls for payload-only acknowledgement, single-copy exposure, digest binding, exact apply, trim and disjoint activation. The model includes write-back after loss of the publisher, a silent journal and ambiguous guarded settlement with an advancing clock. Refine probe and member authentication, checkpoint authority and successor installation to the implementation, including delayed durable replies, copied or cutoff-equal votes and exclusion inferred from silence.
 2. Replay injected crashes at each transition natively.
 3. Prove the partition publication transitions, scan coverage, and the composition from token to effect.
 4. Trace replica decoding, deferred delivery, oversized payload resolution, leader and follower apply, and recovery imports.
@@ -150,6 +152,13 @@ Goal: every point and range read in production agrees with the bitemporal refere
 4. For TIME-2 and SNAP-1, prove preservation of the original winner or explicit erasure across suffix extension, compaction, recovery and nested forks.
 5. Exercise the 10/20/15/40 correction, tied times across a cut and expiry during idleness.
 6. Compare paired histories with independent clock samples and the same funded observation schedule. Controls use order as the clock, floor the clock only on writes, charge hidden work to public turns, reopen on cap plus await, collapse tied positions and substitute an older winner after erasure.
+
+The [exact-cut model](tla/ExactTemporalCut.tla) and [Lean selection laws](lean/ExactTemporalCut.lean) exercise the position and cap distinction.
+The model includes no-lead, position-tie, erased-winner and cap-plus-await controls, with reachability cases for late correction, ties and erasure.
+The native resolver imports the [Verus proof sources](verus/system_time/proof.rs) for SQL history assignment and the prepared Proposal window. The controls substitute append for the receiver observation, include the window endpoint and remove the append ceiling.
+The directory clock and the runtime publisher call the transition functions in [receiver clock](verus/receiver_clock/proof.rs).
+The hosted receiver stores the observation in its ordered result row. Replica application installs the stored rows without taking a new decision reading.
+The SQL token owner retains the admitted view in the issuing node. Placement-issued tokens can also re-admit the identical installed cut after restart or load its exact retained checkpoint by authenticated boundary and root digest. Cut reconstruction for arbitrary suffixes, full owned revision addressing and funded appointments remain open production refinements.
 
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 

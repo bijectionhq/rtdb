@@ -132,8 +132,8 @@ Prepared audience queries reuse their registration on the same pool and within i
 
 A shared byte or decoded-page cache requires an explicit opt-in by the underlying object owner.
 Encrypted and captured object stores use fresh owner-mediated reads, and coordinated raw providers can cache ciphertext below decryption.
-Already materialized plaintext owned by an individual cursor or other execution still needs an exact live-key fence through consumption.
-That work depends on the per-unit authority and drain contract for each provider and capture kind.
+Plaintext held by an individual cursor or other execution retains an inventory of its originating key authorities.
+Each delivery grant also observes the original read lease.
 
 A hosted PostgreSQL confirmation can advance from the locally adopted checkpoint only after the live recovery owner confirms its identical root and replica boundary.
 Directory-managed journals require the installed manifest, active writer scope and usable replay start.
@@ -146,6 +146,51 @@ A successor loglet retains the installed decision floor.
 Trimming and exact deletion require an installed recovery fence after replacement publication and older replay drain.
 The native checker joins observed checkpoint, trim and offloaded-object retirement decisions by scope, revision, root, manifest and journal anchor.
 It also checks that each logged receipt follows the observed covering quorum publication for the same stream, epoch and ensemble.
-This join covers the recorded recovery and retirement owners.
-The full native capture still needs the production T1 certificate-to-query handoff, T2's exact reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
+Directory-managed fresh answers carry the portable T1 decision fingerprint through the probe nonce, the applied catalog capture and frontend delivery.
+The native checker also joins the checkpoint publisher to its covering certified decision and from the checkpoint to the installed recovery closure.
+Inherited loglet prefixes without a portable decision carry no certified-answer observation.
+The full native capture still needs the general T2 reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
 The new model, controls and native joins have source review only.
+
+
+### Native authority follow-through
+
+Compaction and stored artefact builders register the captured catalog and, where the inputs belong to its live census, its compacted-primary paths. Coordinated Classic checkpoint loads hold the recovery deletion gate across discovery and manifest reads. Hosted startup and admitted archive reads carry their existing residence registration through I/O admission. Installed primary reset uses a conservative catalog registration because its manifest includes superseded inputs.
+
+A cursor tracks the exact slots consulted by the immutable-unit cipher across opening, pulls and local buffering.
+Local, remote and disk-cache object discovery admits the exact key or prefix under the opened provider.
+S3 inventory admits version checks, listings, terminal metadata and conditional publication ranges under the provider's scope.
+Local journals admit file discovery, range pulls and replay probes with the file path and selected offset or interval.
+S3 and DynamoDB key-vault discovery carry the opened vault and exact point or scan prefix and cursor.
+The admission retains these scopes through the individual operation.
+Selecting a catalog, checkpoint or recovery dependency retains the corresponding authority across requests.
+
+The grant follows PostgreSQL rows and COPY chunks through flushing and Flight statements and encoded action replies to stream handoff.
+Directory-managed serving and staged replay confirm the original deployment vault entry.
+Archive grants confirm the capture authority and the exact object or replay-record slot.
+Held-world requests carry the caller's delivery scope to the archive worker and attach the keys that produced its replayed in-memory snapshot.
+The worker retains custody through the reply channel, and Flight checks the originating keys again on transport handoff.
+Classic and Local Multi vaults hold shared key locks while writing an answer.
+Withdrawal and scheduling serialize on the corresponding exclusive locks.
+Remote S3 and DynamoDB providers still drain after fencing.
+Their 30-second grant and 60-second drain assume that the reader's monotonic clock advances at least half as fast as the settling owner's clock.
+T4 publishes a directory-backed receiver frontier for ordered observations.
+Answer delivery freezes each grant's earliest monotonic and wall-clock cutoff.
+Every PostgreSQL socket write and flush checks that cutoff after protocol encoding, including when it resumes inside a buffered write.
+Private PostgreSQL frames carry the original exclusive wall cutoff through each gateway, and the outer gateway consumes that stamp before releasing the corresponding frame.
+Flight carries one cutoff for a protected routed response and refuses any frame whose live grant ends sooner.
+HTTP/2 and TLS can retain accepted Flight data beyond a body poll, so the connection writer enforces its earliest protected cutoff through closure.
+A gateway imports the sender's absolute cutoff and fixes a local monotonic ceiling on receipt.
+Cross-host enforcement assumes a consistent wall-clock domain with a bound on skew.
+Remote provider settlement still requires the existing clock-rate margin.
+The composed model distinguishes admission, partial handoff, time advancing while transport is paused, and refusal at expiry.
+Its negative control permits a socket write at the cutoff and violates the live-write invariant.
+
+Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. The new detached broker admits its own exact position hold before reading and retains it through provider drain. The broker keeps its key grant through TLS payload delivery.
+The checker joins that admission to the origin replay ticket and requires a matching certified range, sealed frame and exact publication before accepting broker delivery. These changes have source review only.
+
+
+Installed receipt reclamation emits the ordered journal's withdrawal position and exact provider path and publication fingerprints.
+The provider trace joins those fingerprints with the placement and withdrawal position before validating physical removal.
+This covers installed receipt publications for which the runtime can obtain an exact object fence.
+The complete T2 replay requires the full reachable-publication census and a recovery exclusion that can settle the detached version independently of physical trim. The broker serves normal tails and ranges. Administrative and transfer access and hosted credential provisioning remain relevant to closing the full recovery inventory.

@@ -14,7 +14,6 @@ use crate::keys::KeyService;
 use crate::packing::{PackIndex, block_pack, observe_pack_index, pack_block};
 use crate::reference::{Base, References, stores};
 
-mod receipts;
 pub(super) mod tombstones;
 use tombstones::TombstoneJournal;
 
@@ -161,7 +160,6 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
             if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
             eligible.push((marker.key, target, witness));
         }
-        let mut receipts = None;
         let mut checked = BTreeSet::new();
         let mut checked_terminal = BTreeSet::new();
         for (marker, target, witness) in &eligible {
@@ -175,27 +173,15 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
                 let Some([data_tombstone, release_tombstone]) = provider.terminal_targets(target, marker, publication).await? else { continue; };
                 RetirementWork::Tombstones { deployment: candidate.id.clone(), target: target.to_string(), release: marker.to_string(), data_tombstone, release_tombstone }
             } else {
-                let (version, legacy_receipt) = match (&witness.version, keys) {
-                    (Some(version), _) => (version.clone(), None),
-                    (None, Some(keys)) => {
-                        if receipts.is_none() {
-                            let historical = eligible.iter().filter(|(_, _, entry)| entry.terminal.is_none() && entry.version.is_none()).map(|(_, _, entry)| &entry.record);
-                            receipts = Some(receipts::ReceiptIndex::load(bucket, keys, candidate, &store, historical).await?);
-                        }
-                        let Some(publication) = receipts.as_ref().and_then(|index| index.get(&witness.record)) else { continue; };
-                        (publication.version.clone(), Some(publication.receipt.clone()))
-                    }
-                    (None, None) => continue,
-                };
-                let Some(release_version) = &witness.release_version else { continue; };
+                let (Some(version), Some(release_version)) = (&witness.version, &witness.release_version) else { continue; };
                 if witness.pack.is_some() {
                     if !checked.insert((target.clone(), version.version.clone())) { continue; }
                     // Keep an incomplete pack from repeatedly closing its lineage.
                     if pack_release_bound(bucket, provider, target, witness, &markers, threshold).await?.is_none() { continue; }
                 }
-                if !provider.available(target, &version).await? || !provider.available(marker, release_version).await? { continue; }
+                if !provider.available(target, version).await? || !provider.available(marker, release_version).await? { continue; }
                 RetirementWork::S3 { deployment: candidate.id.clone(), target: target.to_string(),
-                    release: marker.to_string(), version, release_version: Some(release_version.clone()), legacy_receipt }
+                    release: marker.to_string(), version: version.clone(), release_version: release_version.clone() }
             };
             let retirement = LineageRetirement { token: Uuid::new_v4(), source: source.clone(), work };
             let reserved = directory.change_lineage(lineage, LineageChange::ReserveRetirement {
@@ -243,8 +229,6 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
         }
     };
     erase_granted(directory, provider, lineage, grant).await?;
-    // An already-authorized legacy attempt can settle its data version. The
-    // release remains for a new pass to identify and settle by exact version.
     settle(directory, lineage, deployment, retirement).await?;
     if let RetirementWork::S3 { version, .. } = &retirement.work {
         forget_settled_replica_candidate(directory, deployment, &target, version).await?;
@@ -258,7 +242,7 @@ async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvi
         RetirementWork::S3 { target, release, version, release_version, .. } => {
             let target = ObjectKey::new(target)?;
             let release = ObjectKey::new(release)?;
-            for (key, publication) in std::iter::once((&target, version)).chain(release_version.iter().map(|version| (&release, version))) {
+            for (key, publication) in [(&target, version), (&release, release_version)] {
                 let observed = || serde_json::json!({
                     "lineage": lineage, "revision": grant.revision(), "residence": retirement.source, "retirement": retirement.token,
                     "key": key.as_str(), "publication": publication,
@@ -283,6 +267,103 @@ async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvi
         _ => return Err(changed()),
     }
     Ok(())
+}
+
+#[derive(PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "publication", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum InstalledPublication {
+    Version { version: PhysicalObjectVersion },
+    Terminal { terminal: TerminalObjectPublication },
+}
+
+impl InstalledPublication {
+    pub(crate) fn matches(&self, observed: &rtdb_types::PhysicalObjectPublication) -> bool {
+        use rtdb_types::PhysicalObjectPublication;
+        match (self, observed) {
+            (Self::Version { version }, PhysicalObjectPublication::Version(observed)) => version == observed,
+            (Self::Terminal { terminal }, PhysicalObjectPublication::Terminal(observed)) => terminal == observed,
+            _ => false,
+        }
+    }
+
+    /// One physical provider path has one journal name. The exact publication
+    /// is bound separately so a competing grant cannot retire another version.
+    pub(crate) fn withdrawal(&self) -> Result<ordered_logkeeper::ordered::ObjectWithdrawal> {
+        use ring::digest::{SHA256, digest};
+
+        let exact = serde_json::to_vec(self).map_err(|error| Error::Task(error.to_string()))?;
+        let (namespace, key) = match self {
+            Self::Version { version } => (&version.namespace, &version.key),
+            Self::Terminal { terminal } => (&terminal.namespace, &terminal.key),
+        };
+        Ok(ordered_logkeeper::ordered::ObjectWithdrawal {
+            name: installed_object_name(namespace, key)?,
+            version: digest(&SHA256, &exact).as_ref().try_into().expect("SHA-256 width"),
+        })
+    }
+
+    pub(crate) async fn available(&self, key: &ObjectKey, provider: &rtdb_s3::VersionedInventory) -> Result<bool> {
+        match self {
+            Self::Version { version } => {
+                if !provider.owns_publication(key, version) { return Ok(false); }
+                provider.exact_retirement_available(key, version).await
+            }
+            Self::Terminal { terminal } => {
+                let Some(provider) = provider.enrolled_terminal_retirement().await? else { return Ok(false); };
+                provider.publication_fence_available(key, terminal, installed_publication_token(self.withdrawal()?)).await
+            }
+        }
+    }
+}
+
+pub(crate) fn installed_object_name(
+    namespace: &rtdb_types::S3ObjectNamespace, key: &str,
+) -> Result<ordered_logkeeper::ordered::ObjectName> {
+    let address = serde_json::to_vec(&(namespace, key)).map_err(|error| Error::Task(error.to_string()))?;
+    Ok(ring::digest::digest(&ring::digest::SHA256, &address).as_ref().try_into().expect("SHA-256 width"))
+}
+
+fn installed_publication_token(withdrawal: ordered_logkeeper::ordered::ObjectWithdrawal) -> Uuid {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&withdrawal.version[..16]);
+    uuid::Builder::from_random_bytes(bytes).into_uuid()
+}
+
+pub(crate) struct InstalledPublicationDeletionGrant<'a> {
+    key: &'a ObjectKey,
+    publication: &'a InstalledPublication,
+    fence: ordered_logkeeper::ordered::ObjectFence,
+    placement: ordered_logkeeper::ordered::Placement,
+}
+
+impl<'a> InstalledPublicationDeletionGrant<'a> {
+    pub(crate) fn from_journal(
+        key: &'a ObjectKey, publication: &'a InstalledPublication, fence: ordered_logkeeper::ordered::ObjectFence,
+        placement: ordered_logkeeper::ordered::Placement,
+    ) -> Result<Self> {
+        if publication.withdrawal()? != fence.object { return Err(changed()); }
+        Ok(Self { key, publication, fence, placement })
+    }
+
+    pub(crate) async fn settle(self, provider: &rtdb_s3::VersionedInventory) -> Result<()> {
+        let observed = || serde_json::json!({
+            "deployment": self.placement.deployment, "incarnation": self.placement.incarnation,
+            "group": self.placement.group, "generation": self.placement.generation,
+            "position": self.fence.position, "name": self.fence.object.name, "version": self.fence.object.version,
+            "key": self.key.as_str(), "publication_bytes": serde_json::to_vec(self.publication).expect("publication encodes"),
+            "address_bytes": self.publication.serialized_address().expect("provider address encodes"),
+        });
+        crate::residence_trace::record("authorize-installed-publication", observed);
+        match self.publication {
+            InstalledPublication::Version { version } => provider.retire_observed_version(self.key, version).await?,
+            InstalledPublication::Terminal { terminal } => {
+                let provider = provider.enrolled_terminal_retirement().await?.ok_or_else(changed)?;
+                provider.fence_create_only_publication(self.key, terminal, installed_publication_token(self.fence.object)).await?;
+            }
+        }
+        crate::residence_trace::record("remove-installed-publication", observed);
+        Ok(())
+    }
 }
 
 fn replica_payload_store(owner: &DeploymentRecord) -> Result<String> {
@@ -411,22 +492,12 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     let Some(witness) = read_release(bucket, release).await? else { return Ok(None); };
     if witness.target_name() != Some(relative) { return Err(changed()); }
     if !witness.ready_by(threshold) { return Ok(None); }
-    let (deployment, retires_release) = match &retirement.work {
-        RetirementWork::S3 { deployment, version, release_version, legacy_receipt, .. } => {
-            if release_version.as_ref().is_some_and(|expected| witness.release_version.as_ref() != Some(expected)) {
-                return Err(changed());
+    let deployment = match &retirement.work {
+        RetirementWork::S3 { deployment, version, release_version, .. } => {
+            if witness.version.as_ref() != Some(version) || witness.release_version.as_ref() != Some(release_version) {
+                return Ok(None);
             }
-            match (witness.version.as_ref(), legacy_receipt.as_deref(), keys) {
-                (Some(observed), None, _) if observed == version => {},
-                (None, Some(receipt), Some(keys)) if release_version.is_some() => {
-                    let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
-                    if owner.storage_prefix() != retirement.source
-                        || !receipts::verify(bucket, keys, &owner, &store, &witness.record, receipt, version).await?
-                    { return Ok(None); }
-                }
-                _ => return Ok(None),
-            }
-            (deployment, release_version.is_some())
+            deployment
         }
         RetirementWork::Tombstones { deployment, data_tombstone, release_tombstone, .. } => {
             let Some(publication) = &witness.terminal else { return Ok(None); };
@@ -437,12 +508,11 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
             }
             let Some([data, marker]) = provider.terminal_targets(target, release, publication).await? else { return Ok(None); };
             if &data != data_tombstone || &marker != release_tombstone { return Err(changed()); }
-            (deployment, true)
+            deployment
         }
         _ => return Err(changed()),
     };
     let pack = if witness.pack.is_some() {
-        if !retires_release { return Err(changed()); }
         let Some(ready) = pack_release_bound(bucket, provider, target, &witness, &markers, threshold).await? else { return Ok(None); };
         Some(ready)
     } else {
@@ -516,7 +586,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
                 return Err(changed());
             }
         }
-        let fence = StorageRegion::ExactRetirement { object: target.to_string(), release: retires_release.then(|| release.to_string()) };
+        let fence = StorageRegion::ExactRetirement { object: target.to_string(), release: Some(release.to_string()) };
         if let Some(previous) = record.storage_regions.insert(retirement.token, fence.clone()) && previous != fence {
             return Err(changed());
         }
@@ -529,18 +599,19 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
 
     if pack.is_none() {
         let base = Base::load(bucket, &store).await?;
-        let mut released = BTreeSet::from([relative.to_owned()]);
-        if retires_release { released.insert(release_name.to_owned()); }
+        let released = BTreeSet::from([relative.to_owned(), release_name.to_owned()]);
         base.forget(bucket, &store, &released).await?;
     }
-    if let Some(replica) = &witness.replica
+    if let (Some(replica), RetirementWork::S3 { version, .. }) = (&witness.replica, &retirement.work)
         && let (Some(trim), Some(anchor)) = (&owner.replica_payload_trim, &owner.replica_anchor)
     {
         crate::residence_trace::record("retirement-recovery-dependency", || serde_json::json!({
             "lineage": owner.lineage, "installation": owner.id, "incarnation": owner.incarnation,
             "epoch": owner.log_epoch, "stream": owner.stream("replica"), "revision": owner.version,
-            "retirement": retirement.token, "key": target.as_str(), "position": replica.position,
+            "residence": retirement.source, "retirement": retirement.token, "key": target.as_str(),
+            "publication": version, "position": replica.position, "frame": replica.frame_sha256,
             "trim_through": trim.through, "anchor": anchor.digest,
+            "journals": trim.journals.iter().filter_map(|endpoint| endpoint.journal()).collect::<Vec<_>>(),
         }));
     }
     Ok(Some(owner.version))
@@ -553,7 +624,7 @@ fn archived_source_holds(region: &StorageRegion, work: &RetirementWork) -> bool 
         | StorageRegion::ReferenceRead { archive_source: Some(hold), .. }) = region else { return false; };
     match work {
         RetirementWork::S3 { version, release_version, .. } =>
-            !hold.permits_retirement(version) || release_version.as_ref().is_some_and(|version| !hold.permits_retirement(version)),
+            !hold.permits_retirement(version) || !hold.permits_retirement(release_version),
         _ => true,
     }
 }
@@ -682,7 +753,7 @@ mod tests {
         record.replica_payload_trim = Some(Box::new(ReplicaPayloadTrim { incarnation: record.incarnation, log_epoch: record.log_epoch,
             through: 6, journals: [rtdb_types::JournalEndpoint::Member {
                 address: "127.0.0.1:1".into(), journal: Uuid::new_v4().to_string(),
-            }].into(), applied: false, candidates: Vec::new() }));
+            }].into(), applied: false, candidates: Vec::new(), journal_units: Vec::new() }));
         let relative = "oversized/b00-published.binpb";
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
         let target = ObjectKey::new(format!("{}/{root}/{relative}", record.storage_prefix())).unwrap();
@@ -1251,7 +1322,7 @@ mod tests {
         let queue = release_version.key.clone();
         let retirement = LineageRetirement { token: Uuid::new_v4(), source: residence,
             work: RetirementWork::S3 { deployment: owner.id.clone(), target: object.clone(),
-                release: marker.clone(), version: publication, release_version: Some(release_version), legacy_receipt: None },
+                release: marker.clone(), version: publication, release_version },
         };
         let mut fenced = owner.clone();
         fenced.storage_regions.insert(retirement.token, StorageRegion::ExactRetirement { object, release: Some(marker) });
@@ -1327,82 +1398,6 @@ mod tests {
         assert!(!directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.contains_key(&retirement.token),
             "settlement removes the physical owner's fence");
         assert_eq!(directory.lineage_state(&owner.lineage).await.unwrap().open_generation(), Some(1));
-    }
-    #[tokio::test]
-    async fn hosted_reaper_retains_legacy_evidence_until_the_recovered_version_settles() {
-        use rtdb_format::trie_retirement::{RetirementFile, RetirementIntent, intent_digest, journal_directory};
-
-        let directory = MemoryDirectory::new();
-        let bucket = VersionedReleaseStore::default();
-        let files = tempfile::tempdir().unwrap();
-        let keys = crate::keys::LocalKeyService::new(files.path().join("keys")).unwrap();
-        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
-        let namespace = Uuid::new_v4();
-        owner.storage_namespaces = Some(StorageNamespaces { objects: namespace, keys: [0; 32] });
-        let epoch = StorageEpoch(0);
-        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
-        let selected = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch,
-            replica_epoch: epoch, through: ReplicaPosition(1) };
-        let floor = CatalogAdmissionFloor { residence: owner.storage_prefix(), object_namespace: namespace,
-            cut: CatalogCut { through: ReplicaPosition(2), ..selected } };
-        owner.catalog_admission_floors.insert(root.clone(), floor.clone());
-        owner.checkpoint = Some(rtdb_directory::Checkpoint { block: 1, boundary: 2, source: 1, system_time: 0, root_sha256: Some([2; 32]) });
-        owner.recovery_manifest_sha256 = Some([2; 32]);
-        let owner = directory.create_deployment(owner).await.unwrap();
-        let store = format!("{}/{root}", owner.storage_prefix());
-        let key = "tables/orders/data/l01-rc-b00.arrow";
-        let marker = ObjectKey::new(format!("{store}/{GARBAGE_DIRECTORY}/00000000000000000000-release")).unwrap();
-        let release = super::super::GarbageRecord { key: key.into(), released_at_ms: 0, trie_floor: Some(floor) };
-        bucket.put(&marker, serde_json::to_vec(&release).unwrap().into()).await.unwrap();
-
-        let records = directory.deployments().await.unwrap();
-        for outcome in super::super::reaper_pass(&bucket, &records, i64::MAX, Duration::ZERO).await.unwrap() { outcome.unwrap(); }
-        assert!(bucket.head(&marker).await.is_ok());
-
-        let target = ObjectKey::new(format!("{store}/{key}")).unwrap();
-        let version = PhysicalObjectVersion { namespace: S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None },
-            key: format!("cell/{target}"), version: "original".into() };
-        let versions = Provider { version: version.clone(), attempts: AtomicUsize::new(0), markers: AtomicUsize::new(0) };
-        let intent = RetirementIntent { selected, table: rtdb_types::TableRef::new("public", "orders"), tries: vec!["l01-rc-b00".into()],
-            files: vec![RetirementFile { key: key.into(), version: Some(version), terminal_publication: None, matches_publication: true }], after_reset: None };
-        let encoded = serde_json::to_vec(&intent).unwrap();
-        let relative = format!("{}/installed/{}", journal_directory(selected), intent_digest(&encoded));
-        let receipt = ObjectKey::new(format!("{store}/{relative}")).unwrap();
-        let cipher = crate::cipher::Cipher::new(&keys.key(&owner.key_id()).await.unwrap()).unwrap();
-        let mut bytes = 2i64.to_be_bytes().to_vec();
-        bytes.extend(encoded);
-        bucket.put(&receipt, cipher.seal_deterministic(&relative, &bytes).unwrap()).await.unwrap();
-
-        let reader = Uuid::new_v4();
-        crate::admin::update_installation(directory.as_ref(), &owner.id, |record| {
-            record.storage_regions.insert(reader, StorageRegion::ReferenceRead { custody: ReplayCustody::Local, archive_source: None, object: Some(marker.to_string()) });
-            Ok(())
-        }).await.unwrap();
-        assert_eq!(reap(directory.as_ref(), &bucket, &versions, &owner, 0, None, Some(&keys)).await.unwrap_err().code, "rtdb.multi/exact-retirement");
-        assert_eq!(versions.attempts.load(Ordering::Relaxed), 0);
-        super::super::release_region(directory.as_ref(), &owner.id, reader, false).await.unwrap();
-
-        assert_eq!(reap(directory.as_ref(), &bucket, &versions, &owner, 0, None, Some(&keys)).await.unwrap_err().code, "fixture/provider-reply-lost");
-        let state = directory.lineage_state(&owner.lineage).await.unwrap();
-        assert!(state.exact_erasure_authorized());
-        let retirement = state.retirement().unwrap();
-        assert!(matches!(&retirement.work,
-            RetirementWork::S3 { legacy_receipt: Some(path), version, release_version: Some(release_version), .. }
-                if path == receipt.as_str() && version == &versions.version && release_version.version == "marker"));
-        let fenced = directory.deployment(&owner.id).await.unwrap().unwrap();
-        assert!(matches!(fenced.storage_regions.get(&retirement.token), Some(StorageRegion::ExactRetirement { object, release: Some(release) })
-            if object == target.as_str() && release == marker.as_str()));
-        assert!(bucket.head(&marker).await.is_ok());
-
-        bucket.delete(&receipt).await.unwrap();
-        bucket.put(&target, Bytes::from_static(b"replacement")).await.unwrap();
-        reap(directory.as_ref(), &bucket, &versions, &owner, 0, None, None).await.unwrap();
-        assert!(directory.lineage_state(&owner.lineage).await.unwrap().retirement().is_none());
-        assert!(directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.is_empty());
-        assert_eq!(versions.attempts.load(Ordering::Relaxed), 2);
-        assert_eq!(versions.markers.load(Ordering::Relaxed), 1);
-        assert!(bucket.head(&marker).await.is_ok());
-        assert_eq!(bucket.get(&target).await.unwrap().as_ref(), b"replacement");
     }
     #[tokio::test]
     async fn terminal_retirement_waits_for_reads_and_recovery_and_resumes_its_upload_after_restart() {

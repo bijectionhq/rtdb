@@ -189,6 +189,10 @@ pub enum StatementKind { Query, Dml, Session }
 
 impl<'input> ParsedStatement<'input> {
     /// Binds this syntax against the caller's catalog using its original source and raw metadata budget.
+    pub fn snapshot_selector(&self) -> Result<rtdb_plan::QuerySettings> {
+        self.tree.settings.snapshot_selector()
+    }
+
     pub fn bind(self, catalog: &dyn rtdb_plan::Catalog, options: &crate::PrepareOptions) -> Result<rtdb_plan::PreparedStatement> {
         crate::bind::bind(self, catalog, options)
     }

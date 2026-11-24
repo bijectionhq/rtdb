@@ -8,7 +8,7 @@ use rtdb_storage::{
     ObjectKey,
     remote::{PublicationResult, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag},
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, S3TombstoneCondition, S3TombstoneTarget};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, S3TombstoneCondition, S3TombstoneTarget, TerminalObjectPublication};
 use uuid::Uuid;
 
 use super::VersionedInventory;
@@ -18,6 +18,7 @@ pub enum NeverVersionedObject {
     Retired(Uuid),
 }
 
+#[derive(Clone)]
 pub struct ObservedTerminalObject {
     allocation: Uuid,
     target: S3TombstoneTarget,
@@ -89,6 +90,14 @@ impl NeverVersionedRetirement<'_> {
     pub async fn read_observed_range(
         &self, key: &ObjectKey, observed: &ObservedTerminalObject, range: Range<u64>,
     ) -> Result<Bytes> {
+        self.inventory.inspect((key.clone(), observed.clone(), range), |inventory, (key, observed, range)| async move {
+            NeverVersionedRetirement { inventory: &inventory }.read_range_at_publication(&key, &observed, range).await
+        }).await
+    }
+
+    async fn read_range_at_publication(
+        &self, key: &ObjectKey, observed: &ObservedTerminalObject, range: Range<u64>,
+    ) -> Result<Bytes> {
         let path = self.checked_path(key, &observed.target)?;
         let S3TombstoneCondition::Matches(tag) = &observed.target.condition else {
             return Err(unavailable("The observed publication has no strong entity tag"));
@@ -126,6 +135,12 @@ impl NeverVersionedRetirement<'_> {
     }
 
     async fn observe_with_size(&self, key: &ObjectKey) -> Result<(NeverVersionedObject, Option<u64>)> {
+        self.inventory.inspect(key.clone(), |inventory, key| async move {
+            NeverVersionedRetirement { inventory: &inventory }.inspect_metadata(&key).await
+        }).await
+    }
+
+    async fn inspect_metadata(&self, key: &ObjectKey) -> Result<(NeverVersionedObject, Option<u64>)> {
         let path = self.path(key);
         let reply = self
             .inventory
@@ -217,6 +232,47 @@ impl NeverVersionedRetirement<'_> {
             }
             NeverVersionedObject::Open(target) => target,
         };
+        self.write_create_only_fence(key, target, token).await
+    }
+
+    /// Fences only the publication named by the grant. An already installed
+    /// fence is a valid retry of the same grant.
+    pub async fn fence_create_only_publication(
+        &self, key: &ObjectKey, publication: &TerminalObjectPublication, token: Uuid,
+    ) -> Result<()> {
+        if !self.publication_fence_available(key, publication, token).await? {
+            return Err(unavailable("The terminal publication changed before retirement"));
+        }
+        if self.confirms(key, token).await? { return Ok(()); }
+        let target = S3TombstoneTarget {
+            namespace: publication.namespace.clone(),
+            key: publication.key.clone(),
+            condition: S3TombstoneCondition::Matches(publication.etag.clone()),
+        };
+        self.write_create_only_fence(key, target, token).await
+    }
+
+    pub async fn publication_fence_available(
+        &self, key: &ObjectKey, publication: &TerminalObjectPublication, token: Uuid,
+    ) -> Result<bool> {
+        if self.allocation() != Some(publication.allocation) || token.is_nil() {
+            return Ok(false);
+        }
+        let target = S3TombstoneTarget {
+            namespace: publication.namespace.clone(),
+            key: publication.key.clone(),
+            condition: S3TombstoneCondition::Matches(publication.etag.clone()),
+        };
+        self.checked_path(key, &target)?;
+        Ok(match self.observe(key).await? {
+            NeverVersionedObject::Retired(previous) => previous == token,
+            NeverVersionedObject::Open(observed) => observed == target,
+        })
+    }
+
+    async fn write_create_only_fence(
+        &self, key: &ObjectKey, target: S3TombstoneTarget, token: Uuid,
+    ) -> Result<()> {
         let path = self.checked_path(key, &target)?;
         let request = self
             .inventory

@@ -16,6 +16,8 @@ use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 
 mod archive;
+mod delivery;
+pub(crate) use delivery::DeploymentDelivery;
 mod assertion;
 mod journal;
 mod unit;
@@ -27,6 +29,19 @@ pub use journal::JournalKey;
 pub use archive::ArchiveKey;
 pub use crate::cipher::object::FramedObject;
 pub(crate) use archive::legacy_archive_key;
+
+/// The trim owner recorded these names before the certified ciphertext disappeared.
+pub(crate) async fn withdraw_archive_records(
+    keys: &dyn KeyService, residence: &str, records: &[String], region: &Arc<IoRegion>,
+) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt, stream};
+    let scope = UnitScope::archive(residence);
+    stream::iter(records.iter().map(|record| async move {
+        let name = archive::associated_unit(record)?;
+        keys.withdraw_unit_key(scope.slot(&name), region).await
+    })).buffer_unordered(16).try_collect::<Vec<()>>().await?;
+    Ok(())
+}
 
 pub const KEY_BYTES: usize = 32;
 const NAMESPACE_KEY_ID: &str = ".rtdb-key-namespace";
@@ -66,6 +81,10 @@ pub trait KeyService: Send + Sync {
     async fn key(&self, deployment: &str) -> Result<[u8; KEY_BYTES]>;
     /// Read current custody without creating a key.
     async fn existing_key(&self, deployment: &str) -> Result<Option<[u8; KEY_BYTES]>>;
+    /// Confirms the original key and keeps the authority live through delivery.
+    async fn grant_deployment_key(&self, _id: &str, _binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
+        Err(rtdb_storage::Error::Closed("The deployment key owner cannot grant delivery".into()))
+    }
     /// Gives `to` the key `from` has, for a fork whose objects are copies of its parent's.
     async fn copy(&self, from: &str, to: &str) -> Result<()>;
     /// Withdraws the key and permanently refuses provisioning for this deployment ID.
@@ -113,6 +132,11 @@ pub trait KeyService: Send + Sync {
     async fn archive_key(&self, id: &str, provision: bool, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
         let key = if provision { self.key(id).await? } else { self.existing(id).await? };
         legacy_archive_key(&key)
+    }
+
+    /// Returns the original residence authority for independently withdrawable units.
+    async fn scoped_unit_key(&self, _id: &str, _region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        Err(unit::unsupported())
     }
 
     async fn archive_key_is_operation_only(&self, _id: &str) -> Result<bool> { Ok(false) }
@@ -234,7 +258,7 @@ impl LocalKeyService {
                 return Err(archive::revoked());
             }
             vault.read_or_create_key(&vault_path, provision)?;
-            return Ok(Arc::new(archive::LocalArchiveKey { unit_vault: vault.clone(), vault, id, region }));
+            return Ok(archive::tracked_archive_key(archive::LocalArchiveKey { unit_vault: vault.clone(), vault, id, region }));
         }
         if provision {
             drop(raw_lock);
@@ -242,20 +266,30 @@ impl LocalKeyService {
         } else {
             read_key(&path, fs::read(&path).map_err(io)?)?;
         }
-        Ok(Arc::new(archive::LocalArchiveKey { vault: self.clone(), unit_vault: self.archive_vault()?, id, region }))
+        Ok(archive::tracked_archive_key(archive::LocalArchiveKey { vault: self.clone(), unit_vault: self.archive_vault()?, id, region }))
     }
     fn region_path(&self, region: uuid::Uuid) -> PathBuf {
         self.directory.join(format!("{region}.storage-region"))
     }
 
-    fn lock_key(&self, path: &Path) -> Result<File> {
-        let lock = File::options()
+    fn open_key_lock(&self, path: &Path) -> Result<File> {
+        File::options()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path.with_extension("lock"))
-            .map_err(io)?;
+            .map_err(io)
+    }
+
+    fn lock_key_shared(&self, path: &Path) -> Result<File> {
+        let lock = self.open_key_lock(path)?;
+        lock.lock_shared().map_err(io)?;
+        Ok(lock)
+    }
+
+    fn lock_key(&self, path: &Path) -> Result<File> {
+        let lock = self.open_key_lock(path)?;
         lock.lock().map_err(io)?;
         match fs::remove_file(path.with_extension("pending")) {
             Ok(()) => self.sync_directory()?,
@@ -313,6 +347,20 @@ impl LocalKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for LocalKeyService {
+    async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
+        let vault = self.clone();
+        let id = id.to_owned();
+        IoRegion::new().run_blocking(move || {
+            let map = journal::key_error;
+            let path = vault.path(&id).map_err(map)?;
+            let custody = Arc::new(vault.lock_key_shared(&path).map_err(map)?);
+            vault.require_raw_key(&id).map_err(map)?;
+            let material = read_key(&path, fs::read(&path).map_err(io).map_err(map)?).map_err(map)?;
+            delivery::require_deployment_key(Some(material), binding)?;
+            Ok(UnitOutput::HeldGrant { until: None, custody })
+        }).await
+    }
+
     async fn namespace_id(&self) -> Result<[u8; KEY_BYTES]> { self.load_key(self.directory.join(".namespace"), None).await }
 
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
@@ -370,9 +418,7 @@ impl KeyService for LocalKeyService {
                 Err(error) => return Err(io(error)),
             }
         }
-        if deployment.starts_with("stage-") {
-            self.withdraw_local_scope(UnitScope::archive(deployment), &IoRegion::new()).await?;
-        }
+        self.withdraw_local_scope(UnitScope::archive(deployment), &IoRegion::new()).await?;
         Ok(())
     }
 
@@ -414,6 +460,10 @@ impl KeyService for LocalKeyService {
         region.run_blocking(move || Ok(vault.open_archive_key(id, provision, key_region))).await?
     }
 
+    async fn scoped_unit_key(&self, id: &str, region: Arc<IoRegion>) -> Result<Arc<dyn ArchiveKey>> {
+        self.archive_key(id, false, region).await
+    }
+
     async fn archive_key_is_operation_only(&self, id: &str) -> Result<bool> {
         require_general_key_namespace(id)?;
         self.require_service_root()?;
@@ -443,7 +493,7 @@ impl KeyService for LocalKeyService {
         let vault = self.clone();
         let scope = UnitScope::archive(id);
         let id = id.to_owned();
-        let withdrawal = tokio::task::spawn_blocking(move || {
+        let withdrawal = tokio::task::spawn_blocking(move || -> Result<ArchiveKeyWithdrawal> {
             vault.require_service_root()?;
             let raw_path = vault.path(&id)?;
             let _raw_lock = vault.lock_key(&raw_path)?;

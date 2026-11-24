@@ -227,7 +227,7 @@ pub fn resolve_located_point<W: Copy>(mut history: BTreeMap<Iid, Vec<LocatedHist
     let mut visible = Vec::new();
     let mut resolver = rtdb_temporal::HistoryResolver::new_in(bounds, clamp_valid_time, Arc::clone(memory));
     for events in history.values_mut() {
-        events.sort_unstable_by_key(|event| (std::cmp::Reverse(event.header.system_position()), event.header.valid_time.lower()));
+        events.sort_unstable_by_key(|event| (std::cmp::Reverse(event.header.precedence()), event.header.valid_time.lower()));
         if events.windows(2).any(|pair| {
             let (left, right) = (&pair[0], &pair[1]);
             left.header.version() == right.header.version() && (left.origin.is_none() || left.origin != right.origin

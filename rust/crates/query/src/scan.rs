@@ -270,7 +270,7 @@ impl ActiveRows {
 struct Head { header: EventHeader, active: usize, priority: usize, ordinal: usize }
 impl Ord for Head {
     fn cmp(&self, other: &Self) -> Ordering {
-        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.system_position().cmp(&other.header.system_position()))
+        other.header.iid.cmp(&self.header.iid).then_with(|| self.header.precedence().cmp(&other.header.precedence()))
             .then_with(|| other.priority.cmp(&self.priority)).then_with(|| other.ordinal.cmp(&self.ordinal))
             .then_with(|| other.active.cmp(&self.active))
     }
@@ -534,7 +534,8 @@ impl Fragment {
         if !matches!(self.state, FragmentState::Pending) { return; }
         let (fragmenter, request) = (Arc::clone(fragmenter), Arc::clone(&self.request));
         let memory = Arc::clone(memory);
-        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(async move { fragmenter.dispatch_reply(&request, &memory).await })));
+        let work = rtdb_storage::IoRegion::inherit_reading(async move { fragmenter.dispatch_reply(&request, &memory).await });
+        self.state = FragmentState::Dispatched(Dispatch(tokio::spawn(work)));
     }
     async fn next_batch(&mut self, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
         if let FragmentState::Dispatched(dispatch) = &mut self.state {
@@ -1591,7 +1592,7 @@ impl PartitionScan {
             let source = rows.row(index)?;
             let header = source.header()?;
             if header.iid < page.lower || header.iid > page.upper { return Err(invalid("page-path", "Data page contains an IID outside its metadata path")); }
-            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.system_position() < header.system_position())) {
+            if previous.is_some_and(|previous| previous.iid > header.iid || (previous.iid == header.iid && previous.precedence() < header.precedence())) {
                 return Err(invalid("page-order", "Data page is not in IID and descending system-position order"));
             }
             previous = Some(header);
@@ -1791,6 +1792,16 @@ impl PartitionScan {
                             .map(|header| Value::I64(i64::from(header.commit_position)))
                     }).collect::<Result<Vec<_>>>()?;
                     return Ok(Some(crate::columnar::Column::Values(ordinals)));
+                }
+                if self.scan.columns[position].name == rtdb_types::HOSTED_RECEIPT_TX_ID
+                    && self.execution.context.catalog.owned_identity().is_some()
+                {
+                    let transactions = rows.iter().map(|row| {
+                        let (batch, index) = row.source;
+                        batches[batch as usize].header(index as usize)
+                            .map(|header| header.position.map_or(Value::Null, |position| Value::I64(position.transaction.0)))
+                    }).collect::<Result<Vec<_>>>()?;
+                    return Ok(Some(crate::columnar::Column::Values(transactions)));
                 }
                 if self.scan.columns[position].name == "user_metadata" && projected.is_some() {
                     return Ok(projected.take());
@@ -2150,7 +2161,7 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
         let events = [0x00, 0x40, 0x80].into_iter().zip(values).enumerate().map(|(index, (prefix, value))| {
-            StoredEvent {
+            StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: None,
@@ -2200,7 +2211,7 @@ mod tests {
 
         for (operation, retained) in [(StoredOperation::Delete, false), (StoredOperation::Redacted, true)] {
             let id = EntityId::Integer(1);
-            let event = StoredEvent {
+            let event = StoredEvent { position: None,
                 iid: id.iid(), entity_key: Some(id.handle_bytes().into()), commit_position: 1,
                 origin: Some(rtdb_types::EventOrigin([9; 32])), operation, ..events[0].clone()
             };
@@ -2230,7 +2241,7 @@ mod tests {
             let mut write = TransactionBuffer::new(state.value().snapshot(),
                 TransactionKey { tx_id: TxId(tx_id as i64), system_time }, Arc::clone(&memory)).unwrap();
             for (iid, value) in rows {
-                write.append(table.clone(), StoredEvent {
+                write.append(table.clone(), StoredEvent { position: None,
                     origin: None, commit_position: 0, entity_key: None, iid, system_from: system_time, valid_time: Interval::ALL,
                     operation: StoredOperation::Put(StructFields::from([("v".into(), Value::I64(value))])), recency: None,
                 }).unwrap();
@@ -2255,6 +2266,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_receipt_projects_the_assigned_position_after_a_gap() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let table = TableRef::new("public", rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE);
+        let id = EntityId::String("receipt".to_owned());
+        let key = |position| TransactionKey { tx_id: TxId(position), system_time: Timestamp(10) };
+        let mut prepare = TransactionBuffer::new(state.value().snapshot(), key(0), Arc::clone(&memory)).unwrap();
+        prepare.put(table.clone(), StructFields::from([("_id".into(), id.as_value())]), Interval::ALL).unwrap();
+        let prepared = prepare.stage().unwrap();
+        let mut ordered = TransactionBuffer::new(state.value().snapshot(), key(4), Arc::clone(&memory)).unwrap().stage().unwrap();
+        ordered.install_prepared_generation(prepared, &memory).unwrap();
+        state.apply(&ordered).unwrap();
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, memory, Timestamp(10), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let mut cursor = crate::owned_relation::open_owned_table_point(
+            context, table, id.iid(), Some(&id), Some(Interval::ALL),
+            Some(&[rtdb_types::HOSTED_RECEIPT_TX_ID]), false,
+        ).await.unwrap().unwrap();
+        let row = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(crate::owned_receipt_transaction(row.batch(), 0).unwrap(), TxId(4));
+    }
+
+    #[tokio::test]
     async fn owned_position_points_and_windows_hide_only_the_selected_commit_suffix() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
@@ -2272,7 +2309,7 @@ mod tests {
             let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
             if values.len() > 1 { write.retain_owned_positions().unwrap(); }
             for &value in values {
-                write.append(table.clone(), StoredEvent {
+                write.append(table.clone(), StoredEvent { position: None,
                     origin: None,
                     commit_position: 0,
                     entity_key: Some(id.handle_bytes().into()),
@@ -3761,7 +3798,7 @@ mod tests {
     async fn assert_combined_summary_replacement(snapshot: Snapshot, table: TableRef, store: Arc<MemoryStore>) {
         let key = TransactionKey { tx_id: TxId(1), system_time: Timestamp(110) };
         let mut write = TransactionBuffer::new(snapshot, key, MemoryBudget::new(1 << 20)).unwrap();
-        write.append(table.clone(), StoredEvent {
+        write.append(table.clone(), StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,

@@ -382,42 +382,40 @@ fn admission_json(document: &StructFields<Value>) -> Option<serde_json::Value> {
     serde_json::from_slice(body).ok()
 }
 
-fn clock_command_matches(record: &serde_json::Value) -> bool {
-    use sha2::{Digest, Sha256};
-
-    match record.pointer("/task/command") {
-        Some(serde_json::Value::Null) => true,
-        Some(serde_json::Value::String(command)) => {
-            let digest = format!("{:x}", Sha256::digest(command.as_bytes()));
-            command.starts_with("[\"bijection.task.emit.v2\",")
-                && record.pointer("/task/digest").and_then(serde_json::Value::as_str)
-                    == Some(digest.as_str())
-        }
-        Some(_) | None => false,
-    }
-}
-
 fn continuation_verdict(original: &StructFields<Value>, refusal: &StructFields<Value>, clock: bool) -> bool {
     let (Some(mut original), Some(refusal)) = (admission_json(original), admission_json(refusal)) else { return false; };
-    if clock && !clock_command_matches(&original) {
+    if clock && !super::schedule_order::clock_command_matches(&original) {
         return false;
     }
     let path = if !clock {
         "/continuation/completion"
-    } else if original.get("previous_delivery").is_some() && original.get("delivered").is_none() {
-        "/previous_delivery/completion"
     } else {
         "/delivered"
     };
     let Some(verdict) = original.pointer_mut(path) else { return false; };
     if verdict.as_str() != Some("delivered") { return false; }
     *verdict = "constraint_refused".into();
+    if clock && original.get("completed_run").is_some() {
+        if !matches!(
+            original.pointer("/task/continuation/kind").and_then(serde_json::Value::as_str),
+            Some("run" | "land"),
+        ) || !matches!(
+            original.pointer("/completed_run/kind").and_then(serde_json::Value::as_str),
+            Some("deferred" | "settled"),
+        ) {
+            return false;
+        }
+        original["completed_run"] = serde_json::json!({
+            "kind": "settled",
+            "outcome": {"status": "refused", "reason": "ConstraintRefused"},
+        });
+    }
     original == refusal
 }
 
 fn refused_run_followup(document: &StructFields<Value>) -> bool {
     admission_json(document).is_some_and(|body| {
-        clock_command_matches(&body) && body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
+        super::schedule_order::clock_command_matches(&body) && body.pointer("/task/continuation/run_fate/outcome").is_some_and(|outcome| {
             outcome.get("status").and_then(serde_json::Value::as_str) == Some("refused")
                 && outcome.get("reason").and_then(serde_json::Value::as_str) == Some("ConstraintRefused")
         })
@@ -642,6 +640,33 @@ pub(super) fn may_settle(error: &Anomaly) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_constraint_refusal_orders_its_own_fate() {
+        use sha2::{Digest, Sha256};
+
+        let command = r#"["bijection.task.emit.v2",{"destination":{"kind":"function"}},null]"#;
+        let row = |delivered, completed_run| {
+            StructFields::from([("admission".into(), Value::Binary(serde_json::to_vec(&serde_json::json!({
+                "task": {
+                    "command": command,
+                    "digest": format!("{:x}", Sha256::digest(command.as_bytes())),
+                    "continuation": {"kind": "run"}
+                },
+                "delivered": delivered,
+                "completed_run": completed_run,
+            })).unwrap()))])
+        };
+        let primary = row("delivered", serde_json::json!({"kind": "deferred"}));
+        let refusal = row("constraint_refused", serde_json::json!({
+            "kind": "settled", "outcome": {"status": "refused", "reason": "ConstraintRefused"}
+        }));
+        let foreign = row("constraint_refused", serde_json::json!({
+            "kind": "settled", "outcome": {"status": "ok", "result": "null"}
+        }));
+        assert!(continuation_verdict(&primary, &refusal, true));
+        assert!(!continuation_verdict(&primary, &foreign, true));
+    }
 
     #[test]
     fn landing_refusal_keeps_the_request_and_withdraws_candidate_assertions() {

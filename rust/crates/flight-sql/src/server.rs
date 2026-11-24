@@ -1,9 +1,10 @@
-use std::{future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, task::{Context, Poll}};
+use std::{future::Future, io::{self, IoSlice}, net::SocketAddr, pin::Pin, sync::{Arc, Mutex}, task::{Context, Poll}};
 use arrow_flight::flight_service_server::FlightServiceServer;
-use futures::StreamExt;
+use futures::{StreamExt, task::AtomicWaker};
 use rtdb_auth::Authenticator;
 use rtdb_columnar::MemoryReservation;
 use rtdb_node::{Clock, Node, SystemClock};
+use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
 use rtdb_types::{Anomaly, Result};
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, net::{TcpListener, TcpStream}, sync::{OwnedSemaphorePermit, Semaphore, watch}};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -52,7 +53,9 @@ impl ServerDriver {
                 (Ok(_), Err(_)) => None,
                 (Ok(stream), Ok(admission)) => transport.as_ref().map(|transport| transport.reserve(AUDIENCE_HOLDER_TRANSPORT_BYTES))
                     .transpose().ok().map(|reservation| stream.set_nodelay(true).map(|()| ConnectionIo {
-                        stream, _admission: admission, _transport: reservation,
+                        peer: stream.connect_info(),
+                        stream: FlightEgressIo::new(stream, Arc::new(FlightEgress::default())),
+                        _admission: admission, _transport: reservation,
                         cancellation: Box::pin(incoming_cancel.clone().cancelled_owned()),
                     })),
             };
@@ -80,15 +83,191 @@ impl ServerDriver {
     }
 }
 impl Drop for ServerDriver { fn drop(&mut self) { self.service.0.cancellation.cancel(); self.service.close(); } }
-struct ConnectionIo { stream: TcpStream, _admission: Option<OwnedSemaphorePermit>, _transport: Option<Arc<MemoryReservation>>, cancellation: Pin<Box<dyn Future<Output = ()> + Send>> }
-impl Connected for ConnectionIo { type ConnectInfo = TcpConnectInfo; fn connect_info(&self) -> Self::ConnectInfo { self.stream.connect_info() } }
-impl ConnectionIo { fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> { if self.cancellation.as_mut().poll(cx).is_ready() { Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Flight server stopped")) } else { Ok(()) } } }
+#[derive(Clone)]
+pub(crate) struct FlightConnectInfo {
+    pub(crate) peer: TcpConnectInfo,
+    pub(crate) egress: Arc<FlightEgress>,
+}
+
+#[derive(Default)]
+pub struct FlightEgress {
+    state: Mutex<EgressState>,
+    socket: AtomicWaker,
+}
+
+#[derive(Default)]
+struct EgressState {
+    cutoff: Option<DeliveryDeadline>,
+    closed: bool,
+    grants: Vec<PlaintextDelivery>,
+}
+
+impl FlightEgress {
+    pub(crate) fn admit(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<()> {
+        grant.check()?;
+        if let (Some(grant), Some(relay)) = (grant.transport_deadline(), relay) && !grant.covers(relay) {
+            return Err(network(expired()));
+        }
+        let Some(cutoff) = relay.or_else(|| grant.transport_deadline()) else {
+            grant.observe_answer();
+            return Ok(());
+        };
+        let mut state = self.state.lock().expect("Flight egress state");
+        state.restrict(cutoff).map_err(network)?;
+        grant.check()?;
+        grant.observe_answer();
+        state.grants.push(grant);
+        drop(state);
+        self.socket.wake();
+        Ok(())
+    }
+
+    /// Retains the issuer's exclusive cutoff for downstream socket writes.
+    pub fn restrict(&self, cutoff: DeliveryDeadline) -> io::Result<()> {
+        self.state.lock().expect("Flight egress state").restrict(cutoff)?;
+        self.socket.wake();
+        Ok(())
+    }
+
+    fn cutoff(&self, cx: &mut Context<'_>) -> io::Result<Option<DeliveryDeadline>> {
+        self.socket.register(cx.waker());
+        let state = self.state.lock().expect("Flight egress state");
+        if state.closed || state.cutoff.is_some_and(|cutoff| !cutoff.is_live())
+            || state.grants.iter().any(|grant| grant.check().is_err()) { return Err(expired()); }
+        Ok(state.cutoff)
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("Flight egress state");
+        state.closed = true;
+        let grants = std::mem::take(&mut state.grants);
+        drop(state);
+        drop(grants);
+    }
+}
+
+impl EgressState {
+    fn restrict(&mut self, cutoff: DeliveryDeadline) -> io::Result<()> {
+        if self.closed || !cutoff.is_live() || self.cutoff.is_some_and(|prior| !prior.is_live()) {
+            return Err(expired());
+        }
+        self.cutoff = Some(self.cutoff.map_or(cutoff, |prior| prior.earlier(cutoff)));
+        Ok(())
+    }
+}
+
+fn expired() -> io::Error { io::Error::new(io::ErrorKind::TimedOut, "The Flight answer delivery deadline expired") }
+
+/// Guards the connection after HTTP/2 accepts a protected reply into its own queues.
+/// A multiplexed connection carries its earliest cutoff until it closes.
+pub struct FlightEgressIo<W> {
+    stream: W,
+    egress: Arc<FlightEgress>,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<W> FlightEgressIo<W> {
+    pub fn new(stream: W, egress: Arc<FlightEgress>) -> Self { Self { stream, egress, timer: None } }
+
+    fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if let Some(cutoff) = self.egress.cutoff(cx)? {
+            let cutoff = cutoff.instant().into();
+            let timer = self.timer.get_or_insert_with(|| Box::pin(tokio::time::sleep_until(cutoff)));
+            if timer.deadline() != cutoff { timer.as_mut().reset(cutoff); }
+            if timer.as_mut().poll(cx).is_ready() { return Err(expired()); }
+        }
+        Ok(())
+    }
+}
+
+impl<W> Drop for FlightEgressIo<W> { fn drop(&mut self) { self.egress.close(); } }
+
+impl<W: AsyncRead + Unpin> AsyncRead for FlightEgressIo<W> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for FlightEgressIo<W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+    fn is_write_vectored(&self) -> bool { self.stream.is_write_vectored() }
+    fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bytes)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.check(cx)?;
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+struct ConnectionIo {
+    stream: FlightEgressIo<TcpStream>,
+    peer: TcpConnectInfo,
+    _admission: Option<OwnedSemaphorePermit>,
+    _transport: Option<Arc<MemoryReservation>>,
+    cancellation: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Connected for ConnectionIo {
+    type ConnectInfo = FlightConnectInfo;
+    fn connect_info(&self) -> Self::ConnectInfo {
+        FlightConnectInfo { peer: self.peer.clone(), egress: self.stream.egress.clone() }
+    }
+}
+
+impl ConnectionIo {
+    fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.cancellation.as_mut().poll(cx).is_ready() {
+            return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "Flight server stopped"));
+        }
+        Ok(())
+    }
+}
 impl AsyncRead for ConnectionIo {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> { if let Err(error) = self.check(cx) { return Poll::Ready(Err(error)); } Pin::new(&mut self.stream).poll_read(cx, buffer) }
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> { self.check(cx)?; Pin::new(&mut self.stream).poll_read(cx, buffer) }
 }
 impl AsyncWrite for ConnectionIo {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> { if let Err(error) = self.check(cx) { return Poll::Ready(Err(error)); } Pin::new(&mut self.stream).poll_write(cx, bytes) }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> { if let Err(error) = self.check(cx) { return Poll::Ready(Err(error)); } Pin::new(&mut self.stream).poll_flush(cx) }
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> { self.check(cx)?; Pin::new(&mut self.stream).poll_write(cx, bytes) }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> { self.check(cx)?; Pin::new(&mut self.stream).poll_flush(cx) }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> { Pin::new(&mut self.stream).poll_shutdown(cx) }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use rtdb_storage::{HeldView, ReadLease, sealing::PlaintextView};
+    use rtdb_types::MemoryBudget;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn queued_flight_bytes_require_the_original_grant_at_the_socket() {
+        let time = Arc::new(AtomicI64::new(0));
+        let clock = {
+            let time = time.clone();
+            Arc::new(move || time.load(Ordering::Relaxed))
+        };
+        let view = PlaintextView::new(MemoryBudget::new(64 << 10));
+        let grant = view.grant().await.unwrap().holding(
+            HeldView::recovery(Arc::new(())), Some(Arc::new(ReadLease::new(Some(2_000_000), clock))),
+        );
+        let egress = Arc::new(FlightEgress::default());
+        egress.admit(grant, None).unwrap();
+        let mut output = Vec::new();
+
+        time.store(2_000_000, Ordering::Relaxed);
+        let error = FlightEgressIo::new(&mut output, egress).write_all(b"queued HTTP/2 body").await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(output.is_empty());
+    }
+}
+
 fn network(error: impl std::fmt::Display) -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.flight-sql/transport", error.to_string()) }

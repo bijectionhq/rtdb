@@ -50,17 +50,58 @@ pub fn enabled() -> bool { sink().is_some() }
 
 pub fn logkeeper_publication(
     stream: &str, epoch: u64, ensemble: &[u8], through: i64, quorum: usize,
-    installed: impl FnOnce() -> Vec<usize>,
+    installed: impl FnOnce() -> Vec<usize>, decision: Option<[u8; 32]>,
 ) {
     record("quorum-publication", || serde_json::json!({
         "stream": stream, "epoch": epoch, "ensemble": ensemble, "through": through,
-        "quorum": quorum, "installed": installed(),
+        "quorum": quorum, "installed": installed(), "decision": decision,
     }));
 }
 
-pub fn logkeeper_receipt(stream: &str, epoch: u64, ensemble: &[u8], through: i64, decision_through: i64) {
+pub fn logkeeper_receipt(
+    stream: &str, epoch: u64, ensemble: &[u8], through: i64, decision_through: i64, decision: Option<[u8; 32]>,
+) {
     record("quorum-receipt", || serde_json::json!({
         "stream": stream, "epoch": epoch, "ensemble": ensemble, "through": through,
-        "decision_through": decision_through,
+        "decision_through": decision_through, "decision": decision,
     }));
+}
+
+
+/// Correlates one authenticated loglet decision with the catalog selected for its read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CertifiedRead {
+    pub invocation: [u8; 16],
+    pub stream: String,
+    pub epoch: u64,
+    pub ensemble: [u8; 32],
+    pub through: i64,
+    pub decision: [u8; 32],
+}
+
+impl CertifiedRead {
+    pub fn observe(&self, event: &'static str) {
+        record(event, || serde_json::to_value(self).expect("read identity encodes"));
+    }
+}
+
+#[derive(Serialize)]
+pub struct CertifiedDecision<'a> {
+    pub stream: &'a str,
+    pub epoch: u64,
+    pub ensemble: &'a [u8],
+    pub through: i64,
+    pub predecessor: i64,
+    pub decision: [u8; 32],
+    pub statement: Vec<u8>,
+    pub prefix_digest: &'a [u8],
+    pub predecessor_digest: &'a [u8],
+    pub roster: &'a [String],
+    pub quorum: u32,
+    pub voters: Vec<String>,
+    pub installers: Vec<String>,
+}
+
+pub fn logkeeper_decision<'a>(decision: impl FnOnce() -> CertifiedDecision<'a>) {
+    record("certified-decision", || serde_json::to_value(decision()).expect("decision identity encodes"));
 }

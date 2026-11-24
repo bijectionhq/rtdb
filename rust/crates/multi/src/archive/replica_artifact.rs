@@ -25,6 +25,11 @@ pub(super) struct PayloadBytes {
 }
 
 impl PayloadBytes {
+    pub(super) async fn retaining<F: std::future::Future>(&self, work: F) -> F::Output {
+        let reservation = Arc::clone(&self._reservation);
+        IoRegion::retaining(reservation, work).await
+    }
+
     pub(super) async fn read(
         store: &dyn ObjectStore,
         key: &ObjectKey,
@@ -155,10 +160,13 @@ impl<'a> ReplicaArtifact<'a> {
         body: &[u8],
         chain: &mut Context,
     ) -> Result<()> {
-        let object = self.payload(offset)?;
-        let digest = self.put(&object, body).await?;
+        let digest = self.write_payload(offset, body).await?;
         extend_payload(chain, offset, &digest);
         Ok(())
+    }
+
+    pub(super) async fn write_payload(&self, offset: i64, body: &[u8]) -> Result<[u8; 32]> {
+        self.put(&self.payload(offset)?, body).await
     }
 
     pub(super) async fn read_payload(
@@ -331,7 +339,7 @@ fn extend_chain(chain: &mut Context, first: i64, through: i64, digest: &[u8; 32]
     chain.update(digest);
 }
 
-fn extend_payload(chain: &mut Context, offset: i64, digest: &[u8; 32]) {
+pub(super) fn extend_payload(chain: &mut Context, offset: i64, digest: &[u8; 32]) {
     chain.update(b"payload\0");
     chain.update(&offset.to_be_bytes());
     chain.update(digest);
@@ -393,6 +401,7 @@ mod tests {
                 system_time: Timestamp(11),
             },
             replica_sha256: Some([2; 32]),
+            placed_debt: None,
             lifetime_floors_sha256: [3; 32],
         };
         let vault = tempfile::tempdir().unwrap();

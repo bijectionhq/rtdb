@@ -6,7 +6,6 @@ use crate::protocol::{Identify, Request, RequestBody, Response, ResponseBody, en
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use rtdb_storage::{Error, Result};
-use rtdb_types::valid_journal_identity;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
@@ -179,15 +178,16 @@ async fn run_session(
     mut requests: mpsc::UnboundedReceiver<QueuedRequest>,
     waiters: Arc<Waiters>,
 ) {
+    let nonce = *uuid::Uuid::new_v4().as_bytes();
     let identified = tokio::time::timeout(CONNECT_TIMEOUT, async {
         let mut frame = BytesMut::new();
-        encode_frame(&Request { id: 0, body: Some(RequestBody::Identify(Identify {})), target_journal: String::new() }, &mut frame);
+        encode_frame(&Request { id: 0, body: Some(RequestBody::Identify(Identify { nonce: bytes::Bytes::copy_from_slice(&nonce) })), target_journal: String::new() }, &mut frame);
         writer.write_all(&frame).await?;
         read_frame::<Response>(&mut reader).await
     }).await;
     let identity: Arc<str> = match identified {
         Ok(Ok(Some(Response { id: 0, body: Some(ResponseBody::JournalIdentity(identity)) })))
-            if valid_journal_identity(&identity.journal) => identity.journal.into(),
+            if crate::attestation::proves_identity(&identity.journal, &identity.public_key, &identity.signature, &nonce) => identity.journal.into(),
         Ok(Err(error)) => return waiters.fail(format!("could not identify the journal: {error}")),
         Err(_) => return waiters.fail("timed out identifying the journal".to_owned()),
         _ => return waiters.fail("the server did not advertise a journal identity".to_owned()),

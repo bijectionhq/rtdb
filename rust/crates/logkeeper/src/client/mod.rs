@@ -3,12 +3,14 @@
 mod audit;
 mod connection;
 mod ensemble;
+mod read_index_evidence;
 mod guarded_recovery;
 pub(crate) mod recovery;
 mod writer;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use crate::decision::{DecisionCertificate, HandoffCertificate, StableDecision};
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message;
@@ -28,7 +30,6 @@ pub use audit::{CertifiedRangeReader, JournalSyncObservation, RetainedAudit, aud
 
 /// Matches the read-side charge `LogRecord::retain` requires beyond the payload.
 const RECORD_OVERHEAD_BYTES: usize = 256;
-const READ_INDEX_GRACE: Duration = Duration::from_millis(15);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
@@ -74,6 +75,9 @@ pub struct ActiveLogletReadIndex {
     epoch: u64,
     ensemble: Bytes,
     through: LogOffset,
+    decision: Option<StableDecision>,
+    handoff: Option<HandoffCertificate>,
+    invocation: [u8; 16],
 }
 
 impl ActiveLogletReadIndex {
@@ -81,6 +85,9 @@ impl ActiveLogletReadIndex {
     pub fn epoch(&self) -> u64 { self.epoch }
     pub fn ensemble(&self) -> &[u8] { &self.ensemble }
     pub fn through(&self) -> LogOffset { self.through }
+    pub fn decision(&self) -> Option<&StableDecision> { self.decision.as_ref() }
+    pub fn handoff(&self) -> Option<&HandoffCertificate> { self.handoff.as_ref() }
+    pub fn invocation(&self) -> [u8; 16] { self.invocation }
 }
 
 struct Shared {
@@ -127,6 +134,9 @@ fn validate(config: &StreamConfig) -> rtdb_types::Result<()> {
     if !journals.is_empty() && journals.len() != config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble needs an identity for every slot"));
     }
+    if !journals.is_empty() && (config.write_quorum <= journals.len() / 2 || journals.len() > crate::decision::MAX_JOURNALS) {
+        return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble requires a bounded intersecting quorum"));
+    }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));
     }
@@ -172,13 +182,18 @@ fn earlier(chain: &[Loglet], start: i64, like: &StreamConfig) -> rtdb_types::Res
 /// Lsns stay dense across the move, and [`QuorumLog::loglets`] gives the chain to record and hand to readers.
 /// An `open_writer` or `seal` of the old ensemble at `epoch` or below is refused afterwards.
 pub async fn open_writer_on(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, from: CopyFrom, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
+    open_writer_on_checkpoint(chain, new, epoch, from, None, cancellation).await
+}
+
+/// Opens a moved writer bound to the published checkpoint covering any discarded prefix.
+pub async fn open_writer_on_checkpoint(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, from: CopyFrom, checkpoint: Option<crate::HandoffCheckpoint>, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&new)?;
     validate_chain(&chain)?;
     if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "writer epochs start at 1")); }
     let previous_loglet = chain.last().expect("validated non-empty");
     let previous = Ensemble::new(loglet_config(previous_loglet, &new)?);
     let ensemble = Arc::new(Ensemble::new(new.clone()));
-    let (writer, start) = Writer::open_moved(&previous, previous_loglet.start_lsn, Arc::clone(&ensemble), epoch, from).await?;
+    let (writer, start) = Writer::open_moved(&previous, previous_loglet.start_lsn, Arc::clone(&ensemble), epoch, from, checkpoint).await?;
     let earlier = earlier(&chain, start, &new)?;
     Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, start, earlier, role: Role::Writer(writer), cancellation }) }))
 }
@@ -265,10 +280,17 @@ pub async fn seal(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<LogOf
 /// Fences the original stream and settles exactly the history its normal
 /// recovery would select. The settled epoch has no activated append writer.
 pub async fn seal_recover_committed(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<LogOffset> {
+    let (_, through) = seal_recover_bounds(config, epoch).await?;
+    Ok(through)
+}
+
+/// Returns the settled trim floor and committed end of one recovered history.
+pub async fn seal_recover_bounds(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<(LogOffset, LogOffset)> {
     validate(config)?;
     if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "epochs start at 1")); }
     let ensemble = Ensemble::new(config.clone());
-    Ok(LogOffset(Writer::seal_recover_committed(&ensemble, epoch).await?))
+    let (trim, through) = Writer::seal_recover_committed(&ensemble, epoch).await?;
+    Ok((LogOffset(trim), LogOffset(through)))
 }
 
 /// Lets every server drop entries at or below `through`, which must be committed.
@@ -346,15 +368,6 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> rtdb_types::Result<()>
     Ok(())
 }
 
-fn read_index_frontiers(held: &mut [i64], published: i64, journals: usize, quorum: usize) -> (i64, i64) {
-    held.sort_unstable_by(|left, right| right.cmp(left));
-    // Unobserved slots could all hold a completed write, including slots that refused the active-epoch check.
-    let unknown = journals - held.len();
-    let known_committed = published.max(held[quorum - 1]);
-    let maybe_committed = known_committed.max(held[quorum - unknown - 1]);
-    (maybe_committed, known_committed)
-}
-
 impl QuorumLog {
     fn enqueue_at(&self, payload: Bytes, time: AppendTime<'_>) -> Result<AppendReceipt> {
         let maximum = self.shared.ensemble.config.maximum_message_bytes;
@@ -365,53 +378,144 @@ impl QuorumLog {
             Role::Reader(_) => Err(Error::ReadOnlyLog(PathBuf::from(&self.shared.ensemble.config.stream))),
         }
     }
-    /// Bounds writes completed before this call on the exact active ensemble.
-    /// The caller must wait for committed application through the returned position.
+    /// Finds a quorum-installed decision in the active loglet.
+    /// A local decision recovered by the probe must be installed on a quorum before exposure.
     pub async fn read_index(&self, epoch: u64) -> Result<ActiveLogletReadIndex> {
         let ensemble = &self.shared.ensemble;
-        let confirmed = |through| ActiveLogletReadIndex {
-            stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(), through: LogOffset(through),
-        };
         let quorum = ensemble.config.write_quorum;
         let unavailable = |message: &str| Error::Remote { key: ensemble.config.stream.clone(), message: message.into() };
-        if quorum <= ensemble.len() / 2 { return Err(unavailable("read indexes require intersecting write quorums")); }
-        let mut replies: FuturesUnordered<_> = (0..ensemble.len()).map(|server| ensemble.read_index(server, epoch)).collect();
-        let mut held = Vec::with_capacity(ensemble.len());
-        let mut published = -1;
-        let mut grace = None;
-        let mut bound = None;
-        while !replies.is_empty() {
-            let reply = tokio::select! {
-                biased;
-                _ = self.shared.cancellation.cancelled() => return Err(Error::Closed("quorum log closed".into())),
-                reply = replies.next() => reply.expect("pending read-index replies"),
-                _ = async {
-                    match grace {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                } => break,
-            };
-            match reply {
-                Ok(Ack::Accepted(position)) => {
-                    held.push(position.last_lsn);
-                    published = published.max(position.commit_lsn);
-                }
-                Ok(Ack::Refused(refused)) if refused.promised > epoch => return Err(Error::Deposed { epoch, promised: refused.promised }),
-                _ if held.len() + replies.len() < quorum => break,
-                _ => continue,
-            }
-            if held.len() >= quorum {
-                let (maybe_committed, known_committed) = read_index_frontiers(&mut held, published, ensemble.len(), quorum);
-                if maybe_committed == known_committed { return Ok(confirmed(maybe_committed)); }
-                bound = Some(maybe_committed);
-                grace.get_or_insert_with(|| tokio::time::Instant::now() + READ_INDEX_GRACE);
-            }
+        if quorum <= ensemble.len() / 2 {
+            return Err(unavailable("read indexes require intersecting write quorums"));
         }
-        bound.map(confirmed).ok_or_else(|| unavailable("a write quorum did not confirm the active loglet"))
+        let nonce = *uuid::Uuid::new_v4().as_bytes();
+        let round = async {
+            let mut probes: FuturesUnordered<_> = (0..ensemble.len())
+                .map(|server| async move { (server, ensemble.read_index(server, epoch, nonce).await) })
+                .collect();
+            let mut observed = Vec::with_capacity(quorum);
+            while observed.len() < quorum {
+                if observed.len() + probes.len() < quorum {
+                    return Err(unavailable("a quorum did not confirm the active loglet"));
+                }
+                match probes.next().await.expect("need more probe replies") {
+                    (server, Ok(decided)) => observed.push((server, decided)),
+                    (_, Err(error @ Error::Deposed { .. })) => return Err(error),
+                    _ => (),
+                }
+            }
+
+            let confirmed = |through, decision, handoff| ActiveLogletReadIndex {
+                stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(),
+                through: LogOffset(through), decision, handoff, invocation: nonce,
+            };
+            if let Some(scope) = ensemble.decision_scope(epoch) {
+                let mut handoff: Option<HandoffCertificate> = None;
+                let mut selected: Option<&DecisionCertificate> = None;
+                for (_, reply) in &observed {
+                    if let Some(proof) = &reply.handoff {
+                        if !proof.authentic() || proof.handoff.destination != scope
+                            || handoff.as_ref().is_some_and(|prior| prior.handoff != proof.handoff)
+                        {
+                            return Err(unavailable("the read quorum returned incompatible activation evidence"));
+                        }
+                        handoff = Some(proof.clone());
+                    }
+                    let Some(candidate) = &reply.certificate else { continue; };
+                    if candidate.statement.scope != scope || !candidate.authentic() {
+                        return Err(unavailable("the read quorum returned an invalid decision certificate"));
+                    }
+                    if let Some(current) = selected {
+                        let old = current.statement.prefix.through;
+                        let new = candidate.statement.prefix.through;
+                        if old == new && current.statement != candidate.statement {
+                            return Err(unavailable("the read quorum returned conflicting decisions"));
+                        }
+                        if old >= new { continue; }
+                    }
+                    selected = Some(candidate);
+                }
+                let Some(certificate) = selected else {
+                    let inherited = observed.iter().map(|(_, reply)| reply.visible).max().expect("nonempty quorum");
+                    if handoff.as_ref().is_some_and(|proof| proof.handoff.through != inherited) {
+                        return Err(unavailable("the inherited cut differs from the attested activation"));
+                    }
+                    return Ok(confirmed(inherited, None, handoff));
+                };
+                let through = certificate.statement.prefix.through;
+                let proof = observed.iter().filter_map(|(_, reply)| reply.stability.as_ref())
+                    .find(|proof| proof.certificate.statement == certificate.statement && proof.authentic());
+                let proof = match proof {
+                    Some(proof) => proof.clone(),
+                    None => ensemble.stabilize(certificate.clone()).await?.0,
+                };
+                if !observed.iter().any(|(_, reply)| reply.visible >= through) {
+                    ensemble.ensure_replay(proof.clone()).await?;
+                }
+                proof.observe(ensemble.identity());
+                return Ok(confirmed(through, Some(proof), handoff));
+            }
+
+            let selected = observed.iter().map(|(_, reply)| reply.decided).max().expect("nonempty quorum");
+            let confirmed = || confirmed(selected, None, None);
+            if observed.iter().any(|(_, reply)| reply.visible >= selected) {
+                return Ok(confirmed());
+            }
+
+            let mut installed = Vec::with_capacity(quorum);
+            let mut repair = FuturesUnordered::new();
+            let install = |server| async move { (server, ensemble.commit(server, epoch, selected).await) };
+            for (server, reply) in observed {
+                if reply.decided >= selected { installed.push(server); }
+                else { repair.push(install(server)); }
+            }
+            while installed.len() < quorum {
+                if installed.len() + probes.len() + repair.len() < quorum {
+                    return Err(unavailable("a quorum did not install the selected decision"));
+                }
+                tokio::select! {
+                    Some((server, reply)) = probes.next(), if !probes.is_empty() => match reply {
+                        Ok(reply) if reply.visible >= selected => return Ok(confirmed()),
+                        Ok(reply) if reply.decided >= selected => installed.push(server),
+                        Ok(_) => repair.push(install(server)),
+                        Err(error @ Error::Deposed { .. }) => return Err(error),
+                        Err(_) => (),
+                    },
+                    Some((server, reply)) = repair.next(), if !repair.is_empty() => match reply {
+                        Ok(Ack::Accepted(ack)) if ack.commit_lsn >= selected => installed.push(server),
+                        Ok(Ack::Refused(refusal)) if refusal.promised > epoch =>
+                            return Err(Error::Deposed { epoch, promised: refusal.promised }),
+                        _ => (),
+                    },
+                }
+            }
+
+            let mut exposure: FuturesUnordered<_> = installed.into_iter()
+                .map(|server| ensemble.publish(server, epoch, selected)).collect();
+            while let Some(reply) = exposure.next().await {
+                match reply {
+                    Ok(Ack::Accepted(ack)) if ack.commit_lsn >= selected => return Ok(confirmed()),
+                    Ok(Ack::Refused(refusal)) if refusal.promised > epoch =>
+                        return Err(Error::Deposed { epoch, promised: refusal.promised }),
+                    _ => (),
+                }
+            }
+            Err(unavailable("the selected decision could not be made visible for replay"))
+        };
+        tokio::select! {
+            biased;
+            _ = self.shared.cancellation.cancelled() => Err(Error::Closed("quorum log closed".into())),
+            index = round => index,
+        }
     }
 
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
+    pub fn activation_handoff(&self) -> Option<&HandoffCertificate> {
+        match &self.shared.role {
+            Role::Writer(writer) => writer.handoff(),
+            Role::Reader(_) => None,
+        }
+    }
+
     pub fn loglets(&self) -> Vec<Loglet> {
         let shared = &self.shared;
         shared.earlier.iter().map(|loglet| Loglet { servers: loglet.ensemble.config.servers.clone(), start_lsn: loglet.start, write_quorum: loglet.ensemble.config.write_quorum })

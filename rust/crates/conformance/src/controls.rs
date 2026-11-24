@@ -91,7 +91,7 @@ pub async fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
             let mut polygons = Vec::with_capacity(events.len());
             for event in events {
                 let iid: [u8; 16] = hex_bytes(&event.iid)?.try_into().map_err(|_| "IID fixture must have 16 bytes")?;
-                let event = EventHeader {
+                let event = EventHeader { position: None,
                     commit_position: 0,
                     iid: Iid(iid), system_from: Timestamp(event.system_from),
                     valid_time: Interval::from_micros(event.valid_from, event.valid_to)?,

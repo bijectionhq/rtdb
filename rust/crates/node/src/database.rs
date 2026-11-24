@@ -91,6 +91,10 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
+    pub(crate) fn replica_read_deployment(&self) -> Option<uuid::Uuid> {
+        self.replica_read_index.as_ref()?.deployment()
+    }
+
     pub(crate) fn has_replica_read_index(&self) -> bool {
         self.replica_read_index.is_some()
     }
@@ -125,8 +129,16 @@ impl Database {
                     _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
                     _ = self.cancellation.cancelled() => Err(self.replica_behind()),
                     retained = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage) => {
-                        drop(barrier);
-                        retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))
+                        let retained = retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+                        if let Some(read) = &barrier.certified_read {
+                            if retained.catalog_cut().is_none_or(|cut| cut.through.after_offset(cut.replica_epoch) != read.through) {
+                                return Err(self.replica_behind());
+                            }
+                            read.observe("certified-catalog-capture");
+                            Ok(retained.with_certified_read(read.clone()))
+                        } else {
+                            Ok(retained)
+                        }
                     }
                 };
             }
@@ -292,6 +304,7 @@ pub(crate) struct DatabaseFactory {
     pub memory: Arc<MemoryBudget>,
     pub cache: Arc<CacheBudget>,
     pub clock: Arc<dyn Clock>,
+    pub decision_clock: Option<Arc<dyn rtdb_tx::DecisionClock>>,
     pub authorization: Arc<dyn TransactionAuthorization>,
     pub observer: Arc<dyn CollectionObserver>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
@@ -352,16 +365,18 @@ impl DatabaseFactory {
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
             if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
                 && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
-                    || resources.blocks != rtdb_replication::BlockDiscovery::AtPublished(rtdb_replication::PublishedCheckpoint {
-                        block: *block, boundary: *through, root_sha256: Some(*root),
-                    })
+                    || !matches!(resources.blocks,
+                        rtdb_replication::BlockDiscovery::AtPublished(checkpoint)
+                        | rtdb_replication::BlockDiscovery::AtErasure(checkpoint)
+                        if checkpoint.block == *block && checkpoint.boundary == *through && checkpoint.root_sha256 == Some(*root))
                     || !recovered.block.as_ref().is_some_and(|loaded| loaded.block_index() == *block
                         && loaded.boundary_replica_position() == Some(*through) && loaded.publication_sha256() == Some(*root)))
             {
                 return Err(Anomaly::fault("rtdb.node/checkpoint-await-cut", "The opened checkpoint does not establish its await-token cut"));
             }
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
-                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
+                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?
+                .with_placed_transfer(opened_logs.placed_transfer)?;
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
             } else {
@@ -378,12 +393,14 @@ impl DatabaseFactory {
                 }
                 recovered.with_source_floor(logs.source_floor()?)
             };
+            logs.install_replica_reference_source(recovered.block.clone(), self.options.file_size_target)?;
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let event_history = !read_only && self.options.artefact_threads != 0
                 && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
+                decision_clock: self.decision_clock.clone(),
                 write_event_origins: event_history,
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {
@@ -479,7 +496,7 @@ impl DatabaseFactory {
                 (None, None) => None,
             };
             match hold {
-                Some(hold) => IoRegion::retaining(hold, assembly).await,
+                Some(hold) => IoRegion::reading(rtdb_storage::HeldView::recovery(hold), assembly).await,
                 None => assembly.await,
             }
         }.await;

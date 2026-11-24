@@ -1,12 +1,13 @@
 use std::{sync::{Arc, Mutex, Weak}, time::Duration};
 
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use arrow_array::TimestampMicrosecondArray;
+use rtdb_columnar::{MemoryBudget, MemoryReservation, selected_cell};
 use rtdb_storage::cache::{BufferPool, HeldCatalogRead};
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, TimeUnit, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EntityId, Interval, LogicalType, OwnedRelation, PlacedAttemptScope, Result, ScalarType, Timestamp, TransactionKey, Value};
 
 use crate::Database;
-use super::{AppliedCatalogAdmission, CatalogReadCut, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, prepare_query, read_value};
+use super::{AppliedCatalogAdmission, CatalogReadCut, NativeSession, OwnedRangeWitness, OwnedReadSession, QueryBasis, TimeBasis, covers_transaction, hosted_source_unavailable, prepare_query};
 use rtdb_query::QueryContext;
 
 /// One storage registration for a lower bound on the physical catalogs read by a prepared session.
@@ -106,6 +107,7 @@ impl AppliedReadFloor {
     }
 
     pub fn history(&self) -> uuid::Uuid { self.history }
+    pub(super) fn minimum(&self) -> TransactionKey { self.minimum }
 
     pub(super) fn cut<'a>(
         &self, original: Option<TransactionKey>, memory: &'a Arc<MemoryBudget>,
@@ -138,8 +140,10 @@ impl AppliedReadFloor {
                 let batch = batch.batch();
                 if batch.num_rows() == 0 { continue; }
                 if seen || batch.num_rows() != 1 { return Err(unavailable()); }
-                let value = read_value(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?;
-                if !matches!(value, Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } if value == expected.system_time.0) {
+                let time = selected_cell(batch.schema_ref().field(0), batch.column(0).as_ref(), 0)?
+                    .and_then(|(_, column, row)| column.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                        .map(|column| column.value(row)));
+                if time != Some(expected.system_time.0) {
                     return Err(unavailable());
                 }
                 seen = true;
@@ -148,6 +152,60 @@ impl AppliedReadFloor {
         }
         Ok(())
     }
+}
+
+impl NativeSession {
+    pub async fn confirm_hosted_source_prefix(
+        &self,
+        history: uuid::Uuid,
+        floor: Option<&AppliedReadFloor>,
+    ) -> Result<Option<TransactionKey>> {
+        if history.is_nil() || floor.is_some_and(|floor| floor.history() != history)
+            || self.service.audience_storage.is_some() || self.placed_history()?.is_none()
+        {
+            return Err(hosted_source_unavailable());
+        }
+        let database = self.state.database();
+        let cancellation = self.state.cancellation();
+        let receipt = self.service.await_durable_source(database, true, cancellation).await?
+            .ok_or_else(hosted_source_unavailable)?;
+        if uuid::Uuid::parse_str(&receipt.history).ok() != Some(history) {
+            return Err(hosted_source_unavailable());
+        }
+        let Some(sampled) = receipt.applied else {
+            return if floor.is_none() { Ok(None) } else { Err(hosted_source_unavailable()) };
+        };
+        if floor.is_some_and(|floor| !covers_transaction(sampled, floor.minimum())) {
+            return Err(hosted_source_unavailable());
+        }
+        let basis = QueryBasis {
+            snapshot: TimeBasis::default(),
+            replica_capture: None,
+            resume_token: None,
+            has_await_floor: false,
+            snapshot_time: Some(sampled.system_time),
+            current_time: sampled.system_time.into(),
+            timezone: self.state.session_timezone().to_owned(),
+        };
+        let context = self.service.query_context(database, &basis, cancellation).await?;
+        let captured = context.catalog.database(database)?;
+        let [partition] = captured.partitions.as_slice() else {
+            return Err(hosted_source_unavailable());
+        };
+        let head = partition.tx_basis().filter(|head| covers_transaction(*head, sampled))
+            .ok_or_else(hosted_source_unavailable)?;
+        let sampled_floor = AppliedReadFloor::new(history, vec![sampled])?;
+        floor.unwrap_or(&sampled_floor).require_transactions(&context, head, Some(sampled)).await?;
+        context.check_cancelled()?;
+        self.service.database()?;
+        Ok(Some(sampled))
+    }
+}
+
+/// The held read's covered position and its own receiver observation.
+pub struct AppliedReadConfirmation {
+    pub covered: TransactionKey,
+    pub observed_at: Timestamp,
 }
 
 fn unavailable() -> Anomaly {
@@ -247,6 +305,8 @@ impl OwnedReadSession {
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
             replica_capture: None,
+            resume_token: None,
+            has_await_floor: false,
             snapshot_time: None,
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),
@@ -301,7 +361,7 @@ impl OwnedReadSession {
         until: Timestamp,
         controls: &[HostedControlWrite],
         point: Option<&AppliedOwnedPoint>,
-    ) -> Result<Option<TransactionKey>> {
+    ) -> Result<Option<AppliedReadConfirmation>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.applied_scope != Some(scope)
@@ -340,6 +400,8 @@ impl OwnedReadSession {
         let basis = QueryBasis {
             snapshot: TimeBasis::default(),
             replica_capture: None,
+            resume_token: None,
+            has_await_floor: false,
             snapshot_time: None,
             current_time: self.node.query_instant(),
             timezone: self.context.timezone.clone(),
@@ -355,8 +417,7 @@ impl OwnedReadSession {
         let [captured] = database.partitions.as_slice() else {
             return Err(unavailable());
         };
-        let head = captured.tx_basis().filter(|head| head.system_time < until)
-            .ok_or_else(unavailable)?;
+        let head = captured.tx_basis().ok_or_else(unavailable)?;
         floor.require_transactions(&current, head, Some(self.present)).await?;
         let mut matches = compare_controls(&self.context, &current, controls).await?;
         if let Some(point) = point {
@@ -379,10 +440,11 @@ impl OwnedReadSession {
         }
         self.check()?;
         current.check_cancelled()?;
-        if self.node.now() >= until {
+        let observed_at = self.node.receiver_time().await?;
+        if observed_at >= until {
             return Err(unavailable());
         }
-        Ok(matches.then_some(head))
+        Ok(matches.then_some(AppliedReadConfirmation { covered: head, observed_at }))
     }
 }
 
@@ -422,7 +484,9 @@ mod tests {
         assert_eq!(confirmation_floor(original, original).unwrap(), original);
         assert_eq!(confirmation_floor(original, later).unwrap(), later);
         assert_eq!(confirmation_floor(later, original).unwrap(), later);
-        for divergent in [cut(3, 8), cut(4, 5), cut(4, 2)] {
+        let tied = cut(4, 5);
+        assert_eq!(confirmation_floor(original, tied).unwrap(), tied);
+        for divergent in [cut(3, 8), cut(4, 2)] {
             assert!(confirmation_floor(original, divergent).is_err());
         }
     }

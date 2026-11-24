@@ -17,6 +17,8 @@ pub type TransactionClock = dyn Fn() -> Result<Timestamp> + Send + Sync;
 
 #[async_trait]
 pub trait ReplicaReadIndex: Send + Sync {
+    fn deployment(&self) -> Option<uuid::Uuid> { None }
+
     /// Bounds writes completed before the call on the replica log opened with this capability.
     async fn confirm(&self) -> Result<rtdb_storage::log::LogOffset>;
 
@@ -26,6 +28,7 @@ pub trait ReplicaReadIndex: Send + Sync {
             offset: self.confirm().await?,
             wait: std::time::Duration::from_millis(20),
             retention: None,
+            certified_read: None,
         })
     }
 }
@@ -34,6 +37,7 @@ pub struct ProtectedReadIndex {
     pub offset: rtdb_storage::log::LogOffset,
     pub wait: std::time::Duration,
     pub retention: Option<Arc<dyn Send + Sync>>,
+    pub certified_read: Option<Arc<rtdb_types::residence_trace::CertifiedRead>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +52,7 @@ pub struct OpenedLogs {
     pub replica: Arc<dyn Log>,
     pub source_epoch: StorageEpoch,
     pub replica_epoch: StorageEpoch,
+    pub placed_transfer: Option<rtdb_types::PlacedTransfer>,
     pub replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     pub await_authority: crate::AwaitAuthority,
     pub drivers: Vec<ResourceDriver>,
@@ -166,7 +171,7 @@ pub struct NativeResources {
     log_factories: BTreeMap<String, Arc<dyn LogFactory>>,
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
     disk_cache: Option<Arc<DiskCache>>,
-    classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
+    pub(crate) classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
@@ -388,14 +393,14 @@ impl ResourceFactory for NativeResources {
                 };
                 Ok(OpenedLogs { source: Arc::new(source), replica: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)),
                     source_epoch: StorageEpoch(epoch), replica_epoch: StorageEpoch(epoch), replica_read_index: None,
-                    await_authority: crate::AwaitAuthority::SourcePosition, drivers: Vec::new() })
+                    placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition, drivers: Vec::new() })
             }
             Some(database_config::Log::LocalLog(log)) => {
                 let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
                 let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io))?;
                 let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io))?;
                 let epoch = StorageEpoch(log.epoch.unwrap_or(0));
-                Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, await_authority: crate::AwaitAuthority::SourcePosition,
+                Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,
                     drivers: source_driver.into_iter().chain(replica_driver).collect() })
             }
             Some(database_config::Log::OtherLog(log)) => self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?.open(log, access, log_cancellation).await,

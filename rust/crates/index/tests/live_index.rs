@@ -28,7 +28,7 @@ fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_releas
     for precision in [i32::MIN, 0, 1, 256, i32::MAX] {
         let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap());
         let declared = StructFields::from([("v".into(), value.logical_type())]);
-        let events = [StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+        let events = [StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None }];
         if precision < 3 { assert!(IndexBatch::from_events(&events, &declared, &memory).is_err()); }
         let copied = IndexBatch::copy_events_with_put_schema(&events, &declared, &memory).unwrap();
@@ -93,7 +93,7 @@ fn events_appended_by_reference_and_by_value_stage_as_one_tables_rows() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
     let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
-    let event = |id| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
+    let event = |id| StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
     tx.append_to(&table(), event(1)).unwrap();
     tx.append(table(), event(2)).unwrap();
     tx.append_to(&table(), event(3)).unwrap();

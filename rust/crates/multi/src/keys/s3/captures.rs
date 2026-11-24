@@ -8,7 +8,7 @@ use super::{
     key_error, unit,
 };
 use crate::keys::archive::{
-    ArchiveKey, CaptureCryptography, matches_authority_key, with_archive_unit,
+    ArchiveKey, CaptureCryptography, matches_authority_key, tracked_archive_key, with_archive_unit,
 };
 
 pub(super) struct CaptureAuthority {
@@ -59,7 +59,7 @@ impl S3KeyService {
         } else {
             self.existing(id).await?;
         }
-        Ok(Arc::new(CaptureAuthority {
+        Ok(tracked_archive_key(CaptureAuthority {
             vault: self.clone(),
             id: id.to_owned(),
         }))

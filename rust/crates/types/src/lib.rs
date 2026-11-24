@@ -19,7 +19,7 @@ pub use journal::{JournalEndpoint, valid_journal_identity};
 mod journal_evidence;
 pub use journal_evidence::journal_frame_matches;
 mod placed_attempt;
-pub use placed_attempt::{PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed, PlacedDecision};
+pub use placed_attempt::{PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, PlacedAttemptScope, PlacedAttemptSeed, PlacedDecision, PlacedReservation, PlacedTerminal, PlacedTransfer, PlacedTransferDebt};
 mod pg;
 mod type_edn;
 mod time;
@@ -61,7 +61,7 @@ pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, 
 pub use type_edn::{TypeForm, function_type_mismatch};
 pub use position::*;
 pub use pg::{PgType, PgTypeDescriptor, pg_name_oid, pg_table_oid};
-pub use time::{EventHeader, EventOp, EventOrigin, Instant, Interval, RowVersion, TemporalBounds, TimedJournalCutoff};
+pub use time::{EventHeader, EventOp, EventOrigin, EventPosition, Instant, Interval, RowVersion, TemporalBounds, TimedJournalCutoff};
 pub use timestamp::Timestamp;
 pub use list_value::{ListBuilder, ListValue, ListView};
 pub use value::{DecimalValue, Value};

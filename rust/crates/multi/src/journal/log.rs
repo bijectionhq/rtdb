@@ -6,21 +6,24 @@ use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, Request, RequestId,
+    APPEND_RECORD_CHARGE_BYTES, AppendClass, Command, Cut, Grant, Hold, MAX_OBJECT_REFERENCES,
+    ObjectName, Request, RequestId,
     service::Route,
 };
 use rtdb_node::{ProtectedReadIndex, ReplicaReadIndex};
+use rtdb_format::{catalog::BlockCatalog, envelope::{ReplicaBody, ReplicaFrame}};
 use rtdb_storage::{
     Error, IoRegion, Result,
     log::{
         AppendCapacity, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRange,
         LogRecord, LogReplayTail, LogTail, ReplayHead, ReplicaObjectCustody, ReplicaObjectScope,
+        ReplicaPayloadReference, ReplicaReferenceSource,
     },
     object_store::ReadReservation,
 };
-use rtdb_types::{Anomaly, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, Timestamp};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicI64, Ordering},
 };
 use std::time::Duration;
@@ -38,16 +41,26 @@ const MAX_UNSETTLED_READS: usize = 8;
 pub(crate) struct JournalLog {
     reads: Arc<Reads>,
     maximum_data_message: usize,
-    writer: Mutex<Writer>,
+    writer: Option<Mutex<Writer>>,
     recovery: Mutex<Option<Arc<Held>>>,
+    reference_source: OnceLock<ReferenceSource>,
 }
 
 struct Writer {
     grant: Grant,
     head: Cut,
-    pending: Option<Request>,
-    /// Each read is a fresh admission; an uncertain one is released by its identity.
-    unsettled_reads: Vec<RequestId>,
+    pending: Option<PendingAppend>,
+    checkpoint: Option<BlockCatalog>,
+}
+
+struct PendingAppend {
+    request: Request,
+    checkpoint: Option<BlockCatalog>,
+}
+
+struct ReferenceSource {
+    source: ReplicaReferenceSource,
+    blocks: Arc<rtdb_replication::BlockStore>,
 }
 
 struct Reads {
@@ -57,6 +70,8 @@ struct Reads {
     tip: AtomicI64,
     tasks: TaskTracker,
     maximum: usize,
+    unsettled: Mutex<Vec<RequestId>>,
+    reader_epoch: Option<u64>,
 }
 
 pub(crate) struct Held {
@@ -154,19 +169,43 @@ impl JournalLog {
             tip: AtomicI64::new(latest(current.head).map_err(storage)?.0),
             tasks,
             maximum: maximum_message_bytes,
+            unsettled: Mutex::new(Vec::new()),
+            reader_epoch: None,
         });
         let writer = Mutex::new(Writer {
             grant: admission.grant,
             head: admission.recovery.through,
             pending: None,
-            unsettled_reads: Vec::new(),
+            checkpoint: None,
         });
         Ok(Arc::new(Self {
             reads,
             maximum_data_message,
-            writer,
+            writer: Some(writer),
             recovery: Mutex::new(Some(recovery)),
+            reference_source: OnceLock::new(),
         }))
+    }
+
+    pub(super) async fn open_reader(
+        journal: Arc<InstalledJournal>,
+        keys: Arc<dyn KeyService>,
+        epoch: u64,
+        recovery: Arc<Held>,
+        maximum: usize,
+        tasks: TaskTracker,
+    ) -> Result<Arc<Self>> {
+        let reads = Arc::new(Reads {
+            journal, keys, io: IoRegion::new(), maximum, tasks,
+            tip: AtomicI64::new(latest(recovery.scope().through).map_err(storage)?.0),
+            unsettled: Mutex::new(Vec::new()), reader_epoch: Some(epoch),
+        });
+        reads.route().await?;
+        Ok(Arc::new(Self { reads, maximum_data_message: 0, writer: None, recovery: Mutex::new(Some(recovery)), reference_source: OnceLock::new() }))
+    }
+
+    fn writer(&self) -> Result<&Mutex<Writer>> {
+        self.writer.as_ref().ok_or_else(|| Error::ReadOnlyLog(self.reads.journal.deployment().to_string().into()))
     }
 
     async fn enqueue_at(
@@ -175,6 +214,7 @@ impl JournalLog {
         payload: Bytes,
         sample: impl FnOnce() -> Result<Timestamp> + Send,
     ) -> Result<AppendReceipt> {
+        let writer = self.writer()?;
         let maximum = match class {
             AppendClass::Data => self.maximum_data_message,
             AppendClass::Maintenance => self.reads.maximum.saturating_sub(SEALED_OVERHEAD),
@@ -185,7 +225,7 @@ impl JournalLog {
                 maximum,
             });
         }
-        let mut writer = self.writer.lock().await;
+        let mut writer = writer.lock().await;
         if writer.pending.is_some() {
             self.finish_append(&mut writer).await?;
         }
@@ -194,6 +234,7 @@ impl JournalLog {
             return Err(deposed(writer.grant, &current));
         }
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
+        let (references, checkpoint) = self.references(&writer, &payload).await?;
         let key = JournalKey::new(current.placement, writer.grant.key_generation);
         let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
@@ -203,23 +244,21 @@ impl JournalLog {
             expected_next: writer.head.next_lsn,
             timestamp: timestamp.0,
             payload,
+            references,
         };
-        writer.pending = Some(
-            self.reads
-                .journal
-                .request(&current, command)
-                .map_err(storage)?,
-        );
+        let request = self.reads.journal.request(&current, command).map_err(storage)?;
+        writer.pending = Some(PendingAppend { request, checkpoint });
         let committed = self.finish_append(&mut writer).await?;
         if let Some(outcome) = outcome { outcome.observe(committed); }
         Ok(AppendReceipt::observed(async move { Ok(committed) }))
     }
 
     async fn finish_append(&self, writer: &mut Writer) -> Result<LogMetadata> {
-        let request = writer
+        let pending = writer
             .pending
             .as_ref()
             .ok_or_else(|| Error::Task("No pending ordered append".into()))?;
+        let request = &pending.request;
         let Command::Append {
             class,
             expected_next,
@@ -246,6 +285,12 @@ impl JournalLog {
                 writer.pending = None;
                 return Err(capacity.unwrap_or_else(|| storage(error)));
             }
+            Err(error) if matches!(error.code.as_str(),
+                "rtdb.multi/ordered-conflict" | "rtdb.multi/ordered-replay-unavailable")
+            => {
+                writer.pending = None;
+                return Err(storage(error));
+            }
             Err(error) => return Err(storage(error)),
         };
         if result.class != *class
@@ -261,11 +306,64 @@ impl JournalLog {
             timestamp: Timestamp(*timestamp),
         };
         writer.head = result.cut;
-        writer.pending = None;
+        if let Some(checkpoint) = writer.pending.take().and_then(|pending| pending.checkpoint) {
+            writer.checkpoint = Some(checkpoint);
+        }
         self.reads
             .tip
             .fetch_max(metadata.offset.0, Ordering::Release);
         Ok(metadata)
+    }
+
+    async fn references(
+        &self, writer: &Writer, payload: &[u8],
+    ) -> Result<(Option<Vec<ObjectName>>, Option<BlockCatalog>)> {
+        if let Some(names) = inline_references(payload)? {
+            return Ok((Some(names), None));
+        }
+        let Some(attached) = self.reference_source.get() else { return Ok((None, None)); };
+        let Some(mut envelope) = ReplicaFrame::decode(payload).map_err(storage)?.into_envelope() else {
+            return Ok((None, None));
+        };
+        let source = &attached.source;
+        let detached = ReplicaPayloadReference::from_frame(payload, source.version, source.epoch)?;
+        let detached_body;
+        if let Some(detached) = &detached {
+            detached_body = detached.read_at(source.store.as_ref(), &source.memory).await?;
+            envelope = envelope.unwrap_payload(detached_body.as_ref()).map_err(storage)?;
+        }
+        let base = writer.checkpoint.as_ref().or(source.checkpoint.as_ref());
+        let replay = rtdb_replication::ReplayBase {
+            storage_version: source.version, storage_epoch: source.epoch, checkpoint: base,
+        };
+        let mut dependencies = rtdb_replication::tail_dependencies(replay, [&envelope], attached.blocks.as_ref()).await.map_err(storage)?;
+        if let Some(detached) = detached {
+            dependencies.insert(detached.object().clone());
+        }
+        let checkpoint = match &envelope.message {
+            ReplicaBody::BlockUploaded(upload)
+                if upload.storage_version == Some(source.version.0)
+                    && upload.storage_epoch.unwrap_or_default() == source.epoch.0
+                    && upload.block_index.unwrap_or_default() > base.map_or(-1, |block| block.block_index().0) =>
+            {
+                let (checkpoint, _) = attached.blocks.load(BlockIndex(upload.block_index.unwrap_or_default())).await.map_err(storage)?;
+                Some(checkpoint)
+            }
+            _ => None,
+        };
+        let mut names = Vec::with_capacity(dependencies.len());
+        for object in dependencies {
+            let Some((namespace, key)) = source.store.replica_publication_address(&object).await? else {
+                return Ok((None, checkpoint));
+            };
+            names.push(crate::store::exact_retirement::installed_object_name(&namespace, &key).map_err(storage)?);
+        }
+        names.sort_unstable();
+        names.dedup();
+        if names.len() > MAX_OBJECT_REFERENCES {
+            return Err(Error::Task("The installed append exceeds the journal object reference bound".into()));
+        }
+        Ok((Some(names), checkpoint))
     }
 
     async fn capture(&self, from: LogOffset, to: LogOffset) -> Result<Cursor> {
@@ -283,16 +381,26 @@ impl JournalLog {
     /// Releases reads whose outcome was lost. A release settles a read once it is
     /// decided at or after the read's retry horizon, after which a delayed copy of
     /// that barrier can only expire. Failures keep the identity for a later attempt.
-    async fn settle_reads(&self, writer: &mut Writer) {
-        let mut unsettled = Vec::with_capacity(writer.unsettled_reads.len());
-        for read in writer.unsettled_reads.drain(..) {
+    async fn settle_reads(&self, reads: &mut Vec<RequestId>) {
+        let mut unsettled = Vec::with_capacity(reads.len());
+        for read in reads.drain(..) {
             match self.reads.journal.release_read(read).await {
                 Ok(position) if position >= read.expires_at => {}
                 Ok(_) | Err(_) => unsettled.push(read),
             }
         }
-        writer.unsettled_reads = unsettled;
+        *reads = unsettled;
     }
+}
+
+fn inline_references(payload: &[u8]) -> Result<Option<Vec<ObjectName>>> {
+    let frame = ReplicaFrame::decode(payload).map_err(storage)?;
+    Ok(frame.into_envelope().and_then(|envelope| match envelope.message {
+        ReplicaBody::ResolvedTx(_) | ReplicaBody::NoOp(_) | ReplicaBody::BlockBoundary(_)
+        | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsRemoved(_) => Some(Vec::new()),
+        ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_) | ReplicaBody::ArtefactsAdded(_)
+        | ReplicaBody::OversizedMessage(_) => None,
+    }))
 }
 
 #[async_trait]
@@ -302,48 +410,44 @@ impl ReplicaReadIndex for JournalLog {
     }
 
     async fn protect(&self, _applied: LogOffset) -> rtdb_types::Result<ProtectedReadIndex> {
-        let mut writer = self.writer.lock().await;
+        let mut reads = self.reads.unsettled.lock().await;
         let mut retried = false;
         loop {
-            self.settle_reads(&mut writer).await;
-            if writer.unsettled_reads.len() >= MAX_UNSETTLED_READS {
+            self.settle_reads(&mut reads).await;
+            if reads.len() >= MAX_UNSETTLED_READS {
                 return Err(reads_unsettled());
             }
-            let current = self.reads.journal.route().await?;
-            if current.writer.grant != Some(writer.grant) {
-                return Err(deposed(writer.grant, &current).into());
-            }
-            let invocation = self.reads.journal.request(
-                &current,
-                Command::Barrier {
-                    grant: writer.grant,
-                },
-            )?;
+            let current = self.reads.route().await?;
+            let invocation = self.reads.journal.request(&current, Command::Barrier)?;
             // Record the identity first so a cancelled read is still released later.
-            writer.unsettled_reads.push(invocation.id);
+            reads.push(invocation.id);
             match self.reads.journal.barrier(&invocation).await {
                 Ok(proof) => {
-                    writer.unsettled_reads.retain(|read| *read != invocation.id);
+                    reads.retain(|read| *read != invocation.id);
                     let hold = proof.claim.read();
                     let retention = self.reads.retain(hold);
+                    if self.reads.reader_epoch.is_some() {
+                        self.reads.route().await?;
+                    }
                     let offset = latest(hold.through)?;
                     crate::residence_trace::record("ordered-read-index", || serde_json::json!({
                         "deployment": current.placement.deployment, "incarnation": current.placement.incarnation,
                         "group": current.placement.group, "generation": current.placement.generation,
-                        "epoch": writer.grant.epoch, "invocation": hold.id.nonce, "through": offset.0,
+                        "epoch": current.writer.epoch, "invocation": hold.id.nonce, "through": offset.0,
                     }));
                     return Ok(ProtectedReadIndex {
                         offset,
                         wait: Duration::from_secs(2),
-                        retention: Some(retention),
+                        retention: Some(Arc::new((proof, retention))),
+                        certified_read: None,
                     });
                 }
                 Err(ReadFailure::Refused(error)) => {
-                    writer.unsettled_reads.retain(|read| *read != invocation.id);
+                    reads.retain(|read| *read != invocation.id);
                     return Err(error);
                 }
                 Err(ReadFailure::Uncertain(error)) if retried => {
-                    self.settle_reads(&mut writer).await;
+                    self.settle_reads(&mut reads).await;
                     return Err(error);
                 }
                 Err(ReadFailure::Uncertain(_)) => retried = true,
@@ -355,6 +459,9 @@ impl ReplicaReadIndex for JournalLog {
 impl Reads {
     async fn route(&self) -> Result<Route> {
         let view = self.journal.route().await.map_err(storage)?;
+        if self.reader_epoch.is_some_and(|epoch| epoch != view.writer.epoch) {
+            return Err(Error::Closed("The ordered reader attachment changed".into()));
+        }
         self.tip
             .fetch_max(latest(view.head).map_err(storage)?.0, Ordering::Release);
         Ok(view)
@@ -365,15 +472,7 @@ impl Reads {
     }
 
     async fn acquire(self: &Arc<Self>, view: &Route, from: u64, through: u64) -> Result<Arc<Held>> {
-        let grant = view
-            .writer
-            .grant
-            .ok_or_else(|| Error::Closed("There is no installed journal writer".into()))?;
-        let command = Command::ProtectRange {
-            grant,
-            from,
-            through,
-        };
+        let command = Command::ProtectRange { from, through };
         let request = self.journal.request(view, command).map_err(storage)?;
         Held::acquire(&self.journal, request, &self.tasks)
             .await
@@ -411,6 +510,9 @@ impl Cursor {
         if self.end == Some(self.next) {
             return Ok(());
         }
+        if self.next < view.erasure_floor {
+            return Err(Error::ErasedUnderView);
+        }
         if self.next < view.floor.next_lsn {
             return Err(Error::UnavailableLogRange {
                 requested: i64::try_from(self.next).unwrap_or(i64::MAX),
@@ -421,7 +523,15 @@ impl Cursor {
             .end
             .map_or(view.head.next_lsn, |end| end.min(view.head.next_lsn));
         if self.next < through {
-            let held = self.reads.acquire(&view, self.next, through).await?;
+            let held = match self.reads.acquire(&view, self.next, through).await {
+                Ok(held) => held,
+                Err(error) => {
+                    if self.next < self.reads.route().await?.erasure_floor {
+                        return Err(Error::ErasedUnderView);
+                    }
+                    return Err(error);
+                }
+            };
             self.from = Some(held.hold.start);
             self.held = Some(held);
         }
@@ -548,12 +658,13 @@ impl Cursor {
             Some(reservation) => reservation.retaining_io(open).await?,
             None => open.await?,
         };
+        let replica_objects = ReplicaObjectCustody::from_delivery(
+            scope, head.metadata.offset, &payload, rtdb_format::keys::CURRENT_STORAGE_VERSION,
+            rtdb_types::StorageEpoch(0), Arc::clone(held) as Arc<dyn Send + Sync>,
+        )?;
         let record = LogRecord {
             metadata: head.metadata,
-            replica_objects: Some(ReplicaObjectCustody::new(
-                scope,
-                Arc::clone(held) as Arc<dyn Send + Sync>,
-            )),
+            replica_objects,
             payload: Bytes::from_owner(Delivery {
                 bytes: payload,
                 _held: Arc::clone(held),
@@ -583,10 +694,25 @@ impl AsRef<[u8]> for Delivery {
 
 #[async_trait]
 impl Log for JournalLog {
+    fn requires_replica_payload_permit(&self) -> bool { true }
     fn needs_published_recovery_checkpoint(&self) -> bool { true }
+    fn install_replica_reference_source(&self, source: ReplicaReferenceSource) -> Result<()> {
+        if self.writer.is_none() { return Ok(()); }
+        let blocks = rtdb_replication::BlockStore::new(
+            Arc::clone(&source.store), Arc::clone(&source.cache), Arc::clone(&source.memory), source.file_size_target,
+        ).map_err(storage)?;
+        self.reference_source.set(ReferenceSource { source, blocks })
+            .map_err(|_| Error::Task("The installed journal already has a replay reference source".into()))
+    }
+    async fn publish_replica_payload(
+        &self, store: &dyn rtdb_storage::ObjectStore, key: &rtdb_storage::ObjectKey, body: Bytes,
+    ) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        Ok(store.put_with_publication(key, body).await?.and_then(rtdb_types::PhysicalObjectPublication::into_version))
+    }
 
     async fn confirms_recovery_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
-        let grant = self.writer.lock().await.grant;
+        let Some(writer) = &self.writer else { return Ok(false); };
+        let grant = writer.lock().await.grant;
         let route = self.reads.route().await?;
         let checkpoint = route.checkpoint;
         if route.writer.grant != Some(grant) || checkpoint.root != root || latest(checkpoint.cut).map_err(storage)? != through {
@@ -610,7 +736,8 @@ impl Log for JournalLog {
     }
 
     async fn holds_writer_grant(&self) -> Result<bool> {
-        let grant = self.writer.lock().await.grant;
+        let Some(writer) = &self.writer else { return Ok(false); };
+        let grant = writer.lock().await.grant;
         Ok(self.reads.route().await?.writer.grant == Some(grant))
     }
 
@@ -652,7 +779,7 @@ impl Log for JournalLog {
 
     async fn available_append_capacity(&self) -> Result<Option<AppendCapacity>> {
         let current = self.reads.route().await?;
-        let grant = self.writer.lock().await.grant;
+        let grant = self.writer()?.lock().await.grant;
         if current.writer.grant != Some(grant) {
             return Err(deposed(grant, &current));
         }
@@ -790,4 +917,26 @@ fn reads_unsettled() -> Anomaly {
         "rtdb.multi/ordered-read-unsettled",
         "Earlier installed reads with lost outcomes are not yet released",
     )
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+    use rtdb_format::{envelope::ReplicaEnvelope, keys::CURRENT_STORAGE_VERSION, log::proto::NoOp};
+    use rtdb_types::{StorageEpoch, Term, TermSequence};
+
+    #[test]
+    fn a_detached_body_needs_a_reference_even_when_its_inline_record_has_none() {
+        let inline = ReplicaEnvelope {
+            term: Term(1),
+            term_sequence: Some(TermSequence(1)),
+            message: ReplicaBody::NoOp(NoOp::default()),
+        };
+        let bytes = inline.encode();
+        let detached = inline.offloaded(
+            CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(0), "body".into(), &bytes,
+        );
+        assert_eq!(inline_references(&bytes).unwrap(), Some(Vec::new()));
+        assert!(inline_references(&detached.encode()).unwrap().is_none());
+    }
 }

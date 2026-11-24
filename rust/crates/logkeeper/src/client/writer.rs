@@ -8,7 +8,9 @@ use super::guarded_recovery::{
     predecessor_commit_target, recover_guarded_tail, recovery_commit_quorum, sealed_journal_evidence, valid_guarded_source,
 };
 use super::recovery::{Holding, plan_repair, winner};
-use crate::protocol::{Accepted, Commit, Entry, RequestBody, Sealed};
+use crate::decision::{DecisionCertificate, DecisionPrefix, DecisionStatement, Handoff, HandoffCertificate, HandoffCheckpoint, StableDecision};
+use crate::history::RetainedChain;
+use crate::protocol::{Accepted, Entry, RequestBody, Sealed};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
@@ -46,6 +48,7 @@ struct Replica {
     installed: i64,
     /// The latest ordinary publication queued on this connection.
     installing: i64,
+    publishing: i64,
     link: Link,
 }
 
@@ -142,6 +145,8 @@ struct Pipeline {
     next_lsn: i64,
     commit: i64,
     publication: Option<i64>,
+    stability: Option<StableDecision>,
+    activation_floor: i64,
     history: Holding,
     /// Entry `i` has lsn `buffer_first + i`; it holds every uncommitted entry and some recent committed ones.
     buffer_first: i64,
@@ -162,6 +167,7 @@ pub(crate) struct Writer {
     epoch: u64,
     state: Mutex<State>,
     tip: watch::Sender<Tip>,
+    handoff: Option<HandoffCertificate>,
 }
 
 fn record(entry: &Entry) -> LogRecord {
@@ -221,9 +227,28 @@ async fn copy(source: (&Ensemble, usize), target: (&Ensemble, usize), epoch: u64
     }
 }
 
+async fn recovery_digest(source: (&Ensemble, usize), first: i64, through: i64) -> Result<[u8; 32]> {
+    let (ensemble, server) = source;
+    let mut chain = RetainedChain::new(&ensemble.config.stream, first);
+    let mut next = first;
+    while next <= through {
+        let page = ensemble.fetch(server, next, through.saturating_add(1), MAXIMUM_BATCH_ENTRIES).await?;
+        if page.entries.is_empty() {
+            return Err(Error::ConflictingObject(ensemble.stream()));
+        }
+        for entry in page.entries {
+            if entry.lsn != next || entry.lsn > through { return Err(Error::ConflictingObject(ensemble.stream())); }
+            chain.append(&entry);
+            next += 1;
+        }
+    }
+    Ok(chain.bytes())
+}
+
 /// Where the recovered history comes from and where the writer's ensemble starts holding it.
 struct Recovered<'a> {
     source: (&'a Ensemble, usize),
+    predecessor_decision: Option<DecisionCertificate>,
     history: Holding,
     /// A server holding no entries starts here rather than at the history's trim point; lower lsns stay with an earlier loglet.
     start: i64,
@@ -347,6 +372,80 @@ struct SealedHistory {
     source: usize,
     history: Holding,
     guarded_commit: Option<i64>,
+    certified_through: Option<i64>,
+}
+
+fn sealed_certificate<'a>(ensemble: &Ensemble, replies: &'a [(usize, Sealed)]) -> Result<Option<&'a DecisionCertificate>> {
+    let mut selected: Option<&DecisionCertificate> = None;
+    for (_, reply) in replies {
+        let Some(candidate) = &reply.certificate else { continue; };
+        let statement = &candidate.statement;
+        if !candidate.authentic() || statement.scope.stream != ensemble.config.stream {
+            return Err(Error::ConflictingObject(ensemble.stream()));
+        }
+        if ensemble.decision_scope(statement.scope.epoch).as_ref() != Some(&statement.scope) {
+            if statement.scope.epoch < reply.synced { continue; }
+            return Err(Error::ConflictingObject(ensemble.stream()));
+        }
+        if let Some(current) = selected {
+            let old = current.statement.prefix.through;
+            let new = statement.prefix.through;
+            if old == new && current.statement != *statement {
+                return Err(Error::ConflictingObject(ensemble.stream()));
+            }
+            if old >= new { continue; }
+        }
+        selected = Some(candidate);
+    }
+    Ok(selected)
+}
+
+async fn proves_sealed_decision(
+    ensemble: &Ensemble, server: usize, sealed: &Sealed, certificate: &DecisionCertificate,
+) -> bool {
+    let cut = &certificate.statement.prefix;
+    if sealed.trim_lsn > cut.predecessor || sealed.last_lsn < cut.through { return false; }
+    let Ok(predecessor) = <[u8; 32]>::try_from(cut.predecessor_digest.as_ref()) else { return false; };
+    let mut chain = RetainedChain::from_bytes(predecessor);
+    let mut next = cut.predecessor + 1;
+    while next <= cut.through {
+        let Ok(fetched) = ensemble.fetch(server, next, cut.through.saturating_add(1), MAXIMUM_BATCH_ENTRIES).await else {
+            return false;
+        };
+        if fetched.entries.is_empty() { return false; }
+        for entry in fetched.entries {
+            if entry.lsn != next || entry.lsn > cut.through { return false; }
+            chain.append(&entry);
+            next += 1;
+        }
+    }
+    cut.digest.as_ref() == chain.bytes()
+}
+
+async fn verify_sealed_floor(
+    ensemble: &Ensemble, replies: &[(usize, Sealed)], source: usize, winning: &Sealed,
+) -> Result<Option<i64>> {
+    let Some(certified) = sealed_certificate(ensemble, replies)? else { return Ok(None); };
+    let through = certified.statement.prefix.through;
+    let unavailable = || Error::Remote {
+        key: ensemble.stream(), message: format!("the sealed recovery cannot verify its decision through {through}"),
+    };
+    if winning.last_lsn < through { return Err(unavailable()); }
+    if winning.trim_lsn >= through {
+        // Hosted trim already requires the checkpoint custody owner. The signed
+        // seal establishes the local trim and the stability proof retains its cut.
+        let stable = replies.iter().filter_map(|(_, reply)| reply.stability.as_ref()).any(|proof|
+            proof.certificate.statement == certified.statement && proof.authentic());
+        return if stable { Ok(Some(through)) } else { Err(unavailable()) };
+    }
+    if winning.trim_lsn > certified.statement.prefix.predecessor {
+        return Err(unavailable());
+    }
+    if proves_sealed_decision(ensemble, source, winning, certified).await {
+        Ok(Some(through))
+    } else {
+        Err(unavailable())
+    }
 }
 
 async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usize, Sealed)>) -> Result<SealedHistory> {
@@ -355,7 +454,8 @@ async fn sealed_history(ensemble: &Ensemble, epoch: u64, replies: &mut Vec<(usiz
     loop {
         let (source, winning) = winning_seal(replies);
         let source = *source;
-        let mut sealed = SealedHistory { source, history: Holding::from(winning), guarded_commit: None };
+        let certified_through = verify_sealed_floor(ensemble, replies, source, winning).await?;
+        let mut sealed = SealedHistory { source, history: Holding::from(winning), guarded_commit: None, certified_through };
         if !winning.guarded_tail { return Ok(sealed); }
         let witness = covers_recovered_commit(winning.commit_lsn, sealed.history.last);
         let resolution = if witness {
@@ -456,40 +556,53 @@ impl Writer {
     pub async fn open(ensemble: Arc<Ensemble>, epoch: u64) -> Result<Arc<Self>> {
         let mut replies = seal_quorum(&ensemble, epoch).await?;
         let SealedHistory { source, history, .. } = sealed_history(&ensemble, epoch, &mut replies).await?;
-        let recovered = Recovered { source: (&ensemble, source), start: history.trim + 1, history };
-        Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered).await
+        let recovered = Recovered { source: (&ensemble, source), start: history.trim + 1, history, predecessor_decision: None };
+        Self::establish(Arc::clone(&ensemble), epoch, &replies, recovered, None).await
     }
 
-    pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<i64> {
+    pub(super) async fn seal_recover_committed(ensemble: &Ensemble, epoch: u64) -> Result<(i64, i64)> {
         let mut replies = seal_quorum(ensemble, epoch).await?;
         let SealedHistory { source, history, .. } = sealed_history(ensemble, epoch, &mut replies).await?;
         let last = history.last;
-        let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history };
+        let trim = history.trim;
+        let recovered = Recovered { source: (ensemble, source), start: history.trim + 1, history, predecessor_decision: None };
         sync_quorum(ensemble, epoch, &replies, &recovered, last).await?;
-        Ok(last)
+        Ok((trim, last))
     }
 
     /// Recovers the same history used by a local ensemble move and by a
     /// copy to a different physical stream.
     async fn recover_moved(previous: &Ensemble, previous_start: i64, epoch: u64, from: CopyFrom) -> Result<Recovered<'_>> {
         let mut previous_replies = seal_quorum(previous, epoch).await?;
-        let SealedHistory { source, history, guarded_commit } =
+        let SealedHistory { source, history, guarded_commit, certified_through } =
             sealed_history(previous, epoch, &mut previous_replies).await?;
         let start = match from { CopyFrom::Retained => previous_start, CopyFrom::Lsn(lsn) => lsn }.clamp(history.trim + 1, history.last + 1);
-        let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone() };
+        let in_place = Recovered { source: (previous, source), start: history.trim + 1, history: history.clone(), predecessor_decision: None };
         // A move can stop before the destination is durable or recorded. The
         // predecessor quorum must already retain the guarded outcome.
-        let commit = predecessor_commit_target(guarded_commit, start - 1);
+        let commit = predecessor_commit_target(guarded_commit, start - 1).max(certified_through.unwrap_or(-1));
+        let predecessor_decision = sealed_certificate(previous, &previous_replies)?.cloned();
         sync_quorum(previous, epoch, &previous_replies, &in_place, commit).await?;
-        Ok(Recovered { source: (previous, source), history, start })
+        Ok(Recovered { source: (previous, source), history, start, predecessor_decision })
     }
 
     /// Copies the recovered suffix into another ensemble and opens its writer.
-    pub async fn open_moved(previous: &Ensemble, previous_start: i64, ensemble: Arc<Ensemble>, epoch: u64, from: CopyFrom) -> Result<(Arc<Self>, i64)> {
+    pub async fn open_moved(previous: &Ensemble, previous_start: i64, ensemble: Arc<Ensemble>, epoch: u64, from: CopyFrom, checkpoint: Option<HandoffCheckpoint>) -> Result<(Arc<Self>, i64)> {
         let recovered = Self::recover_moved(previous, previous_start, epoch, from).await?;
         let start = recovered.start;
+        let handoff = match (previous.decision_scope(epoch), ensemble.decision_scope(epoch)) {
+            (Some(source), Some(destination)) => {
+                let digest = recovery_digest(recovered.source, start, recovered.history.last).await?;
+                let transfer = Handoff {
+                    source, destination, first: start, through: recovered.history.last,
+                    digest: Bytes::copy_from_slice(&digest), decided: recovered.predecessor_decision.clone(), checkpoint,
+                };
+                Some(previous.export_handoff(transfer).await?)
+            }
+            _ => None,
+        };
         let replies = seal_quorum(&ensemble, epoch).await?;
-        Ok((Self::establish(ensemble, epoch, &replies, recovered).await?, start))
+        Ok((Self::establish(ensemble, epoch, &replies, recovered, handoff).await?, start))
     }
 
     /// Commits the retained history in its new journal without opening a writer.
@@ -532,12 +645,15 @@ impl Writer {
     }
 
     /// Recovers and activates only journals that confirmed the selected decision.
-    async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>) -> Result<Arc<Self>> {
+    async fn establish(ensemble: Arc<Ensemble>, epoch: u64, replies: &[(usize, Sealed)], recovered: Recovered<'_>, handoff: Option<HandoffCertificate>) -> Result<Arc<Self>> {
         let last = recovered.history.last;
         let synced = sync_quorum(&ensemble, epoch, replies, &recovered, last).await?;
         // Predecessor recovery also syncs replicas at this epoch. Only the writer's own ensemble activates.
         let ensemble_ref = &ensemble;
-        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| async move { (server, ensemble_ref.activate(server, epoch).await) }).collect();
+        let mut activating: FuturesUnordered<_> = synced.iter().map(|&server| {
+            let proof = handoff.clone();
+            async move { (server, ensemble_ref.activate_with_handoff(server, epoch, proof).await) }
+        }).collect();
         let mut active = Vec::new();
         while let Some((server, reply)) = activating.next().await {
             match reply {
@@ -554,18 +670,23 @@ impl Writer {
         }
         let long_ago = Instant::now().checked_sub(REPAIR_BACKOFF).unwrap_or_else(Instant::now);
         let replicas = (0..ensemble.len()).map(|server| if active.contains(&server) {
-            Replica { acked: last, installed: last, installing: last, link: Link::Live }
+            Replica { acked: last, installed: last, installing: last, publishing: -1, link: Link::Live }
         } else {
-            Replica { acked: -1, installed: -1, installing: -1, link: Link::Down(long_ago) }
+            Replica { acked: -1, installed: -1, installing: -1, publishing: -1, link: Link::Down(long_ago) }
         }).collect();
-        let pipeline = Pipeline { next_lsn: last + 1, commit: last, publication: None, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
-        let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0 });
+        let pipeline = Pipeline { next_lsn: last + 1, commit: last, publication: None, stability: None, activation_floor: last, history: recovered.history, buffer_first: last + 1, buffer: VecDeque::new(), buffered_bytes: 0, replicas, confirming: None, guarded: None };
+        let writer = Arc::new(Self { ensemble, epoch, state: Mutex::new(State::Open(pipeline)), tip: watch::channel(Tip::Open(last)).0, handoff });
         {
             let mut state = writer.state.lock();
-            if let State::Open(pipeline) = &mut *state { writer.repair_down(pipeline); }
+            if let State::Open(pipeline) = &mut *state {
+                writer.publish_stable(pipeline);
+                writer.repair_down(pipeline);
+            }
         }
         Ok(writer)
     }
+
+    pub(super) fn handoff(&self) -> Option<&HandoffCertificate> { self.handoff.as_ref() }
 
     pub fn tip(&self) -> watch::Receiver<Tip> { self.tip.subscribe() }
 
@@ -696,10 +817,12 @@ impl Writer {
                 replica.acked = replica.acked.max(accepted.last_lsn);
                 replica.installed = replica.installed.max(accepted.commit_lsn);
                 self.advance(pipeline);
+                self.publish_stable(pipeline);
             }
             Ok(Ack::Refused(_)) | Err(_) => {
                 let replica = &mut pipeline.replicas[server];
                 replica.installing = replica.installed;
+                replica.publishing = -1;
                 if matches!(replica.link, Link::Live) {
                     pipeline.replicas[server].link = Link::Repairing;
                     self.spawn_repair(server);
@@ -708,16 +831,130 @@ impl Writer {
         }
     }
 
+    fn advance_certified(self: &Arc<Self>, pipeline: &mut Pipeline, scope: crate::decision::DecisionScope) {
+        if pipeline.publication.is_some() {
+            return;
+        }
+        let write_quorum = self.ensemble.config.write_quorum;
+        let available = if let Some(flight) = &pipeline.guarded {
+            if !GuardedFlight::has_quorum(&flight.originals, write_quorum) { return; }
+            flight.lsn
+        } else {
+            let mut staged: Vec<_> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
+            staged.select_nth_unstable_by(write_quorum - 1, |left, right| right.cmp(left));
+            staged[write_quorum - 1].min(pipeline.next_lsn - 1)
+        };
+        if available <= pipeline.commit { return; }
+
+        let predecessor = pipeline.commit;
+        let first = (predecessor + 1 - pipeline.buffer_first) as usize;
+        let previous = pipeline.stability.clone();
+        let mut chain = match &previous {
+            Some(proof) => RetainedChain::from_bytes(
+                proof.certificate.statement.prefix.digest.as_ref().try_into().expect("certified prefix digest"),
+            ),
+            None => self.handoff.as_ref().map_or_else(
+                || RetainedChain::new(&scope.stream, predecessor + 1),
+                |proof| RetainedChain::from_bytes(proof.handoff.fingerprint()),
+            ),
+        };
+        let predecessor_digest = Bytes::copy_from_slice(&chain.bytes());
+        let mut through = predecessor;
+        let mut guarded_before = None;
+        let mut bytes = 0usize;
+        for buffered in pipeline.buffer.iter().skip(first).take(1024) {
+            let entry = &buffered.entry;
+            bytes = bytes.saturating_add(entry.payload.len())
+                .saturating_add(entry.timed_origin.as_ref().map_or(0, prost::Message::encoded_len));
+            if entry.lsn > available || (through > predecessor && bytes > (4 << 20)) {
+                break;
+            }
+            through = entry.lsn;
+            guarded_before = entry.guarded_before;
+            chain.append(entry);
+        }
+        if through == predecessor { return; }
+        let statement = DecisionStatement { scope, prefix: DecisionPrefix {
+            predecessor, predecessor_digest, through, digest: Bytes::copy_from_slice(&chain.bytes()),
+            guarded: pipeline.guarded.is_some(), guarded_before,
+        }};
+        pipeline.publication = Some(through);
+        let writer = Arc::downgrade(self);
+        let ensemble = Arc::clone(&self.ensemble);
+        tokio::spawn(async move {
+            let mut certificate = None;
+            loop {
+                let outcome = async {
+                    if certificate.is_none() {
+                        certificate = Some(ensemble.certify(statement.clone(), previous.clone()).await?);
+                    }
+                    ensemble.stabilize(certificate.clone().expect("certificate selected")).await
+                }.await;
+                let Some(owner) = writer.upgrade() else { return; };
+                match outcome {
+                    Err(error) if !matches!(error, Error::Deposed { .. }) => {
+                        if !owner.uncertain_certified(through) { return; }
+                    }
+                    settled => {
+                        owner.finish_certified(through, settled);
+                        return;
+                    }
+                }
+                drop(owner);
+                tokio::time::sleep(REPAIR_BACKOFF).await;
+            }
+        });
+    }
+
+    fn uncertain_certified(&self, through: i64) -> bool {
+        let mut state = self.state.lock();
+        let State::Open(pipeline) = &mut *state else { return false; };
+        for buffered in pipeline.buffer.iter_mut().take_while(|buffered| buffered.entry.lsn <= through) {
+            if let Some(receipt) = buffered.receipt.take() {
+                let _ = receipt.send(Err(Error::Remote {
+                    key: self.ensemble.stream(),
+                    message: "the decision outcome is unknown".into(),
+                }));
+            }
+        }
+        true
+    }
+
+    fn finish_certified(self: &Arc<Self>, through: i64, outcome: Result<(StableDecision, Vec<usize>)>) {
+        let mut state = self.state.lock();
+        if let Err(Error::Deposed { promised, .. }) = &outcome {
+            return self.depose(&mut state, *promised);
+        }
+        let State::Open(pipeline) = &mut *state else { return; };
+        debug_assert_eq!(pipeline.publication, Some(through));
+        pipeline.publication = None;
+        match outcome {
+            Ok((proof, installers)) => {
+                for server in installers { pipeline.replicas[server].installed = through; }
+                pipeline.guarded = None;
+                pipeline.stability = Some(proof.clone());
+                self.release(pipeline, through);
+                for server in 0..self.ensemble.len() {
+                    self.ensemble.publish_proof(server, proof.clone(), Box::new(|_| {}));
+                }
+                self.advance(pipeline);
+                self.repair_down(pipeline);
+            }
+            Err(_) => unreachable!("nonterminal decisions are retried before settlement"),
+        }
+    }
+
     fn advance(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        if let Some(scope) = self.ensemble.decision_scope(self.epoch) {
+            return self.advance_certified(pipeline, scope);
+        }
         let write_quorum = self.ensemble.config.write_quorum;
         if let Some(flight) = &mut pipeline.guarded && flight.begin_commit(write_quorum) {
             let flight = pipeline.guarded.as_ref().expect("started under the writer lock");
             let witnesses = flight.witnesses.as_ref().expect("commit started");
             for (server, mark) in witnesses.iter().enumerate() {
                 if *mark == Mark::Pending {
-                    self.send(pipeline, server, RequestBody::Commit(Commit {
-                        stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: flight.lsn,
-                    }));
+                    self.send(pipeline, server, self.ensemble.commit_request(self.epoch, flight.lsn));
                 }
             }
             return;
@@ -727,6 +964,7 @@ impl Writer {
                 let through = flight.lsn;
                 pipeline.guarded = None;
                 self.release(pipeline, through);
+                self.install_through(pipeline, through);
                 self.repair_down(pipeline);
             }
             return;
@@ -738,34 +976,67 @@ impl Writer {
             self.release(pipeline, through);
             pipeline.publication = None;
         }
+        let committed = pipeline.commit;
         let through = match pipeline.publication {
             Some(through) => through,
             None => {
                 let mut held: Vec<_> = pipeline.replicas.iter().map(|replica| replica.acked).collect();
                 held.select_nth_unstable_by(write_quorum - 1, |left, right| right.cmp(left));
                 let through = held[write_quorum - 1].min(pipeline.next_lsn - 1);
-                if through <= pipeline.commit { return; }
+                if through <= pipeline.commit {
+                    self.install_through(pipeline, committed);
+                    return;
+                }
                 pipeline.publication = Some(through);
                 through
             }
         };
+        self.install_through(pipeline, through);
+        if through > pipeline.commit {
+            self.install_through(pipeline, committed);
+        }
+    }
+
+    fn publish_stable(self: &Arc<Self>, pipeline: &mut Pipeline) {
+        if self.ensemble.decision_scope(self.epoch).is_some() {
+            return;
+        }
+        let through = pipeline.commit;
         for server in 0..pipeline.replicas.len() {
             let replica = &mut pipeline.replicas[server];
-            if matches!(replica.link, Link::Live) && replica.acked >= through && replica.installing < through {
+            if matches!(replica.link, Link::Live) && replica.installed >= through && replica.publishing < through {
+                replica.publishing = through;
+                self.send(pipeline, server, self.ensemble.publish_request(self.epoch, through));
+            }
+        }
+    }
+
+    fn install_through(self: &Arc<Self>, pipeline: &mut Pipeline, through: i64) {
+        for server in 0..pipeline.replicas.len() {
+            let replica = &mut pipeline.replicas[server];
+            if matches!(replica.link, Link::Live) && replica.acked >= through
+                && replica.installed < through && replica.installing < through
+            {
                 replica.installing = through;
-                self.send(pipeline, server, RequestBody::Commit(Commit {
-                    stream: self.ensemble.stream(), epoch: self.epoch, commit_lsn: through,
-                }));
+                self.send(pipeline, server, self.ensemble.commit_request(self.epoch, through));
             }
         }
     }
 
     fn release(&self, pipeline: &mut Pipeline, quorum: i64) {
+        let decision = if rtdb_types::residence_trace::enabled() {
+            pipeline.stability.as_ref().filter(|proof| proof.certificate.statement.prefix.through == quorum)
+                .map(|proof| {
+                    proof.observe(self.ensemble.identity());
+                    proof.certificate.statement.fingerprint()
+                })
+        } else { None };
         rtdb_types::residence_trace::logkeeper_publication(
             &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), quorum,
             self.ensemble.config.write_quorum,
             || pipeline.replicas.iter().enumerate().filter_map(|(peer, replica)|
                 (replica.installed >= quorum).then_some(peer)).collect(),
+            decision,
         );
         let previous = pipeline.commit;
         pipeline.commit = quorum;
@@ -777,7 +1048,7 @@ impl Writer {
                 && receipt.send(Ok(record(&buffered.entry).metadata)).is_ok()
             {
                 rtdb_types::residence_trace::logkeeper_receipt(
-                    &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), buffered.entry.lsn, quorum,
+                    &self.ensemble.config.stream, self.epoch, self.ensemble.identity(), buffered.entry.lsn, quorum, decision,
                 );
             }
         }
@@ -836,6 +1107,34 @@ impl Writer {
         let plan = plan_repair(&Holding::from(&sealed), &history).map_err(|message| Error::Remote { key: ensemble.config.stream.clone(), message })?;
         if let Some(through) = plan.trim_through { deposed_by(epoch, ensemble.trim(server, through).await?)?; }
         let mut from = plan.from;
+        if let Some(handoff) = &self.handoff {
+            let probe = ensemble.read_index(server, epoch, *uuid::Uuid::new_v4().as_bytes()).await;
+            if !probe.is_ok_and(|reply| reply.handoff.is_some_and(|active| active.handoff == handoff.handoff)) {
+                let frontier = handoff.handoff.through;
+                if from <= frontier {
+                    let sources: Vec<usize> = {
+                        let state = self.state.lock();
+                        match &*state {
+                            State::Open(pipeline) => (0..pipeline.replicas.len()).filter(|&peer| {
+                                peer != server && matches!(pipeline.replicas[peer].link, Link::Live)
+                            }).collect(),
+                            State::Deposed { promised } => return Err(Error::Deposed { epoch, promised: *promised }),
+                        }
+                    };
+                    // A peer can have a shorter live tail, but every activated
+                    // peer has verified this same inherited cut.
+                    let peer = sources.first().copied().ok_or_else(|| Error::Remote {
+                        key: ensemble.stream(), message: "no source remains for the inherited cut".into(),
+                    })?;
+                    from = copy((ensemble, peer), (ensemble, server), epoch, from, frontier).await?.last_lsn + 1;
+                } else {
+                    deposed_by(epoch, ensemble.overwrite(server, epoch, from, Vec::new(), true).await?)?;
+                }
+                deposed_by(epoch, ensemble.commit(server, epoch, frontier).await?)?;
+                deposed_by(epoch, ensemble.activate_with_handoff(server, epoch, Some(handoff.clone())).await?)?;
+            }
+        }
+
         let mut empty_fetches = 0;
         loop {
             let (sources, buffer_first) = {
@@ -844,9 +1143,13 @@ impl Writer {
                 if from >= pipeline.buffer_first {
                     if pipeline.guarded.is_some() { return Err(self.guarded_outcome_unknown()); }
                     let entries = pipeline.buffer.iter().skip((from - pipeline.buffer_first) as usize).map(|buffered| buffered.entry.clone()).collect();
-                    let body = ensemble.repair_request(epoch, from, entries, pipeline.commit);
+                    let inherited = if ensemble.decision_scope(epoch).is_some() { pipeline.activation_floor } else { pipeline.commit };
+                    let body = ensemble.repair_request(epoch, from, entries, inherited);
                     pipeline.replicas[server].link = Link::Live;
                     self.send(pipeline, server, body);
+                    if let Some(proof) = &pipeline.stability {
+                        ensemble.publish_proof(server, proof.clone(), Box::new(|_| {}));
+                    }
                     return Ok(());
                 }
                 let sources: Vec<usize> = (0..pipeline.replicas.len()).filter(|&peer| peer != server && matches!(pipeline.replicas[peer].link, Link::Live)).collect();
@@ -1045,7 +1348,7 @@ mod tests {
         for _ in 0..4 {
             let directory = tempfile::tempdir().unwrap();
             let options = ServerOptions { data_dir: directory.path().to_owned(), fsync: true, cache_bytes: 0 };
-            let (provider, journal) = PreparedJournal::open_for_member(options, uuid::Uuid::new_v4().to_string()).await.unwrap();
+            let (provider, journal) = PreparedJournal::open_for_member(options).await.unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             endpoints.push(JournalEndpoint::Member { address: listener.local_addr().unwrap().to_string(), journal });
             servers.push(tokio::spawn(provider.serve(listener, cancellation.clone())));

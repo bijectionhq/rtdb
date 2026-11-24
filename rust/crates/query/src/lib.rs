@@ -36,6 +36,7 @@ mod system;
 mod inspection;
 mod trace;
 mod settings;
+pub use settings::{SnapshotAdmission, SnapshotTokenIssuer, SqlSnapshotView};
 mod pages;
 mod analysis;
 mod batch_join;
@@ -55,6 +56,7 @@ pub use entity_history::{HistoryObject, table_point_rows, uncovered_history_iids
 pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions, retain_catalog_snapshot};
 pub use fragment::{FragmentBytes, FragmentDepth, FragmentReply, FragmentResidence, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment, evaluate_fragment_retained};
 pub use cursor::{PreparedQuery, QueryCursor, encoding_ordered_batch};
+pub use rtdb_storage::sealing::{DeliveryIo, current_delivery_deadline};
 pub use query_cpu::QueryCpu;
 pub use settings::unindexed_tx;
 pub use runtime_schema::RuntimeSchema;
@@ -77,12 +79,12 @@ pub use owned_relation::OwnedSpatialScan;
 pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, OWNED_UNIQUE_PATHS_MAX, OWNED_UNIQUE_POLICY_ID, lookup_owned_unique, owned_unique_key_id, owned_unique_path_key, read_owned_unique_policy};
 pub use owned_relation::{
     ArchivedHeldClock, OwnedChangeEntry, OwnedIdentityCandidates, OwnedSpatialProjection, open_owned_artefact_candidate, open_owned_assertion_point, open_owned_capacity_point, open_owned_identity_page, open_owned_identity_page_all_valid, open_owned_identity_prefix, open_owned_path_catalog, open_owned_point, open_owned_point_at_system, open_owned_root_prefix_projection, open_owned_root_projection,
-    open_owned_spatial_scan, open_owned_key_timeline, open_owned_unique_point, open_owned_unique_timeline, open_owned_unique_window, open_staged_unique_window, open_owned_valid_boundaries, open_owned_valid_during_at, owned_identity_candidates, owned_row_revision, read_owned_parent_schemas, read_owned_root_publication,
-    read_archived_held_clock, read_owned_change_entry, read_owned_fixed_range_changes, read_owned_fixed_range_rule, read_owned_lifetime_floor, read_owned_lifetime_floor_table, read_owned_relation_schema, read_owned_retirement, read_owned_retirements, read_owned_schema_catalog, read_owned_world, read_owned_world_with_revision, read_owned_world_clock, read_owned_worlds, read_owned_world_clock_revision, select_owned_world_clock,
+    open_owned_spatial_scan, open_owned_key_timeline, open_owned_unique_point, open_owned_unique_timeline, open_owned_unique_window, open_archived_world_unique_window, open_staged_unique_window, open_owned_valid_boundaries, open_owned_valid_during_at, owned_identity_candidates, owned_row_revision, read_owned_parent_schemas, read_owned_root_publication,
+    read_archived_held_clock, read_held_world_publication, read_owned_change_entry, read_owned_fixed_range_changes, read_owned_fixed_range_rule, read_owned_lifetime_floor, read_owned_lifetime_floor_table, read_owned_relation_schema, read_owned_retirement, read_owned_retirements, read_owned_schema_catalog, read_owned_world, read_owned_world_with_revision, read_owned_world_clock, read_owned_worlds, read_owned_world_clock_revision, select_owned_world_clock,
 };
 pub use owned_relation::{
     open_owned_lifetime_point, open_owned_point_with_position_mask, open_owned_valid_during_with_position_mask, open_owned_world_constraint_projection,
-    owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
+    owned_receipt_transaction, owned_row_assertion_ordinal, owned_row_lifetime, read_owned_point_revision,
 };
 
 mod owned_journal;

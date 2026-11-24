@@ -42,7 +42,12 @@ A model marker represents an accepted event after these operations and before an
 The remaining binding is from the admitted context list and fingerprint slot through native source encoding, chosen replica batch, and exact held-row decoding.
 
 `resolve_next_source` advances the source watermark and uses that source position as the source transaction's ID.
-The resolver enforces strict advances in source transaction ID and system time before staging.
+The shared stage checks strict source transaction ID advance and nondecreasing system time.
+Owned publication selects a strict revision before staging: automatic selection advances a stalled clock, an explicit owned revision must advance, and an offered slot must be strictly later than the selected predecessor.
+The verified source-order and strict-time decisions are distinct, and the projection concerns a published owned action.
+A shared strict stage would reject an ordinary SQL transaction at source 12 and time 10 after source 11 at time 10, even though the ordinary history permits that tie.
+At the same predecessor a placed publication offered time 10 is refused, while automatic owned publication can select 11.
+Keeping time selection with its existing owners preserves both histories.
 The claim replaces an ordinary hosted control at the claim's assigned system time, which `read_hosted_control_point` recovers from the exact epoch slice.
 `ordered_opened` derives the new intake start from the selected checkpoint and replica tail of the installation and seeds recovery on the same log epoch.
 `promote_term` opens that source tail from applied progress and seeds the resolver with the same applied transaction key and source position.

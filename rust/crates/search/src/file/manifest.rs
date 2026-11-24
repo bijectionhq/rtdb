@@ -172,6 +172,7 @@ impl Manifest {
         let row = row as usize;
         let bound = |index| self.events.column(index).as_primitive::<Int64Type>().value(row);
         Ok(KeyedEvent {
+            position: super::read_event_position(self.events.column(6).as_ref(), row),
             system_from: bound(1), valid_from: bound(2), valid_to: bound(3),
             op: op_of(self.events.column(4).as_primitive::<UInt8Type>().value(row))?,
         })

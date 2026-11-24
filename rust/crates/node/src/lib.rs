@@ -2,6 +2,7 @@ mod ordered_index;
 pub use ordered_index::{path_columns_at_cut, stable_owned_path_columns};
 pub use ordered_index::{OwnedCountRequest, OwnedDecimalSum, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, owned_count as count_owned_cut, measure_owned_cut, range_owned_cut};
 mod session;
+mod sql_snapshots;
 mod resources;
 mod catalog;
 mod config;
@@ -33,7 +34,8 @@ pub use database::{CompactionRelay, Database};
 pub use rtdb_tx::{ArchivedWorldConstraints, HostedControlWrite, WorldConstraintArchive};
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
-pub use node::{AppliedOwnedPoint, AppliedReadFloor};
+pub use node::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
+pub use node::RootCatalogRead;
 pub use node::SearchFileFormat;
 #[cfg(feature = "search")]
 pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
@@ -51,3 +53,5 @@ pub use operations::{CompactorReset, SnapshotExport};
 /// The stack each runtime worker gets: a query's operators and expressions nest with the depth of the statement,
 /// and stack overflow aborts the process rather than failing the query. It is reserved, not committed, up front.
 pub const WORKER_STACK_BYTES: usize = 16 << 20;
+
+pub use rtdb_tx::{DecisionClock, DecisionObservation};

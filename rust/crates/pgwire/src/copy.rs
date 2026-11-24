@@ -45,15 +45,25 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
         let Some(encoded) = encoded else { break };
         let (rows, bytes, _reservation) = encoded.inspect_err(|_| cursor.record_consumer_error())?;
         count = count.checked_add(rows).ok_or_else(|| protocol("COPY TO row count overflow"))?;
-        for chunk in bytes.chunks(64 * 1024) {
-            wire.send(b'd', chunk).await?;
-        }
-        wire.flush().await?;
+        let grant = cursor.delivery_grant().await?;
+        grant.deliver(async {
+            for chunk in bytes.chunks(64 * 1024) {
+                wire.send(b'd', chunk).await?;
+            }
+            wire.flush().await
+        }).await.map_err(crate::wire::delivery_error)?;
     }
     encoder.finish().map_err(arrow_output_error)?;
-    wire.send(b'd', encoder.get_ref()).await?;
-    wire.empty(b'c').await?;
-    wire.string(b'C', &format!("COPY {count}")).await
+    let grant = cursor.delivery_grant().await?;
+    grant.deliver(async {
+        wire.send(b'd', encoder.get_ref()).await?;
+        wire.empty(b'c').await?;
+        wire.string(b'C', &format!("COPY {count}")).await?;
+        if grant.is_bounded() { wire.flush().await?; }
+        Ok(())
+    }).await.map_err(crate::wire::delivery_error)?;
+    grant.observe_answer();
+    Ok(())
 }
 
 fn arrow_output_error(error: arrow_schema::ArrowError) -> Anomaly {

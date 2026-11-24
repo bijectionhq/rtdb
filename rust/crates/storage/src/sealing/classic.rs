@@ -20,6 +20,7 @@ use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
 const OWNER: &str = "~rtdb-classic-key-lineage";
 const KEY_BYTES: usize = 32;
+pub const KAFKA_LOG_SEAL_OVERHEAD: usize = LOG_SEAL_OVERHEAD;
 pub(crate) const LOG_SEAL_OVERHEAD: usize = 16 + super::cipher::SEALED_OVERHEAD;
 
 #[derive(Clone)]
@@ -184,6 +185,27 @@ impl ClassicKeyVault {
         }))
     }
 
+    /// Kafka's immutable topic ID selects a vault lineage. Only the caller
+    /// that created the still-empty topic may enroll its vault namespace.
+    pub fn kafka_log_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>) -> Result<Arc<ClassicObjectKeys>> {
+        let topic = Uuid::from_bytes(topic);
+        if topic.is_nil() {
+            return Err(invalid("A Classic Kafka log must have a broker topic identity"));
+        }
+        let path = self.0.join(format!("kafka-{}", topic.simple()));
+        if enroll {
+            match fs::create_dir(&path) {
+                Ok(()) => sync_directory(&self.0).map_err(io(&self.0))?,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io(&path)(error).into()),
+            }
+        }
+        if !path.is_dir() {
+            return Err(invalid("The Classic Kafka topic requires its original enrolled key vault"));
+        }
+        Ok(Arc::new(ClassicObjectKeys { path: path.into(), region }))
+    }
+
     pub fn require_unsealed_log(path: &Path) -> Result<()> {
         if path
             .with_extension("key-lineage")
@@ -217,38 +239,51 @@ impl ClassicObjectKeys {
 
     /// Settles the slot at the original vault after the residence has excluded all uses.
     pub async fn withdraw(&self, key: &ObjectKey) -> crate::Result<()> {
-        if key.as_str() == OWNER {
-            return Err(Error::InvalidKey(key.to_string()));
-        }
-        let path = self.name(key);
-        self.region
-            .run_blocking(move || {
-                let _lock = lock(&path)?;
-                let fence = path.with_extension("closed");
-                match File::options().write(true).create_new(true).open(&fence) {
-                    Ok(file) => crate::sync_file(&file).map_err(io(&fence))?,
-                    Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(io(&fence)(error)),
-                }
-                let parent = path.parent().expect("the slot has its vault directory");
-                sync_directory(parent).map_err(io(parent))?;
-                for file in [&path, &path.with_extension("pending")] {
-                    match fs::remove_file(file) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == ErrorKind::NotFound => {}
-                        Err(error) => return Err(io(file)(error)),
-                    }
-                }
-                sync_directory(parent).map_err(io(parent))
-            })
-            .await
+        self.withdraw_units(std::slice::from_ref(key)).await
     }
+
+    pub(crate) async fn withdraw_units(&self, keys: &[ObjectKey]) -> crate::Result<()> {
+        if keys.is_empty() { return Ok(()); }
+        let paths = keys.iter().map(|key| {
+            if key.as_str() == OWNER { return Err(Error::InvalidKey(key.to_string())); }
+            Ok(self.name(key))
+        }).collect::<crate::Result<Vec<_>>>()?;
+        self.region.run_blocking(move || {
+            for path in paths { withdraw_slot(&path)?; }
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+}
+
+fn withdraw_slot(path: &Path) -> crate::Result<()> {
+    let _lock = lock(path)?;
+    let fence = path.with_extension("closed");
+    match File::options().write(true).create_new(true).open(&fence) {
+        Ok(file) => crate::sync_file(&file).map_err(io(&fence))?,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(io(&fence)(error)),
+    }
+    let parent = path.parent().expect("the slot has its vault directory");
+    sync_directory(parent).map_err(io(parent))?;
+    for file in [path, path.with_extension("pending").as_path()] {
+        match fs::remove_file(file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(io(file)(error)),
+        }
+    }
+    sync_directory(parent).map_err(io(parent))
 }
 
 #[async_trait::async_trait]
 impl ObjectCipher for ClassicObjectKeys {
     async fn withdraw(&self, key: &ObjectKey) -> crate::Result<()> {
         ClassicObjectKeys::withdraw(self, key).await
+    }
+
+    async fn withdraw_all(&self, keys: &[ObjectKey]) -> crate::Result<()> {
+        self.withdraw_units(keys).await
     }
 
     async fn operate(
@@ -260,11 +295,21 @@ impl ObjectCipher for ClassicObjectKeys {
             return Err(Error::InvalidKey(key.to_string()));
         }
         let path = self.name(key);
-        let key = key.clone();
         self.region
-            .run_blocking(move || {
+            .read(Arc::clone(&self.path), key.clone(), move |_, key| {
+                if matches!(operation, UnitOperation::Grant) {
+                    let custody = Arc::new(open_slot_lock(&path)?);
+                    custody.lock_shared().map_err(io(&path))?;
+                    if path.with_extension("closed").try_exists().map_err(io(&path))? {
+                        return Err(Error::ErasedUnderView);
+                    }
+                    if fs::metadata(&path).map_err(io(&path))?.len() != KEY_BYTES as u64 {
+                        return Err(Error::Task("Invalid Classic unit key".into()));
+                    }
+                    return Ok(UnitOutput::HeldGrant { until: None, custody });
+                }
                 with_key(&path, operation.provisions(), |cipher| {
-                    operation.apply(cipher, &key)
+                    operation.apply(cipher, key)
                 })
             })
             .await
@@ -272,6 +317,109 @@ impl ObjectCipher for ClassicObjectKeys {
 }
 
 impl ClassicObjectKeys {
+    pub async fn seal_kafka_record(&self, plaintext: Bytes) -> crate::Result<Bytes> {
+        let publication = Uuid::new_v4();
+        let name = ObjectKey::new(format!("frames/{publication}"))?;
+        let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
+        let ciphertext = self.operate(&name, UnitOperation::SealValue(associated, plaintext)).await?.bytes()?;
+        let mut frame = Vec::with_capacity(16 + ciphertext.len());
+        frame.extend_from_slice(publication.as_bytes());
+        frame.extend_from_slice(&ciphertext);
+        Ok(frame.into())
+    }
+
+    pub async fn open_kafka_record(&self, frame: Bytes) -> crate::Result<Bytes> {
+        let publication = frame.get(..16).and_then(|prefix| Uuid::from_slice(prefix).ok())
+            .filter(|publication| !publication.is_nil())
+            .ok_or_else(|| Error::Task("Kafka frame has no sealed publication identity".into()))?;
+        let name = ObjectKey::new(format!("frames/{publication}"))?;
+        let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
+        self.operate(&name, UnitOperation::OpenValue(associated, frame.slice(16..))).await?.bytes()
+    }
+
+    /// Persists the exact broker-acknowledged position before acknowledging it to RTDB.
+    pub fn record_kafka_publication(&self, offset: i64, frame: &[u8]) -> crate::Result<()> {
+        if offset < 0 || frame.len() < KAFKA_LOG_SEAL_OVERHEAD {
+            return Err(Error::Task("Invalid Kafka frame publication".into()));
+        }
+        let index = self.path.join("positions");
+        let floor = self.path.join("retired-before");
+        let _gate = lock(&floor)?;
+        if offset < kafka_retired_before(&floor)? {
+            return Err(Error::ErasedUnderView);
+        }
+        match fs::create_dir(&index) {
+            Ok(()) => sync_directory(self.path.as_ref()).map_err(io(&index))?,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(io(&index)(error)),
+        }
+        let mut identity = [0; 48];
+        identity[..16].copy_from_slice(&frame[..16]);
+        identity[16..].copy_from_slice(digest(&SHA256, frame).as_ref());
+        let marker = index.join(offset.to_string());
+        match fs::read(&marker) {
+            Ok(bytes) if bytes == identity => Ok(()),
+            Ok(_) => Err(Error::Task("The Kafka position changed its sealed publication".into())),
+            Err(error) if error.kind() == ErrorKind::NotFound => write_kafka_marker(&marker, &identity, false),
+            Err(error) => Err(io(&marker)(error)),
+        }
+    }
+
+    /// Repairs the census after an ambiguous broker acknowledgement while the record is retained.
+    pub async fn open_kafka_publication(self: &Arc<Self>, offset: i64, frame: Bytes) -> crate::Result<Bytes> {
+        let plaintext = self.open_kafka_record(frame.clone()).await?;
+        let keys = Arc::clone(self);
+        self.region.run_blocking(move || keys.record_kafka_publication(offset, &frame)).await?;
+        Ok(plaintext)
+    }
+
+    /// Consumes the broker's confirmed exclusive floor for this topic lineage.
+    pub async fn retire_kafka_before(&self, before: i64) -> crate::Result<bool> {
+        if before < 0 {
+            return Err(Error::Task("The Kafka floor is negative".into()));
+        }
+        let path = Arc::clone(&self.path);
+        self.region.run_blocking(move || {
+            let floor = path.join("retired-before");
+            let _gate = lock(&floor)?;
+            let mut next = kafka_retired_before(&floor)?;
+            if before < next {
+                return Err(Error::Task("The Kafka broker rolled back a retired floor".into()));
+            }
+            let index = path.join("positions");
+            let stop = before.min(next.saturating_add(128));
+            while next < stop {
+                let marker = index.join(next.to_string());
+                let bytes = fs::read(&marker).map_err(|error| {
+                    if error.kind() == ErrorKind::NotFound {
+                        Error::Task(format!("The broker trimmed Kafka offset {next} before its slot was recorded"))
+                    } else {
+                        io(&marker)(error)
+                    }
+                })?;
+                let identity: [u8; 48] = bytes.try_into()
+                    .map_err(|_| Error::Task("Malformed Kafka retirement evidence".into()))?;
+                let publication = Uuid::from_slice(&identity[..16]).ok()
+                    .filter(|publication| !publication.is_nil())
+                    .ok_or_else(|| Error::Task("Malformed Kafka publication identity".into()))?;
+                use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+                let name = ObjectKey::new(format!("frames/{publication}"))?;
+                let slot = path.join(URL_SAFE_NO_PAD.encode(digest(&SHA256, name.as_str().as_bytes()).as_ref()));
+                withdraw_slot(&slot)?;
+                let advanced = next + 1;
+                write_kafka_marker(&floor, &advanced.to_be_bytes(), true)?;
+                // The floor now carries the receipt and makes a failed unlink harmless.
+                match fs::remove_file(&marker) {
+                    Ok(()) => sync_directory(&index).map_err(io(&index))?,
+                    Err(error) if error.kind() == ErrorKind::NotFound => (),
+                    Err(error) => return Err(io(&marker)(error)),
+                }
+                next = advanced;
+            }
+            Ok(next == before)
+        }).await
+    }
+
     pub(crate) fn seal_record(
         &self,
         offset: i64,
@@ -307,6 +455,61 @@ impl ClassicObjectKeys {
             cipher.open(&associated, ciphertext)
         })
     }
+
+    pub(crate) fn retire_record(&self, offset: i64, timestamp: i64, sealed: &[u8]) -> crate::Result<()> {
+        let (publication, _) = sealed.split_at_checked(16)
+            .ok_or_else(|| Error::Task("The sealed Classic frame has no publication identity".into()))?;
+        let publication = Uuid::from_slice(publication)
+            .map_err(|_| Error::Task("Invalid log publication identity".into()))?;
+        let slot = self.name(&ObjectKey::new(format!("frames/{publication}"))?);
+        let marker = slot.with_extension("retirement");
+        let mut binding = ring::digest::Context::new(&SHA256);
+        binding.update(b"rtdb.classic.log-retirement/v1\0");
+        binding.update(&offset.to_be_bytes());
+        binding.update(&timestamp.to_be_bytes());
+        binding.update(sealed);
+        let binding = binding.finish();
+        match fs::read(&marker) {
+            Ok(prior) if prior == binding.as_ref() => {}
+            Ok(_) => return Err(Error::Task("The sealed log retirement intent differs".into())),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                // Authenticate this offset and its original publication before
+                // recording authority to destroy its slot.
+                self.open_record(offset, timestamp, sealed)?;
+                let mut intent = tempfile::NamedTempFile::new_in(self.path.as_ref()).map_err(io(&marker))?;
+                intent.write_all(binding.as_ref()).map_err(io(&marker))?;
+                crate::sync_file(intent.as_file()).map_err(io(&marker))?;
+                intent.persist_noclobber(&marker).map_err(|error| io(&marker)(error.error))?;
+                sync_directory(self.path.as_ref()).map_err(io(&marker))?;
+            }
+            Err(error) => return Err(io(&marker)(error)),
+        }
+        withdraw_slot(&slot)
+    }
+
+}
+
+fn kafka_retired_before(path: &Path) -> crate::Result<i64> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let bytes = bytes.try_into().map_err(|_| Error::Task("Malformed Kafka retirement floor".into()))?;
+            let floor = i64::from_be_bytes(bytes);
+            if floor < 0 { return Err(Error::Task("Malformed Kafka retirement floor".into())); }
+            Ok(floor)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(io(path)(error)),
+    }
+}
+
+fn write_kafka_marker(path: &Path, bytes: &[u8], replace: bool) -> crate::Result<()> {
+    let parent = path.parent().expect("Kafka marks have a vault directory");
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(io(path))?;
+    file.write_all(bytes).map_err(io(path))?;
+    crate::sync_file(file.as_file()).map_err(io(path))?;
+    if replace { file.persist(path) } else { file.persist_noclobber(path) }
+        .map_err(|error| io(path)(error.error))?;
+    sync_directory(parent).map_err(io(parent))
 }
 
 fn with_key<T>(
@@ -334,16 +537,20 @@ fn with_key<T>(
     operate(&cipher?)
 }
 
-fn lock(path: &Path) -> crate::Result<File> {
+fn open_slot_lock(path: &Path) -> crate::Result<File> {
     let lock = path.with_extension("lock");
-    let file = File::options()
+    File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(&lock)
-        .map_err(io(&lock))?;
-    file.lock().map_err(io(&lock))?;
+        .map_err(io(&lock))
+}
+
+fn lock(path: &Path) -> crate::Result<File> {
+    let file = open_slot_lock(path)?;
+    file.lock().map_err(io(&path.with_extension("lock")))?;
     Ok(file)
 }
 
@@ -390,6 +597,43 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
 mod tests {
     use super::*;
     use crate::MemoryStore;
+
+    #[tokio::test]
+    async fn a_confirmed_kafka_floor_retires_exact_recorded_publications() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = ClassicKeyVault::open(directory.path())?;
+        let keys = vault.kafka_log_keys(Uuid::new_v4().into_bytes(), true, IoRegion::new())?;
+        let earlier = keys.seal_kafka_record(Bytes::from_static(b"old")).await?;
+        let later = keys.seal_kafka_record(Bytes::from_static(b"live")).await?;
+        keys.record_kafka_publication(1, &later)?;
+        assert!(keys.retire_kafka_before(1).await.is_err());
+        keys.record_kafka_publication(0, &earlier)?;
+        assert!(keys.record_kafka_publication(0, &later).is_err());
+        assert!(keys.retire_kafka_before(1).await?);
+        assert!(keys.retire_kafka_before(1).await?);
+        assert!(matches!(keys.open_kafka_record(earlier).await, Err(Error::ErasedUnderView)));
+        assert_eq!(keys.open_kafka_record(later).await?, Bytes::from_static(b"live"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kafka_frames_require_the_enrolled_topic_and_original_vault() -> Result<()> {
+        let original = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let vault = ClassicKeyVault::open(original.path())?;
+        let other = ClassicKeyVault::open(other.path())?;
+        let topic = Uuid::new_v4().into_bytes();
+        let io = IoRegion::new();
+        let keys = vault.kafka_log_keys(topic, true, Arc::clone(&io))?;
+        let body = Bytes::from_static(b"sealed Kafka record");
+        let frame = keys.seal_kafka_record(body.clone()).await?;
+        assert_ne!(frame, body);
+        assert!(other.kafka_log_keys(topic, false, Arc::clone(&io)).is_err());
+        let different = vault.kafka_log_keys(Uuid::new_v4().into_bytes(), true, Arc::clone(&io))?;
+        assert!(different.open_kafka_record(frame.clone()).await.is_err());
+        assert_eq!(vault.kafka_log_keys(topic, false, io)?.open_kafka_record(frame).await?, body);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn an_enrolled_root_requires_its_original_vault_and_a_withdrawn_slot_stays_closed()

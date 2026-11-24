@@ -2,11 +2,15 @@ use std::time::Duration;
 
 use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest};
 use rtdb_plan::Catalog;
-use rtdb_storage::cache::CacheBudget;
+use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+
+#[path = "held_overlay_merge.rs"]
+mod overlay_merge;
+
 use crate::archive::read_world::{ArchiveLifetimeRead, CheckpointPoint, read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
 
 #[derive(Clone)]
@@ -29,44 +33,67 @@ impl rtdb_node::WorldConstraintArchive for WorldArchive {
         let world = check.world;
         let pin = Uuid::from_bytes(world.pin.0);
         let retained = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
-        if retained.ancestor.is_some() || world.ancestor.is_some()
-            || retained.world.as_bytes() != &world.id.0
-            || retained.owner != check.owner
-            || retained.capture.as_bytes() != &world.capture.0
-            || retained.suffix.map(|suffix| Iid(*suffix.as_bytes())) != world.suffix
-            || retained.manifest_sha256 != world.manifest
-            || retained.schema_digest != world.schemas.digest()
-            || retained.basis != world.basis
-            || retained.parent_publication != world.parent_publication
-            || retained.mode != world.mode
-            || retained.until != world.until
+        if retained.owner != check.owner || !matches_retention(world, retained)
             || check.ordered >= retained.until
         {
             return Err(unavailable());
         }
-        let parent = CheckpointReadWorld {
-            deployment: Uuid::parse_str(&installed.id).map_err(|_| unavailable())?,
-            capture: retained.capture,
-            manifest_sha256: retained.manifest_sha256.clone(),
-            suffix: retained.suffix,
-            basis: retained.basis,
-        };
-        admit_capture(&installed, &self.storage, &parent)?;
+        let deployment = Uuid::parse_str(&installed.id).map_err(|_| unavailable())?;
+        let parent = parent_media(deployment, retained);
+        admit_world_media(&installed, &self.storage, deployment, retained)?;
         let resources = CheckpointReadResources {
             node: &self.options, memory: check.memory, cache: Arc::clone(&check.cache), cancellation: check.cancellation,
         };
-        with_checkpoint_context(
+        let ancestor = retained.ancestor.as_ref();
+        let placement = check.placement;
+        let guard = |current: &DeploymentRecord| {
+            let current_pin = current.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
+            if current_pin != retained
+                || PlacedAttemptScope::new(&current.stream("replica"), current.epoch)? != placement
+                || now() >= current_pin.until
+            {
+                return Err(unavailable());
+            }
+            admit_world_media(current, &self.storage, deployment, current_pin)
+        };
+        guard(&installed)?;
+        let result = with_checkpoint_context(
             self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
-            &parent, resources, |context| check.validate(context),
-        ).await
+            &parent, resources.clone(), |context| async move {
+                let Some(ancestor) = ancestor else { return check.validate(context).await; };
+                let media = ancestor_media(deployment, ancestor);
+                with_checkpoint_context(
+                    self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
+                    &media, resources, |frozen| async move {
+                        let (overlay, shadow) = {
+                            let relation = check.relation();
+                            let schema = world.schemas.relation(relation).ok_or_else(unavailable)?;
+                            let layer = InheritedRelation::open(
+                                Arc::clone(&context), frozen, check.owner, relation, ancestor, schema, check.memory,
+                            ).await?;
+                            (layer.overlay, layer.shadow)
+                        };
+                        check.validate_layers(context, &[(overlay, shadow)]).await
+                    },
+                ).await
+            },
+        ).await;
+        let current = self.directory.deployment(&installed.id).await?.ok_or_else(unavailable)?;
+        guard(&current)?;
+        result
     }
 }
 
 pub(crate) struct HeldCheckpointWorld {
     open: OpenWorld,
     memory: Arc<MemoryBudget>,
-    requests: mpsc::Sender<ArchiveRead>,
+    requests: mpsc::Sender<ArchiveRequest>,
     cancellation: CancellationToken,
+}
+
+struct ArchiveRequest {
+    operation: ArchiveRead,
+    plaintext: PlaintextScopes,
 }
 
 struct ArchivePoint {
@@ -261,6 +288,11 @@ pub(crate) struct WorldIdentityPage {
 }
 
 impl HeldCheckpointWorld {
+    async fn send_archive(&self, operation: ArchiveRead) -> Result<()> {
+        self.requests.send(ArchiveRequest { operation, plaintext: PlaintextScopes::capture() })
+            .await.map_err(|_| OwnedWorld::unavailable())
+    }
+
     pub fn present(&self) -> TransactionKey { self.open.snapshot.present() }
 
     pub fn application_publication(&self) -> Option<(Timestamp, Timestamp)> {
@@ -299,6 +331,16 @@ impl HeldCheckpointWorld {
     pub fn ancestor(&self) -> Option<(Iid, Timestamp)> {
         self.open.record.ancestor.as_ref().map(|ancestor| (Iid(ancestor.world), ancestor.system))
     }
+    fn uses_frozen_overlay(&self, system: Option<Timestamp>) -> bool {
+        self.ancestor().is_some_and(|(_, inherited)| {
+            !self.clock_mode().is_writable() || system.is_some_and(|system| system <= inherited)
+        })
+    }
+
+    fn frozen_system(&self, system: Option<Timestamp>) -> Option<Timestamp> {
+        system.filter(|system| self.uses_frozen_overlay(Some(*system)))
+    }
+
     pub fn parent_pin(&self) -> Iid { self.open.record.pin }
     pub fn until(&self) -> Timestamp { self.open.retained.until }
     pub fn evidence_until(&self) -> Timestamp { self.open.snapshot.evidence_until().min(self.until()) }
@@ -322,6 +364,9 @@ impl HeldCheckpointWorld {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(relations)?;
         if let Some((_, system)) = self.ancestor() {
+            if !self.clock_mode().is_writable() || after < system {
+                return Err(OwnedWorld::unavailable());
+            }
             self.preflight_accepted_scope(relations, system).await?;
         } else {
             self.require_accepted_archive_scope(relations).await?;
@@ -336,7 +381,7 @@ impl HeldCheckpointWorld {
         &self, frontiers: Vec<(OwnedRelation, i64)>, guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
     ) -> Result<()> {
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Coverage {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Coverage {
             frontiers, guard, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
@@ -349,26 +394,36 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn point(&self, relation: &OwnedRelation, id: &EntityId, valid_at: Timestamp, observed: bool) -> Result<WorldPoint> {
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(None) {
             return self.ancestor_point(relation, id, valid_at, observed).await;
         }
         self.check_relation(relation)?;
         let (local, witness) = self.open.read_local(relation, id, valid_at, &self.memory, observed).await?;
-        let shadowed = local.is_some();
-        let fact = if let Some(fact) = local {
-            fact
-        } else {
-            self.archive_point(relation, id, valid_at, None).await?
-        };
+        let (fact, shadowed) = self.resolve_local(relation, id, valid_at, local, None).await?;
         self.check_relation(relation)?;
         Ok(WorldPoint { present: self.present(), fact, until: None, shadowed, witness })
+    }
+
+    async fn resolve_local(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
+        local: Option<Option<WorldFact>>, schema: Option<&rtdb_types::OwnedSchema>,
+    ) -> Result<(Option<WorldFact>, bool)> {
+        let inherited = if self.ancestor().is_some() {
+            let point = self.ancestor_point(relation, id, valid, false).await?;
+            Some((point.fact, point.shadowed))
+        } else { None };
+        match (local, inherited) {
+            (Some(fact), _) => Ok((fact, true)),
+            (None, Some(inherited)) => Ok(inherited),
+            (None, None) => Ok((self.archive_point_checked(relation, id, valid, None, schema).await?, false)),
+        }
     }
 
     pub async fn path_touch(
         &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
         group: Timestamp, valid: Timestamp, images: bool,
     ) -> Result<[(Option<WorldFact>, bool); 2]> {
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(Some(group)) {
             let (result, _) = self.read_ancestor(relation, AncestorRead::PathTouch {
                 id: id.clone(), path: path.clone(), group, valid, images,
             }).await?;
@@ -390,11 +445,11 @@ impl HeldCheckpointWorld {
             if images && index == 1 && local.as_ref().is_none_or(|fact| fact.revision != group) {
                 return Err(OwnedWorld::unavailable());
             }
-            let shadowed = local.is_some();
-            let mut fact = match local {
-                Some(fact) => self.open.local_fact(relation, fact).await?,
-                None => self.archive_point(relation, id, valid, None).await?,
+            let local = match local {
+                Some(fact) => Some(self.open.local_fact(relation, fact).await?),
+                None => None,
             };
+            let (mut fact, shadowed) = self.resolve_local(relation, id, valid, local, None).await?;
             if let Some(fact) = &mut fact {
                 if !fact.row.contains_key("_id") { return Err(OwnedWorld::unavailable()); }
                 if images {
@@ -417,7 +472,7 @@ impl HeldCheckpointWorld {
     ) -> Result<()> {
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::PathColumns {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::PathColumns {
             relation: relation.clone(), path: path.clone(), expected_schema: expected_schema.cloned(), guard, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let parent_columns = self.cancellation.run_until_cancelled(result).await
@@ -434,7 +489,10 @@ impl HeldCheckpointWorld {
     pub async fn preflight_accepted_scope(&self, relations: &[OwnedRelation], system: Timestamp) -> Result<Timestamp> {
         self.check()?;
         if let Some(ancestor) = &self.open.record.ancestor {
-            return self.archived_accepted_clock(relations, system).await?.reading(ancestor, system);
+            if self.uses_frozen_overlay(Some(system)) {
+                return self.archived_accepted_clock(relations, system).await?.reading(ancestor, system);
+            }
+            self.archived_accepted_clock(relations, ancestor.system).await?;
         }
         let clock = self.open.snapshot.certify_world_accepted_scope(&self.open.record, relations, system).await?;
         self.require_accepted_archive_scope(relations).await?;
@@ -462,6 +520,16 @@ impl HeldCheckpointWorld {
         -> Result<Option<(Timestamp, Timestamp)>> {
         self.check()?;
         if self.ancestor().is_some() {
+            if self.clock_mode().is_writable() && requested > self.initial_clock()
+                && let Some((system, reading)) = self.open.snapshot.select_world_accepted_scope(
+                    &self.open.record, relations, requested,
+                ).await?
+            {
+                if self.preflight_accepted_scope(relations, system).await? != reading {
+                    return Err(OwnedWorld::unavailable());
+                }
+                return Ok(Some((system, reading)));
+            }
             let first = relations.first().ok_or_else(OwnedWorld::unavailable)?;
             let (result, _) = self.read_ancestor(first, AncestorRead::SelectClock(requested)).await?;
             let AncestorResult::SelectedClock(selected) = result else { return Err(OwnedWorld::unavailable()); };
@@ -486,7 +554,7 @@ impl HeldCheckpointWorld {
             schemas.push((relation.clone(), schema.clone()));
         }
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::AcceptedScope {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::AcceptedScope {
             schemas, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
@@ -512,7 +580,7 @@ impl HeldCheckpointWorld {
             if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         }
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentAsOf {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentAsOf {
             requested, schemas, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let selected = self.cancellation.run_until_cancelled(result).await
@@ -533,7 +601,7 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, system).await?;
         let valid = Interval::at(valid)?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentPointAt {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentPointAt {
             system, point: ArchivePoint {
                 relation: relation.clone(), id: id.clone(), valid, lifetime: None,
                 expected_schema: Some(schema.clone()), guard: Arc::clone(&guard), reply,
@@ -560,7 +628,7 @@ impl HeldCheckpointWorld {
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, system).await?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentScheduleAt {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentScheduleAt {
             relation: relation.clone(), id: id.clone(), system, valid, schema, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let schedule = self.cancellation.run_until_cancelled(result).await
@@ -582,7 +650,7 @@ impl HeldCheckpointWorld {
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, before).await?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentTouchImagesAt {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentTouchImagesAt {
             relation: relation.clone(), path: path.clone(), id: id.clone(), selected, before, group,
             valid, images, schema, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -606,7 +674,7 @@ impl HeldCheckpointWorld {
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentChangesAt {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentChangesAt {
             relation: relation.clone(), selected, after, through, limit, reverse, schema, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
@@ -642,7 +710,7 @@ impl HeldCheckpointWorld {
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, request.system.lower()).await?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::ParentVersionsAt {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentVersionsAt {
             relation: relation.clone(), id: id.clone(), selected, request, schema, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
@@ -662,7 +730,7 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
         system: Timestamp,
     ) -> Result<(Option<WorldFact>, bool)> {
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(Some(system)) {
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::Point {
                 id: id.clone(), valid: Interval::at(valid)?,
             }, Some(system)).await?;
@@ -687,11 +755,11 @@ impl HeldCheckpointWorld {
     ) -> Result<(Option<WorldFact>, bool)> {
         let local = cut.shadow(id, valid).await?;
         let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
-        let shadowed = local.is_some();
-        let fact = match local {
-            Some(fact) => self.open.local_fact(relation, fact).await?,
-            None => self.archive_point_checked(relation, id, valid, None, Some(schema)).await?,
+        let local = match local {
+            Some(fact) => Some(self.open.local_fact(relation, fact).await?),
+            None => None,
         };
+        let (fact, shadowed) = self.resolve_local(relation, id, valid, local, Some(schema)).await?;
         if let Some(fact) = &fact {
             let upper = if shadowed { cut.system_time() } else { self.parent_basis().system_time };
             if fact.revision > upper { return Err(OwnedWorld::unavailable()); }
@@ -724,7 +792,7 @@ impl HeldCheckpointWorld {
                 self.open.snapshot.relation_release_guard([relation])?,
         };
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ancestor {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Ancestor {
             relation: relation.clone(), read, selected, schema, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let read = self.cancellation.run_until_cancelled(result).await
@@ -822,7 +890,7 @@ impl HeldCheckpointWorld {
         let valid = Interval::at(valid_at)?;
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, self.open.retained.basis.system_time).await?;
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Point(ArchivePoint {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Point(ArchivePoint {
             relation: relation.clone(), id: id.clone(), valid, lifetime, expected_schema: expected_schema.cloned(), guard, reply,
         }))).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         self.cancellation.run_until_cancelled(result).await
@@ -898,7 +966,7 @@ impl HeldCheckpointWorld {
             }).collect::<Result<Vec<_>>>()?;
             Some((system, schemas))
         } else { None };
-        let ancestor_system = earlier.filter(|(_, parent_only)| !parent_only).map(|(system, _)| system);
+        let ancestor_system = self.frozen_system(earlier.filter(|(_, parent_only)| !parent_only).map(|(system, _)| system));
         let ancestor_schemas = if self.ancestor().is_some() && parent_at.is_none()
             && !earlier.is_some_and(|(_, parent_only)| parent_only)
         {
@@ -913,7 +981,8 @@ impl HeldCheckpointWorld {
         };
         let historical = parent_at.is_some();
         let writable = self.clock_mode().is_writable();
-        let use_overlay = writable && !historical && !earlier.is_some_and(|(_, parent_only)| parent_only);
+        let use_overlay = writable && !historical
+            && !earlier.is_some_and(|(system, parent_only)| parent_only || self.uses_frozen_overlay(Some(system)));
         let columns = if use_overlay || earlier.is_some() {
             self.search_columns(&partitions, &frontiers, &guard).await?
         } else {
@@ -930,7 +999,7 @@ impl HeldCheckpointWorld {
             None
         };
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Search {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Search {
             partitions, frontiers, query, overlay,
             ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1001,7 +1070,7 @@ impl HeldCheckpointWorld {
         guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>,
     ) -> Result<Vec<String>> {
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::SearchColumns {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::SearchColumns {
             partitions: partitions.to_vec(), frontiers: frontiers.to_vec(), guard: Arc::clone(guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let columns = self.cancellation.run_until_cancelled(result).await
@@ -1031,7 +1100,7 @@ impl HeldCheckpointWorld {
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>, valid: Timestamp,
     ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
         self.check_relation(&relation)?;
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(None) {
             return self.ancestor_overlay_range(&relation, path, request, valid, None).await;
         }
         if !self.clock_mode().is_writable() { return Err(OwnedWorld::unavailable()); }
@@ -1039,7 +1108,11 @@ impl HeldCheckpointWorld {
         let witness = self.open.snapshot.world_relation_witnesses(world, [&relation])
             .await?.pop().ok_or_else(OwnedWorld::unavailable)?;
         self.require_overlay_coverage(&relation, &witness).await?;
-        let page = self.open.snapshot.range_world_overlay(world, &relation, &path, request, valid).await?;
+        let page = if self.ancestor().is_some() {
+            self.merged_overlay_range(&relation, &path, request, valid, None).await?
+        } else {
+            self.open.snapshot.range_world_overlay(world, &relation, &path, request, valid).await?
+        };
         self.check_relation(&relation)?;
         Ok((page, witness))
     }
@@ -1048,14 +1121,18 @@ impl HeldCheckpointWorld {
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>,
         valid: Timestamp, system: Timestamp,
     ) -> Result<OwnedRangePage> {
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(Some(system)) {
             return self.ancestor_overlay_range(&relation, path, request, valid, Some(system))
                 .await.map(|(page, _)| page);
         }
         self.check_relation(&relation)?;
         let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, &relation, system).await?;
         self.require_accepted_archive_scope(std::slice::from_ref(&relation)).await?;
-        let page = cut.overlay_range(&path, request, valid).await?;
+        let page = if self.ancestor().is_some() {
+            self.merged_overlay_range(&relation, &path, request, valid, Some(&cut)).await?
+        } else {
+            cut.overlay_range(&path, request, valid).await?
+        };
         let columns = page.schema.fields().iter().map(|field| field.name().clone()).collect::<Vec<_>>();
         self.require_parent_path(&relation, &path, &columns, None).await?;
         self.check_relation(&relation)?;
@@ -1144,7 +1221,7 @@ impl HeldCheckpointWorld {
             (witness, None)
         };
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Ordered {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Ordered {
             relation, path, frontier: witness.purge_frontier(), lower: lower.cloned(), upper: upper.cloned(),
             valid, earlier, read, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1158,9 +1235,9 @@ impl HeldCheckpointWorld {
     pub async fn version(
         &self, relation: &OwnedRelation, id: &EntityId, from: Timestamp, through: Timestamp, group: Timestamp,
     ) -> Result<(Timestamp, Vec<(Interval, WorldFact, bool)>)> {
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(Some(group)) {
             let (result, _) = self.read_ancestor(relation, AncestorRead::Version {
-                id: id.clone(), from, through, group,
+                id: id.clone(), from, through: self.ancestor().map_or(through, |(_, cap)| through.min(cap)), group,
             }).await?;
             let AncestorResult::Version(clock, spans) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok((clock, spans));
@@ -1179,7 +1256,7 @@ impl HeldCheckpointWorld {
         let version = self.open.snapshot.world_version(self.open.record.id, relation, id, from, through, group).await?;
         let valid = Interval::ALL;
         let local = read_boundaries(version.boundaries().await?, valid).await?;
-        let parent = self.archive_boundaries(relation, id, valid, Some(schema.clone())).await?;
+        let parent = self.inherited_boundaries(relation, id, valid, Some(schema.clone())).await?;
         let boundaries = merge_boundaries(parent, local, valid)?;
         let mut bytes = 0usize;
         let mut slices = Vec::with_capacity(boundaries.len().saturating_sub(1));
@@ -1188,11 +1265,11 @@ impl HeldCheckpointWorld {
             guard()?;
             let local = version.shadow_at(window[0]).await?;
             let local = decode_point(local.row.into_iter().collect(), id, &self.memory, None)?;
-            let shadowed = local.is_some();
-            let fact = match local {
-                Some(fact) => self.open.local_fact(relation, fact).await?,
-                None => self.archive_point(relation, id, window[0], None).await?,
+            let local = match local {
+                Some(fact) => Some(self.open.local_fact(relation, fact).await?),
+                None => None,
             };
+            let (fact, shadowed) = self.resolve_local(relation, id, window[0], local, Some(schema)).await?;
             if let Some(fact) = fact {
                 if fact.revision > group { return Err(OwnedWorld::unavailable()); }
                 schema.validate_row(&fact.row)?;
@@ -1206,11 +1283,22 @@ impl HeldCheckpointWorld {
         Ok((clock, slices))
     }
 
+    async fn inherited_boundaries(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, schema: Option<rtdb_types::OwnedSchema>,
+    ) -> Result<Vec<Timestamp>> {
+        if self.ancestor().is_none() {
+            return self.archive_boundaries(relation, id, valid, schema).await;
+        }
+        let (result, _) = self.read_ancestor(relation, AncestorRead::Schedule { id: id.clone(), valid }).await?;
+        let AncestorResult::Schedule(timeline) = result else { return Err(OwnedWorld::unavailable()); };
+        Ok(timeline.into_iter().flat_map(|(span, _)| [span.lower(), span.upper()]).collect())
+    }
+
     async fn archive_boundaries(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Interval, expected_schema: Option<rtdb_types::OwnedSchema>,
     ) -> Result<Vec<Timestamp>> {
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Boundaries {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Boundaries {
             relation: relation.clone(), id: id.clone(), valid, expected_schema,
             guard: self.open.snapshot.relation_release_guard([relation])?, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1237,8 +1325,8 @@ impl HeldCheckpointWorld {
     ) -> Result<(Vec<(Interval, Timestamp)>, Option<OwnedWorldWitness>)> {
         self.check_relation(relation)?;
         if valid.is_empty() { return Err(OwnedWorld::unavailable()); }
-        if self.ancestor().is_some() {
-            let (result, witness) = self.read_ancestor_at(relation, AncestorRead::Schedule { id: id.clone(), valid }, system).await?;
+        if self.ancestor().is_some() && (parent_only || self.uses_frozen_overlay(system)) {
+            let (result, witness) = self.read_ancestor_at(relation, AncestorRead::Schedule { id: id.clone(), valid }, self.frozen_system(system)).await?;
             let AncestorResult::Schedule(timeline) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok((timeline, Some(witness)));
         }
@@ -1263,7 +1351,7 @@ impl HeldCheckpointWorld {
             let scan = self.open.snapshot.open_world_shadow_boundaries(self.open.record.id, relation, id, valid).await?;
             read_boundaries(scan, valid).await?
         };
-        let parent = self.archive_boundaries(relation, id, valid, earlier.as_ref().map(|(_, schema)| (**schema).clone())).await?;
+        let parent = self.inherited_boundaries(relation, id, valid, earlier.as_ref().map(|(_, schema)| (**schema).clone())).await?;
         let boundaries = merge_boundaries(parent, local, valid)?;
         let mut visible = Vec::with_capacity(boundaries.len().saturating_sub(1));
         for window in boundaries.windows(2) {
@@ -1295,7 +1383,7 @@ impl HeldCheckpointWorld {
     pub async fn identity_page(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
     ) -> Result<WorldIdentityPage> {
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(None) {
             Interval::at(valid)?;
             if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
             let (result, _) = self.read_ancestor(relation, AncestorRead::Identities {
@@ -1319,7 +1407,7 @@ impl HeldCheckpointWorld {
         {
             return Err(OwnedWorld::unavailable());
         }
-        if self.ancestor().is_some() && !parent_only {
+        if self.uses_frozen_overlay(Some(system)) && !parent_only {
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::Identities {
                 valid, after: after.map(str::to_owned), limit,
             }, Some(system)).await?;
@@ -1367,7 +1455,7 @@ impl HeldCheckpointWorld {
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         let (reply, result) = oneshot::channel();
-        self.cancellation.run_until_cancelled(self.requests.send(ArchiveRead::Identities {
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Identities {
             relation: relation.clone(), at: valid, after: after.map(str::to_owned), fetch, earlier,
             guard: self.open.snapshot.relation_release_guard([relation])?, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1396,9 +1484,17 @@ impl HeldCheckpointWorld {
             } else {
                 self.open.snapshot.world_identity_candidates(self.open.record.id, relation, valid, after, FETCH).await?
             };
-            let parent = self.archive_identity_candidates(relation, valid, after, FETCH, None).await?;
+            let (parent, _parent_charges) = if self.ancestor().is_some() {
+                let (result, _) = self.read_ancestor(relation, AncestorRead::Identities {
+                    valid, after: after.map(str::to_owned), limit: FETCH,
+                }).await?;
+                let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
+                (page.keys, page.reservations)
+            } else {
+                self.archive_identity_candidates(relation, valid, after, FETCH, None).await?.into_parts()
+            };
 
-            let (candidates, through) = identity_candidates(&parent.keys, &local.keys, FETCH);
+            let (candidates, through) = identity_candidates(&parent, &local.keys, FETCH);
             for key in candidates {
                 let id = EntityId::String(key.clone());
                 let shadow = if let Some(cut) = cut {
@@ -1413,7 +1509,7 @@ impl HeldCheckpointWorld {
                 let visible = match shadow {
                     Some(visible) => visible,
                     None => {
-                        if local.keys.binary_search(key).is_ok() || parent.keys.binary_search(key).is_err() {
+                        if local.keys.binary_search(key).is_ok() || parent.binary_search(key).is_err() {
                             return Err(OwnedWorld::unavailable());
                         }
                         self.open.snapshot.check_point_purge_floor(relation, &id, self.open.retained.basis.system_time).await?;
@@ -1449,7 +1545,7 @@ impl HeldCheckpointWorld {
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(None) {
             Interval::at(valid)?;
             let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
                 valid, after: after.map(str::to_owned), limit,
@@ -1467,7 +1563,7 @@ impl HeldCheckpointWorld {
         let candidates = self.open.snapshot.world_identity_candidates(
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;
-        self.finish_overlay_identities(relation, candidates, limit)
+        self.merge_overlay_identities(relation, valid, after, limit, candidates).await
     }
 
     pub async fn overlay_identities_at(
@@ -1475,7 +1571,7 @@ impl HeldCheckpointWorld {
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
-        if self.ancestor().is_some() {
+        if self.uses_frozen_overlay(Some(system)) {
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::OverlayIdentities {
                 valid, after: after.map(str::to_owned), limit,
             }, Some(system)).await?;
@@ -1485,7 +1581,29 @@ impl HeldCheckpointWorld {
         let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
         self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
         let candidates = cut.overlay_identities(valid, after, limit + 1).await?;
-        self.finish_overlay_identities(relation, candidates, limit)
+        self.merge_overlay_identities(relation, valid, after, limit, candidates).await
+    }
+
+    async fn merge_overlay_identities(
+        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        local: rtdb_query::OwnedIdentityCandidates,
+    ) -> Result<WorldIdentityPage> {
+        if self.ancestor().is_none() {
+            return self.finish_overlay_identities(relation, local, limit);
+        }
+        let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
+            valid, after: after.map(str::to_owned), limit,
+        }).await?;
+        let AncestorResult::Identities(mut inherited) = result else { return Err(OwnedWorld::unavailable()); };
+        let (keys, reservations) = local.into_parts();
+        inherited.keys.extend(keys);
+        inherited.reservations.extend(reservations);
+        inherited.keys.sort_unstable();
+        inherited.keys.dedup();
+        inherited.more |= inherited.keys.len() > limit;
+        inherited.keys.truncate(limit);
+        self.check_relation(relation)?;
+        Ok(inherited)
     }
 
     fn finish_overlay_identities(
@@ -1818,6 +1936,7 @@ impl<'a> InheritedRelation<'a> {
             *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
             for key in &page.keys {
                 let id = EntityId::String(key.clone());
+                if corpus.contains_shadow(partition, &id) { continue; }
                 let shadow = self.shadow(&id, instant).await?.ok_or_else(unavailable)?;
                 let text = shadow.as_ref().map(|row| search_text(row, &column)).transpose()?.flatten();
                 corpus.shadow(partition, id, text)?;
@@ -2036,6 +2155,19 @@ async fn read_boundaries(cursor: Option<rtdb_query::QueryCursor>, valid: Interva
     Ok(boundaries)
 }
 
+async fn send_archive_answer<T>(plaintext: &PlaintextView, reply: oneshot::Sender<Result<T>>, answer: Result<T>) {
+    if reply.is_closed() { return; }
+    let _grant = if answer.is_ok() {
+        match plaintext.grant().await {
+            Ok(grant) => Some(grant),
+            Err(error) => { let _ = reply.send(Err(error)); return; }
+        }
+    } else {
+        None
+    };
+    let _ = reply.send(answer);
+}
+
 impl Drop for HeldCheckpointWorld {
     fn drop(&mut self) { self.close(); }
 }
@@ -2057,7 +2189,7 @@ pub(crate) async fn open_held_checkpoint_world(
     let opening = cancellation.clone().drop_guard();
     let worker = cancellation.clone();
     let backing_memory = Arc::clone(&memory);
-    let (requests, mut pending) = mpsc::channel::<ArchiveRead>(1);
+    let (requests, mut pending) = mpsc::channel::<ArchiveRequest>(1);
     let (ready, opened) = oneshot::channel();
     tokio::spawn(async move {
         let timer = worker.clone();
@@ -2079,6 +2211,7 @@ pub(crate) async fn open_held_checkpoint_world(
                     let scope = &worker;
                     let memory = &backing_memory;
                     async move {
+                        let dependencies = PlaintextDependencies::capture(memory)?;
                         if scope.is_cancelled() || tokio::time::Instant::now() >= deadline
                             || opened.send(Ok(())).is_err()
                         {
@@ -2089,7 +2222,17 @@ pub(crate) async fn open_held_checkpoint_world(
                                 _ = scope.cancelled() => break,
                                 point = pending.recv() => match point { Some(point) => point, None => break },
                             };
-                            match request {
+                            let ArchiveRequest { operation, plaintext: caller } = request;
+                            let plaintext = PlaintextView::new(Arc::clone(memory));
+                            macro_rules! scoped_read {
+                                ($read:expr) => {
+                                    caller.reading(plaintext.reading(async {
+                                        dependencies.admit()?;
+                                        $read.await
+                                    }))
+                                };
+                            }
+                            match operation {
                                 ArchiveRead::Ancestor { relation, read, selected, schema, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
@@ -2151,15 +2294,17 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::Coverage { frontiers, guard, reply } => {
-                                    let coverage = guard().and_then(|()| check_archive_coverage(
-                                        &context, &owner, frontiers.iter().map(|(relation, frontier)| (relation, *frontier)),
-                                    ));
-                                    let _ = reply.send(coverage);
+                                    let coverage = scoped_read!(async {
+                                        guard().and_then(|()| check_archive_coverage(
+                                            &context, &owner, frontiers.iter().map(|(relation, frontier)| (relation, *frontier)),
+                                        ))
+                                    }).await;
+                                    send_archive_answer(&plaintext, reply, coverage).await;
                                 }
                                 ArchiveRead::ParentAsOf { requested, schemas, guard, mut reply } => {
                                     let read = async {
@@ -2171,9 +2316,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::ParentScheduleAt { relation, id, system, valid, schema, guard, mut reply } => {
                                     let read = async {
@@ -2205,9 +2350,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::ParentTouchImagesAt { relation, path, id, selected, before, group, valid, images, schema, guard, mut reply } => {
                                     let read = async {
@@ -2278,9 +2423,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::ParentChangesAt { relation, selected, after, through, limit, reverse, schema, guard, mut reply } => {
                                     let read = async {
@@ -2292,9 +2437,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::ParentVersionsAt { relation, id, selected, request, schema, guard, mut reply } => {
                                     let read = async {
@@ -2336,9 +2481,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::ParentPointAt { system, point } => {
                                     let ArchivePoint { relation, id, valid, guard, expected_schema, mut reply, .. } = point;
@@ -2356,9 +2501,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::AcceptedScope { schemas, guard, mut reply } => {
                                     let read = async {
@@ -2377,9 +2522,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::PathColumns { relation, path, expected_schema, guard, mut reply } => {
                                     let read = async {
@@ -2396,9 +2541,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::Point(ArchivePoint { relation, id, valid, lifetime, expected_schema, guard, mut reply }) => {
                                     let read = async {
@@ -2417,9 +2562,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::Search { partitions, frontiers, query, overlay, ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard, mut reply } => {
                                     let read = async {
@@ -2439,15 +2584,18 @@ pub(crate) async fn open_held_checkpoint_world(
                                                 CheckpointReadResources {
                                                     node: &archive.options, memory, cache: Arc::clone(&ancestor_cache), cancellation: scope,
                                                 },
-                                                |overlay| {
-                                                    let overlay = overlay.with_owned_read_guard(Arc::clone(&guard));
+                                                |archived| {
+                                                    let archived = archived.with_owned_read_guard(Arc::clone(&guard));
                                                     let (root, owner, partitions, query) = (&scoped, &owner, &partitions, &query);
                                                     async move {
-                                                        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(memory), query)?;
+                                                        let mut corpus = match overlay {
+                                                            Some(corpus) => corpus,
+                                                            None => rtdb_node::HeldTextCorpus::new(Arc::clone(memory), query)?,
+                                                        };
                                                         let mut remaining = 4096;
                                                         for (index, ((relation, path), schema)) in partitions.iter().zip(schemas).enumerate() {
                                                             let inherited = InheritedRelation::open(
-                                                                Arc::clone(root), Arc::clone(&overlay), owner, relation, ancestor, &schema, memory,
+                                                                Arc::clone(root), Arc::clone(&archived), owner, relation, ancestor, &schema, memory,
                                                             ).await?.at(ancestor_system).await?;
                                                             inherited.search_shadows(path, index, valid, &mut corpus, &mut remaining).await?;
                                                         }
@@ -2466,9 +2614,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::SearchColumns { partitions, frontiers, guard, mut reply } => {
                                     let read = async {
@@ -2488,9 +2636,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::Ordered { relation, path, frontier, lower, upper, valid, earlier, read, guard, mut reply } => {
                                     let read = async {
@@ -2526,9 +2674,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::Boundaries { relation, id, valid, expected_schema, guard, mut reply } => {
                                     let read = async {
@@ -2549,9 +2697,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                                 ArchiveRead::Identities { relation, at, after, fetch, earlier, guard, mut reply } => {
                                     let read = async {
@@ -2568,9 +2716,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let response = tokio::select! {
                                         _ = scope.cancelled() => break,
                                         _ = reply.closed() => continue,
-                                        result = read => result,
+                                        result = scoped_read!(read) => result,
                                     };
-                                    let _ = reply.send(response);
+                                    send_archive_answer(&plaintext, reply, response).await;
                                 }
                             }
                         }

@@ -27,10 +27,15 @@ impl OpenTransaction<'_> {
     /// The predecessor belongs to this installed history, including any staged transactions.
     pub(super) async fn observe_retention_clock(&self, appended: Timestamp) -> Result<RetentionClock> {
         let snapshot = self.buffer.base_snapshot();
-        let Some(predecessor) = snapshot.tx_basis() else { return Ok(RetentionClock::observe(None, appended)); };
+        let Some(predecessor) = snapshot.tx_basis() else {
+            return Ok(RetentionClock::observe(None, self.decision.map_or(appended, |sample| sample.instant)));
+        };
         let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let previous = installed_receipt_time(context, predecessor).await?;
-        Ok(RetentionClock::observe(previous, appended))
+        Ok(match self.decision {
+            Some(sample) => RetentionClock { time: sample.instant, previous },
+            None => RetentionClock::observe(previous, appended),
+        })
     }
 }
 
@@ -51,16 +56,9 @@ pub async fn installed_receipt_time(
         "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE _id = ? AND system_time = ?",
         vec![Value::I64(head.tx_id.0), system_time()],
     ).await?;
-    let exact = match point {
-        Some(clock) => Some(clock),
-        None => read_receipt_clock_row(&context,
-            "SELECT receipt_time FROM xt.txs FOR ALL VALID_TIME WHERE system_time = ?",
-            vec![system_time()],
-        ).await?,
-    };
-    if let Some(Some(exact)) = exact { return Ok(Some(exact)); }
+    if let Some(Some(exact)) = point { return Ok(Some(exact)); }
 
-    // Legacy replay can advance the installed head without a transaction row carrying the clock.
+    // A copied prefix can preserve its transaction row under the original source ID.
     Ok(read_receipt_clock_row(&context,
         "SELECT MAX(receipt_time) FROM xt.txs FOR ALL VALID_TIME WHERE system_time <= ?",
         vec![system_time()],

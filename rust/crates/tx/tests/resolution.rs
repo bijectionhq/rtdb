@@ -15,7 +15,7 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
+    ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> StructFields<Value> { StructFields::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
@@ -45,7 +45,7 @@ async fn a_static_insert_preserves_interleaved_assertion_order_for_one_identity(
 }
 
 #[tokio::test]
-async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_same_time() {
+async fn ordinary_sql_orders_at_a_tied_history_coordinate_after_a_regression() {
     use rtdb_format::envelope::SourceMessage;
 
     let context = context();
@@ -67,20 +67,36 @@ async fn ordinary_sql_asserts_the_ordered_ceiling_and_places_offsets_from_the_sa
         resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(previous), request(vec![], &context), &context).await.unwrap();
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
         let result = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(90), replay(), &context).await.unwrap();
-        assert_eq!(result.result().tx_key().system_time, Timestamp(previous + 1));
-        if previous == 101 {
-            assert_eq!(result.result().error().unwrap().code, "xtdb/assert-failed");
-            assert!(!result.writes().tables().contains_key(&table()));
-            continue;
-        }
+        assert_eq!(result.result().tx_key().system_time, Timestamp(previous));
+        assert_eq!(result.result().tx_key().tx_id.0, 1);
         assert!(result.result().committed(), "{:?}", result.result().error());
         let event = result.writes().tables()[&table()].batch().unwrap().view().read_event(0).unwrap();
-        assert_eq!(event.valid_time, Interval::from_micros(2_000_101, 3_000_101).unwrap());
+        assert_eq!(event.valid_time, Interval::from_micros(2_000_000 + previous, 3_000_000 + previous).unwrap());
         let StoredOperation::Put(row) = event.operation else { panic!("Expected a put"); };
         let Value::Utf8(id) = &row["_id"] else { panic!("Expected an encoded key"); };
-        let expected = Timestamp(1_000_101);
+        let expected = Timestamp(1_000_000 + previous);
         assert_eq!(rtdb_types::parse_sql_timestamp_instant(id.strip_prefix("at-").unwrap(), "UTC").unwrap().as_micros().unwrap(), expected);
         assert_eq!(rtdb_expr::timestamp_micros(&row["v"], "UTC").unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn explicit_system_time_may_tie_and_never_leads_its_original_append() {
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![], &context), &context).await.unwrap();
+    state.apply(first.writes()).unwrap();
+    resolver.take_head().unwrap();
+    for (position, appended, committed) in [(1, 100, true), (2, 99, false)] {
+        let options = SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() };
+        let request = SourceTransaction::new(vec![], options, &context.memory).unwrap();
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(position), Timestamp(appended), request, &context).await.unwrap();
+        assert_eq!(resolved.result().committed(), committed);
+        assert_eq!(resolved.result().tx_key().system_time, Timestamp(100));
+        if !committed { assert_eq!(resolved.result().error().unwrap().code, "rtdb/future-system-time"); }
+        state.apply(resolved.writes()).unwrap();
+        resolver.take_head().unwrap();
     }
 }
 
@@ -214,7 +230,7 @@ async fn external_writer_query_admits_sql_and_reads_its_own_staged_rows() {
             assert_eq!(transaction.open_query(&malformed, Vec::new()).await.err().unwrap(), expected);
             assert_eq!(self.0.used_bytes(), baseline);
 
-            transaction.append(table(), rtdb_format::data::StoredEvent {
+            transaction.append(table(), rtdb_format::data::StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: None,
@@ -787,7 +803,7 @@ async fn a_client_system_time_ahead_of_the_log_is_refused_and_cannot_strand_the_
 }
 
 #[tokio::test]
-async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_projection_advances() {
+async fn explicit_owned_time_keeps_its_append_bound_and_does_not_manufacture_a_successor() {
     use rtdb_format::envelope::{ReplicaBody, SourceMessage};
     use rtdb_types::{OwnedRelation, TxId};
 
@@ -811,10 +827,11 @@ async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_proje
     for (position, sample) in [(0, 100), (1, 100), (2, 99)] {
         let snapshot = state.snapshot();
         let resolved = resolver.resolve_source(snapshot.clone(), SourcePosition(position), Timestamp(sample), owned(sample, position), &context).await.unwrap();
-        assert!(resolved.result().committed(), "{:?}", resolved.result().error());
+        assert_eq!(resolved.result().committed(), position == 0);
+        if position != 0 { assert_eq!(resolved.result().error().unwrap().code, "invalid-system-time"); }
         let key = resolved.result().tx_key();
         assert_eq!(key.tx_id, TxId(position));
-        assert_eq!(key.system_time, Timestamp(100 + position));
+        if position == 0 { assert_eq!(key.system_time, Timestamp(sample)); }
         let body = resolved.to_replica_body(&context.memory).unwrap();
         let ReplicaBody::ResolvedTx(body) = body.body() else { panic!("resolved transaction"); };
         let replay = decode_replica(body, None, snapshot.block_index(), &context.memory).unwrap();
@@ -823,8 +840,8 @@ async fn owned_append_witness_keeps_the_clock_observation_when_the_ordered_proje
         assert!(matches!(row["source_log_time"], Value::Timestamp { value, .. } if value == sample));
         state.apply(resolver.take_head().unwrap().writes()).unwrap();
     }
-    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(97, 3), &context).await.unwrap();
-    assert_eq!(refused.result().error().unwrap().code, "rtdb/ordered-system-time");
+    let refused = resolver.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(98), owned(99, 3), &context).await.unwrap();
+    assert_eq!(refused.result().error().unwrap().code, "rtdb/future-system-time");
 }
 
 #[tokio::test]
@@ -933,7 +950,7 @@ async fn external_event_writer_cannot_erase_private_replay_markers() {
     #[async_trait::async_trait]
     impl TransactionWriter for ExternalWriter {
         async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult> {
-            let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent {
+            let error = transaction.append(TableRef::new("xt", "rtdb_replay_keys"), rtdb_format::data::StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: None,

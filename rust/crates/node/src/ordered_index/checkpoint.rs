@@ -123,33 +123,32 @@ impl Checkpoint {
         let managed = store.index_page_lifecycle();
         if let Some(lifecycle) = managed {
             lifecycle.retire_before(tree.page_scope()).await?;
-        }
-        for object in objects {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
+        } else {
+            for object in objects {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                let Some((scope, _)) = object
+                    .key
+                    .as_str()
+                    .strip_prefix(generations.as_str())
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .and_then(|suffix| suffix.split_once('/'))
+                else {
+                    continue;
+                };
+                let Ok(scope) = u64::from_str_radix(scope, 16) else {
+                    continue;
+                };
+                let block = page_block(&object.key, &prefix);
+                if scope < self.scope
+                    || (block.is_some_and(|block| block <= self.through)
+                        && !reachable.keys.contains(&object.key))
+                {
+                    store.delete(&object.key).await?;
+                    tree.storage.invalidate(&object.key).await?;
+                }
             }
-            let Some((scope, _)) = object
-                .key
-                .as_str()
-                .strip_prefix(generations.as_str())
-                .and_then(|suffix| suffix.strip_prefix('/'))
-                .and_then(|suffix| suffix.split_once('/'))
-            else {
-                continue;
-            };
-            let Ok(scope) = u64::from_str_radix(scope, 16) else {
-                continue;
-            };
-            let block = page_block(&object.key, &prefix);
-            if (managed.is_none() && scope < self.scope)
-                || (block.is_some_and(|block| block <= self.through)
-                    && !reachable.keys.contains(&object.key))
-            {
-                store.delete(&object.key).await?;
-                tree.storage.invalidate(&object.key).await?;
-            }
-        }
-        if managed.is_none() {
             let legacy = key(&tree.directory, "pages")?;
             for object in store.list(Some(&legacy)).await? {
                 if cancellation.is_cancelled() {
@@ -390,8 +389,10 @@ fn manifest_checksum(checkpoint: &Checkpoint) -> Result<[u8; 32]> {
         digest.update(root.measure.count.to_le_bytes());
         digest.update(references::measure_domain_bytes(root.measure.domain));
         digest.update(root.measure.sum);
-        digest.update(first.0.to_le_bytes());
-        digest.update(last.0.to_le_bytes());
+        for revision in [first, last] {
+            digest.update(revision.time.0.to_le_bytes());
+            digest.update(revision.transaction.to_le_bytes());
+        }
     } else {
         digest.update([0]);
     }
@@ -475,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn arrow_checkpoint_reopens_the_json_subtrees_it_keeps() -> Result<()> {
         use rtdb_types::Timestamp;
-        use crate::ordered_index::tree::KeyRef;
+        use crate::ordered_index::tree::{IndexRevision, KeyRef};
 
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let memory = MemoryBudget::new(32 << 20);
@@ -484,7 +485,7 @@ mod tests {
         let token = CancellationToken::new();
         let roots = RevisionRoots {
             archived: None,
-            changes: (0..128).map(|instant| (Timestamp(instant), None)).collect(),
+            changes: (0..128).map(|instant| (IndexRevision { time: Timestamp(10), transaction: instant }, None)).collect(),
         };
         let root = store_roots(&tree, 0, &roots, &token).await?;
         publish(&tree, 0, 128, root, &token).await?;
@@ -492,7 +493,7 @@ mod tests {
         tree.arrow_references = true;
         let legacy = latest(&storage, &directory, &memory, 0).await?.unwrap();
         let mut roots = legacy.roots();
-        roots.changes.insert(Timestamp(128), None);
+        roots.changes.insert(IndexRevision { time: Timestamp(10), transaction: 128 }, None);
         let root = store_roots(&tree, 1, &roots, &token).await?;
         publish(&tree, 1, 129, root, &token).await?;
 
@@ -507,7 +508,8 @@ mod tests {
             let KeyRef::Revision(time) = hit.key() else {
                 panic!("Expected a revision at every key");
             };
-            observed.push(time.0);
+            assert_eq!(time.time, Timestamp(10));
+            observed.push(time.transaction);
         }
         assert_eq!(observed, (0..129).collect::<Vec<_>>());
         Ok(())

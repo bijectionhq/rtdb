@@ -29,6 +29,7 @@ pub(crate) struct WorldReadmission {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RelocatedAncestor {
     pub(crate) original: TransactionKey,
+    pub(crate) selected: TransactionKey,
     pub(crate) retained: OwnedWorldAncestor,
 }
 
@@ -104,6 +105,10 @@ impl WorldReadmission {
             (None, None) => Ok(None),
             (Some(old), Some(relocated))
                 if relocated.original == old.basis
+                    && relocated.selected.system_time == old.system
+                    && relocated.selected.tx_id.0 >= 0
+                    && (relocated.selected == old.basis
+                        || (relocated.selected.tx_id < old.basis.tx_id && old.system < old.basis.system_time))
                     && old.basis.system_time <= self.source_cut
                     && (old.system == old.basis.system_time)
                         == (relocated.retained.system == relocated.retained.basis.system_time)
@@ -290,10 +295,14 @@ mod tests {
             source_cut: Timestamp(90),
             original_parent: world.basis,
             original_until: world.until,
-            ancestor: Some(RelocatedAncestor { original: original.basis, retained: retained.clone() }),
+            ancestor: Some(RelocatedAncestor { original: original.basis, selected: original.basis, retained: retained.clone() }),
         };
         assert_eq!(admission.retained_ancestor(&world)?, Some(&retained));
         let moved = admission.ancestor.as_mut().expect("fixture has a relocated ancestor");
+        moved.selected = position(1, original.system.0);
+        assert!(admission.retained_ancestor(&world).is_err());
+        let moved = admission.ancestor.as_mut().expect("fixture has a relocated ancestor");
+        moved.selected = original.basis;
         moved.retained.source_root = position(101, 110);
         assert!(admission.retained_ancestor(&world).is_err());
         admission.ancestor = None;

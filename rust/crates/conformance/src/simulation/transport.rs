@@ -100,7 +100,7 @@ impl Log for ActorLog {
         let frame = ReplicaEnvelope::decode(&bytes).map_err(|error| Error::Task(error.to_string()))?
             .ok_or_else(|| invalid("missing native replica envelope"))?;
         let claim = frame.term_sequence == Some(TermSequence(0))
-            && matches!(frame.message, ReplicaBody::NoOp(NoOp { src_msg_id: None }));
+            && matches!(frame.message, ReplicaBody::NoOp(NoOp { src_msg_id: None, placed_slot_reservation: None }));
         if !initial {
             return Err(invalid(if claim { "captured peer refuses replica claim" } else { "refused peer attempted an ordinary replica append" }));
         }
@@ -171,7 +171,7 @@ mod tests {
 
     fn claim() -> Bytes {
         ReplicaEnvelope {
-            term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(NoOp { src_msg_id: None }),
+            term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() }),
         }.encode().into()
     }
 

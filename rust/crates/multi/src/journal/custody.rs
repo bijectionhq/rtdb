@@ -4,11 +4,12 @@ mod local;
 
 use super::InstalledJournal;
 use crate::keys::{KeyService, UnitLedger, UnitScope};
-use crate::store::EncryptingStore;
+use crate::store::{EncryptingStore, exact_retirement::installed_object_name};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, Placement, service::Route,
+    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, MAX_OBJECT_REFERENCES,
+    ObjectName, Placement, RequestId, service::Route,
 };
 use ring::digest::{SHA256, digest};
 use rtdb_directory::Checkpoint as RtdbCheckpoint;
@@ -60,25 +61,56 @@ struct Scope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Preparation {
+    pub authority: CheckpointAuthority,
     pub writer: Grant,
     pub base: Checkpoint,
     pub through: Cut,
     pub checkpoint: RtdbCheckpoint,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ErasureBinding {
+    pub operation: Uuid,
+    pub custody_domain: Uuid,
+    pub rotation: RequestId,
+    pub fixed_before_ms: Option<u64>,
+}
+
+impl ErasureBinding {
+    pub(crate) fn descriptor(self) -> Result<Fingerprint> {
+        let mut bytes = b"rtdb.multi/checkpoint-erasure-attempt/v1\0".to_vec();
+        bytes.extend_from_slice(&serde_json::to_vec(&self).map_err(serialization)?);
+        Ok(fingerprint(&bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum CheckpointAuthority {
+    Upload,
+    Erasure(ErasureBinding),
+}
+
 impl Preparation {
     pub fn ordered(self, reservation: Reservation) -> Result<CheckpointPreparation> {
         let root = validate_cut(self.checkpoint, self.through)?;
         let mut descriptor = [0; 32];
-        for (bytes, field) in descriptor.chunks_exact_mut(8).zip([
-            self.checkpoint.block,
-            self.checkpoint.boundary,
-            self.checkpoint.source,
-            self.checkpoint.system_time,
-        ]) {
-            bytes.copy_from_slice(&field.to_be_bytes());
+        match self.authority {
+            CheckpointAuthority::Upload => {
+                for (bytes, field) in descriptor.chunks_exact_mut(8).zip([
+                    self.checkpoint.block,
+                    self.checkpoint.boundary,
+                    self.checkpoint.source,
+                    self.checkpoint.system_time,
+                ]) {
+                    bytes.copy_from_slice(&field.to_be_bytes());
+                }
+            }
+            CheckpointAuthority::Erasure(binding) => descriptor = binding.descriptor()?,
         }
         Ok(CheckpointPreparation {
+            erasure: matches!(self.authority, CheckpointAuthority::Erasure(_)),
             checkpoint: self.through,
             root,
             source: self.writer,
@@ -90,7 +122,7 @@ impl Preparation {
     }
 
     pub fn recover(chosen: CheckpointPreparation, reservation: Reservation) -> Result<Self> {
-        if chosen.custody != reservation.custody || chosen.usable_bytes != reservation.usable_bytes
+        if chosen.erasure || chosen.custody != reservation.custody || chosen.usable_bytes != reservation.usable_bytes
         {
             return Err(invalid(
                 "The installed provider reservation differs from the ordered preparation",
@@ -112,6 +144,7 @@ impl Preparation {
         };
         validate_cut(checkpoint, chosen.checkpoint)?;
         Ok(Self {
+            authority: CheckpointAuthority::Upload,
             writer: chosen.source,
             base: chosen.base,
             through: chosen.checkpoint,
@@ -136,6 +169,7 @@ struct Manifest {
     revision: u64,
     next_lsn: u64,
     history: Fingerprint,
+    authority: CheckpointAuthority,
     checkpoint: RtdbCheckpoint,
     members: BTreeMap<String, Member>,
 }
@@ -151,6 +185,7 @@ struct Member {
 pub struct OpenedCheckpoint {
     pub checkpoint: RtdbCheckpoint,
     pub store: Arc<dyn ObjectStore>,
+    pub(super) authority: CheckpointAuthority,
 }
 
 impl CheckpointCustody {
@@ -306,19 +341,41 @@ impl CheckpointCustody {
         reservation: &Reservation,
         origin: Preparation,
         source: &dyn ObjectStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<ObjectName>> {
         self.require_provider(reservation.custody)?;
         let budget = Self::copy_budget(reservation)?;
         // A permanent size refusal must precede the first provider effect
         // and the ordered binding of a reservation to a source.
-        let _ = crate::archive::ordered_checkpoint_sources(
+        let members = crate::archive::ordered_checkpoint_sources(
             source,
             origin.checkpoint,
             self.epoch,
             budget,
         )
         .await?;
-        Ok(())
+        let mut references = Vec::with_capacity(members.len().saturating_add(2));
+        let custody = reservation.custody;
+        references.push(self.object_name(&self.intent(custody)?)?);
+        references.push(self.object_name(&self.manifest(custody)?)?);
+        for member in members {
+            references.push(self.object_name(&self.member(custody, &member.name)?)?);
+        }
+        references.sort_unstable();
+        references.dedup();
+        if references.len() > MAX_OBJECT_REFERENCES {
+            return Err(invalid("The checkpoint closure exceeds the journal's object reference bound"));
+        }
+        Ok(references)
+    }
+
+    fn object_name(&self, key: &ObjectKey) -> Result<ObjectName> {
+        if let Some((namespace, name)) = self.bucket.s3_publication_address(key) {
+            return installed_object_name(&namespace, &name);
+        }
+        if self.local.is_some() {
+            return Ok(fingerprint(&serde_json::to_vec(&("local-checkpoint", self.provider, key.as_str())).map_err(serialization)?));
+        }
+        Err(invalid("The checkpoint archive cannot identify an immutable allocation"))
     }
 
     pub(crate) async fn prepared(
@@ -338,7 +395,10 @@ impl CheckpointCustody {
             manifest: fingerprint(&frame),
             custody: reservation.custody,
         };
-        self.read_manifest(reader.as_ref(), checkpoint).await?;
+        let manifest = self.read_manifest(reader.as_ref(), checkpoint).await?;
+        if origin.authority != manifest.authority {
+            return Err(invalid("The prepared checkpoint has different recovery authority"));
+        }
         Ok(Some(checkpoint))
     }
 
@@ -373,6 +433,7 @@ impl CheckpointCustody {
             revision: custody.revision,
             next_lsn: through.next_lsn,
             history: through.history,
+            authority: origin.authority,
             checkpoint,
             members: BTreeMap::new(),
         };
@@ -422,7 +483,9 @@ impl CheckpointCustody {
         if route.placement != self.placement {
             return Err(invalid("The custodian does not own this checkpoint scope"));
         }
-        self.open(checkpoint).await?;
+        if self.open(checkpoint).await?.authority != CheckpointAuthority::Upload {
+            return Err(invalid("A clean checkpoint must publish and rotate together"));
+        }
         journal.publish(route, checkpoint).await
     }
 
@@ -442,7 +505,7 @@ impl CheckpointCustody {
         // can be opened by this exact manifest before the journal can use it.
         let _ = crate::archive::recovery_manifest_sha256(store.as_ref(), checkpoint, self.epoch)
             .await?;
-        Ok(OpenedCheckpoint { checkpoint, store })
+        Ok(OpenedCheckpoint { checkpoint, store, authority: manifest.authority })
     }
 
     async fn read_manifest(
@@ -628,6 +691,10 @@ impl ExactStore {
 
 #[async_trait]
 impl ObjectStore for ExactStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        let (_, physical) = self.member(key).ok()?;
+        self.bucket.s3_publication_address(&physical)
+    }
     fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         Ok(self.observe_head(key).await?.value)

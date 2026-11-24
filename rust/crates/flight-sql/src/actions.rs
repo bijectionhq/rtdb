@@ -6,18 +6,72 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
-use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
+use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
+
+fn fresh_replica_action(action: &str) -> bool {
+    use crate::owned_actions::*;
+    matches!(action, CLOSE_SESSION
+        | OWNED_SPATIAL_READINESS_V1
+        | OBSERVE_HELD_HOSTED_V1
+        | CONFIRM_APPLIED_HOSTED_V6
+        | READ_HELD_HOSTED_CONTROL_V2
+        | READ_HELD_ROOT_CATALOG_V1
+        | OPEN_OWNED_SCOPED_READ_V2
+        | OPEN_OWNED_READ_AS_OF_V1
+        | OPEN_FRESH_OWNED_READ_V2
+        | SPATIAL_OPEN_OWNED
+        | SPATIAL_RANK_NEXT_OWNED
+        | SPATIAL_NEXT_OWNED
+        | SPATIAL_RANK_OPEN_OWNED
+        | SPATIAL_RANK_OPEN_OWNED_V2
+        | SPATIAL_CLOSE_OWNED
+        | SPATIAL_HELD_OWNED_V1
+        | SPATIAL_HELD_OWNED_V2
+        | SPATIAL_HELD_OWNED_V3
+        | SEARCH_HELD_OWNED_V5
+        | HELD_OWNED_RANGE_V1
+        | HELD_OWNED_RANGE_V2
+        | HELD_OWNED_RANGE_V3
+        | HELD_OWNED_RANGE_V4
+        | HELD_OWNED_COUNT_V1
+        | HELD_OWNED_COUNT_V2
+        | HELD_OWNED_MEASURE_V1
+        | HELD_OWNED_MEASURE_AT_V1
+        | HELD_OWNED_STORAGE_USAGE_V1
+        | HELD_OWNED_MERGED_CHANGES_DESCENDING_V1
+        | HELD_OWNED_MERGED_CHANGES_V3
+        | HELD_OWNED_CHANGES_V3
+        | READ_HELD_UNIQUE_V1
+        | READ_HELD_UNIQUE_WINDOW_V1
+        | HELD_OWNED_POINT_V1
+        | HELD_OWNED_POINT_V2
+        | HELD_OWNED_FIXED_POINT_V1
+        | HELD_PROTECTED_COVERAGE_V1
+        | HELD_OWNED_IDENTITIES_V1
+        | HELD_OWNED_IDENTITIES_ALL_VALID_V1
+        | HELD_OWNED_VERSIONS_V2
+        | HELD_OWNED_PATH_TOUCH_V1
+        | HELD_OWNED_HISTORICAL_POINT_V1
+        | HELD_OWNED_POSITION_POINT_V1
+        | HELD_OWNED_VALID_DURING_V2
+        | HELD_OWNED_VALID_REGION_V1
+        | HELD_OWNED_POSITION_VALID_DURING_V1
+        | CLOSE_OWNED_READ_V1)
+}
 
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V5, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, OPEN_APPLIED_OWNED_READ_V4, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
         use rtdb_storage::audience_work;
+        if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
+            return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
+        }
         let turn = if call.session.audience_source().is_some() {
             let admit = || -> Result<_, Status> {
                 Ok(match action.r#type.as_str() {
                     PREPARE_APPLIED_READ_V3 => call.session.audience_recovery_work(),
-                    OPEN_APPLIED_OWNED_READ_V4 => {
+                    OPEN_APPLIED_OWNED_READ_V5 => {
                         let generation = self.audience_open_generation(&action.body)?;
                         call.session.audience_projection()?;
                         if generation == 1 {
@@ -26,7 +80,7 @@ impl Service {
                             Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS))
                         }
                     },
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V5 =>
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V6 =>
                         Some(self.audience_read_work(&call, &action.r#type, &action.body)?),
                     _ => None,
                 })
@@ -36,14 +90,14 @@ impl Service {
         if let Some(turn) = &turn {
             turn.admit_action().map_err(|error| call.error(Status::resource_exhausted(error.to_string())))?;
         }
-        let work = async {
+        let work = Box::pin(async {
             let action_type = action.r#type.as_str();
             if let Some(source) = call.session.audience_source() {
                 audience_work::decode_bytes(action.encoded_len())
                     .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
-                    PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V4 | CONFIRM_APPLIED_HOSTED_V5 => {}
+                    PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V5 | CONFIRM_APPLIED_HOSTED_V6 => {}
                     HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | READ_HELD_HOSTED_CONTROL_V2 => {
                         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
                         let attachment = attachment.ok_or_else(unsupported)?;
@@ -69,8 +123,10 @@ impl Service {
                 crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered).await?)]),
                 crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
-                crate::owned_actions::CONFIRM_APPLIED_HOSTED_V5 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 => Ok(vec![Ok(Box::pin(self.confirm_hosted_source_action(&call, &action.body)).await?)]),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 => Ok(vec![Ok(Box::pin(self.read_held_root_catalog_action(&call, &action.body)).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V1 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
@@ -78,9 +134,10 @@ impl Service {
                 crate::owned_actions::COMMIT_ORDERED_V1 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Ordered, false).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V4 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped, true).await?)]),
                 crate::owned_actions::COMMIT_OWNED_V7 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_OWNED_SCOPED_READ_V1 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_OWNED_READ_V2 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SPATIAL_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::Open).await?)]),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
                     let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
@@ -96,7 +153,7 @@ impl Service {
                 crate::owned_actions::SPATIAL_HELD_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V2).await?)]),
                 crate::owned_actions::SPATIAL_HELD_OWNED_V3 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V3).await?)]),
                 PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V4 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
@@ -146,7 +203,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_IDENTITIES_ALL_VALID_V1 => Ok(vec![Ok(self.held_owned_identities_all_valid_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
-                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V3 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
+                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V4 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
@@ -167,7 +224,7 @@ impl Service {
                 crate::owned_actions::PREPARE_REPLAY_PARENT_V1 => Ok(vec![Ok(self.prepare_replay_parent_action(&call, &action.body).await?)]),
                 crate::owned_actions::FINISH_REPLAY_PARENTS_V1 => Ok(vec![Ok(self.finish_replay_parents_action(&call, &action.body).await?)]),
                 crate::owned_actions::RETAIN_REPLAYED_WORLD_V3 => Ok(vec![Ok(self.retain_replayed_world_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_WORLD_READ_V4 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_WORLD_READ_V5 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_WORLD_HEAD_V1 => Ok(vec![Ok(self.read_held_world_head_action(&call, &action.body)?)]),
                 crate::owned_actions::SELECT_HELD_WORLD_PARENT_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfParent).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_POINT_AT_V1 => Ok(vec![Ok(self.held_world_point_at_action(&call, &action.body, true).await?)]),
@@ -285,7 +342,7 @@ impl Service {
                 }
                 _ => Err(unsupported()),
             }
-        };
+        });
         let owner = call.audience_io_owner();
         let work = async move {
             match owner {
@@ -294,14 +351,16 @@ impl Service {
                 None => work.await,
             }
         };
-        let results = call.cancellation.run_until_cancelled(work).await.ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
+        let plaintext = rtdb_storage::sealing::PlaintextView::new(Arc::clone(call.memory()));
+        let results = call.cancellation.run_until_cancelled(plaintext.reading(work)).await
+            .ok_or_else(cancelled).and_then(|result| result).map_err(|error| call.error(error))?;
         if call.session.audience_source().is_some()
             && (results.len() > 1 || results.iter().any(|result| result.as_ref().is_ok_and(|reply|
                 reply.encoded_len() > AUDIENCE_REPLY_BYTES)))
         {
             return Err(call.error(Status::resource_exhausted("The audience reply exceeds its transport allowance")));
         }
-        self.publish(); result_stream(call, results)
+        self.publish(); action_result_stream(call, results, plaintext).await
     }
     fn claim_transaction(&self, call: &Call, handle: &Bytes) -> Result<Arc<Transaction>, Status> {
         self.transaction(call, handle)?; found(self.0.transactions.take(handle), "transaction")
@@ -314,3 +373,17 @@ fn pack_as<M: Message>(type_url: &str, value: &M, service: &Service) -> Result<A
     Ok(ActionResult { body: wire::retain(Any { type_url: type_url.into(), value: value.encode_to_vec().into() }.encode_to_vec(), charge) })
 }
 fn raw<M: Message>(value: &M, service: &Service) -> Result<ActionResult, Status> { let charge = service.memory().reserve(wire::add(value.encoded_len(), 256)?).map_err(status)?; Ok(ActionResult { body: wire::retain(value.encode_to_vec(), charge) }) }
+
+#[cfg(test)]
+#[test]
+fn fresh_flight_sessions_admit_only_read_actions() {
+    use crate::owned_actions::*;
+    assert!(fresh_replica_action(OPEN_FRESH_OWNED_READ_V2));
+    assert!(fresh_replica_action(HELD_OWNED_POINT_V2));
+    assert!(fresh_replica_action(READ_HELD_ROOT_CATALOG_V1));
+    assert!(fresh_replica_action(CLOSE_OWNED_READ_V1));
+    assert!(!fresh_replica_action(OPEN_OWNED_READ_V3));
+    assert!(!fresh_replica_action(OFFER_CLOCK_SLOT_V1));
+    assert!(!fresh_replica_action(COMMIT_OWNED_V7));
+    assert!(!fresh_replica_action(DECIDE_HOSTED_V1));
+}

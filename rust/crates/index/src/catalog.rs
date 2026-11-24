@@ -70,7 +70,18 @@ pub struct TableCatalog {
 
 impl TableCatalog {
     pub fn load(block: Option<BlockCatalog>, table_blocks: &BTreeMap<TableRef, TableBlock>) -> Result<Self> {
-        let entries: BTreeMap<_, _> = block.as_ref().map(BlockCatalog::table_entries).transpose()?.unwrap_or_default().into_iter().map(|entry| (entry.table.clone(), entry)).collect();
+        Self::load_at_view(block, table_blocks, false)
+    }
+
+    /// Load the business subset of the authenticated checkpoint registry.
+    pub fn load_held(block: BlockCatalog, table_blocks: &BTreeMap<TableRef, TableBlock>) -> Result<Self> {
+        Self::load_at_view(Some(block), table_blocks, true)
+    }
+
+    fn load_at_view(block: Option<BlockCatalog>, table_blocks: &BTreeMap<TableRef, TableBlock>, held: bool) -> Result<Self> {
+        let entries: BTreeMap<_, _> = block.as_ref().map(BlockCatalog::table_entries).transpose()?.unwrap_or_default()
+            .into_iter().filter(|entry| !held || !entry.table.stores_expiring_transaction_metadata())
+            .map(|entry| (entry.table.clone(), entry)).collect();
         if entries.keys().any(|table| TableRef::owned_schema(&table.schema) && !table.supported_owned_name()) {
             return Err(invalid("Unknown owned relation policy or invalid owned relation name in checkpoint"));
         }

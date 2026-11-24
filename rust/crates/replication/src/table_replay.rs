@@ -81,7 +81,7 @@ impl<'a> RetainedTableReplay<'a> {
                     }
                     let transaction = rtdb_tx::decode_replica(message, self.latest_tx, self.block, memory)?;
                     let key = transaction.writes.tx_key();
-                    if self.latest_tx.is_some_and(|last| key.tx_id <= last.tx_id || key.system_time <= last.system_time) {
+                    if self.latest_tx.is_some_and(|last| key.tx_id <= last.tx_id || key.system_time < last.system_time) {
                         return Err(invalid("Resolved transaction basis regressed"));
                     }
                     if let Some(write) = transaction.writes.tables().get(self.table) {

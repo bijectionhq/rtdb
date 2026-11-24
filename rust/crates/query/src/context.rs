@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
-use rtdb_storage::cache::{BufferPool, HeldCatalogRead};
+use rtdb_storage::{cache::{BufferPool, HeldCatalogRead}, sealing::{PlaintextDelivery, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -86,6 +86,11 @@ impl CatalogSnapshot {
     /// Provider requests for this catalog's files begin only while the lease admits them.
     pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
     pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
+    pub(crate) fn reset_sql_snapshot_view(&mut self) {
+        self.read_view = Arc::default();
+        self.fragmenter = None;
+        self.fragment_residence = None;
+    }
     pub(crate) async fn held_view(&self) -> Result<Arc<rtdb_storage::HeldView>> {
         self.check_view_lease()?;
         self.read_view.get_or_try_init(|| async {
@@ -224,8 +229,11 @@ pub struct QueryContext {
     pub(crate) application_name: Option<(Arc<str>, Arc<rtdb_columnar::MemoryReservation>)>,
     pub(crate) operator_root: Option<Arc<Self>>,
     pub(crate) read_basis: Option<Arc<crate::settings::ReadBasis>>,
+    pub(crate) snapshot_admission: Option<Arc<dyn crate::settings::SnapshotAdmission>>,
+    pub(crate) snapshot_tokens: Option<Arc<crate::settings::SnapshotTokenIssuer>>,
     pub(crate) accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>,
     pub(crate) query_cpu: Option<Arc<crate::QueryCpu>>,
+    plaintext: Option<Arc<PlaintextView>>,
 }
 
 impl QueryContext {
@@ -239,7 +247,7 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, accelerators: Arc::from(Vec::new()), query_cpu: None }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None }))
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(mut self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
@@ -301,10 +309,46 @@ impl QueryContext {
             self.cancellation.run_until_cancelled(self.catalog.held_view()),
         ).await.flatten().ok_or_else(cancelled)??;
         let work = rtdb_storage::IoRegion::retaining(self.clone(), rtdb_storage::IoRegion::leased(self.catalog.read_lease(), work));
-        let answer = rtdb_storage::IoRegion::reading(view, work).await?;
+        let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
+        let work = plaintext.reading(async {
+            for partition in self.catalog.databases.values().flat_map(|database| &database.partitions) {
+                if let Some(read) = partition.certified_read() {
+                    PlaintextView::track_certified_read(read)?;
+                }
+            }
+            let answer = work.await?;
+            self.grant_delivery(&plaintext).await?;
+            Ok(answer)
+        });
+        rtdb_storage::IoRegion::reading(view, work).await
+    }
+
+    pub(crate) fn with_plaintext(mut self: Arc<Self>) -> Arc<Self> {
+        if self.plaintext.is_none() {
+            let view = PlaintextView::new(Arc::clone(&self.memory));
+            Arc::make_mut(&mut self).plaintext = Some(view);
+        }
+        self
+    }
+
+    pub(crate) async fn delivery_grant(self: &Arc<Self>) -> Result<PlaintextDelivery> {
+        let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
+        let view = self.catalog.held_view().await?;
+        let lease = self.catalog.read_lease();
+        let work = rtdb_storage::IoRegion::leased(lease.clone(), self.grant_delivery(&plaintext));
+        let grant = rtdb_storage::IoRegion::reading(view.clone(), work).await?;
+        Ok(grant.holding(view, lease))
+    }
+
+    async fn grant_delivery(&self, plaintext: &PlaintextView) -> Result<PlaintextDelivery> {
+        self.check_cancelled()?;
+        let grant = self.owner_cancellation.run_until_cancelled(
+            self.cancellation.run_until_cancelled(plaintext.grant()),
+        ).await.flatten().ok_or_else(cancelled)??;
         self.catalog.check_view_lease()?;
         self.check_cancelled()?;
-        Ok(answer)
+        grant.check()?;
+        Ok(grant)
     }
 
     pub fn check_cancelled(&self) -> Result<()> {

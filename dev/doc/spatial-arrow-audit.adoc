@@ -93,9 +93,17 @@ The host checks the SDK reply's encoded size with a bounded byte counter.
 Transaction resolution still orders admission, locality, and final-state checks.
 
 | Bijection deploy-hook catalog
-| Hook setup decoded the staged declaration bodies, re-encoded them while opening the Root, and parsed the successor schema again.
-| Hook setup uses the prepared typed schema, its digest, and the typed relation declarations.
+| Layout planning and release admission decoded the already analyzed successor schema from JSON.
+Hook setup also decoded and re-encoded the staged declarations.
+| Layout planning, release admission, and deploy hooks use the analyzed schema.
+The native runtime binds it to the exact canonical bytes retained by the successor program, while hook opening shares the prepared typed relation declarations.
 The ordered publication builds its Arrow declaration batch from the prepared durable bodies.
+
+| Installed catalog for direct Roots
+| Preparation and hook opening fetched a key list through PostgreSQL, then fetched each declaration as a row on the same transaction.
+| Flight returns the bounded declaration inventory as Arrow batches on the same hold as the installation, owner, application admission, and program observations.
+Bijection checks the original allowance, declaration identities and stamps before using the installed layout.
+The scoped fresh Flight route admits the same bounded catalog selectors under a reader-owned hold.
 
 | Hosted Root catalog replacement
 | The Flight decoder materialized the hosted catalog payload as generic document fields before source encoding and resolution.
@@ -121,13 +129,11 @@ Owned action headers carry authorization, framing, and held-read controls.
 
 == Remaining control-plane conversions
 
-Bijection's `schema_predecessor` and `open_root_facts` read the installed owner, schema digest, and relation inventory over PostgreSQL before staging or opening deploy hooks.
-`read_accepted_layouts` receives row records and decodes each declaration body in that transaction.
-The Arrow hosted-control point action can read one declared key at a held cut.
-The preparation path still needs a held Arrow inventory that returns all active declarations under the same owner and program observation.
-
-The schema preparation caller also encodes the analyzed successor schema as JSON before the native runtime decodes it to compare table definitions.
-The persisted program schema and its digest already use those exact bytes.
+The reserved audience bootstrap and legacy catalog ownership transitions still read declarations over PostgreSQL.
+Ordinary Root fact and catalog reads use the scoped Flight action for their exact source floor.
+Ordered clock holds and hosted Flight commits confirm the durable source and their exact transaction floors through Flight.
+RTDB checks the original writer's quorum before acknowledging the sampled position in Arrow.
+The hosted image label `io.rtdb.held-root-catalog=true` and the standalone build-info field `held_root_catalog` attest both Flight actions.
 
 == Bijection and RTDB Flight integration tests
 

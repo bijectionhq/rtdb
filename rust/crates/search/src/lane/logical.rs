@@ -9,10 +9,10 @@ use rtdb_types::{AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, Interva
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchDefinition, file::{BuildMode, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, TextRevision, TreeLocator, write_group_as}};
+use crate::{SearchDefinition, file::{BuildMode, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, SearchPosition, search_position, TextRevision, TreeLocator, write_group_as}};
 use super::{PageRows, SearchBuilder, fault, indexing_allowance};
 
-type Erases = BTreeMap<Iid, (Timestamp, u32)>;
+type Erases = BTreeMap<Iid, SearchPosition>;
 
 #[derive(Default)]
 struct RunContents {
@@ -100,11 +100,13 @@ fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], incl
         if header.op == EventOp::Redacted {
             return Err(fault("Search repair requires assertion-level redaction coverage"));
         }
-        header.commit_position = posting_position(header, batch.origin(row)?, row)?;
+        if header.position.is_none() {
+            header.commit_position = posting_position(header, batch.origin(row)?, row)?;
+        }
         if header.op == EventOp::Erase {
             let reservation = Arc::get_mut(charge).expect("Search repair owns its scratch");
             reservation.grow_to(reservation.bytes().saturating_add(128))?;
-            contents.erases.entry(header.iid).and_modify(|old| *old = (*old).max(header.system_position())).or_insert(header.system_position());
+            contents.erases.entry(header.iid).and_modify(|old| *old = (*old).max(search_position(header))).or_insert(search_position(header));
             has_erases = true;
         }
         if include_documents && header.op == EventOp::Put {
@@ -118,7 +120,7 @@ fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], incl
                     let retained = tokens.get_array_memory_size().saturating_add(256);
                     reservation.grow_to(reservation.bytes().saturating_add(retained))?;
                     contents.documents.push(LogicalDocument { iid: header.iid, field, revision: revision_of(&tokens),
-                        sql_id, tokens, position: header.system_position() });
+                        sql_id, tokens, position: search_position(header) });
                 }
             }
         }
@@ -514,11 +516,11 @@ impl SearchBuilder {
     }
 }
 
-enum MergedRow { Document(LogicalDocument), Erase(Iid, (Timestamp, u32)) }
+enum MergedRow { Document(LogicalDocument), Erase(Iid, SearchPosition) }
 
 impl MergedRow {
     fn iid(&self) -> Iid { match self { Self::Document(doc) => doc.iid, Self::Erase(iid, _) => *iid } }
-    fn position(&self) -> (Timestamp, u32) { match self { Self::Document(doc) => doc.position, Self::Erase(_, position) => *position } }
+    fn position(&self) -> SearchPosition { match self { Self::Document(doc) => doc.position, Self::Erase(_, position) => *position } }
 }
 
 struct MergedRows(Vec<MergedRow>);
@@ -537,8 +539,8 @@ impl SearchPage for MergedRows {
             }
             MergedRow::Erase(..) => (EventOp::Erase, None),
         };
-        let (system_from, commit_position) = row.position();
-        Ok(IndexedRow { header: EventHeader { iid: row.iid(), system_from, commit_position,
+        let (system_from, position, commit_position) = row.position();
+        Ok(IndexedRow { header: EventHeader { position, iid: row.iid(), system_from, commit_position,
             valid_time: Interval::ALL, op }, key: None, sql_id, values, revisions })
     }
 }
@@ -600,11 +602,11 @@ mod tests {
         let document = |text: &str, position| LogicalDocument {
             iid, sql_id: None, field: 0, revision: text_revision(text), tokens: rtdb_text::analyze(text), position
         };
-        let mut documents = vec![document("shared text", (Timestamp(1), 0)),
-            document("old text", (Timestamp(2), 2)), document("shared text", (Timestamp(2), 4))];
-        assert!(scrub_documents(&mut documents, &Erases::from([(iid, (Timestamp(2), 3))])));
+        let mut documents = vec![document("shared text", (Timestamp(1), None, 0)),
+            document("old text", (Timestamp(2), None, 2)), document("shared text", (Timestamp(2), None, 4))];
+        assert!(scrub_documents(&mut documents, &Erases::from([(iid, (Timestamp(2), None, 3))])));
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[0].revision, text_revision("shared text"));
-        assert_eq!(documents[0].position, (Timestamp(2), 4));
+        assert_eq!(documents[0].position, (Timestamp(2), None, 4));
     }
 }

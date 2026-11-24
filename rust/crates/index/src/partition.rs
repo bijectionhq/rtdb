@@ -4,7 +4,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::{Mutex, RwLock};
 use rtdb_format::{catalog::{BlockCatalog, TableBlock}, keys::TrieKey};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, TransactionKey, TxId};
+use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKey, TxId};
 
 use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;

@@ -49,8 +49,7 @@ impl LineageRetirement {
 
     fn matches_fence(&self, owner: &DeploymentRecord) -> bool {
         let (target, marker) = match &self.work {
-            RetirementWork::S3 { target, release, release_version, .. } => (target, release_version.as_ref().map(|_| release)),
-            RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
+            RetirementWork::S3 { target, release, .. } | RetirementWork::Tombstones { target, release, .. } => (target, Some(release)),
             RetirementWork::ReplayPack { target, capture, .. }
             | RetirementWork::ReplayPackTombstone { target, capture, .. } => {
                 return matches!(owner.storage_regions.get(&self.token), Some(StorageRegion::ReplayPackRetirement { object, capture: held })
@@ -64,7 +63,7 @@ impl LineageRetirement {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum RetirementWork {
     Local { local_volume: [u8; 32] },
     S3 {
@@ -72,10 +71,7 @@ pub enum RetirementWork {
         target: String,
         release: String,
         version: PhysicalObjectVersion,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        release_version: Option<PhysicalObjectVersion>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        legacy_receipt: Option<String>,
+        release_version: PhysicalObjectVersion,
     },
     Tombstones {
         deployment: String,
@@ -314,10 +310,7 @@ impl LineageState {
     }
 
     pub(crate) fn settle_exact_owned(&self, owner: &DeploymentRecord, retirement: &LineageRetirement) -> Result<(DeploymentRecord, Self)> {
-        // An older exact-version attempt may already have cleared its data-only fence.
-        let matching_fence = retirement.matches_fence(owner)
-            || matches!(retirement.work, RetirementWork::S3 { release_version: None, .. })
-                && !owner.storage_regions.contains_key(&retirement.token);
+        let matching_fence = retirement.matches_fence(owner);
         let ready = match &self.admission {
             Admission::Erasing(current) => current == retirement && !current.work.uses_tombstones(),
             Admission::ErasingTombstones { retirement: current, uploads } => current == retirement && uploads.is_empty(),

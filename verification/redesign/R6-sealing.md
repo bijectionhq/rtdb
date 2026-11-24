@@ -58,18 +58,20 @@ The S3 vault registers each slot in a conditionally updated shard before issuing
 Scope withdrawal closes the namespace and freezes each shard before tombstoning the registered slots, including registrations whose create result was lost.
 A late conditional create for a registered slot races with the terminal tombstone on that same slot.
 The serving and checkpoint retirement owners invoke the same vault settlement after their existing admission and drain checks.
+The DynamoDB vault orders each conditional unit creation against a scope fence in a transaction and confirms the fenced slot census before reporting withdrawal.
 
 Local and S3 checkpoint captures use separate slots for their objects and replica archive records.
 Capture cryptography combines the slot with an indispensable capture authority secret, so withdrawing the capture also disables any retained slot.
 An ordered checkpoint transfer stores the verified manifest, segments and detached payloads under the destination's slot namespace before seeding its live journal.
-Directory-managed Multi objects, primary staged objects, and live journal seeding still use coarser keys or share encrypted bytes.
+Primary and replay stage inventories place each member and manifest in separate destination slots. The directory freezes the inventory before transfer. Activation verifies its members, writes and reopens the serving closure, then withdraws the stage namespace through the original vault. A retry uses the accepted activation receipt before resuming withdrawal. Disposal also sweeps the separate stage namespace, including interrupted slots. Detached replay bodies remain in the installed broker's separate custody. Directory-managed replica logs register one key slot per frame. A cross-cell move and an ordered transfer reseal certified source pages under independent destination slots. Same-residence ensemble repair preserves the existing frames and keys. Residence disposal closes and withdraws all registered journal slots. The directory trim grant binds its authenticated per-frame census before truncation and completes only after the vault withdraws those slots. Directory-managed Multi serving objects still need individual withdrawal across packs, inherited publications and copied serving roots.
 Classic local, S3, Azure and GCS object stores can enroll in the same sealed format with a private filesystem vault supplied through `RTDB_CLASSIC_KEY_VAULT`.
 The vault directory must already exist and belong to the original installation outside payload and disk-cache backup roots.
 The immutable provider marker selects the vault lineage and refuses enrollment over existing unsealed data.
-The local trie release authority authenticates the installed receipt and drains the eligible root before it asks the vault to withdraw the selected slots.
+The coordinated trie release authority authenticates the installed receipt and drains the eligible root before it asks the vault to withdraw the selected slots.
 Classic local source and replica logs seal each frame under a fresh publication slot, with the physical offset and sampled timestamp authenticated.
 Reopening a configured sealed log requires its original key lineage.
-Classic sealed-log retirement, Kafka logs, remote exact key retirement and deployment-wide collection of installed unit slots remain open.
+Classic Kafka database logs use the same vault with a namespace bound to the broker's topic UUID. Only the writer that confirms creation of an empty topic can enroll it. A reader or replacement must open that original namespace. The broker orders the resulting publication IDs at their physical offsets.
+The Classic retained-repair anchor grants offline prefix retirement. The original vault verifies each selected sealed frame and records its exact withdrawal intent before wiping the ciphertext. The surviving replica boundary and suffix keep their keys. Kafka publishes each durable offset and ciphertext identity into the original topic vault before acknowledging the append. A writable owner confirms the broker floor under the same topic identity and drains exact slots through that floor in bounded batches. A missing offset census stops settlement. Remote retirement outside exact installed release grants remains open.
 Provider verification includes ranged reads, object naming, lost create replies, redundant compaction jobs, independent-copy isolation, cache fencing, and nonce uniqueness.
 
 [Current cipher](../../rust/crates/storage/src/sealing/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)

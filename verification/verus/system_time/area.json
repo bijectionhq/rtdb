@@ -1,5 +1,5 @@
 {
-  "summary": "The resolver admits strictly advancing system times and handles a stalled or exhausted clock.",
+  "summary": "Ordinary SQL admits tied history time within the original append bound. Owned publications that still address rows by strict system time retain their separate successor rule.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 11,
+  "min_verified_functions": 18,
   "controls": {
     "reuse_the_previous_tick": {
       "mutate": [
@@ -167,6 +167,86 @@
         }
       ],
       "min_verified_functions": 9
+    },
+    "sql_rejects_a_tie": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "historical_time(previous, requested) == requested && requested <= logged",
+          "replace": "advances(previous, requested) && requested <= logged"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_historical_time",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "sql_accepts_a_client_time_after_append": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "historical_time(previous, requested) == requested && requested <= logged",
+          "replace": "historical_time(previous, requested) == requested"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "admits_historical_time",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "substitute_append_for_the_receiver_observation": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& reading <= observed\n        && observed < until",
+          "replace": "&& reading <= appended\n        && appended < until"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "include_the_receiver_window_end": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& observed < until",
+          "replace": "&& observed <= until"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "let_a_prepared_clock_lead_append": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& reading <= appended\n        && reading <= observed",
+          "replace": "&& reading <= observed"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
+          "category": "postcondition not satisfied"
+        }
+      ]
     }
   }
 }

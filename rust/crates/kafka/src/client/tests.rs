@@ -173,7 +173,7 @@ fn native_client_copies_retain_one_tls_snapshot_after_the_log_and_store_file_are
     assert!(retained > 0);
     std::fs::remove_file(file).unwrap();
     let log_options = KafkaLogOptions::new("tls-ownership");
-    let producer_config = crate::producer_config(&configuration, &log_options, &Warnings::default());
+    let producer_config = crate::producer_config(&configuration, &log_options, &Warnings::default(), false);
     let native = producer_config.create_native_config().unwrap();
     let duplicate = native.clone(); drop(native); drop(producer_config);
     let log = KafkaLog { configuration: crate::LogConfiguration::Common(configuration), options: log_options, progress: Arc::new(crate::Progress::new(-1)), access: crate::Access::ReadOnly };
@@ -195,7 +195,7 @@ fn producer_derivation_preserves_tls_ownership_overrides_and_warning_order() {
         ("linger.ms".into(), "17".into()), ("compression.type".into(), "gzip".into()), ("message.max.bytes".into(), "4096".into())]);
     let configuration = prepare(&options, &memory).unwrap(); let warnings = Warnings::default();
     let mut log_options = KafkaLogOptions::new("log"); log_options.queue_capacity = 7; log_options.queued_bytes = 4096;
-    let derived = crate::producer_config(&configuration, &log_options, &warnings);
+    let derived = crate::producer_config(&configuration, &log_options, &warnings, false);
     assert_eq!(derived.get("acks"), Some("all"));
     assert_eq!(derived.get("enable.idempotence"), Some("false"));
     assert_eq!(derived.get("max.in.flight.requests.per.connection"), Some("1"));
@@ -216,7 +216,7 @@ fn producer_derivation_applies_defaults_without_changing_the_shared_base() {
     let configuration = prepare(&BTreeMap::new(), &MemoryBudget::new(0)).unwrap();
     for pipelined in [false, true] {
         let mut options = KafkaLogOptions::new("log"); options.pipelined = pipelined;
-        let derived = crate::producer_config(&configuration, &options, &Warnings::default());
+        let derived = crate::producer_config(&configuration, &options, &Warnings::default(), false);
         assert_eq!(derived.get("acks"), Some("all"));
         assert_eq!(derived.get("enable.idempotence"), Some("true"));
         assert_eq!(derived.get("compression.type"), Some("snappy"));

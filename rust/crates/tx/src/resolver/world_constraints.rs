@@ -109,18 +109,19 @@ impl WindowBudget {
         Ok(holders)
     }
 
-    async fn shadow_covers(
+    async fn shadow_windows(
         &mut self,
         context: &Arc<QueryContext>,
         owner: &str,
         overlay: &OwnedRelation,
         id: &EntityId,
         window: Interval,
-    ) -> Result<bool> {
+        windows: &mut Vec<Interval>,
+    ) -> Result<()> {
         // Deletion shadows also keep a physical _id, with their original valid interval.
         let Some(mut cursor) = rtdb_query::open_owned_key_timeline(
             Arc::clone(context), owner, overlay, id, window, "_id",
-        ).await? else { return Ok(false); };
+        ).await? else { return Ok(()); };
         let mut through = window.lower();
         let mut limit = self.fetch() - 1;
         while let Some(batch) = cursor.next_batch().await? {
@@ -130,52 +131,101 @@ impl WindowBudget {
                 rtdb_query::owned_row_revision(rows, row, id, &context.memory)?;
                 let valid = unique_segment_interval(rows, row, window)?;
                 if valid.lower() < through { return Err(unique_uncovered()); }
-                if valid.lower() > through { return Ok(false); }
                 through = valid.upper();
+                self.reservations.push(context.memory.reserve(64)?);
+                windows.push(valid);
             }
         }
-        Ok(through == window.upper())
+        Ok(())
     }
 }
+
+// The archive owner admits these layers in descending shadow precedence.
+type FrozenLayer = (Arc<QueryContext>, OwnedRelation);
 
 impl FiniteUniqueClaims<'_> {
     async fn validate(
         mut self,
         parent: &Arc<QueryContext>,
+        frozen: &[FrozenLayer],
         owner: &str,
         relation: &OwnedRelation,
         basis: Timestamp,
-        policy: &rtdb_query::OwnedUniquePolicy,
+        policy: Option<&rtdb_query::OwnedUniquePolicy>,
         frontier: i64,
     ) -> Result<()> {
         for path in self.paths {
-            let Some(column) = policy.paths.get(path.path) else {
-                if frontier == 0 { continue; }
+            let root_column = policy.and_then(|policy| policy.paths.get(path.path));
+            if root_column.map(String::as_str).is_some_and(|column| column != path.column)
+                || root_column.is_none() && frontier != 0
+            {
                 return Err(unique_uncovered());
-            };
-            if column != path.column { return Err(unique_uncovered()); }
+            }
             for (key, local) in path.claims {
                 for window in merge_windows(local.iter().map(|part| part.valid).collect())? {
-                    let cursor = rtdb_query::open_owned_unique_window(
-                        Arc::clone(parent), owner, relation, column, Some(&key), window, basis,
-                        None, self.budget.fetch(),
-                    ).await?;
-                    let mut inherited = self.budget.holders(parent, cursor, column, &key, window).await?;
-                    ordered_segments(&mut inherited, unique_uncovered)?;
-                    for holder in inherited {
-                        let start = local.partition_point(|part| part.valid.upper() <= holder.valid.lower());
-                        for claim in local[start..].iter().take_while(|claim| claim.valid.lower() < holder.valid.upper()) {
-                            let overlap = claim.valid.intersection(holder.valid).ok_or_else(unique_uncovered)?;
-                            if !self.budget.shadow_covers(&self.local, owner, self.overlay, &holder.value, overlap).await? {
-                                return Err(unique_taken());
-                            }
-                        }
+                    for (depth, (context, shadow)) in frozen.iter().enumerate() {
+                        let cursor = rtdb_query::open_archived_world_unique_window(
+                            Arc::clone(context), owner, shadow, path.column, &key, window, self.budget.fetch(),
+                        ).await?;
+                        let holders = self.budget.holders(context, cursor, path.column, &key, window).await?;
+                        self.budget.require_masked_holders(
+                            owner, &self.local, self.overlay, &frozen[..depth], &local, holders,
+                        ).await?;
+                    }
+                    if let Some(column) = root_column {
+                        let cursor = rtdb_query::open_owned_unique_window(
+                            Arc::clone(parent), owner, relation, column, Some(&key), window, basis,
+                            None, self.budget.fetch(),
+                        ).await?;
+                        let holders = self.budget.holders(parent, cursor, column, &key, window).await?;
+                        self.budget.require_masked_holders(
+                            owner, &self.local, self.overlay, frozen, &local, holders,
+                        ).await?;
                     }
                 }
             }
         }
         Ok(())
     }
+}
+
+impl WindowBudget {
+    async fn require_masked_holders(
+        &mut self,
+        owner: &str,
+        local: &Arc<QueryContext>,
+        overlay: &OwnedRelation,
+        newer: &[FrozenLayer],
+        claims: &[Segment<EntityId>],
+        mut holders: Vec<Segment<EntityId>>,
+    ) -> Result<()> {
+        ordered_segments(&mut holders, unique_uncovered)?;
+        for holder in holders {
+            let start = claims.partition_point(|part| part.valid.upper() <= holder.valid.lower());
+            for claim in claims[start..].iter().take_while(|claim| claim.valid.lower() < holder.valid.upper()) {
+                let overlap = claim.valid.intersection(holder.valid).ok_or_else(unique_uncovered)?;
+                let mut windows = Vec::new();
+                self.shadow_windows(local, owner, overlay, &holder.value, overlap, &mut windows).await?;
+                if windows_cover(&mut windows, overlap) { continue; }
+                for (context, shadow) in newer {
+                    self.shadow_windows(context, owner, shadow, &holder.value, overlap, &mut windows).await?;
+                }
+                if !windows_cover(&mut windows, overlap) { return Err(unique_taken()); }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn windows_cover(windows: &mut [Interval], target: Interval) -> bool {
+    windows.sort_unstable();
+    let mut through = target.lower();
+    for window in windows {
+        if window.lower() > through { return false; }
+        through = through.max(window.upper());
+        if through >= target.upper() { return true; }
+    }
+    false
 }
 
 impl RuleCounts<'_> {
@@ -192,7 +242,19 @@ impl RuleCounts<'_> {
 }
 
 impl ArchivedWorldConstraints<'_> {
-    pub async fn validate(mut self, parent: Arc<QueryContext>) -> Result<()> {
+    pub fn relation(&self) -> &OwnedRelation {
+        self.relation
+    }
+
+    pub async fn validate(self, parent: Arc<QueryContext>) -> Result<()> {
+        self.validate_layers(parent, &[]).await
+    }
+
+    pub async fn validate_layers(
+        mut self,
+        parent: Arc<QueryContext>,
+        frozen: &[(Arc<QueryContext>, OwnedRelation)],
+    ) -> Result<()> {
         let database = parent.catalog.database(parent.catalog.default_database())?;
         let [snapshot] = database.partitions.as_slice() else { return Err(uncovered()); };
         if snapshot.tx_basis() != Some(self.world.basis)
@@ -207,28 +269,76 @@ impl ArchivedWorldConstraints<'_> {
         if declared.as_ref().map(|(schema, _)| schema) != self.world.schemas.relation(self.relation) {
             return Err(uncovered());
         }
-        if self.finite_unique.is_some()
-            || self.unique.iter().any(|claim| claim.keys.values().any(|active| *active))
-        {
+        if !frozen.is_empty() && (self.period_count.is_some() || !self.sample_counts.is_empty()) {
+            return Err(uncovered());
+        }
+        let active_unique = self.unique.iter().any(|claim| claim.keys.values().any(|active| *active));
+        let mut frozen_masks = BTreeSet::new();
+        let mut mask_reservations = Vec::new();
+        if !self.rules.is_empty() || active_unique {
+            let names = projected_columns(&self.rules, &self.unique, true);
+            for (context, shadow) in frozen {
+                if let Some(mut cursor) = rtdb_query::open_owned_world_constraint_projection(
+                    Arc::clone(context), self.owner, shadow, self.valid, &names,
+                ).await? {
+                    while let Some(batch) = cursor.next_batch().await? {
+                        let rows = batch.batch();
+                        for row in 0..rows.num_rows() {
+                            context.check_cancelled_at(row)?;
+                            let read = |name: &str| occupancy_value_at(&context.memory, rows, row, name, uncovered);
+                            let id = read("_id")?.entity_id()?;
+                            if frozen_masks.contains(&id) { continue; }
+                            let included = [!self.before.contains(&id), !self.after.contains(&id)];
+                            mask_reservations.push(self.memory.reserve(id.as_value().retained_bytes()?.saturating_add(192))?);
+                            frozen_masks.insert(id);
+                            match read(WorldShadow::FIELDS)? {
+                                Value::Null => (),
+                                Value::List(_) => {
+                                    for rule in &mut self.rules {
+                                        rule.add(read, included)?;
+                                    }
+                                    if active_unique && included[1] {
+                                        for claim in &self.unique {
+                                            if claim.keys.values().all(|active| !*active) { continue; }
+                                            let key = unique_key(read(claim.column)?)?;
+                                            if claim.keys.get(&key) == Some(&true) {
+                                                return Err(unique_taken());
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => return Err(uncovered()),
+                            }
+                        }
+                    }
+                }
+                context.check_cancelled()?;
+            }
+        }
+        if self.finite_unique.is_some() || active_unique {
             let table = self.relation.table(self.owner);
             let frontier = snapshot.relation_event_frontier(&table)?;
-            if snapshot.contains_table(&self.relation.unique_table(self.owner)) {
+            let policy = if snapshot.contains_table(&self.relation.unique_table(self.owner)) {
                 let policy = rtdb_query::read_owned_unique_policy(
                     Arc::clone(&parent), self.owner, self.relation,
                 ).await?;
                 if policy.through_events != frontier { return Err(unique_uncovered()); }
-                self.require_unique_claims(&parent, &policy, frontier).await?;
-                if let Some(finite) = self.finite_unique.take() {
-                    finite.validate(
-                        &parent, self.owner, self.relation, self.world.basis.system_time, &policy, frontier,
-                    ).await?;
+                self.require_unique_claims(&parent, &policy, frontier, &frozen_masks).await?;
+                Some(policy)
+            } else {
+                if frontier != 0
+                    || !snapshot.trie_entries(&table).is_empty()
+                    || snapshot.iter_segments(&table).any(|segment| segment.row_count() != 0)
+                    || snapshot.table_catalog().metadata(&table).is_some_and(|metadata| metadata.row_count != 0)
+                {
+                    return Err(unique_uncovered());
                 }
-            } else if frontier != 0
-                || !snapshot.trie_entries(&table).is_empty()
-                || snapshot.iter_segments(&table).any(|segment| segment.row_count() != 0)
-                || snapshot.table_catalog().metadata(&table).is_some_and(|metadata| metadata.row_count != 0)
-            {
-                return Err(unique_uncovered());
+                None
+            };
+            if let Some(finite) = self.finite_unique.take() {
+                finite.validate(
+                    &parent, frozen, self.owner, self.relation, self.world.basis.system_time, policy.as_ref(), frontier,
+                ).await?;
             }
         }
         if let Some((local_members, maximum)) = self.period_count {
@@ -253,6 +363,7 @@ impl ArchivedWorldConstraints<'_> {
                     parent.check_cancelled_at(row)?;
                     let read = |name: &str| occupancy_value_at(&parent.memory, rows, row, name, uncovered);
                     let id = read("_id")?.entity_id()?;
+                    if frozen_masks.contains(&id) { continue; }
                     let inherited = [!self.before.contains(&id), !self.after.contains(&id)];
                     if inherited.iter().any(|included| *included) {
                         for rule in &mut self.rules {
@@ -287,6 +398,7 @@ impl ArchivedWorldConstraints<'_> {
         parent: &Arc<QueryContext>,
         policy: &rtdb_query::OwnedUniquePolicy,
         frontier: i64,
+        frozen_masks: &BTreeSet<EntityId>,
     ) -> Result<()> {
         for claim in &self.unique {
             if claim.keys.values().all(|active| !*active) { continue; }
@@ -302,7 +414,9 @@ impl ArchivedWorldConstraints<'_> {
                 ).await? {
                     let holder = occupancy_value_at(&parent.memory, hit.row.batch(), 0, "_id", unique_uncovered)?
                         .entity_id()?;
-                    if !self.after.contains(&holder) { return Err(unique_taken()); }
+                    if !self.after.contains(&holder) && !frozen_masks.contains(&holder) {
+                        return Err(unique_taken());
+                    }
                 }
             }
         }
@@ -617,6 +731,24 @@ impl OpenTransaction<'_> {
             }).await?;
             drop(reservations);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finite_claim_checks_union_of_newer_writers() -> Result<()> {
+        let claim = Interval::new(Timestamp(10), Timestamp(40))?;
+        let local = Interval::new(Timestamp(10), Timestamp(20))?;
+        let newer = Interval::new(Timestamp(20), Timestamp(30))?;
+        let older = Interval::new(Timestamp(28), Timestamp(40))?;
+        let late = Interval::new(Timestamp(31), Timestamp(40))?;
+        assert!(!windows_cover(&mut [local], claim));
+        assert!(windows_cover(&mut [newer, older, local], claim));
+        assert!(!windows_cover(&mut [local, newer, late], claim));
         Ok(())
     }
 }

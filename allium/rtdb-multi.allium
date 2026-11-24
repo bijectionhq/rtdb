@@ -686,6 +686,13 @@ contract LogService {
         -- A serving attachment acquires replay protection and waits for same-history application through the cut before capturing that exact snapshot.
         -- Fresh basis capture retains protection through execution and transfer. Raw staged tips do not constrain selection.
 
+    @invariant BrokeredDetachedBodyUsesTheCommittedPosition
+        -- A sealed directory journal frame commits the digest of its detached reference.
+        -- The broker admits one position under a current replay ticket and retains its own directory region through delivery and provider drain.
+        -- It matches the supplied reference to the quorum-certified frame and verifies the exact provider publication and body digest.
+        -- The detached storage namespace and unit-key vault belong to the broker.
+        -- A cross-cell successor reseals detached bodies under its broker and binds the returned publication into the new committed frame.
+
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.
         -- The boundary must belong to this deployment's log, including when its first readable block came from a parent.
@@ -1532,6 +1539,8 @@ rule ConsumeIntake {
 -- The read loads only the checkpoint closure, with no replay of the serving tail.
 -- A writable checkpoint world durably pins that capture before ordering its owner-scoped registration.
 -- A held child of Root starts at the exact archived Root publication, even if Root has since advanced.
+-- A child at its parent's retained Root publication may start its own Held writer at the inherited reading.
+-- Its independent pin owns the same Root media and its registry entry binds the original parent registration prefix.
 -- The child's registration, its application ownership custody, the request receipt and any Root facts order together.
 -- A world opens against an authenticated attachment when the durable pin and ordered registration name the same cut and remain live.
 -- Child writes are confined to one world, and the ordered resolver checks that world's expiry before applying any writes.
@@ -1733,6 +1742,7 @@ rule PublishCheckpoint {
 }
 
 rule TrimCertifiedReplicaPrefix {
+    -- The prefix owner retains its authenticated journal unit census before trim and withdraws those slots through the original vault.
     -- The checkpoint's boundary record supplies the intake position on reopen.
     -- An active suffix pin retains its first required replica record until its verified archive publication is recorded or the pin expires.
     -- A separately captured suffix retains its capture until explicit archive retirement.
@@ -1986,6 +1996,7 @@ rule RetireOrderedIndexPages {
         and EveryAdmittedProviderUploadSettled(scope)
 
     ensures:
+        GenerationKeyScopeWithdrawn(scope)
         EveryObjectVersionAndUploadRemoved(scope)
         EmptyProviderInventoryRecorded(scope)
 }
@@ -3069,6 +3080,7 @@ rule RetainServingReplayArchive {
 }
 
 rule StageHistoricalCheckpoint {
+    -- Primary members and the sealed inventory have separate slots in the stage vault.
     when: HistoricalCheckpointStageRequested(capture, target, operation)
 
     requires: ExactRetainedCapture(capture)
@@ -3239,7 +3251,7 @@ rule BeginCellMove {
 
 rule MoveCutover {
     -- The destination accepts placements only after the cell map switches to it.
-    -- The destination's first holder imports the sealed source log before it can serve.
+    -- The destination verifies the certified retained interval and reseals each frame into its own slots before it can serve.
     -- A retry after the switch finishes publication and leaves the source tombstone.
     -- Forks in the source cell retain access to every object they share.
     -- Verify the destination's root owner, checkpoint catalog, required trie metadata and trie envelopes against its own storage generation.
@@ -3286,6 +3298,8 @@ rule CleanUpMovedSource {
 rule ChargeQuery {
     -- Query CPU is scheduled by weighted deficit round robin across deployments, on a runtime separate from the write path.
     -- Memory is granted per query from the deployment's quota within the node's budget, and a query over its grant spills or is refused.
+    -- A protected answer keeps its original delivery cutoff through the frontend and gateway buffers.
+    -- Each socket handoff checks the cutoff and expiry closes a partly delivered reply.
     when: QueryArrived(member, query, session)
 
     ensures:

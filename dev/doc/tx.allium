@@ -29,8 +29,8 @@
 -- A pgwire portal encodes supported primitive and timestamp cells from their Arrow positions, including active dense union legs.
 -- A pgwire portal can encode numeric coefficients and structured JSON, JSON-LD, and Transit results from their Arrow cells.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
--- A versioned Flight SQL run ticket carries Arrow IPC arguments within its binary frame.
--- The Flight SQL server also redeems run tickets issued with the earlier JSON envelope.
+-- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
+-- The authenticated session and original attachment authorize redemption of its ticket.
 -- Compatible list and struct parameters stay in Arrow through that projection.
 -- Arithmetic on compatible integer and floating-point parameter columns uses the Arrow projection kernel.
 -- Supported comparisons, casts, and string functions can consume bound Arrow columns in the vector expression evaluator.
@@ -155,6 +155,11 @@
 -- It compares every bound with the corresponding covered counter after applying the commit's membership changes.
 -- A checked Proposal settlement binds a count condition to its own world and evaluates the complete counted prefix across the retained parent and final overlay.
 -- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
+-- The private Proposal slot carries the held Root's through-position and a separate receiver-clock target.
+-- A positioned receiver evaluates the half-open slot using its independent clock observation.
+-- The staged history coordinate also has to fit between the previous owned coordinate and source append.
+-- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
+-- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
 -- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.
 -- In a Proposal, local period rows and absence shadows mask the same identity in the held parent at that cut.
 -- An installed sample projection folds the complete assertion population per series in accepted order and counts each surviving sample coordinate once.
@@ -167,7 +172,9 @@
 -- A world overlay may withdraw a fact under a current Root capacity or uniqueness rule.
 -- A replacement outside every current Root capacity predicate does not increase a covered count.
 -- In placed settlement, an acceptance-valid world write checks the current Root capacity against its final overlay and exact retained parent.
--- A local tombstone or replacement masks the archived member with the same identity.
+-- The receiver opens each frozen writer under its registered pin at the exact source cut.
+-- From newest to oldest, a tombstone or replacement masks older members with the same identity.
+-- Capacity compares the complete effective populations on either side of the local write.
 -- A growth beyond the current maximum aborts the world writes and accompanying effects.
 -- A Root unique claim covers the fact's exact valid interval.
 -- The ordered resolver checks the final holders of each affected key over every changed interval.
@@ -177,7 +184,8 @@
 -- A world unique claim checks final local occupancy and the exact archived occupant for its path and key.
 -- A final local shadow can withdraw an inherited occupant and transfer the unique key in the same ordered write.
 -- A finite Proposal or Held world validates each affected unique key over its final winning local intervals and the exact admitted archived parent.
--- A local shadow masks an inherited claim only for the same entity and the intersection with the shadow's winning valid interval.
+-- Newer shadows mask an inherited claim only for the same entity and the intersection with their winning valid intervals.
+-- For each ancestor or Root holder, the receiver checks whether the union of newer masks covers its overlap with a local claim.
 -- Two adjacent half-open claims may share the key, and any remaining intersection aborts the world write.
 -- Acceptance-valid writes in a Held world start at the logical clock that the world publishes with them and have an open end.
 -- Held Original replay installs complete-key capacity rules at their source transaction and requires the exact resulting frontier and counter effects.
@@ -206,6 +214,8 @@
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- A held position point or valid window excludes assertions from the first masked position through the end of one commit before resolving the winners.
 -- A Root point or valid window reports the stored ordinal of each positioned winner through its owned read response.
+-- An ordered index keeps separate revision roots for tied historical times and applies the held cut through its original transaction.
+-- Rebuilding an ordered index suppresses assertions before the full erasure position, including earlier assertions at the same historical time.
 -- A held position read still honours live ordered erasure and returns no commit evidence.
 -- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
 -- Its ordered condition checks the original parent pin and Root purge frontier.
@@ -281,6 +291,9 @@
 -- Databases with external transaction sources and nodes without indexing cannot serve this barrier.
 -- SHOW rtdb_hosted_source_barrier is the hosted variant and returns the confirmed deployment identity.
 -- It requires a current holder with linearizable reads, a recovered directory checkpoint, and a fresh quorum confirmation.
+-- The ordinary hosted Flight source confirmation uses the same barrier before checking the original positions at one admitted catalog cut.
+-- The authenticated placed control owner supplies the deployment identity and up to four exact transaction ID and system-time pairs.
+-- The Flight reply carries the sampled applied position as Arrow columns only when the cut proves every supplied position.
 --
 -- == Boundaries ==
 --
@@ -425,6 +438,8 @@ value CommitOpts {
     --                   The installed catalog determines retention even when a query selects an earlier system time.
     --                   A settled retry keeps its original causal coordinate after that metadata expires.
     --                   An idempotency_key field names an exact transaction retry identity scoped to the registered receiver, database and authenticated principal.
+    --                   The hosted named-await carrier binds the Original task owner, request address and descriptor to the ordered command.
+    --                   A hosted function completion orders its fate with the application writes and substitutes the exact refusal fate when the resolver chooses the constraint refusal.
     --                   A same-body retry within the receipt window returns the original outcome and a changed body aborts with rtdb/idempotency-conflict.
     --                   Application owners register business intents and compare any labelled commands at their own decision boundaries.
     --                   Within one installed history, receipt admission and expiry use the original certified decision reading.
@@ -1215,7 +1230,8 @@ rule CommitWriting {
 }
 
 -- In a placed deployment, COMMIT ASYNC sets the connection's await token to an opaque attempt receipt.
--- A volatile intake receipt identifies a provisional offer.
+-- The holder's bounded memory intake contains provisional offers.
+-- A placed submit acknowledges only after observing the exact ordered reservation or its terminal witness.
 -- Covered effectful admission reserves the original slot and funds its terminal witness under the exact request binding.
 -- Exact retry redeems the original slot, and a retired issuance namespace excludes recreation.
 -- The effect or refusal and the receiver's exact terminal witness occupy one ordered record.
@@ -1226,7 +1242,9 @@ rule CommitWriting {
 -- The same decision installation gates visibility.
 -- A fenced attempt with missing evidence remains unknown unless durable evidence excludes an original timely quorum.
 -- A missing witness or exclusive receipt expiry leaves unresolved obligations charged and does not settle the effect.
--- The successor installs the authentic prefix and accepts outstanding slot obligations before opening fresh work.
+-- The Original terminal transfer receipt binds the certified replica interval and the exact unmatched receiver reservation.
+-- The destination verifies the census while held and retains the original slot through publication.
+-- The successor orders the inherited slot's fence before opening fresh receiver admission.
 -- An applied prefix remains a causal basis after receipt expiry.
 -- An ordered erasure can collect settled evidence after its retention, holds and export obligations end.
 -- Before pinning an implicit read basis, redeem the attempt and wait for its exact installed applied prefix.

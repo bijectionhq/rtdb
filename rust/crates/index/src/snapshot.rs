@@ -26,6 +26,7 @@ pub struct Snapshot {
     system_time_cap: Option<Timestamp>,
     catalog_cut: Option<CatalogCut>,
     catalog_read: Option<CatalogRead>,
+    certified_read: Option<Arc<rtdb_types::residence_trace::CertifiedRead>>,
 }
 
 /// Routing coordinates carried by the captured catalog and its applied event
@@ -52,7 +53,7 @@ impl OwnedRoutingInventory {
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, certified_read: None }
     }
     pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
         self.catalog_cut = catalog_cut;
@@ -91,6 +92,13 @@ impl Snapshot {
     /// Clones the storage registration that was attached when the catalog was captured.
     pub fn catalog_read_permit<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
         Arc::clone(&self.catalog_read.as_ref()?.permit).downcast().ok()
+    }
+    pub fn with_certified_read(mut self, read: Arc<rtdb_types::residence_trace::CertifiedRead>) -> Self {
+        self.certified_read = Some(read);
+        self
+    }
+    pub fn certified_read(&self) -> Option<&Arc<rtdb_types::residence_trace::CertifiedRead>> {
+        self.certified_read.as_ref()
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     pub fn serving_search<T: std::any::Any>(&self) -> Option<&T> { self.durable.search.as_ref()?.get() }

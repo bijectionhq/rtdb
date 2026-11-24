@@ -8,6 +8,7 @@
 use super::payload::{Cache, Item, Location, Source, Stored};
 use super::state::{Event, Held, StreamState, Window};
 use super::store::{Slot, Store};
+use crate::decision::{DecisionCertificate, Handoff, HandoffCertificate, StableDecision};
 use crate::history::RetainedChain;
 use crate::protocol::{Entries, Entry, before_guarded_cutoff};
 use bytes::{Bytes, BytesMut};
@@ -48,6 +49,20 @@ struct Snapshot {
     retired: bool,
     #[prost(bytes = "bytes", tag = "6")]
     active_ensemble: Bytes,
+    #[prost(sint64, optional, tag = "7")]
+    installed: Option<i64>,
+    #[prost(message, optional, tag = "8")]
+    certificate: Option<DecisionCertificate>,
+    #[prost(message, optional, tag = "9")]
+    stability: Option<StableDecision>,
+    #[prost(bool, tag = "10")]
+    certified: bool,
+    #[prost(bytes = "bytes", tag = "11")]
+    last_ensemble: Bytes,
+    #[prost(message, optional, tag = "12")]
+    export: Option<Handoff>,
+    #[prost(message, optional, tag = "13")]
+    handoff: Option<HandoffCertificate>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -60,6 +75,14 @@ struct ObservedSync {
     timestamp: i64,
     #[prost(sfixed64, tag = "4")]
     clock_upper_micros: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CertificateExposure {
+    #[prost(message, required, tag = "1")]
+    proof: StableDecision,
+    #[prost(bool, tag = "2")]
+    replay: bool,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
@@ -88,13 +111,23 @@ enum Kind {
     Drop(u64),
     #[prost(message, tag = "13")]
     ObservedSync(ObservedSync),
+    #[prost(sint64, tag = "18")]
+    Install(i64),
+    #[prost(message, tag = "15")]
+    InstallCertificate(DecisionCertificate),
+    #[prost(message, tag = "16")]
+    ExposeCertificate(CertificateExposure),
+    #[prost(message, tag = "19")]
+    ExportHandoff(Handoff),
+    #[prost(message, tag = "20")]
+    InstallHandoff(HandoffCertificate),
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20")]
     kind: Option<Kind>,
     // An activation is an optional refinement of an existing synced record.
     #[prost(bytes = "bytes", tag = "12")]
@@ -103,6 +136,8 @@ struct Record {
     // the entry itself, before the post-sync clock observation can exist.
     #[prost(bool, optional, tag = "14")]
     original_append: Option<bool>,
+    #[prost(bool, tag = "17")]
+    certified: bool,
 }
 
 fn record(event: &Event) -> Kind {
@@ -112,6 +147,11 @@ fn record(event: &Event) -> Kind {
         Event::Activate { epoch, .. } => Kind::Synced(*epoch),
         Event::Truncate(from) => Kind::Truncate(*from),
         Event::Append(entry) => Kind::Append(entry.clone()),
+        Event::Install(lsn) => Kind::Install(*lsn),
+        Event::ExportHandoff(handoff) => Kind::ExportHandoff(handoff.clone()),
+        Event::InstallHandoff(proof) => Kind::InstallHandoff(proof.clone()),
+        Event::InstallCertificate(certificate) => Kind::InstallCertificate(certificate.clone()),
+        Event::ExposeCertificate { proof, replay } => Kind::ExposeCertificate(CertificateExposure { proof: proof.clone(), replay: *replay }),
         Event::Commit(lsn) => Kind::Commit(*lsn),
         Event::Trim(through) => Kind::Trim(*through),
         Event::Drop(epoch) => Kind::Drop(*epoch),
@@ -173,6 +213,7 @@ struct Current {
 }
 
 pub(crate) struct Journal {
+    pub(super) signer: rtdb_storage::attestation::SigningKey,
     segments: PathBuf,
     fsync: bool,
     _lock: File,
@@ -304,18 +345,24 @@ fn read_identity(path: &Path, length: usize) -> Result<Option<String>> {
     Ok(Some(identity))
 }
 
-fn write_identity(data_dir: &Path, path: &Path, identity: &str, fsync: bool) -> Result<()> {
+fn write_identity(data_dir: &Path, path: &Path, contents: &[u8], fsync: bool) -> Result<()> {
     let temporary = path.with_extension("tmp");
-    let mut file = OpenOptions::new().create(true).truncate(true).write(true)
-        .open(&temporary).map_err(|error| io_error(&temporary, error))?;
-    file.write_all(identity.as_bytes()).map_err(|error| io_error(&temporary, error))?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary).map_err(|error| io_error(&temporary, error))?;
+    file.write_all(contents).map_err(|error| io_error(&temporary, error))?;
     if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&temporary, error))?; }
     fs::rename(&temporary, path).map_err(|error| io_error(path, error))?;
     sync_directory(data_dir, fsync)
 }
 
 pub(super) enum MemberIdentity {
-    Open(String),
+    Open,
     Reopen(String),
 }
 
@@ -337,23 +384,42 @@ impl Journal {
         let files = list_segments(&segments, true)?;
         let member_path = data_dir.join("MEMBER");
         let local_path = data_dir.join("JOURNAL_ID");
-        let (identity_path, candidate) = match member.as_ref() {
-            Some(MemberIdentity::Open(candidate) | MemberIdentity::Reopen(candidate)) => {
+        let identity_path = match member.as_ref() {
+            Some(MemberIdentity::Open | MemberIdentity::Reopen(_)) => {
                 if local_path.try_exists().map_err(|error| io_error(&local_path, error))? {
                     return Err(corrupt(&local_path, "an anonymous journal cannot register as a member"));
                 }
-                (&member_path, candidate.clone())
+                &member_path
             }
             None => {
                 if member_path.try_exists().map_err(|error| io_error(&member_path, error))? {
                     return Err(corrupt(&member_path, "a member journal requires its member configuration"));
                 }
-                (&local_path, uuid::Uuid::new_v4().to_string())
+                &local_path
             }
         };
-        let identity = read_identity(identity_path, candidate.len())?;
-        if matches!(member, Some(MemberIdentity::Reopen(_))) && identity.as_deref() != Some(candidate.as_str()) {
+        let identity = read_identity(identity_path, 36)?;
+        if let Some(MemberIdentity::Reopen(expected)) = &member
+            && identity.as_deref() != Some(expected.as_str())
+        {
             return Err(corrupt(identity_path, "the original journal member identity is missing or different"));
+        }
+        let private_key = data_dir.join("JOURNAL_SIGNING_KEY");
+        let encoded = match fs::read(&private_key) {
+            Ok(encoded) => encoded,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && identity.is_none() => {
+                let key = rtdb_storage::attestation::SigningKey::generate()
+                    .map_err(|error| io_error(&private_key, error))?;
+                write_identity(data_dir, &private_key, &key, fsync)?;
+                key
+            }
+            Err(error) => return Err(io_error(&private_key, error)),
+        };
+        let signer = rtdb_storage::attestation::SigningKey::open(&encoded)
+            .map_err(|error| io_error(&private_key, error))?;
+        let candidate = crate::attestation::journal_id(&signer.public_key()).to_string();
+        if identity.as_ref().is_some_and(|retained| retained != &candidate) {
+            return Err(corrupt(identity_path, "the journal signing key does not own its retained identity"));
         }
         if identity.is_some() && files.is_empty() {
             return Err(corrupt(identity_path, "the installed journal has lost its segments"));
@@ -404,10 +470,11 @@ impl Journal {
         } else {
             if fsync { rtdb_storage::sync_file(&file).map_err(|error| io_error(&path, error))?; }
             sync_directory(&segments, fsync)?;
-            write_identity(data_dir, identity_path, &candidate, fsync)?;
+            write_identity(data_dir, identity_path, candidate.as_bytes(), fsync)?;
             candidate
         };
         let journal = Self {
+            signer,
             segments,
             fsync,
             _lock: lock,
@@ -469,7 +536,8 @@ impl Journal {
                             _ => None,
                         };
                         let original_append = matches!(event, Event::Append(entry) if entry.guarded).then_some(observation.is_some());
-                        frame_record(Record { stream: slot.id, kind: Some(record(event)), active_ensemble, original_append }, &mut buffer);
+                        frame_record(Record { stream: slot.id, kind: Some(record(event)), active_ensemble, original_append,
+                            certified: matches!(event, Event::Activate { certified: true, .. }), }, &mut buffer);
                         if let Event::Append(entry) = event {
                             placed.push(Placed { slot, entry, start, length: buffer.len() - start, observation });
                         }
@@ -560,6 +628,13 @@ impl Journal {
             frame(id, Kind::Snapshot(Snapshot {
                 promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.dropped,
                 active_ensemble: state.active_ensemble.as_ref().map_or_else(Bytes::new, |ensemble| Bytes::copy_from_slice(ensemble)),
+                installed: Some(state.installed),
+                certificate: state.certificate.clone(),
+                stability: state.stability.clone(),
+                certified: state.certified,
+                last_ensemble: state.last_ensemble.as_ref().map_or_else(Bytes::new, |ensemble| Bytes::copy_from_slice(ensemble)),
+                export: state.export.clone(),
+                handoff: state.handoff.clone(),
             }), &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
@@ -571,7 +646,7 @@ impl Journal {
                 let length = payload.len() as u32;
                 let entry = Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, guarded: held.guarded, guarded_before: held.guarded_before, timed_origin: held.timed_origin.as_deref().cloned(), payload };
                 let original_append = held.guarded.then_some(held.observed_sync.is_some());
-                frame_record(Record { stream: id, kind: Some(Kind::Append(entry)), active_ensemble: Bytes::new(), original_append }, &mut buffer);
+                frame_record(Record { stream: id, kind: Some(Kind::Append(entry)), active_ensemble: Bytes::new(), original_append, certified: false }, &mut buffer);
                 locations.push(Location { segment: sequence, offset: written + start as u64, length: (buffer.len() - start) as u32, payload: length });
                 if let Some(clock_upper_micros) = held.observed_sync.as_ref().and_then(|sample| sample.get().copied()) {
                     frame(id, Kind::ObservedSync(ObservedSync { lsn, epoch: held.epoch,
@@ -681,7 +756,7 @@ impl Replay {
         let length = file.metadata().map_err(|error| io_error(path, error))?.len();
         let mut reader = BufReader::with_capacity(1 << 20, file);
         let mut position = 0u64;
-        while let Some((Record { stream, kind, active_ensemble, original_append }, framed)) = read_record(&mut reader, length - position).map_err(|error| io_error(path, error))? {
+        while let Some((Record { stream, kind, active_ensemble, original_append, certified }, framed)) = read_record(&mut reader, length - position).map_err(|error| io_error(path, error))? {
             let at = position;
             position += framed;
             let kind = kind.ok_or_else(|| corrupt(path, "a record without a kind"))?;
@@ -704,7 +779,15 @@ impl Replay {
                     *state = StreamState {
                         promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced),
                         active_ensemble: decode_ensemble(path, &snapshot.active_ensemble)?,
-                        trim: snapshot.trim, commit: snapshot.commit, dropped: snapshot.retired, ..StreamState::default()
+                        certified: snapshot.certified,
+                        last_ensemble: decode_ensemble(path, &snapshot.last_ensemble)?,
+                        export: snapshot.export,
+                        handoff: snapshot.handoff,
+                        trim: snapshot.trim, commit: snapshot.commit,
+                        installed: snapshot.installed.ok_or_else(|| corrupt(path, "snapshot has no installed decision frontier"))?,
+                        certificate: snapshot.certificate,
+                        stability: snapshot.stability,
+                        dropped: snapshot.retired, ..StreamState::default()
                     };
                 }
                 Kind::Promise(epoch) => state.apply(&Event::Promise(epoch)),
@@ -714,7 +797,7 @@ impl Replay {
                         if epoch == 0 || epoch != state.promised || state.active_ensemble.is_some_and(|active| active != ensemble) {
                             return Err(corrupt(path, "activation does not match the stream's promised epoch or ensemble"));
                         }
-                        state.apply(&Event::Activate { epoch, ensemble });
+                        state.apply(&Event::Activate { epoch, ensemble, certified });
                     }
                 }
                 Kind::Truncate(from) => state.apply(&Event::Truncate(from)),
@@ -735,6 +818,11 @@ impl Replay {
                         return Err(corrupt(path, "invalid sync observation"));
                     }
                 }
+                Kind::Install(lsn) => state.apply(&Event::Install(lsn)),
+                Kind::ExportHandoff(handoff) => state.apply(&Event::ExportHandoff(handoff)),
+                Kind::InstallHandoff(proof) => state.apply(&Event::InstallHandoff(proof)),
+                Kind::InstallCertificate(certificate) => state.apply(&Event::InstallCertificate(certificate)),
+                Kind::ExposeCertificate(exposure) => state.apply(&Event::ExposeCertificate { proof: exposure.proof, replay: exposure.replay }),
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),
                 Kind::Trim(through) => state.apply(&Event::Trim(through)),
                 Kind::Drop(epoch) => state.apply(&Event::Drop(epoch)),
@@ -877,6 +965,18 @@ pub(crate) async fn run(journal: Arc<Journal>, store: Weak<Store>, mut queue: mp
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn install_and_original_append_decode_as_distinct_journal_fields() {
+        use super::{Kind, Message, Record};
+
+        let old = Record::decode(&[0x70, 0x01][..]).unwrap();
+        assert_eq!(old.original_append, Some(true));
+        assert!(old.kind.is_none());
+        let installed = Record::decode(&[0x90, 0x01, 0x02][..]).unwrap();
+        assert!(matches!(installed.kind, Some(Kind::Install(1))));
+        assert_eq!(installed.original_append, None);
+    }
+
     use super::*;
 
     const UNBOUNDED: usize = usize::MAX;
@@ -927,12 +1027,10 @@ mod tests {
     #[test]
     fn an_installed_member_rejects_missing_segments() {
         let directory = tempfile::tempdir().unwrap();
-        let first = "c2a4eba6-83a7-455d-a1c1-b80c5cf5f2ba";
-        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open(first.into()))).unwrap();
-        assert_eq!(identity, first);
+        let (journal, _, identity) = Journal::open(directory.path(), true, 0, Some(MemberIdentity::Open)).unwrap();
         drop(journal);
         fs::remove_dir_all(directory.path().join("segments")).unwrap();
-        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(first.into()))).is_err());
+        assert!(Journal::open(directory.path(), true, 0, Some(MemberIdentity::Reopen(identity))).is_err());
     }
 
     #[test]
@@ -942,21 +1040,21 @@ mod tests {
         let stream = slot(&journal, "active-loglet");
         let ensemble = [4; 32];
         synced(&journal, &stream, 1);
-        decide(&journal, &stream, |state| state.activate(1, ensemble));
+        decide(&journal, &stream, |state| state.activate(1, ensemble, false));
         drop(journal);
 
         let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = recovered_slots(recovered).remove("active-loglet").unwrap();
-        assert!(matches!(stream.state.lock().read_index(1, ensemble), crate::protocol::ResponseBody::Accepted(_)));
-        assert!(matches!(stream.state.lock().activate(1, [5; 32]).reply, crate::protocol::ResponseBody::Refused(_)));
+        assert!(matches!(stream.state.lock().read_index(1, ensemble, false), crate::protocol::ResponseBody::Accepted(_)));
+        assert!(matches!(stream.state.lock().activate(1, [5; 32], false).reply, crate::protocol::ResponseBody::Refused(_)));
         compact(&journal, &[&stream]);
         drop(journal);
 
         let (journal, recovered, _) = Journal::open(directory.path(), true, 0, None).unwrap();
         let stream = recovered_slots(recovered).remove("active-loglet").unwrap();
-        assert!(matches!(stream.state.lock().read_index(1, ensemble), crate::protocol::ResponseBody::Accepted(_)));
+        assert!(matches!(stream.state.lock().read_index(1, ensemble, false), crate::protocol::ResponseBody::Accepted(_)));
         synced(&journal, &stream, 2);
-        assert!(matches!(stream.state.lock().read_index(2, ensemble), crate::protocol::ResponseBody::Refused(_)));
+        assert!(matches!(stream.state.lock().read_index(2, ensemble, false), crate::protocol::ResponseBody::Refused(_)));
     }
 
     #[test]
@@ -1006,7 +1104,7 @@ mod tests {
         let mut raw = BytesMut::new();
         frame_record(Record {
             stream: stream.id, kind: Some(Kind::Append(Entry { guarded: true, ..entry(0) })),
-            active_ensemble: Bytes::new(), original_append: Some(true),
+            active_ensemble: Bytes::new(), original_append: Some(true), certified: false,
         }, &mut raw);
         // Stop after persisting the raw append, before the second sync can publish its sample.
         journal.append(&mut journal.current.lock(), &raw, true).unwrap();

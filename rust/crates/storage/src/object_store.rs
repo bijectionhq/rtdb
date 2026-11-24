@@ -146,12 +146,22 @@ pub trait IndexPageLifecycle: Send + Sync {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Identifies a loose allocation by the S3 address this owner will use,
+    /// including for names reserved before the first provider write.
+    fn s3_publication_address(&self, _key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> { None }
+    /// Resolves the provider address selected by the current held storage view.
+    async fn replica_publication_address(&self, key: &ObjectKey) -> Result<Option<(rtdb_types::S3ObjectNamespace, String)>> {
+        let observed = self.observe_head(key).await?;
+        Ok(observed.version.map(|version| (version.namespace, version.key))
+            .or_else(|| self.s3_publication_address(key)))
+    }
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
-    /// Opens the read-only objects owned by an authenticated replica delivery.
-    async fn open_replica_objects(&self, _scope: crate::log::ReplicaObjectScope) -> Result<Arc<dyn ObjectStore>> {
-        Err(Error::Task("The store has no installed replica object scope".into()))
+    /// Resolves the single payload named by an authenticated replica delivery.
+    async fn read_replica_payload(&self, _custody: &crate::log::ReplicaObjectCustody,
+        _memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<crate::log::ReplicaPayload> {
+        Err(Error::Task("The store has no installed replica payload broker".into()))
     }
     /// Published checkpoint files survive a process restart on the same storage.
     fn syncs_checkpoints(&self) -> bool { false }
@@ -179,6 +189,23 @@ pub trait ObjectStore: Send + Sync {
     /// Returns false while the authority retains the files and expects the caller to retry.
     async fn release_trie_files(&self, _receipt: &ObjectKey, _contents: Bytes) -> rtdb_types::Result<bool> {
         Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "This store has no coordinated trie release"))
+    }
+    /// Closes stale catalog admissions and checks current holds for each Classic candidate.
+    /// A path is supplied only when the installed receipt identifies an immutable compacted file.
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
+        Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()])
+    }
+    /// Provider preflight for an exact publication selected by the Classic grant.
+    async fn classic_trie_retirement_ready(&self, _key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> rtdb_types::Result<bool> {
+        Ok(version.is_none())
+    }
+    /// Physical settlement, called by the Classic retirement owner after admission closes.
+    async fn settle_classic_trie(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> rtdb_types::Result<()> {
+        if version.is_some() {
+            return Err(rtdb_types::Anomaly::unsupported("rtdb.storage/trie-release", "The provider cannot settle an exact object version"));
+        }
+        self.delete(key).await?;
+        Ok(())
     }
     async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
@@ -271,10 +298,6 @@ pub trait ObjectStore: Send + Sync {
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
-    async fn put_replica_payload(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
-        self.put(key, bytes).await?;
-        Ok(None)
-    }
     /// Returns the identity from the successful write or from the read that verified an identical existing object.
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.put(key, bytes).await?;
@@ -414,9 +437,9 @@ impl LocalStore {
 
     /// Settles the prefixes selected by the verified offline repair anchor.
     pub async fn retire_classic_log_prefixes(&self, anchor: crate::LocalRepairAnchor,
-        replica: &Path, maximum: usize,
+        replica: &Path, maximum: usize, vault: Option<&crate::sealing::ClassicKeyVault>,
     ) -> rtdb_types::Result<()> {
-        crate::classic_retirement::retire_log_prefixes(self, anchor, replica, maximum).await
+        crate::classic_retirement::retire_log_prefixes(self, anchor, replica, maximum, vault).await
     }
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -424,8 +447,9 @@ impl LocalStore {
     }
     /// Shares a caller-owned I/O region with sibling stores; closing the region closes admission for every sibling.
     pub fn open_in(root: impl AsRef<Path>, io: Arc<IoRegion>) -> Result<Self> {
-        let _operation = io.admit()?;
-        let root = root.as_ref();
+        let selected = Arc::new(root.as_ref().to_path_buf());
+        let _operation = io.admit_read(selected.clone(), ())?;
+        let root = selected.as_path();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
         Ok(Self { root: Arc::new(root), io, catalog: None })
@@ -437,13 +461,11 @@ impl LocalStore {
     }
     /// Synchronizes an existing immutable object and its directory entries through the storage root.
     pub async fn sync_existing(&self, key: &ObjectKey) -> Result<()> {
-        let root = self.root.clone();
-        let path = self.path(key);
-        let key = key.clone();
-        self.io.run(move || {
-            let file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), |root, key| {
+            let path = root.join(key.as_str());
+            let file = open_object(&path, key)?;
             crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
-            sync_parents(&path, &root)
+            sync_parents(&path, root)
         }).await
     }
 
@@ -451,20 +473,20 @@ impl LocalStore {
     pub async fn hold_recovery_open(&self) -> rtdb_types::Result<Arc<dyn Send + Sync>> {
         let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
-        Ok(Arc::new(self.io.run(move || Ok(ledger.hold_recovery_open())).await??))
+        Ok(Arc::new(self.io.read(ledger, "recovery-open", |ledger, _| Ok(ledger.hold_recovery_open())).await??))
     }
 
     pub(crate) async fn try_lock_recovery_deletion(&self) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
-        let gate = self.io.run(move || Ok(ledger.try_lock_recovery_deletion())).await??;
+        let gate = self.io.read(ledger, "recovery-open", |ledger, _| Ok(ledger.try_lock_recovery_deletion())).await??;
         Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
     }
 
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
     pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
-        let ledger = crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch());
-        self.io.run(move || Ok(ledger.install_repair_anchor(anchor))).await?
+        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch()));
+        self.io.read(ledger, "repair-anchor", move |ledger, _| Ok(ledger.install_repair_anchor(anchor))).await?
     }
 
     /// Loads the durable repair anchor at this local storage root.
@@ -472,7 +494,7 @@ impl LocalStore {
         let ledger = self.catalog.clone().unwrap_or_else(|| {
             Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), rtdb_types::StorageEpoch(0)))
         });
-        self.io.run(move || Ok(ledger.retained_repair_anchor())).await?
+        self.io.read(ledger, "repair-anchor", |ledger, _| Ok(ledger.retained_repair_anchor())).await?
     }
 
     /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
@@ -485,7 +507,7 @@ impl LocalStore {
     /// Missing sources return MissingObject, different destination bytes return ConflictingObject, and either closed region returns Closed.
     /// An I/O or synchronization error can occur after the destination has been published.
     pub async fn copy_to(&self, source: &ObjectKey, destination: &LocalStore, key: &ObjectKey) -> Result<()> {
-        let admission = self.io.admit()?;
+        let admission = self.io.admit_read(self.root.clone(), source.clone())?;
         let file = open_object(&self.path(source), source)?;
         destination.publish_file(key, AdmittedFile { file, _admission: admission }).await
     }
@@ -569,7 +591,7 @@ impl ObjectStore for LocalStore {
 
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let Some(ledger) = self.catalog.clone() else { return Ok(None); };
-        Ok(Some(Arc::new(self.io.run(move || Ok(ledger.retain(cut))).await??)))
+        Ok(Some(Arc::new(self.io.read(ledger, ("floor", cut), |ledger, &(_, cut)| Ok(ledger.retain(cut))).await??)))
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
@@ -577,7 +599,7 @@ impl ObjectStore for LocalStore {
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let Some(ledger) = self.catalog.clone() else { return Ok(true); };
-        self.io.run(move || Ok(ledger.advance(installed))).await?
+        self.io.read(ledger, ("floor", installed), |ledger, &(_, installed)| Ok(ledger.advance(installed))).await?
     }
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
@@ -585,18 +607,18 @@ impl ObjectStore for LocalStore {
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || {
-            let file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            let path = root.join(key.as_str());
+            let file = open_object(&path, key)?;
             let size = file.metadata().map_err(|error| Error::io(&path, error))?.len();
-            Ok(StoredObject { key, size })
+            Ok(StoredObject { key: key.clone(), size })
         }).await
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || {
-            let mut file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            let path = root.join(key.as_str());
+            let mut file = open_object(&path, key)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
             Ok(Bytes::from(bytes))
@@ -604,35 +626,38 @@ impl ObjectStore for LocalStore {
     }
 
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<Bytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || {
-            let mut file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), move |root, key| {
+            let path = root.join(key.as_str());
+            let mut file = open_object(&path, key)?;
             if file.metadata().map_err(|error| Error::io(&path, error))?.len() != length as u64 {
-                return Err(wrong_size(&key, length));
+                return Err(wrong_size(key, length));
             }
             let mut bytes = vec![0; length];
             file.read_exact(&mut bytes).map_err(|error| Error::io(&path, error))?;
             if file.read(&mut [0]).map_err(|error| Error::io(&path, error))? != 0 {
-                return Err(wrong_size(&key, length));
+                return Err(wrong_size(key, length));
             }
             Ok(Bytes::from(bytes))
         }).await
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || read_local_range(&path, &key, range)).await
+        self.io.read(self.root.clone(), (key.clone(), range), |root, (key, range)| {
+            read_local_range(&root.join(key.as_str()), key, range.clone())
+        }).await
     }
 
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+        self.io.read(self.root.clone(), (key.clone(), range), move |root, (key, range)| {
+            reservation.finish(read_local_range(&root.join(key.as_str()), key, range.clone())?)
+        }).await
     }
 
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || map_range(LocalFile::new(open_object(&path, &key)?, None), &key, range, reservation)).await
+        self.io.read(self.root.clone(), (key.clone(), range), move |root, (key, range)| {
+            map_range(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None), key, range.clone(), reservation)
+        }).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
@@ -660,7 +685,7 @@ impl ObjectStore for LocalStore {
     }
 
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
-        let admission = self.io.admit()?;
+        let admission = self.io.admit_read(self.root.clone(), source.to_path_buf())?;
         let file = File::open(source).map_err(|error| Error::io(source, error))?;
         self.publish_file(key, AdmittedFile { file, _admission: admission }).await
     }
@@ -670,9 +695,7 @@ impl ObjectStore for LocalStore {
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
-        let root = self.root.clone();
-        let directory = directory.cloned();
-        self.io.run(move || {
+        self.io.read(self.root.clone(), directory.cloned(), |root, directory| {
             fn visit(root: &Path, path: &Path, result: &mut Vec<StoredObject>) -> Result<()> {
                 let metadata = match fs::symlink_metadata(path) {
                     Ok(metadata) => metadata,
@@ -694,9 +717,9 @@ impl ObjectStore for LocalStore {
                 }
                 Ok(())
             }
-            let start = directory.as_ref().map_or_else(|| root.as_ref().clone(), |key| root.join(key.as_str()));
+            let start = directory.as_ref().map_or_else(|| root.clone(), |key| root.join(key.as_str()));
             let mut result = Vec::new();
-            visit(&root, &start, &mut result)?;
+            visit(root, &start, &mut result)?;
             result.sort_by(|a, b| a.key.cmp(&b.key));
             Ok(result)
         }).await
@@ -704,8 +727,9 @@ impl ObjectStore for LocalStore {
 
     /// A local object is never rewritten under its key, and an open file outlives a delete, so the file is the object for as long as it is held.
     async fn local_file(&self, key: &ObjectKey) -> Result<Option<LocalFile>> {
-        let (path, key) = (self.path(key), key.clone());
-        self.io.run(move || Ok(Some(LocalFile::new(open_object(&path, &key)?, None)))).await
+        self.io.read(self.root.clone(), key.clone(), |root, key| {
+            Ok(Some(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None)))
+        }).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
@@ -723,8 +747,10 @@ impl ObjectStore for LocalStore {
         };
         let path = self.path(key);
         let root = self.root.clone();
-        let ledger = crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0));
-        self.io.run(move || Ok(ledger.collect_recovery_file(block, || remove_local_object(&root, &path)))).await?
+        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0)));
+        self.io.read(ledger, ("repair-anchor", key.clone(), block), move |ledger, (_, _, block)| {
+            Ok(ledger.collect_recovery_file(*block, || remove_local_object(&root, &path)))
+        }).await?
     }
 }
 

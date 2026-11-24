@@ -62,7 +62,7 @@ fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
     use rtdb_types::{EntityId, Interval, LogicalType, ScalarType, Timestamp, Value};
 
     let events = [Value::Null, Value::I64(7), Value::Utf8("mixed".into())].into_iter().enumerate()
-        .map(|(index, value)| StoredEvent {
+        .map(|(index, value)| StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,

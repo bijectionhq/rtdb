@@ -2,18 +2,26 @@
 
 use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
-    Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint, Grant, Outcome, Placement,
-    Principal, Receipt, Request, RequestId,
+    Checkpoint, CheckpointPreparation, Command, Cut, Grant, Outcome, Placement, Principal, Receipt,
+    Request, RequestId,
+    service::wire::{Decision, SignedRotationSlots},
 };
+use rtdb_storage::ObjectStore;
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
 use crate::journal::{
-    Authority, InstalledJournal, WriterAdmission, custody::CheckpointCustody, refused,
+    Authority, InstalledJournal, WriterAdmission,
+    custody::{CheckpointAuthority, CheckpointCustody, ErasureBinding, Preparation, Reservation},
+    refused,
 };
 use crate::keys::{JournalKey, KeyService};
 
-const MAX_REVOCATION_DELAY_MS: u64 = 120_000;
+mod evidence;
+use evidence::CustodyEvidence;
+pub use evidence::{DeadlineReservation, DestructionEvidence, ErasureDeadline, ErasureTiming};
+
+const OPERATIONAL_TARGET_MS: u64 = 120_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Erasure {
@@ -21,6 +29,7 @@ pub struct Erasure {
     pub operation: Uuid,
     pub custody_domain: Uuid,
     pub incumbent: Grant,
+    pub timing: ErasureTiming,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,11 +39,27 @@ pub struct PreparedErasure {
     pub rotation: RequestId,
 }
 
+fn binding(erasure: Erasure, rotation: RequestId) -> ErasureBinding {
+    ErasureBinding {
+        operation: erasure.operation,
+        custody_domain: erasure.custody_domain,
+        rotation,
+        fixed_before_ms: match erasure.timing {
+            ErasureTiming::Fixed { before_ms } => Some(before_ms),
+            ErasureTiming::OperationalTarget => None,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ErasureCommit {
     pub prepared: PreparedErasure,
     pub committed_at_ms: u64,
-    pub deadline_ms: u64,
+    pub deadline: ErasureDeadline,
+    /// Attests the exact retiring key inventory selected by the custody owner.
+    pub retiring_inventory: [u8; 32],
+    /// Authenticated Logkeeper response used to bind the ordered switch.
+    pub switch_evidence: [u8; 32],
 }
 
 #[derive(Clone, Copy)]
@@ -43,25 +68,13 @@ pub enum ErasureProgress {
     Committed(ErasureCommit),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum RecoverySlotId {
-    A,
-    B,
-}
-
-#[derive(Clone, Copy)]
-pub struct RecoverySlot {
-    pub id: RecoverySlotId,
-    pub placement: Placement,
-    pub durable_image: Fingerprint,
-    pub checkpoint: Checkpoint,
-    pub suffix_key_generation: u64,
-}
-
 pub struct CleanRecoverySlots {
     prepared: PreparedErasure,
     successor: WriterAdmission,
-    slots: [RecoverySlot; 2],
+    receipt: Receipt,
+    slots: SignedRotationSlots,
+    binding: [u8; 32],
+    deadline: Option<DeadlineReservation>,
 }
 
 impl CleanRecoverySlots {
@@ -73,16 +86,33 @@ impl CleanRecoverySlots {
         self.successor
     }
 
-    pub fn slots(&self) -> &[RecoverySlot; 2] {
+    pub fn binding(&self) -> [u8; 32] {
+        self.binding
+    }
+
+    pub fn receipt(&self) -> Receipt {
+        self.receipt
+    }
+
+    pub fn slots(&self) -> &SignedRotationSlots {
         &self.slots
+    }
+
+    pub fn deadline(&self) -> Option<DeadlineReservation> {
+        self.deadline
     }
 }
 
 #[async_trait]
 pub trait ErasureCustody: Send + Sync {
-    /// Close copy and new serving admissions and drain the incumbent, including
-    /// pending appends and offloaded writes. Keep the fence through restart
-    /// until commit or durable resolution of an abandoned attempt.
+    /// Reserve an enforceable deadline for this exact attempt before any
+    /// irreversible switch. Retrying the same attempt reuses its reservation.
+    async fn reserve_deadline(&self, _prepared: PreparedErasure) -> Result<DeadlineReservation> {
+        Err(evidence::authority_unavailable())
+    }
+
+    /// Stop incumbent writes and await pending appends and offloaded writes.
+    /// Hold the write fence through restart until the attempt is resolved.
     ///
     /// Prepare the exact cut in Logkeeper, stage an independently readable
     /// successor at that cut, and retain the exact prepared tuple before
@@ -92,19 +122,22 @@ pub trait ErasureCustody: Send + Sync {
     /// Re-entry returns the original tuple or the exact committed result.
     async fn prepare(&self, erasure: Erasure) -> Result<ErasureProgress>;
 
-    /// Authenticate durable images for slot A and slot B in that order.
-    /// Recovery must remain fenced against any older selector once this returns.
-    async fn recovery_slots(
-        &self,
-        prepared: PreparedErasure,
-        successor: WriterAdmission,
-    ) -> Result<[RecoverySlot; 2]>;
-
-    /// Make the result and the old generation's irrevocable deadline one
+    /// The journal switch has closed old-root and replay admission. Use the
+    /// signed decision and quorum evidence to establish the custody drain.
+    /// Make the result and the retiring keys' irrevocable deadline one
     /// durable decision. The authority owns the clock, all grants and key
     /// operations in the affected domain. A concurrent or retried commit of
     /// the same operation returns the original receipt and expiry.
     async fn commit_and_arm(&self, ready: CleanRecoverySlots) -> Result<ErasureCommit>;
+
+    /// Read back the original owner's physical disposition after the custody
+    /// drain. A pending or ambiguous provider result has no completion evidence.
+    async fn destruction(&self, _commit: ErasureCommit) -> Result<Option<DestructionEvidence>> {
+        Err(Anomaly::unsupported(
+            "rtdb.multi/erasure-evidence",
+            "This custody profile supplies no authenticated destruction evidence",
+        ))
+    }
 }
 
 pub struct ErasureCoordinator<'a> {
@@ -112,6 +145,7 @@ pub struct ErasureCoordinator<'a> {
     custodian: &'a InstalledJournal,
     provider: &'a CheckpointCustody,
     keys: &'a dyn KeyService,
+    authority: Option<CustodyEvidence>,
 }
 
 impl<'a> ErasureCoordinator<'a> {
@@ -134,14 +168,76 @@ impl<'a> ErasureCoordinator<'a> {
             custodian,
             provider,
             keys,
+            authority: None,
         })
     }
 
-    pub async fn commit(
+    /// Binds fixed-deadline and destruction evidence to the installed custody
+    /// signer. A storage credential or an operational schedule confers no such authority.
+    pub fn with_custody_verification_key(mut self, key: [u8; 32]) -> Result<Self> {
+        self.authority = Some(CustodyEvidence::new(key)?);
+        Ok(self)
+    }
+
+    /// Materializes an already rewritten SQL survivor closure in the protected
+    /// provider allocation. Its catalog must describe the exact quiesced head.
+    pub async fn stage_survivor(
         &self,
-        custody: &dyn ErasureCustody,
         erasure: Erasure,
-    ) -> Result<ErasureCommit> {
+        rotation: RequestId,
+        reservation: Reservation,
+        checkpoint: rtdb_directory::Checkpoint,
+        source: &dyn ObjectStore,
+    ) -> Result<PreparedErasure> {
+        self.require_incumbent(erasure)?;
+        let route = self.custodian.route().await?;
+        if route.writer.grant != Some(erasure.incumbent)
+            || rotation.nonce.is_nil()
+            || rotation.expires_at <= route.position.saturating_add(1)
+            || route.head.next_lsn <= route.checkpoint.cut.next_lsn
+            || reservation.custody.allocation == route.checkpoint.custody.allocation
+            || checkpoint.root_sha256 == Some(route.checkpoint.root)
+        {
+            return Err(invalid(
+                "Erasure staging needs a new root and custody at the exact incumbent head",
+            ));
+        }
+        let origin = Preparation {
+            authority: CheckpointAuthority::Erasure(binding(erasure, rotation)),
+            writer: erasure.incumbent,
+            base: route.checkpoint,
+            through: route.head,
+            checkpoint,
+        };
+        let preparation = origin.ordered(reservation)?;
+        match route.preparing {
+            Some(chosen) if chosen == preparation => (),
+            Some(_) => return Err(invalid("The journal is preparing another checkpoint")),
+            None => {
+                let references = self
+                    .provider
+                    .preflight(&reservation, origin, source)
+                    .await?;
+                self.custodian
+                    .prepare_checkpoint(&route, preparation, references)
+                    .await?;
+            }
+        }
+        self.provider.begin(&reservation, origin).await?;
+        let checkpoint = match self.provider.prepared(reservation, origin).await? {
+            Some(checkpoint) => checkpoint,
+            None => self.provider.prepare(&reservation, origin, source).await?,
+        };
+        let prepared = PreparedErasure {
+            erasure,
+            checkpoint,
+            rotation,
+        };
+        self.reopen(prepared).await?;
+        Ok(prepared)
+    }
+
+    fn require_incumbent(&self, erasure: Erasure) -> Result<()> {
         if erasure.placement != self.worker.placement()
             || !matches!(self.worker.authority(), Authority::Worker { enrollment } if enrollment == erasure.incumbent.enrollment)
         {
@@ -149,7 +245,49 @@ impl<'a> ErasureCoordinator<'a> {
                 "Erasure must address the installed credential of the incumbent",
             ));
         }
-        coordinate(self, self.keys, custody, erasure).await
+        if erasure.operation.is_nil()
+            || erasure.custody_domain.is_nil()
+            || erasure.timing == (ErasureTiming::Fixed { before_ms: 0 })
+        {
+            return Err(invalid(
+                "Erasure requires an exact operation, custody domain and timing profile",
+            ));
+        }
+        if matches!(erasure.timing, ErasureTiming::Fixed { .. }) && self.authority.is_none() {
+            return Err(evidence::authority_unavailable());
+        }
+        Ok(())
+    }
+
+    pub async fn commit(
+        &self,
+        custody: &dyn ErasureCustody,
+        erasure: Erasure,
+    ) -> Result<ErasureCommit> {
+        self.require_incumbent(erasure)?;
+        coordinate(self, self.keys, custody, erasure, self.authority.as_ref()).await
+    }
+
+    pub async fn confirm_destruction(
+        &self,
+        custody: &dyn ErasureCustody,
+        commit: ErasureCommit,
+    ) -> Result<Option<DestructionEvidence>> {
+        if commit.prepared.erasure.placement != self.custodian.placement() {
+            return Err(invalid(
+                "The destruction receipt belongs to another placement",
+            ));
+        }
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or_else(evidence::authority_unavailable)?;
+        validate_commit(commit.prepared, commit, None, Some(authority))?;
+        let Some(receipt) = custody.destruction(commit).await? else {
+            return Ok(None);
+        };
+        authority.verify_destruction(commit, &receipt)?;
+        Ok(Some(receipt))
     }
 }
 
@@ -163,8 +301,8 @@ struct Selection {
 #[async_trait]
 trait ErasureJournal: Sync {
     async fn selection(&self) -> Result<Selection>;
-    async fn publish(&self, checkpoint: Checkpoint) -> Result<()>;
-    async fn execute(&self, request: &Request) -> Result<Receipt>;
+    async fn reopen(&self, prepared: PreparedErasure) -> Result<()>;
+    async fn execute(&self, request: &Request) -> Result<Decision>;
 }
 
 #[async_trait]
@@ -179,15 +317,19 @@ impl ErasureJournal for ErasureCoordinator<'_> {
         })
     }
 
-    async fn publish(&self, checkpoint: Checkpoint) -> Result<()> {
-        let route = self.custodian.route().await?;
-        self.provider
-            .publish(self.custodian, &route, checkpoint)
-            .await
+    async fn reopen(&self, prepared: PreparedErasure) -> Result<()> {
+        if self.provider.open(prepared.checkpoint).await?.authority
+            != CheckpointAuthority::Erasure(binding(prepared.erasure, prepared.rotation))
+        {
+            return Err(invalid(
+                "The provider checkpoint belongs to a different erasure attempt",
+            ));
+        }
+        Ok(())
     }
 
-    async fn execute(&self, request: &Request) -> Result<Receipt> {
-        Ok(self.worker.execute(request).await?.receipt)
+    async fn execute(&self, request: &Request) -> Result<Decision> {
+        self.custodian.execute(request).await
     }
 }
 
@@ -196,11 +338,20 @@ async fn coordinate(
     keys: &dyn KeyService,
     custody: &dyn ErasureCustody,
     erasure: Erasure,
+    authority: Option<&CustodyEvidence>,
 ) -> Result<ErasureCommit> {
     if erasure.operation.is_nil() || erasure.custody_domain.is_nil() {
         return Err(invalid(
             "Erasure requires an exact operation and custody domain",
         ));
+    }
+    if let ErasureTiming::Fixed { before_ms } = erasure.timing {
+        if before_ms == 0 {
+            return Err(invalid("A fixed erasure deadline must be positive"));
+        }
+        if authority.is_none() {
+            return Err(evidence::authority_unavailable());
+        }
     }
     let old = erasure.incumbent;
     let generation = old
@@ -215,7 +366,7 @@ async fn coordinate(
     let prepared = match custody.prepare(erasure).await? {
         ErasureProgress::Prepared(prepared) if prepared.erasure == erasure => prepared,
         ErasureProgress::Committed(commit) if commit.prepared.erasure == erasure => {
-            return validate_commit(commit.prepared, commit);
+            return validate_commit(commit.prepared, commit, None, authority);
         }
         _ => return Err(invalid("Custody returned a different erasure operation")),
     };
@@ -235,32 +386,48 @@ async fn coordinate(
                 "The clean checkpoint is outside the quiesced journal head",
             ));
         }
-        if selected.checkpoint != checkpoint {
-            if !selected.preparing.is_some_and(|entry| {
-                entry.source == old
-                    && entry.base == selected.checkpoint
-                    && entry.checkpoint == checkpoint.cut
-                    && entry.root == checkpoint.root
-                    && entry.custody == checkpoint.custody
-            }) {
-                return Err(invalid(
-                    "The clean checkpoint lacks its exact ordered preparation",
-                ));
-            }
-            journal.publish(checkpoint).await?;
+        let descriptor = binding(erasure, prepared.rotation).descriptor()?;
+        if !selected.preparing.is_some_and(|entry| {
+            entry.erasure
+                && entry.source == old
+                && entry.base == selected.checkpoint
+                && entry.checkpoint == checkpoint.cut
+                && entry.root == checkpoint.root
+                && entry.custody == checkpoint.custody
+                && entry.descriptor == descriptor
+        }) {
+            return Err(invalid(
+                "The clean checkpoint lacks its exact ordered erasure preparation",
+            ));
         }
     }
+    journal.reopen(prepared).await?;
+    let deadline = match erasure.timing {
+        ErasureTiming::OperationalTarget => None,
+        ErasureTiming::Fixed { before_ms } => {
+            let reservation = custody.reserve_deadline(prepared).await?;
+            if reservation.by_ms == 0 || reservation.by_ms > before_ms {
+                return Err(invalid(
+                    "The custody reservation exceeds the requested deadline",
+                ));
+            }
+            authority
+                .ok_or_else(evidence::authority_unavailable)?
+                .verify_reservation(prepared, reservation)?;
+            Some(reservation)
+        }
+    };
 
     let request = Request {
         id: prepared.rotation,
         placement: erasure.placement,
-        principal: Principal::Worker(old.enrollment),
-        command: Command::RotateKey {
+        principal: Principal::Custodian,
+        command: Command::PublishAndRotate {
             grant: old,
             checkpoint,
         },
     };
-    let receipt = journal.execute(&request).await?;
+    let decision = journal.execute(&request).await?;
     let successor = validate_rotation(
         &request,
         checkpoint,
@@ -269,11 +436,18 @@ async fn coordinate(
             epoch,
             key_generation: generation,
         },
-        receipt,
+        decision.receipt,
     )?;
-    let slots = custody.recovery_slots(prepared, successor).await?;
-    let ready = require_clean_slots(prepared, successor, slots)?;
-    validate_commit(prepared, custody.commit_and_arm(ready).await?)
+    let ready = require_clean_slots(prepared, successor, decision, deadline)?;
+    let binding = ready.binding();
+    let commit = custody.commit_and_arm(ready).await?;
+    if deadline.is_some_and(|reserved| {
+        reserved.by_ms != commit.deadline.at_ms()
+            || reserved.retiring_inventory != commit.retiring_inventory
+    }) {
+        return Err(invalid("Custody armed a different reservation"));
+    }
+    validate_commit(prepared, commit, Some(binding), authority)
 }
 
 fn validate_rotation(
@@ -315,40 +489,62 @@ fn validate_rotation(
 fn require_clean_slots(
     prepared: PreparedErasure,
     successor: WriterAdmission,
-    slots: [RecoverySlot; 2],
+    decision: Decision,
+    deadline: Option<DeadlineReservation>,
 ) -> Result<CleanRecoverySlots> {
-    if !slots
-        .iter()
-        .zip([RecoverySlotId::A, RecoverySlotId::B])
-        .all(|(slot, id)| {
-            slot.id == id
-                && slot.placement == prepared.erasure.placement
-                && slot.durable_image != [0; 32]
-                && slot.checkpoint == prepared.checkpoint
-                && slot.suffix_key_generation == successor.grant.key_generation
-        })
-    {
-        return Err(invalid(
-            "Both recovery slots must bind the clean checkpoint and successor generation",
-        ));
-    }
+    let slots = decision
+        .rotation
+        .filter(|proof| proof.evidence.covers(decision.receipt))
+        .ok_or_else(|| invalid("Both recovery slots require authenticated quorum readback"))?;
+    // The installed Logkeeper client authenticates the decision and exact
+    // readback in this signature before returning it to custody.
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"rtdb.multi/erasure-logkeeper-switch/v1\0");
+    digest.update(&slots.signature.issuer);
+    digest.update(&slots.signature.proof);
+    digest.update(&decision.receipt.position.to_be_bytes());
+    let binding = digest.finish().as_ref().try_into().expect("SHA-256 width");
     Ok(CleanRecoverySlots {
         prepared,
         successor,
+        receipt: decision.receipt,
         slots,
+        binding,
+        deadline,
     })
 }
 
-fn validate_commit(prepared: PreparedErasure, commit: ErasureCommit) -> Result<ErasureCommit> {
+fn validate_commit(
+    prepared: PreparedErasure,
+    commit: ErasureCommit,
+    switch: Option<[u8; 32]>,
+    authority: Option<&CustodyEvidence>,
+) -> Result<ErasureCommit> {
     if commit.prepared != prepared
-        || !matches!(
-            commit.deadline_ms.checked_sub(commit.committed_at_ms),
-            Some(1..=MAX_REVOCATION_DELAY_MS)
-        )
+        || commit.committed_at_ms == 0
+        || commit.retiring_inventory == [0; 32]
+        || commit.switch_evidence == [0; 32]
+        || switch.is_some_and(|binding| binding != commit.switch_evidence)
     {
         return Err(invalid(
-            "The erasure commit has a different identity or an invalid deadline",
+            "The erasure commit has a different switch or retiring inventory",
         ));
+    }
+    match (prepared.erasure.timing, commit.deadline) {
+        (ErasureTiming::OperationalTarget, ErasureDeadline::Target { at_ms })
+            if commit.committed_at_ms.checked_add(OPERATIONAL_TARGET_MS) == Some(at_ms) => {}
+        (ErasureTiming::Fixed { before_ms }, ErasureDeadline::Enforced { by_ms, signature })
+            if by_ms > commit.committed_at_ms && by_ms <= before_ms =>
+        {
+            authority
+                .ok_or_else(evidence::authority_unavailable)?
+                .verify_commit(&commit, &signature)?;
+        }
+        _ => {
+            return Err(invalid(
+                "The custody authority returned a different deadline profile",
+            ));
+        }
     }
     Ok(commit)
 }

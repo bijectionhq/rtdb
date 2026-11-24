@@ -8,7 +8,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp};
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{FileHandle, FileSlice, OwnedBytes, WatchCallback, WatchHandle, WritePtr};
 use tantivy::schema::{Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions};
@@ -20,7 +20,7 @@ use crate::member_bounds::{MemberStart, document_member};
 use crate::rank_windows::{extend_impact, window_of};
 use crate::rectangle::merge_adjacent_valid_time;
 
-const MAGIC: &[u8; 8] = b"RTSRCH03";
+const MAGIC: &[u8; 8] = b"RTSRCH04";
 pub(super) fn is_bundle(bytes: &[u8]) -> bool { bytes.starts_with(MAGIC) }
 /// Identifies the bundle bytes produced by the builder, including visibility encoding.
 pub const FORMAT_VERSION: i32 = 11;
@@ -32,10 +32,10 @@ const STORED_IMPACTS: u32 = 1024;
 /// A row's place in a column's runs where the row is visible nowhere, and where it is visible with the column null or absent.
 const NO_DOC: u32 = u32::MAX;
 const NULL_DOC: u32 = u32::MAX - 1;
-/// A row's key in the sidecar: IID, system from, valid from, valid to, operation.
-const KEY_BYTES: usize = 16 + 8 + 8 + 8 + 1;
+/// IID, three timestamps, operation, and an optional original event position.
+const KEY_BYTES: usize = 16 + 8 + 8 + 8 + 1 + 1 + EventPosition::WIDTH as usize;
 
-use super::SearchRow;
+use super::{KeyedEvent, SearchRow};
 
 /// Lifespans, in weeks, below which a document falls into each class but the last, which is unbounded.
 const LIFESPAN_WEEKS: [i64; 5] = [1, 4, 16, 64, 256];
@@ -106,10 +106,6 @@ fn lifespan(rectangles: &[[i64; 4]], ceiling: i64) -> (u8, Section) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocMatch { pub doc: u32, pub iid: [u8; 16], pub member: u32 }
 
-/// An event of the file's data, as another file's documents are cut by it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyedEvent { pub system_from: i64, pub valid_from: i64, pub valid_to: i64, pub op: EventOp }
-
 fn schema(columns: &[String]) -> (Schema, Vec<Field>) {
     let mut builder = Schema::builder();
     let text = TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqsAndPositions).set_fieldnorms(true));
@@ -139,7 +135,7 @@ impl Entity {
             }
             self.identity = Some(id);
         }
-        self.rows.push((ordinal, EventHeader { commit_position: 0, iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
+        self.rows.push((ordinal, EventHeader { position: row.position, commit_position: 0, iid: Iid(row.iid), system_from: Timestamp(row.system_from), valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op }));
         for ((indices, distinct, seen), value) in self.values.iter_mut().zip(row.values) {
             indices.push(value.map(|tokens| *seen.entry(tokens.clone()).or_insert_with(|| { distinct.push(tokens); distinct.len() - 1 })));
         }
@@ -183,7 +179,7 @@ where
             doc: u32::try_from(sidecar.doc_iids.len()).map_err(fault)?,
         });
         let mut entities = BTreeMap::<Option<EntityId>, Entity>::new();
-        let mut previous: Option<([u8; 16], i64)> = None;
+        let mut previous: Option<([u8; 16], (i64, Option<EventPosition>))> = None;
         for page in pages {
             sidecar.page_starts.push(rows);
             for row in page? {
@@ -192,7 +188,7 @@ where
                     return Err(Anomaly::unsupported("rtdb.search/input-order", "Search file members do not hold disjoint IID ranges in order"));
                 }
                 if let Some((iid, system)) = previous {
-                    if iid > row.iid || (iid == row.iid && system < row.system_from) {
+                    if iid > row.iid || (iid == row.iid && system < (row.system_from, row.position)) {
                         return Err(Anomaly::unsupported("rtdb.search/input-order", "Search rows are not in IID and descending system-time order"));
                     }
                     if iid != row.iid {
@@ -201,11 +197,13 @@ where
                         }
                     }
                 }
-                previous = Some((row.iid, row.system_from));
+                previous = Some((row.iid, (row.system_from, row.position)));
                 for docs in &mut sidecar.row_docs { docs.push(NO_DOC); }
                 sidecar.keys.extend_from_slice(&row.iid);
                 for value in [row.system_from, row.valid_from, row.valid_to] { sidecar.keys.extend_from_slice(&value.to_le_bytes()); }
                 sidecar.keys.push(op_code(row.op));
+                sidecar.keys.push(u8::from(row.position.is_some()));
+                sidecar.keys.extend_from_slice(&row.position.map_or([0; EventPosition::WIDTH as usize], EventPosition::to_bytes));
                 if let Some(id) = &row.identity { sidecar.row_identities.extend_from_slice(&id.handle_bytes()); }
                 sidecar.row_identity_starts.push(u32::try_from(sidecar.row_identities.len()).map_err(fault)?);
                 entities.entry(row.identity.clone()).or_insert_with(|| Entity::new(columns.len())).push(rows, row)?;
@@ -644,7 +642,12 @@ impl Sidecar {
 
     fn key(&self, row: u32) -> Result<KeyedEvent> {
         let at = self.keys + row as usize * KEY_BYTES + 16;
-        Ok(KeyedEvent { system_from: self.i64_at(at), valid_from: self.i64_at(at + 8), valid_to: self.i64_at(at + 16), op: op_of(self.data()[at + 24])? })
+        let position = match self.data()[at + 25] {
+            0 => None,
+            1 => Some(EventPosition::from_bytes(self.data()[at + 26..at + 26 + EventPosition::WIDTH as usize].try_into().map_err(fault)?)),
+            _ => return Err(corrupt("Search event position has an invalid presence marker")),
+        };
+        Ok(KeyedEvent { position, system_from: self.i64_at(at), valid_from: self.i64_at(at + 8), valid_to: self.i64_at(at + 16), op: op_of(self.data()[at + 24])? })
     }
 }
 
@@ -729,7 +732,7 @@ pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Wr
         let header = sidecar.key(row)?;
         let iid = Iid(sidecar.row_iid(row).try_into().map_err(fault)?);
         let key = sidecar.row_identity(row);
-        events.push(EventHeader { iid, system_from: Timestamp(header.system_from), commit_position: 0,
+        events.push(EventHeader { position: header.position, iid, system_from: Timestamp(header.system_from), commit_position: 0,
             valid_time: Interval::new(Timestamp(header.valid_from), Timestamp(header.valid_to))?, op: header.op },
             (!key.is_empty()).then_some(key))?;
     }

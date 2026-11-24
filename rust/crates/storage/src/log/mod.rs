@@ -63,37 +63,8 @@ pub struct LogMetadata {
     pub timestamp: Timestamp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplicaObjectScope {
-    pub deployment: uuid::Uuid,
-    pub incarnation: uuid::Uuid,
-    pub group: uuid::Uuid,
-    pub generation: u64,
-    pub writer_epoch: u64,
-}
-
-#[derive(Clone)]
-pub struct ReplicaObjectCustody {
-    pub scope: ReplicaObjectScope,
-    _hold: Arc<dyn Send + Sync>,
-}
-
-impl ReplicaObjectCustody {
-    pub fn new(scope: ReplicaObjectScope, hold: Arc<dyn Send + Sync>) -> Self {
-        Self { scope, _hold: hold }
-    }
-}
-
-impl std::fmt::Debug for ReplicaObjectCustody {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.scope.fmt(formatter)
-    }
-}
-
-impl PartialEq for ReplicaObjectCustody {
-    fn eq(&self, other: &Self) -> bool { self.scope == other.scope }
-}
-impl Eq for ReplicaObjectCustody {}
+mod replica_objects;
+pub use replica_objects::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload, ReplicaPayloadBroker, ReplicaPayloadReference};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogRecord {
@@ -201,9 +172,29 @@ pub struct AppendCapacity {
     pub last_data: Option<LogOffset>,
 }
 
+pub struct ReplicaReferenceSource {
+    pub store: Arc<dyn crate::ObjectStore>,
+    pub cache: Arc<crate::cache::BufferPool>,
+    pub memory: Arc<rtdb_columnar::MemoryBudget>,
+    pub checkpoint: Option<rtdb_format::catalog::BlockCatalog>,
+    pub version: rtdb_types::StorageVersion,
+    pub epoch: rtdb_types::StorageEpoch,
+    pub file_size_target: i64,
+}
+
 #[async_trait]
 pub trait Log: Send + Sync {
     fn needs_published_recovery_checkpoint(&self) -> bool { false }
+    /// This replica log confers offload access only through a delivered payload permit.
+    fn requires_replica_payload_permit(&self) -> bool { false }
+    fn install_replica_reference_source(&self, _source: ReplicaReferenceSource) -> Result<()> { Ok(()) }
+    /// Publishes a detached body under the replica path's custody.
+    async fn publish_replica_payload(
+        &self, store: &dyn crate::ObjectStore, key: &crate::ObjectKey, body: Bytes,
+    ) -> Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        store.put(key, body).await?;
+        Ok(None)
+    }
     /// A hosted owner attests its exact selected recovery root before a source may confirm it.
     async fn confirms_recovery_checkpoint(&self, _block: i64, _through: LogOffset, _root: [u8; 32]) -> Result<bool> {
         Ok(false)

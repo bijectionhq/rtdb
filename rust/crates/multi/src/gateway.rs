@@ -134,6 +134,8 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
     }
 }
 
+const RELAY_ANSWER_DEADLINE_PARAMETER: &str = "rtdb.relay_answer_deadline";
+
 struct Startup { bytes: Vec<u8>, parameters: BTreeMap<String, String> }
 
 impl Startup {
@@ -162,9 +164,10 @@ type Client = Box<dyn Transport>;
 async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken,
                     heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, frame_memory: Arc<MemoryBudget>, connection_index: usize) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
-    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.clone()));
+    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(rtdb_storage::sealing::DeliveryIo::new(client)), options.tls.clone()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
     let Some((mut client, mut startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
+    let forward_stamp = startup.parameters.remove(RELAY_ANSWER_DEADLINE_PARAMETER).as_deref() == Some("on");
     let selector = startup.parameters.get("database");
     let selection = match selector {
         Some(selector) => database_selector(selector),
@@ -185,17 +188,19 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
     };
     if let Some(gateway) = remote_gateway {
+        startup.parameters.insert(RELAY_ANSWER_DEADLINE_PARAMETER.into(), "on".into());
+        startup.bytes = encode_startup(&startup.parameters);
         let forward = tokio::time::timeout_at(startup_deadline, async {
             let mut forward = connect(&gateway).await?;
             forward.write_all(&startup.bytes).await.map_err(io)?;
             Ok::<_, Anomaly>(forward)
         }).await;
-        let mut forward = match forward {
+        let forward = match forward {
             Ok(Ok(forward)) => forward,
             Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await,
             Err(_) => return refuse(&mut client, "57P03", "Timed out forwarding startup to the deployment's cell").await,
         };
-        return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
+        return crate::session::relay_cell(client, forward, &frame_memory, forward_stamp).await;
     }
     if let Some(installation) = expected {
         startup.parameters.insert("database".into(), name.clone());
@@ -232,7 +237,7 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     }.with_frame_memory(frame_memory).with_installation(expected);
     tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
-        outcome = session.run_before(client, server, control, epoch, startup_deadline) => outcome,
+        outcome = session.run_before(client, server, control, epoch, startup_deadline, forward_stamp) => outcome,
     }
 }
 
@@ -343,7 +348,13 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
         if router.deployment.as_deref().is_some_and(|id| Uuid::parse_str(id).ok() != Some(installed.deployment)) {
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
         }
-        let (server, worker, epoch) = route_ordered(name, installed, options, |worker, probe| async move {
+        if router.read_only && !prefer_holder
+            && let Ok(read) = route_ordered_reader(name, installed, options).await
+        {
+            let server = connect_serving(&read.worker.pgwire, &read.worker.control, read.probe, options).await?;
+            return Ok((server, Some(read.worker.control), read.epoch, installed.deployment.to_string()));
+        }
+        let (server, worker, epoch) = route_ordered(name, installed, options, !router.read_only || prefer_holder, |worker, probe| async move {
             connect_serving(&worker.pgwire, &worker.control, probe, options).await
         }).await?;
         return Ok((server, Some(worker.control), epoch, installed.deployment.to_string()));
@@ -419,10 +430,45 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     Err(refused.or(retryable).or(last).unwrap_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/no-node", "No node can serve this deployment")))
 }
 
+pub(crate) struct OrderedReaderRoute {
+    pub worker: crate::journal::hosted::WorkerEndpoint,
+    pub placement: ordered_logkeeper::ordered::Placement,
+    pub epoch: u64,
+    pub flight: Option<String>,
+    probe: Option<u64>,
+}
+
+pub(crate) async fn route_ordered_reader(
+    name: &str, installed: &crate::journal::hosted::GatewayPlacement, options: &GatewayOptions,
+) -> Result<OrderedReaderRoute> {
+    let view = installed.journal.route().await?;
+    let incumbent = view.writer.grant.map(|grant| grant.enrollment);
+    let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect(
+        "rtdb.multi/ordered-gateway", "An ordered reader needs its cell route credential"))?;
+    let key = control::ControlKey(options.capabilities.clone());
+    for worker in installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent) {
+        let request = Request::SubscribeOrderedFresh {
+            name: name.into(), placement: view.placement, enrollment: worker.enrollment, epoch: view.writer.epoch,
+        };
+        let Ok((Response::OrderedRead { address, flight, proof }, probe)) =
+            control::call_with_pgwire_probe(&worker.control, request, options.control_timeout, &key).await else { continue; };
+        if address == worker.pgwire && secret.verify_route(&control::ordered_read_binding(
+            name, view.placement, worker.enrollment, view.writer.epoch, &address, flight.as_deref(),
+        ), &proof) {
+            return Ok(OrderedReaderRoute {
+                worker: worker.clone(), placement: view.placement, epoch: view.writer.epoch, flight, probe,
+            });
+        }
+    }
+    Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/ordered-reader",
+        "No enrolled worker could open the ordered read basis"))
+}
+
 pub(crate) async fn route_ordered<T, Open>(
     name: &str,
     installed: &crate::journal::hosted::GatewayPlacement,
     options: &GatewayOptions,
+    allow_takeover: bool,
     open: impl Fn(crate::journal::hosted::WorkerEndpoint, Option<u64>) -> Open + Send,
 ) -> Result<(T, crate::journal::hosted::WorkerEndpoint, u64)>
 where
@@ -436,7 +482,7 @@ where
     let key = control::ControlKey(options.capabilities.clone());
     let installed_incumbent = incumbent.and_then(|owner| installed.endpoints.get(&owner));
     let candidates = installed_incumbent.into_iter()
-        .chain(installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent));
+        .chain(installed.endpoints.values().filter(|worker| allow_takeover && Some(worker.enrollment) != incumbent));
     let mut refused = None;
     for worker in candidates {
         let takeover = Some(worker.enrollment) != incumbent;

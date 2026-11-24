@@ -21,6 +21,48 @@ pub struct ReplayedTransaction {
 
 /// Decodes the complete transaction for atomic application by the caller.
 pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
+    decode(message, predecessor, block, memory, false)
+}
+
+/// The held-world writer calls this after authenticating the original journal
+/// frame. Validate all its effects, then keep the original business table
+/// bytes and omit retry state, including the placed lookup witness.
+pub fn project_held_replica(message: &mut ResolvedTx, predecessor: TransactionKey, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<()> {
+    decode_replica(message, Some(predecessor), block, memory)?;
+    message.table_data.retain(|name, _| !receipt_table(name));
+    message.placed_attempt = None;
+    message.placed_slot_terminal = None;
+    // The strict acceptance witness is bound to that same placed attempt.
+    // Original journal admission checked it before this projection.
+    message.acceptance_stage = None;
+    Ok(())
+}
+
+/// The authenticated held-world manifest attests projection of frames that
+/// passed the full replica decoder. Placement-dependent checks ran before the
+/// receipt witness was removed. This decoder is private to archived replay.
+pub fn decode_held_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<ReplayedTransaction> {
+    if message.placed_attempt.is_some() || message.placed_slot_terminal.is_some() || message.table_data.keys().any(|name| receipt_table(name)) {
+        return Err(invalid("Held business replay contains expiring transaction metadata"));
+    }
+    decode(message, predecessor, block, memory, true)
+}
+
+fn receipt_table(name: &str) -> bool {
+    name.split_once('/').is_some_and(|(schema, table)| TableRef::new(schema, table).stores_expiring_transaction_metadata())
+}
+
+fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: BlockIndex, memory: &Arc<MemoryBudget>, held: bool) -> Result<ReplayedTransaction> {
+    if let Some(wire) = message.placed_slot_terminal.as_deref() {
+        let terminal = rtdb_types::PlacedTerminal::decode(wire)?;
+        if message.placed_attempt.is_none() || (terminal.fenced && (
+            message.committed != Some(false) || message.db_op.is_some() || message.acceptance_stage.is_some()
+            || message.external_source_token.is_some() || message.search_delta.is_some()
+            || message.table_data.keys().any(|table| table != "xt/txs" && table != "xt/placed_attempt_outcomes")
+        )) {
+            return Err(invalid("A placed receiver fence cannot publish effects"));
+        }
+    }
     let placed = if let Some(placed) = message.placed_attempt.as_deref() {
         let (attempt, retirement) = decode_replica_outcome_attempt(placed).map_err(|_| invalid("Invalid placed attempt identity"))?;
         let position = Some(attempt.position().0);
@@ -79,6 +121,9 @@ pub fn decode_replica(message: &ResolvedTx, predecessor: Option<TransactionKey>,
             }
         }
         tables.insert(table, TableWrite::new(StructFields::new(), Some(batch)));
+    }
+    if held {
+        return Ok(ReplayedTransaction { writes: StagedWrite::new(key, predecessor, block, tables)?, result, placed_attempt: None });
     }
     let outcome = placed.map(|(attempt, retirement)| read_placed_outcome(&tables, attempt, retirement, &result, memory)).transpose()?;
     let proof = outcome.as_ref().map(|(proof, _)| proof);
@@ -367,6 +412,46 @@ mod tests {
     use rtdb_types::{EntityId, Iid, OwnedRelation};
 
     #[test]
+    fn held_projection_preserves_the_exact_business_batch() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 24);
+        let state = PartitionState::empty(Default::default())?;
+        let previous = TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) };
+        let key = TransactionKey { tx_id: TxId(2), system_time: Timestamp(20) };
+        let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
+        let business = TableRef::new("public", "orders");
+        let receipt = TableRef::new("xt", "idempotency_receipts");
+        for (table, id) in [(&business, "order"), (&receipt, "retry")] {
+            transaction.put(table.clone(), StructFields::from([
+                ("_id".into(), Value::Utf8(id.into())),
+            ]), Interval::ALL)?;
+        }
+        let staged = transaction.stage()?;
+        let mut frame = ResolvedTx {
+            tx_id: Some(key.tx_id.0),
+            src_msg_id: Some(key.tx_id.0),
+            system_time_micros: Some(key.system_time.0),
+            committed: Some(true),
+            ..Default::default()
+        };
+        for (table, write) in staged.tables() {
+            let batch = write.batch().unwrap().arrow();
+            let bytes = crate::ipc::encode(batch.schema().as_ref(), [batch], &memory)?;
+            frame.table_data.insert(table.schema_and_table(), bytes.as_slice().to_vec());
+        }
+        let original = frame.table_data[&business.schema_and_table()].clone();
+        assert!(decode_held_replica(&frame, Some(previous), staged.block_index(), &memory).is_err());
+
+        project_held_replica(&mut frame, previous, staged.block_index(), &memory)?;
+        assert_eq!(frame.table_data.len(), 1);
+        assert_eq!(frame.table_data[&business.schema_and_table()], original);
+        let replayed = decode_held_replica(&frame, Some(previous), staged.block_index(), &memory)?;
+        assert_eq!(replayed.result.tx_key(), key);
+        assert!(replayed.writes.tables().contains_key(&business));
+        assert!(!replayed.writes.tables().contains_key(&receipt));
+        Ok(())
+    }
+
+    #[test]
     fn archive_replay_accounts_for_copied_and_omitted_world_ordinals() -> Result<()> {
         let memory = MemoryBudget::new(1 << 24);
         let state = PartitionState::empty(Default::default())?;
@@ -385,7 +470,7 @@ mod tests {
         for (copied, omitted, valid) in [(1u32, 2u32, true), (3, 2, false), (2, 2, false)] {
             let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
             transaction.retain_archived_owned_positions(vec![copied])?;
-            transaction.append_archived_world_effect(&overlay, StoredEvent {
+            transaction.append_archived_world_effect(&overlay, StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
                 entity_key: Some(original.handle_bytes().into()),

@@ -280,6 +280,7 @@ pub struct RecoveryService {
     storage: CellStorage,
     archive: CellStorage,
     keys: Arc<dyn KeyService>,
+    broker: Option<crate::replay_broker::Client>,
     hosted_task: Option<HostedTask>,
     control: ControlKey,
     memory: Arc<MemoryBudget>,
@@ -292,6 +293,7 @@ impl RecoveryService {
         storage: CellStorage,
         archive: CellStorage,
         keys: Arc<dyn KeyService>,
+        broker: Option<crate::replay_broker::Client>,
         hosted_task: Option<HostedTask>,
         control: ControlKey,
     ) -> Result<Self> {
@@ -301,6 +303,7 @@ impl RecoveryService {
             storage,
             archive,
             keys,
+            broker,
             hosted_task,
             control,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
@@ -409,7 +412,7 @@ impl RecoveryService {
                     .ok_or_else(|| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-suffix-unavailable",
                         "The checkpoint suffix pin changed before archive admission"))?;
                 let archive_sha256 = archive::capture_replica_suffix(
-                    directory, &self.storage, &self.archive, self.keys.as_ref(), self.hosted_task.as_ref(),
+                    directory, &self.archive, self.keys.as_ref(), self.broker.as_ref(), self.hosted_task.as_ref(),
                     request.authority, lease, retained, &self.memory,
                 ).await?;
                 Ok(Reply::SuffixCaptured {
@@ -596,10 +599,10 @@ impl RecoveryService {
                 };
                 let sealed = Box::pin(archive::issue_checkpoint_transfer(
                     Arc::clone(&directory), &self.storage, &self.archive, self.keys.as_ref(),
-                    selector.clone(), self.hosted_task.clone(),
+                    selector.clone(), self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 let activation = Box::pin(archive::activate_checkpoint_transfer_target(
-                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 let terminal = activation.replica.bootstrap.terminal;
                 if terminal != sealed {
@@ -639,7 +642,7 @@ impl RecoveryService {
                     transfer_only: true,
                 };
                 let terminal = Box::pin(archive::issue_checkpoint_transfer(
-                    directory, &self.storage, &self.archive, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, &self.archive, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 Ok(Reply::TransferSourceSealed { terminal })
             },
@@ -659,7 +662,7 @@ impl RecoveryService {
                     transfer_only: true,
                 };
                 let activation = Box::pin(archive::activate_checkpoint_transfer_target(
-                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 Ok(Reply::TransferTargetActivated { activation })
             },
@@ -679,7 +682,7 @@ impl RecoveryService {
                     transfer_only: true,
                 };
                 let replica = Box::pin(archive::seed_checkpoint_transfer_target(
-                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 Ok(Reply::TransferTargetSeeded { replica })
             },
@@ -699,7 +702,7 @@ impl RecoveryService {
                     transfer_only: true,
                 };
                 let bootstrap = Box::pin(archive::verify_checkpoint_transfer_target(
-                    directory, &self.storage, self.keys.as_ref(), selector, self.hosted_task.clone(),
+                    directory, &self.storage, self.keys.as_ref(), selector, self.broker.as_ref(), self.hosted_task.clone(),
                 )).await?;
                 Ok(Reply::TransferTargetVerified { bootstrap })
             },
@@ -1078,6 +1081,7 @@ mod tests {
         let capture = Uuid::new_v4();
         let token = "c".repeat(64);
         let mut service = RecoveryService {
+            broker: None,
             hosted_task: None,
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
@@ -1167,6 +1171,7 @@ mod tests {
         let token = "a".repeat(64);
         let keys = Arc::new(crate::keys::LocalKeyService::new(temporary.path().join("keys")).unwrap());
         let service = RecoveryService {
+            broker: None,
             hosted_task: None,
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
@@ -1278,6 +1283,7 @@ mod tests {
         directory.create_deployment(installation).await.unwrap();
         let token = "a".repeat(64);
         let service = RecoveryService {
+            broker: None,
             hosted_task: None,
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),

@@ -1,0 +1,16 @@
+= Staged owned archive identity
+
+The entry point includes the decisions called by the staged manifest reader, the owned checkpoint opener, the live trie stream, and the sealed object reader.
+Both inspection and streaming run through `with_stage`, which binds source, capture, destination, stage operation, and manifest digest to the held directory receipt.
+`open_inventory` admits the manifest closure and constructs `CapturedObjects`, whose reads select an object under its manifest key and authenticate its sealed bytes before opening it.
+`open_owned_snapshot` requires the published checkpoint, including its original root digest, and checks the recovered transaction against its snapshot and the checkpoint timestamp.
+The stream's relation header and walk use the same sorted live trie vector.
+The walk advances exactly one slot after the header and the complete authenticated file bytes have been sent.
+
+The proofs check manifest and object identity comparisons, the recovered transaction decision and the file cursor.
+They rely on the snapshot representation of catalog membership, the cryptographic bindings, and the storage and stream primitives.
+The catalog recovery and completeness of compaction output are separate obligations.
+
+With the pinned Verus and Z3 on the local environment, run `BIJECTION_LOCAL_EXECUTION=owner-authorized verus --no-external-by-default verification/verus/owned_archive_files/proof.rs`.
+For the control, replace `index >= tries.len()` with `index >= tries.len().saturating_sub(1)` in a disposable copy of `inventory_identity.rs` with the same proof layout and run the same command.
+The control must fail the postcondition of `next_owned_file` by ending the stream before the last advertised trie.

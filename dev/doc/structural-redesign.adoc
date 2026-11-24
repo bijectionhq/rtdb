@@ -11,6 +11,9 @@ The second review's Multi serving and custody boundaries extend that design.
 * An await token establishes a causal lower bound.
   A system-time cap filters the chosen prefix, and a fresh admission can include later corrections below that cap.
   An issued exact snapshot token identifies the same applied cut on every successful re-admission under current authorization, retention and custody.
+  A placed SQL token seals the original owner, partition position, physical generation, historical cap and clock interpretation.
+  A reopened node can serve the identical installed cut or its retained exact checkpoint.
+  An advanced head with the same historical timestamp never substitutes for the captured position.
 * A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
   SNAP-1 and DUR-1 are amended accordingly.
 * An erasure reaches forks that retain shared custody of that history.
@@ -172,24 +175,36 @@ Classic remote holds use conditional writes and finish after admitted provider w
 Compaction and stored artefact builds on coordinated storage hold their input catalogs through provider drain.
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
-The coordinated collector submits the installed receipt to the storage owner, which owns the pending decision and the deletion grant.
+The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
 The approved reachability contract replaces the cutoff for deletion.
-For hosted loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
-Complete claims for other file kinds, classic storage, and all recovery roots remain open.
-Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
+For hosted and versioned Classic S3 loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
+Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
+Abandoned remote hold recovery, renewal, full recovery-root integration and the remaining search, fork and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.
 |Multi binds checkpoint metadata and startup suffix holds.
 Coordinated native local startup retains its recovery media through checkpoint discovery and cursor admission under the same filesystem gate used by trie and metadata deletion.
 Startup and compactor reset share the primary inventory check for missing or wrong-length data and metadata files.
-Pending archive captures protect their journal interval until archive publication or expiry.
+Pending archive suffix pins protect their certified journal interval until archive publication or expiry.
 Recovery can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
 Enrolled terminal storage can retire loose files with a write witness and an installed release.
 The existing versioned S3 payload collector still waits for the known physical journals to trim. The approved contract requires brokered recovery exclusion and drain before independent payload settlement.
 Normal readers register bounded replay holds and retain delivered pointers through provider drain. Archive and transfer reads require an admitted region covering the certified pointer's position.
 The offload retirement record binds the certified sealed frame digest and original replica position to the observed physical publication.
+Installed journal delivery resolves the one payload authenticated at its replica position through the serving lease and unit-key owner.
+Directory-managed serving writes publish detached bodies through the replay broker. Serving tails and ranges redeem the committed reference through the broker under a durable replay ticket.
+The broker verifies the committed position without opening the sealed journal frame and holds its own admission through delivery and drain. It opens only the detached object namespace and unit-key vault.
+Archive suffix capture, terminal transfer replay and timestamp-fork reads redeem their detached references through the same broker.
+Checkpoint transfer seeds detached bodies through a separate transfer credential and binds the destination provider publication into the re-sealed pointer.
+Cross-cell handoff retains the original replay interval and republishes each detached body under the destination broker before seeding its journal.
+The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
+Independent payload settlement still requires complete installed references and a recovery dependency fence.
+Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
+Inline appends without new provider dependencies publish an empty reference set.
+Installed upload, trie, artefact and detached-body appends resolve their dependencies against the admitted replay catalog and attest the observed S3 publication addresses.
+Unidentified provider addresses or unknown record types keep the journal fence closed.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
@@ -204,15 +219,24 @@ Local and S3 checkpoint and serving-prefix retirement fence and withdraw the vau
 Local and S3 checkpoint captures and ordered transfer manifests, segments, and detached payloads hold independent slots within their capture or destination authority.
 Classic object roots may enroll a separate key vault for local and built-in remote providers.
 Classic local source and replica logs use independent publication slots under their enrolled log lineages.
-Local Classic trie retirement withdraws slots behind its exact release authority.
-Directory-managed Multi, Classic sealed-log retirement and Kafka logs, remote key retirement, primary staged files, and copied live journals remain open.
+Coordinated Classic trie retirement withdraws slots behind its exact release authority.
+Primary and replay stages keep their members and manifest in a separate destination inventory with independent slots. Transfer activation opens that inventory, writes its verified serving closure and withdraws the stage namespace through the original vault after directory activation. Detached replay bodies stay with the credential-separated broker.
+Directory-managed replica journal frames use independently registered slots. A cross-cell move or transfer seed verifies the source pages and reseals them at their original offsets under destination slots. Directory trim persists the certified frame census before truncation and withdraws those slots under the exact directory grant. Residence disposal also sweeps orphan slots.
+Classic Kafka database logs seal frames before enqueueing and use the original vault lineage bound to the broker topic ID. The vault records the exact frame at each acknowledged offset and retires recorded slots below a confirmed broker floor.
+Classic offline repair-anchor reclamation withdraws the exact sealed local-log frame slots before overwriting their ciphertext and preserves the replica boundary.
+Directory-managed ordered-index pages use per-page slots in their admitted generation. The index custodian withdraws the entire generation, including unplaced slots, before ciphertext collection.
+Other live directory serving objects and per-unit retirement outside coordinated releases remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
 |The operation-only local archive broker persists scheduled capture-key revocation and attests physical settlement on the original media.
 Installed serving reads enforce their journal lease through body delivery, and installed payload cryptography bounds each provider operation.
 Installed recovery opens independently sealed checkpoint closures before their publication, then serves and replays from the selected closure.
-SQL erasure still requires ordered closure of affected admissions, a complete survivor rebuild and retiring-key census, bounded plaintext drain, and evidenced provider destruction.
+The installed journal orders clean checkpoint publication, key rotation, and old-root and replay admission closure together. Its accepting quorum reads back both durable voter slots and the installed RTDB custodian verifies the signed evidence before it asks for a deadline.
+Plaintext delivery inherits the originating object read lease and cannot extend it through a separate key check.
+An exact-head clean provider allocation binds the erasure operation, custody domain and rotation identity into its preparation and sealed manifest. Recovery opens that selected root at the chosen head without replaying an earlier upload confirmation.
+The coordinator distinguishes the current provider's 120-second operational target from a signed fixed commitment. A fixed request requires an authenticated deadline reservation before the switch. The original authority's separate destruction evidence binds the switch, retiring inventory, completed drain, and provider disposition.
+Production SQL erasure still requires a complete survivor rebuild and retiring-key census, bounded plaintext and egress drain, and evidenced provider destruction.
 
 |8
 |Transaction metadata retention.
@@ -221,16 +245,30 @@ New recovery checkpoints omit covered receipt tries, placed intake releases appl
 Directory deployments can retire loose receipt L0 through their custodian after successor publication and certified replay exclusion.
 An exact record erase co-orders erasure of transaction metadata explicitly associated with that record.
 Classic local repair-base maintenance settles covered log payloads and skip diagnostics, and pack retirement accepts an independent successor that omits covered receipt members.
-Held archive and remaining provider custody closure stay open.
+New held-world suffixes authenticate exact business effects before leaving receipt state with its original authority. Held checkpoint reads open only business members of the authenticated manifest.
+Classic S3 can settle an exact compacted receipt version bound to an installed release and the publication recorded by compaction.
+Active installed grants submit receipt trie publications with their exact installed removal. The S3 consumer verifies the successor and asks the journal for an exact object fence before withdrawing the key slot and settling the version or terminal publication.
+The v3 suffix cutover requires exact copied-payload evidence and reset installations. The reaper requires both the target and release publication and leaves unbound copies outside its grant.
+Installed checkpoint and replay producers submit the S3 allocation references used by the fence.
+Active files remain pending when any selected dependency lacks a complete reference or the provider lacks an exact publication witness.
+Quiet histories depend on the ordered clock work in T4.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
-|Catalog holds bind pool residence and physical cut through query execution and provider drain.
-Revocable stores opt out of shared plaintext and decoded-page caching.
+|Catalog holds bind pool residence and physical cut through queries, compaction and stored artefact builds.
+Checkpoint discovery at startup and coordinated Classic checkpoint loads carry their existing recovery holds into provider drain.
+Local and remote object stores, the disk cache, S3 inventory, local journals and remote vault discovery bind their opened owner and exact target at I/O admission.
+PostgreSQL rows and COPY, Flight statements and materialized Flight actions carry delivery grants for the originating unit, deployment or archive keys.
+Local vault locks retain exact custody through delivery, and remote key providers drain bounded grants after fencing.
+PostgreSQL and Flight enforce the original answer cutoff on socket writes and flushes, including on gateway egress.
+A multiplexed Flight connection retains its earliest protected cutoff and closes at that deadline.
+Held-world replies carry the original replay dependencies across the archive worker.
 Hosted PostgreSQL feedback follows the exact published recovery root.
-The bounded replay includes quorum publication before acknowledgement and recovery exclusion before deletion.
-Native replay joins checkpoint, trim and dependent retirement observations by exact identities and revisions.
-Universal low-level read and cursor-local key enforcement, production T1 and T2 completion, full cross-owner replay, and execution evidence remain open.
+The bounded replay includes quorum publication before acknowledgement, recovery exclusion before deletion, and refusal of a paused answer at its transport deadline.
+Native replay joins portable T1 decisions to the applied catalog and frontend answer, and checks the covering decision for directory checkpoint publication.
+It correlates broker reads with both replay holds, checkpoint publication and trim with dependent version removal, and installed receipt removal with the exact journal fence.
+General T2 reachability and recovery exclusion and execution evidence remain open.
+Cross-host cutoff checks rely on a consistent wall-clock domain, and remote vault settlement retains its clock-rate margin.
 |===
 
 == Placed serving and search

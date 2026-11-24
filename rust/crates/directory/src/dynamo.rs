@@ -537,6 +537,42 @@ impl DynamoDirectory {
 
 #[async_trait]
 impl Directory for DynamoDirectory {
+    async fn receiver_clock(&self, domain: uuid::Uuid) -> Result<Option<crate::ReceiverClockSample>> {
+        let name = format!("{}{domain}", crate::CLOCK_PREFIX);
+        let client = self.audience_reader.as_ref().unwrap_or(&self.client);
+        get_item(client, &self.tables.deployment_names, NAME, &name).await?.map(|item| {
+            let sample: crate::ReceiverClockSample = serde_json::from_str(string_attribute(&item, RECORD)?)
+                .map_err(|error| Anomaly::fault("rtdb.directory/clock-record", error.to_string()))?;
+            if sample.domain != domain || sample.sequence != number_attribute(&item, VERSION)? {
+                return Err(Anomaly::fault("rtdb.directory/clock-record", "Receiver clock record differs from its identity"));
+            }
+            Ok(sample)
+        }).transpose()
+    }
+
+    async fn publish_receiver_clock(&self, domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp) -> Result<()> {
+        let previous = self.receiver_clock(domain).await?;
+        let Some(sample) = crate::ReceiverClockSample::advance(previous, domain, publisher, observation)? else {
+            return Ok(());
+        };
+        let name = format!("{}{domain}", crate::CLOCK_PREFIX);
+        let request = self.client.put_item().table_name(&self.tables.deployment_names)
+            .item(NAME, AttributeValue::S(name))
+            .item(VERSION, number(sample.sequence))
+            .item(RECORD, blob(&sample)?);
+        let request = match previous {
+            Some(last) => request.condition_expression("#version = :last")
+                .expression_attribute_names("#version", VERSION)
+                .expression_attribute_values(":last", number(last.sequence)),
+            None => request.condition_expression("attribute_not_exists(#name)").expression_attribute_names("#name", NAME),
+        };
+        match request.send().await {
+            Ok(_) => Ok(()),
+            Err(error) if error.as_service_error().is_some_and(|service| service.is_conditional_check_failed_exception()) => Ok(()),
+            Err(error) => Err(sdk_anomaly("PutItem", error)),
+        }
+    }
+
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         let id = installed_journal_id(id)?;
         // The reservation occupies the deployment key without a version that could pass a deployment CAS.

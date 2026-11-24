@@ -307,7 +307,7 @@ impl NativeSession {
         let mut bound = 8192usize;
         if let Some(value) = self.state.parameter(name) { bound = size(bound, value.len().checked_mul(4).ok_or_else(|| invalid("SHOW allocation size overflow"))?)?; }
         if let Some(token) = if name == "latest_submitted_tx" { self.state.last_submitted_await_token() } else { self.state.effective_await_token() } { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
-        let snapshot_token = if name == "snapshot_token" { Some(basis.snapshot_token()) } else { None };
+        let snapshot_token = if name == "snapshot_token" { Some(context.issue_snapshot_token()?.ok_or_else(crate::sql_snapshots::unretained)?) } else { None };
         if let Some(token) = &snapshot_token { bound = size(bound, token.len().checked_mul(4).ok_or_else(|| invalid("SHOW token size overflow"))?)?; }
         let error = match (name, self.state.last_submitted()) { ("latest_submitted_tx", Some(LastSubmittedTx::Executed(tx))) => tx.encoded_error()?, _ => None };
         if let Some(error) = &error { bound = size(bound, error.as_ref().len().checked_mul(4).ok_or_else(|| invalid("SHOW error size overflow"))?)?; }

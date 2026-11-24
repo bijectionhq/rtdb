@@ -16,7 +16,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use prost_types::Any;
 use rtdb_directory::{Cas, CatalogAdmissionFloor, DeploymentRecord, Directory, Lifecycle, LineageChange, LineageRetirement, MemberId, MemberPool, MemberRole, MemberState, HostedTask, ReplayCustody, RetirementWork, StoragePublication, StorageRegion, now_ms};
-use rtdb_format::{keys::{StorageRoot, TrieKey}, trie_retirement::InstalledRetirement};
+use rtdb_format::{keys::StorageRoot, trie_retirement::InstalledRetirement};
 use rtdb_node::{AudienceReadStorage, OpenedRecoveryStore, OpenedServingStores, RemoteStorageFactory};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadReservation, RetainedBytes, ObjectReadAllocation, object_store::{IndexPageLifecycle, StoredObject}, remote::PublicationJournal};
 use rtdb_types::{Anomaly, PhysicalObjectVersion, Result};
@@ -28,15 +28,16 @@ use uuid::Uuid;
 use crate::cipher::{Cipher, object};
 use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
-use crate::keys::KeyService;
+use crate::keys::{DeploymentDelivery, KeyService, UnitLedger, UnitOperation, UnitOutput, UnitScope};
 pub use rtdb_storage::sealing::EncryptingStore;
+use rtdb_storage::sealing::ObjectCipher;
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
 use crate::reference::custody::ReferenceReads;
 
 #[path = "key_enrollment.rs"]
 mod key_enrollment;
-mod exact_retirement;
+pub(crate) mod exact_retirement;
 mod replay_retirement;
 
 /// The protobuf type name the cell's storage factory is registered under.
@@ -89,7 +90,6 @@ pub struct CellStoreFactory {
     pub storage_namespaces: rtdb_directory::StorageNamespaces,
     pub(crate) hosted_task: Option<HostedTask>,
     pub(crate) audience_source: Option<Uuid>,
-    pub(crate) replica_payload_reclamation: bool,
     pub(crate) storage_regions: TaskTracker,
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
@@ -226,7 +226,7 @@ impl RemoteStorageFactory for CellStoreFactory {
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
-        let (opened, audience_reads) = IoRegion::retaining(Arc::clone(&checkpoint_metadata), async {
+        let (opened, audience_reads) = IoRegion::reading(rtdb_storage::HeldView::recovery(Arc::clone(&checkpoint_metadata)), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
                 crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone(), audience_writer).await?
             } else {
@@ -313,15 +313,65 @@ impl RemoteStorageFactory for CellStoreFactory {
             Some(material) => material,
             None => self.enroll_serving_key(&config, &id).await?,
         };
-        let ordinary = EncryptingStore::new(cached, &material)?.with_replica_publications(
-            self.replica_payload_reclamation && matches!(config.storage, crate::deployment::CellStorage::S3 { .. }),
-        );
-        let ordinary = Arc::new(ordinary);
+        let keys: Arc<dyn ObjectCipher> = Arc::new(ServingKeys {
+            keys: Arc::clone(&self.keys),
+            residence: record.storage_prefix(),
+            directory: Arc::clone(&self.directory),
+            installation: record.id.clone(),
+            writer_epoch: config.writer_epoch,
+            io: IoRegion::new(),
+            deployment: Cipher::new(&material)?,
+            delivery: DeploymentDelivery::new(self.keys.clone(), id, &material),
+        });
+        let ordinary = Arc::new(EncryptingStore::with_units(cached, Arc::clone(&keys)));
         let audience = audience.zip(self.audience_writer(&config, &record)).map(|(store, source)| {
-            let store = Arc::new(AudienceObjectStore(EncryptingStore::new(store, &material)?));
-            Ok::<_, Anomaly>(AudienceReadStorage { source, store })
-        }).transpose()?;
+            let store = Arc::new(AudienceObjectStore(EncryptingStore::with_units(store, keys)));
+            AudienceReadStorage { source, store }
+        });
         Ok(OpenedServingStores { ordinary, audience })
+    }
+}
+
+struct ServingKeys {
+    keys: Arc<dyn KeyService>,
+    residence: String,
+    directory: Arc<dyn Directory>,
+    installation: String,
+    writer_epoch: Option<u64>,
+    io: Arc<IoRegion>,
+    deployment: Cipher,
+    delivery: Arc<DeploymentDelivery>,
+}
+
+#[async_trait]
+impl ObjectCipher for ServingKeys {
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        if let Some((index, generation)) = ordered_index_storage::page_generation(name.as_str()) {
+            if operation.provisions() {
+                let epoch = self.writer_epoch.ok_or_else(|| Error::Closed("The index writer is fenced".into()))?;
+                let definition = format!("/{}/{index}", rtdb_format::keys::ORDERED_INDEX_ROOT);
+                let current = self.directory.deployment(&self.installation).await
+                    .map_err(|error| publication_error(name, error))?;
+                let admitted = current.is_some_and(|record| {
+                    record.storage_prefix() == self.residence && record.epoch == epoch && record.holder.is_some()
+                        && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+                        && record.ordered_indexes.iter().any(|(name, state)| {
+                            name.ends_with(&definition) && state.admits(generation)
+                                && state.generations.get(&generation).is_some_and(|users| !users.is_empty())
+                        })
+                });
+                if !admitted {
+                    return Err(Error::Closed("The directory has no admitted index page generation".into()));
+                }
+            }
+            let scope = UnitScope::ordered_index(&self.residence, index, generation);
+            return UnitLedger::new(Arc::clone(&self.keys), scope, Arc::clone(&self.io))
+                .operate(name, operation).await;
+        }
+        if matches!(operation, UnitOperation::Grant) {
+            return self.delivery.operate(name, operation).await;
+        }
+        operation.apply(&self.deployment, name)
     }
 }
 
@@ -377,6 +427,7 @@ fn discovery_from_admitted_record(config: &CellStoreConfig, record: &DeploymentR
 }
 
 fn checkpoint_startup_replay(record: &DeploymentRecord) -> Result<Option<i64>> {
+    crate::hosted_recovery::checkpoint_decision(record)?;
     let Some(checkpoint) = record.checkpoint.filter(|checkpoint| checkpoint.root_sha256.is_some()) else { return Ok(None); };
     if checkpoint.boundary < 0 { return Err(storage_region_error("The published checkpoint has an invalid replay boundary")); }
     Ok(Some(crate::hosted_recovery::replay_start(record, checkpoint.boundary)?))
@@ -529,9 +580,10 @@ pub(crate) fn track_checkpoint_stage_publications(
     deployment: String,
     region: Uuid,
     operation: Uuid,
+    bootstrap: Option<[u8; 32]>,
 ) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointStage(operation) },
+        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointStage { operation, bootstrap } },
     ));
 }
 
@@ -547,20 +599,6 @@ pub(crate) fn track_checkpoint_transfer_publications(
     ));
 }
 
-pub(crate) struct CheckpointReplayPublication {
-    pub bootstrap_sha256: [u8; 32],
-    pub object: ObjectKey,
-}
-
-pub(crate) fn track_checkpoint_replay_publication(
-    io: &mut Arc<IoRegion>, directory: Arc<dyn Directory>, deployment: String, region: Uuid,
-    replay: CheckpointReplayPublication,
-) {
-    Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
-        DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::CheckpointReplay(replay) },
-    ));
-}
-
 pub(crate) fn track_hosted_fork_publications(io: &mut Arc<IoRegion>, directory: Arc<dyn Directory>, deployment: String, region: Uuid) {
     Arc::get_mut(io).expect("the region has not been exposed").track_publications(Arc::new(
         DirectoryPublications { directory, deployment, region, writer_epoch: None, owner: PublicationOwner::HostedFork },
@@ -570,9 +608,8 @@ pub(crate) fn track_hosted_fork_publications(io: &mut Arc<IoRegion>, directory: 
 enum PublicationOwner {
     Serving,
     Transfer,
-    CheckpointStage(Uuid),
+    CheckpointStage { operation: Uuid, bootstrap: Option<[u8; 32]> },
     CheckpointTransfer(Uuid),
-    CheckpointReplay(CheckpointReplayPublication),
     HostedFork,
 }
 
@@ -595,9 +632,22 @@ impl PublicationJournal for DirectoryPublications {
             let accepts_writes = match &self.owner {
                 PublicationOwner::Serving => matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
                 PublicationOwner::Transfer => record.lifecycle == Lifecycle::Moving && record.move_from.is_some(),
-                PublicationOwner::CheckpointStage(operation) => record.lifecycle == Lifecycle::Restoring
-                    && record.checkpoint_stage.as_ref().is_some_and(|stage| {
-                        stage.intent.operation == *operation && stage.staged_manifest_sha256.is_none()
+                PublicationOwner::CheckpointStage { operation, bootstrap } => record.lifecycle == Lifecycle::Restoring
+                    && record.checkpoint_stage.as_deref().is_some_and(|stage| {
+                        if stage.intent.operation != *operation { return false; }
+                        match bootstrap {
+                            None => stage.staged_manifest_sha256.is_none()
+                                && ObjectKey::new(crate::archive::stage::staged_storage_root(record))
+                                    .is_ok_and(|root| key.is_under(&root)),
+                            Some(digest) => record.checkpoint_transfer_replica.as_deref().is_some_and(|replica| {
+                                replica.bootstrap.ciphertext_sha256 == *digest
+                                    && &replica.bootstrap.terminal.fence.destination == stage
+                                    && crate::archive::checkpoint_storage_root().is_ok_and(|version| {
+                                        ObjectKey::new(format!("{}/{version}", record.storage_prefix()))
+                                            .is_ok_and(|root| key.is_under(&root))
+                                    })
+                            }),
+                        }
                     }),
                 PublicationOwner::CheckpointTransfer(operation) => record.lifecycle == Lifecycle::Restoring
                     && record.checkpoint_transfer_fence.as_deref().is_some_and(|fence| {
@@ -605,17 +655,6 @@ impl PublicationJournal for DirectoryPublications {
                         intent.operation == *operation && intent.destination.to_string() == record.id
                             && record.checkpoint_stage.as_deref() == Some(&fence.destination)
                             && crate::archive::admits_checkpoint_transfer_object(record, &fence.destination, key.as_str())
-                    }),
-                PublicationOwner::CheckpointReplay(replay) => record.lifecycle == Lifecycle::Restoring
-                    && &replay.object == key
-                    && record.checkpoint_transfer_replica.as_deref().is_some_and(|replica| {
-                        let bootstrap = &replica.bootstrap;
-                        let fence = &bootstrap.terminal.fence;
-                        bootstrap.ciphertext_sha256 == replay.bootstrap_sha256
-                            && fence.destination.intent.destination.to_string() == record.id
-                            && record.checkpoint_transfer_fence.as_deref() == Some(fence)
-                            && record.checkpoint_stage.as_deref() == Some(&fence.destination)
-                            && record.checkpoint_transfer_bootstrap.as_deref() == Some(bootstrap)
                     }),
                 PublicationOwner::HostedFork => record.lifecycle == Lifecycle::Restoring
                     && record.hosted_fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),
@@ -1207,15 +1246,7 @@ fn remember_release(released: &mut BTreeMap<ObjectKey, Vec<PhysicalObjectVersion
 }
 
 fn is_collected_trie_file(key: &str) -> bool {
-    rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) || is_compacted_primary_file(key)
-}
-
-fn is_compacted_primary_file(key: &str) -> bool {
-    let Some((_, name)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once('/')) else { return false; };
-    name.strip_prefix("data/").or_else(|| name.strip_prefix("meta/"))
-        .and_then(|file| file.strip_suffix(".arrow"))
-        .and_then(|trie| trie.parse::<TrieKey>().ok())
-        .is_some_and(|trie| trie.level() > 0)
+    rtdb_format::search_manifest::is_run_key(key) || rtdb_format::keys::is_receipt_l0_file(key) || rtdb_format::keys::is_compacted_primary_file(key)
 }
 
 fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageRecord, exact: bool) -> bool {
@@ -1232,7 +1263,7 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
         && record.storage_namespaces.is_some_and(|value| value.objects == required.object_namespace)
         && cut.replica_epoch.0 == record.log_epoch
         && crate::catalog_readers::readers_allow(record, &root, cut,
-            (exact && is_compacted_primary_file(&release.key)).then_some(release.key.as_str()))
+            (exact && rtdb_format::keys::is_compacted_primary_file(&release.key)).then_some(release.key.as_str()))
         && record.catalog_admission_floors.get(&root).is_some_and(|floor| {
             floor.residence == required.residence && floor.object_namespace == required.object_namespace
                 && floor.cut.storage_version == cut.storage_version && floor.cut.storage_epoch == cut.storage_epoch
@@ -1284,7 +1315,7 @@ impl ObjectStore for GarbageStore {
         files.sort_by_key(|file| file.release_order());
         let paths = files.iter().map(|file| {
             let exact = file.terminal_publication.is_some() || file.matches_publication && file.version.is_some();
-            (exact && is_compacted_primary_file(&file.key)).then_some(file.key.as_str())
+            (exact && rtdb_format::keys::is_compacted_primary_file(&file.key)).then_some(file.key.as_str())
         }).collect::<Vec<_>>();
         let (floor, allowed) = readers.close_admission(installed.cut(), &paths).await?;
         for (file, allowed) in files.into_iter().zip(&allowed) {
@@ -1341,6 +1372,9 @@ impl ObjectStore for GarbageStore {
         Ok(objects.into_iter().filter(|object| !object.key.as_str().starts_with(GARBAGE_DIRECTORY) && !released.contains_key(&object.key)).collect())
     }
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+        if self.index_pages.is_some() && ordered_index_storage::page_generation(key.as_str()).is_some() {
+            return Err(Error::Closed("The index page generation owns its retirement".into()));
+        }
         if key.as_str().starts_with("oversized/") {
             return Err(Error::Remote { key: key.to_string(), message: "An offloaded replica payload belongs to the retained journal".into() });
         }
@@ -1471,7 +1505,8 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
                 StoredRelease::Replica { .. } => { reaped.waiting += 1; continue; }
                 StoredRelease::Path(record) => record,
             };
-            if !permits_release(record, &store, &released, false) || !recovery_covers_release(record, &released)
+            if ordered_index_storage::page_generation(&released.key).is_some()
+                || !permits_release(record, &store, &released, false) || !recovery_covers_release(record, &released)
                 || !oversized_payload_collectable(record, &released.key, now_ms)
                 || released.released_at_ms > threshold || checkpoint_metadata_block(&released.key)
                 .is_some_and(|block| !checkpoint_metadata_collectable(block, published, oldest))
@@ -1617,6 +1652,7 @@ pub async fn run_reaper(
                         }
                     }
                     for record in &deployments {
+                        let Some(keys) = keys.as_deref() else { break; };
                         if !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
                             || (record.ordered_indexes.is_empty() && record.ordered_index_catalogs.is_empty())
                         {
@@ -1628,7 +1664,7 @@ pub async fn run_reaper(
                             continue;
                         };
                         match cancellation.run_until_cancelled(
-                            ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &current)
+                            ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &current, keys)
                         ).await {
                             None => return,
                             Some(Ok(())) => {}
@@ -2220,7 +2256,7 @@ mod tests {
         let allocation = uuid::Uuid::new_v4();
         let storage = CellStorage::parse(&format!("s3://fixture?terminal={allocation}.{}", "A".repeat(43))).unwrap();
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
-        let factory = CellStoreFactory { replica_payload_reclamation: false,
+        let factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
         };
@@ -2248,7 +2284,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { replica_payload_reclamation: false, directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -2263,7 +2299,7 @@ mod tests {
         let keys = Arc::new(crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap());
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
         let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
-        let factory = CellStoreFactory { replica_payload_reclamation: false,
+        let factory = CellStoreFactory {
             directory: directory.clone(), keys: keys.clone(), storage_namespaces,
             storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
         };
@@ -2309,7 +2345,6 @@ mod tests {
         record.linearizable_reads = true;
         let record = directory.create_deployment(record).await.unwrap();
         let factory = CellStoreFactory {
-            replica_payload_reclamation: false,
             directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
             scoped_writes: None, hosted_task: None, local_witnesses: None,
             audience_source: Some(Uuid::parse_str(&record.id).unwrap()),
@@ -2606,7 +2641,7 @@ mod tests {
         record.storage_namespaces = Some(storage_namespaces);
         let record = directory.create_deployment(record).await.unwrap();
         let key = keys.key(&record.key_id()).await.unwrap();
-        let factory = CellStoreFactory { replica_payload_reclamation: false,
+        let factory = CellStoreFactory {
             directory: directory.clone(),
             keys: keys.clone(),
             storage_regions: TaskTracker::new(),
@@ -2824,6 +2859,8 @@ mod tests {
         let bucket = storage.bucket(IoRegion::new()).await.unwrap();
 
         let directory = rtdb_directory::MemoryDirectory::new();
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path()).unwrap();
         let region = Uuid::new_v4();
         let attempt = Uuid::new_v4();
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
@@ -2857,12 +2894,12 @@ mod tests {
             Ok(())
         }).await.unwrap();
         assert!(journal.admit(&object, Uuid::new_v4(), &upload).await.is_err());
-        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &closed).await.unwrap();
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &closed, &keys).await.unwrap();
         assert!(!inventory.is_empty(&old).await.unwrap());
 
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         let drained = directory.deployment(&record.id).await.unwrap().unwrap();
-        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &drained).await.unwrap();
+        ordered_index_storage::reap(directory.as_ref(), &storage, bucket.as_ref(), &drained, &keys).await.unwrap();
         assert!(inventory.complete(&upload_path, &upload, Bytes::from_static(b"late")).await.is_err());
         assert!(inventory.is_empty(&old).await.unwrap());
         assert!(!inventory.is_empty(&replacement).await.unwrap());
@@ -2996,7 +3033,7 @@ mod tests {
         for name in [core, packed, loose] { writer.delete(&key(name)).await.unwrap(); }
 
         let tasks = TaskTracker::new();
-        let storage_factory = CellStoreFactory { replica_payload_reclamation: false,
+        let storage_factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, hosted_task: None,
             storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, audience_source: None,
         };

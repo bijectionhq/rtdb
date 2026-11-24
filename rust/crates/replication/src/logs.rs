@@ -56,6 +56,7 @@ pub struct PartitionLogs {
     pub storage_version: StorageVersion, pub storage_epoch: StorageEpoch,
     store: Arc<dyn ObjectStore>, cache: Arc<BufferPool>, memory: Arc<MemoryBudget>,
     data_suspended: AtomicBool,
+    placed_transfer: Option<rtdb_types::PlacedTransfer>,
 }
 impl PartitionLogs {
     pub fn new(source: Arc<dyn Log>, replica: Arc<dyn Log>, source_epoch: StorageEpoch, replica_epoch: StorageEpoch,
@@ -63,9 +64,46 @@ impl PartitionLogs {
         if Arc::ptr_eq(&source, &replica) { return Err(Anomaly::incorrect("rtdb.replication/aliased-logs", "Source and replica logs must be distinct")); }
         SourcePosition::from_epoch_offset(source_epoch, -1)?;
         ReplicaPosition::from_epoch_offset(replica_epoch, -1)?;
-        Ok(Arc::new(Self { source, replica, source_epoch, replica_epoch, storage_version, storage_epoch, store, cache, memory, data_suspended: AtomicBool::new(false) }))
+        Ok(Arc::new(Self { source, replica, source_epoch, replica_epoch, storage_version, storage_epoch, store, cache, memory, data_suspended: AtomicBool::new(false), placed_transfer: None }))
     }
+    pub fn with_placed_transfer(mut self: Arc<Self>, transfer: Option<rtdb_types::PlacedTransfer>) -> Result<Arc<Self>> {
+        if let Some(transfer) = transfer {
+            let invalid = || Anomaly::fault("rtdb.replication/transfer-cut", "The placed transfer has another replica interval");
+            if transfer.after > transfer.through
+                || transfer.debt.as_ref().is_some_and(|debt| debt.reserved_at <= transfer.after || debt.reserved_at > transfer.through)
+            {
+                return Err(invalid());
+            }
+            ReplicaPosition::from_epoch_offset(self.replica_epoch, transfer.after)?;
+            ReplicaPosition::from_epoch_offset(self.replica_epoch, transfer.through)?;
+            Arc::get_mut(&mut self).ok_or_else(invalid)?.placed_transfer = Some(transfer);
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn placed_transfer(&self) -> Option<&rtdb_types::PlacedTransfer> {
+        self.placed_transfer.as_ref()
+    }
+
+    pub(crate) fn is_copied_replica_position(&self, position: ReplicaPosition) -> bool {
+        let offset = position.after_offset(self.replica_epoch);
+        self.placed_transfer().is_some_and(|transfer| transfer.after < offset && offset <= transfer.through)
+    }
+
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
+    pub fn install_replica_reference_source(
+        &self, checkpoint: Option<rtdb_format::catalog::BlockCatalog>, file_size_target: i64,
+    ) -> Result<()> {
+        Ok(self.replica.install_replica_reference_source(rtdb_storage::log::ReplicaReferenceSource {
+            store: Arc::clone(&self.store),
+            cache: Arc::clone(&self.cache),
+            memory: Arc::clone(&self.memory),
+            checkpoint,
+            version: self.storage_version,
+            epoch: self.storage_epoch,
+            file_size_target,
+        })?)
+    }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
     pub(crate) fn storage(&self) -> &Arc<dyn ObjectStore> { &self.store }
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
@@ -189,13 +227,16 @@ impl PartitionLogs {
             return Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch });
         }
         let now = clock();
-        // Only the term's initial claim and the block close can consume reserved journal space.
+        // Claims, checkpoint closure and inherited receiver fences use reserved journal space.
         // Keep that class when a large block upload is represented by an offload reference.
         // A journal that fences writer terms has no claims, so its sequence-zero no-op is ordinary data.
         let maintenance = match &envelope.message {
             ReplicaBody::BlockBoundary(_) | ReplicaBody::BlockUploaded(_) => true,
             ReplicaBody::NoOp(message) => !self.fences_writer_terms()
-                && envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none(),
+                && envelope.term_sequence == Some(TermSequence(0)) && message.src_msg_id.is_none()
+                && message.placed_slot_reservation.is_none(),
+            ReplicaBody::ResolvedTx(tx) => tx.placed_slot_terminal.as_deref()
+                .map(rtdb_types::PlacedTerminal::decode).transpose()?.is_some_and(|terminal| terminal.fenced),
             _ => false,
         };
         let enqueue = |payload| async move {
@@ -208,7 +249,7 @@ impl PartitionLogs {
                 let payload_id = uuid::Uuid::new_v4().to_string();
                 let key = ObjectKey::new(oversized_key(block, &payload_id)?)?;
                 let mut proxy = envelope.offloaded(self.storage_version, self.storage_epoch, block, payload_id, &payload);
-                if let Some(version) = self.store.put_replica_payload(&key, payload).await? {
+                if let Some(version) = self.replica.publish_replica_payload(self.store.as_ref(), &key, payload).await? {
                     proxy.bind_offload_publication(version)?;
                 }
                 let payload = EncodedPayload::encode(proxy.encoded_len(), &self.memory, || Ok(proxy.encode()))?;
@@ -235,7 +276,12 @@ impl PartitionLogs {
         let Some(envelope) = frame.into_envelope() else { return Ok(DecodedReplica::Unrecognized { term, sequence }); };
         let fingerprint = (Some(term) == own_term && matches!(&envelope.message, ReplicaBody::ResolvedTx(_) | ReplicaBody::OversizedMessage(_)))
             .then(|| fingerprint(&record.payload));
-        let oversized_delivery = matches!(&envelope.message, ReplicaBody::OversizedMessage(_)).then_some(record);
+        let oversized = matches!(&envelope.message, ReplicaBody::OversizedMessage(_));
+        if oversized && self.replica.requires_replica_payload_permit() && record.replica_objects.is_none() {
+            return Err(Anomaly::fault("rtdb.replication/oversized-delivery",
+                "The hosted replica returned a pointer without its payload permit"));
+        }
+        let oversized_delivery = oversized.then_some(record);
         Ok(DecodedReplica::Known(ReplicaRecord { metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery }))
     }
     /// Admission runs on the outer envelope before this fetch; a held block receives the resolved body.
@@ -254,17 +300,16 @@ impl PartitionLogs {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
-        let origin = delivery.replica_objects.as_ref().map(|custody| custody.scope);
-        if origin.is_some() && !matches!(&record.envelope.message,
-            ReplicaBody::OversizedMessage(reference) if reference.payload_sha256.as_ref().is_some_and(|sha| sha.len() == 32))
-        {
-            return Err(Anomaly::fault("rtdb.replication/oversized-digest", "An installed replica payload has no exact digest"));
+        if let Some(custody) = &delivery.replica_objects {
+            if !custody.matches(delivery.metadata.offset, &key) {
+                return Err(Anomaly::fault("rtdb.replication/oversized-delivery",
+                    "The replica payload permit does not match this delivery"));
+            }
+            let payload = custody.redeem(self.store.as_ref(), &self.memory).await?;
+            return self.decode_oversized(record, payload.as_ref());
         }
         IoRegion::retaining(Arc::new(delivery), async {
-            let store = match origin {
-                Some(scope) => self.store.open_replica_objects(scope).await?,
-                None => Arc::clone(&self.store),
-            };
+            let store = &self.store;
             let length = usize::try_from(store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
             let allocation = store.exact_object_allocation(&key, length)?;
             let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(size_overflow)?;

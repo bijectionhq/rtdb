@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod audience_work;
 pub mod cache;
 pub mod disk_cache;

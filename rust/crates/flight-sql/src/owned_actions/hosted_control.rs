@@ -1,6 +1,8 @@
 use super::*;
+use rtdb_node::RootCatalogRead;
 
 pub(crate) const READ_HELD_HOSTED_CONTROL_V2: &str = "rtdb.owned.ReadHeldHostedControl.v2";
+pub(crate) const READ_HELD_ROOT_CATALOG_V1: &str = "rtdb.owned.ReadHeldRootCatalog.v1";
 
 pub(super) fn require_audience_control(
     session: &crate::state::Session, relation: &str, id: &str,
@@ -17,6 +19,64 @@ fn audience_control_admitted(relation: &str, id: &str) -> bool {
 }
 
 impl Service {
+    pub(crate) async fn read_held_root_catalog_action(
+        &self,
+        call: &Call,
+        body: &[u8],
+    ) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if call.session.audience_source().is_some()
+            || call.session.caller.principal.user_id().is_none()
+            || matches!(call.session.caller.owner, crate::state::Owner::Anonymous)
+        {
+            return Err(Status::permission_denied("Root catalog reads require an ordinary authenticated session"));
+        }
+        let (handle, body) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Root catalog read requires a held handle"))?;
+        let read = match body {
+            [0] => RootCatalogRead::Installation,
+            [1] => RootCatalogRead::RestoreHold,
+            [2] => RootCatalogRead::RestoreRelease,
+            [3] => RootCatalogRead::Custody,
+            [4] => RootCatalogRead::Owner,
+            [5] => RootCatalogRead::Admission,
+            [6] => RootCatalogRead::ProgramSchema,
+            [7] => RootCatalogRead::Declarations,
+            _ => return Err(invalid("Invalid held Root catalog projection")),
+        };
+        if call.session.placed_database().is_some() {
+            let policy = self.hosted_control_policy(call)?;
+            let relation = OwnedRelation::new(read.relation()).map_err(status)?;
+            admit_control_targets(policy, [&relation])?;
+        }
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let mut cursor = held.snapshot.open_root_catalog(read).await.map_err(status)?;
+        let mut retained = Vec::new();
+        let mut rows = 0;
+        while let Some(page) = cursor.next_batch().await.map_err(status)? {
+            let count = page.batch().num_rows();
+            if count == 0 { continue; }
+            rows += count;
+            if rows > read.maximum_rows() {
+                return Err(Status::resource_exhausted("Root catalog exceeds its row bound"));
+            }
+            retained.push(page);
+        }
+        let schema = match retained.first() {
+            Some(page) => page.batch().schema_ref().as_ref().clone(),
+            None => (*wire::plan_schema(cursor.runtime_schema(), call.memory())?).clone(),
+        };
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(OWNED_PRESENT.into(), held.snapshot.system_time().0.to_string());
+        let schema = Arc::new(schema.with_metadata(metadata));
+        let pages = retained.iter().map(|page| {
+            RecordBatch::try_new(Arc::clone(&schema), page.batch().columns().to_vec())
+        }).collect::<Result<Vec<_>, _>>().map_err(arrow)?;
+        let reply = self.owned_stream_reply_in(call.memory(), &schema, &pages)?;
+        held.snapshot.check().map_err(status)?;
+        Ok(reply)
+    }
+
     pub(super) fn hosted_control_policy(
         &self,
         call: &Call,

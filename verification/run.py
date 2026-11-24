@@ -390,9 +390,9 @@ def verify_read_index_frontiers(args, scratch):
     path = Path("verification/lean/ReadIndexFrontiers.lean")
     controls = {
         "offset-without-history": (
-            "later.history = earlier.history ∧ ∃ suffix, later.entries = earlier.entries ++ suffix",
-            "∃ suffix, later.entries = earlier.entries ++ suffix",
-            ["extension_transitive", "handoff_preserves_installed_prefix", "matching_offsets_do_not_bind_history"],
+            "¬ Extends foreign original",
+            "¬ (foreign.entries.length = original.entries.length)",
+            ["matching_offsets_do_not_bind_history"],
         ),
     }
     verify_lean_model(args, scratch, path, "read-index-frontiers", controls, 6)
@@ -1932,6 +1932,8 @@ def verify_lean(args, scratch):
             verify_group_publication(args, scratch)
             verify_reader_reclamation_minimality(args, scratch)
             verify_basis_tokens(args, scratch)
+            verify_lean_model(args, scratch, Path("verification/lean/ExactTemporalCut.lean"),
+                              "exact-temporal-cut", {}, 4)
             verify_run_encoding(args, scratch)
             verify_memory_admission(args, scratch)
             verify_memory_trie(args, scratch)
@@ -2112,6 +2114,8 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "ack_payload"'), "StableCutCovered"),
     ("ActiveLogletReadIndex", "read-index-single-install",
      ('Mutation = "none"', 'Mutation = "single_install"'), "ReadStabilized"),
+    ("ActiveLogletReadIndex", "read-index-successive-read-inversion",
+     ('Mutation = "none"', 'Mutation = "single_install"'), "ReadReadMonotone"),
     ("ActiveLogletReadIndex", "read-index-unbound-digest",
      ('Mutation = "none"', 'Mutation = "wrong_digest"'), "ExactDecision"),
     ("ActiveLogletReadIndex", "read-index-skips-apply",
@@ -3247,6 +3251,8 @@ RESIDENCE_AUTHORITY_CONTROLS = (
     ("ack_before_closure", "AcknowledgedClosure"),
     ("arm_before_successor", "ErasureHasSuccessor"),
     ("use_revoked_cache", "RevokedCacheClosed"),
+    ("skip_transport_deadline", "OnlyLiveTransportWrites"),
+    ("dispose_ignores_answer", "ClosedAfterDrain"),
     ("ack_payload_quorum", "AcknowledgedDecision"),
     ("read_unpublished_decision", "FreshIndexHasPublication"),
     ("lose_decision_on_activation", "DecisionSurvivesActivation"),
@@ -3275,15 +3281,37 @@ def replay_bounded_worker_stack(args, source):
         raise ValueError("the deep statement did not execute through cursor disposal on the worker stack")
 
 
+def exact_temporal_cut_cases():
+    cases = {
+        "": None,
+        "Lead": "NoLead",
+        "Cap": "ExactResult",
+        "Tie": "TiePrecedence",
+        "Survivor": "ExactResult",
+        "BackdatedReach": "NoBackdatedSuffix",
+        "TieReach": "NoTiedCut",
+        "ErasureReach": "NoErasedWinner",
+    }
+    return (("ExactTemporalCut", f"ExactTemporalCut{suffix}", None, invariant)
+            for suffix, invariant in cases.items())
+
+
 def verify_tla(args, scratch):
-    for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES):
+    for module, name, mutation, invariant in (*TLA_CASES, *RESIDENCE_AUTHORITY_CASES, *exact_temporal_cut_cases()):
         case = f"tlc-{name}"
         directory = scratch / case
         clone_file(Path(f"verification/tla/{module}.tla"), directory)
         config_name = "KernelProgress" if name in {"eventual-ack", "unfair-apply"} else module
+        if module == "ExactTemporalCut":
+            config_name = name
         config = clone_file(Path(f"verification/tla/{config_name}.cfg"), directory)
         if mutation:
             replace_once(config, *mutation)
+            if module == "ActiveLogletReadIndex" and mutation[0] == 'Mutation = "none"':
+                # Each fault is judged against its own law, even if it can
+                # also cause an earlier failure of a different invariant.
+                baseline = next(line for line in config.read_text().splitlines() if line.startswith("INVARIANTS "))
+                replace_once(config, baseline, f"INVARIANT {invariant}")
         with tempfile.TemporaryDirectory(prefix="states-", dir=directory) as metadir:
             log = run_case(
                 [args.java, "-XX:+UseParallelGC", "-Xmx1g", "-cp", args.tlc, "tlc2.TLC",
@@ -3407,6 +3435,12 @@ def verify_composed_residence_trace(args, scratch):
         index = positions[kind]
         altered[index][field] = value
         check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", altered, index, extended=True)
+
+    late_write = [event.copy() for event in events]
+    index = positions["refuse-transport-answer"]
+    late_write[index] = events[positions["handoff-transport-answer"]].copy()
+    late_write[index][1] = events[positions["advance-transport-time"]][1]
+    check_residence_trace(args, scratch, "tlc-residence-authorities-write-after-deadline", late_write, index, extended=True)
 
     external = [event.copy() for event in events]
     index = positions["attempt-outcome"]
@@ -4590,8 +4624,9 @@ def verify_native_exact_marker(args, source):
     cases = {
         "skip-marker": (
             "rust/crates/multi/src/store/exact_retirement.rs",
-            "    if let Some(release_version) = release_version {\n        provider.erase(&release, release_version).await?;\n    }",
-            "    let _ = release_version;", "the release marker needs its own absence evidence",
+            "for (key, publication) in [(&target, version), (&release, release_version)] {",
+            "let _ = (&release, release_version);\n            for (key, publication) in [(&target, version)] {",
+            "the release marker needs its own absence evidence",
         ),
         "orphan-owner-fence": (
             "rust/crates/directory/src/lineage.rs", "next_owner.storage_regions.remove(&retirement.token);",
@@ -4972,6 +5007,43 @@ def verify_native_recovery_trace(args, source):
         raise ValueError(f"{label}: the native residence capture omitted a checkpoint, hold, or trim observation")
     verify_native(native)
     verify_joined([native])
+    answers = [event for event in native if event["event"] == "certified-answer"]
+    if not answers:
+        raise ValueError(f"{label}: the follower did not deliver an answer from a certified capture")
+    bad_answer = copy.deepcopy(native)
+    answer = next(event for event in bad_answer if event["event"] == "certified-answer")
+    answer["through"] += 1
+    try:
+        verify_joined([bad_answer])
+    except ValueError as error:
+        if "answer lacks its exact certified catalog capture" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted a different answer cut")
+    reordered = native.copy()
+    answer_index = next(index for index, event in enumerate(reordered) if event["event"] == "certified-answer")
+    answer = reordered.pop(answer_index)
+    capture_index = next(index for index, event in enumerate(reordered)
+                         if event["event"] == "certified-catalog-capture" and event["invocation"] == answer["invocation"])
+    reordered.insert(capture_index, answer)
+    try:
+        verify_joined([reordered])
+    except ValueError as error:
+        if "certified-answer precedes its exact prerequisite" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted an answer before capture")
+    bad_checkpoint = copy.deepcopy(native)
+    checkpoint = next(event for event in bad_checkpoint
+                      if event["event"] == "publish-checkpoint" and event.get("decision") is not None)
+    checkpoint["decision"][0] ^= 1
+    try:
+        verify_joined([bad_checkpoint])
+    except ValueError as error:
+        if "checkpoint lacks its covering certified decision" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: native residence validator accepted a substituted checkpoint decision")
     bad_root = copy.deepcopy(native)
     published = next(event for event in bad_root if event["event"] == "authorize-trim")
     published["manifest"][0] ^= 1
@@ -5004,6 +5076,58 @@ def verify_native_recovery_trace(args, source):
         raise ValueError(f"{label}: native residence validator accepted another journal epoch")
 
     validate_recovery_revisions(args, label, trace)
+    verify_native_payload_replay(args, source)
+
+
+def verify_native_payload_replay(args, source):
+    import copy
+
+    label = "rust-retained-payload-replay"
+    fixture = "recovery_holds::tests::a_payload_read_spends_its_directory_replay_hold"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", fixture, "--", "--exact"]
+    with tempfile.TemporaryDirectory(prefix="rtdb-retained-payload-replay-") as temporary:
+        path = Path(temporary) / "residence.jsonl"
+        env = os.environ | {
+            "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0",
+            "RTDB_RESIDENCE_TRACE_PATH": str(path),
+        }
+        result = run_case(command, source / "rust", args.evidence, label, env)
+        if result.returncode or f"{fixture} ... ok" not in result.stdout:
+            raise ValueError(f"{label}: the native broker did not produce its payload trace")
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        shutil.copyfile(path, args.evidence / f"{label}.jsonl")
+    read = next(event for event in events if event["event"] == "read-retained-payload")
+    directory = [event for event in events if event["event"] != "read-retained-payload"]
+    verify_joined([directory, [read]])
+    substituted_frame = read["frame"].copy()
+    substituted_frame[0] ^= 1
+    for field, changed, expected in (
+        ("hold", "another-ticket", "payload read lacks its exact replay hold"),
+        ("position", read["position"] + 1, "payload read is outside its admitted replay interval"),
+        ("frame", substituted_frame, "broker read lacks the exact certified pointer"),
+    ):
+        corrupted = copy.deepcopy(read)
+        corrupted[field] = changed
+        try:
+            verify_joined([directory, [corrupted]])
+        except ValueError as error:
+            if expected not in str(error):
+                raise
+        else:
+            raise ValueError(f"{label}: accepted a substituted {field}")
+
+    orphan = copy.deepcopy(read)
+    orphan["source_hold"]["hold"] = "another-source-ticket"
+    try:
+        verify_joined([directory, [orphan]])
+    except ValueError as error:
+        if "broker read lacks its originating replay hold" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: accepted a substituted originating hold")
 
 
 def capture_native_recovery(args, source, label, trace, observations):

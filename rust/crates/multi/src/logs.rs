@@ -4,7 +4,7 @@
 //! The source log is the holder's in-process intake: only the holder submits, the holder alone resolves, and a resolved transaction is durable once its replica record commits, so a transaction costs one quorum append.
 //! A submission the holder had not yet resolved when it stopped was never acknowledged, and its client retries it.
 
-use std::sync::Arc;
+use std::{ops::AsyncFn, sync::Arc};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
@@ -22,9 +22,15 @@ use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, object_store::ReadReservati
 use rtdb_types::{Anomaly, BlockIndex, JournalEndpoint, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttemptScope, ReplicaPosition, Result, SourcePosition, StorageEpoch, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-use crate::cipher::{Cipher, SEALED_OVERHEAD};
+use crate::cipher::Cipher;
 use crate::deployment::LogkeeperLogConfig;
+use crate::keys::KeyService;
 use crate::recovery_holds::{RecoveryAdmission, RecoveryHolds, ReplayHold};
+
+mod units;
+pub(crate) use units::JournalUnits;
+pub(crate) use units::commits_payload_reference;
+use units::OVERHEAD as UNIT_OVERHEAD;
 
 const SCAN_WINDOW: i64 = 256;
 const INTAKE_TIP_WINDOW: i64 = 8;
@@ -34,6 +40,7 @@ struct LogletReadIndex {
     log: Arc<QuorumLog>,
     epoch: u64,
     custody: RecoveryAdmission,
+    deployment: Option<uuid::Uuid>,
 }
 
 impl LogletReadIndex {
@@ -49,6 +56,7 @@ impl LogletReadIndex {
 
 #[async_trait]
 impl ReplicaReadIndex for LogletReadIndex {
+    fn deployment(&self) -> Option<uuid::Uuid> { self.deployment }
     async fn confirm(&self) -> Result<LogOffset> { Ok(self.sample().await?.through()) }
 
     async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> {
@@ -59,10 +67,22 @@ impl ReplicaReadIndex for LogletReadIndex {
         } else {
             None
         };
+        let certified_read = if rtdb_types::residence_trace::enabled() {
+            index.decision().map(|proof| {
+                let observation = Arc::new(rtdb_types::residence_trace::CertifiedRead {
+                    invocation: index.invocation(), stream: index.stream().to_owned(), epoch: index.epoch(),
+                    ensemble: index.ensemble().try_into().expect("the certified ensemble fingerprint"),
+                    through: offset.0, decision: proof.certificate.statement.fingerprint(),
+                });
+                observation.observe("certified-read-index");
+                observation
+            })
+        } else { None };
         Ok(rtdb_node::ProtectedReadIndex {
             offset,
             wait: READ_INDEX_WITHIN,
             retention: Some(Arc::new((index, replay))),
+            certified_read,
         })
     }
 }
@@ -73,6 +93,7 @@ struct DeploymentReceipts {
 }
 
 const RECEIPT_ASSOCIATED: &str = "rtdb.multi/placed-await/v1";
+const SQL_SNAPSHOT_ASSOCIATED: &str = "rtdb.multi/sql-snapshot/v1";
 
 impl PlacedReceiptCodec for DeploymentReceipts {
     fn scope(&self) -> PlacedAttemptScope { self.scope }
@@ -85,6 +106,16 @@ impl PlacedReceiptCodec for DeploymentReceipts {
         let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
         self.cipher.open(RECEIPT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
     }
+
+    fn seal_snapshot(&self, value: &[u8]) -> Result<String> {
+        Ok(URL_SAFE_NO_PAD.encode(self.cipher.seal(SQL_SNAPSHOT_ASSOCIATED, value)?))
+    }
+
+    fn open_snapshot(&self, token: &str) -> Result<Vec<u8>> {
+        let invalid = || Anomaly::incorrect("rtdb/invalid-snapshot-token", "Snapshot token is invalid for this database");
+        let sealed = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
+        self.cipher.open(SQL_SNAPSHOT_ASSOCIATED, &sealed).map(|bytes| bytes.to_vec()).map_err(|_| invalid())
+    }
 }
 
 /// The writers a node has opened, by deployment, for confirming leadership before a linearizable read.
@@ -95,7 +126,10 @@ pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std:
 pub trait EnsembleRecorder: Send + Sync {
     /// Records every endpoint a copy can touch before any bytes move.
     async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[JournalEndpoint]) -> Result<()>;
-    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
+    async fn record(
+        &self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>,
+        handoff: &rtdb_logkeeper::HandoffCertificate,
+    ) -> Result<()>;
 }
 
 pub(crate) struct LogkeeperLogFactory {
@@ -134,16 +168,44 @@ impl EnsembleRecorder for DirectoryRecorder {
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its log copy was reserved"))
     }
 
-    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
+    async fn record(
+        &self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>,
+        proof: &rtdb_logkeeper::HandoffCertificate,
+    ) -> Result<()> {
         for _ in 0..8 {
             let current = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
             if current.epoch != epoch { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its new ensemble was recorded")); }
+            let ordered_ids = |members: &[rtdb_directory::MemberId]| {
+                let mut ids: Vec<_> = members.iter().map(|member| member.0.clone()).collect();
+                ids.sort_unstable();
+                ids
+            };
+            let handoff = &proof.handoff;
+            let checkpoint = handoff_checkpoint(&current);
+            if !proof.authentic() || handoff.source.stream != current.stream("replica")
+                || handoff.destination.epoch != epoch || handoff.source.journals != ordered_ids(&current.ensemble)
+                || handoff.destination.journals != ordered_ids(&ensemble)
+                || handoff.source.quorum as usize != crate::deployment::write_quorum(current.ensemble.len())
+                || handoff.destination.quorum as usize != crate::deployment::write_quorum(ensemble.len())
+                || handoff.checkpoint != checkpoint || (handoff.first > 0 && checkpoint.is_none())
+            {
+                return Err(Anomaly::incorrect("rtdb.multi/ensemble-handoff", "The installed predecessor and checkpoint do not attest this successor"));
+            }
             let mut next = current.clone();
             next.ensemble = ensemble.clone();
             if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))
     }
+}
+
+fn handoff_checkpoint(record: &rtdb_directory::DeploymentRecord) -> Option<rtdb_logkeeper::HandoffCheckpoint> {
+    let checkpoint = record.checkpoint?;
+    Some(rtdb_logkeeper::HandoffCheckpoint {
+        through: checkpoint.boundary,
+        catalog: Bytes::copy_from_slice(&checkpoint.root_sha256?),
+        inventory: Bytes::copy_from_slice(&record.recovery_manifest_sha256?),
+    })
 }
 
 pub(crate) fn frozen_checkpoint(
@@ -157,7 +219,7 @@ pub(crate) fn frozen_checkpoint(
     let start = end(checkpoint.source)?;
     let intake = Arc::new(IntakeLog::new(maximum_message_bytes, start));
     Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None,
-        await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
+        placed_transfer: None, await_authority: AwaitAuthority::Frozen, drivers: Vec::new() })
 }
 
 pub(crate) async fn ordered_opened(
@@ -173,10 +235,17 @@ pub(crate) async fn ordered_opened(
     let opened = ordered.latest()?;
     let scope = PlacedAttemptScope::new(&record.stream("replica"), admission.grant.epoch)?;
     let replica: Arc<dyn Log> = ordered.clone();
-    let intake_cut = checkpoint.map(|block| crate::deployment::TransferIntakeCut {
+    let terminal = record.checkpoint_transfer_activation.as_ref()
+        .map(|activation| &activation.replica.bootstrap.terminal);
+    let intake_cut = terminal.map(|terminal| {
+        crate::deployment::TransferIntakeCut {
+            replica_through: terminal.replica_through, source_through: terminal.source_through,
+        }
+    }).or_else(|| checkpoint.map(|block| crate::deployment::TransferIntakeCut {
         replica_through: block.boundary, source_through: block.source,
-    });
-    let next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
+    }));
+    let placed_transfer = terminal.map(rtdb_directory::CheckpointTransferTerminal::placed_transfer);
+    let next = next_source_offset_from_cut(replica.as_ref(), epoch, include_placed_debt(intake_cut, placed_transfer.as_ref())?).await?;
     let intake = Arc::new(IntakeLog::new(maximum_message_bytes, next));
     let trimming = {
         let intake = Arc::clone(&intake);
@@ -191,7 +260,8 @@ pub(crate) async fn ordered_opened(
     };
     Ok(OpenedLogs {
         source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
-        replica_read_index: Some(Box::new(OrderedReadIndex(ordered))),
+        placed_transfer,
+        replica_read_index: Some(Box::new(OrderedReadIndex { journal: ordered, deployment: uuid::Uuid::parse_str(&record.id).ok() })),
         await_authority: AwaitAuthority::Live {
             codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
             recovery: ClosedEpochRecovery::Opened(opened),
@@ -201,12 +271,34 @@ pub(crate) async fn ordered_opened(
     })
 }
 
-struct OrderedReadIndex(Arc<crate::journal::JournalLog>);
+pub(crate) fn ordered_reader_opened(
+    journal: Arc<crate::journal::JournalLog>, key: &[u8], record: &rtdb_directory::DeploymentRecord,
+    writer_epoch: u64, checkpoint: Option<rtdb_directory::Checkpoint>, maximum: usize,
+) -> Result<OpenedLogs> {
+    let epoch = StorageEpoch(record.log_epoch);
+    let deployment = uuid::Uuid::parse_str(&record.id).ok();
+    let index = || Box::new(OrderedReadIndex { journal: Arc::clone(&journal), deployment }) as Box<dyn ReplicaReadIndex>;
+    let await_authority = if writer_epoch == 0 { AwaitAuthority::Frozen } else {
+        let scope = PlacedAttemptScope::new(&record.stream("replica"), writer_epoch)?;
+        AwaitAuthority::Live {
+            codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
+            recovery: ClosedEpochRecovery::ReadIndex(index()), placed_receipt_retirement: record.placed_receipt_retirement,
+        }
+    };
+    let next = checkpoint.map_or(0, |checkpoint| checkpoint.source.saturating_add(1));
+    let replica_read_index = Some(index());
+    let replica: Arc<dyn Log> = journal;
+    Ok(OpenedLogs { source: Arc::new(IntakeLog::new(maximum, next)), replica, source_epoch: epoch,
+        replica_epoch: epoch, placed_transfer: None, replica_read_index, await_authority, drivers: Vec::new() })
+}
+
+struct OrderedReadIndex { journal: Arc<crate::journal::JournalLog>, deployment: Option<uuid::Uuid> }
 
 #[async_trait]
 impl ReplicaReadIndex for OrderedReadIndex {
-    async fn confirm(&self) -> Result<LogOffset> { self.0.confirm().await }
-    async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> { self.0.protect(applied).await }
+    fn deployment(&self) -> Option<uuid::Uuid> { self.deployment }
+    async fn confirm(&self) -> Result<LogOffset> { self.journal.confirm().await }
+    async fn protect(&self, applied: LogOffset) -> Result<rtdb_node::ProtectedReadIndex> { self.journal.protect(applied).await }
 }
 
 #[async_trait]
@@ -242,9 +334,19 @@ impl LogFactory for LogkeeperLogFactory {
                     Some(previous) => {
                         member_ids(previous)?;
                         self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
-                        let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0, write_quorum: crate::deployment::write_quorum(previous.len()) }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
-                        // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
-                        self.recorder.record(&config.deployment, config.epoch, ensemble).await?;
+                        let original = self.holds.directory.deployment(&config.deployment).await?
+                            .filter(|record| record.epoch == config.epoch && record.stream("replica") == stream.stream)
+                            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/ensemble-handoff", "The directory has no current predecessor placement"))?;
+                        let checkpoint = handoff_checkpoint(&original);
+                        let moved = rtdb_logkeeper::open_writer_on_checkpoint(
+                            vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0,
+                                write_quorum: crate::deployment::write_quorum(previous.len()) }],
+                            stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, checkpoint, cancellation.clone(),
+                        ).await?;
+                        let proof = moved.activation_handoff().ok_or_else(|| {
+                            Anomaly::incorrect("rtdb.multi/ensemble-handoff", "The moved writer has no certified predecessor")
+                        })?;
+                        self.recorder.record(&config.deployment, config.epoch, ensemble, proof).await?;
                         moved
                     }
                     None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,
@@ -264,6 +366,7 @@ impl LogFactory for LogkeeperLogFactory {
             Box::new(LogletReadIndex {
                 log: Arc::clone(&quorum), epoch: config.epoch,
                 custody: RecoveryAdmission::new(Arc::clone(&self.holds), &config),
+                deployment: uuid::Uuid::parse_str(&config.deployment).ok(),
             })
         };
         let replica_read_index = config.require_read_index.then(&read_index);
@@ -276,8 +379,9 @@ impl LogFactory for LogkeeperLogFactory {
             AwaitAuthority::Live { codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(&key)? }), recovery,
                 placed_receipt_retirement: config.placed_receipt_retirement }
         } else { AwaitAuthority::Frozen };
-        let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &key, &config, Arc::clone(&self.holds))?);
-        let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, config.transfer_intake_cut).await?;
+        let replica: Arc<dyn Log> = Arc::new(SealedLog::for_serving(quorum, &config, Arc::clone(&self.holds)).await?);
+        let intake_cut = include_placed_debt(config.transfer_intake_cut, config.placed_transfer.as_ref())?;
+        let mut next = next_source_offset_from_cut(replica.as_ref(), epoch, intake_cut).await?;
         if let Some(through) = config.transferred_source_through {
             let floor = through.checked_add(1).filter(|floor| *floor >= 0)
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/intake-floor", "Invalid transferred source offset"))?;
@@ -298,7 +402,7 @@ impl LogFactory for LogkeeperLogFactory {
             }.boxed()
         };
         Ok(OpenedLogs { source: intake, replica, source_epoch: epoch, replica_epoch: epoch,
-            replica_read_index, await_authority, drivers: vec![trimming] })
+            replica_read_index, placed_transfer: config.placed_transfer.clone(), await_authority, drivers: vec![trimming] })
     }
 }
 
@@ -314,6 +418,23 @@ fn member_ids(servers: &[JournalEndpoint]) -> Result<Vec<rtdb_directory::MemberI
 /// Every replica record consumes at most one source position, so the newest one named, plus one per later record, bounds every position assigned before; oversized records, whose position is out of line, are covered by that count.
 pub async fn next_source_offset(replica: &dyn Log, epoch: StorageEpoch) -> Result<i64> {
     next_source_offset_from_cut(replica, epoch, None).await
+}
+
+fn include_placed_debt(
+    cut: Option<crate::deployment::TransferIntakeCut>,
+    transfer: Option<&rtdb_types::PlacedTransfer>,
+) -> Result<Option<crate::deployment::TransferIntakeCut>> {
+    let Some(transfer) = transfer else { return Ok(cut); };
+    let Some(debt) = &transfer.debt else { return Ok(cut); };
+    let mut cut = cut.ok_or_else(|| Anomaly::fault(
+        "rtdb.multi/intake-floor", "Transferred receiver debt has no terminal intake cut",
+    ))?;
+    if transfer.through != cut.replica_through {
+        return Err(Anomaly::fault("rtdb.multi/intake-floor", "Receiver debt belongs to another terminal cut"));
+    }
+    let reserved = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
+    cut.source_through = cut.source_through.max(reserved.attempt.position().offset());
+    Ok(Some(cut))
 }
 
 async fn next_source_offset_from_cut(
@@ -368,13 +489,16 @@ async fn next_source_offset_from_cut(
 
 enum Scanned { Position(i64), MayConsume, Consumes }
 
-/// What one replica record says about the source positions consumed up to it.
+/// What one replica record says about source positions allocated up to it.
 /// A claim or heartbeat (a no-op naming no source position) and a leader's own deletion notice consume none; anything else whose position it does not name may have consumed one.
 fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
     let Some(envelope) = ReplicaEnvelope::decode(payload)? else { return Ok(Scanned::MayConsume); };
     let position = match &envelope.message {
         ReplicaBody::ResolvedTx(tx) => tx.src_msg_id,
-        ReplicaBody::NoOp(noop) => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
+        ReplicaBody::NoOp(noop) => match noop.placed_slot_reservation.as_deref() {
+            Some(wire) => Some(rtdb_types::PlacedReservation::decode(wire)?.attempt.position().0),
+            None => match noop.src_msg_id { None => return Ok(Scanned::Consumes), position => position },
+        },
         ReplicaBody::BlockBoundary(boundary) => boundary.latest_processed_msg_id,
         ReplicaBody::BlockUploaded(upload) => upload.latest_processed_msg_id,
         ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) => return Ok(Scanned::Consumes),
@@ -388,7 +512,8 @@ fn source_position(payload: &[u8], epoch: StorageEpoch) -> Result<Scanned> {
 
 /// Materializes admitted transactions up to the requested time in the confirmed replica prefix.
 pub(crate) async fn transactions_until(
-    replica: &dyn Log, store: &dyn ObjectStore, catalog: &BlockCatalog, boundary: i64, through: LogOffset, system_time: Timestamp,
+    replica: &dyn Log, catalog: &BlockCatalog, boundary: i64, through: LogOffset, system_time: Timestamp,
+    read_payload: impl AsyncFn(i64, &[u8]) -> Result<rtdb_storage::log::ReplicaPayload>,
 ) -> Result<Vec<ReplicaEnvelope>> {
     let mut kept = Vec::new();
     let mut fence = TermFence::from_catalog(catalog)?;
@@ -405,12 +530,9 @@ pub(crate) async fn transactions_until(
             let frame = ReplicaFrame::decode(&record.payload)?;
             if fence.admit(frame.term, frame.term_sequence)?.verdict != Verdict::Apply { continue; }
             let envelope = frame.into_envelope().ok_or_else(gap)?;
-            let envelope = if let Some(key) = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))? {
-                let key = ObjectKey::new(key)?;
-                IoRegion::retaining(Arc::new(record), async {
-                    let bytes = store.get_fresh(&key).await?;
-                    Ok::<_, Anomaly>(envelope.unwrap_payload(&bytes)?)
-                }).await?
+            let envelope = if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) {
+                let body = read_payload(record.metadata.offset.0, &record.payload).await?;
+                envelope.unwrap_payload(body.as_ref())?
             } else { envelope };
             if let ReplicaBody::ResolvedTx(tx) = envelope.message {
                 tx.checked_acceptance_stage()?;
@@ -433,38 +555,51 @@ pub fn renumber_into(tail: &mut [ReplicaEnvelope], epoch: StorageEpoch) -> Resul
         tx.tx_id = Some(position);
         tx.src_msg_id = Some(position);
         tx.placed_attempt = None;
+        tx.placed_slot_terminal = None;
         tx.acceptance_stage = None;
         tx.table_data.remove(&attempt_table);
     }
     Ok(())
 }
 
-/// A log whose payloads are sealed under the deployment's key, so a logkeeper never holds a row in the clear.
+/// Directory-managed payloads enter the journal as independently sealed publications.
 pub struct SealedLog {
     inner: Arc<dyn Log>,
-    cipher: Arc<Cipher>,
-    stream: Arc<str>,
+    units: Arc<JournalUnits>,
     recovery: Option<RecoveryAdmission>,
 }
 
 impl SealedLog {
-    pub fn new(inner: Arc<dyn Log>, key: &[u8], stream: &str) -> Result<Self> {
-        Ok(Self { inner, cipher: Arc::new(Cipher::new(key)?), stream: Arc::from(stream), recovery: None })
+    pub async fn new(inner: Arc<dyn Log>, keys: &dyn KeyService, residence: &str, scope: &str, io: Arc<IoRegion>) -> Result<Self> {
+        let units = Arc::new(JournalUnits::open(keys, residence, scope, io).await?);
+        Ok(Self { inner, units, recovery: None })
     }
 
-    fn for_serving(inner: Arc<dyn Log>, key: &[u8], config: &LogkeeperLogConfig, holds: Arc<RecoveryHolds>) -> Result<Self> {
-        let mut log = Self::new(inner, key, &config.replica_seal_scope)?;
+    async fn for_serving(inner: Arc<dyn Log>, config: &LogkeeperLogConfig, holds: Arc<RecoveryHolds>) -> Result<Self> {
+        let mut log = Self::new(inner, holds.keys.as_ref(), &config.key_id, &config.replica_seal_scope, IoRegion::new()).await?;
         log.recovery = Some(RecoveryAdmission::new(holds, config));
         Ok(log)
     }
-}
 
-fn opened(cipher: &Cipher, stream: &str, record: LogRecord) -> rtdb_storage::Result<LogRecord> {
-    Ok(LogRecord { payload: cipher.open(stream, &record.payload)?, ..record })
+    fn admit_size(&self, payload: &Bytes) -> rtdb_storage::Result<()> {
+        if let Some(maximum) = self.maximum_append_bytes()
+            && payload.len() > maximum
+        {
+            return Err(rtdb_storage::Error::MessageTooLarge { size: payload.len(), maximum });
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl Log for SealedLog {
+    fn requires_replica_payload_permit(&self) -> bool { self.recovery.is_some() }
+    async fn publish_replica_payload(
+        &self, _store: &dyn ObjectStore, key: &ObjectKey, body: Bytes,
+    ) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectVersion>> {
+        let admission = self.recovery.as_ref().ok_or_else(|| rtdb_storage::Error::Closed("The detached replay writer is unavailable".into()))?;
+        admission.publish(key, body).await
+    }
     fn requires_checkpoint_digest(&self) -> bool { self.inner.requires_checkpoint_digest() }
     fn needs_published_recovery_checkpoint(&self) -> bool {
         self.recovery.is_some() || self.inner.needs_published_recovery_checkpoint()
@@ -479,29 +614,31 @@ impl Log for SealedLog {
     fn fences_writer_terms(&self) -> bool { self.inner.fences_writer_terms() }
     async fn holds_writer_grant(&self) -> rtdb_storage::Result<bool> { self.inner.holds_writer_grant().await }
     fn maximum_append_bytes(&self) -> Option<usize> {
-        self.inner.maximum_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+        self.inner.maximum_append_bytes()?.checked_sub(UNIT_OVERHEAD)
     }
     fn maximum_guarded_append_bytes(&self) -> Option<usize> {
-        self.inner.maximum_guarded_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+        self.inner.maximum_guarded_append_bytes()?.checked_sub(UNIT_OVERHEAD)
     }
     fn maximum_timed_original_append_bytes(&self) -> Option<usize> {
-        self.inner.maximum_timed_original_append_bytes()?.checked_sub(SEALED_OVERHEAD)
+        self.inner.maximum_timed_original_append_bytes()?.checked_sub(UNIT_OVERHEAD)
     }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+        self.admit_size(&payload)?;
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
-        let receipt = self.inner.enqueue(self.cipher.seal(&self.stream, &payload)?, timestamp).await?;
+        let receipt = self.inner.enqueue(self.units.seal(payload).await?, timestamp).await?;
         Ok(observe_attempt(receipt, outcome))
     }
     async fn enqueue_maintenance(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
-        self.inner.enqueue_maintenance(self.cipher.seal(&self.stream, &payload)?, timestamp).await
+        self.admit_size(&payload)?;
+        self.inner.enqueue_maintenance(self.units.seal(payload).await?, timestamp).await
     }
     async fn available_append_capacity(&self) -> rtdb_storage::Result<Option<rtdb_storage::log::AppendCapacity>> {
         self.inner.available_append_capacity().await
     }
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
-        let receipt = self.inner.enqueue_guarded(self.cipher.seal(&self.stream, &payload)?, guard).await?;
+        let receipt = self.inner.enqueue_guarded(self.units.seal(payload).await?, guard).await?;
         Ok(observe_attempt(receipt, outcome))
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }
@@ -512,19 +649,18 @@ impl Log for SealedLog {
             None => None,
         };
         Ok(self.inner.recovery_tail(after).await?.map(|inner| {
-            Box::new(SealedTail { inner, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: hold.map(Arc::new), admission: self.recovery.clone() }) as Box<dyn LogTail>
+            Box::new(SealedTail { inner, units: Arc::clone(&self.units), hold: hold.map(Arc::new), admission: self.recovery.clone() }) as Box<dyn LogTail>
         }))
     }
     async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
         if let Some(admission) = &self.recovery { admission.check_start(after).await?; }
-        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), hold: None, admission: self.recovery.clone() }))
+        Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, units: Arc::clone(&self.units), hold: None, admission: self.recovery.clone() }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
-        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, cipher: Arc::clone(&self.cipher), stream: Arc::clone(&self.stream), admission: self.recovery.clone() }))
+        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, units: Arc::clone(&self.units), admission: self.recovery.clone() }))
     }
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {
-        let mut records = self.inner.read_range(from, to).await?.into_iter()
-            .map(|record| opened(&self.cipher, &self.stream, record)).collect::<rtdb_storage::Result<Vec<_>>>()?;
+        let mut records = open_records(&self.units, self.inner.read_range(from, to).await?).await?;
         if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
         Ok(records)
     }
@@ -541,8 +677,7 @@ fn observe_attempt(receipt: AppendReceipt, outcome: Option<crate::residence_trac
 
 struct SealedTail {
     inner: Box<dyn LogTail>,
-    cipher: Arc<Cipher>,
-    stream: Arc<str>,
+    units: Arc<JournalUnits>,
     hold: Option<Arc<ReplayHold>>,
     admission: Option<RecoveryAdmission>,
 }
@@ -553,7 +688,7 @@ impl SealedTail {
         if let Some(hold) = &self.hold {
             covered = records.partition_point(|record| record.metadata.offset <= hold.through);
             for record in &mut records[..covered] {
-                record.payload = hold.retain_delivery(std::mem::take(&mut record.payload));
+                hold.retain_record(record)?;
             }
             if records.last().is_some_and(|record| record.metadata.offset >= hold.through) { self.hold = None; }
         }
@@ -565,8 +700,7 @@ impl SealedTail {
 #[async_trait]
 impl LogTail for SealedTail {
     async fn poll(&mut self, timeout: Duration) -> rtdb_storage::Result<Vec<LogRecord>> {
-        let mut records = self.inner.poll(timeout).await?.into_iter()
-            .map(|record| opened(&self.cipher, &self.stream, record)).collect::<rtdb_storage::Result<Vec<_>>>()?;
+        let mut records = open_records(&self.units, self.inner.poll(timeout).await?).await?;
         self.retain_deliveries(&mut records).await?;
         Ok(records)
     }
@@ -577,25 +711,47 @@ impl LogTail for SealedTail {
 impl LogReplayTail for SealedTail {
     async fn poll_head(&mut self, timeout: Duration) -> rtdb_storage::Result<Option<ReplayHead>> {
         let head = self.inner.replay().expect("checked when replay was offered").poll_head(timeout).await?;
-        Ok(head.map(|head| ReplayHead { payload_len: head.payload_len.saturating_sub(SEALED_OVERHEAD), ..head }))
+        head.map(|head| {
+            let payload_len = head.payload_len.checked_sub(UNIT_OVERHEAD)
+                .ok_or_else(|| rtdb_storage::Error::Task("Truncated sealed journal record".into()))?;
+            let allocation_bound = head.allocation_bound.checked_mul(2)
+                .ok_or_else(|| rtdb_storage::Error::Task("Journal replay allocation overflow".into()))?;
+            Ok(ReplayHead { payload_len, allocation_bound, ..head })
+        }).transpose()
     }
     async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> rtdb_storage::Result<LogRecord> {
-        let sealed = ReplayHead { payload_len: head.payload_len + SEALED_OVERHEAD, ..head };
+        let payload_len = head.payload_len.checked_add(UNIT_OVERHEAD)
+            .ok_or_else(|| rtdb_storage::Error::Task("Journal record length overflow".into()))?;
+        let sealed = ReplayHead { payload_len, allocation_bound: head.allocation_bound / 2, ..head };
+        if reservation.length() < head.allocation_bound {
+            return Err(rtdb_storage::Error::Task("Journal replay reservation is too small".into()));
+        }
         let record = self.inner.replay().expect("checked when replay was offered").read_head(sealed, reservation).await?;
-        let mut record = opened(&self.cipher, &self.stream, record)?;
+        let mut record = self.units.open_record(record).await?;
         self.retain_deliveries(std::slice::from_mut(&mut record)).await?;
         Ok(record)
     }
 }
 
-struct SealedRange { inner: Box<dyn LogRange>, cipher: Arc<Cipher>, stream: Arc<str>, admission: Option<RecoveryAdmission> }
+async fn open_records(units: &JournalUnits, records: Vec<LogRecord>) -> rtdb_storage::Result<Vec<LogRecord>> {
+    let mut opened = Vec::with_capacity(records.len());
+    for record in records {
+        opened.push(units.open_record(record).await?);
+    }
+    Ok(opened)
+}
+
+struct SealedRange { inner: Box<dyn LogRange>, units: Arc<JournalUnits>, admission: Option<RecoveryAdmission> }
 
 #[async_trait]
 impl LogRange for SealedRange {
-    fn allocation_bound(&self) -> usize { self.inner.allocation_bound() }
+    fn allocation_bound(&self) -> usize { self.inner.allocation_bound().saturating_mul(2) }
     async fn next(&mut self, reservation: ReadReservation) -> rtdb_storage::Result<Option<LogRecord>> {
+        if reservation.length() < self.allocation_bound() {
+            return Err(rtdb_storage::Error::Task("Journal range reservation is too small".into()));
+        }
         let Some(record) = self.inner.next(reservation).await? else { return Ok(None); };
-        let mut record = opened(&self.cipher, &self.stream, record)?;
+        let mut record = self.units.open_record(record).await?;
         if let Some(admission) = &self.admission { admission.retain_offloaded(std::slice::from_mut(&mut record)).await?; }
         Ok(Some(record))
     }
@@ -647,6 +803,29 @@ mod tests {
     use rtdb_types::Term;
 
     #[tokio::test]
+    async fn inherited_receiver_debt_keeps_its_source_position_across_fresh_intake() {
+        use rtdb_types::{PlacedReservation, PlacedTransfer, PlacedTransferDebt};
+
+        let epoch = StorageEpoch(2);
+        let position = SourcePosition::from_epoch_offset(epoch, 94).unwrap();
+        let attempt = PlacedAttemptScope::new("original", 3).unwrap().issue()
+            .identify(position, Some("sender")).unwrap();
+        let reserved = PlacedReservation::new(attempt, Timestamp(1), b"original");
+        let transfer = PlacedTransfer {
+            after: 2,
+            through: 8,
+            debt: Some(PlacedTransferDebt { term: 3, reserved_at: 7, reservation: reserved.encode() }),
+        };
+        let cut = crate::deployment::TransferIntakeCut { replica_through: 8, source_through: 10 };
+        let journal = MemoryLog::starting_at(1024, LogOffset(9));
+        let sealed = include_placed_debt(Some(cut), Some(&transfer)).unwrap();
+        assert_eq!(next_source_offset_from_cut(&journal, epoch, sealed).await.unwrap(), 95);
+
+        let stale = crate::deployment::TransferIntakeCut { replica_through: 7, source_through: 10 };
+        assert!(include_placed_debt(Some(stale), Some(&transfer)).is_err());
+    }
+
+    #[tokio::test]
     async fn a_fork_materializes_only_admitted_offloaded_frames() {
         use rtdb_format::log::proto;
         use rtdb_types::Term;
@@ -673,14 +852,20 @@ mod tests {
         journal.enqueue(reference.encode().into(), Timestamp(10)).await.unwrap().durable().await.unwrap();
         store.put(&path, bytes).await.unwrap();
 
-        let tail = transactions_until(&journal, &store, &catalog, -1, LogOffset(1), Timestamp(10)).await.unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let read = async |position, frame: &[u8]| {
+            assert_eq!(position, 1);
+            let reference = rtdb_storage::log::ReplicaPayloadReference::from_frame(frame, CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap();
+            Ok::<_, Anomaly>(reference.read_at(&store, &memory).await?)
+        };
+        let tail = transactions_until(&journal, &catalog, -1, LogOffset(1), Timestamp(10), &read).await.unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].message, transaction.message);
 
         store.delete(&path).await.unwrap();
         store.put(&path, Bytes::from_static(b"replacement")).await.unwrap();
-        let error = transactions_until(&journal, &store, &catalog, -1, LogOffset(1), Timestamp(10)).await.unwrap_err();
-        assert_eq!(error.code, "rtdb.format/oversized-payload-mismatch");
+        let error = transactions_until(&journal, &catalog, -1, LogOffset(1), Timestamp(10), &read).await.unwrap_err();
+        assert_eq!(error.code, "rtdb.storage/immutable-object-conflict");
     }
 
     #[tokio::test]
@@ -689,7 +874,6 @@ mod tests {
         use rtdb_types::Term;
 
         let journal = MemoryLog::new(1024);
-        let store = rtdb_storage::MemoryStore::default();
         let catalog = BlockCatalog::from_proto(rtdb_format::block::proto::Block {
             block_index: Some(0), term_id: Some(2), boundary_term_seq: Some(0), ..Default::default()
         }).unwrap();
@@ -700,7 +884,7 @@ mod tests {
             }),
         };
 
-        let copy = transactions_until(&journal, &store, &catalog, -1, LogOffset(0), Timestamp(10));
+        let copy = transactions_until(&journal, &catalog, -1, LogOffset(0), Timestamp(10), async |_, _| unreachable!());
         tokio::pin!(copy);
         assert!(futures::poll!(copy.as_mut()).is_pending());
         journal.enqueue(transaction.encode().into(), Timestamp(10)).await.unwrap().durable().await.unwrap();
@@ -732,12 +916,13 @@ mod tests {
             placed_receipt_retirement: false,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
-            transfer_intake_cut: None,
+            transfer_intake_cut: None, placed_transfer: None,
             frozen_at: None,
             previous_servers: None,
         };
         let configuration = Any { type_url: String::new(), value: serde_json::to_vec(&configuration).unwrap() };
-        let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
+        let holds = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(),
+            broker: None, custody: rtdb_directory::ReplayCustody::Local, tasks: Default::default() });
         let factory = LogkeeperLogFactory::new(1024, Default::default(), holds);
 
         let refused = factory.open(&configuration, LogAccess::ReadWrite, CancellationToken::new()).await.err().unwrap();
@@ -766,16 +951,18 @@ mod tests {
             frozen_at: None,
             log_epoch: record.log_epoch,
             transferred_source_through: None,
-            transfer_intake_cut: None,
+            transfer_intake_cut: None, placed_transfer: None,
             write_quorum: 1,
         };
         let provider = Arc::new(MemoryLog::new(1024));
         let files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(files.path()).unwrap()),
+            broker: None,
             custody: ReplayCustody::Local, tasks: Default::default(),
         });
-        let replica = SealedLog::for_serving(provider.clone(), &[7; 32], &config, holds.clone()).unwrap();
+        holds.keys.key(&config.key_id).await.unwrap();
+        let replica = SealedLog::for_serving(provider.clone(), &config, holds.clone()).await.unwrap();
         for _ in 0..7 {
             replica.enqueue(Bytes::from_static(b"entry"), Timestamp(0)).await.unwrap().durable().await.unwrap();
         }
@@ -823,15 +1010,18 @@ mod tests {
             servers: vec![], deployment: record.id.clone(), key_id: record.key_id(),
             replica_stream: record.stream("replica"), replica_seal_scope: record.replica_seal_scope(),
             write_quorum: 1, epoch: record.epoch, require_read_index: false, log_epoch: record.log_epoch,
-            transferred_source_through: None, transfer_intake_cut: None, frozen_at: None, previous_servers: None,
+            transferred_source_through: None, transfer_intake_cut: None, placed_transfer: None, frozen_at: None, previous_servers: None,
             placed_receipt_retirement: false,
+            write_quorum: 1,
         };
         let directory_files = tempfile::tempdir().unwrap();
         let holds = Arc::new(RecoveryHolds {
             directory: directory.clone(), keys: Arc::new(crate::keys::LocalKeyService::new(directory_files.path()).unwrap()),
+            broker: None,
             custody: ReplayCustody::Local, tasks: Default::default(),
         });
-        let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &[7; 32], &config, holds.clone()).unwrap();
+        holds.keys.key(&config.key_id).await.unwrap();
+        let replica = SealedLog::for_serving(Arc::new(MemoryLog::new(1024)), &config, holds.clone()).await.unwrap();
         let claim = ReplicaEnvelope { term: Term(1), term_sequence: None, message: ReplicaBody::NoOp(Default::default()) };
         replica.enqueue(Bytes::from(claim.encode()), Timestamp(0)).await.unwrap().durable().await.unwrap();
         let mut tail = replica.recovery_tail(LogOffset(-1)).await.unwrap().unwrap();
@@ -839,7 +1029,8 @@ mod tests {
         replica.enqueue(Bytes::from(proxy.encode()), Timestamp(1)).await.unwrap().durable().await.unwrap();
         let mut records = tail.poll(Duration::from_secs(1)).await.unwrap();
         assert_eq!(records.len(), 2);
-        let delivery = records.pop().unwrap().payload;
+        let delivery = records.pop().unwrap();
+        let permit = delivery.replica_objects.as_ref().unwrap();
         drop((tail, records));
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -853,6 +1044,11 @@ mod tests {
         let first_required = current.required_replica_offsets(0).min().unwrap();
         assert_eq!(crate::replica_retention::replica_trim_through(3, first_required), Some(0));
 
+        let ticket = *current.storage_regions.keys().next().unwrap();
+        crate::store::release_region(directory.as_ref(), &record.id, ticket, false).await.unwrap();
+        let store = rtdb_storage::MemoryStore::default();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        assert!(matches!(permit.redeem(&store, &memory).await, Err(rtdb_storage::Error::Closed(_))));
         drop(delivery);
         holds.tasks.close();
         tokio::time::timeout(Duration::from_secs(5), holds.tasks.wait()).await.unwrap();
@@ -868,11 +1064,11 @@ mod tests {
     async fn the_intake_starts_beyond_every_source_position_the_replica_stream_may_hold() {
         let replica = MemoryLog::new(1 << 20);
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 0, "a fresh deployment starts at 0");
-        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;
         append(&replica, ReplicaBody::ResolvedTx(proto::ResolvedTx { src_msg_id: Some(41), ..Default::default() })).await;
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42);
         for _ in 0..INTAKE_TIP_WINDOW {
-            append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+            append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;
         }
         assert_eq!(next_source_offset(&replica, StorageEpoch(0)).await.unwrap(), 42, "a claim consumes no source position");
         append(&replica, ReplicaBody::TriesAdded(Default::default())).await;
@@ -887,7 +1083,7 @@ mod tests {
         let cut = TransferIntakeCut { replica_through: 501, source_through: 1000 };
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1001);
         append(&replica, ReplicaBody::OversizedMessage(proto::OversizedMessage::default())).await;
-        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await;
+        append(&replica, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() })).await;
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(cut)).await.unwrap(), 1002);
         let earlier = TransferIntakeCut { replica_through: 499, ..cut };
         assert_eq!(next_source_offset_from_cut(&replica, StorageEpoch(0), Some(earlier)).await.unwrap(), 1004);

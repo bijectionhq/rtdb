@@ -36,6 +36,18 @@ fn stale() -> Anomaly {
 }
 
 impl SourceTransaction {
+    /// Reads the authored clock target from the bounded command envelope.
+    pub fn proposal_generation_reading(&self) -> Result<Option<Timestamp>> {
+        if !is_landing(&self.operations) { return Ok(None); }
+        let mut ticks = self.operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedClockSlot { slot }) => Some(*slot),
+            _ => None,
+        });
+        let slot = ticks.next().ok_or_else(invalid)?;
+        if ticks.next().is_some() { return Err(invalid()); }
+        Ok(Some(slot.reading))
+    }
+
     /// Lowers both the approved effects and the chosen constraint outcome on one
     /// private snapshot. Its provisional transaction ID is used only by the
     /// buffer. The admitted landing operations use the offered system reading.
@@ -59,16 +71,12 @@ impl SourceTransaction {
         let scope = self.placed_attempt(SourcePosition(provisional_id))?.map(PlacedAttempt::scope)
             .filter(|scope| Some(*scope) == context.owned_witness_scope).ok_or_else(invalid)?;
 
-        let mut ticks = operations.operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedClockSlot { predecessor }) => Some(*predecessor),
+        let time = self.proposal_generation_reading()?.ok_or_else(invalid)?;
+        let slot = operations.operations.iter().find_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedClockSlot { slot }) => Some(*slot),
             _ => None,
-        });
-        let tick = ticks.next().ok_or_else(invalid)?;
-        let time = crate::system_time::clock_slot_reading(tick.system_time).ok_or_else(invalid)?;
-        if ticks.next().is_some() {
-            return Err(invalid());
-        }
-        crate::system_time::clock_slot_time(tick, Some(predecessor), time).ok_or_else(|| {
+        }).ok_or_else(invalid)?;
+        crate::system_time::clock_slot_time(slot, Some(predecessor), time, time).ok_or_else(|| {
             Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable")
         })?;
         operations.operations.retain(|operation| !matches!(operation, Operation::Public(TxOp::OwnedClockSlot { .. })));
@@ -122,7 +130,7 @@ fn require_landing(primary: &[Operation], refusal: &[Operation]) -> Result<()> {
 
 impl PreparedLanding {
     pub(super) fn choose(
-        self, base: &Snapshot, assigned: TransactionKey, slot: Option<TransactionKey>,
+        self, base: &Snapshot, assigned: TransactionKey, slot: Option<crate::OwnedClockSlot>,
         primary: &[Operation], refusal: &[Operation],
         scope: Option<rtdb_types::PlacedAttemptScope>, context: &ResolveContext,
     ) -> Result<(StagedWrite, bool)> {
@@ -239,14 +247,14 @@ mod tests {
         assert!(!state.snapshot().contains_table(&application_table));
 
         let mut metadata = TransactionBuffer::new(state.snapshot(), key(5, 20), Arc::clone(&memory))?.stage()?;
-        metadata.install_prepared_generation(generation.writes)?;
+        metadata.install_prepared_generation(generation.writes, &memory)?;
         assert!(!state.snapshot().contains_table(&application_table));
         state.apply(&metadata)?;
         assert!(state.snapshot().contains_table(&application_table));
 
         let old = PreparedLanding::decode(&frame, Some(b"original footprint"), &memory)?;
         let mut later = TransactionBuffer::new(state.snapshot(), key(6, 30), memory)?.stage()?;
-        assert!(later.install_prepared_generation(old.writes).is_err());
+        assert!(later.install_prepared_generation(old.writes, &memory).is_err());
         Ok(())
     }
 }

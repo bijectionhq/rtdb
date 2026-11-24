@@ -200,7 +200,7 @@ impl InstalledJournal {
         &self,
         invocation: &Request,
     ) -> std::result::Result<SignedBarrier, ReadFailure> {
-        if !matches!(&invocation.command, Command::Barrier { .. }) {
+        if !matches!(&invocation.command, Command::Barrier) {
             return Err(ReadFailure::Refused(mismatch(
                 "The request is not a fresh read invocation",
             )));
@@ -253,6 +253,19 @@ impl InstalledJournal {
             _ => Err(mismatch(
                 "The journal returned a different serving lease result",
             )),
+        }
+    }
+
+    pub async fn read_lease(&self, hold: Hold, epoch: u64) -> Result<u64> {
+        let view = self.route().await?;
+        if view.writer.epoch != epoch {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/reader-epoch", "The ordered reader attachment changed"));
+        }
+        let decision = self.execute(&self.request(&view, Command::LeaseRead { hold })?).await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::ReadLeased { hold: leased, issued_at, lease_end }
+                if leased == hold && lease_end > issued_at => Ok(lease_end - issued_at),
+            _ => Err(mismatch("The journal returned a different read lease")),
         }
     }
 
@@ -401,12 +414,39 @@ impl InstalledJournal {
         &self,
         route: &Route,
         preparation: CheckpointPreparation,
+        references: Vec<ordered_logkeeper::ordered::ObjectName>,
     ) -> Result<()> {
-        let request = self.request(route, Command::PrepareCheckpoint { preparation })?;
+        let request = self.request(
+            route,
+            Command::PrepareCheckpoint {
+                preparation,
+                references: Some(references),
+            },
+        )?;
         let decision = self.execute(&request).await?;
         match decision.receipt.outcome.map_err(refused)? {
             Outcome::CheckpointPrepared(chosen) if chosen == preparation => Ok(()),
             _ => Err(mismatch("The journal prepared a different checkpoint")),
+        }
+    }
+
+    pub(super) async fn withdraw_object(
+        &self, route: &Route, object: ordered_logkeeper::ordered::ObjectWithdrawal,
+    ) -> Result<Option<ordered_logkeeper::ordered::ObjectFence>> {
+        let decision = self.execute(&self.request(route, Command::WithdrawObject { object })?).await?;
+        match decision.receipt.outcome {
+            Ok(Outcome::ObjectWithdrawn(fence)) if fence.object == object => {
+                let placement = route.placement;
+                crate::residence_trace::record("ordered-object-fence", || serde_json::json!({
+                    "deployment": placement.deployment, "incarnation": placement.incarnation,
+                    "group": placement.group, "generation": placement.generation,
+                    "position": fence.position, "name": fence.object.name, "version": fence.object.version,
+                }));
+                Ok(Some(fence))
+            }
+            Err(Refusal::Conflict | Refusal::Unavailable | Refusal::Capacity) => Ok(None),
+            Err(reason) => Err(refused(reason)),
+            Ok(_) => Err(mismatch("The journal withdrew a different object publication")),
         }
     }
 

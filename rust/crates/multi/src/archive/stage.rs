@@ -14,22 +14,30 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    ArchivedObject, CapturePoint, capture_receipt, checkpoint_storage_root, digest, encode,
+    ArchivedObject, CapturePoint, MAXIMUM_MANIFEST_BYTES, capture_receipt, digest, encode,
     inconsistent, read_object, require_capture_open, unavailable, verified_archive,
 };
 use crate::{
     admin::{begin_disposal, cell_media, installation_record, update_installation},
-    cipher::Cipher,
     deployment::CellStorage,
     keys::KeyService,
     reference::{PrefixedStore, key},
     store::{
-        CheckpointReplayPublication, ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
-        track_checkpoint_replay_publication, track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
+        ROOT_MARKER, reconcile_storage_regions, release_region, remote_storage_region,
+        track_checkpoint_stage_publications, track_checkpoint_transfer_publications, track_publications,
     },
 };
 
 pub(super) const STAGED_MANIFEST: &str = "~checkpoint-stage";
+pub(crate) const STAGED_INVENTORY_DIRECTORY: &str = "~checkpoint-inventory";
+
+pub(crate) fn staged_storage_root(record: &DeploymentRecord) -> String {
+    format!("{}/{STAGED_INVENTORY_DIRECTORY}", record.storage_prefix())
+}
+
+pub(crate) fn staged_key_id(record: &DeploymentRecord) -> String {
+    format!("checkpoint-inventory-{}", record.key_id())
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
@@ -320,8 +328,8 @@ fn staged(
 /// inventory until all asynchronous storage operations have drained.
 pub(crate) enum RegionPublication {
     Stage(Arc<dyn Directory>, Uuid),
+    InstallStage(Arc<dyn Directory>, Uuid, [u8; 32]),
     CheckpointTransfer(Arc<dyn Directory>, Uuid),
-    CheckpointReplay(Arc<dyn Directory>, CheckpointReplayPublication),
     Capture(Arc<dyn Directory>),
 }
 
@@ -364,13 +372,13 @@ where
     if matches!(media, CellStorage::S3 { .. }) {
         match publication {
             Some(RegionPublication::Stage(owner, operation)) => {
-                track_checkpoint_stage_publications(&mut io, owner, deployment.to_owned(), region, operation);
+                track_checkpoint_stage_publications(&mut io, owner, deployment.to_owned(), region, operation, None);
+            }
+            Some(RegionPublication::InstallStage(owner, operation, bootstrap)) => {
+                track_checkpoint_stage_publications(&mut io, owner, deployment.to_owned(), region, operation, Some(bootstrap));
             }
             Some(RegionPublication::CheckpointTransfer(owner, operation)) => {
                 track_checkpoint_transfer_publications(&mut io, owner, deployment.to_owned(), region, operation);
-            }
-            Some(RegionPublication::CheckpointReplay(owner, replay)) => {
-                track_checkpoint_replay_publication(&mut io, owner, deployment.to_owned(), region, replay);
             }
             Some(RegionPublication::Capture(owner)) => {
                 track_publications(&mut io, owner, deployment.to_owned(), region, None);
@@ -392,7 +400,15 @@ where
     .await;
     let uncertain = admitted.is_err();
     let result = match admitted {
-        Ok(record) => run(record, region, io.clone()).await,
+        Ok(record) => {
+            let work = run(record, region, io.clone());
+            if capture.is_some() {
+                let view = rtdb_storage::HeldView::recovery(io.clone());
+                IoRegion::reading(view, work).await
+            } else {
+                work.await
+            }
+        }
         Err(error) => Err(error),
     };
     io.close_and_wait().await;
@@ -426,11 +442,13 @@ async fn copy_checkpoint(
             "The staged installation must have its own media key",
         ));
     }
-    let target_cipher = Cipher::new(&media_key)?;
+    let stage_id = staged_key_id(target);
+    keys.archive_key(&stage_id, true, Arc::clone(&target_io)).await?;
+    let stage_key = keys.scoped_unit_key(&stage_id, Arc::clone(&target_io)).await?;
     let source = PrefixedStore::new(bucket, format!("{prefix}/objects"));
     let destination = PrefixedStore::new(
         storage.bucket(target_io).await?,
-        format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?),
+        staged_storage_root(target),
     );
     crate::store::check_root(&destination, &target.id, true).await?;
     let mut objects = Vec::with_capacity(capture.objects.len());
@@ -440,7 +458,7 @@ async fn copy_checkpoint(
         let name = key(&object.name)?;
         let ciphertext = read_object(&source, &name, object).await?;
         let plaintext = object.open(source_cipher.as_ref(), &name, ciphertext).await?;
-        let resealed = target_cipher.seal_object(&name, &plaintext)?;
+        let resealed = stage_key.seal_object(&name, plaintext).await?;
         let staged = ArchivedObject::from_sealed(&name, &resealed)?;
         put_exact(&destination, &name, resealed).await?;
         expected.insert(name);
@@ -452,8 +470,12 @@ async fn copy_checkpoint(
         CheckpointContents::Replay => StageInventory::Replay { objects },
     };
     let inventory = encode(&inventory)?;
+    if inventory.len() as u64 > MAXIMUM_MANIFEST_BYTES {
+        return Err(inconsistent("Staged checkpoint inventory exceeds its bound"));
+    }
     let digest = digest(&inventory);
-    put_exact(&destination, &manifest_name, inventory).await?;
+    let sealed = stage_key.seal_object(&manifest_name, inventory).await?;
+    put_exact(&destination, &manifest_name, sealed).await?;
     let observed = destination
         .list(None)
         .await?

@@ -1,26 +1,30 @@
 use super::prefix_retirement::{DESCRIPTOR, GrantDescriptor, local_lifetime};
 use super::reclamation::{ReclamationQueue, queue_prefix};
-use super::{Routes, genesis, invalid};
+use super::{Attachment, AttachmentAdmission, Routes, genesis, invalid};
 use crate::deployment::CellStorage;
 use crate::journal::{
     InstalledJournal,
-    custody::{CheckpointCustody, Preparation},
+    custody::{CheckpointAuthority, CheckpointCustody, Preparation},
 };
 use crate::keys::{KeyService, UnitLedger, UnitScope};
 use crate::store::{EncryptingStore, ScopedCellWrites};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use ordered_logkeeper::ordered::{Grant, Placement};
+use ordered_logkeeper::ordered::{Grant, Hold, Placement};
 use prost_types::Any;
+use rtdb_format::trie_retirement::InstalledRetirement;
 use rtdb_node::{OpenedRecoveryStore, RemoteStorageFactory};
 use rtdb_replication::{BlockDiscovery, PublishedCheckpoint};
 use rtdb_storage::{
     Error, IoRegion, ObjectKey, ObjectObservation, ObjectStore, ReadLease,
-    log::ReplicaObjectScope,
+    log::{ReplicaObjectCustody, ReplicaObjectScope, ReplicaPayload},
     object_store::{ObjectReadAllocation, ReadReservation, RetainedBytes, StoredObject},
 };
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result};
+use rtdb_types::{
+    Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectPublication, PhysicalObjectVersion,
+    ReplicaPosition, Result,
+};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::Path;
@@ -51,57 +55,45 @@ struct ServingLease {
     renewal: tokio::sync::Mutex<()>,
 }
 
-impl WriteScope {
-    async fn serving(&self) -> Result<Instant> {
-        if let Some((deadline, renew_after)) = self.lease_state()
-            && Instant::now() < renew_after
-        {
+impl ServingLease {
+    async fn serving(&self, renew: impl std::future::Future<Output = Result<u64>>) -> Result<Instant> {
+        if let Some((deadline, renew_after)) = self.lease_state() && Instant::now() < renew_after {
             return Ok(deadline);
         }
-        let _renewing = self.lease.renewal.lock().await;
-        if let Some((deadline, renew_after)) = self.lease_state()
-            && Instant::now() < renew_after
-        {
+        let _renewing = self.renewal.lock().await;
+        if let Some((deadline, renew_after)) = self.lease_state() && Instant::now() < renew_after {
             return Ok(deadline);
         }
         let sent = Instant::now();
-        match self.journal.lease(self.grant).await {
+        match renew.await {
             Ok(length) => {
                 let length = Duration::from_millis(length);
-                let deadline = sent
-                    .checked_add(length)
-                    .filter(|deadline| Instant::now() < *deadline)
-                    .ok_or_else(|| {
-                        invalid("The installed writer received an expired serving lease")
-                    })?;
-                *self
-                    .lease
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                let deadline = sent.checked_add(length).filter(|deadline| Instant::now() < *deadline)
+                    .ok_or_else(|| invalid("The installed serving lease arrived expired"))?;
+                *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some((deadline, sent + length / 2));
                 Ok(deadline)
             }
-            Err(error) => self
-                .lease_state()
-                .map(|(deadline, _)| deadline)
-                .filter(|deadline| Instant::now() < *deadline)
-                .ok_or_else(|| {
-                    Anomaly::new(
-                        AnomalyCategory::Unavailable,
-                        rtdb_node::NOT_HELD,
-                        format!("The installed writer has no current serving lease: {error}"),
-                    )
-                }),
+            Err(error) => self.lease_state().map(|(deadline, _)| deadline)
+                .filter(|deadline| Instant::now() < *deadline).ok_or(error),
         }
     }
 
     fn lease_state(&self) -> Option<(Instant, Instant)> {
-        *self
-            .lease
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+struct ReaderScope {
+    journal: Arc<InstalledJournal>,
+    protection: Arc<crate::journal::Held>,
+    epoch: u64,
+    lease: ServingLease,
+}
+
+impl ReaderScope {
+    async fn serving(&self) -> Result<Instant> {
+        self.lease.serving(self.journal.read_lease(self.protection.scope(), self.epoch)).await
     }
 }
 
@@ -143,8 +135,12 @@ impl RemoteStorageFactory for StoreFactory {
     ) -> Result<OpenedRecoveryStore> {
         use rtdb_s3::WriteAuthorization;
         let (placement, attachment) = self.routes.resolve(configuration)?;
-        let grant = attachment.admission.grant;
-        let hold = attachment.admission.recovery;
+        let (grant, hold) = match attachment.admission {
+            AttachmentAdmission::Writer { admission } => (admission.grant, admission.recovery),
+            AttachmentAdmission::Reader { epoch, hold, .. } => {
+                return self.open_reader(&placement, &attachment, root, io, epoch, hold).await;
+            }
+        };
         let scope = Arc::new(WriteScope {
             journal: Arc::clone(&placement.worker),
             grant,
@@ -153,29 +149,7 @@ impl RemoteStorageFactory for StoreFactory {
         scope.authorize(None).await?;
         placement.worker.replay_head(hold, hold.start).await?;
         let protection = placement.pin_root(hold, &self.releases).await?;
-        let (lower, blocks) = if genesis(hold.checkpoint) && attachment.base.checkpoint.is_none() {
-            (None, BlockDiscovery::List)
-        } else {
-            let custody = placement
-                .checkpoint_custody(Arc::clone(&io), Arc::clone(&self.keys))
-                .await?;
-            let opened = custody.open(hold.checkpoint).await?;
-            let checkpoint = opened.checkpoint;
-            if attachment.base.checkpoint != Some(checkpoint) {
-                return Err(invalid(
-                    "The database attachment names a different protected checkpoint",
-                ));
-            }
-            let published = PublishedCheckpoint {
-                block: BlockIndex(checkpoint.block),
-                boundary: ReplicaPosition::from_epoch_offset(
-                    placement.worker.log_epoch(),
-                    checkpoint.boundary,
-                )?,
-                root_sha256: checkpoint.root_sha256,
-            };
-            (Some(opened.store), BlockDiscovery::AtPublished(published))
-        };
+        let (lower, blocks) = self.open_checkpoint(&placement, &attachment, hold, Arc::clone(&io)).await?;
         let storage_prefix = placement.record.storage_prefix();
         let installed = placement.worker.placement();
         let grant_prefix = grant_prefix(&storage_prefix, installed.generation, grant.epoch);
@@ -239,6 +213,7 @@ impl RemoteStorageFactory for StoreFactory {
         let store = Arc::new(ServingStore {
             lower,
             upper,
+            reader: None,
             writer: Some(ServingWriter {
                 scope,
                 reclamation,
@@ -264,11 +239,78 @@ impl RemoteStorageFactory for StoreFactory {
     }
 }
 
+impl StoreFactory {
+    async fn open_checkpoint(
+        &self, placement: &super::Placement, attachment: &Attachment, hold: Hold, io: Arc<IoRegion>,
+    ) -> Result<(Option<Arc<dyn ObjectStore>>, BlockDiscovery)> {
+        let (lower, blocks) = if genesis(hold.checkpoint) && attachment.base.checkpoint.is_none() {
+            (None, BlockDiscovery::List)
+        } else {
+            let custody = placement
+                .checkpoint_custody(Arc::clone(&io), Arc::clone(&self.keys))
+                .await?;
+            let opened = custody.open(hold.checkpoint).await?;
+            let checkpoint = opened.checkpoint;
+            if attachment.base.checkpoint != Some(checkpoint) {
+                return Err(invalid(
+                    "The database attachment names a different protected checkpoint",
+                ));
+            }
+            let published = PublishedCheckpoint {
+                block: BlockIndex(checkpoint.block),
+                boundary: ReplicaPosition::from_epoch_offset(
+                    placement.worker.log_epoch(),
+                    checkpoint.boundary,
+                )?,
+                root_sha256: checkpoint.root_sha256,
+            };
+            let discovery = match opened.authority {
+                CheckpointAuthority::Upload => BlockDiscovery::AtPublished(published),
+                CheckpointAuthority::Erasure(_) => BlockDiscovery::AtErasure(published),
+            };
+            (Some(opened.store), discovery)
+        };
+        Ok((lower, blocks))
+    }
+
+    async fn open_reader(
+        &self, placement: &super::Placement, attachment: &Attachment,
+        root: &ObjectKey, io: Arc<IoRegion>, epoch: u64, hold: Hold,
+    ) -> Result<OpenedRecoveryStore> {
+        let protection = placement.retained_reader(hold)?;
+        let scope = ReaderScope {
+            journal: Arc::clone(&placement.worker), protection, epoch, lease: ServingLease::default(),
+        };
+        let deadline = scope.serving().await?;
+        let route = placement.worker.route().await?;
+        if route.writer.epoch != epoch {
+            return Err(invalid("The ordered reader epoch changed during attachment"));
+        }
+        let (lower, blocks) = tokio::time::timeout_at(deadline.into(),
+            self.open_checkpoint(placement, attachment, hold, Arc::clone(&io)),
+        ).await.map_err(|_| invalid("The checkpoint read exceeded its ordered lease"))??;
+        let objects = ReplicaObjects {
+            installed: placement.worker.placement(), storage_prefix: placement.record.storage_prefix(),
+            root: root.clone(), bucket: self.storage.bucket(Arc::clone(&io)).await?,
+            io, storage: self.storage.clone(), keys: Arc::clone(&self.keys),
+        };
+        let upper: Arc<dyn ObjectStore> = if hold.start == hold.through && route.writer.grant.is_none() {
+            Arc::new(rtdb_storage::MemoryStore::default())
+        } else {
+            with_read_lease(deadline, |_| objects.open_writer(epoch)).await?
+        };
+        let store = Arc::new(ServingStore {
+            lower, upper, writer: None, reader: Some(ServingReader { scope, objects }),
+        });
+        Ok(OpenedRecoveryStore { store, blocks, audience: None, checkpoint_metadata: None, fragment_storage: None })
+    }
+}
+
 pub(super) fn grant_prefix(storage_prefix: &str, generation: u64, writer_epoch: u64) -> String {
     format!("{storage_prefix}/~ordered/{generation}/{writer_epoch}")
 }
 
-fn source_prefix(
+pub(super) fn source_prefix(
     storage_prefix: &str,
     generation: u64,
     writer_epoch: u64,
@@ -435,6 +477,7 @@ pub(super) async fn reopen_source(
         lower,
         upper,
         writer: None,
+        reader: None,
     }))
 }
 
@@ -444,6 +487,12 @@ struct ServingStore {
     lower: Option<Arc<dyn ObjectStore>>,
     upper: Arc<dyn ObjectStore>,
     writer: Option<ServingWriter>,
+    reader: Option<ServingReader>,
+}
+
+struct ServingReader {
+    scope: ReaderScope,
+    objects: ReplicaObjects,
 }
 
 struct ServingWriter {
@@ -471,42 +520,23 @@ impl ServingStore {
         read: impl FnOnce(&'a dyn ObjectStore) -> BoxFuture<'a, rtdb_storage::Result<T>> + Send,
     ) -> rtdb_storage::Result<T> {
         let work = async { read(self.inherited(key).await?.unwrap_or(self.upper.as_ref())).await };
-        let Some(writer) = &self.writer else {
-            return work.await;
-        };
-        self.with_serving_lease(writer, |_| work).await
+        match self.serving_deadline().await? {
+            Some(deadline) => with_read_lease(deadline, |_| work).await,
+            None => work.await,
+        }
     }
 
-    async fn with_serving_lease<
-        T: Send,
-        F: std::future::Future<Output = rtdb_storage::Result<T>> + Send,
-    >(
-        &self,
-        writer: &ServingWriter,
-        work: impl FnOnce(Instant) -> F + Send,
-    ) -> rtdb_storage::Result<T> {
-        let deadline = writer
-            .scope
-            .serving()
-            .await
-            .map_err(|error| Error::Remote {
-                key: "installed serving grant".into(),
-                message: error.to_string(),
-            })?;
-        let started = Instant::now();
-        let micros = |length: Duration| length.as_micros().min(i64::MAX as u128) as i64;
-        let length = micros(deadline.saturating_duration_since(started));
-        let lease = Arc::new(ReadLease::new(
-            Some(length),
-            Arc::new(move || micros(started.elapsed())),
-        ));
-        let result = tokio::time::timeout_at(
-            deadline.into(),
-            IoRegion::leased(Some(Arc::clone(&lease)), work(deadline)),
-        )
-        .await;
-        lease.check()?;
-        result.map_err(|_| Error::Closed("The installed serving lease expired".into()))?
+    async fn serving_deadline(&self) -> rtdb_storage::Result<Option<Instant>> {
+        let deadline = if let Some(writer) = &self.writer {
+            writer.scope.lease.serving(writer.scope.journal.lease(writer.scope.grant)).await
+        } else if let Some(reader) = &self.reader {
+            reader.scope.serving().await
+        } else {
+            return Ok(None);
+        };
+        deadline.map(Some).map_err(|error| Error::Remote {
+            key: "installed serving lease".into(), message: error.to_string(),
+        })
     }
 
     async fn authorize(&self, key: &ObjectKey) -> rtdb_storage::Result<&ServingWriter> {
@@ -527,24 +557,70 @@ impl ServingStore {
     }
 }
 
+async fn with_read_lease<T, F>(deadline: Instant, work: impl FnOnce(Instant) -> F) -> rtdb_storage::Result<T>
+where F: std::future::Future<Output = rtdb_storage::Result<T>> {
+    let started = Instant::now();
+    let micros = |length: Duration| length.as_micros().min(i64::MAX as u128) as i64;
+    let length = micros(deadline.saturating_duration_since(started));
+    let lease = Arc::new(ReadLease::new(Some(length), Arc::new(move || micros(started.elapsed()))));
+    let result = tokio::time::timeout_at(deadline.into(), IoRegion::leased(Some(Arc::clone(&lease)), work(deadline))).await;
+    lease.check()?;
+    result.map_err(|_| Error::Closed("The installed serving lease expired".into()))?
+}
+
 #[async_trait]
 impl ObjectStore for ServingStore {
+    async fn replica_publication_address(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<(rtdb_types::S3ObjectNamespace, String)>> {
+        self.read(key, |store| store.replica_publication_address(key)).await
+    }
+    fn defers_trie_releases(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    fn releases_receipt_l0(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    // Settlement still belongs to the recovery dependency owner. The active
+    // writer can only authenticate the installed removal and queue its files.
+    async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
+        let installed = InstalledRetirement::decode(receipt.as_str(), &contents)?;
+        let writer = self.authorize(receipt).await?;
+        if self.get_fresh_exact(receipt, contents.len()).await? != contents {
+            return Err(invalid("The installed grant trie release differs from its stored receipt"));
+        }
+        let mut files = installed.files().iter().collect::<Vec<_>>();
+        files.sort_by_key(|file| file.release_order());
+        for file in files {
+            let key = ObjectKey::new(&file.key)?;
+            if rtdb_format::keys::is_receipt_trie_file(key.as_str()) {
+                writer.reclamation.enqueue_receipt(
+                    self.upper.as_ref(), self.lower.as_deref(), &key, receipt, installed.cut(), file,
+                ).await?;
+            } else {
+                writer.reclamation.enqueue(self.upper.as_ref(), self.lower.as_deref(), &key).await?;
+            }
+        }
+        Ok(true)
+    }
+
     fn queues_offloaded_payload_reclamation(&self) -> bool {
         self.writer.is_some()
     }
 
-    async fn open_replica_objects(
-        &self,
-        scope: ReplicaObjectScope,
-    ) -> rtdb_storage::Result<Arc<dyn ObjectStore>> {
-        let owner = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| Error::Task("The store has no installed replica object scope".into()))?;
-        self.with_serving_lease(owner, |deadline| {
-            owner.replica_objects.open(scope, deadline)
-        })
-        .await
+    async fn read_replica_payload(
+        &self, custody: &ReplicaObjectCustody, memory: &Arc<rtdb_columnar::MemoryBudget>,
+    ) -> rtdb_storage::Result<ReplicaPayload> {
+        let objects = self.writer.as_ref().map(|writer| &writer.replica_objects)
+            .or_else(|| self.reader.as_ref().map(|reader| &reader.objects))
+            .ok_or_else(|| Error::Task("The store has no installed replica payload broker".into()))?;
+        let scope = custody.installed_scope()
+            .ok_or_else(|| Error::Task("The payload permit does not name an installed placement".into()))?;
+        let deadline = self.serving_deadline().await?.ok_or_else(|| Error::Closed("The replay lease is unavailable".into()))?;
+        with_read_lease(deadline, |deadline| async move {
+            let store = objects.open(scope, deadline).await?;
+            custody.read_from(store.as_ref(), memory).await
+        }).await
     }
 
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
@@ -556,6 +632,14 @@ impl ObjectStore for ServingStore {
         key: &ObjectKey,
     ) -> rtdb_storage::Result<ObjectObservation<StoredObject>> {
         self.read(key, |store| store.observe_head(key)).await
+    }
+
+    async fn retirement_version(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectVersion>> {
+        self.read(key, |store| store.retirement_version(key)).await
+    }
+
+    async fn retirement_publication(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
+        self.read(key, |store| store.retirement_publication(key)).await
     }
 
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
@@ -629,23 +713,30 @@ impl ObjectStore for ServingStore {
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+        self.put_with_publication(key, bytes).await.map(drop)
+    }
+
+    async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
         self.authorize(key).await?;
         if let Some(lower) = self.inherited(key).await? {
-            return if lower.get_fresh_exact(key, bytes.len()).await? == bytes {
-                Ok(())
-            } else {
-                Err(Error::ConflictingObject(key.to_string()))
-            };
+            if lower.get_fresh_exact(key, bytes.len()).await? != bytes {
+                return Err(Error::ConflictingObject(key.to_string()));
+            }
+            return lower.retirement_publication(key).await;
         }
-        self.upper.put(key, bytes).await
+        self.upper.put_with_publication(key, bytes).await
     }
 
     async fn put_file(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<()> {
+        self.put_file_with_publication(key, path).await.map(drop)
+    }
+
+    async fn put_file_with_publication(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<Option<PhysicalObjectPublication>> {
         self.authorize(key).await?;
         if self.inherited(key).await?.is_some() {
             return Err(Error::ConflictingObject(key.to_string()));
         }
-        self.upper.put_file(key, path).await
+        self.upper.put_file_with_publication(key, path).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
@@ -676,8 +767,8 @@ impl ObjectStore for ServingStore {
             }
             Ok(objects.into_values().collect())
         };
-        match &self.writer {
-            Some(writer) => self.with_serving_lease(writer, |_| work).await,
+        match self.serving_deadline().await? {
+            Some(deadline) => with_read_lease(deadline, |_| work).await,
             None => work.await,
         }
     }
