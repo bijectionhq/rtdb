@@ -66,18 +66,23 @@ pub struct RunningNode {
 }
 
 pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSettings) -> Result<RunningNode> {
-    if settings.agent.installed_journal_manifest.is_some() && settings.capabilities.is_none() {
+    if (settings.agent.installed_journal_manifest.is_some() || settings.agent.installed_cell.is_some()) && settings.capabilities.is_none() {
         return Err(Anomaly::incorrect("rtdb.multi/ordered-worker", "Installed journal workers require a cell route credential"));
     }
-    let ordered = Arc::new(match &settings.agent.installed_journal_manifest {
-        Some(path) => crate::journal::hosted::Routes::read(path, &settings.agent.storage, settings.agent.replay_broker.as_ref())?,
-        None => crate::journal::hosted::Routes::default(),
+    let ordered = Arc::new(match (&settings.agent.installed_journal_manifest, &settings.agent.installed_cell) {
+        (Some(_), Some(_)) => return Err(Anomaly::incorrect("rtdb.multi/installed-cell", "Choose one installed journal configuration")),
+        (None, Some(path)) => crate::journal::hosted::Routes::runtime(
+            crate::journal::cell::InstalledCell::read(path)?, settings.agent.storage.clone(),
+        )?,
+        (Some(path), None) => crate::journal::hosted::Routes::read(path, &settings.agent.storage, settings.agent.replay_broker.as_ref())?,
+        (None, None) => crate::journal::hosted::Routes::default(),
     });
     ordered.reserve_deployments(directory.as_ref()).await?;
     let audience = settings.configuration.flight_sql.as_ref().and_then(|flight| flight.audience);
     if settings.agent.audience_journal_port == Some(0)
         || audience.is_none() && settings.agent.audience_journal_port.is_some()
         || audience.is_some() && settings.agent.audience_journal_port.is_none() && settings.agent.installed_journal_manifest.is_none()
+            && settings.agent.installed_cell.is_none()
     {
         return Err(Anomaly::incorrect("rtdb.multi/audience-authority",
             "A classic audience Flight listener requires its read-only journal port"));

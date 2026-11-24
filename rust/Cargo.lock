@@ -2990,6 +2990,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "journal-contract"
+version = "0.1.0"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0#f17bedb0e01ce58709dc05aa3189d028ff1620a0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3158,12 +3166,13 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=a02017d29613f4b4052b1ff0b0234dc91ac31367#a02017d29613f4b4052b1ff0b0234dc91ac31367"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0#f17bedb0e01ce58709dc05aa3189d028ff1620a0"
 dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
  "futures",
+ "journal-contract",
  "libc",
  "parking_lot",
  "prost",

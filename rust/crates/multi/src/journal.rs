@@ -17,6 +17,7 @@ use ordered_logkeeper::ordered::{
 mod adapter_command;
 mod append_selection;
 pub mod custody;
+pub mod cell;
 pub mod hosted;
 mod prefix_retirement;
 pub(crate) mod retention_decision;

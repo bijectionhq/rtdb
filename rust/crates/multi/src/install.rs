@@ -37,7 +37,7 @@ use tokio_rustls::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::admin;
+use crate::{admin, journal::cell::CellAccess, keys::KeyService};
 
 const FRAME_BYTES: u64 = 2048;
 const DEADLINE: Duration = Duration::from_secs(15);
@@ -117,6 +117,7 @@ pub struct Installer {
     disposal: Option<Token>,
     org: String,
     replicas: usize,
+    installed: Option<(Arc<CellAccess>, Arc<dyn KeyService>)>,
 }
 
 pub(crate) struct Token {
@@ -172,7 +173,13 @@ impl Installer {
             disposal,
             org,
             replicas,
+            installed: None,
         })
+    }
+
+    pub fn with_installed_cell(mut self, cell: Arc<CellAccess>, keys: Arc<dyn KeyService>) -> Self {
+        self.installed = Some((cell, keys));
+        self
     }
 
     async fn handle(&self, directory: &dyn Directory, line: &str) -> Reply {
@@ -206,6 +213,27 @@ impl Installer {
             || request.observation.is_some() != matches!(request.operation, Operation::ConfirmRecoveryArchive)
         {
             return Ok(Reply::Refused);
+        }
+        if let Some((cell, keys)) = &self.installed {
+            if request.incarnation != 1 {
+                return Ok(Reply::Refused);
+            }
+            let Request { operation, name, authority, .. } = request;
+            return match operation {
+                Operation::Install => {
+                    cell.install(directory, keys.as_ref(), authority, &name, &self.org).await?;
+                    Ok(Reply::Installed { name, authority })
+                }
+                Operation::ScheduleDisposal => {
+                    let epoch = cell.retire(authority, &name, &self.org).await?;
+                    Ok(epoch.map_or(Reply::Deferred, |epoch| Reply::Scheduled { name, authority, epoch }))
+                }
+                Operation::InspectDisposal => {
+                    let epoch = cell.retired(authority, &name, &self.org).await?;
+                    Ok(epoch.map_or(Reply::Deferred, |epoch| Reply::Scheduled { name, authority, epoch }))
+                }
+                Operation::ScheduleRecoveryDisposal | Operation::ConfirmRecoveryArchive => Ok(Reply::Deferred),
+            };
         }
         let existing = directory.deployment_by_name(&request.name).await?;
         if let Some(installation) = existing.as_ref() {
@@ -403,6 +431,7 @@ mod tests {
             disposal: Some(Token::new(&token).unwrap()),
             org: "cell".into(),
             replicas: 3,
+            installed: None,
         };
         let installed = Uuid::new_v4();
         directory.reserve_installed_journal(installed).await.unwrap();
@@ -427,6 +456,7 @@ mod tests {
             disposal: Some(Token::new(&disposal).unwrap()),
             org: "cell".into(),
             replicas: 3,
+            installed: None,
         };
         let authority = Uuid::new_v4();
         let request = |operation: &str, token: &str, authority: Uuid| {

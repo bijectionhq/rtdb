@@ -253,11 +253,11 @@ impl Router {
         if fresh {
             return self.fresh_target(name, installation).await;
         }
-        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+        if let Some(installed) = self.options.ordered_placement(name).await.map_err(directory_error)? {
             if installation.is_some_and(|id| id != installed.deployment) {
                 return Err(Status::not_found("No matching installed Flight SQL deployment"));
             }
-            let (address, worker, epoch) = crate::gateway::route_ordered(name, installed, &self.options, true, |worker, _| async move {
+            let (address, worker, epoch) = crate::gateway::route_ordered(name, &installed, &self.options, true, |worker, _| async move {
                 let reply = control::call(&worker.control, &control::Request::FlightEndpoint,
                     self.timeout, &self.control).await?;
                 match reply {
@@ -269,6 +269,9 @@ impl Router {
                 holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment), replica: None, ordered_reader: None, fresh: false };
             self.validate(&target).await?;
             return Ok(target);
+        }
+        if self.options.installed_cell.is_some() {
+            return Err(Status::not_found("No matching installed Flight SQL deployment"));
         }
         let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
             .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id))
@@ -288,11 +291,11 @@ impl Router {
 
     /// Resolve an eligible subscriber and let the receiver establish its own cut.
     async fn fresh_target(&self, name: &str, installation: Option<Uuid>) -> std::result::Result<Target, Status> {
-        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+        if let Some(installed) = self.options.ordered_placement(name).await.map_err(directory_error)? {
             if installation.is_some_and(|id| id != installed.deployment) {
                 return Err(Status::not_found("No matching installed Flight SQL deployment"));
             }
-            let target = if let Ok(read) = crate::gateway::route_ordered_reader(name, installed, &self.options, true).await {
+            let target = if let Ok(read) = crate::gateway::route_ordered_reader(name, &installed, &self.options, true).await {
                 Target {
                     name: name.into(), deployment: installed.deployment.to_string(),
                     holder: MemberId(read.worker.enrollment.worker.to_string()),
@@ -312,6 +315,9 @@ impl Router {
             };
             self.validate(&target).await?;
             return Ok(target);
+        }
+        if self.options.installed_cell.is_some() {
+            return Err(Status::not_found("No matching installed Flight SQL deployment"));
         }
         let record = self.directory.deployment_by_name(name).await.map_err(directory_error)?
             .filter(|record| installation.is_none_or(|expected| expected.to_string() == record.id))
@@ -369,7 +375,7 @@ impl Router {
         if installation.is_some_and(|id| id != source) {
             return Err(Status::not_found("No matching installed Flight audience"));
         }
-        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+        if let Some(installed) = self.options.ordered_placement(name).await.map_err(directory_error)? {
             if installed.deployment != source {
                 return Err(Status::not_found("No matching installed Flight audience"));
             }
@@ -383,6 +389,7 @@ impl Router {
                 enrollment: Some(grant.enrollment), replica: None, ordered_reader: None, fresh: false,
             });
         }
+        if self.options.installed_cell.is_some() { return Err(moved()); }
         let (record, member) = self.directory.audience_holder(&source.to_string()).await.map_err(directory_error)?
             .ok_or_else(moved)?;
         // This lookup only locates the existing holder. The peer proof names
@@ -397,7 +404,7 @@ impl Router {
     }
 
     async fn validate(&self, target: &Target) -> std::result::Result<(), Status> {
-        if let Some(installed) = self.options.installed_journals.as_ref().and_then(|routes| routes.by_name(&target.name)) {
+        if let Some(installed) = self.options.ordered_placement(&target.name).await.map_err(directory_error)? {
             let Some(enrollment) = target.enrollment.filter(|id| installed.endpoints.contains_key(id)) else { return Err(moved()); };
             let route = installed.journal.route().await.map_err(|_| moved())?;
             if target.deployment != installed.deployment.to_string() || route.writer.epoch != target.epoch {
@@ -407,6 +414,7 @@ impl Router {
                 || target.ordered_reader.is_none() && route.writer.grant.is_some_and(|grant| grant.enrollment == enrollment)
             { Ok(()) } else { Err(moved()) };
         }
+        if self.options.installed_cell.is_some() { return Err(moved()); }
         if let Some(replica) = &target.replica {
             let Some(record) = self.directory.deployment(&target.deployment).await.map_err(directory_error)? else { return Err(moved()); };
             if record.name != target.name || record.epoch != target.epoch || record.log_epoch != replica.log_epoch

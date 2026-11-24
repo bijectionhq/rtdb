@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ordered_logkeeper::ordered::daemon::{
-    ApplicationRoute, Client, Credentials, Manifest, SuccessorRoute,
+    ApplicationRoute, Client, Credentials, EndpointAddress, Manifest, SuccessorRoute,
 };
 use ordered_logkeeper::ordered::service::{
     Route, WithdrawnWorker,
@@ -443,7 +443,7 @@ async fn discard_reply(identity: &Identity, route: &ApplicationRoute, original: 
         .unwrap();
     tls.alpn_protocols = vec![b"logkeeper-application/1".to_vec()];
     let endpoint = &route.endpoints[0];
-    let stream = TcpStream::connect(endpoint.address).await.unwrap();
+    let stream = endpoint.connect().await.unwrap();
     let mut channel = TlsConnector::from(Arc::new(tls))
         .connect(endpoint.server_name.clone().try_into().unwrap(), stream)
         .await
@@ -935,7 +935,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
     assert_eq!(read.through, appended.cut);
     assert!(admitted.barrier.is_some());
 
-    let failed_voter = installed.endpoints[0].address;
+    let EndpointAddress::Socket(failed_voter) = installed.endpoints[0].address else { panic!("test voter must use a socket address") };
     cohort
         .voters
         .iter_mut()
@@ -1705,7 +1705,7 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
         .unwrap();
     zombie.try_lock_shared().unwrap();
 
-    let unavailable = installed.endpoints[0].address;
+    let EndpointAddress::Socket(unavailable) = installed.endpoints[0].address else { panic!("test voter must use a socket address") };
     cohort
         .voters
         .iter_mut()
@@ -1953,4 +1953,190 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
     for voter in &mut cohort.voters {
         voter.stop().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
+    use rtdb_multi::journal::cell::{InstalledCell, Role};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let authority = Authority::new(Uuid::new_v4(), 2 << 20, 24 << 20, 32);
+    let root = authority.data.path();
+    let mut cohort = authority.cohort("runtime", None);
+    let management = &authority.group_spec["clients"];
+    for voter in &mut cohort.voters {
+        let mut definition: Value = serde_json::from_slice(&fs::read(&voter.manifest).unwrap()).unwrap();
+        definition["groups"] = json!([]);
+        definition["management"] = management.clone();
+        write_json(&voter.manifest, &definition);
+        voter.manifest().initialize().unwrap();
+        voter.start();
+    }
+    let group: Value = serde_json::from_slice(&fs::read(&cohort.group).unwrap()).unwrap();
+    let voters: Vec<_> = group["voters"].as_array().unwrap().iter().map(|voter| {
+        let receipt: Vec<u8> = serde_json::from_value(voter["receipt_key"].clone()).unwrap();
+        json!({
+            "voter": voter["voter"], "zone": voter["zone"],
+            "endpoint": voter["endpoint"]["address"], "server_name": voter["endpoint"]["server_name"],
+            "certificate": voter["endpoint"]["certificate"],
+            "receipt_key": receipt.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        })
+    }).collect();
+
+    let storage = CellStorage::Local { root: root.join("runtime-serving") };
+    let archive_root = root.join("runtime-archive");
+    let archive = CellStorage::Local { root: archive_root.clone() };
+    let keys_dir = root.join("runtime-keys");
+    let keys: Arc<dyn KeyService> = Arc::new(LocalKeyService::new(keys_dir.clone()).unwrap());
+    admin::initialize_storage(&storage, keys.as_ref()).await.unwrap();
+    admin::initialize_storage(&archive, keys.as_ref()).await.unwrap();
+
+    let control_port = reserve_port();
+    let pgwire_port = reserve_port();
+    let control = control_port.local_addr().unwrap();
+    let pgwire = pgwire_port.local_addr().unwrap();
+    let cell_file = root.join("runtime-cell.json");
+    let pem = |identity: &Identity| json!({
+        "certificate": identity.credentials["certificate"], "key": identity.credentials["key"],
+    });
+    write_json(&cell_file, &json!({
+        "cell": "runtime", "ca": root.join("ca.crt"), "archive_root": archive_root, "keys": keys_dir,
+        "limits": group["limits"], "maximum_prefix_bytes": group["maximum_prefix_bytes"],
+        "maximum_application_frame": FRAME, "exchange_ms": 2_500, "voters": voters,
+        "administrator_pin": authority.administrator.pin, "route_reader_pin": authority.router.pin,
+        "custodian_pin": authority.custodian.pin,
+        "workers": [{
+            "worker": authority.enrollments[0].worker, "certificate": authority.workers[0].pin,
+            "control": control, "pgwire": pgwire,
+        }],
+        "credentials": {
+            "administrator": pem(&authority.administrator), "route_reader": pem(&authority.router),
+            "worker": pem(&authority.workers[0]), "custodian": pem(&authority.custodian),
+        },
+    }));
+    let directory: Arc<dyn Directory> = MemoryDirectory::new();
+    let cell = InstalledCell::read(&cell_file).unwrap();
+    let discovery = Arc::new(cell.access(Role::RouteReader).unwrap());
+    let deployments = [Uuid::new_v4(), Uuid::new_v4()];
+    eventually(async || discovery.by_deployment(deployments[0]).await.ok()).await;
+
+    let node_settings = || {
+        let mut agent = AgentOptions::new(storage.clone());
+        agent.installed_cell = Some(cell_file.clone());
+        agent.watch_interval = Duration::from_millis(50);
+        process::NodeSettings {
+            configuration: rtdb_server::config::NodeConfiguration::from_yaml(&format!(
+                "authn: !SingleRootUser\n  password: cell-test\nserver:\n  port: {}\n  numThreads: 4\n",
+                pgwire.port(),
+            )).unwrap(),
+            allocation_limit_bytes: 1 << 30,
+            control,
+            advertise_host: Some("127.0.0.1".into()),
+            hosted_task: None,
+            availability_zone: "test-az".into(),
+            engine_version: None,
+            agent,
+            lease: common::lease(),
+            pool: MemberPool::General,
+            claim_wait: Duration::from_millis(2),
+            keys: keys.clone(),
+            cache_dir: root.join("runtime-cache"),
+            local_compaction: false,
+            capabilities: Some(common::secret()),
+        }
+    };
+    drop(control_port);
+    drop(pgwire_port);
+    let node = process::start_node(directory.clone(), node_settings()).await.unwrap();
+
+    let lifecycle = Identity::new(root, "lifecycle", &authority.issuer);
+    let credentials: Credentials = serde_json::from_value(lifecycle.credentials.clone()).unwrap();
+    let provider = Arc::new(tls_ring::default_provider());
+    let server = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_protocol_versions(&[&TLS13]).unwrap().with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_file(&credentials.certificate).unwrap()],
+            PrivateKeyDer::from_pem_file(&credentials.key).unwrap(),
+        ).unwrap();
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from_pem_file(&credentials.roots).unwrap()).unwrap();
+    let connector = TlsConnector::from(Arc::new(ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&TLS13]).unwrap().with_root_certificates(roots).with_no_client_auth()));
+
+    let token = "1".repeat(64);
+    let token_file = root.join("installation-token");
+    fs::write(&token_file, &token).unwrap();
+    let disposal_token = "2".repeat(64);
+    let disposal_file = root.join("disposal-token");
+    fs::write(&disposal_file, &disposal_token).unwrap();
+    let installer = rtdb_multi::install::Installer::from_file(&token_file, Some(&disposal_file), "test".into(), 3).unwrap()
+        .with_installed_cell(Arc::new(cell.access(Role::Administrator).unwrap()), keys.clone());
+    let installs = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let installs_address = installs.local_addr().unwrap();
+    let stop = CancellationToken::new();
+    let installation = tokio::spawn(rtdb_multi::install::serve(
+        installs, Arc::new(server), directory.clone(), Arc::new(installer), stop.clone(),
+    ));
+    let lifecycle = async |operation: &str, token: &str, name: &str, deployment: Uuid, receive: bool| {
+        let socket = TcpStream::connect(installs_address).await.unwrap();
+        let mut stream = connector.connect("localhost".try_into().unwrap(), socket).await.unwrap();
+        let mut request = serde_json::to_vec(&json!({
+            "operation": operation, "token": token, "name": name, "authority": deployment, "incarnation": 1,
+        })).unwrap();
+        request.push(b'\n');
+        stream.write_all(&request).await.unwrap();
+        if !receive { return Value::Null; }
+        let mut reply = String::new();
+        BufReader::new(stream).read_line(&mut reply).await.unwrap();
+        serde_json::from_str::<Value>(&reply).unwrap()
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let gateway = tokio::spawn(gateway::serve(listener, directory.clone(), GatewayOptions {
+        capabilities: Some(common::secret()),
+        installed_cell: Some(discovery.clone()),
+        ..Default::default()
+    }, stop.clone()));
+
+    lifecycle("install", &token, "alpha", deployments[0], false).await;
+    let before = eventually(async || discovery.by_deployment(deployments[0]).await.ok().flatten()).await;
+    for (name, deployment) in ["alpha", "bravo"].into_iter().zip(deployments) {
+        assert_eq!(lifecycle("install", &token, name, deployment, true).await,
+            json!({ "outcome": "installed", "name": name, "authority": deployment }));
+    }
+    assert_eq!(discovery.by_deployment(deployments[0]).await.unwrap(), Some(before));
+    assert!(directory.deployments().await.unwrap().is_empty());
+    let empty = Uuid::new_v4();
+    assert_eq!(lifecycle("install", &token, "empty", empty, true).await["outcome"], "installed");
+    assert_eq!(lifecycle("schedule_disposal", &disposal_token, "empty", empty, true).await["outcome"], "scheduled");
+    assert!(discovery.by_deployment(empty).await.unwrap().is_none());
+    assert_eq!(lifecycle("schedule_disposal", &disposal_token, "empty", empty, true).await["outcome"], "scheduled");
+    assert_eq!(lifecycle("install", &token, "empty", empty, true).await["outcome"], "refused");
+
+    for (name, total) in [("alpha", 12), ("bravo", 34)] {
+        common::connect(&address, name).await.simple_query(
+            &format!("INSERT INTO orders (_id, total) VALUES (1, {total})"),
+        ).await.unwrap();
+    }
+    node.shutdown().await.unwrap();
+    cohort.voters[0].stop().await;
+    cohort.voters[0].stop = CancellationToken::new();
+    cohort.voters[0].start();
+    let voter = cohort.voters[0].address;
+    eventually(async || TcpStream::connect(voter).await.ok()).await;
+    let replacement = process::start_node(directory.clone(), node_settings()).await.unwrap();
+    for (name, total) in [("alpha", "12"), ("bravo", "34")] {
+        let result = common::connect(&address, name).await.simple_query("SELECT total FROM orders").await.unwrap();
+        let values: Vec<_> = result.iter().filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+            _ => None,
+        }).collect();
+        assert_eq!(values, vec![total]);
+    }
+
+    replacement.shutdown().await.unwrap();
+    stop.cancel();
+    gateway.await.unwrap().unwrap();
+    installation.await.unwrap().unwrap();
+    for voter in &mut cohort.voters { voter.stop().await; }
 }

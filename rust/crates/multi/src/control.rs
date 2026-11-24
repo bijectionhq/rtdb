@@ -106,6 +106,8 @@ pub struct OrderedActivation {
     pub predecessor: OrderedPredecessor,
     pub target: ordered_logkeeper::ordered::Enrollment,
     pub takeover: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) placement: Option<ordered_logkeeper::ordered::Placement>,
     nonce: uuid::Uuid,
     proof: [u8; 32],
 }
@@ -115,7 +117,7 @@ impl OrderedActivation {
         secret: &crate::capability::CellSecret, name: &str, placement: ordered_logkeeper::ordered::Placement,
         predecessor: OrderedPredecessor, target: ordered_logkeeper::ordered::Enrollment, takeover: bool,
     ) -> Self {
-        let mut activation = Self { predecessor, target, takeover, nonce: uuid::Uuid::new_v4(), proof: [0; 32] };
+        let mut activation = Self { predecessor, target, takeover, placement: Some(placement), nonce: uuid::Uuid::new_v4(), proof: [0; 32] };
         activation.proof = secret.sign_route(&activation.forward(name, placement));
         activation
     }

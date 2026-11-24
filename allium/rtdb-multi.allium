@@ -483,9 +483,23 @@ contract LogService {
         -- A mixed cell permanently reserves the installed identity before sharing its media with directory administration.
         -- The reservation occupies the identity without supplying a directory deployment record, epoch or version.
         -- Directory creation and staging require an unreserved identity, and effects on an existing directory deployment require its versioned record.
-        -- A worker sends a configured installed name through authenticated journal activation and uses directory control only for its directory deployments.
+        -- A worker sends an installed name through authenticated journal activation and uses directory control only for its directory deployments.
         -- Execution-memory pressure selects only holdings under directory authority.
         -- The installed grant and custody decisions authorize serving, recovery, checkpoint publication, trim and retirement of journal-owned media.
+
+    @invariant RuntimeJournalPublicationRequiresDurableInstallation
+        -- A voter admits a runtime group after synchronising its definition and initial voter media.
+        -- The tenant installation reserves the exact deployment identity and provisions its two keys after a strict majority persists the group.
+        -- Publication binds the tenant name and organisation to the group's route.
+        -- The gateway acknowledges installation and admits route discovery through a matching majority after that publication.
+        -- A retry for the same deployment derives the same placement.
+        -- A worker verifies the published route against the activation's deployment and placement before opening the attachment.
+
+    @invariant RuntimeJournalRetirementRequiresFinalCheckpoint
+        -- The terminal seal names the selected checkpoint at the head of the journal.
+        -- The seal succeeds in the first decision slot after observing the exact final checkpoint, a vacant grant, drained holds and no pending preparation.
+        -- A durable retirement marker removes the group from worker and gateway discovery.
+        -- The retirement marker preserves the sealed media for reconciliation.
 
     @invariant InstalledJournalOwnsWriterAndRecovery
         -- The installed journal chooses a replacement grant against its exact observed predecessor and the candidate's current enrollment.

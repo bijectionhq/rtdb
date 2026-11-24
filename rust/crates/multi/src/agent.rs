@@ -61,6 +61,7 @@ pub struct AgentOptions {
     pub audience_journal_port: Option<u16>,
     pub storage: CellStorage,
     pub installed_journal_manifest: Option<std::path::PathBuf>,
+    pub installed_cell: Option<std::path::PathBuf>,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
     pub replay_broker: Option<crate::replay_broker::Client>,
@@ -97,7 +98,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { audience_journal_port: None, storage, installed_journal_manifest: None, world_archive: None, s3_write_role: None, replay_broker: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { audience_journal_port: None, storage, installed_journal_manifest: None, installed_cell: None, world_archive: None, s3_write_role: None, replay_broker: None, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
@@ -352,7 +353,7 @@ impl NodeAgent {
     }
 
     fn require_directory_route(&self, name: &str) -> Result<()> {
-        if !directory_route_allowed(self.ordered.by_name(name).is_some()) {
+        if self.ordered.is_runtime() || !directory_route_allowed(self.ordered.by_name(name).is_some()) {
             return Err(Anomaly::incorrect("rtdb.multi/ordered-placement", "An installed journal uses its own placement decisions"));
         }
         Ok(())
@@ -522,8 +523,11 @@ impl NodeAgent {
 
     async fn authenticated_ordered_activation(&self, name: &str, activation: crate::control::OrderedActivation) -> Result<Response> {
         let unavailable = || Anomaly::new(AnomalyCategory::Forbidden, "rtdb.multi/ordered-route", "The request has no exact authenticated ordered worker route");
-        let placement = self.ordered.by_name(name).ok_or_else(unavailable)?;
         let secret = self.secret.as_ref().ok_or_else(unavailable)?;
+        if activation.placement.is_some_and(|scope| !activation.authentic(secret, name, scope)) {
+            return Err(unavailable());
+        }
+        let placement = self.ordered.resolve_runtime(name, activation.placement).await?.ok_or_else(unavailable)?;
         let scope = placement.worker.placement();
         if !activation.authentic(secret, name, scope)
             || !matches!(placement.worker.authority(), crate::journal::Authority::Worker { enrollment } if enrollment == activation.target)
@@ -533,7 +537,7 @@ impl NodeAgent {
         if !activation.takeover && activation.predecessor.enrollment != Some(activation.target) {
             return Err(unavailable());
         }
-        let response = self.activate_ordered(name, placement, activation.predecessor).await?;
+        let response = self.activate_ordered(name, &placement, activation.predecessor).await?;
         if let Response::Held { epoch, address } = response {
             let proof = secret.sign_route(&activation.reply_binding(scope, epoch, &address));
             Ok(Response::OrderedHeld { epoch, address, proof })
@@ -549,7 +553,7 @@ impl NodeAgent {
         let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/ordered-reader",
             "The enrolled reader cannot open this ordered basis");
         let secret = self.secret.as_ref().ok_or_else(unavailable)?;
-        let placement = self.ordered.by_name(name).filter(|placement| placement.worker.placement() == scope)
+        let placement = self.ordered.resolve_runtime(name, Some(scope)).await?
             .ok_or_else(unavailable)?;
         if !matches!(placement.worker.authority(), crate::journal::Authority::Worker { enrollment: own } if own == enrollment) {
             return Err(unavailable());
@@ -1987,7 +1991,7 @@ impl Handler for NodeAgent {
                 let source = self.ordered.by_name(&parent).ok_or_else(unavailable)?;
                 let destination = self.ordered.by_name(&child).ok_or_else(unavailable)?;
                 let broker = self.replay_broker().ok_or_else(unavailable)?;
-                source.enroll_installed_fork(destination, broker, &self.keys, self.node.memory(),
+                source.enroll_installed_fork(&destination, broker, &self.keys, self.node.memory(),
                     &self.ordered_releases).await?;
                 Ok(Response::InstalledForkEnrolled)
             }.await,

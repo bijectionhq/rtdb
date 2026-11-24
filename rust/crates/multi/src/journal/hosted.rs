@@ -88,7 +88,17 @@ pub(crate) struct Placement {
 }
 
 #[derive(Default)]
-pub(crate) struct Routes(BTreeMap<String, Arc<Placement>>);
+pub(crate) struct Routes {
+    configured: BTreeMap<String, Arc<Placement>>,
+    runtime: Option<RuntimeRoutes>,
+}
+
+struct RuntimeRoutes {
+    cell: Arc<super::cell::InstalledCell>,
+    discovery: super::cell::CellAccess,
+    serving: crate::deployment::CellStorage,
+    opened: parking_lot::RwLock<BTreeMap<String, Arc<Placement>>>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +111,7 @@ struct GatewayDefinition {
 
 pub struct GatewayRoutes(BTreeMap<String, GatewayPlacement>);
 
+#[derive(Clone)]
 pub(crate) struct GatewayPlacement {
     pub deployment: Uuid,
     pub journal: Arc<InstalledJournal>,
@@ -198,100 +209,143 @@ impl Routes {
         let entries: Vec<Definition> = read_manifest(path)?;
         let mut routes = BTreeMap::new();
         for entry in entries {
-            if serving.overlaps(&entry.archive)? {
-                return Err(invalid(
-                    "The checkpoint archive overlaps the serving storage",
-                ));
-            }
-            let worker = InstalledJournal::open(entry.worker)?;
-            let custodian = entry.custody.map(InstalledJournal::open).transpose()?;
-            let Authority::Worker { enrollment } = worker.authority() else {
-                return Err(invalid("A node needs its exact enrolled worker credential"));
-            };
-            if !worker.binds(&entry.deployment)
-                || custodian.as_ref().is_some_and(|custodian| {
-                    !custodian.binds(&entry.deployment)
-                        || custodian.placement() != worker.placement()
-                        || !matches!(custodian.authority(), Authority::Custody)
-                })
-            {
-                return Err(invalid(
-                    "The installed route addresses a different deployment or residence",
-                ));
-            }
-            let endpoints = worker_endpoints(entry.endpoints)?;
-            if !endpoints.contains_key(&enrollment) {
-                return Err(invalid("The local journal worker has no installed route"));
-            }
-            if matches!(&entry.archive, crate::deployment::CellStorage::S3 { config } if config.terminal_scope.is_none())
-            {
-                return Err(invalid(
-                    "An ordered S3 checkpoint archive needs enrolled terminal storage",
-                ));
-            }
             let name = entry.deployment.name.clone();
-            let mut checkpoint_reservations = BTreeMap::new();
-            for reservation in entry.checkpoint_reservations {
-                CheckpointCustody::copy_budget(&reservation)?;
-                if reservation.custody.revision <= 1
-                    || reservation.custody.allocation.is_nil()
-                    || checkpoint_reservations
-                        .insert(reservation.custody.revision, reservation)
-                        .is_some()
-                {
-                    return Err(invalid(
-                        "Each provider checkpoint reservation needs one exact next revision",
-                    ));
-                }
-            }
-            if entry.journal_window_bytes == Some(0) {
-                return Err(invalid(
-                    "The installed journal window size must be positive",
-                ));
-            }
-            let custody_work = entry.custody_work.map(|installation| {
-                let broker = broker.cloned().ok_or_else(|| invalid("The installed custody domain needs its broker route"))?;
-                custody_work::WorkOwner::open(installation, broker, worker.placement())
-            }).transpose()?;
-            let erasure_signer = entry.erasure_signing_key.as_deref().map(erasure::installed::Signer::open).transpose()?;
-            if erasure_signer.is_some() && (custodian.is_none() || custody_work.is_none()) {
-                return Err(invalid("The installed erasure signer needs a custodian and an enrolled custody domain"));
-            }
-            let placement = Arc::new(Placement {
-                record: entry.deployment,
-                worker,
-                custodian,
-                archive: entry.archive,
-                archive_prefix: ObjectKey::new(entry.archive_prefix)?,
-                journal_window_bytes: entry.journal_window_bytes,
-                custody_work,
-                erasure_signer,
-                nomination: Default::default(),
-                worker_disposal: Default::default(),
-                reader_opening: Default::default(),
-                checkpoint_reservations,
-                publication: Default::default(),
-            });
-            if routes.insert(name, placement).is_some() {
+            if routes.insert(name, Self::placement(entry, serving, broker)?).is_some() {
                 return Err(invalid("An installed deployment name occurs twice"));
             }
         }
-        Ok(Self(routes))
+        Ok(Self { configured: routes, runtime: None })
     }
 
-    pub fn by_name(&self, name: &str) -> Option<&Arc<Placement>> {
-        self.0.get(name)
+    fn placement(entry: Definition, serving: &crate::deployment::CellStorage,
+        broker: Option<&crate::replay_broker::Client>) -> Result<Arc<Placement>>
+    {
+        if serving.overlaps(&entry.archive)? {
+            return Err(invalid(
+                "The checkpoint archive overlaps the serving storage",
+            ));
+        }
+        let worker = InstalledJournal::open(entry.worker)?;
+        let custodian = entry.custody.map(InstalledJournal::open).transpose()?;
+        let Authority::Worker { enrollment } = worker.authority() else {
+            return Err(invalid("A node needs its exact enrolled worker credential"));
+        };
+        if !worker.binds(&entry.deployment)
+            || custodian.as_ref().is_some_and(|custodian| {
+                !custodian.binds(&entry.deployment)
+                    || custodian.placement() != worker.placement()
+                    || !matches!(custodian.authority(), Authority::Custody)
+            })
+        {
+            return Err(invalid(
+                "The installed route addresses a different deployment or residence",
+            ));
+        }
+        let endpoints = worker_endpoints(entry.endpoints)?;
+        if !endpoints.contains_key(&enrollment) {
+            return Err(invalid("The local journal worker has no installed route"));
+        }
+        if matches!(&entry.archive, crate::deployment::CellStorage::S3 { config } if config.terminal_scope.is_none())
+        {
+            return Err(invalid(
+                "An ordered S3 checkpoint archive needs enrolled terminal storage",
+            ));
+        }
+        let mut checkpoint_reservations = BTreeMap::new();
+        for reservation in entry.checkpoint_reservations {
+            CheckpointCustody::copy_budget(&reservation)?;
+            if reservation.custody.revision <= 1
+                || reservation.custody.allocation.is_nil()
+                || checkpoint_reservations
+                    .insert(reservation.custody.revision, reservation)
+                    .is_some()
+            {
+                return Err(invalid(
+                    "Each provider checkpoint reservation needs one exact next revision",
+                ));
+            }
+        }
+        if entry.journal_window_bytes == Some(0) {
+            return Err(invalid(
+                "The installed journal window size must be positive",
+            ));
+        }
+        let custody_work = entry.custody_work.map(|installation| {
+            let broker = broker.cloned().ok_or_else(|| invalid("The installed custody domain needs its broker route"))?;
+            custody_work::WorkOwner::open(installation, broker, worker.placement())
+        }).transpose()?;
+        let erasure_signer = entry.erasure_signing_key.as_deref().map(erasure::installed::Signer::open).transpose()?;
+        if erasure_signer.is_some() && (custodian.is_none() || custody_work.is_none()) {
+            return Err(invalid("The installed erasure signer needs a custodian and an enrolled custody domain"));
+        }
+        Ok(Arc::new(Placement {
+            record: entry.deployment,
+            worker,
+            custodian,
+            archive: entry.archive,
+            archive_prefix: ObjectKey::new(entry.archive_prefix)?,
+            journal_window_bytes: entry.journal_window_bytes,
+            custody_work,
+            erasure_signer,
+            nomination: Default::default(),
+            worker_disposal: Default::default(),
+            reader_opening: Default::default(),
+            checkpoint_reservations,
+            publication: Default::default(),
+        }))
+    }
+
+    pub(crate) fn runtime(cell: Arc<super::cell::InstalledCell>,
+        serving: crate::deployment::CellStorage) -> Result<Self>
+    {
+        if serving.overlaps(&cell.archive()?)? {
+            return Err(invalid("The checkpoint archive overlaps the serving storage"));
+        }
+        let discovery = cell.access(super::cell::Role::Worker)?;
+        Ok(Self { configured: BTreeMap::new(), runtime: Some(RuntimeRoutes {
+            cell, discovery, serving, opened: Default::default(),
+        }) })
+    }
+
+    pub(crate) fn is_runtime(&self) -> bool { self.runtime.is_some() }
+
+    pub fn by_name(&self, name: &str) -> Option<Arc<Placement>> {
+        self.configured.get(name).cloned().or_else(|| self.runtime.as_ref()?.opened.read().get(name).cloned())
+    }
+
+    pub(crate) async fn resolve_runtime(&self, name: &str,
+        scope: Option<ordered_logkeeper::ordered::Placement>,
+    ) -> Result<Option<Arc<Placement>>> {
+        if let Some(placement) = self.by_name(name) {
+            return Ok(Some(placement).filter(|placement| scope.is_none_or(|scope| placement.worker.placement() == scope)));
+        }
+        let (Some(runtime), Some(scope)) = (&self.runtime, scope) else { return Ok(None); };
+        let Some(published) = runtime.discovery.by_deployment(scope.deployment).await? else { return Ok(None); };
+        if published.binding.name != name || published.route.placement != scope {
+            return Ok(None);
+        }
+        let (worker, endpoints) = runtime.cell.worker_attachment(published.route)?;
+        let deployment = super::cell::deployment_record(name, &published.binding.organization, scope.deployment);
+        let definition = Definition {
+            deployment, worker, endpoints, custody: None, custody_work: None, erasure_signing_key: None,
+            archive: runtime.cell.archive()?, archive_prefix: format!("deployments/{}", scope.deployment),
+            journal_window_bytes: None, checkpoint_reservations: Vec::new(),
+        };
+        let placement = Self::placement(definition, &runtime.serving, None)?;
+        let mut opened = runtime.opened.write();
+        Ok(Some(opened.entry(name.to_owned()).or_insert(placement).clone())
+            .filter(|placement| placement.worker.placement() == scope))
     }
 
     pub(crate) async fn reserve_deployments(&self, directory: &dyn rtdb_directory::Directory) -> Result<()> {
-        for placement in self.0.values() {
+        for placement in self.configured.values() {
             directory.reserve_installed_journal(placement.worker.deployment()).await?;
         }
         Ok(())
     }
 
     pub(crate) fn custody_placements(&self) -> impl Iterator<Item = (&str, &Placement)> {
-        self.0.iter().filter_map(|(name, placement)| {
+        self.configured.iter().filter_map(|(name, placement)| {
             placement
                 .custodian
                 .as_ref()
@@ -314,7 +368,7 @@ impl Routes {
                 }
             }
         }).ok_or_else(|| invalid("The database attachment addresses a different installed journal worker"))?;
-        Ok((Arc::clone(placement), attachment))
+        Ok((placement, attachment))
     }
 }
 
@@ -355,7 +409,7 @@ pub fn read_application_route(
     read_manifest(path)
 }
 
-fn read_manifest<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+pub(super) fn read_manifest<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let mut body = Vec::new();
     File::open(path)
         .and_then(|file| file.take(MAX_MANIFEST_BYTES + 1).read_to_end(&mut body))

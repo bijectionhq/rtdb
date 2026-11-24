@@ -43,6 +43,7 @@ pub struct GatewayOptions {
     /// The cell map and this gateway's cell, so a connection for a deployment living elsewhere is forwarded there.
     pub cells: Option<(Arc<dyn crate::cells::CellMap>, String)>,
     pub installed_journals: Option<Arc<crate::journal::hosted::GatewayRoutes>>,
+    pub installed_cell: Option<Arc<crate::journal::cell::CellAccess>>,
     pub control_timeout: Duration,
     /// When set, every frontend must negotiate TLS before startup.
     pub tls: Option<Arc<rustls::ServerConfig>>,
@@ -59,11 +60,22 @@ pub struct GatewayOptions {
 impl Default for GatewayOptions {
     fn default() -> Self {
         Self {
-            cells: None, installed_journals: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
+            cells: None, installed_journals: None, installed_cell: None, tls: None, startup_timeout: crate::session::STARTUP_WITHIN,
             control_timeout: Duration::from_secs(35), touch_interval: Duration::from_secs(10),
             maximum_connections: 4096, maximum_connections_per_deployment: 256,
             maximum_buffered_bytes: crate::session::DEFAULT_GATEWAY_FRAME_BYTES, capabilities: None,
         }
+    }
+}
+
+impl GatewayOptions {
+    pub(crate) async fn ordered_placement(&self, name: &str)
+        -> Result<Option<crate::journal::hosted::GatewayPlacement>>
+    {
+        if let Some(cell) = &self.installed_cell {
+            return cell.gateway_placement(name).await;
+        }
+        Ok(self.installed_journals.as_ref().and_then(|routes| routes.by_name(name)).cloned())
     }
 }
 
@@ -181,7 +193,8 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     let Some(_deployment_connection) = deployments.admit(&name) else {
         return refuse(&mut client, "53300", "This deployment has reached its gateway connection limit").await;
     };
-    let ordered = options.installed_journals.as_ref().and_then(|routes| routes.by_name(&name)).is_some();
+    let ordered = options.installed_cell.is_some()
+        || options.installed_journals.as_ref().and_then(|routes| routes.by_name(&name)).is_some();
     let Ok(remote_gateway) = tokio::time::timeout_at(startup_deadline, async {
         if ordered { None } else { elsewhere(&directory, &name, &options).await }
     }).await else {
@@ -341,7 +354,7 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
     let directory = &router.directory;
     let name = router.name.as_str();
     let options = &router.options;
-    if let Some(installed) = options.installed_journals.as_ref().and_then(|routes| routes.by_name(name)) {
+    if let Some(installed) = options.ordered_placement(name).await? {
         if router.snapshot {
             return Err(Anomaly::unsupported("rtdb.multi/ordered-pgwire-checkpoint-unheld",
                 "The installed PGWire checkpoint selector cannot bind a connection to an exact protected checkpoint"));
@@ -350,15 +363,18 @@ async fn route(router: &GatewayRouter, prefer_holder: bool) -> Result<(TcpStream
             return Err(Anomaly::incorrect("rtdb.multi/install-identity", format!("Database {name} has another installation ID")));
         }
         if router.read_only && !prefer_holder
-            && let Ok(read) = route_ordered_reader(name, installed, options, false).await
+            && let Ok(read) = route_ordered_reader(name, &installed, options, false).await
         {
             let server = connect_serving(&read.worker.pgwire, &read.worker.control, read.probe, options).await?;
             return Ok((server, Some(read.worker.control), read.epoch, installed.deployment.to_string()));
         }
-        let (server, worker, epoch) = route_ordered(name, installed, options, !router.read_only || prefer_holder, |worker, probe| async move {
+        let (server, worker, epoch) = route_ordered(name, &installed, options, !router.read_only || prefer_holder, |worker, probe| async move {
             connect_serving(&worker.pgwire, &worker.control, probe, options).await
         }).await?;
         return Ok((server, Some(worker.control), epoch, installed.deployment.to_string()));
+    }
+    if options.installed_cell.is_some() {
+        return Err(Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No installed deployment is named {name}")));
     }
     let record = directory.deployment_by_name(name).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment is named {name}")))?;

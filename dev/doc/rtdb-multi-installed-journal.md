@@ -10,6 +10,50 @@ Application wire version 9 adds the custodian's bounded query of withdrawn hold 
 An existing RTDB directory record and its log offsets do not certify a Logkeeper history.
 Route the installation through the installed manifest when the initial group, storage and keys are ready.
 
+## Install hosted tenants at runtime
+
+Start the gateway and nodes with `--installed-cell FILE` and the cell route secret.
+Use the gateway's existing installation listener and lifecycle credentials.
+Initialize each voter's media before it starts with an empty `groups` list.
+Give the voters a common `management` array of administrator, route reader and worker certificate pins using the same role objects as the group `clients` array.
+The voter binds management and application connections to their authenticated TLS identities.
+
+The cell file contains the following fields.
+
+| Field | Value |
+| --- | --- |
+| `cell` | Cell name |
+| `ca` | Path to the cell's CA PEM file |
+| `voters` | Odd roster of at least three entries with `voter` UUID, `zone`, `endpoint` as `host:port`, TLS `server_name`, `certificate` as a 32-byte SHA-256 array and Ed25519 `receipt_key` as 64 hex characters |
+| `limits` | Logkeeper `Limits` for every new group |
+| `archive_root` | Independent archive storage location, including the terminal scope for S3 |
+| `keys` | Serving and journal key vault location |
+| `maximum_prefix_bytes`, `maximum_application_frame` | Voter media prefix and application frame sizes for each group |
+| `exchange_ms` | Management deadline in milliseconds, defaulting to 2000 |
+| `administrator_pin`, `route_reader_pin`, optional `custodian_pin` | SHA-256 pins encoded as 32-byte arrays |
+| `workers` | Ordered array of configured worker slots with `worker` UUID, `certificate` pin, `control` and `pgwire` addresses |
+| `credentials` | Optional per-role objects `administrator`, `route_reader`, `worker` and `custodian`, each with a PEM `certificate` and `key` path |
+
+Mount only the private keys that each process uses.
+When a role has no credential entry, supply the `_CERTIFICATE` and `_KEY` path variables under its prefix `RTDB_ORDERED_ADMINISTRATOR`, `RTDB_ORDERED_ROUTE_READER`, `RTDB_ORDERED_WORKER` or `RTDB_ORDERED_CUSTODIAN`.
+A node's certificate selects its configured worker slot.
+Keep worker profiles and voter settings stable across an in-progress installation.
+
+For incarnation 1, send `Install` with the tenant's deployment UUID and name.
+The gateway derives stable placement coordinates from the UUID and sends the exact group definition to every voter.
+A strict majority must persist the definition before the gateway reserves the deployment UUID and provisions the serving key and journal key generation 1.
+The gateway enrolls the configured worker slots and publishes the name binding on a strict majority before returning the existing `Installed` reply.
+Retry a lost reply with the same UUID, name and organization.
+The gateway uses a matching voter majority for name discovery, and a node obtains the published route by deployment UUID when it first receives a matching activation.
+The installed-cell gateway and node serve through this journal authority.
+The static `--installed-journals` configuration remains available for a provisioned group.
+
+`ScheduleDisposal` waits for the selected checkpoint to cover the journal head.
+It withdraws the configured enrollments and retires the group after its holds and any checkpoint preparation have drained.
+A matching voter majority persists the terminal retirement and the lifecycle endpoint returns `Scheduled`.
+The retired route stays unavailable to workers and serving gateways.
+The journal seal retains the voter media and does not supply a physical disposal receipt.
+
 ## Provision the journal and storage
 
 1. Install an odd cohort of at least three Logkeeper voters in distinct failure zones. Give each voter an exclusive persistent volume and a distinct TLS certificate and receipt-signing key. The stage and selected image alternate between two preallocated slots on each volume. Size the volume for the two full slots, group metadata and filesystem overhead. The initialization command creates new media. Restarts use the serving command and recover the existing media.

@@ -33,10 +33,10 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node [--directory DIR] [--installed-journals FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
-       rtdb-multi gateway [--directory DIR] [--installed-journals FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
+       rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
                           [--install-listen ADDR --install-token-file FILE --install-org ORG --install-replicas N]\n\
                           [--disposal-token-file FILE]\n\
        rtdb-multi cell-map --listen ADDR [--dynamodb-prefix PREFIX]\n\
@@ -545,13 +545,20 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             }
             let audience = configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
             let installed_journals = arguments.optional("installed-journals").map(PathBuf::from);
+            let installed_cell = arguments.optional("installed-cell").map(PathBuf::from);
+            let runtime_cell = installed_cell.as_deref().map(rtdb_multi::journal::cell::InstalledCell::read).transpose()?;
+            let keys = match &runtime_cell {
+                Some(cell) => cell.keys.as_str(),
+                None => arguments.required("keys")?,
+            };
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
                 Some(directory) => open_directory(directory, audience && arguments.present("audience-journal-port")).await?,
-                None if installed_journals.is_some() && !audience => rtdb_directory::MemoryDirectory::new(),
+                None if (installed_journals.is_some() || installed_cell.is_some()) && !audience => rtdb_directory::MemoryDirectory::new(),
                 None => return Err(usage("--directory is required without an installed journal manifest".into())),
             };
             let mut agent = AgentOptions::new(CellStorage::parse(arguments.required("storage-root")?)?);
             agent.installed_journal_manifest = installed_journals;
+            agent.installed_cell = installed_cell;
             agent.replay_broker = replay_broker_client(&arguments, "")?;
             if let Some(port) = arguments.optional("audience-journal-port") {
                 agent.audience_journal_port = Some(port.parse::<u16>().ok()
@@ -584,7 +591,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
-                keys: key_service(arguments.required("keys")?).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
+                keys: key_service(keys).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
@@ -613,13 +620,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             };
             let installed_journals = arguments.optional("installed-journals")
                 .map(|path| rtdb_multi::journal::hosted::GatewayRoutes::read(std::path::Path::new(path))).transpose()?.map(Arc::new);
-            let classic_audience = arguments.present("directory") && audience.is_some_and(|(_, profile)| {
+            let installed_cell = arguments.optional("installed-cell")
+                .map(|path| rtdb_multi::journal::cell::InstalledCell::read(std::path::Path::new(path))).transpose()?;
+            if installed_cell.is_some() && installed_journals.is_some() {
+                return Err(usage("Choose --installed-cell or --installed-journals".into()));
+            }
+            let classic_audience = installed_cell.is_none() && arguments.present("directory") && audience.is_some_and(|(_, profile)| {
                 installed_journals.as_ref().is_none_or(|routes| !routes.contains_deployment(profile.source()))
             });
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
                 Some(address) => open_directory(address, classic_audience).await?,
-                None if installed_journals.is_some() => rtdb_directory::MemoryDirectory::new(),
-                None => return Err(usage("--directory is required without an installed journal manifest".into())),
+                None if installed_journals.is_some() || installed_cell.is_some() && audience.is_none() => rtdb_directory::MemoryDirectory::new(),
+                None => return Err(usage("--directory is required without an installed journal manifest or for runtime audience Flight".into())),
             };
             if classic_audience { directory.require_audience_reads()?; }
             let listener = tokio::net::TcpListener::bind(arguments.address("listen", "127.0.0.1:5432")?).await.map_err(io)?;
@@ -633,6 +645,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 None
             };
             let mut options = gateway::GatewayOptions { capabilities: cell_secret(&arguments)?, tls: tls.clone(), installed_journals, ..Default::default() };
+            if let Some(cell) = &installed_cell {
+                if options.capabilities.is_none() {
+                    return Err(usage("--installed-cell requires --cell-secret".into()));
+                }
+                options.installed_cell = Some(Arc::new(cell.access(rtdb_multi::journal::cell::Role::RouteReader)?));
+            }
             options.maximum_connections = arguments.number("max-connections", options.maximum_connections)?;
             options.maximum_connections_per_deployment = arguments.number("max-connections-per-deployment", options.maximum_connections_per_deployment)?;
             options.maximum_buffered_bytes = arguments.number("max-buffered-bytes", options.maximum_buffered_bytes)?;
@@ -678,6 +696,13 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     arguments.required("install-org")?.to_owned(),
                     arguments.number("install-replicas", 3usize)?,
                 )?;
+                let installer = match &installed_cell {
+                    Some(cell) => installer.with_installed_cell(
+                        Arc::new(cell.access(rtdb_multi::journal::cell::Role::Administrator)?),
+                        key_service(&cell.keys).await?,
+                    ),
+                    None => installer,
+                };
                 let installs = tokio::net::TcpListener::bind(arguments.address("install-listen", "127.0.0.1:0")?).await.map_err(io)?;
                 tokio::select! {
                     gateway = gateway::serve(listener, directory.clone(), options.clone(), cancellation.clone()) => gateway,
