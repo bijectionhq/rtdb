@@ -15,7 +15,9 @@ pub(crate) async fn needs_rank_family(
     }
     let (schema, _) = rtdb_query::read_owned_relation_schema(Arc::clone(context), owner, relation).await?
         .ok_or_else(unavailable)?;
-    if relation.admits_world_ciphertext_points(&schema) { return Ok(true); }
+    if relation.admits_world_ciphertext_points(&schema) {
+        return if PlaintextView::has_root_rank_authority() { Ok(true) } else { Err(unavailable()) };
+    }
     if schema.has_opaque_columns() { return Err(unavailable()); }
     Ok(false)
 }

@@ -255,6 +255,8 @@ Flight and archive rank outputs also carry a bounded current marker check throug
 Protocol 222 includes a complete bounded family inventory in each held text and nearest reply, including replies with no hits.
 The inventory comes from the admitted corpus before result slicing. It covers non-hit text statistics and vector candidates, and includes protected world shadows that affect the inherited corpus.
 The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field.
+Protected partitions require the installed original rank owner before corpus or scoring work.
+The statistics-only artefact route refuses protected partitions.
 An indexed Root landing registers its physical derivative under `bjrl1/<family hex>/<destination assertion hex>/<canonical AddressRef>` before publication.
 The family and assertion fields are 32 and 64 lowercase hexadecimal characters, respectively, and the full physical selector fits the 512-byte derivative key bound.
 The ranker uses the canonical address for overlay masks, candidate identity, tie breaks, and output.

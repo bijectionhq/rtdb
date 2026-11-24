@@ -197,13 +197,20 @@ impl PlaintextView {
         }).map_err(|_| rank_unavailable())?
     }
 
-    pub async fn require_root_rank_derivative(selected: RootRankSelection<'_>) -> rtdb_types::Result<()> {
-        let authority = PLAINTEXT_VIEWS.try_with(|views| {
+    fn root_rank_authority() -> Option<Arc<dyn RootRankAuthority>> {
+        PLAINTEXT_VIEWS.try_with(|views| {
             views.iter().rev().find_map(|view| {
                 view.rank.lock().as_ref().map(|rank| rank.root_authority.clone())
             }).flatten()
-        }).ok().flatten().ok_or_else(rank_unavailable)?;
-        authority.require_derivative(selected).await
+        }).ok().flatten()
+    }
+
+    pub fn has_root_rank_authority() -> bool {
+        Self::root_rank_authority().is_some()
+    }
+
+    pub async fn require_root_rank_derivative(selected: RootRankSelection<'_>) -> rtdb_types::Result<()> {
+        Self::root_rank_authority().ok_or_else(rank_unavailable)?.require_derivative(selected).await
     }
 
     pub fn tracks_rank_inventory() -> bool {
