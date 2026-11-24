@@ -15,29 +15,29 @@ use super::{
     key::{AtomRef, Bucket},
     maintenance::cancelled,
     postings::{BatchKind, KeyBatch, KeyRow, ProjectedKeys, Tuple},
-    tree::{Address, AddressRef, Cursor, Hit, Item, Key, KeyRef, Link, Root, Span, Tree},
+    tree::{Address, AddressRef, Cursor, Hit, IndexRevision, Item, Key, KeyRef, Link, Root, Span, Tree},
 };
 
-/// The roots for the partition's system-time points, with erasures applied to every affected root.
+/// The roots for the partition's ordered history, with erasures applied to every affected root.
 #[derive(Default)]
 pub(super) struct RevisionRoots {
     pub archived: Root,
-    pub changes: BTreeMap<Timestamp, Root>,
+    pub changes: BTreeMap<IndexRevision, Root>,
 }
 
 impl RevisionRoots {
     pub async fn at(
         &self,
         tree: &Tree,
-        system_from: Timestamp,
-    ) -> Result<Option<(Timestamp, Root)>> {
-        if let Some((&time, root)) = self.changes.range(..=system_from).next_back() {
+        through: IndexRevision,
+    ) -> Result<Option<(IndexRevision, Root)>> {
+        if let Some((&time, root)) = self.changes.range(..=through).next_back() {
             return Ok(Some((time, root.clone())));
         }
         let mut cursor = Cursor::new(self.archived.clone(), true);
         cursor
             .next(tree, |key| match key {
-                KeyRef::Revision(time) if time <= system_from => Ordering::Equal,
+                KeyRef::Revision(revision) if revision <= through => Ordering::Equal,
                 KeyRef::Revision(_) => Ordering::Greater,
                 KeyRef::Posting(..) | KeyRef::Row(_) => Ordering::Less,
             })
@@ -73,11 +73,11 @@ impl RevisionRoots {
             return Ok(());
         }
         let (mut last, mut root) = self
-            .at(tree, Timestamp::MAX)
+            .at(tree, IndexRevision::MAX)
             .await?
-            .map_or((Timestamp::MIN, None), |(time, root)| (time, root));
-        for (time, rows) in changes.revisions {
-            if last > time {
+            .map_or((None, None), |(revision, root)| (Some(revision), root));
+        for (revision, rows) in changes.revisions {
+            if last.is_some_and(|last| last > revision) {
                 return Err(format_error(
                     "Ordered index replay crossed its revision frontier",
                 ));
@@ -96,11 +96,11 @@ impl RevisionRoots {
                 }
                 let before = tree.spans(&root, &address).await?;
                 let cut = events.iter().any(|event| event.header.op == EventOp::Erase);
-                let after = resolve(address.iid, time, &before, &events, &tree.memory)?;
+                let after = resolve(address.iid, revision.time, &before, &events, &tree.memory)?;
                 if cut {
                     cut_at_revision = true;
                     self.stage_archived(tree, cancellation).await?;
-                    for (_, historical) in self.changes.range_mut(..time) {
+                    for (_, historical) in self.changes.range_mut(..revision) {
                         let spans = tree.spans(historical, &address).await?;
                         if !spans.is_empty() {
                             let mut removals = BTreeMap::new();
@@ -117,15 +117,15 @@ impl RevisionRoots {
             }
             if cut_at_revision || !edits.is_empty() {
                 root = tree.edit(root, edits.into_iter().collect()).await?;
-                self.changes.insert(time, root.clone());
+                self.changes.insert(revision, root.clone());
             }
-            last = time;
+            last = Some(revision);
         }
         Ok(())
     }
 }
 
-fn archived_revision(hit: Hit) -> Result<(Timestamp, Root)> {
+fn archived_revision(hit: Hit) -> Result<(IndexRevision, Root)> {
     let entry = hit.into_entry();
     match (entry.key, entry.item) {
         (Key::Revision(time), Item::Revision(pointer)) => Ok((time, pointer.map(Link::Stored))),
@@ -248,7 +248,7 @@ struct Event {
 
 #[derive(Default)]
 pub(super) struct Changes {
-    revisions: BTreeMap<Timestamp, BTreeMap<Address, Vec<Event>>>,
+    revisions: BTreeMap<IndexRevision, BTreeMap<Address, Vec<Event>>>,
 }
 
 impl Changes {
@@ -257,28 +257,31 @@ impl Changes {
         self,
         tree: &Tree,
         mut root: Root,
-        system_at: Timestamp,
+        through: IndexRevision,
         order: EventOrder,
         cancellation: &CancellationToken,
     ) -> Result<Root> {
-        for (time, rows) in self.revisions {
+        for (revision, rows) in self.revisions {
             let mut edits = BTreeMap::new();
             for (address, mut events) in rows {
                 if cancellation.is_cancelled() {
                     return Err(cancelled());
                 }
-                if time > system_at && !events.iter().any(|event| event.header.op == EventOp::Erase)
+                if revision > through && !events.iter().any(|event| event.header.op == EventOp::Erase)
                 {
                     continue;
                 }
                 let before = tree.spans(&root, &address).await?;
-                let after = if time > system_at {
+                let after = if revision > through {
                     Vec::new()
                 } else {
                     if matches!(order, EventOrder::OldestFirst) {
                         events.reverse();
                     }
-                    resolve(address.iid, time, &before, &events, &tree.memory)?
+                    if events.iter().any(|event| event.header.position.is_some() || event.header.commit_position != 0) {
+                        events.sort_by_key(|event| std::cmp::Reverse(event.header.precedence()));
+                    }
+                    resolve(address.iid, revision.time, &before, &events, &tree.memory)?
                 };
                 if before.as_ref() != after.as_slice() {
                     project(&mut edits, &address, &before, after.into());
@@ -402,7 +405,7 @@ impl Changes {
             for (header, address, row) in retained {
                 let allocation = memory.reserve(address.key.len().saturating_add(256))?;
                 self.revisions
-                    .entry(header.system_from)
+                    .entry(IndexRevision::of_event(header))
                     .or_default()
                     .entry(address.owned())
                     .or_default()
@@ -510,7 +513,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (_, pin) = roots.at(&tree, Timestamp(0)).await.unwrap().unwrap();
+        let (_, pin) = roots.at(&tree, IndexRevision::through_time(Timestamp(0))).await.unwrap().unwrap();
         let revised = put(1, 1, Interval::from_micros(4, 8).unwrap(), 5);
         roots
             .apply(
@@ -521,7 +524,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (_, root) = roots.at(&tree, Timestamp(1)).await.unwrap().unwrap();
+        let (_, root) = roots.at(&tree, IndexRevision::through_time(Timestamp(1))).await.unwrap().unwrap();
         for (valid, expected) in [(3, 90), (4, 5), (7, 5), (8, 90), (15, 90)] {
             assert_eq!(
                 keys(&tree, root.clone(), Timestamp(valid)).await,
@@ -530,6 +533,33 @@ mod tests {
         }
         assert!(keys(&tree, root, Timestamp(16)).await.is_empty());
         assert_eq!(keys(&tree, pin, Timestamp(4)).await, vec![(90, iid)]);
+    }
+
+    #[tokio::test]
+    async fn an_ordered_cut_selects_one_of_two_tied_transactions() {
+        use rtdb_types::{EventPosition, TxId};
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
+        let memory = MemoryBudget::new(32 << 20);
+        let directory = ObjectKey::new("tied-revisions").unwrap();
+        let tree = Tree::new(&storage, &directory, &memory, 0).await.unwrap();
+        let token = CancellationToken::new();
+        let mut roots = RevisionRoots::default();
+        let mut first = put(1, 40, Interval::ALL, 2);
+        let mut second = put(1, 40, Interval::ALL, 9);
+        first.position = Some(EventPosition { transaction: TxId(10), ordinal: 0 });
+        second.position = Some(EventPosition { transaction: TxId(11), ordinal: 0 });
+        let iid = first.iid;
+
+        roots.apply(&tree, changes(&[second, first], &memory, &token), EventOrder::NewestFirst, &token)
+            .await.unwrap();
+        roots.archived = super::super::checkpoint::store_roots(&tree, 0, &roots, &token).await.unwrap();
+        roots.changes.clear();
+        let captured = IndexRevision { time: Timestamp(40), transaction: 10 };
+        let (_, early) = roots.at(&tree, captured).await.unwrap().unwrap();
+        let (_, late) = roots.at(&tree, IndexRevision::through_time(Timestamp(40))).await.unwrap().unwrap();
+        assert_eq!(keys(&tree, early, Timestamp(0)).await, vec![(2, iid)]);
+        assert_eq!(keys(&tree, late, Timestamp(0)).await, vec![(9, iid)]);
     }
 
     #[tokio::test]
@@ -558,12 +588,12 @@ mod tests {
         };
         roots.apply(&tree, changes(&[first, peer], &memory, &token), EventOrder::OldestFirst, &token)
             .await.unwrap();
-        let (_, original) = roots.at(&tree, Timestamp(0)).await.unwrap().unwrap();
+        let (_, original) = roots.at(&tree, IndexRevision::through_time(Timestamp(0))).await.unwrap().unwrap();
         assert_eq!(keys(&tree, original, Timestamp(0)).await, vec![(2, iid), (9, iid)]);
         roots.apply(&tree, changes(&[erase], &memory, &token), EventOrder::OldestFirst, &token)
             .await.unwrap();
         for at in [0, 1] {
-            let (_, root) = roots.at(&tree, Timestamp(at)).await.unwrap().unwrap();
+            let (_, root) = roots.at(&tree, IndexRevision::through_time(Timestamp(at))).await.unwrap().unwrap();
             assert_eq!(keys(&tree, root, Timestamp(0)).await, vec![(9, iid)]);
         }
     }
@@ -604,8 +634,8 @@ mod tests {
             )
             .await
             .unwrap();
-        let (_, old) = roots.at(&tree, Timestamp(0)).await.unwrap().unwrap();
-        let (_, new) = roots.at(&tree, Timestamp(1)).await.unwrap().unwrap();
+        let (_, old) = roots.at(&tree, IndexRevision::through_time(Timestamp(0))).await.unwrap().unwrap();
+        let (_, new) = roots.at(&tree, IndexRevision::through_time(Timestamp(1))).await.unwrap().unwrap();
         assert!(keys(&tree, old, Timestamp(6)).await.is_empty());
         assert!(keys(&tree, new.clone(), Timestamp(4)).await.is_empty());
         assert_eq!(keys(&tree, new, Timestamp(6)).await, vec![(3, iid)]);

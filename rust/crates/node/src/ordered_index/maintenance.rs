@@ -277,7 +277,7 @@ fn source_read_error(error: rtdb_storage::Error) -> Anomaly {
 #[derive(Default)]
 struct ErasureCuts {
     scope: u64,
-    by_address: BTreeMap<Address, (Timestamp, Arc<MemoryReservation>)>,
+    by_address: BTreeMap<Address, ((Timestamp, i128), Arc<MemoryReservation>)>,
 }
 
 impl ErasureCuts {
@@ -294,10 +294,10 @@ impl ErasureCuts {
                 match self.by_address.entry(address.owned()) {
                     Entry::Occupied(mut entry) => {
                         let cut = &mut entry.get_mut().0;
-                        *cut = (*cut).max(header.system_from);
+                        *cut = (*cut).max(header.precedence());
                     }
                     Entry::Vacant(entry) => {
-                        entry.insert((header.system_from, memory.reserve(key.len().saturating_add(128))?));
+                        entry.insert((header.precedence(), memory.reserve(key.len().saturating_add(128))?));
                     }
                 }
             }
@@ -306,7 +306,7 @@ impl ErasureCuts {
     }
 
     fn retains(&self, header: rtdb_types::EventHeader, address: AddressRef<'_>) -> bool {
-        self.by_address.get(&address.owned()).is_none_or(|(cut, _)| header.system_from >= *cut)
+        self.by_address.get(&address.owned()).is_none_or(|(cut, _)| header.precedence() >= *cut)
     }
 }
 
@@ -381,8 +381,13 @@ pub(super) async fn read_root(
     system_at: Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<Option<Root>> {
+    let through = match snapshot.tx_basis() {
+        Some(head) if head.system_time <= system_at =>
+            super::tree::IndexRevision { time: head.system_time, transaction: head.tx_id.0 },
+        _ => super::tree::IndexRevision::through_time(system_at),
+    };
     let Some(root) =
-        read_flushed_root(tree, definition, snapshot, checkpoint, system_at, cancellation).await?
+        read_flushed_root(tree, definition, snapshot, checkpoint, through, cancellation).await?
     else {
         return Ok(None);
     };
@@ -400,7 +405,7 @@ pub(super) async fn read_root(
             )?;
         }
     }
-    live.read(tree, root, system_at, EventOrder::OldestFirst, cancellation)
+    live.read(tree, root, through, EventOrder::OldestFirst, cancellation)
         .await
         .map(Some)
 }
@@ -410,14 +415,14 @@ async fn read_flushed_root(
     definition: &Definition,
     snapshot: &Snapshot,
     checkpoint: Option<checkpoint::Checkpoint>,
-    system_at: Timestamp,
+    revision: super::tree::IndexRevision,
     cancellation: &CancellationToken,
 ) -> Result<Option<Root>> {
     let through = source_frontier(snapshot, &definition.table);
     let (after, mut rows, mut root) = if let Some(checkpoint) = checkpoint {
         let root = checkpoint
             .roots()
-            .at(tree, system_at)
+            .at(tree, revision)
             .await?
             .and_then(|(_, root)| root);
         (checkpoint.through, checkpoint.source_rows, root)
@@ -438,7 +443,7 @@ async fn read_flushed_root(
             flushed_changes(tree, definition, &source, cancellation, |_, _| true).await?;
         rows = rows.checked_add(count).ok_or_else(incomplete_source)?;
         root = changes
-            .read(tree, root, system_at, EventOrder::NewestFirst, cancellation)
+            .read(tree, root, revision, EventOrder::NewestFirst, cancellation)
             .await?;
     }
     if rows != source_rows(snapshot, &definition.table) {

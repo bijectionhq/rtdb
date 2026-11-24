@@ -209,6 +209,8 @@
 -- At the admitted system cut, a held root valid window returns ordered non-overlapping winning slices clipped at the requested endpoints.
 -- A held position point or valid window excludes assertions from the first masked position through the end of one commit before resolving the winners.
 -- A Root point or valid window reports the stored ordinal of each positioned winner through its owned read response.
+-- An ordered index keeps separate revision roots for tied historical times and applies the held cut through its original transaction.
+-- Rebuilding an ordered index suppresses assertions before the full erasure position, including earlier assertions at the same historical time.
 -- A held position read still honours live ordered erasure and returns no commit evidence.
 -- A held world valid window can resolve the archived parent alone for a relation without a fixed lifetime.
 -- Its ordered condition checks the original parent pin and Root purge frontier.
