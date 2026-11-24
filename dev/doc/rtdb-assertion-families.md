@@ -160,6 +160,16 @@ All hex is lowercase, including the canonical AddressRef. The full selector fits
 RTDB checks the selector's family and member against the request. Root entries are deduplicated by relation and physical selector.
 A refused or interrupted reservation may retain its inventory entry. Its selector is disjoint from every ordinary Root projection at that address.
 A world slot can enrol multiple fresh stages for the same member across rewrites.
+A retained Root execution outcome may use a separately enrolled stage on the installed Root line.
+For that artifact the `world` field names the original installed Root line, the member is an active landing on that line, the relation is `bj_fact_root_admission`, and the key is a 64-character lowercase hex commitment to the receipt and its disclosure.
+The Root line is a sealing scope for this private artifact. A Root search projection uses its distinct physical selector and carries no stage.
+The existing family envelope actions and the derived-stage response hold bind the same receipt artifact slot.
+The retained outcome keeps its existing Root unit seal, and recall requires the original Root unit fence and the exact live family member.
+The installed Root line, family vault and receipt must remain reachable.
+The admitted output route covers a registered result with one exact landed Root point as its protected input.
+A successor archive copy needs a durable route authenticated to the Original deployment, incarnation, ordered journal position and current family authority.
+A frozen capture proves the historical assertion and bytes. Recall through a new deployment also needs access to the Original ordered marker and release owner through any source retirement.
+Successor replay of a family carrier refuses until that route is available.
 An exact retry succeeds and conflicting reuse of a stage or slot is refused.
 A family holds at most 2048 derived entries; the next registration is refused with `rtdb.multi/assertion-family-size`.
 
@@ -264,18 +274,26 @@ An indexed Root landing registers its physical derivative under `bjrl1/<family h
 The family and assertion fields are 32 and 64 lowercase hexadecimal characters, respectively, and the full physical selector fits the 512-byte derivative key bound.
 The ranker uses the canonical address for overlay masks, candidate identity, tie breaks, and output.
 Custody and erasure use the full physical selector.
-Before admitting an unshadowed protected Root projection, the ranker reads the payload carrier at `row/<AddressRef>` on the same held valid and system cut.
-For a landed carrier, it also reads `row-position/row/<AddressRef>` from the installed base relation underlying the search relation.
+The installed writer uses the registered selector for both first publication and later backfill, and ordinary writes cannot replace an active landed carrier.
+This publication contract requires a fresh installation and supported retained cuts with no previous raw family derivative slots.
+A raw projection expresses ordinary protected custody and uses the existing corpus bounds.
+Before admitting an unshadowed decorated Root projection, the ranker requires absence of the raw projection and reads the payload carrier at `row/<AddressRef>` and the protected journal at `row-position/row/<AddressRef>` at the same held valid and system cut.
+The journal belongs to the installed base relation underlying the search relation.
 The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
 The Root contributor uses the journal assertion ordinal.
-Undecorated family-linked projections and multiple visible physical selectors for an unshadowed canonical address refuse.
+A decorated selector with a different carrier or with a visible raw alias refuses.
+Hosted protocol 223 advertises the binary ranked-reply actions via Flight `ListActions`.
+The Root actions are `SearchHeld.v7`, `NearestHeld.v4` and `HybridHeld.v4` in the `rtdb.owned.` namespace.
+World text uses `SearchHeldWorld.v4`, `SearchHeldWorldAt.v3` and `SearchHeldWorldParentAt.v3`.
+World vector and hybrid use `NearestHeldWorld.v3`, `NearestHeldWorldAt.v3`, `NearestHeldWorldParentAt.v3`, `HybridHeldWorld.v3`, `HybridHeldWorldAt.v3` and `HybridHeldWorldParentAt.v3`.
+The action request bodies and rank-scope digest domains are unchanged.
 Ranked replies require the `x-rtdb-owned-ipc: stream-v1` request header.
 The first Flight action result body carries the binary inventory as a big-endian u16 entry count followed by entries in strictly increasing byte order.
 Even a zero count has its own result body.
 The Arrow IPC schema, any hit batch frames and the end marker follow in the same reply stream.
 The reply admits the combined encoded Flight result sizes under the existing message limit before sending any frame.
 An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root protected journal publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
-The bounds are 512 entries of at most 1024 bytes, at most 512 Root carrier probes per rank, and one journal probe per decorated Root selector.
+The bounds are 512 entries of at most 1024 bytes, at most 512 decorated Root selectors per rank, with one carrier, journal and raw alias probe per selector.
 Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
 `FamilyResponseRelease.v2` adds exact world-derived input kind 2 and exact Root-derived input kind 3 to the existing response-part hold.
 The consumer retains the inventory in the invocation's original output custody even when it returns only counts, cursors or derived scores.

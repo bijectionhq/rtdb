@@ -1,7 +1,7 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use rtdb_columnar::{ArrowCell, EntityIdRef, OwnedBatch};
-use rtdb_query::{QueryContext, owned_row_revision, owned_row_revision_for};
+use rtdb_query::{QueryContext, owned_row_revision, owned_row_revision_for, read_owned_point_revision};
 use rtdb_storage::sealing::{PlaintextView, RootRankSelection};
 use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, EntityId, Interval, OwnedRelation, Result, RootFamilyDerivativeId, RootLandingTarget, Timestamp};
 use sha2::{Digest, Sha256};
@@ -30,9 +30,7 @@ pub(crate) struct RootProjectionId<'a> {
 impl<'a> RootProjectionId<'a> {
     pub(crate) fn parse(id: EntityIdRef<'a>) -> Result<Self> {
         let EntityIdRef::String(physical) = id else { return Err(unavailable()); };
-        if physical.is_empty() || physical.len() > RootFamilyDerivativeId::MAX_KEY_BYTES {
-            return Err(unavailable());
-        }
+        if physical.is_empty() { return Err(unavailable()); }
         let landing = RootFamilyDerivativeId::parse(physical).map_err(|_| unavailable())?;
         Ok(Self { physical, landing })
     }
@@ -49,18 +47,20 @@ impl<'a> RootProjectionId<'a> {
         &self, context: &Arc<QueryContext>, owner: &str, relation: &OwnedRelation, valid: Timestamp,
         projection: &arrow_array::RecordBatch, row: usize,
     ) -> Result<()> {
+        let Some(landing) = self.landing else { return Ok(()); };
         PlaintextView::charge_rank_carrier()?;
+        let alias = self.canonical().into_owned();
+        if read_owned_point_revision(Arc::clone(context), owner, relation, &alias, Interval::at(valid)?)
+            .await?.is_some()
+        {
+            return Err(unavailable());
+        }
+
         let carrier_relation = OwnedRelation::new("fact_unit_column_payloads")?;
-        let carrier_key = format!("row/{}", self.address());
-        let journal_key = self.landing.map(|_| format!("row-position/{carrier_key}"));
-        let carrier = EntityId::String(carrier_key);
+        let carrier = EntityId::String(format!("row/{}", landing.address));
         let page = point(context, owner, &carrier_relation, &carrier, valid).await?;
         let body = ArrowCell::named(page.batch(), "sealed_payload", 0)
             .and_then(ArrowCell::binary).ok_or_else(unavailable)?;
-        let Some(landing) = self.landing else {
-            return if body.starts_with(b"BJRP1") { Ok(()) } else { Err(unavailable()) };
-        };
-
         let body = body.strip_prefix(b"BJRL1").ok_or_else(unavailable)?;
         let (family, body) = body.split_first_chunk::<16>().ok_or_else(unavailable)?;
         let (stage, body) = body.split_first_chunk::<40>().ok_or_else(unavailable)?;
@@ -74,7 +74,7 @@ impl<'a> RootProjectionId<'a> {
         }
 
         let journal = OwnedRelation::new(relation.name().strip_suffix("_search").ok_or_else(unavailable)?)?;
-        let journal_id = EntityId::String(journal_key.ok_or_else(unavailable)?);
+        let journal_id = EntityId::String(format!("row-position/row/{}", landing.address));
         let position = point(context, owner, &journal, &journal_id, valid).await?;
         ArrowCell::named(position.batch(), "membership_until", 0).and_then(ArrowCell::binary)
             .filter(|bytes| bytes.len() == size_of::<i64>()).ok_or_else(unavailable)?;
