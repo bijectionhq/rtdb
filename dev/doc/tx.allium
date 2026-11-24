@@ -272,6 +272,8 @@
 --      The selected decision must have quorum installation before exposure, including when the receiver has to complete installation.
 --      The cut covers all prior quorum-installed decisions and completed fresh reads of the same history.
 --      A silent writer and uncertified staged suffix add no dependency when a quorum, hold and selected applied cut are available.
+--      An enrolled ordered reader can protect replay and apply the barrier while the writer grant is vacant.
+--      Ordinary Flight release consumes durable, authenticated range evidence at a protected applied cut of the same history.
 --      A replay-safe unpinned read may retry within the same lineage before output, with its causal floor and audience intact.
 --      A read transaction retains its captured basis across later statements.
 --      Each explicit snapshot token identifies the basis the caller selected.

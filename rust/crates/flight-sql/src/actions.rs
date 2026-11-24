@@ -18,6 +18,8 @@ fn fresh_replica_action(action: &str) -> bool {
         | READ_HELD_ROOT_CATALOG_V1
         | OPEN_OWNED_SCOPED_READ_V2
         | OPEN_OWNED_READ_AS_OF_V1
+        | SEAL_HOSTED_RANGES_V1
+        | VALIDATE_FRESH_HOSTED_V1
         | OPEN_FRESH_OWNED_READ_V2
         | SPATIAL_OPEN_OWNED
         | SPATIAL_RANK_NEXT_OWNED
@@ -109,7 +111,9 @@ impl Service {
                 }
             }
             match action_type {
-                crate::owned_actions::DECIDE_HOSTED_V1 => Ok(vec![Ok(self.decide_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
+                crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECIDE_HOSTED_V2 => Ok(vec![Ok(self.decide_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
@@ -385,5 +389,7 @@ fn fresh_flight_sessions_admit_only_read_actions() {
     assert!(!fresh_replica_action(OPEN_OWNED_READ_V3));
     assert!(!fresh_replica_action(OFFER_CLOCK_SLOT_V1));
     assert!(!fresh_replica_action(COMMIT_OWNED_V7));
-    assert!(!fresh_replica_action(DECIDE_HOSTED_V1));
+    assert!(fresh_replica_action(SEAL_HOSTED_RANGES_V1));
+    assert!(fresh_replica_action(VALIDATE_FRESH_HOSTED_V1));
+    assert!(!fresh_replica_action(DECIDE_HOSTED_V2));
 }

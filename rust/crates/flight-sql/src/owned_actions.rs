@@ -34,7 +34,9 @@ use crate::{
     upload, wire,
 };
 
-pub(crate) const DECIDE_HOSTED_V1: &str = "rtdb.owned.DecideHosted.v1";
+pub(crate) const SEAL_HOSTED_RANGES_V1: &str = "rtdb.owned.SealHostedRanges.v1";
+pub(crate) const VALIDATE_FRESH_HOSTED_V1: &str = "rtdb.owned.ValidateFreshHosted.v1";
+pub(crate) const DECIDE_HOSTED_V2: &str = "rtdb.owned.DecideHosted.v2";
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
 pub(crate) const DECLARE_OWNED_CAPACITY_V2: &str = "rtdb.owned.DeclareCapacity.v2";
 pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniquePath.v1";
@@ -1067,6 +1069,95 @@ impl Service {
         Ok((OwnedClockSlot { through, reading }, body))
     }
 
+    /// Seal only observations the original native hold actually issued.
+    pub(crate) async fn seal_hosted_ranges_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        self.hosted_control_policy(call)?;
+        let (witnesses, rest, _witness_charge) = self.owned_witness_prefix(call, body, false)?;
+        if !rest.is_empty() { return Err(invalid("Unexpected input after the hosted range witnesses")); }
+        let mut bytes = Vec::new();
+        let mut charges = Vec::with_capacity(witnesses.len());
+        for (held, witness) in witnesses {
+            let cap = wire::add(4096, wire::mul(witness.retained_bytes(), 12)?)?
+                .min(3 * rtdb_node::MAX_DURABLE_RANGE_BYTES);
+            charges.push(call.reserve(cap)?);
+            let token = held.snapshot.seal_durable_range(&witness).map_err(status)?;
+            bytes.extend_from_slice(&u32::try_from(token.len()).map_err(arrow)?.to_be_bytes());
+            bytes.extend_from_slice(token.as_bytes());
+        }
+        let charge = call.reserve(bytes.len())?;
+        Ok(ActionResult { body: wire::retain(Bytes::from(bytes), charge) })
+    }
+
+    fn durable_hosted_ranges<'a>(&self, body: &'a [u8]) -> Result<(Vec<&'a str>, &'a [u8]), Status> {
+        let (length, mut body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Hosted validation has no range count"))?;
+        let count = usize::from(u16::from_be_bytes(*length));
+        if count > MAX_RANGE_WITNESSES { return Err(invalid("Too many hosted range witnesses")); }
+        let mut witnesses = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (length, rest) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Missing durable range length"))?;
+            let length = u32::from_be_bytes(*length) as usize;
+            if length == 0 || length > 2 * rtdb_node::MAX_DURABLE_RANGE_BYTES {
+                return Err(invalid("Invalid durable range length"));
+            }
+            let (token, rest) = rest.split_at_checked(length).ok_or_else(|| invalid("Truncated durable range"))?;
+            witnesses.push(std::str::from_utf8(token).map_err(|_| invalid("Invalid durable range encoding"))?);
+            body = rest;
+        }
+        Ok((witnesses, body))
+    }
+
+    async fn open_durable_hosted_ranges(&self, call: &Call, tokens: Vec<&str>) -> Result<Vec<rtdb_node::DurableRange>, Status> {
+        if tokens.is_empty() { return Ok(Vec::new()); }
+        let connection = self.connection(call, &call.database).await?;
+        let native = connection.borrow().await?;
+        require_idle(&native)?;
+        tokens.into_iter().map(|token| native.open_durable_range(token).map_err(status)).collect()
+    }
+
+    pub(crate) async fn validate_fresh_hosted_action(
+        &self, call: &Call, envelope: &Bytes,
+    ) -> Result<ActionResult, Status> {
+        let policy = self.hosted_control_policy(call)?;
+        if call.session.audience_source().is_some() { return Err(unsupported()); }
+        let (floor, body) = hosted_observation::applied_read_floor(envelope)?;
+        let (tokens, body) = self.durable_hosted_ranges(body)?;
+        let token_bytes = tokens.iter().map(|token| token.len()).sum();
+        let _witness_charge = call.reserve(wire::add(4096, wire::mul(token_bytes, 4)?)?)?;
+        let ranges = self.open_durable_hosted_ranges(call, tokens).await?;
+        let (until, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted validation has no deadline"))?;
+        let (length, body) = body.split_first_chunk::<4>().ok_or_else(|| invalid("Hosted validation has no fact group length"))?;
+        let (facts, controls) = body.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Truncated hosted validation fact groups"))?;
+        let count = ordered_group_count(facts)?;
+        let _framing = call.reserve((count + MAX_COMMIT_GROUPS) * 512)?;
+        let facts = owned_groups(facts, false, true)?;
+        let controls = owned_groups(controls, true, false)?;
+        let fact_relations = facts.iter().map(|(relation, _)| relation).collect::<BTreeSet<_>>();
+        if fact_relations.len() + controls.len() > MAX_COMMIT_GROUPS {
+            return Err(invalid("Hosted validation exceeds its group limit"));
+        }
+        hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
+        let scope = self.hosted_control_scope(call).await?;
+        let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(ranges.len())
+            .ok_or_else(|| invalid("Hosted validation exceeds its condition limit"))?;
+        let (controls, _controls) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, true)?;
+        let mut operations = Vec::new();
+        let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut operations, &mut rows_left, CommitEffects::Facts)?;
+        let _points = call.reserve(wire::mul(operations.len(), std::mem::size_of::<rtdb_node::AppliedOwnedPoint>())?)?;
+        let points = operations.into_iter().map(|operation| match operation {
+            TxOp::OwnedCheck { relation, id, valid_at, expected } =>
+                Ok(rtdb_node::AppliedOwnedPoint { relation, id, valid_at, expected }),
+            _ => Err(invalid("Hosted validation supports only point and control checks")),
+        }).collect::<Result<Vec<_>, _>>()?;
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        let confirmation = native.validate_durable_hosted_read(
+            scope, &floor, Timestamp(i64::from_be_bytes(*until)), &controls, &points, &ranges,
+        ).await.map_err(status)?;
+        hosted_observation::confirmation_reply(call, confirmation)
+    }
+
     pub(crate) async fn decide_hosted_action(
         &self, call: &Call, envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
@@ -1111,7 +1202,10 @@ impl Service {
         } else {
             (Vec::new(), body, Vec::new())
         };
-        let (witnesses, body, _witness_charge) = self.owned_witness_prefix(call, body, true)?;
+        let (tokens, body) = self.durable_hosted_ranges(body)?;
+        let token_bytes = tokens.iter().map(|token| token.len()).sum();
+        let _witness_charge = call.reserve(wire::add(4096, wire::mul(token_bytes, 4)?)?)?;
+        let witnesses = self.open_durable_hosted_ranges(call, tokens).await?;
         let (deadline, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Hosted commit has no deadline"))?;
         let deadline = Timestamp(i64::from_be_bytes(*deadline));
         let (journal_before, body) = if recheck_at_staging {
@@ -1152,10 +1246,8 @@ impl Service {
         if recheck_at_staging && (replay || controls.iter().all(rtdb_tx::HostedControlWrite::is_check)) {
             return Err(invalid("A staging deadline requires a live hosted control replacement"));
         }
-        if replay {
-            for (held, _) in &witnesses {
-                held.snapshot.require_unscoped_root().map_err(status)?;
-            }
+        if replay && witnesses.iter().any(rtdb_node::DurableRange::requires_live_root) {
+            return Err(invalid("Scoped evidence requires live Root custody"));
         }
         if replay && (counted || !worlds.is_empty()) {
             return Err(invalid("Native replay admits an original effect batch"));
@@ -1163,6 +1255,7 @@ impl Service {
         let effects = CommitEffects::hosted(replay, counted || !worlds.is_empty(), &controls);
         let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut writes, &mut rows_left, effects)?;
         writes.extend(controls.into_iter().map(TxOp::HostedControl));
+        writes.extend(witnesses.into_iter().map(rtdb_node::DurableRange::operation));
         let _refusal = if let Some(refusal) = refusal {
             if replay {
                 return Err(invalid("A hosted constraint decision requires live Root custody"));
@@ -1194,7 +1287,7 @@ impl Service {
         if let Some(tick) = slot {
             self.wait_for_clock_slot(call, tick).await?;
         }
-        self.owned_write_reply_with_reads(call, writes, witnesses, worlds).await
+        self.owned_write_reply_with_reads(call, writes, Vec::new(), worlds).await
     }
 
     fn decode_hosted_control_groups(

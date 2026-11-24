@@ -75,6 +75,8 @@ mod owned_purge;
 pub use owned_purge::{OwnedPurgeBucket, owned_purge_floor, read_owned_purge_bucket, purge_coverage_document};
 mod owned_relation;
 mod owned_unique;
+mod owned_range;
+pub use owned_range::{verify_owned_entity_region, verify_owned_fixed_range};
 pub use owned_relation::OwnedSpatialScan;
 pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, OWNED_UNIQUE_PATHS_MAX, OWNED_UNIQUE_POLICY_ID, lookup_owned_unique, owned_unique_key_id, owned_unique_path_key, read_owned_unique_policy};
 pub use owned_relation::{

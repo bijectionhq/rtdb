@@ -23,7 +23,7 @@ use crate::{admin, capability::CellSecret, cipher::Cipher, control, gateway::{De
 
 const DATABASE_HEADER: &str = "x-xtdb-database";
 const COOKIE: &str = "arrow_flight_session_id";
-const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v5";
+const ROUTE_CONTEXT: &str = "rtdb.multi/flight-session/v6";
 const FRESH_HEADER: &str = "x-rtdb-fresh-read";
 const HANDSHAKE: &str = "/arrow.flight.protocol.FlightService/Handshake";
 const DO_ACTION: &str = "/arrow.flight.protocol.FlightService/DoAction";
@@ -41,6 +41,7 @@ struct Target {
     enrollment: Option<ordered_logkeeper::ordered::Enrollment>,
     replica: Option<FreshReplica>,
     ordered_reader: Option<ordered_logkeeper::ordered::Placement>,
+    fresh: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,7 +266,7 @@ impl Router {
                 }
             }).await.map_err(|_| moved())?;
             let target = Target { name: name.to_owned(), deployment: installed.deployment.to_string(),
-                holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment), replica: None, ordered_reader: None };
+                holder: MemberId(worker.enrollment.worker.to_string()), epoch, address, enrollment: Some(worker.enrollment), replica: None, ordered_reader: None, fresh: false };
             self.validate(&target).await?;
             return Ok(target);
         }
@@ -282,7 +283,7 @@ impl Router {
         let reply = control::call(control, &control::Request::FlightEndpoint, self.timeout, &self.control).await
             .map_err(|_| Status::unavailable("The holder did not report a Flight SQL endpoint"))?;
         let control::Response::FlightEndpoint { address } = reply else { return Err(Status::unavailable("The holder has no Flight SQL endpoint")); };
-        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None, replica: None, ordered_reader: None })
+        Ok(Target { name: current.name, deployment: current.id, holder, epoch: current.epoch, address, enrollment: None, replica: None, ordered_reader: None, fresh: false })
     }
 
     /// Resolve an eligible subscriber and let the receiver establish its own cut.
@@ -291,12 +292,23 @@ impl Router {
             if installation.is_some_and(|id| id != installed.deployment) {
                 return Err(Status::not_found("No matching installed Flight SQL deployment"));
             }
-            let read = crate::gateway::route_ordered_reader(name, installed, &self.options).await.map_err(|_| moved())?;
-            let target = Target {
-                name: name.into(), deployment: installed.deployment.to_string(),
-                holder: MemberId(read.worker.enrollment.worker.to_string()),
-                address: read.flight.ok_or_else(moved)?, epoch: read.epoch,
-                enrollment: Some(read.worker.enrollment), replica: None, ordered_reader: Some(read.placement),
+            let target = if let Ok(read) = crate::gateway::route_ordered_reader(name, installed, &self.options, true).await {
+                Target {
+                    name: name.into(), deployment: installed.deployment.to_string(),
+                    holder: MemberId(read.worker.enrollment.worker.to_string()),
+                    address: read.flight.ok_or_else(moved)?, epoch: read.epoch,
+                    enrollment: Some(read.worker.enrollment), replica: None, ordered_reader: Some(read.placement), fresh: true,
+                }
+            } else {
+                let route = installed.journal.route().await.map_err(|_| moved())?;
+                let grant = route.writer.grant.ok_or_else(moved)?;
+                let worker = installed.endpoints.get(&grant.enrollment).ok_or_else(moved)?;
+                let address = self.reported_flight_endpoint(&worker.control).await?;
+                Target {
+                    name: name.into(), deployment: installed.deployment.to_string(),
+                    holder: MemberId(grant.enrollment.worker.to_string()), epoch: grant.epoch,
+                    address, enrollment: Some(grant.enrollment), replica: None, ordered_reader: None, fresh: true,
+                }
             };
             self.validate(&target).await?;
             return Ok(target);
@@ -323,7 +335,7 @@ impl Router {
             let target = Target {
                 name: record.name.clone(), deployment: record.id.clone(),
                 holder: replica.id.clone(), epoch: record.epoch, address, enrollment: None,
-                ordered_reader: None,
+                ordered_reader: None, fresh: true,
                 replica: Some(FreshReplica {
                     stream: record.stream("replica"), log_epoch: record.log_epoch,
                     storage_prefix: record.storage_prefix(),
@@ -331,7 +343,23 @@ impl Router {
             };
             if self.validate(&target).await.is_ok() { return Ok(target); }
         }
-        Err(Status::unavailable("No fresh Flight subscriber is available"))
+        let holder = record.holder.as_ref().and_then(|holder| members.get(holder))
+            .filter(|holder| holder_is_current(&record, holder)).ok_or_else(moved)?;
+        let control = holder.control_address.as_deref().ok_or_else(moved)?;
+        let target = Target {
+            name: record.name, deployment: record.id, holder: holder.id.clone(), epoch: record.epoch,
+            address: self.reported_flight_endpoint(control).await?, enrollment: None,
+            replica: None, ordered_reader: None, fresh: true,
+        };
+        self.validate(&target).await?;
+        Ok(target)
+    }
+
+    async fn reported_flight_endpoint(&self, endpoint: &str) -> std::result::Result<String, Status> {
+        match control::call(endpoint, &control::Request::FlightEndpoint, self.timeout, &self.control).await {
+            Ok(control::Response::FlightEndpoint { address }) => Ok(address),
+            _ => Err(moved()),
+        }
     }
 
     async fn audience_target(
@@ -353,7 +381,7 @@ impl Router {
             return Err(moved());
         }
         let address = audience_holder_address(&member.address, route.holder_port)?;
-        Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None, replica: None, ordered_reader: None })
+        Ok(Target { name: record.name, deployment: record.id, holder: member.id, epoch: record.epoch, address, enrollment: None, replica: None, ordered_reader: None, fresh: false })
     }
 
     async fn validate(&self, target: &Target) -> std::result::Result<(), Status> {
@@ -405,7 +433,7 @@ impl Router {
             Some(_) => return Err(Status::permission_denied("A fresh Flight route is fixed at its handshake")),
             None => false,
         };
-        if route.as_ref().is_some_and(|route| route.target.replica.is_some() || route.target.ordered_reader.is_some()) && request.uri().path() != DO_ACTION {
+        if route.as_ref().is_some_and(|route| route.target.fresh) && request.uri().path() != DO_ACTION {
             return Err(Status::permission_denied("The fresh Flight route carries owned reads"));
         }
         let parse_audience = |value: &str| AudienceFlightConfig::parse(value)
@@ -496,7 +524,7 @@ impl Router {
                 (None, Some(placement)) => self.secret.ordered_reader_peer(
                     placement, target.epoch, target.enrollment.ok_or_else(moved)?, remote,
                 ),
-                (None, None) => self.secret.flight_peer(&target.deployment, target.epoch, remote),
+                (None, None) => self.secret.flight_peer(&target.deployment, target.epoch, target.fresh, remote),
                 (Some(_), Some(_)) => return Err(moved()),
             };
             headers.insert(FORWARDED_PEER_HEADER, header_value(&peer)?);

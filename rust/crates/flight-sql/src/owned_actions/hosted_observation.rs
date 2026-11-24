@@ -24,6 +24,22 @@ pub(super) fn applied_read_floor(body: &[u8]) -> Result<(rtdb_node::AppliedReadF
     Ok((floor, body))
 }
 
+pub(super) fn confirmation_reply(
+    call: &Call, confirmation: Option<rtdb_node::AppliedReadConfirmation>,
+) -> Result<ActionResult, Status> {
+    let bytes = match confirmation {
+        Some(confirmation) => {
+            let mut bytes = Vec::with_capacity(24);
+            bytes.extend_from_slice(&confirmation.covered.tx_id.0.to_be_bytes());
+            bytes.extend_from_slice(&confirmation.covered.system_time.0.to_be_bytes());
+            bytes.extend_from_slice(&confirmation.observed_at.0.to_be_bytes());
+            Bytes::from(bytes)
+        }
+        None => Bytes::from_static(&[0]),
+    };
+    Ok(ActionResult { body: wire::retain(bytes, call.reserve(24)?) })
+}
+
 fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Status> {
     let (kind, body) = body.split_first().ok_or_else(|| invalid("Applied confirmation requires a point flag"))?;
     match kind {
@@ -136,17 +152,7 @@ impl Service {
         let until = Timestamp(i64::from_be_bytes(*deadline));
         let covered = held.snapshot.confirm_applied_hosted_read(scope, &floor, until, &controls, point.as_ref())
             .await.map_err(status)?;
-        let bytes = match covered {
-            Some(confirmation) => {
-                let mut bytes = Vec::with_capacity(24);
-                bytes.extend_from_slice(&confirmation.covered.tx_id.0.to_be_bytes());
-                bytes.extend_from_slice(&confirmation.covered.system_time.0.to_be_bytes());
-                bytes.extend_from_slice(&confirmation.observed_at.0.to_be_bytes());
-                Bytes::from(bytes)
-            }
-            None => Bytes::from_static(&[0]),
-        };
-        Ok(ActionResult { body: wire::retain(bytes, call.reserve(24)?) })
+        confirmation_reply(call, covered)
     }
 
     pub(crate) async fn observe_held_hosted_action(

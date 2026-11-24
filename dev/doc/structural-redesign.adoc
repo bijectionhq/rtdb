@@ -305,6 +305,8 @@ Otherwise the reader writes back the same certificate to a quorum, accepting an 
 Uncertified staged bytes above the selection add no read dependency.
 
 Holder and subscriber use the same freshness contract.
+An enrolled cold reader of an ordered placement acquires and renews a serving lease against its exact retained replay hold, independently of the writer grant.
+Ordinary Flight release checks durable range evidence and point and control equalities on a protected applied cut, under the original history and deadline.
 The serving attachment acquires protection for the original checkpoint and suffix, waits for same-history application and captures catalog and data at the selected cut.
 Freshness is retryably unavailable when authority, quorum installation, custody or exact application cannot be established.
 With a stable active quorum, recoverable data and sufficient apply and query service, a reader can serve without the writer or silent journals.

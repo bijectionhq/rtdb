@@ -705,7 +705,7 @@ Its source accepts immutable creation only, preserving complete identities after
 One-shot and held live point reads use the server's ordered present and report a returned row's exclusive expiry as `rtdb.owned.until_micros` in Arrow metadata.
 Mode 3 of `rtdb.owned.ReadHeldWorldPoint.v2` reads an ordinary point from the held parent.
 It returns a witness for the original pin and the relation's purge frontier, independent of the world's overlay.
-`rtdb.owned.DecideHosted.v1` can order this evidence with Root writes and hosted controls.
+`rtdb.owned.DecideHosted.v2` can order this evidence with Root writes and hosted controls.
 The request prefixes the hosted commit body with a counted-commit byte (0 or 1), a big-endian u16 hold count, and one section per distinct hold.
 Each section has a 16-byte handle, a big-endian u16 witness count, and 16 bytes per witness nonce.
 The commit admits one to eight holds with up to 128 witnesses each.
@@ -866,7 +866,7 @@ An empty covered page has no rows and carries the already-known held present in 
 
 === Retiring an owned relation
 
-An admitted Root `rtdb.owned.DecideHosted.v1` can retire Root relations together with its catalog changes.
+An admitted Root `rtdb.owned.DecideHosted.v2` can retire Root relations together with its catalog changes.
 Send one row in the retired relation's fact group with `_op: Utf8` equal to `retire-relation`, `_id: Utf8` equal to the relation name, and `retain_micros: Int64`, the 0 to 100-year history the relation keeps after retirement.
 The transaction records the retirement in the principal's retired catalog and deletes the relation's ordered, search and spatial paths from their catalogs.
 The declaration stays, so historical reads keep resolving the relation's schema until collection reclaims it.
@@ -885,7 +885,7 @@ The resolver initializes the new rule's covered counters from the final visible 
 If a prefix already exceeds the proposed cap, the transaction aborts with `rtdb.owned/capacity-already-exceeded`.
 Redeclaring a projection with the same predicate and prefix width changes its maximum while retaining its counters.
 Lowering the maximum checks the relation's final membership at the declaring revision, including any removals in that transaction.
-An admitted Root `rtdb.owned.DecideHosted.v1` can co-order capacity declarations with its catalog changes.
+An admitted Root `rtdb.owned.DecideHosted.v2` can co-order capacity declarations with its catalog changes.
 Send each declaration in the target relation's fact group with `_op: Utf8` equal to `declare-capacity`, `_id: Utf8` equal to the projection column, and the four fields from DeclareCapacity.v2.
 The hosted batch must check the observed `bj_installation` authority row.
 The facts, counters and catalog changes commit together after the authority, catalog and capacity conditions all succeed.
@@ -946,7 +946,7 @@ The relation-frontier check still applies to moving-valid reads, continuation re
 
 === Committing checked hosted control rows with owned facts
 
-`rtdb.owned.DecideHosted.v1` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
+`rtdb.owned.DecideHosted.v2` is enabled only for a live placed connection authenticated as `flightSql.hostedControls.owner` with `flightSql.ownedNativeActions` enabled.
 The operator's `flightSql.hostedControls.relations` sequence names the admitted ordinary `public.bj_*` tables.
 The Root witness block uses the Commit.v3 unsigned Int16 big-endian witness count (zero to 32) and its 16-byte held handle plus 16-byte nonce pairs.
 The optional sections and the ordering deadline precede the ordered fact and control groups as described below.
@@ -979,17 +979,26 @@ a revision or rows. Send that revision or null as `_expected_micros` in a
 subsequent checked hosted commit. A missing table or a non-epoch valid slice
 refuses the read.
 
-`rtdb.owned.DecideHosted.v1` starts with one flags byte.
+`rtdb.owned.DecideHosted.v2` starts with one flags byte.
 The low five bits signal final counts, held-world reads, a refusal alternative, a physical journal cutoff and an offered clock slot, in that order.
 The optional 16-byte slot handle comes first.
 The optional refusal comes next as a length-prefixed section containing a length-prefixed fact group stream and the hosted control group stream.
 An optional held-world prefix follows, using the original handles and witness nonces.
-The optional ordered-present count conditions precede the Root witness prefix.
+The optional ordered-present count conditions precede the durable Root range evidence.
+Its wire prefix is a big-endian unsigned 16-bit count followed by that many UTF-8 tokens, each preceded by its big-endian unsigned 32-bit byte length.
+`rtdb.owned.SealHostedRanges.v1` accepts the original held handles and issued witness nonces and returns the length-prefixed tokens in the same order.
+The authenticated token binds the principal, history, original transaction, relation and range, event frontier, and expiry.
+Another eligible receiver can validate it after the original Flight session closes.
 The deadline follows, with the physical cutoff and receiver clock certificate digest present when requested.
 The final streams contain the primary facts and hosted controls.
 
+`rtdb.owned.ValidateFreshHosted.v1` starts with the history UUID and one to four exact transaction positions, followed by the durable Root range prefix, the exclusive deadline and the fact and control group streams.
+It accepts only point and control equality checks and issued durable range evidence.
+An ordinary fresh Flight receiver acquires and applies a protected journal cut, verifies the supplied evidence and returns the covered transaction and receiver observation, or refuses release.
+The receiver can be an enrolled subscriber while the writer grant is vacant.
+
 `rtdb.owned.OfferClockSlot.v1` takes a 16-byte placed Root hold handle and returns a signed big-endian microsecond reading five hundred milliseconds beyond its reserved present.
-`rtdb.owned.DecideHosted.v1` can order at that reading using the original handle.
+`rtdb.owned.DecideHosted.v2` can order at that reading using the original handle.
 `rtdb.owned.DecideHeldWorlds.v1` can also order at the offered reading.
 The placement and session must still own the hold.
 The source append must fall in the first second starting at the offered time, and the ordered history must still be below that reading.
