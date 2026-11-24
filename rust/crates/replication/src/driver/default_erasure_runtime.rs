@@ -1,4 +1,6 @@
-use crate::default_erasure::{self, DefaultErasure, ErasureRetirement, SelectedRewrite};
+use crate::default_erasure::{
+    self, DefaultErasure, ErasureCompleted, ErasureRetirement, SelectedRewrite,
+};
 
 use super::*;
 
@@ -6,6 +8,14 @@ impl ReplicationDriver {
     /// Supplies the local provider's read-grant horizon, including clock uncertainty.
     pub fn with_default_erasure_grant(mut self, grant_micros: u64) -> Self {
         self.default_erasure_grant_micros = Some(grant_micros);
+        self
+    }
+
+    pub fn with_default_erasure_read_fence(
+        mut self,
+        fence: Arc<dyn crate::DefaultErasureReadFence>,
+    ) -> Self {
+        self.default_erasure_read_fence = Some(fence);
         self
     }
 
@@ -50,10 +60,35 @@ impl ReplicationDriver {
             }
             Some(DefaultErasure::Retiring {
                 intent,
+                ordered_intent,
                 log_prefixes_settled,
                 objects_settled,
-            }) if !log_prefixes_settled || !objects_settled => {
+            }) => {
                 let intent = *intent;
+                let ordered_intent = *ordered_intent;
+                let Some(fence) = self.default_erasure_read_fence.as_deref() else {
+                    return Ok(());
+                };
+                let authority = self
+                    .serving
+                    .as_ref()
+                    .ok_or_else(serving::unavailable)?
+                    .checkpoint_authority();
+                if !intent.binds_predecessor()
+                    || !authority
+                        .checkpoints
+                        .as_ref()
+                        .is_some_and(|keys| keys.kms.supports_durable_generation_retirement())
+                {
+                    return Ok(());
+                }
+                let cut = intent.read_cut()?;
+                let Some(read_closure) = fence.close(cut).await? else {
+                    return Ok(());
+                };
+                if !fence.verify(cut, read_closure).await? {
+                    return Err(default_erasure::invalid());
+                }
                 let log_prefixes_settled =
                     *log_prefixes_settled || intent.settle_log_prefixes(&self.logs).await?;
                 let now_lower = Timestamp(
@@ -61,12 +96,29 @@ impl ReplicationDriver {
                         .0
                         .saturating_sub(SERVING_CLOCK_UNCERTAINTY_MICROS),
                 );
-                let objects_settled = log_prefixes_settled
-                    && intent
-                        .settle_objects(&self.blocks, &self.logs, now_lower)
-                        .await?;
+                let objects_settled = *objects_settled
+                    || log_prefixes_settled
+                        && intent
+                            .settle_objects(&self.blocks, &self.logs, now_lower)
+                            .await?;
+                if objects_settled && intent.destroy_predecessor(authority, now_lower).await? {
+                    let completed = ErasureCompleted {
+                        intent,
+                        ordered_intent,
+                        read_closure,
+                    };
+                    completed.verify(&self.blocks, authority, fence).await?;
+                    let block = self.partition.value().live().block_index();
+                    self.leader.as_mut().ok_or_else(term_ended)?.enqueue(
+                        WriteBody::Message(ReplicaBody::NoOp(completed.message()?)),
+                        block,
+                        None,
+                        &self.resolve.memory,
+                    )?;
+                }
                 self.default_erasure = Some(DefaultErasure::Retiring {
                     intent,
+                    ordered_intent,
                     log_prefixes_settled,
                     objects_settled,
                 });
@@ -78,13 +130,8 @@ impl ReplicationDriver {
 
     pub(super) fn retry_default_erasure(&self) -> bool {
         self.leader.as_ref().is_some_and(|leader| leader.confirmed)
-            && matches!(
-                self.default_erasure,
-                Some(DefaultErasure::Retiring {
-                    objects_settled: false,
-                    ..
-                })
-            )
+            && self.default_erasure_read_fence.is_some()
+            && matches!(self.default_erasure, Some(DefaultErasure::Retiring { .. }))
     }
 
     pub(super) fn require_default_erasure_order(&self, record: &ReplicaRecord) -> Result<()> {
@@ -98,7 +145,10 @@ impl ReplicationDriver {
                 Some(DefaultErasure::Selected(_) | DefaultErasure::Retiring { .. }),
                 ReplicaBody::BlockUploaded(_),
             ) => true,
-            (Some(_), ReplicaBody::NoOp(message)) => ErasureRetirement::decode(message)?.is_some(),
+            (Some(_), ReplicaBody::NoOp(message)) => {
+                ErasureRetirement::decode(message)?.is_some()
+                    || ErasureCompleted::decode(message)?.is_some()
+            }
             _ => false,
         };
         if admitted {
@@ -108,11 +158,16 @@ impl ReplicationDriver {
         }
     }
 
-    pub(super) fn apply_default_erasure_control(
+    pub(super) async fn apply_default_erasure_control(
         &mut self,
         message: &proto::NoOp,
         position: ReplicaPosition,
     ) -> Result<bool> {
+        if let Some(completed) = ErasureCompleted::decode(message)? {
+            self.apply_default_erasure_completion(completed, position)
+                .await?;
+            return Ok(true);
+        }
         let Some(intent) = ErasureRetirement::decode(message)? else {
             return Ok(false);
         };
@@ -130,10 +185,51 @@ impl ReplicationDriver {
         intent.require_selected(*selected, position)?;
         self.default_erasure = Some(DefaultErasure::Retiring {
             intent,
+            ordered_intent: position,
             log_prefixes_settled: false,
             objects_settled: false,
         });
         Ok(true)
+    }
+
+    async fn apply_default_erasure_completion(
+        &mut self,
+        completed: ErasureCompleted,
+        position: ReplicaPosition,
+    ) -> Result<()> {
+        let Some(DefaultErasure::Retiring {
+            intent,
+            ordered_intent,
+            ..
+        }) = self.default_erasure
+        else {
+            return Err(default_erasure::invalid());
+        };
+        completed.require_order(intent, ordered_intent, position)?;
+        let fence = self
+            .default_erasure_read_fence
+            .as_deref()
+            .ok_or_else(default_erasure::unsupported)?;
+        let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
+        completed
+            .verify(&self.blocks, serving.checkpoint_authority(), fence)
+            .await?;
+        let cut = intent.read_cut()?;
+        serving.complete_erasure(intent.cut(), cut.successor, cut.unreadable_by)?;
+        self.default_erasure = None;
+        if let Some(leader) = &mut self.leader
+            && leader.source_tail.is_none()
+            && leader.source_poll.is_none()
+            && leader.source_head.is_none()
+            && leader.source_batch.is_empty()
+        {
+            leader.source_tail = Some(
+                self.logs
+                    .source_replay(self.progress.source_position())
+                    .await?,
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn observe_default_erasure_upload(&mut self, record: &ReplicaRecord) -> Result<()> {

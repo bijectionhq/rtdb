@@ -34,6 +34,7 @@ fn an_ordered_retirement_keeps_the_deadline_when_reopened() -> Result<()> {
             boundary: ReplicaPosition(42),
             members_sha256: [4; 32],
             inventory_sha256: Some([8; 32]),
+            prior_generation: Some(1),
         },
         checkpoint: PublishedCheckpoint {
             block: BlockIndex(8),
@@ -47,6 +48,27 @@ fn an_ordered_retirement_keeps_the_deadline_when_reopened() -> Result<()> {
     let replayed = ErasureRetirement::decode(&initial.message()?)?.unwrap();
     assert_eq!(replayed.unreadable_by, Timestamp(1200));
     replayed.require_selected(selected, ReplicaPosition(44))?;
+    let completed = ErasureCompleted {
+        intent: replayed,
+        ordered_intent: ReplicaPosition(44),
+        read_closure: [10; 32],
+    };
+    let reopened = ErasureCompleted::decode(&completed.message()?)?.unwrap();
+    assert_eq!(reopened, completed);
+    reopened.require_order(initial, ReplicaPosition(44), ReplicaPosition(45))?;
+    assert!(
+        reopened
+            .require_order(initial, ReplicaPosition(44), ReplicaPosition(44))
+            .is_err()
+    );
+    assert!(
+        reopened
+            .require_order(initial, ReplicaPosition(43), ReplicaPosition(45))
+            .is_err()
+    );
+    let retirement = reopened.intent.read_cut()?;
+    assert_eq!((retirement.predecessor, retirement.successor), (1, 2));
+    assert_eq!(retirement.unreadable_by, Timestamp(1200));
     assert!(
         replayed
             .require_selected(selected, ReplicaPosition(43))
@@ -68,6 +90,80 @@ fn an_ordered_retirement_keeps_the_deadline_when_reopened() -> Result<()> {
     assert_eq!(
         RewriteEvidence::read(&frame[6..])?,
         (Some(selected.evidence), b"[state]".as_slice())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn predecessor_destruction_preserves_the_successor_across_vault_restart() -> Result<()> {
+    use crate::NativeCheckpointAuthority;
+    use rtdb_crypt::{FileKms, Generation, Kms};
+
+    let directory = tempfile::tempdir().unwrap();
+    let incarnation = [3; 16];
+    let keys = Arc::new(FileKms::open(directory.path(), || 50)?);
+    let database = uuid::Uuid::from_bytes(incarnation);
+    let predecessor = Generation {
+        database,
+        number: 1,
+    };
+    let successor = Generation {
+        database,
+        number: 2,
+    };
+    keys.create(predecessor).await?;
+    keys.create(successor).await?;
+    let authority = NativeServingAuthority {
+        incarnation,
+        checkpoints: Some(NativeCheckpointAuthority {
+            kms: keys,
+            generation: 1,
+        }),
+    };
+    let cut = ErasureCut {
+        basis: Basis::new(incarnation, 9),
+        source: SourcePosition(31),
+        replica: ReplicaPosition(41),
+        term: Term(6),
+    };
+    let intent = ErasureRetirement {
+        evidence: RewriteEvidence {
+            cut,
+            boundary: ReplicaPosition(42),
+            members_sha256: [4; 32],
+            inventory_sha256: Some([8; 32]),
+            prior_generation: Some(1),
+        },
+        block: BlockIndex(8),
+        root_sha256: [5; 32],
+        upload: ReplicaPosition(43),
+        observed_at: Timestamp(30),
+        unreadable_by: Timestamp(50),
+    };
+    assert!(
+        !intent
+            .destroy_predecessor(&authority, Timestamp(49))
+            .await?
+    );
+    assert!(
+        intent
+            .destroy_predecessor(&authority, Timestamp(50))
+            .await?
+    );
+    let reopened = Arc::new(FileKms::open(directory.path(), || 50)?);
+    assert!(reopened.generation_destroyed(predecessor).await?);
+    reopened.check_readable(successor).await?;
+    let authority = NativeServingAuthority {
+        incarnation,
+        checkpoints: Some(NativeCheckpointAuthority {
+            kms: reopened,
+            generation: 2,
+        }),
+    };
+    assert!(
+        intent
+            .destroy_predecessor(&authority, Timestamp(51))
+            .await?
     );
     Ok(())
 }

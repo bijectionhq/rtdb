@@ -102,7 +102,7 @@ pub(crate) fn apply(
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<AppliedDecision>> {
     if crate::checkpoint_admin::PinControl::decode(message)?.is_some() { return Ok(None); }
-    if ErasureRetirement::decode(message)?.is_some() {
+    if ErasureRetirement::decode(message)?.is_some() || crate::default_erasure::ErasureCompleted::decode(message)?.is_some() {
         return Err(erasure_recovery_required());
     }
     let Some(serving) = serving else {

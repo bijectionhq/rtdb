@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use rtdb_storage::log::{CheckpointKeyRetirement, CheckpointPrefix};
+use rtdb_storage::log::{
+    CheckpointKeyRetirement, CheckpointPrefix, LogOffset, PriorCheckpointReferences,
+};
 use rtdb_storage::sealing::{KafkaFrameKeys, KafkaPrefixRetirement};
 use rtdb_types::{Anomaly, Result};
 
@@ -36,6 +38,7 @@ impl KafkaLog {
         let (broker_floor, broker_end) = self.verified_watermarks(topic).await?;
         if broker_end < retirement.before
             || broker_floor > retirement.before
+                && keys.kafka_classic_retirement_floor()? < retirement.before
                 && !keys.has_kafka_prefix_retirement(retirement).await?
         {
             return Err(Anomaly::incorrect(
@@ -61,6 +64,33 @@ impl KafkaLog {
 impl CheckpointKeyRetirement for KafkaLog {
     fn checkpoint_offsets_are_dense(&self) -> bool {
         true
+    }
+
+    async fn prior_checkpoint_references(
+        &self,
+        through: LogOffset,
+    ) -> Result<Option<PriorCheckpointReferences>> {
+        if !self.replica_references {
+            return Ok(None);
+        }
+        let (keys, topic) = self.native_prefix_custody()?;
+        let (broker_floor, broker_end) = self.verified_watermarks(topic).await?;
+        let before = through
+            .0
+            .checked_add(1)
+            .filter(|before| *before > 0 && *before <= broker_end)
+            .ok_or_else(|| {
+                Anomaly::incorrect(
+                    "rtdb.kafka/native-retirement",
+                    "The replica inventory exceeds the observed broker prefix",
+                )
+            })?;
+        let first_live = broker_floor.max(keys.kafka_erasure_floor()?).min(before);
+        let detached = keys.prior_replica_references(first_live).await?;
+        Ok(Some(PriorCheckpointReferences {
+            first_live: LogOffset(first_live),
+            detached,
+        }))
     }
 
     async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> Result<()> {

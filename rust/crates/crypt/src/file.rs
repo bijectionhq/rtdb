@@ -154,6 +154,12 @@ impl Slot {
 
 #[async_trait]
 impl Kms for FileKms {
+    fn supports_durable_generation_retirement(&self) -> bool { true }
+
+    async fn generation_destroyed(&self, generation: Generation) -> Result<bool> {
+        self.access(generation, |_, state, _| Ok(matches!(state, Some(State::Destroyed)))).await
+    }
+
     async fn create(&self, generation: Generation) -> Result<()> {
         self.access(generation, |slot, state, _| match state {
             None => slot.write_key(&aead::random_key()?),

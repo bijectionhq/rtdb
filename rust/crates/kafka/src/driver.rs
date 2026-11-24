@@ -2,12 +2,12 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use bytes::Bytes;
 use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext, PurgeConfig}};
-use rtdb_storage::{Error, Result, log::LogMetadata, sealing::KafkaFrameKeys};
+use rtdb_storage::{Error, Result, log::{CheckpointReplicaReference, LogMetadata}, sealing::KafkaFrameKeys};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use crate::{ConfiguredLogClient, KafkaLogOptions, Progress, metadata, transport_error};
 
-pub(crate) struct Delivery { pub reply: oneshot::Sender<Result<LogMetadata>>, pub _allocation: Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)> }
+pub(crate) struct Delivery { pub reply: oneshot::Sender<Result<LogMetadata>>, pub reference: Option<CheckpointReplicaReference>, pub _allocation: Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)> }
 pub(crate) struct Queued { pub payload: Bytes, pub accepted: oneshot::Sender<Result<()>>, pub completion: Box<Delivery> }
 pub(crate) struct DeliveryContext { pub progress: Arc<Progress>, pub topic: String, pub keys: Option<Arc<KafkaFrameKeys>> }
 impl ClientContext for DeliveryContext {}
@@ -19,7 +19,7 @@ impl ProducerContext for DeliveryContext {
                 if let Some(keys) = &self.keys {
                     let frame = rdkafka::Message::payload(message)
                         .ok_or_else(|| Error::Task("Kafka acknowledged a missing sealed frame".into()))?;
-                    keys.record_kafka_publication(metadata.offset.0, frame)?;
+                    keys.record_kafka_publication_and_reference(metadata.offset.0, frame, completion.reference.as_ref())?;
                 }
                 Ok(metadata)
             }),

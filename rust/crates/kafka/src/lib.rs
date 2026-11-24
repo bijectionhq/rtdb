@@ -45,21 +45,25 @@ enum Access {
     Writable { queue: mpsc::Sender<driver::Queued>, bytes: Arc<Semaphore>, records: Arc<Semaphore> },
 }
 
-pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access, keys: Option<Arc<KafkaFrameKeys>>, topic_id: Option<[u8; 16]> }
+pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access, keys: Option<Arc<KafkaFrameKeys>>, topic_id: Option<[u8; 16]>, replica_references: bool }
 pub struct OpenedKafkaLog { pub log: Arc<KafkaLog>, pub driver: Option<KafkaLogDriver> }
 
 impl KafkaLog {
     /// The owner must run the returned driver, then cancel and join it before releasing a writable log.
     /// TLS material is admitted against `memory` and remains charged until the last derived native client is destroyed.
     pub async fn open(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>) -> Result<OpenedKafkaLog> {
-        Self::open_log(cluster, options, observer, memory, None).await
+        Self::open_log(cluster, options, observer, memory, None, false).await
     }
 
     pub async fn open_classic(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: ClassicKeyVault) -> Result<OpenedKafkaLog> {
-        Self::open_log(cluster, options, observer, memory, Some(vault)).await
+        Self::open_log(cluster, options, observer, memory, Some(vault), false).await
     }
 
-    async fn open_log(cluster: &KafkaClusterConfig, mut options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: Option<ClassicKeyVault>) -> Result<OpenedKafkaLog> {
+    pub async fn open_classic_replica(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: ClassicKeyVault) -> Result<OpenedKafkaLog> {
+        Self::open_log(cluster, options, observer, memory, Some(vault), true).await
+    }
+
+    async fn open_log(cluster: &KafkaClusterConfig, mut options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: Option<ClassicKeyVault>, replica_references: bool) -> Result<OpenedKafkaLog> {
         options.validate()?;
         if vault.is_some() {
             options.maximum_message_bytes = options.maximum_message_bytes.checked_add(KAFKA_LOG_SEAL_OVERHEAD)
@@ -96,7 +100,7 @@ impl KafkaLog {
             let access = Access::Writable { queue, bytes: Arc::clone(&bytes), records: Arc::clone(&records) };
             (access, Some(KafkaLogDriver::new(producer, receiver, Arc::clone(&progress), options.clone(), bytes, records)))
         };
-        Ok(OpenedKafkaLog { log: Arc::new(Self { configuration, options, progress, access, keys, topic_id }), driver })
+        Ok(OpenedKafkaLog { log: Arc::new(Self { configuration, options, progress, access, keys, topic_id, replica_references }), driver })
     }
 
     pub async fn settle_classic_prefix(&self) -> Result<bool> {
@@ -244,6 +248,7 @@ impl KafkaLog {
         let record_permit = Arc::clone(records).acquire_owned().await.map_err(|_| Error::Closed("Kafka append capacity ended".into()))?;
         self.progress.check()?;
         let allocation = Arc::new((byte_permit, record_permit));
+        let reference = self.replica_references.then(|| KafkaFrameKeys::replica_reference(&payload)).flatten();
         let payload = match &self.keys {
             Some(keys) => IoRegion::retaining(allocation.clone(), keys.seal_kafka_record(payload)).await?,
             None => payload,
@@ -251,13 +256,13 @@ impl KafkaLog {
         self.progress.check()?;
         let (reply, durable) = oneshot::channel();
         let (accepted, acceptance) = oneshot::channel();
-        queue.send(driver::Queued { payload, accepted, completion: Box::new(driver::Delivery { reply, _allocation: allocation }) }).await.map_err(|_| Error::Closed("Kafka append driver ended".into()))?;
+        queue.send(driver::Queued { payload, accepted, completion: Box::new(driver::Delivery { reply, reference, _allocation: allocation }) }).await.map_err(|_| Error::Closed("Kafka append driver ended".into()))?;
         acceptance.await.map_err(|_| Error::Closed("Kafka driver ended before fixing append order".into()))??;
         Ok(AppendReceipt::new(durable))
     }
 
     fn open_tail(&self, after: LogOffset) -> StorageResult<tail::KafkaTail> {
-        tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after, self.keys.clone())
+        tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after, self.keys.clone(), self.replica_references)
     }
 }
 
@@ -294,7 +299,7 @@ impl Log for KafkaLog {
         let consumer = consumer(&self.configuration, &options)?;
         let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
         if from.0 < low { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: low }); }
-        let tail = tail::KafkaTail::new(consumer, options, Arc::clone(&self.progress), LogOffset(from.0.min(high) - 1), self.keys.clone())?;
+        let tail = tail::KafkaTail::new(consumer, options, Arc::clone(&self.progress), LogOffset(from.0.min(high) - 1), self.keys.clone(), self.replica_references)?;
         let end = high.min(to.0);
         Ok(Box::new(tail::KafkaRange::new(tail, end, self.options.maximum_message_bytes, self.options.request_timeout)))
     }

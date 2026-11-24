@@ -25,6 +25,11 @@
 -- A Local retirement closes admission to prior catalogs and waits for their reader holds and the original deadline.
 -- Object retirement follows settlement of both ordered log prefixes.
 -- Recovery resumes object retirement from the same inventory and cursor after an interruption.
+-- Generation retirement requires durable closure of earlier views, plaintext caches and exports at the original deadline.
+-- The ordered terminal certifies the exact predecessor and successor, settled object inventory and reader closure.
+-- Only the admitted terminal arms the canonical erasure receipt and releases ordinary writes.
+-- Normal writes and checkpoint recovery use the authenticated installed successor generation.
+-- Sealed Kafka reference evidence survives broker offset expiry and covers each unavailable replica coordinate before a new retirement can proceed.
 -- Missing object provenance or a gap in the required replica prefix keeps the route gated.
 -- A live adoption switches subsequent native read delivery to the verified successor generation and preserves the generation of previously acquired views.
 -- Retained replay requires the Default recovery fence before it can cross a pending erase or copy its checkpoint.

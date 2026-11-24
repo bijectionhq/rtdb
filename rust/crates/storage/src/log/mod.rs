@@ -289,10 +289,25 @@ pub struct CheckpointPrefix {
     pub unreadable_by: Timestamp,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
+pub enum CheckpointReplicaReference {
+    Inline,
+    Detached { storage_version: rtdb_types::StorageVersion, storage_epoch: rtdb_types::StorageEpoch, key: String },
+}
+
+pub struct PriorCheckpointReferences {
+    pub first_live: LogOffset,
+    pub detached: Vec<CheckpointReplicaReference>,
+}
+
 #[async_trait]
 pub trait CheckpointKeyRetirement: Send + Sync {
     /// Dense offsets allow the inventory scan to reject a missing record within the retained prefix.
     fn checkpoint_offsets_are_dense(&self) -> bool { false }
+
+    async fn prior_checkpoint_references(&self, _through: LogOffset) -> rtdb_types::Result<Option<PriorCheckpointReferences>> {
+        Ok(None)
+    }
 
     /// Checks the provider's exact prefix before key admission changes.
     async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<()>;

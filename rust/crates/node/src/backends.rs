@@ -103,7 +103,7 @@ impl crate::LogFactory for KafkaFactory {
         replica_options.pipelined = true;
         let vault = self.vault.clone().ok_or_else(|| invalid("Classic Kafka logs require RTDB_CLASSIC_KEY_VAULT"))?;
         let source = KafkaLog::open_classic(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault.clone()).await?;
-        let replica = KafkaLog::open_classic(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault).await?;
+        let replica = KafkaLog::open_classic_replica(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault).await?;
         if source.log.topic_id() == replica.log.topic_id() {
             return Err(invalid("Source and replica Kafka logs resolve to the same physical topic"));
         }

@@ -362,12 +362,24 @@ struct CheckpointWriter {
 }
 
 impl ServingCheckpoint {
+    pub(crate) fn write_generation(&self) -> Result<u64> {
+        let CheckpointPublication::Writer(writer) = &self.publication else {
+            return Err(default_erasure::unsupported());
+        };
+        Ok(writer.authority.generation)
+    }
+
     pub(crate) fn bind_rewrite(&mut self, evidence: RewriteEvidence) -> Result<()> {
         let (prefix, state) = self.image.split_at_checked(CHECKPOINT_HEADER_BYTES + 1).ok_or_else(default_erasure::invalid)?;
         if prefix.last() != Some(&SHARED_CHECKPOINT) || RewriteEvidence::read(state)?.0.is_some() {
             return Err(default_erasure::invalid());
         }
-        let writer = self.writer.as_mut().ok_or_else(default_erasure::unsupported)?;
+        let CheckpointPublication::Writer(writer) = &mut self.publication else {
+            return Err(default_erasure::unsupported());
+        };
+        if evidence.prior_generation.is_some_and(|prior| prior != writer.authority.generation) {
+            return Err(default_erasure::invalid());
+        }
         writer.authority.generation = writer.authority.generation.checked_add(1).ok_or_else(default_erasure::invalid)?;
         writer.collect = false;
         self.image = evidence.frame(prefix, state)?;
@@ -375,7 +387,9 @@ impl ServingCheckpoint {
     }
 
     pub(crate) async fn store_rewrite(self, blocks: &crate::BlockStore, cancellation: &CancellationToken) -> Result<String> {
-        let writer = self.writer.as_ref().ok_or_else(default_erasure::unsupported)?;
+        let CheckpointPublication::Writer(writer) = &self.publication else {
+            return Err(default_erasure::unsupported());
+        };
         writer.authority.kms.create(Generation { database: writer.database, number: writer.authority.generation }).await?;
         self.store(blocks, cancellation).await?.1.ok_or_else(default_erasure::invalid)
     }
@@ -388,7 +402,7 @@ impl ServingCheckpoint {
                 if id.database != writer.database || id.epoch > writer.epoch { return Err(invalid()); }
                 let plaintext = rtdb_store::read_file(store, writer.authority.kms.as_ref(), id).await?;
                 self.image.as_ref() == plaintext.bytes.as_slice()
-                    && (checkpoint_rewrite(&self.image)?.is_none() || plaintext.generation.number == writer.authority.generation)
+                    && plaintext.generation.number == writer.authority.generation
             }
             (CheckpointPublication::Retained { id, generation, kms }, None, Some(key)) if key.parse::<ObjectId>()? == *id => {
                 let plaintext = rtdb_store::read_file(store, kms.as_ref(), *id).await?;
@@ -422,13 +436,18 @@ impl ServingCheckpoint {
 }
 
 impl NativeServing {
-    pub(crate) fn open(authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&NativeCheckpointImage>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
+    pub(crate) fn open(mut authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&NativeCheckpointImage>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
         let (fold, position, shared_checkpoint) = match checkpoint {
             Some(checkpoint) => decode_checkpoint_image(checkpoint.bytes(), authority.incarnation)?,
             None => (TransactState::new(authority.incarnation), 0, false),
         };
         let key_generation = checkpoint.and_then(NativeCheckpointImage::key_generation)
             .or_else(|| authority.checkpoints.as_ref().map(|keys| keys.generation));
+        if let Some(generation) = checkpoint.and_then(NativeCheckpointImage::key_generation)
+            && let Some(keys) = &mut authority.checkpoints
+        {
+            keys.generation = keys.generation.max(generation);
+        }
         let (view, receiver) = watch::channel(NativeServingView {
             index: fold.index().clone(),
             floor: fold.index().head().basis,
@@ -495,6 +514,22 @@ impl NativeServing {
             view.floor = view.index.head().basis;
             view.changes = Arc::default();
         });
+    }
+
+    pub(crate) fn complete_erasure(&mut self, cut: default_erasure::ErasureCut, generation: u64, unreadable_by: Timestamp) -> Result<()> {
+        if self.pending_erasure_installation() != Some(cut.installation()) { return Err(default_erasure::invalid()); }
+        let authority = self.authority.checkpoints.as_mut().ok_or_else(default_erasure::unsupported)?;
+        if !(authority.generation == generation || authority.generation.checked_add(1) == Some(generation)) {
+            return Err(default_erasure::invalid());
+        }
+        let fold = match &mut self.pipeline {
+            Some(pipeline) => pipeline.durable_mut(),
+            None => self.fold.as_mut().ok_or_else(invalid)?,
+        };
+        fold.arm_erasure(cut.basis, unreadable_by)?;
+        authority.generation = generation;
+        self.adopt_erasure_generation(generation);
+        Ok(())
     }
 
     pub(crate) fn source_ready(&self) -> bool {
@@ -824,7 +859,8 @@ impl NativeServing {
 
 pub(crate) fn require_physical_replay_support(message: &proto::NoOp) -> Result<()> {
     if message.serving_record.as_deref().and_then(|frame| frame.first()) == Some(&SHARED_DECISION_FRAME)
-        || default_erasure::ErasureRetirement::decode(message)?.is_some() {
+        || default_erasure::ErasureRetirement::decode(message)?.is_some()
+        || default_erasure::ErasureCompleted::decode(message)?.is_some() {
         return Err(Anomaly::unsupported("rtdb/shared-suffix-replay", "This replay path requires the shared transaction fold"));
     }
     Ok(())

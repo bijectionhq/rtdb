@@ -75,6 +75,33 @@ impl LocalStore {
         .map_err(Into::into)
     }
 
+    pub async fn erasure_objects_complete(
+        &self,
+        fence: LocalErasureRecovery,
+        objects: &[ObjectKey],
+    ) -> Result<bool> {
+        if fence.inventory_sha256.is_none() || self.erasure_recovery_fence().await? != Some(fence) {
+            return Ok(false);
+        }
+        let path = self.object_progress_path(fence);
+        let count = objects.len();
+        let names_sha256 = object_names_sha256(objects);
+        Ok(self
+            .io_region()
+            .run_blocking(move || {
+                Ok(read_object_progress(&path, fence, count, names_sha256)?
+                    .is_some_and(|progress| progress.settled == count))
+            })
+            .await?)
+    }
+
+    fn object_progress_path(&self, fence: LocalErasureRecovery) -> std::path::PathBuf {
+        self.root().join(format!(
+            ".tmp/catalog-ledger/erasure-objects-{}",
+            fence.block.0
+        ))
+    }
+
     /// Settles one batch from the inventory authenticated by the exact recovery floor.
     /// The caller has already settled both log prefixes and supplied the original reader deadline.
     pub async fn settle_erasure_objects(
@@ -107,10 +134,7 @@ impl LocalStore {
             if !drained || now_lower < fence.unreadable_by {
                 return Ok(false);
             }
-            let path = self.root().join(format!(
-                ".tmp/catalog-ledger/erasure-objects-{}",
-                fence.block.0
-            ));
+            let path = self.object_progress_path(fence);
             let count = objects.len();
             let names_sha256 = object_names_sha256(objects);
             let mut progress = self
@@ -201,18 +225,28 @@ fn open_object_progress(
     count: usize,
     names_sha256: [u8; 32],
 ) -> crate::Result<ObjectProgress> {
+    if let Some(progress) = read_object_progress(path, fence, count, names_sha256)? {
+        return Ok(progress);
+    }
+    let progress = ObjectProgress {
+        fence,
+        count,
+        names_sha256,
+        settled: 0,
+    };
+    write_synced(path, &progress)?;
+    Ok(progress)
+}
+
+fn read_object_progress(
+    path: &Path,
+    fence: LocalErasureRecovery,
+    count: usize,
+    names_sha256: [u8; 32],
+) -> crate::Result<Option<ObjectProgress>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let progress = ObjectProgress {
-                fence,
-                count,
-                names_sha256,
-                settled: 0,
-            };
-            write_synced(path, &progress)?;
-            return Ok(progress);
-        }
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(Error::io(path, error)),
     };
     let progress: ObjectProgress = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
@@ -223,7 +257,7 @@ fn open_object_progress(
     {
         return Err(invalid());
     }
-    Ok(progress)
+    Ok(Some(progress))
 }
 
 fn write_synced(path: &Path, value: &impl Serialize) -> crate::Result<()> {

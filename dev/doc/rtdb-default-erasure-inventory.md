@@ -34,6 +34,19 @@ A complete provider proof needs an authority that closes and drains or revokes t
 Object slot settlement covers the authenticated inventory under its original Classic vault.
 It does not establish complete custody for asynchronous publications outside the census, older generation keys, or previously retained plaintext. [Generation selection](../../rust/crates/replication/src/serving.rs#L98) · [Delivery recheck](../../rust/crates/node/src/serving/default.rs#L105) · [Cache invalidation](../../rust/crates/storage/src/cache.rs#L395)
 
+## Completed erasure
+
+A terminal-capable provider must atomically close admission for held native and Classic reads, plaintext caches and exports.
+Its durable witness binds the exact original deadline and establishes exclusive authority over the predecessor and coverage of earlier generations.
+A held copy that can still deliver beyond that deadline prevents the witness.
+The checkpoint vault configuration alone supplies no such witness. [Read-fence contract](../../rust/crates/replication/src/default_erasure/terminal.rs)
+
+The confirmed writer requires the closure before settling log prefixes and objects.
+After settlement and the original deadline, the durable KMS destroys the exact predecessor while keeping the authenticated successor readable.
+The writer orders a completion after the original retirement intent.
+Read-back and restart verify the closure, completed object cursor, destroyed predecessor and readable successor before arming the exact canonical receipt.
+Later checkpoints write under the installed successor and retain the armed receipt. [Driver order](../../rust/crates/replication/src/driver/default_erasure_runtime.rs) · [Generation custody](../../rust/crates/crypt/src/file.rs)
+
 ## Sealed Kafka
 
 Kafka uses the same inventory with a coordinated sealed Local object store.
@@ -41,10 +54,11 @@ Offset continuity is checked through the ordered boundary before recording the i
 The Kafka vault independently validates and withdraws frame keys, while broker retention remains under Classic policy.
 An exact durable Kafka intent can resume after the broker low watermark advances. [Kafka retirement](../../rust/crates/kafka/src/erasure.rs) · [Vault intent](../../rust/crates/storage/src/sealing/classic/kafka_retirement.rs)
 
-For a new inventory, the first unavailable original envelope is the irreducible Kafka history limit.
-`KafkaLog::range` rejects a scan below the broker low watermark, and the vault position census stores publication IDs and digests without detached object addresses.
-An existing bound inventory can survive that loss.
-An uncovered historical interval needs previously persisted object-reference evidence to establish the same proof. [Kafka range](../../rust/crates/kafka/src/lib.rs#L290) · [Position census](../../rust/crates/storage/src/sealing/classic/kafka_retirement.rs)
+A sealed Default replica topic persists reference evidence on acknowledgement and can backfill it when opening a retained frame.
+The vault binds each evidence record to the original offset and sealed publication identity.
+It records either a detached address or an explicit inline frame and preserves both across Classic broker-floor settlement.
+A new inventory requires evidence for every covered coordinate below the broker or key floor and scans the remaining interval directly.
+A position that expired before its evidence was recorded remains irrecoverable to this route. [Kafka range](../../rust/crates/kafka/src/lib.rs#L295) · [Reference evidence](../../rust/crates/storage/src/sealing/classic/kafka_references.rs)
 
 Public physical Erase remains gated.
 Hosted object storage, external pg-source, copied histories without original custody, and deployments with incomplete prefix or reader evidence stay outside this route.

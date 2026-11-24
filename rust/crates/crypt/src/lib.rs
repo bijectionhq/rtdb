@@ -32,6 +32,9 @@ pub struct Generation {
 /// Implementations serving durable databases preserve retirement and destruction across restart.
 #[async_trait]
 pub trait Kms: Send + Sync {
+    fn supports_durable_generation_retirement(&self) -> bool { false }
+    async fn generation_destroyed(&self, _generation: Generation) -> Result<bool> { Ok(false) }
+
     async fn create(&self, generation: Generation) -> Result<()>;
     async fn wrap(&self, generation: Generation, key: &DataKey, context: &[u8]) -> Result<Vec<u8>>;
     async fn unwrap(

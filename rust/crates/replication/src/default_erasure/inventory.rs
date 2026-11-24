@@ -7,7 +7,10 @@ use rtdb_format::{
     journal::{ObjectId, ObjectKind},
     keys::{block_index_from_key, block_key, oversized_block_index, skipped_tx_position},
 };
-use rtdb_storage::{Error, ObjectKey, ReadReservation};
+use rtdb_storage::{
+    Error, ObjectKey, ReadReservation,
+    log::{CheckpointReplicaReference, LogOffset},
+};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -170,14 +173,49 @@ impl RetirementInventory {
         boundary: ReplicaPosition,
         cancellation: &CancellationToken,
     ) -> Result<BTreeSet<String>> {
-        let first = ReplicaPosition::from_epoch_offset(logs.replica_epoch, 0)?;
+        let through = boundary.after_offset(logs.replica_epoch);
+        let before = through
+            .checked_add(1)
+            .filter(|before| *before > 0)
+            .ok_or_else(invalid)?;
         let end = ReplicaPosition(boundary.0.checked_add(1).ok_or_else(invalid)?);
         let (_, custody) = logs.checkpoint_log_keys().ok_or_else(incomplete)?;
         let dense = custody.checkpoint_offsets_are_dense();
+        let mut objects = BTreeSet::new();
+        let mut first_live = 0;
+        if let Some(prior) = custody
+            .prior_checkpoint_references(LogOffset(through))
+            .await?
+        {
+            first_live = prior.first_live.0;
+            if !(0..=before).contains(&first_live) {
+                return Err(incomplete());
+            }
+            for reference in prior.detached {
+                let CheckpointReplicaReference::Detached {
+                    storage_version,
+                    storage_epoch,
+                    key,
+                } = reference
+                else {
+                    return Err(incomplete());
+                };
+                if storage_version != logs.storage_version
+                    || storage_epoch != logs.storage_epoch
+                    || oversized_block_index(&key).is_none_or(|index| index > block)
+                {
+                    return Err(incomplete());
+                }
+                objects.insert(key);
+            }
+        }
+        if first_live == before {
+            return Ok(objects);
+        }
+        let first = ReplicaPosition::from_epoch_offset(logs.replica_epoch, first_live)?;
         let mut range = logs.replica_range(first, end).await?;
         let bound = range.allocation_bound();
         let mut previous: Option<ReplicaPosition> = None;
-        let mut objects = BTreeSet::new();
         while let Some(raw) = cancellation
             .run_until_cancelled(
                 range.next(ReadReservation::new(bound, logs.memory().reserve(bound)?)),
@@ -399,6 +437,7 @@ mod tests {
             boundary: ReplicaPosition(11),
             members_sha256: [6; 32],
             inventory_sha256: None,
+            prior_generation: None,
         };
         let root = block_key(BlockIndex(2))?;
         let offload = rtdb_format::keys::oversized_key(BlockIndex(2), "body")?;

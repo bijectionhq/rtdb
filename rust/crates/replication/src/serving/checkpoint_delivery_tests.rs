@@ -95,3 +95,38 @@ fn pending_erasure_receipts_cannot_be_delivered() -> Result<()> {
     assert_eq!(project_receipt(&index, receipt, None)?.erasure, Some(armed));
     Ok(())
 }
+
+#[tokio::test]
+async fn ordinary_checkpoints_continue_at_the_installed_generation_after_restart() -> Result<()> {
+    let incarnation = [8; 16];
+    let database = Uuid::from_bytes(incarnation);
+    let keys: Arc<dyn Kms> = Arc::new(LocalKms::new(|| 100));
+    let initial = NativeServingAuthority {
+        incarnation,
+        checkpoints: Some(NativeCheckpointAuthority {
+            kms: Arc::clone(&keys),
+            generation: 0,
+        }),
+    };
+    let selected = Generation {
+        database,
+        number: 1,
+    };
+    keys.create(selected).await?;
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
+    let (mut fresh, _) = NativeServing::open(initial.clone(), Arc::clone(&store), None, false)?;
+    let image = fresh.checkpoint(Term(1), false)?.image;
+    let file = WriterObjects::new(database, 1)
+        .file(keys.as_ref(), selected.number, &image)
+        .await?;
+    file.put(store.as_ref()).await?;
+    let checkpoint = initial
+        .read_checkpoint(store.as_ref(), None, Some(&file.id().to_string()))
+        .await?;
+    let (mut reopened, _) = NativeServing::open(initial, store, checkpoint.as_ref(), false)?;
+    assert_eq!(
+        reopened.checkpoint(Term(2), true)?.write_generation()?,
+        selected.number
+    );
+    Ok(())
+}

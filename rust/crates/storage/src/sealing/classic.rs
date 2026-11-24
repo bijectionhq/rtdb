@@ -18,6 +18,7 @@ use uuid::Uuid;
 use super::{EncryptingStore, ObjectCipher, UnitOperation, UnitOutput, cipher::Cipher};
 use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
+mod kafka_references;
 mod kafka_retirement;
 pub use kafka_retirement::KafkaPrefixRetirement;
 
@@ -343,6 +344,12 @@ impl KafkaFrameKeys {
 
     /// Persists the exact broker-acknowledged position before acknowledging it to RTDB.
     pub fn record_kafka_publication(&self, offset: i64, frame: &[u8]) -> crate::Result<()> {
+        self.record_kafka_publication_and_reference(offset, frame, None)
+    }
+
+    pub fn record_kafka_publication_and_reference(
+        &self, offset: i64, frame: &[u8], reference: Option<&crate::log::CheckpointReplicaReference>,
+    ) -> crate::Result<()> {
         if offset < 0 {
             return Err(Error::Task("Invalid Kafka frame publication".into()));
         }
@@ -354,7 +361,11 @@ impl KafkaFrameKeys {
         }
         let erasure_floor = self.kafka_erasure_floor()?;
         if offset >= erasure_floor { self.check_retiring_slot(publication, erasure_floor)?; }
-        self.record_publication_locked(offset, frame, offset >= erasure_floor)
+        self.record_publication_locked(offset, frame, offset >= erasure_floor)?;
+        if let Some(reference) = reference.filter(|_| offset >= erasure_floor) {
+            self.record_reference_locked(offset, frame, reference)?;
+        }
+        Ok(())
     }
 
     fn record_publication_locked(&self, offset: i64, frame: &[u8], retain_new: bool) -> crate::Result<()> {
@@ -379,6 +390,12 @@ impl KafkaFrameKeys {
 
     /// Repairs the census after an ambiguous broker acknowledgement while the record is retained.
     pub async fn open_kafka_publication(self: &Arc<Self>, offset: i64, frame: Bytes) -> crate::Result<Bytes> {
+        self.open_kafka_publication_with_references(offset, frame, false).await
+    }
+
+    pub async fn open_kafka_publication_with_references(
+        self: &Arc<Self>, offset: i64, frame: Bytes, capture_references: bool,
+    ) -> crate::Result<Bytes> {
         self.0.region.read(Arc::clone(self), offset, move |keys, &offset| {
             let broker_floor = keys.0.path.join("retired-before");
             let _gate = lock(&broker_floor)?;
@@ -388,6 +405,9 @@ impl KafkaFrameKeys {
             keys.check_retiring_slot(kafka_publication(&frame)?, erasure_floor)?;
             let plaintext = keys.open_kafka_record(&frame)?;
             keys.record_publication_locked(offset, &frame, true)?;
+            if capture_references && let Some(reference) = Self::replica_reference(&plaintext) {
+                keys.record_reference_locked(offset, &frame, &reference)?;
+            }
             Ok(plaintext)
         }).await
     }

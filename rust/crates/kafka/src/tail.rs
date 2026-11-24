@@ -15,6 +15,7 @@ pub(crate) struct KafkaTail {
     progress: Arc<Progress>,
     next: i64,
     keys: Option<Arc<KafkaFrameKeys>>,
+    replica_references: bool,
 }
 
 pub(crate) struct KafkaRange { tail: KafkaTail, end: i64, maximum: usize, timeout: Duration }
@@ -33,7 +34,7 @@ impl rtdb_storage::log::LogRange for KafkaRange {
 }
 
 impl KafkaTail {
-    pub fn new(consumer: ConfiguredLogClient<Arc<BaseConsumer>>, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset, keys: Option<Arc<KafkaFrameKeys>>) -> Result<Self> {
+    pub fn new(consumer: ConfiguredLogClient<Arc<BaseConsumer>>, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset, keys: Option<Arc<KafkaFrameKeys>>, replica_references: bool) -> Result<Self> {
         progress.check()?;
         let next = after.0.checked_add(1).filter(|next| *next >= 0).ok_or_else(|| Error::UnavailableLogRange { requested: after.0, first_retained: 0 })?;
         let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
@@ -43,7 +44,7 @@ impl KafkaTail {
         assignment.add_partition_offset(&options.topic, 0, Offset::Offset(next)).map_err(|error| transport_error(&options.topic, error))?;
         consumer.assign(&assignment).map_err(|error| transport_error(&options.topic, error))?;
         progress.advance(high - 1);
-        Ok(Self { consumer, pending: None, options, progress, next, keys })
+        Ok(Self { consumer, pending: None, options, progress, next, keys, replica_references })
     }
 
     pub fn next_offset(&self) -> i64 { self.next }
@@ -108,7 +109,7 @@ impl KafkaTail {
         let payload = Bytes::copy_from_slice(self.pending_message()?.as_borrowed().payload().ok_or_else(|| self.tombstone())?);
         let payload = match &self.keys {
             Some(keys) => {
-                let open = keys.open_kafka_publication(head.metadata.offset.0, payload);
+                let open = keys.open_kafka_publication_with_references(head.metadata.offset.0, payload, self.replica_references);
                 match &reservation {
                     Some(reservation) => reservation.retaining_io(open).await?,
                     None => open.await?,

@@ -10,6 +10,7 @@ mod checkpoint_discovery;
 mod replay_floor;
 mod driver;
 mod default_erasure;
+pub use default_erasure::{DefaultErasureReadCut, DefaultErasureReadFence};
 mod fact_history;
 mod logs;
 mod maintenance_class;

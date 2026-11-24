@@ -65,6 +65,10 @@ impl KafkaFrameKeys {
         Ok(Intent::read(&self.0.path.join(INTENT))?.map_or(0, |intent| intent.retirement.before))
     }
 
+    pub fn kafka_classic_retirement_floor(&self) -> crate::Result<i64> {
+        kafka_retired_before(&self.0.path.join("retired-before"))
+    }
+
     pub async fn has_kafka_prefix_retirement(
         &self,
         retirement: KafkaPrefixRetirement,
@@ -186,7 +190,7 @@ fn prepare(
     if retirement.before <= 0 || retirement.before > broker_end {
         return Err(invalid_intent());
     }
-    let mut settled_before = classic_floor;
+    let mut settled_before = classic_floor.min(retirement.before);
     if let Some(prior) = Intent::read(&path.join(INTENT))? {
         if prior.retirement == retirement {
             return Ok(prior);

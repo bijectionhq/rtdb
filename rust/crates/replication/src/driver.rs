@@ -533,6 +533,7 @@ pub struct ReplicationDriver {
     serving_search: Option<Arc<dyn ServingSearchBuilder>>,
     serving: Option<NativeServing>,
     default_erasure: Option<DefaultErasure>,
+    default_erasure_read_fence: Option<Arc<dyn crate::DefaultErasureReadFence>>,
     default_erasure_grant_micros: Option<u64>,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
@@ -593,7 +594,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -1545,7 +1546,7 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => {
-                    if self.apply_default_erasure_control(message, record.metadata.position)? {
+                    if self.apply_default_erasure_control(message, record.metadata.position).await? {
                         self.complete_control(&record);
                         continue;
                     }
