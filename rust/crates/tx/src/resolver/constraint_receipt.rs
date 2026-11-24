@@ -17,8 +17,6 @@ const DECISION_PREFIX: &str = "root_decision:";
 const IMPACT_PREFIX: &str = "root_decision_impact:";
 const CLOCK_TASK: &str = "clock-task:";
 const ACTION_PERFORMANCE: &str = "action-performance:";
-const LANDING_RECEIPT: &str = "root_proposal_landing:";
-const LANDING_PROOF: &str = "root_proposal_landing_proof:";
 const MAX_DECISION_BYTES: usize = 1 << 20;
 
 fn invalid() -> Anomaly {
@@ -220,9 +218,7 @@ fn landing_slot(control: &HostedControlWrite) -> Option<usize> {
         return None;
     }
     let EntityId::String(id) = control.id() else { return None; };
-    if id.starts_with(LANDING_RECEIPT) { Some(0) }
-    else if id.starts_with(LANDING_PROOF) { Some(1) }
-    else { None }
+    crate::hosted_control::landing_receipt_slot(id).map(|(slot, _)| slot)
 }
 
 fn validate_landing_choice(primary: &[Operation], refusal: &[Operation], placed: bool) -> Result<()> {
@@ -294,7 +290,12 @@ fn landing_verdict(before: &[u8], after: &[u8], receipt_id: &str) -> bool {
     let (Ok(mut before), Ok(after)) = (serde_json::from_slice::<serde_json::Value>(before),
         serde_json::from_slice::<serde_json::Value>(after)) else { return false; };
     let Some(record) = before.as_object_mut() else { return false; };
-    if record.get("outcome").and_then(serde_json::Value::as_str) != Some("applied")
+    let Some(label) = record.get("request").and_then(|request| request.get("publication_label"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|label| serde_json::from_str::<Vec<String>>(label).ok()) else { return false; };
+    let protected = crate::hosted_control::protected_proposal_landing_control(receipt_id);
+    if protected == label.is_empty()
+        || record.get("outcome").and_then(serde_json::Value::as_str) != Some("applied")
         || record.get("activation").and_then(serde_json::Value::as_str) != Some(receipt_id)
         || record.get("roots").and_then(serde_json::Value::as_array).is_none_or(Vec::is_empty)
     {
@@ -686,10 +687,10 @@ mod tests {
     #[test]
     fn landing_refusal_keeps_the_request_and_withdraws_candidate_assertions() {
         let id = "root_proposal_landing:original";
-        let before = br#"{"request":{"branch":"one"},"outcome":"applied","activation":"root_proposal_landing:original","roots":[{"position":1}],"environment":{}}"#;
-        let after = br#"{"request":{"branch":"one"},"outcome":"constraint_refused","activation":null,"roots":[],"environment":{}}"#;
-        let foreign = br#"{"request":{"branch":"two"},"outcome":"constraint_refused","activation":null,"roots":[],"environment":{}}"#;
-        let published = br#"{"request":{"branch":"one"},"outcome":"constraint_refused","activation":"root_proposal_landing:original","roots":[],"environment":{}}"#;
+        let before = br#"{"request":{"branch":"one","publication_label":"[]"},"outcome":"applied","activation":"root_proposal_landing:original","roots":[{"position":1}],"environment":{}}"#;
+        let after = br#"{"request":{"branch":"one","publication_label":"[]"},"outcome":"constraint_refused","activation":null,"roots":[],"environment":{}}"#;
+        let foreign = br#"{"request":{"branch":"two","publication_label":"[]"},"outcome":"constraint_refused","activation":null,"roots":[],"environment":{}}"#;
+        let published = br#"{"request":{"branch":"one","publication_label":"[]"},"outcome":"constraint_refused","activation":"root_proposal_landing:original","roots":[],"environment":{}}"#;
         assert!(landing_verdict(before, after, id));
         assert!(!landing_verdict(before, after, "root_proposal_landing:foreign"));
         assert!(!landing_verdict(before, foreign, id));

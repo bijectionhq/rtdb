@@ -275,6 +275,15 @@ A checked Proposal settlement requires the matching point witness for each effec
 The resolver checks each payload against the world’s installed schema.
 A sealed derived projection is an opaque binary field on its declared search relation, carried as binary through source and resolved archive replay.
 
+### Protected prepared receipt placement
+
+Hosted protocol 218 admits a matched protected receipt and proof under `root_proposal_private_landing:` and `root_proposal_private_landing_proof:` in the existing hosted admission relation.
+Only the original placed writer can read those controls.
+The prepared audience has no access, and the protected switch cannot advance public publication frontiers or emit public task intents.
+The switch retains the applied receipt and proof with the destination at one order.
+The constraint-refusal pair keeps the same request, cleared activation and empty candidate roots.
+Bijection owns the equivalent audience check before probing a protected source.
+
 ## Fence semantics across dependent forks
 
 A fence takes effect in the vault, not in any one world, so it closes every world at once.

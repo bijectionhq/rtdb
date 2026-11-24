@@ -929,7 +929,7 @@ impl HostedControlWrite {
 
     pub(crate) fn is_landing_receipt_insert(&self) -> bool {
         self.name() == "bj_fact_root_admission" && !self.is_check() && self.expected().is_none()
-            && matches!(self.id(), EntityId::String(id) if landing_control_id(id, "root_proposal_landing:"))
+            && matches!(self.id(), EntityId::String(id) if landing_receipt_slot(id).is_some_and(|(slot, _)| slot == 0))
     }
 
     pub fn is_check(&self) -> bool {
@@ -1888,6 +1888,24 @@ pub(crate) fn proposal_overlay_write(
     })
 }
 
+const PRIVATE_LANDING_RECEIPT: &str = "root_proposal_private_landing:";
+const PRIVATE_LANDING_PROOF: &str = "root_proposal_private_landing_proof:";
+
+pub fn protected_proposal_landing_control(id: &str) -> bool {
+    id.starts_with(PRIVATE_LANDING_RECEIPT) || id.starts_with(PRIVATE_LANDING_PROOF)
+}
+
+pub(crate) fn landing_receipt_slot(id: &str) -> Option<(usize, bool)> {
+    [
+        ("root_proposal_landing:", 0, false),
+        ("root_proposal_landing_proof:", 1, false),
+        (PRIVATE_LANDING_RECEIPT, 0, true),
+        (PRIVATE_LANDING_PROOF, 1, true),
+    ].into_iter().find_map(|(prefix, slot, protected)| {
+        landing_control_id(id, prefix).then_some((slot, protected))
+    })
+}
+
 /// Fresh native task records a landing may order with its receipt.
 pub const MAX_PROPOSAL_LAND_TASKS: usize = 16;
 
@@ -1922,8 +1940,7 @@ pub fn proposal_land_controls<'a>(controls: impl IntoIterator<Item = &'a HostedC
 pub(crate) fn proposal_landing_replacements<'a>(ids: impl IntoIterator<Item = &'a str>) -> bool {
     let mut seen = std::collections::BTreeSet::new();
     let mut head = false;
-    let mut receipt = false;
-    let mut proof = false;
+    let mut receipt_scopes = [None; 2];
     let mut carrier = false;
     let mut action = false;
     let mut clock_charge = false;
@@ -1935,9 +1952,13 @@ pub(crate) fn proposal_landing_replacements<'a>(ids: impl IntoIterator<Item = &'
         if !seen.insert(id) {
             return false;
         }
+        if let Some((slot, protected)) = landing_receipt_slot(id) {
+            if receipt_scopes[slot].replace(protected).is_some() {
+                return false;
+            }
+            continue;
+        }
         let slot = if landing_control_id(id, "root_proposal_head:") { &mut head }
-        else if landing_control_id(id, "root_proposal_landing:") { &mut receipt }
-        else if landing_control_id(id, "root_proposal_landing_proof:") { &mut proof }
         else if landing_control_id(id, "task-acceptance:") { &mut carrier }
         else if landing_action_task_id(id) { &mut action }
         else if landing_control_id(id, "clock-task:") {
@@ -1957,7 +1978,9 @@ pub(crate) fn proposal_landing_replacements<'a>(ids: impl IntoIterator<Item = &'
             return false;
         }
     }
-    head && receipt && proof && carrier == action
+    let [Some(receipt_protected), Some(proof_protected)] = receipt_scopes else { return false; };
+    head && receipt_protected == proof_protected && carrier == action
+        && (!receipt_protected || (!action && clocks == 0))
         && clocks + usize::from(action) <= MAX_PROPOSAL_LAND_TASKS
         && (!clock_charge || clocks > 0)
         && (!(send_charge || mount_budget || lane_tail) || action)
@@ -2184,9 +2207,14 @@ pub(crate) fn hosted_proposal_land(
     let mut close = false;
     let mut controls = Vec::new();
     let mut frontiers = std::collections::BTreeSet::new();
+    let mut public_version = false;
     if !root_partition_frontiers_match(operations) { return None; }
     for op in operations {
-        if root_partition_frontier_rows(op).is_some() || source_public_root_version_marker(op) { continue; }
+        if root_partition_frontier_rows(op).is_some() { continue; }
+        if source_public_root_version_marker(op) {
+            public_version = true;
+            continue;
+        }
         if let Some(documents) = proposal_landing_frontier_rows(op) {
             for row in documents.rows() {
                 let id = row.string_id()?;
@@ -2277,6 +2305,14 @@ pub(crate) fn hosted_proposal_land(
     }
     let (world, pin, expected_clock) = landing?;
     if writes.is_empty() || frontiers.len() > writes.len() || close && !frontiers.is_empty() {
+        return None;
+    }
+    let protected = controls.iter().any(|control| {
+        control.is_landing_receipt_insert() && matches!(
+            control.id(), EntityId::String(id) if protected_proposal_landing_control(id)
+        )
+    });
+    if protected && (public_version || !frontiers.is_empty()) {
         return None;
     }
     let all_fixed_periods = writes.values().all(|key| key.extents[0].is_some());
