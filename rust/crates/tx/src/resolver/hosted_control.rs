@@ -199,7 +199,7 @@ impl OpenTransaction<'_> {
         let (Value::Utf8(kind), Value::Binary(incarnation), Value::Utf8(writer)) =
             (field("kind")?, field("incarnation")?, field("writer")?)
         else { return Err(stale()); };
-        if kind != "hosted" || incarnation.len() != 16 || incarnation.iter().all(|&byte| byte == 0)
+        if !matches!(kind.as_str(), "hosted" | "standalone") || incarnation.len() != 16 || incarnation.iter().all(|&byte| byte == 0)
             || writer.len() != 32 || !writer.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || proof.is_some_and(|proof| !proof.matches(&incarnation, &writer))
         {
