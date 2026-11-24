@@ -1,5 +1,6 @@
 //! Custody of a detached publication prepared for one destination position.
 
+use rtdb_directory::AbandonedCellGeneration;
 use rtdb_s3::{CreateAttemptPublication, VersionedInventory};
 
 use super::*;
@@ -42,7 +43,52 @@ pub(super) fn transfer_excluded(record: &DeploymentRecord, route: PublishRoute) 
     }
 }
 
+fn closed_generation_drained(record: &DeploymentRecord, generation: Uuid, entry: &AbandonedCellGeneration) -> bool {
+    if record.abandoned_generations.get(&generation) != Some(entry) || record.storage_namespaces != Some(entry.namespaces) {
+        return false;
+    }
+    record.storage_prefix_at(Some(generation)) == entry.prefix && match record.storage_generation {
+        Some(current) if current == generation => record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
+            && record.storage_regions.is_empty(),
+        Some(_) => !record.cell_transfer.as_ref().and_then(|transfer| transfer.attempt.as_ref())
+            .is_some_and(|attempt| attempt.generation == generation),
+        None => false,
+    }
+}
+
 impl Service {
+    /// A closed and drained generation excludes every pointer into this exact
+    /// broker residence, including bodies already adopted by its old journal.
+    pub(super) async fn settle_closed_generation(
+        &self, inventory: &VersionedInventory, record: &DeploymentRecord, generation: Uuid,
+        entry: &AbandonedCellGeneration,
+    ) -> Result<()> {
+        let Some(replay) = entry.detached_replay.as_ref().filter(|replay| !replay.settled) else { return Ok(()); };
+        if replay.namespace != self.namespace || !closed_generation_drained(record, generation, entry)
+        {
+            return Ok(());
+        }
+        let residence = format!("replay-bodies/{}/{}", entry.prefix, replay.log_epoch);
+        let target = ObjectKey::new(&residence)?;
+        // Draining precedes withdrawal, including reserved slots for uploads
+        // that received a provider result but lost their directory response.
+        inventory.drain_uploads(&target).await?;
+        let io = IoRegion::new();
+        let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, replay.log_epoch), Arc::clone(&io));
+        let withdrawn = ledger.withdraw_scope().await;
+        io.close_and_wait().await;
+        withdrawn?;
+        inventory.purge(&target).await?;
+        crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
+            if !closed_generation_drained(current, generation, entry) { return Ok(()); }
+            if let Some(replay) = current.abandoned_generations.get_mut(&generation).and_then(|entry| entry.detached_replay.as_mut()) {
+                replay.settled = true;
+            }
+            Ok(())
+        }).await?;
+        Ok(())
+    }
+
     /// A retry keeps the same position and body. After a lost reply it can
     /// reuse the recorded upload, or the version already certified there.
     pub(super) async fn reuse_transfer_upload(
@@ -142,7 +188,6 @@ impl Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtdb_directory::AbandonedCellGeneration;
 
     #[test]
     fn a_cell_transfer_exclusion_names_its_current_closed_generation() {
@@ -157,12 +202,22 @@ mod tests {
         assert!(!transfer_excluded(&record, route));
         let prefix = record.storage_prefix();
         record.abandoned_generations.insert(generation, AbandonedCellGeneration {
-            ordinal: 1, closed_at_ms: 0, first_empty_at_ms: None, disposition: None, prefix, namespaces,
+            ordinal: 1, closed_at_ms: 0, first_empty_at_ms: None, disposition: None, detached_replay: None, prefix, namespaces,
         });
         assert!(current_generation_abandoned(&record));
         assert!(transfer_excluded(&record, route));
+        let original_stream = record.stream("replica");
+        let entry = record.abandoned_generations[&generation].clone();
+        assert!(closed_generation_drained(&record, generation, &entry));
+        record.storage_regions.insert(Uuid::new_v4(), StorageRegion::ReplicaReplay {
+            first_required: 12, through: 12, custody: ReplayCustody::Local,
+        });
+        assert!(!closed_generation_drained(&record, generation, &entry));
+        record.storage_regions.clear();
         record.storage_generation = Some(Uuid::new_v4());
+        assert_ne!(record.stream("replica"), original_stream);
         assert!(!current_generation_abandoned(&record));
         assert!(!transfer_excluded(&record, route));
+        assert!(closed_generation_drained(&record, generation, &entry));
     }
 }

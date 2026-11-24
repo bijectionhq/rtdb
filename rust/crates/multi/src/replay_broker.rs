@@ -58,6 +58,13 @@ impl History {
         })
     }
 
+    fn stream(self) -> String {
+        match self.storage_generation {
+            Some(generation) => format!("{}/{}-{}/replica", self.deployment, self.incarnation, generation.simple()),
+            None => format!("{}/{}/replica", self.deployment, self.incarnation),
+        }
+    }
+
     fn matches(self, record: &DeploymentRecord) -> bool {
         record.incarnation == self.incarnation && record.log_epoch == self.log_epoch
             && record.storage_generation == self.storage_generation
@@ -443,6 +450,11 @@ impl Service {
                     }
                 }
             }
+            for (&generation, entry) in &record.abandoned_generations {
+                if let Err(error) = self.settle_closed_generation(&inventory, &record, generation, entry).await {
+                    tracing::warn!(installation = %record.id, %generation, code = %error.code, "The abandoned replay residence is awaiting settlement");
+                }
+            }
             let Some(work) = record.replica_payload_trim.as_deref().filter(|work| work.belongs_to(&record)) else { continue; };
             for candidate in &work.candidates {
                 if let Err(error) = self.reclaim_one(&inventory, &record, candidate).await {
@@ -745,8 +757,14 @@ impl Service {
                 {
                     return Err(refused());
                 }
-                let draft = matches!(self.storage, CellStorage::S3 { .. })
-                    .then(|| staging::reserve_body(record, key, route, body_sha256)).transpose()?;
+                let versioned = matches!(self.storage, CellStorage::S3 { .. });
+                if versioned && matches!(route, PublishRoute::CellTransfer { .. }) {
+                    if record.transfer_replay_namespace.is_some_and(|namespace| self.namespace != namespace) {
+                        return Err(refused());
+                    }
+                    record.transfer_replay_namespace = Some(self.namespace);
+                }
+                let draft = versioned.then(|| staging::reserve_body(record, key, route, body_sha256)).transpose()?;
                 record.storage_regions.insert(region, StorageRegion::ReplicaPublication {
                     key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(), draft,
                 });
@@ -877,7 +895,7 @@ impl Service {
             match crate::store::release_region(self.directory.as_ref(), &deployment, region, true).await {
                 Ok(()) => {
                     crate::residence_trace::record("finish-recovery", || serde_json::json!({
-                        "installation": deployment, "stream": format!("{deployment}/{}/replica", history.incarnation),
+                        "installation": deployment, "stream": history.stream(),
                         "epoch": history.log_epoch, "hold": region,
                     }));
                     return;

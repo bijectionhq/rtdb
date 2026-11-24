@@ -313,6 +313,9 @@ pub struct DeploymentRecord {
     /// Each attempted copy uses a different prefix, so a superseded copier can never modify a live destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_generation: Option<uuid::Uuid>,
+    /// Broker namespace enrolled by the current incoming cell-transfer generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_replay_namespace: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_namespaces: Option<StorageNamespaces>,
     /// The last time a previously issued S3 write session may still be usable.
@@ -901,6 +904,15 @@ pub struct AbandonedCellGeneration {
     /// A remote prefix settles only after the write horizon from this observation.
     pub first_empty_at_ms: Option<i64>,
     pub disposition: Option<GenerationDisposition>,
+    pub detached_replay: Option<AbandonedReplicaResidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonedReplicaResidence {
+    pub namespace: [u8; 32],
+    pub log_epoch: i32,
+    pub settled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1160,7 +1172,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
             cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
@@ -1219,8 +1231,10 @@ impl DeploymentRecord {
 
     /// The only prefix this deployment's objects may live under.
     /// The leading hash spreads deployments over the object store's request partitions.
-    pub fn storage_prefix(&self) -> String {
-        let store = self.storage_generation.map_or_else(
+    pub fn storage_prefix(&self) -> String { self.storage_prefix_at(self.storage_generation) }
+
+    pub fn storage_prefix_at(&self, generation: Option<uuid::Uuid>) -> String {
+        let store = generation.map_or_else(
             || self.incarnation.to_string(),
             |generation| format!("{}-{}", self.incarnation, generation.simple()),
         );
@@ -1240,7 +1254,12 @@ impl DeploymentRecord {
     }
 
     /// The name of a physical log stream on this residence's ensemble.
-    pub fn stream(&self, kind: &str) -> String { format!("{}/{}/{kind}", self.id, self.incarnation) }
+    pub fn stream(&self, kind: &str) -> String {
+        match self.storage_generation {
+            Some(generation) => format!("{}/{}-{}/{kind}", self.id, self.incarnation, generation.simple()),
+            None => format!("{}/{}/{kind}", self.id, self.incarnation),
+        }
+    }
 
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {

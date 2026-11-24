@@ -4689,7 +4689,7 @@ async fn exercise_interrupted_replacement(case: Replacement) {
         .find(|path| path.extension().is_some_and(|extension| extension == "pack")).unwrap();
     let closed = rtdb_directory::AbandonedCellGeneration {
         ordinal: 1, namespaces: partial.storage_namespaces.unwrap(), prefix: partial.storage_prefix(),
-        closed_at_ms: rtdb_directory::now_ms(), first_empty_at_ms: None, disposition: None,
+        closed_at_ms: rtdb_directory::now_ms(), first_empty_at_ms: None, disposition: None, detached_replay: None,
     };
     let strip = |record: &mut DeploymentRecord| { record.cell_transfer.as_mut().unwrap().attempt = None; };
     let expected_ordinal = match case {

@@ -3724,3 +3724,9 @@ open question "What is the node-library form of a holder embedded in another pro
 
 open question "Does the directory's envelope count forks?"
     -- Each durable branch is a DeploymentRecord; a deployment with thousands of branches multiplies directory rows, and cell_max_deployments has to say which it bounds.
+
+
+-- Each incoming cell transfer generation owns a distinct destination replica stream.
+-- The detached publisher enrolls its broker namespace before admitting the first provider upload.
+-- Closing the generation withdraws access to its journal pointers.
+-- After admitted work drains, the enrolled broker settles every detached version and key in that exact closed generation, including versions already adopted.

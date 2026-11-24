@@ -701,7 +701,8 @@ impl PublicationJournal for DirectoryPublications {
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
             let accepts_writes = match &self.owner {
                 PublicationOwner::Serving => matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
-                PublicationOwner::Transfer => record.lifecycle == Lifecycle::Moving && record.move_from.is_some(),
+                PublicationOwner::Transfer => record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
+                    && record.storage_generation.is_some_and(|generation| !record.abandoned_generations.contains_key(&generation)),
                 PublicationOwner::CheckpointStage { operation, bootstrap } => record.lifecycle == Lifecycle::Restoring
                     && record.checkpoint_stage.as_deref().is_some_and(|stage| {
                         if stage.intent.operation != *operation { return false; }

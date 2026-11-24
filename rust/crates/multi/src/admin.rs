@@ -1277,7 +1277,7 @@ async fn prepare_cell_move(
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/cell-full", "The destination is at its deployment limit"));
     }
     let source_stream = administration_stream(from.directory.as_ref(), &current, maximum_message_bytes).await?;
-    let target_stream = administration_stream(to.directory.as_ref(), &arrival, maximum_message_bytes).await?;
+    let mut target_stream = administration_stream(to.directory.as_ref(), &arrival, maximum_message_bytes).await?;
     let source_journals = source_stream.servers.iter().chain(&current.replica_journals).chain(&current.log_copy_servers);
     if let Some(legacy) = source_journals.clone().find(|endpoint| endpoint.journal().is_none()) {
         return Err(unbound_inventory(legacy.address()));
@@ -1362,6 +1362,7 @@ async fn prepare_cell_move(
             .and_then(|transfer| transfer.attempt.as_ref())
             .map_or_else(uuid::Uuid::new_v4, |attempt| attempt.generation));
         staged.abandoned_generations.clear();
+        staged.transfer_replay_namespace = None;
         staged.recovery_manifest_sha256 = None;
         staged.checkpoint_decision = None;
         staged.storage_namespaces = Some(target_binding);
@@ -1460,6 +1461,7 @@ async fn prepare_cell_move(
         }
     }
 
+    target_stream.stream = staged.stream("replica");
     crate::archive::reseal_live_journal(
         from, &source, &source_stream, to, &staged, &target_stream, hosted_task.as_ref(),
     ).await?;
@@ -1508,6 +1510,7 @@ async fn stage_cell_storage(
     let admitted = update_installation(to.directory.as_ref(), &staged.id, |record| {
         if !same_cell_move(record, staged) || record.epoch != staged.epoch
             || record.lifecycle != Lifecycle::Moving || record.move_from != staged.move_from
+            || record.storage_generation.is_some_and(|generation| record.abandoned_generations.contains_key(&generation))
         {
             return Err(cell_move_conflict(from, to, &staged.name));
         }

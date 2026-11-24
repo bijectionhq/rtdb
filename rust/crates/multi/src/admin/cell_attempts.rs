@@ -3,7 +3,7 @@
 //! record retains every closed generation until the provider shows it empty.
 
 use rtdb_directory::{
-    AbandonedCellGeneration, CellTransferAttempt, DeploymentRecord, Directory, GenerationDisposition, Lifecycle,
+    AbandonedCellGeneration, AbandonedReplicaResidence, CellTransferAttempt, DeploymentRecord, Directory, GenerationDisposition, Lifecycle,
     ServingInventory, now_ms,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -56,6 +56,9 @@ async fn close(to: &CellHandle<'_>, source: &DeploymentRecord, staged: &Deployme
             closed_at_ms: now_ms(),
             first_empty_at_ms: None,
             disposition: None,
+            detached_replay: record.transfer_replay_namespace.map(|namespace| AbandonedReplicaResidence {
+                namespace, log_epoch: record.log_epoch, settled: false,
+            }),
         });
         Ok(())
     }).await
@@ -128,6 +131,7 @@ pub(super) async fn install_selected(to: &CellHandle<'_>, closed: &DeploymentRec
         }
         record.cell_transfer.clone_from(&source.cell_transfer);
         record.storage_generation = Some(selected.generation);
+        record.transfer_replay_namespace = None;
         record.catalog_readers.clear();
         Ok(())
     }).await
@@ -167,7 +171,11 @@ pub(crate) async fn dispose_generations(directory: &dyn Directory, storage: &Cel
         let selected = attempt_of(&record).map(|attempt| attempt.generation.as_u128());
         // A generation closed just before its successor was installed is
         // still named by the record; disposal of the residence erases it.
-        if !may_dispose(true, generation.as_u128(), current, selected) { continue; }
+        if !may_dispose(true, generation.as_u128(), current, selected)
+            || entry.detached_replay.as_ref().is_some_and(|replay| !replay.settled)
+        {
+            continue;
+        }
         if entry.namespaces != namespaces { return Err(attempt_changed(&record.name)); }
         let prefix = crate::reference::key(&entry.prefix)?;
         crate::reference::require_disjoint_prefix(&prefix, others.iter())?;
