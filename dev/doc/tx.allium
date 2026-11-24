@@ -362,6 +362,7 @@
 -- A hit proves both the full occupancy identity and the winning fact holder's complete Binary key.
 -- A covered miss or verified hit can yield one original held relation witness.
 -- An admitted finite unique window projects complete Binary keys and winning fact holders with clipped valid intervals.
+-- Its Flight reply retains each holder as a complete typed identity in the standard dense Arrow identity union.
 -- A held decision mask applies to fact assertions before key selection, and a masked or historical window issues no commit witness.
 -- An unmasked present window may issue a relation-frontier witness after admitting the complete bounded result.
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.

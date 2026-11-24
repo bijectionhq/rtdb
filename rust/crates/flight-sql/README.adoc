@@ -617,6 +617,12 @@ or no rows for a covered absence. The resolver revalidates this relation
 witness in the same way as other held range evidence. The complete occupancy
 identity, holder identity, and holder's declared key must all agree.
 
+`rtdb.owned.ReadHeldUniqueWindow.v1` uses the held handle, a position mask option, the relation and path prefixes, and a one-row Arrow selector.
+The selector contains nullable Binary `key` and Int64 `system_micros`, `valid_from_micros`, `valid_to_micros` and `limit`.
+The reply has a dense typed identity union in `_id`, a Binary `key`, and Int64 `valid_from_micros` and `valid_to_micros`.
+The active identity child contains its complete value, and an empty result has the same schema.
+The reply preserves the selected clipped slices and includes a witness only when the original cut and mask admit one.
+
 === Reading valid history at a held cut
 
 `rtdb.owned.ReadHeldValidDuring.v2` takes a 16-byte held handle, the relation prefix, and one terminated Arrow IPC stream.

@@ -67,6 +67,15 @@ Send the original signed i64 valid instant and the existing absence byte or pres
 Keep flag `00` for no point and flag `01` with a raw Utf8 key for publication markers and other text points.
 The floor, deadline, following hosted control groups and confirmation reply keep their existing framing.
 
+== Unique window replies
+
+In `owned_flight.rs`, update `HeldRead::unique_window` to admit `_id` as the standard dense Arrow identity union, including on the empty response schema.
+The union has type IDs 0 through 4 for Utf8, Keyword, Int64, UUID and Binary respectively.
+In `fact_points/ordered.rs`, update `unique_window_projection` to select the active child and its value offset for each row.
+For a Binary fact route require the Binary child and decode its raw bytes with `AddressRef::decode`.
+Keep validating the expected table, complete claim key and clipped interval, and retain the caller's overlap checks.
+The request, reply's remaining Binary `key` and two Int64 validity columns, and held witness metadata keep their existing framing.
+
 == Bijection source work
 
 * Carry typed keys through `crates/native_store_runtime/src/rtdb/fact_points.rs` and `fact_points/write_runs.rs`, including `FactHeader`, `FactRun`, boxed or packed `Entry` rows, reposting, and the shared point builders.
