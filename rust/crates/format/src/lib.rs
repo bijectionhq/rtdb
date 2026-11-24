@@ -70,3 +70,5 @@ impl log::proto::PublishedObjectVersion {
 #[path = "envelope/log_headers.rs"]
 mod log_headers;
 pub use log_headers::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
+
+pub mod journal;

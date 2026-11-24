@@ -4541,6 +4541,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-crypt"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "ring",
+ "rtdb-types",
+ "tokio",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "rtdb-directory"
 version = "0.1.0"
 dependencies = [
@@ -5327,6 +5340,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "rtdb-store"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "rtdb-crypt",
+ "rtdb-format",
+ "rtdb-storage",
+ "rtdb-types",
+ "sha2 0.10.9",
+ "tokio",
  "uuid",
 ]
 

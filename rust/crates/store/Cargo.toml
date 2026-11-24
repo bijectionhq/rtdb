@@ -1,0 +1,22 @@
+[package]
+name = "rtdb-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+rtdb-crypt = { path = "../crypt" }
+rtdb-format.workspace = true
+rtdb-storage.workspace = true
+rtdb-types.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,4 +1,6 @@
 -- allium: 3
+-- For epoch-scoped keys, the confirmed leader supplies the retained catalog, replay, pin and admitted compaction roots under its term.
+-- The EpochScopedStorage contract in ../../allium/rtdb-multi.allium governs these keys in default and Multi modes.
 -- gc.allium
 --
 -- Garbage collection of superseded tries (data + meta files) for one database.
