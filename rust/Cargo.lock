@@ -5077,6 +5077,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "memmap2",
  "rtdb-auth",
  "rtdb-columnar",
  "rtdb-expr",

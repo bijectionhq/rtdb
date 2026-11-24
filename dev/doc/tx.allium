@@ -386,6 +386,9 @@
 --      Dictionary frames and their rows share each batch's original delivery grant.
 --      COPY FROM STDIN with an Arrow format submits Arrow document batches.
 --      The connection completes Arrow framing and allocation preflight before submitting the first batch.
+--      COPY can retain the first admitted Arrow input frame and create a spool only when it needs disk storage.
+--      Autocommit can decode compatible record buffers from retained input or bounded immutable ranges of the completed spool.
+--      Arrow batches buffered by an explicit transaction own their decoded storage independently of the COPY input.
 --      Without an explicit transaction, each input batch commits separately.
 --      COPY FROM STDIN with a Transit format decodes consecutive values from the input file and submits the documents in one operation.
 --      Transit wire failures take precedence over document conversion failures.

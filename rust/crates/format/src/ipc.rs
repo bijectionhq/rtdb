@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::sync::Arc;
 use std::collections::HashMap;
 
@@ -96,7 +97,7 @@ impl Seek for SparseFile {
 }
 
 trait RetainedReader: Read + Seek + Send {
-    fn block_slice(&self, _range: std::ops::Range<usize>) -> Option<Buffer> { None }
+    fn block_slice(&mut self, _range: Range<usize>, _record: bool) -> Option<Buffer> { None }
 }
 
 struct StreamReader<R>(R);
@@ -107,6 +108,41 @@ impl<R: Seek> Seek for StreamReader<R> {
     fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> { self.0.seek(position) }
 }
 impl<R: Read + Seek + Send> RetainedReader for StreamReader<R> {}
+
+struct RangeReader<R, F> {
+    reader: StreamReader<R>,
+    retain: F,
+    file_blocks: bool,
+}
+
+impl<R: Read, F> Read for RangeReader<R, F> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> { self.reader.read(out) }
+}
+
+impl<R: Seek, F> Seek for RangeReader<R, F> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> { self.reader.seek(position) }
+}
+
+impl<R, F> RetainedReader for RangeReader<R, F>
+where
+    R: Read + Seek + Send,
+    F: FnMut(Range<u64>) -> Option<Bytes> + Send,
+{
+    fn block_slice(&mut self, range: Range<usize>, record: bool) -> Option<Buffer> {
+        if !record || range.is_empty() { return None; }
+        let bytes = (self.retain)(range.start as u64..range.end as u64)?;
+        if bytes.len() != range.len() || bytes.as_ptr().align_offset(std::mem::align_of::<u128>()) != 0 {
+            return None;
+        }
+        if self.file_blocks {
+            let message = arrow_ipc::root_as_message(&bytes[block_header(&bytes).ok()?]).ok()?;
+            let nodes = message.header_as_record_batch()?.nodes()?;
+            // File normalization edits the encoded block in place on the ordinary read path.
+            if nodes.iter().any(|node| node.null_count() < 0) { return None; }
+        }
+        Some(Buffer::from(bytes))
+    }
+}
 
 struct BufferedReader {
     buffer: Buffer,
@@ -130,7 +166,7 @@ impl Seek for BufferedReader {
     }
 }
 impl RetainedReader for BufferedReader {
-    fn block_slice(&self, range: std::ops::Range<usize>) -> Option<Buffer> {
+    fn block_slice(&mut self, range: Range<usize>, _record: bool) -> Option<Buffer> {
         (range.end <= self.buffer.len()).then(|| {
             let view = self.buffer.slice_with_length(range.start, range.len());
             rtdb_columnar::retain_buffer_with_owner(&view, Arc::new(()))
@@ -162,6 +198,18 @@ impl ArrowFile {
         Self::from_inspected_reader(reader, projection, layout)
     }
 
+    /// Offers retained bytes for record blocks. Returned bytes own their allocation charge.
+    ///
+    /// # Safety
+    /// The reader and every supplied view must expose the same immutable file bytes.
+    pub unsafe fn from_reader_with_retained_ranges(
+        mut reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>,
+        retain: impl FnMut(Range<u64>) -> Option<Bytes> + Send + 'static,
+    ) -> Result<Self> {
+        let layout = inspect_file(&mut reader)?;
+        Self::open_inspected(Box::new(RangeReader { reader: StreamReader(reader), retain, file_blocks: true }), projection, layout)
+    }
+
     /// The layout must describe this immutable reader, as returned by `inspect_file`.
     /// The caller retains a decoding reservation through this reader and every returned buffer or schema.
     pub fn from_inspected_reader(reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
@@ -178,7 +226,7 @@ impl ArrowFile {
         let mut pages = PageDecoder::from_footer(&bytes, data_end, projection)?;
         for index in 0..pages.dictionary_count() {
             let block = pages.dictionaries[index];
-            let bytes = read_block(reader.as_mut(), &block)?;
+            let bytes = read_block(reader.as_mut(), &block, false)?;
             pages.load_dictionary(index, bytes)?;
         }
         Ok(Self { reader, event_projection: None, pages, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
@@ -214,7 +262,7 @@ impl ArrowFile {
 
     pub fn read_page(&mut self, page: usize) -> Result<RecordBatch> {
         let block = self.pages.block(page)?;
-        let buffer = read_block(self.reader.as_mut(), block)?;
+        let buffer = read_block(self.reader.as_mut(), block, true)?;
         let batch = if let Some(projection) = &self.event_projection {
             let bytes = prepare_block(block, buffer, &self.pages.source_schema, false)?;
             let (header, body_start) = block_message(block, &bytes)?;
@@ -236,7 +284,7 @@ impl ArrowFile {
 
     /// Reads an event page with only the requested children of its put leg.
     pub fn read_event_page(&mut self, page: usize, put_columns: &[String]) -> Result<RecordBatch> {
-        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?)?;
+        let buffer = read_block(self.reader.as_mut(), self.pages.block(page)?, true)?;
         let batch = self.pages.decode_event_page(page, buffer, put_columns)?;
         self.next_page = page + 1;
         Ok(batch)
@@ -382,11 +430,11 @@ impl Iterator for ArrowFile {
         Some(self.read_page(page))
     }
 }
-fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
+fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block, record: bool) -> Result<Buffer> {
     let range = block_range(block)?;
     let start = usize::try_from(range.start).map_err(invalid)?;
     let end = usize::try_from(range.end).map_err(invalid)?;
-    if let Some(buffer) = reader.block_slice(start..end) { return Ok(buffer); }
+    if let Some(buffer) = reader.block_slice(start..end, record) { return Ok(buffer); }
     reader.seek(SeekFrom::Start(range.start)).map_err(invalid)?;
     let mut bytes = vec![0; usize::try_from(range.end - range.start).map_err(invalid)?];
     reader.read_exact(&mut bytes).map_err(invalid)?;
@@ -507,16 +555,31 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
 
 enum StreamInput<R> {
     Reader(R),
+    Ranges(Box<dyn RetainedReader>),
     Retained { bytes: Bytes, position: usize },
 }
 
 impl<R: Read> StreamInput<R> {
     fn next_message(&mut self) -> Result<Option<(Cow<'_, [u8]>, Buffer)>> {
         match self {
-            Self::Reader(reader) => Ok(read_message(reader)?.map(|(metadata, body)| {
-                let body = if body.is_empty() { Buffer::default() } else { Buffer::from(body) };
-                (Cow::Owned(metadata), body)
-            })),
+            Self::Reader(reader) => {
+                let Some((metadata, length, _)) = read_message_header(reader)? else { return Ok(None); };
+                Ok(Some((Cow::Owned(metadata), read_message_body(reader, length)?)))
+            }
+            Self::Ranges(reader) => {
+                let Some((metadata, length, record)) = read_message_header(reader.as_mut())? else { return Ok(None); };
+                if record && length != 0 {
+                    let start = reader.stream_position().map_err(invalid)?;
+                    if let Ok(start) = usize::try_from(start) && let Some(end) = start.checked_add(length) {
+                        if let Some(body) = reader.block_slice(start..end, true) {
+                            reader.seek(SeekFrom::Start(end as u64)).map_err(invalid)?;
+                            return Ok(Some((Cow::Owned(metadata), body)));
+                        }
+                    }
+                }
+                let body = read_message_body(reader.as_mut(), length)?;
+                Ok(Some((Cow::Owned(metadata), body)))
+            }
             Self::Retained { bytes, position } => {
                 if *position == bytes.len() { return Ok(None); }
                 let Some((metadata, body)) = stream_message(bytes, position)? else { return Ok(None); };
@@ -556,6 +619,14 @@ impl ArrowStream<Cursor<Arc<[u8]>>> {
     pub fn from_bytes(bytes: Bytes, projection: Option<Vec<usize>>) -> Result<Self> {
         Self::from_input(StreamInput::Retained { bytes, position: 0 }, projection)
     }
+
+    /// Offers retained bytes for record bodies. A supplied range must match the reader and own its allocation charge.
+    pub fn from_reader_with_retained_ranges(
+        reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>,
+        retain: impl FnMut(Range<u64>) -> Option<Bytes> + Send + 'static,
+    ) -> Result<Self> {
+        Self::from_input(StreamInput::Ranges(Box::new(RangeReader { reader: StreamReader(reader), retain, file_blocks: false })), projection)
+    }
 }
 impl<R: Read> ArrowStream<R> {
     /// The caller reserves schema, dictionaries and the largest decoded message before opening the reader.
@@ -588,7 +659,7 @@ impl<R: Read> Iterator for ArrowStream<R> {
     }
 }
 
-fn read_message(reader: &mut impl Read) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+fn read_message_header(reader: &mut (impl Read + ?Sized)) -> Result<Option<(Vec<u8>, usize, bool)>> {
     let mut prefix = [0; 4];
     if reader.read(&mut prefix[..1]).map_err(invalid)? == 0 { return Ok(None); }
     reader.read_exact(&mut prefix[1..]).map_err(invalid)?;
@@ -597,8 +668,15 @@ fn read_message(reader: &mut impl Read) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
     if length == 0 { return Ok(None); }
     let mut metadata = vec![0; usize::try_from(length).map_err(invalid)?]; reader.read_exact(&mut metadata).map_err(invalid)?;
     let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
-    let mut body = vec![0; usize::try_from(message.bodyLength()).map_err(invalid)?]; reader.read_exact(&mut body).map_err(invalid)?;
-    Ok(Some((metadata, body)))
+    let length = usize::try_from(message.bodyLength()).map_err(invalid)?;
+    let record = message.header_type() == arrow_ipc::MessageHeader::RecordBatch;
+    Ok(Some((metadata, length, record)))
+}
+
+fn read_message_body(reader: &mut (impl Read + ?Sized), length: usize) -> Result<Buffer> {
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).map_err(invalid)?;
+    Ok(if body.is_empty() { Buffer::default() } else { Buffer::from(body) })
 }
 
 pub fn read_stream(bytes: Arc<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
