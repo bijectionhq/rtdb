@@ -48,3 +48,9 @@ Multi stores its immutable objects in the S3 bucket.
 Supply permanent database UUIDs in `databases` to run an explicitly provisioned catalog, or use the generated UUID for the initial `xtdb` database.
 Keep the same bucket, cluster name and catalog across node replacement.
 See the https://github.com/bijectionhq/logkeeper/blob/896ed7818780d86e435ebf25c467ac179a1023fb/deploy/README.md[Logkeeper deployment guide] for client issuance and named credentials.
+
+The bundled Multi configuration grants no deployment administration access.
+To supply a deployment administrator, store the complete node YAML in an operator-owned secret and set `multi_configuration_secret` to its ECS Secrets Manager selector.
+Use the bundled `rust/release/cluster-multi.yaml` as the starting configuration and retain the Flight listener on port 3000.
+Configure the authentication provider that verifies the deployment administrator, and list its exact authenticated principal name under `deploymentAdminPrincipals`.
+The ECS execution role receives read access to the selected secret and needs access to its encryption key.

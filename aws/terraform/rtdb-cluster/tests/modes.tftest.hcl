@@ -76,3 +76,38 @@ run "default_rejects_a_journal_url" {
   }
   expect_failures = [aws_ecs_task_definition.node]
 }
+
+run "multi_can_use_an_operator_owned_configuration" {
+  command = plan
+  variables {
+    mode        = "multi"
+    journal_url = "logkeeper+tls://keeper-1.example.internal:5448,keeper-2.example.internal:5448,keeper-3.example.internal:5448"
+    journal_credentials = {
+      "0" = {
+        ca_certificate = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:ca-Abcdef"
+        certificate    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:crt-Abcdef"
+        private_key    = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:key-Abcdef"
+      }
+    }
+    journal_client_security_group_id = "sg-22222222"
+    multi_configuration_secret       = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:node-config-Abcdef"
+  }
+  assert {
+    condition = (
+      jsondecode(aws_ecs_task_definition.node.container_definitions)[0].command == ["node", "--multi", "--config-env", "RTDB_MULTI_CONFIG_YAML"] &&
+      local.secrets.RTDB_MULTI_CONFIG_YAML == var.multi_configuration_secret &&
+      contains(local.secret_arns, var.multi_configuration_secret)
+    )
+    error_message = "The Multi node must load the operator-owned YAML through its ECS secret reference."
+  }
+}
+
+run "default_rejects_a_multi_configuration_secret" {
+  command = plan
+  variables {
+    kafka_bootstrap            = "kafka.internal:9092"
+    kafka_topic                = "rtdb"
+    multi_configuration_secret = "arn:aws:secretsmanager:eu-north-1:123456789012:secret:node-config-Abcdef"
+  }
+  expect_failures = [aws_ecs_task_definition.node]
+}

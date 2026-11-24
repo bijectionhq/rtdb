@@ -82,6 +82,19 @@ variable "root_password_secret" {
   type        = string
 }
 
+variable "multi_configuration_secret" {
+  description = "Optional ECS Secrets Manager selector whose value is the complete Multi node YAML."
+  type        = string
+  default     = null
+  validation {
+    condition = var.multi_configuration_secret == null || can(regex(
+      "^arn:[a-z0-9-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:[A-Za-z0-9/_+=.@-]+-[A-Za-z0-9]{6}(:[^:\\r\\n]*:([^:\\r\\n]*:|:[^:\\r\\n]*))?$",
+      var.multi_configuration_secret
+    ))
+    error_message = "Supply an ECS Secrets Manager selector for the Multi configuration."
+  }
+}
+
 variable "kafka_bootstrap" {
   description = "Comma-separated bootstrap endpoints for default mode."
   type        = string

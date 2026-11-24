@@ -66,6 +66,22 @@ impl ParsedYamlDocument {
     }
 }
 impl ParsedConfiguration {
+    pub fn from_yaml_environment(
+        name: &str,
+        environment: &impl ConfigurationEnvironment,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let input = environment.lookup(name, memory)?
+            .filter(|input| !input.value.trim().is_empty())
+            .ok_or_else(|| invalid("The Multi configuration environment variable is missing or empty"))?;
+        if input.value.len() > 4 * 1024 * 1024 {
+            return Err(invalid("Configuration exceeds 4 MiB"));
+        }
+        Self::from_yaml(&input.value, environment, memory, false).map_err(|error| {
+            Anomaly::new(error.category, error.code, "Invalid Multi configuration from the environment")
+        })
+    }
+
     pub fn from_yaml(text: &str, environment: &impl ConfigurationEnvironment, memory: &Arc<MemoryBudget>, ingest: bool) -> Result<Self> {
         ParsedYamlDocument::from_yaml(text, environment, memory)?.into_node_configuration(environment, ingest)
     }

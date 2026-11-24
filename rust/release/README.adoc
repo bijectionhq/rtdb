@@ -66,6 +66,8 @@ The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
 The process receives SIGTERM directly and drains its database and listener owners before returning.
 
 An image built with Multi supports `deploymentAdminPrincipals` in the node's YAML.
+Use `node --multi --config-env NAME` to load complete node YAML from a host-injected environment variable.
+Supply either `--config-env` or the configuration file option.
 List the exact authenticated principal names that may create, delete, export, restore or fork deployments.
 The default configuration grants no deployment administration access.
 Use the ordinary Flight listener with a verified password or client credential.

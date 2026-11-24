@@ -14,7 +14,7 @@ pub use admin::AdminOptions;
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb admin --help\n       rtdb node --multi [-f FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -31,7 +31,7 @@ pub struct DevOptions {
 }
 
 #[derive(Clone, Debug)]
-pub enum Command { Help, Version, BuildInfo, Start(StartOptions), StartMulti(StartOptions), Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize, checkpoint_key_vault: Option<PathBuf> },
+pub enum Command { Help, Version, BuildInfo, Start(StartOptions), StartMulti { options: StartOptions, config_env: Option<String> }, Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize, checkpoint_key_vault: Option<PathBuf> },
     AdminHelp,
     #[cfg(feature = "multi")]
     Admin(AdminOptions),
@@ -225,11 +225,24 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
     let allocation_limit_bytes = environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024);
     let mut options = StartOptions { mode, file: None, allocation_limit_bytes, pgwire_port: 5432, flight_sql_port: 3000, object_sort };
     let mut multi = false;
+    let mut config_env = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--multi" if mode == NodeMode::Node => multi = true,
             "-h" | "--help" => return Ok(Command::Help),
             "-f" | "--file" if mode != NodeMode::Playground => options.file = Some(PathBuf::from(arguments.next().ok_or_else(|| invalid("--file requires a path"))?)),
+            "--config-env" if mode == NodeMode::Node => {
+                let name = arguments.next().ok_or_else(|| invalid("--config-env requires a variable name"))?;
+                let mut chars = name.chars();
+                if !chars.next().is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+                    || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+                {
+                    return Err(invalid("--config-env requires a variable name"));
+                }
+                if config_env.replace(name).is_some() {
+                    return Err(invalid("--config-env may be specified only once"));
+                }
+            }
             "--memory-limit" => options.allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
             "-p" | "--port" if mode == NodeMode::Playground => options.pgwire_port = port(arguments.next())?,
             "--flight-sql-port" if mode == NodeMode::Playground => options.flight_sql_port = port(arguments.next())?,
@@ -237,7 +250,14 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             _ => return Err(invalid(format!("Unknown option '{argument}'"))),
         }
     }
-    Ok(if multi { Command::StartMulti(options) } else { Command::Start(options) })
+    if config_env.is_some() && (!multi || options.file.is_some()) {
+        return Err(invalid("--config-env requires --multi and cannot be combined with --file"));
+    }
+    Ok(if multi {
+        Command::StartMulti { options, config_env }
+    } else {
+        Command::Start(options)
+    })
 }
 
 impl DevOptions {
@@ -272,6 +292,15 @@ fn repair_checkpoint(value: &str) -> Result<rtdb_node::RepairCheckpoint> {
 }
 
 impl StartOptions {
+    pub fn load_multi_reserved(&self, config_env: Option<&str>) -> Result<ParsedConfiguration> {
+        let Some(name) = config_env else {
+            return self.load_reserved();
+        };
+        let memory = MemoryBudget::new(self.allocation_limit_bytes);
+        Ok(ParsedConfiguration::from_yaml_environment(name, &ProcessEnvironment, &memory)?
+            .with_object_sort(self.object_sort))
+    }
+
     /// Reserves parsing and environment expansion before constructing startup configuration.
     pub fn load_reserved(&self) -> Result<ParsedConfiguration> {
         let memory = MemoryBudget::new(self.allocation_limit_bytes);

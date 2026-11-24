@@ -65,8 +65,32 @@ fn multi_is_explicit_in_development_and_cluster_startup() {
     let Command::Dev(development) = parse(&["dev", "--multi", "--data", "data"]) else { panic!("expected development startup") };
     assert!(development.multi);
     assert_eq!(development.data, std::path::Path::new("data"));
-    assert!(matches!(parse(&["node", "--multi", "-f", "cluster.yaml"]), Command::StartMulti(_)));
+    assert!(matches!(
+        parse(&["node", "--multi", "-f", "cluster.yaml"]),
+        Command::StartMulti { config_env: None, .. }
+    ));
     assert!(cli::parse(["dev", "--multi", "--port", "5432"].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn configuration_environment_is_an_explicit_multi_only_source() {
+    let Command::StartMulti { options, config_env } =
+        parse(&["node", "--config-env", "MULTI_NODE_YAML", "--multi"])
+    else {
+        panic!("expected Multi startup");
+    };
+    assert!(options.file.is_none());
+    assert_eq!(config_env.as_deref(), Some("MULTI_NODE_YAML"));
+
+    let invalid: &[&[&str]] = &[
+        &["node", "--config-env", "MULTI_NODE_YAML"],
+        &["node", "--multi", "--config-env", "MULTI_NODE_YAML", "-f", "cluster.yaml"],
+        &["node", "--multi", "--config-env", "--file"],
+        &["node", "--multi", "--config-env", "ONE", "--config-env", "TWO"],
+    ];
+    for arguments in invalid {
+        assert!(cli::parse(arguments.iter().copied().map(str::to_owned), &|_| None).is_err());
+    }
 }
 
 #[test]

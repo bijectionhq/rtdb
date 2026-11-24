@@ -1,16 +1,25 @@
 data "aws_region" "current" {}
 
 locals {
-  flight_port = 3000
-  peer_port   = 3001
-  multi       = var.mode == "multi"
-  secrets = merge({ RTDB_ROOT_PASSWORD = var.root_password_secret }, merge({}, [
-    for slot, credential in(var.journal_credentials == null ? {} : var.journal_credentials) : {
-      "RTDB_JOURNAL_${slot}_CA_CERTIFICATE" = credential.ca_certificate
-      "RTDB_JOURNAL_${slot}_CERTIFICATE"    = credential.certificate
-      "RTDB_JOURNAL_${slot}_PRIVATE_KEY"    = credential.private_key
-    }
-  ]...))
+  flight_port                = 3000
+  peer_port                  = 3001
+  multi                      = var.mode == "multi"
+  custom_multi_configuration = local.multi && var.multi_configuration_secret != null
+  secrets = merge(
+    { RTDB_ROOT_PASSWORD = var.root_password_secret },
+    local.custom_multi_configuration ? { RTDB_MULTI_CONFIG_YAML = var.multi_configuration_secret } : {},
+    merge({}, [
+      for slot, credential in(var.journal_credentials == null ? {} : var.journal_credentials) : {
+        "RTDB_JOURNAL_${slot}_CA_CERTIFICATE" = credential.ca_certificate
+        "RTDB_JOURNAL_${slot}_CERTIFICATE"    = credential.certificate
+        "RTDB_JOURNAL_${slot}_PRIVATE_KEY"    = credential.private_key
+      }
+    ]...)
+  )
+  multi_command = concat(
+    ["node", "--multi"],
+    local.custom_multi_configuration ? ["--config-env", "RTDB_MULTI_CONFIG_YAML"] : ["--file", "/etc/rtdb/cluster-multi.yaml"]
+  )
 
   environment = merge({
     AWS_REGION              = data.aws_region.current.region
@@ -91,7 +100,7 @@ resource "aws_ecs_task_definition" "node" {
     image           = var.image
     essential       = true
     user            = "20000:20000"
-    command         = local.multi ? ["node", "--multi", "--file", "/etc/rtdb/cluster-multi.yaml"] : ["node", "--file", "/etc/rtdb/cluster-default.yaml"]
+    command         = local.multi ? local.multi_command : ["node", "--file", "/etc/rtdb/cluster-default.yaml"]
     environment     = [for name, value in local.environment : { name = name, value = value } if value != null]
     secrets         = [for name, value in local.secrets : { name = name, valueFrom = value }]
     mountPoints     = local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : []
@@ -116,6 +125,10 @@ resource "aws_ecs_task_definition" "node" {
         var.journal_url == null && var.journal_credentials == null && var.journal_client_security_group_id == null && var.databases == null
       )
       error_message = "Default mode requires Kafka bootstrap and topic. Multi mode requires a Logkeeper TLS URL, one distinct journal credential per slot, at most eight nodes and a journal client security group."
+    }
+    precondition {
+      condition     = local.multi || var.multi_configuration_secret == null
+      error_message = "A Multi configuration secret requires Multi mode."
     }
   }
   tags = var.tags

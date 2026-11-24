@@ -27,6 +27,28 @@ fn bounded_yaml_preserves_provider_tags_aliases_and_environment_defaults() {
 }
 
 #[test]
+fn multi_yaml_environment_requires_explicit_input_and_hides_invalid_values() {
+    let memory = MemoryBudget::new(1 << 24);
+    let environment = Environment(BTreeMap::from([
+        ("MULTI_CONFIG".into(), "server: null\nflightSql: {port: !Env FLIGHT_PORT}".into()),
+        ("FLIGHT_PORT".into(), "3000".into()),
+        ("EMPTY_CONFIG".into(), " ".into()),
+        ("INVALID_CONFIG".into(), "authn: !private-config-marker {}".into()),
+    ]));
+    let parsed = ParsedConfiguration::from_yaml_environment("MULTI_CONFIG", &environment, &memory)
+        .unwrap();
+    assert!(parsed.configuration().server.is_none());
+    assert_eq!(parsed.configuration().flight_sql.as_ref().unwrap().port, 3000);
+
+    for name in ["MISSING_CONFIG", "EMPTY_CONFIG", "INVALID_CONFIG"] {
+        let error = ParsedConfiguration::from_yaml_environment(name, &environment, &memory)
+            .err()
+            .expect("invalid configuration must fail");
+        assert!(!format!("{error:?}").contains("private-config-marker"));
+    }
+}
+
+#[test]
 fn yaml_alias_expansion_reserves_each_copied_node_before_construction() {
     let memory = MemoryBudget::new(400_000);
     let yaml = "a: &a [0, 0, 0, 0, 0, 0, 0, 0]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a]\nc: [*b, *b, *b, *b, *b, *b, *b, *b]\n";
