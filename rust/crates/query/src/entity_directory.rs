@@ -6,14 +6,13 @@ use std::{
 use rtdb_format::{
     cow_tree::{self, RootRef},
     entity_directory::{self, all_rows, iid_rows},
-    keys::TableSlug,
+    keys::{TableSlug, TrieKey},
     log::proto::EntityDirectoryRoot,
 };
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_storage::{audience_work, cache::BufferPool};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, BlockIndex, EventHeader, EventOp, EventOrigin, Iid, MemoryBudget,
-    Result, TableRef,
+    Anomaly, AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, MemoryBudget, Result, TableRef,
 };
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -335,12 +334,22 @@ pub(crate) async fn nominate(
     covered: &BTreeSet<BlockIndex>,
     scope: Option<crate::IidScope<'_>>,
     limit: usize,
-    visit: &mut (impl FnMut(EventHeader, EventOrigin) -> Result<bool> + Send),
+    visit: &mut (impl FnMut(EventHeader) -> Result<bool> + Send),
 ) -> Result<Option<(BlockIndex, usize)>> {
     let table = &request.scan.table.name.table;
-    let Some(receipt) = request.snapshot.trie_catalog().entity_directory(table) else {
+    let catalog = request.snapshot.trie_catalog();
+    let Some(receipt) = catalog.entity_directory(table) else {
         return Ok(None);
     };
+    let through = BlockIndex(receipt.through_block());
+    // Expiring metadata can lose its compacted L0 descriptors.
+    if !table.stores_expiring_transaction_metadata()
+        && !catalog.l0_source(table, BlockIndex(-1), through).any(|trie| {
+            trie.state != TrieState::Live && !covered.contains(&trie.key.block_index())
+        })
+    {
+        return Ok(Some((through, 0)));
+    }
     let entry = request
         .snapshot
         .table_entry(table)
@@ -349,18 +358,21 @@ pub(crate) async fn nominate(
     let mut inspected = 0usize;
     let mut complete = true;
     visit_rows(&read, &entry.slug, &receipt.reference()?, scope, |event| {
-        if covered.contains(&event.origin.source_block()) {
+        let block = event.origin.source_block();
+        if covered.contains(&block)
+            || catalog.trie(table, &TrieKey::l0(block)?).is_some_and(|trie| trie.state == TrieState::Live)
+        {
             return Ok(true);
         }
         inspected = inspected.saturating_add(1);
-        complete = inspected <= limit && visit(event.header, event.origin)?;
+        complete = inspected <= limit && visit(event.header)?;
         Ok(complete)
     })
     .await?;
     if !complete {
         return Err(invalid("Directory gap nomination exceeded its budget"));
     }
-    Ok(Some((BlockIndex(receipt.through_block()), inspected)))
+    Ok(Some((through, inspected)))
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly {

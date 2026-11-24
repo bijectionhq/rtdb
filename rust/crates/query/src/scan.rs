@@ -3574,6 +3574,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logical_gap_nomination_reads_live_l0_pages_and_compacted_directory_rows() {
+        use rtdb_format::{
+            cow_tree::{self, Edit, NoSummary},
+            entity_directory::{self, LogicalEvent},
+            log::proto::{EntityDirectoryChange, EntityDirectoryRoot},
+        };
+        use rtdb_types::{BlockIndex, EventOrigin};
+        use sha2::{Digest, Sha256};
+
+        let (state, table, events) = live_table();
+        let value = state.value();
+        let slug = &value.table_catalog().entry(&table).unwrap().slug;
+        let put_fields = value.live().tables()[&table].column_types().clone();
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let newest = 11;
+        let newest_rows = 40;
+        let iid = |block| Iid([block as u8; 16]);
+        let mut tries = Vec::new();
+        let mut directory_rows = Vec::new();
+        for block in 0..=newest {
+            let trie = TrieKey::l0(BlockIndex(block)).unwrap();
+            let count = if block == newest { newest_rows } else { 8 };
+            let rows: Vec<_> = (0..count).rev().map(|row| StoredEvent {
+                iid: iid(block),
+                origin: Some(EventOrigin::at([block as u8; 16], row as u64, BlockIndex(block))),
+                system_from: Timestamp(100 + block * 100 + row as i64),
+                ..events[0].clone()
+            }).collect();
+            for (row, event) in rows.iter().enumerate() {
+                directory_rows.push(LogicalEvent {
+                    header: event.header(), origin: event.origin.unwrap(), entity_key: None,
+                    payload_hint: Some((trie.clone(), 0, row as u32)),
+                }.encode().unwrap());
+            }
+            let page = build_event_batch(&rows, Some(put_fields.clone()), None).unwrap();
+            let mut metadata = MetadataBuilder::new(false, false);
+            metadata.write_leaf(&page).unwrap();
+            let (metadata, statistics) = metadata.finish().unwrap();
+            let data = write_file(page.schema().as_ref(), &[page]).unwrap();
+            tries.push(CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap());
+            store.put(&ObjectKey::new(slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
+            store.put(&ObjectKey::new(slug.metadata_key(&trie)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        }
+        let source_rows = directory_rows.len() as i64;
+        directory_rows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+        let pages = crate::ObjectPageStore {
+            store, storage: storage.clone(), prefix: entity_directory::prefix(slug),
+        };
+        let (root, _) = cow_tree::apply(&pages, None, directory_rows.into_iter().map(Edit::Put).collect(),
+            &NoSummary, &MemoryBudget::new(1 << 24)).await.unwrap();
+        let directory = EntityDirectoryChange {
+            root: Some(EntityDirectoryRoot {
+                root: Some(root.unwrap().encode()), through_block: Some(newest), source_rows: Some(source_rows),
+                has_erases: Some(false), allocation: Some(vec![0; 16]), writer_fence: Some(0),
+                erase_frontier_digest: Some(Sha256::digest([]).to_vec()),
+            }),
+            replaces_root: None,
+        };
+        let newest_trie = tries.last().unwrap().key.clone();
+        state.add_tries(&BTreeMap::from([(table.clone(), tries)]), Timestamp(1400)).unwrap();
+        state.add_artefacts(&table, vec![(newest_trie, directory.to_artefact().unwrap())]);
+
+        let nominate = async |covered: &BTreeSet<BlockIndex>| {
+            let snapshot = state.value().snapshot();
+            let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table.clone(), storage.clone());
+            let search_queries = SearchQueries::default();
+            let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
+                storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+            let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
+                bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
+                current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+                candidate_iids: None, constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+            crate::uncovered_history_iids(&request, covered, None, 2).await.unwrap()
+        };
+        let mut covered: BTreeSet<_> = (0..newest).map(BlockIndex).collect();
+        let latest_page_work = audience_work::Limits {
+            provider_requests: usize::MAX, provider_bytes: usize::MAX, provider_metadata_bytes: usize::MAX,
+            scan_items: newest_rows + 1, decode_bytes: usize::MAX,
+        };
+        audience_work::within(Some(latest_page_work), async {
+            assert_eq!(nominate(&covered).await, Some(BTreeSet::from([iid(newest)])));
+            assert!(audience_work::scan_items(1).is_err());
+        }).await;
+
+        let compacted = CatalogTrie::notification(TrieKey::new(1, None, vec![], BlockIndex(newest - 1)).unwrap(), 0, None).unwrap();
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![compacted])]), Timestamp(1500)).unwrap();
+        audience_work::within(Some(latest_page_work), async {
+            assert_eq!(nominate(&covered).await, Some(BTreeSet::from([iid(newest)])));
+            assert!(audience_work::scan_items(1).is_err());
+        }).await;
+
+        covered.remove(&BlockIndex(3));
+        assert_eq!(nominate(&covered).await, Some(BTreeSet::from([iid(3), iid(newest)])));
+    }
+
+    #[tokio::test]
     async fn stacked_filters_and_limit_keep_cold_scan_vectors() {
         use rtdb_plan::{BinaryOp, NamedExpr, Relation};
 

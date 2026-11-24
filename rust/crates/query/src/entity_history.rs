@@ -205,6 +205,7 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
 
 async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex>,
     scope: Option<crate::IidScope<'_>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
+    if request.cancellation.is_cancelled() { return Err(cancelled()); }
     let table = &request.scan.table.name.table;
     let mut iids = BTreeSet::new();
     let mut charge = request.memory.reserve(4096)?;
@@ -224,16 +225,17 @@ async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex
         }
         Ok(true)
     };
-    let (through, mut inspected) = crate::entity_directory::nominate(request, covered, scope, budget,
-        &mut |header, _| nominate(header)).await?.map_or((None, 0), |(through, count)| (Some(through), count));
+    let (through, mut inspected) = crate::entity_directory::nominate(request, covered, scope, budget, &mut nominate)
+        .await?.map_or((None, 0), |(through, count)| (Some(through), count));
     for trie in request.snapshot.trie_catalog().iter_tries(table).filter(|trie| trie.state == TrieState::Live) {
         let is_l0 = trie.key.level() == 0;
         let block = trie.key.block_index();
-        if through.is_some_and(|through| block <= through) || (is_l0 && covered.contains(&block)) { continue; }
+        if (is_l0 && covered.contains(&block)) || (!is_l0 && through.is_some_and(|through| block <= through)) { continue; }
         if scope.is_some_and(|keys| !keys.iter().any(|key| contains(trie.key.part(), key))) { continue; }
         let Some(rows) = visit_trie_events(request, &entry.slug, trie, scope, budget.saturating_sub(inspected), |event, _| {
             if event.origin.is_some_and(|origin| {
-                through.is_some_and(|through| origin.source_block() <= through) || covered.contains(&origin.source_block())
+                let block = origin.source_block();
+                covered.contains(&block) || (!is_l0 && through.is_some_and(|through| block <= through))
             }) { return Ok(true); }
             nominate(event.header)
         }).await? else { return Ok(None); };

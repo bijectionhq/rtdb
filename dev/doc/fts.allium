@@ -205,7 +205,11 @@ rule SearchJobRuns {
     -- The table directory covers a sealed prefix of accepted events and carries each erased entity's latest erase frontier.
     -- The table also owns event header pages for individual primary tries.
     -- A point read takes a primary trie without entity history from the data pages its metadata routes the requested keys to, so older data narrows the read rather than sending it to a scan.
-    -- Gap nomination charges each decoded page and counts every inspected row against its budget before opening the next page.
+    -- Gap nomination reads each uncovered block with a live L0 trie from that trie's pages, including within the directory's sealed prefix.
+    -- An uncovered compacted block in the sealed prefix is nominated through the captured entity directory.
+    -- Compacted history beyond the sealed prefix is nominated from live primary tries.
+    -- Primary gap reads count the rows of each decoded page against the inspection budget.
+    -- Directory gap reads count only rows from uncovered blocks that lack a live L0 trie against that budget.
     -- The per-trie point path checks recorded entity keys in history files, primary pages, and live segments.
     -- Histories with different entity keys under one IID resolve through the scan.
     -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
