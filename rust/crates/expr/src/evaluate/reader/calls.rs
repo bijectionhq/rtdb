@@ -1,4 +1,7 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, mem::size_of};
+
+use crate::vector::{VectorInput, score_pair};
+
 use super::*;
 
 pub(super) fn field<'a>(value: EvalValue<'a>,name: Option<&str>,frame: &EvaluationFrame<'_>) -> Result<EvalValue<'a>> {
@@ -333,6 +336,45 @@ fn trim<'a>(args: &'a [Expr],frame: &'a EvaluationFrame<'a>) -> Result<Pending<'
     },frame)
 }
 
+enum CosineOperand<'a> {
+    Borrowed(VectorInput<'a>),
+    Deferred(&'a EvalValue<'a>),
+}
+
+impl<'a> CosineOperand<'a> {
+    fn for_computed_pair(value: &'a EvalValue<'a>) -> Option<Self> {
+        let EvalValue::List(Kind::List | Kind::Fixed, reader) = value else { return None; };
+        match reader.as_ref() {
+            ListReader::Expressions(_) | ListReader::Cast { .. } | ListReader::Trim { .. }
+            | ListReader::IntegerSeries(_) => Some(Self::Deferred(value)),
+            ListReader::Stored(list) if list.array().is_some() => Some(Self::Borrowed(VectorInput::Stored(list.view()))),
+            ListReader::Arrow(cell) => VectorInput::from_numeric_arrow(*cell).map(Self::Borrowed),
+            _ => None,
+        }
+    }
+}
+
+async fn cosine_components<'a>(input: &EvalValue<'a>, frame: &'a EvaluationFrame<'a>) -> Result<Vec<f64>> {
+    let size = len(input)?;
+    let bytes = size.checked_mul(size_of::<f64>()).filter(|bytes| *bytes <= isize::MAX as usize).ok_or_else(overflow)?;
+    frame.context.reserve(bytes)?;
+    let mut components = Vec::with_capacity(size);
+    for index in 0..size {
+        let value = match nth(clone_value(input, frame)?, index, frame)?.await? {
+            EvalValue::Scalar(value) => value,
+            value => materialize(value, frame)?.await?,
+        };
+        let decimal_scratch = frame.context.allocation.filter(|_| matches!(value, Value::Decimal(_))).map(crate::EvaluationScope::scratch);
+        if let Some(scratch) = &decimal_scratch {
+            scratch.reserve(value.retained_bytes()?.checked_mul(16).ok_or_else(overflow)?)?;
+        }
+        // A nonnumeric component is refused by the scorer after both lists have been demanded.
+        components.push(crate::numeric::number(&value).unwrap_or(f64::NAN));
+        if frame.asynchronous && index % 1024 == 1023 { tokio::task::yield_now().await; }
+    }
+    Ok(components)
+}
+
 pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,EvalValue<'a>>> {
     boxed(async move {
         if name == "get_field" { return field(values.remove(0),None,frame); }
@@ -378,6 +420,25 @@ pub(super) fn apply<'a>(name: String,mut values: Vec<EvalValue<'a>>,frame: &'a E
                 && let (Some(left), Some(right)) = (borrowed_vector(left), borrowed_vector(right))
             {
                 return Ok(scalar(crate::vector::score_pair(left, right)?));
+            }
+            if let (Some(left), Some(right)) = (CosineOperand::for_computed_pair(left), CosineOperand::for_computed_pair(right)) {
+                let left_components;
+                let left = match left {
+                    CosineOperand::Borrowed(input) => input,
+                    CosineOperand::Deferred(input) => {
+                        left_components = cosine_components(input, frame).await?;
+                        VectorInput::Components(&left_components)
+                    }
+                };
+                let right_components;
+                let right = match right {
+                    CosineOperand::Borrowed(input) => input,
+                    CosineOperand::Deferred(input) => {
+                        right_components = cosine_components(input, frame).await?;
+                        VectorInput::Components(&right_components)
+                    }
+                };
+                return Ok(scalar(score_pair(left, right)?));
             }
         }
         if name == "nth" { return subscript(values.remove(0),values.remove(0),frame)?.await; }

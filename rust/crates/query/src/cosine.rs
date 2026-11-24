@@ -26,6 +26,16 @@ fn inputs(expr: &Expr) -> Option<(ColumnId, &Expr)> {
     }
 }
 
+pub(crate) fn has_score_output(mut expr: &Expr) -> bool {
+    while let Expr::Case { branches, otherwise } = expr {
+        let [(_, score)] = branches.as_slice() else { return false; };
+        if !matches!(otherwise.as_ref(), Expr::Literal(Value::Null)) { return false; }
+        expr = score;
+    }
+    matches!(expr, Expr::Call { name, args, .. } if args.len() == 2
+        && (name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance")))
+}
+
 pub(crate) enum Projection {
     Null,
     Score {

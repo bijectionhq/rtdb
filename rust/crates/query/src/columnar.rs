@@ -7,7 +7,7 @@ pub(crate) mod search;
 
 use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, StructArray, UnionArray};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray, builder::Float64Builder};
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
 use rtdb_index::IndexBatch;
@@ -3423,6 +3423,12 @@ impl BatchCursor for BatchExpressions {
             let scope = self.execution.scope()?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
+            if crate::cosine::has_score_output(expression)
+                && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease).await?
+            {
+                columns.push(column);
+                continue;
+            }
             lease.grow_to(retained.checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
             let mut values = Vec::with_capacity(batch.len);
             for row in 0..batch.len {
@@ -3460,6 +3466,45 @@ impl BatchCursor for BatchExpressions {
     }
     fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span) }
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+async fn evaluate_score_column(
+    batch: &ColumnBatch, execution: &crate::context::Execution, invocation: &rtdb_expr::ExpressionInvocation<'_>,
+    scope: &rtdb_expr::EvaluationScope, lease: &mut MemoryReservation,
+) -> Result<Option<Column>> {
+    let retained = lease.bytes();
+    let bound = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+    match lease.grow_to(retained.checked_add(bound).ok_or_else(size_error)?) {
+        Ok(()) => (),
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let mut scores = Float64Builder::with_capacity(batch.len);
+    for row in 0..batch.len {
+        let input = BatchRow { batch, row, admit_dates: false };
+        match execution.evaluate_invocation_row(scope, invocation, rtdb_expr::ExpressionRow::Borrowed(&input)).await? {
+            Value::F64(score) => scores.append_value(score),
+            Value::Null => scores.append_null(),
+            _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/cosine-result", "Cosine projection produced a value other than a score or null")),
+        }
+        scope.reset()?;
+    }
+
+    let scores = scores.finish();
+    let nulls = scores.null_count();
+    let (array, ty): (ArrayRef, LogicalType) = if nulls == batch.len {
+        drop(scores);
+        (Arc::new(NullArray::new(batch.len)), LogicalType::Null)
+    } else {
+        let ty = LogicalType::Scalar(rtdb_types::ScalarType::F64);
+        (Arc::new(scores), if nulls == 0 { ty } else { ty.maybe() })
+    };
+    let field = Arc::new(rtdb_columnar::to_field("value", &ty)?);
+    let column = Column::Arrow { array, field, logical: Some(ty) };
+    let bytes = retained.checked_add(column.retained_bytes()?).ok_or_else(size_error)?;
+    if bytes <= lease.bytes() { lease.shrink_to(bytes)?; } else { lease.grow_to(bytes)?; }
+    Ok(Some(column))
 }
 
 /// Packs scalar results whose Arrow cells read back as the same values and exact execution types.

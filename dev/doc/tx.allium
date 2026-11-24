@@ -118,6 +118,8 @@
 -- A page applies the conversion and projection checks in component order.
 -- A list parameter enters evaluation as its Arrow cell.
 -- Score calculation and nullable result construction use Arrow input arrays and output buffers.
+-- Compatible computed cosine operands demand their elements in expression order before vector validation.
+-- The row-evaluated score projection builds a typed Arrow result with the scalar projection's observed nullability.
 -- The integer series cursor writes the generated page directly into a signed 64-bit Arrow vector.
 -- Computed UNNEST gathers both original payload and evaluated child columns by Arrow position.
 -- Its ordinal vector marks the synthetic outer row of an empty list as null.

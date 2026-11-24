@@ -354,6 +354,12 @@ impl<'a> ExpressionRow<'a> {
     }
 }
 
+fn borrowed_cosine_columns(args: &[Expr], schema: &Schema, row: ExpressionRow<'_>) -> Option<Value> {
+    let [Expr::Column { id: left, .. }, Expr::Column { id: right, .. }] = args else { return None; };
+    let column = |id| crate::vector::VectorInput::from_numeric_arrow(row.arrow_cell(schema.position(id)?)?);
+    crate::vector::score_pair(column(*left)?, column(*right)?).ok()
+}
+
 macro_rules! expression_body {
     ($expression:expr, $input_schema:expr, $input_row:expr, $inputs:expr, $eval:ident, $call:ident, $reader:ident) => {{
     let (expr, schema, row, context) = ($expression, $input_schema, $input_row, $inputs);
@@ -432,6 +438,11 @@ macro_rules! expression_body {
             Ok(best)
         }
         Expr::Call { name, args, .. } => {
+            if (name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance"))
+                && let Some(score) = borrowed_cosine_columns(args, schema, row)
+            {
+                return Ok(score);
+            }
             context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
             let mut values = Vec::with_capacity(args.len());
             for argument in args { values.push($eval!(argument)?); }

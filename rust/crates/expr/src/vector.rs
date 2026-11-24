@@ -1,7 +1,7 @@
 use arrow_array::{Array, Float32Array, Float64Array, cast::AsArray, types::{Float16Type, Float32Type, Float64Type}};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, UnionMode};
 use rtdb_columnar::ArrowCell;
-use rtdb_types::{Anomaly, ListView, Result, Value};
+use rtdb_types::{Anomaly, ListValue, ListView, Result, Value};
 
 use crate::{compare::nullish, numeric::number};
 
@@ -15,6 +15,7 @@ pub(crate) fn cosine_distance(left: &Value, right: &Value) -> Result<Value> {
 #[derive(Clone, Copy)]
 pub(crate) enum VectorInput<'a> {
     Stored(ListView<'a>),
+    Components(&'a [f64]),
     Floats { values: ListView<'a>, offset: usize, len: usize },
     Arrow { field: &'a Field, array: &'a dyn Array, offset: usize, len: usize },
 }
@@ -28,10 +29,27 @@ impl<'a> VectorInput<'a> {
         Some(Self::Arrow { field, array, offset: range.start, len: range.len() })
     }
 
+    pub(crate) fn from_numeric_arrow(cell: ArrowCell<'a>) -> Option<Self> {
+        if !cell.field.metadata().is_empty()
+            || !matches!(cell.field.data_type(), DataType::List(_) | DataType::FixedSizeList(_, _))
+        {
+            return None;
+        }
+        let (field, array, _) = cell.sequence_range()?;
+        let primitive = |ty: &DataType| ty.is_integer() || ty.is_floating() || *ty == DataType::Null;
+        let compatible = match field.data_type() {
+            DataType::Union(legs, UnionMode::Dense) => legs.iter().all(|(_, field)| primitive(field.data_type())),
+            ty => primitive(ty),
+        };
+        (compatible && field.data_type() == array.data_type() && ListValue::supports_numeric_arrow(field))
+            .then(|| Self::from_arrow(cell)).flatten()
+    }
+
     pub(crate) fn prefix(self, length: usize) -> Option<Self> {
         if length > self.len() { return None; }
         Some(match self {
             Self::Stored(ListView::Values(values)) => Self::Stored(ListView::Values(&values[..length])),
+            Self::Components(values) => Self::Components(&values[..length]),
             Self::Stored(ListView::Numeric(values)) => Self::Arrow { field: values.field(), array: values.array().as_ref(), offset: 0, len: length },
             Self::Stored(ListView::Scalars(_)) => return None,
             Self::Stored(values) => Self::Floats { values, offset: 0, len: length },
@@ -49,12 +67,20 @@ impl<'a> VectorInput<'a> {
     }
 
     pub(crate) fn len(self) -> usize {
-        match self { Self::Stored(values) => values.len(), Self::Floats { len, .. } | Self::Arrow { len, .. } => len }
+        match self {
+            Self::Stored(values) => values.len(),
+            Self::Components(values) => values.len(),
+            Self::Floats { len, .. } | Self::Arrow { len, .. } => len,
+        }
     }
 
     pub(crate) fn component(self, index: usize) -> Result<f64> {
         match self {
             Self::Stored(values) => component_at(values, index),
+            Self::Components(values) => {
+                let value = values[index];
+                value.is_finite().then_some(value).ok_or_else(invalid_component)
+            }
             Self::Floats { values, offset, .. } => values.float_component(offset + index)
                 .filter(|value| value.is_finite()).ok_or_else(invalid_component),
             Self::Arrow { field, array, offset, .. } => arrow_number(ArrowCell { field, array, row: offset + index }),
@@ -89,7 +115,7 @@ fn float_slice(input: VectorInput<'_>) -> Option<FloatSlice<'_>> {
     let (values, offset, len) = match input {
         VectorInput::Stored(view) => (view, 0, view.len()),
         VectorInput::Floats { values, offset, len } => (values, offset, len),
-        VectorInput::Arrow { .. } => return None,
+        VectorInput::Arrow { .. } | VectorInput::Components(_) => return None,
     };
     match values {
         ListView::F32(values) => Some(FloatSlice::F32(values, offset, len)),
@@ -247,8 +273,12 @@ fn component(value: &Value) -> Result<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CosineVector, cosine_distance};
+    use arrow_array::{Array, FixedSizeListArray, ListArray, types::{Float32Type, UInt64Type}};
+    use arrow_schema::Field;
+    use rtdb_columnar::{ArrowCell, read_execution_value};
     use rtdb_types::Value;
+
+    use super::{CosineVector, VectorInput, cosine_distance, score_pair};
 
     #[test]
     fn packed_text_has_no_float_prefix() {
@@ -288,5 +318,27 @@ mod tests {
         }
         assert_eq!(prepared.score([0.0; 4].into_iter()), None);
         assert_eq!(prepared.score([1.0, f64::NAN, 0.0, 1.0].into_iter()), None);
+    }
+
+    #[test]
+    fn borrowed_sliced_list_pairs_keep_opened_integer_bits_and_child_validity() {
+        let integers = ListArray::from_iter_primitive::<UInt64Type, _, _>([
+            Some([Some(0), Some(0)]), Some([Some(u64::MAX), Some(3)]), Some([None, Some(3)]),
+        ]).slice(1, 2);
+        let floats = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>([
+            Some([Some(0.0), Some(0.0)]), Some([Some(2.0), Some(1.0)]),
+        ], 2).slice(1, 1);
+        let integer_field = Field::new("integers", integers.data_type().clone(), true);
+        let float_field = Field::new("floats", floats.data_type().clone(), true);
+        let right = VectorInput::from_numeric_arrow(ArrowCell { field: &float_field, array: &floats, row: 0 }).unwrap();
+        let stored_right = read_execution_value(&float_field, &floats, 0).unwrap();
+        let left = VectorInput::from_numeric_arrow(ArrowCell { field: &integer_field, array: &integers, row: 0 }).unwrap();
+        let stored_left = read_execution_value(&integer_field, &integers, 0).unwrap();
+        let Value::F64(expected) = cosine_distance(&stored_left, &stored_right).unwrap() else { unreachable!() };
+        let Value::F64(score) = score_pair(left, right).unwrap() else { unreachable!() };
+        assert_eq!(score.to_bits(), expected.to_bits());
+
+        let left = VectorInput::from_numeric_arrow(ArrowCell { field: &integer_field, array: &integers, row: 1 }).unwrap();
+        assert_eq!(score_pair(left, right).unwrap_err().code, "rtdb.vector/component");
     }
 }

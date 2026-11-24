@@ -89,3 +89,54 @@ async fn cosine_distance_rejects_inputs_without_a_defined_distance() {
         assert_eq!(query(&statement).await.unwrap_err().code, code, "{statement}");
     }
 }
+
+#[tokio::test]
+async fn computed_cosine_has_the_same_score_bits_as_column_pairs() {
+    let output = query(
+        "SELECT COSINE_DISTANCE(v, ARRAY[x,y]) AS left_score,
+                COSINE_DISTANCE(ARRAY[x,y], v) AS right_score,
+                COSINE_DISTANCE(v, w) AS column_score
+         FROM (VALUES
+             (ARRAY[1E290,-8E290], ARRAY[1E-290,2E-290], 1E-290, 2E-290),
+             (ARRAY[-5E-200,7E-200], ARRAY[3E195,4E195], 3E195, 4E195)
+         ) AS t(v,w,x,y)",
+    ).await.unwrap();
+    assert_eq!(output.len(), 2);
+    for row in output {
+        let [V::F64(left), V::F64(right), V::F64(columns)] = row.as_slice() else {
+            panic!("Expected three double-precision scores");
+        };
+        assert_eq!(left.to_bits(), columns.to_bits());
+        assert_eq!(right.to_bits(), columns.to_bits());
+        assert!((0.0..=2.0).contains(columns));
+    }
+}
+
+#[tokio::test]
+async fn computed_cosine_demands_only_selected_array_elements_and_rows() {
+    let output = query(
+        "SELECT CASE WHEN enabled THEN COSINE_DISTANCE(TRIM_ARRAY(CAST(v AS BIGINT ARRAY),1), w)
+                     ELSE NULL END AS score
+         FROM (VALUES
+             (1, TRUE, ARRAY['7','bad'], ARRAY[1]),
+             (2, FALSE, ARRAY['bad','bad'], ARRAY[0]),
+             (3, TRUE, ARRAY['7','bad'], NULL)
+         ) AS t(id,enabled,v,w) ORDER BY id",
+    ).await.unwrap();
+    assert_eq!(output, [vec![V::F64(0.0)], vec![V::Null], vec![V::Null]]);
+}
+
+#[tokio::test]
+async fn computed_cosine_preserves_element_and_vector_error_precedence() {
+    for (arguments, code) in [
+        ("v, ARRAY[1,1/n]", "xtdb.expression/division-by-zero"),
+        ("ARRAY[1,1/n], v", "xtdb.expression/division-by-zero"),
+        ("ARRAY[NULL], ARRAY[1,1/n]", "xtdb.expression/division-by-zero"),
+        ("v, ARRAY[NULL,1]", "rtdb.vector/dimensions"),
+        ("v, ARRAY[NULL]", "rtdb.vector/zero-norm"),
+        ("ARRAY[NULL], v", "rtdb.vector/component"),
+    ] {
+        let statement = format!("SELECT COSINE_DISTANCE({arguments}) FROM (VALUES (ARRAY[0],0)) AS t(v,n)");
+        assert_eq!(query(&statement).await.unwrap_err().code, code, "{statement}");
+    }
+}
