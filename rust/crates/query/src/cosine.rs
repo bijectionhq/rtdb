@@ -26,14 +26,24 @@ fn inputs(expr: &Expr) -> Option<(ColumnId, &Expr)> {
     }
 }
 
-pub(crate) fn has_score_output(mut expr: &Expr) -> bool {
-    while let Expr::Case { branches, otherwise } = expr {
-        let [(_, score)] = branches.as_slice() else { return false; };
-        if !matches!(otherwise.as_ref(), Expr::Literal(Value::Null)) { return false; }
+pub(crate) fn has_score_output(mut expr: &Expr, allow_extended_cases: bool) -> bool {
+    while let Expr::Case { branches, otherwise } = expr
+        && let [(_, score)] = branches.as_slice()
+        && matches!(otherwise.as_ref(), Expr::Literal(Value::Null))
+    {
         expr = score;
     }
-    matches!(expr, Expr::Call { name, args, .. } if args.len() == 2
-        && (name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance")))
+    match expr {
+        Expr::Case { branches, otherwise } | Expr::SimpleCase { branches, otherwise, .. } if allow_extended_cases => {
+            branches.iter().map(|(_, result)| result).chain([otherwise.as_ref()]).all(|result| {
+                stacker::maybe_grow(128 * 1024, 2 * 1024 * 1024, || has_score_output(result, true))
+            })
+        }
+        Expr::Literal(Value::F64(_) | Value::Null) => allow_extended_cases,
+        Expr::Call { name, args, .. } => args.len() == 2
+            && (name.eq_ignore_ascii_case("cosine_distance") || name.eq_ignore_ascii_case("cosine-distance")),
+        _ => false,
+    }
 }
 
 pub(crate) enum Projection {

@@ -2738,6 +2738,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cosine_cases_keep_double_bits_and_null_only_types_within_the_page_charge() {
+        let len = 4096;
+        let memory = MemoryBudget::new(1 << 24);
+        let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), crate::DatabaseSnapshot {
+            partitions: vec![],
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+        })].into(), false).unwrap();
+        let context = crate::QueryContext::new(catalog, Arc::clone(&memory), Timestamp(0), "UTC", Default::default(), &tokio_util::sync::CancellationToken::new()).unwrap();
+        let execution = crate::context::Execution { context: Arc::clone(&context), parameters: Arc::new(crate::parameters::BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: crate::context::OuterRows::empty(&memory).unwrap(), bindings: None, analysis: None };
+        let baseline = memory.used_bytes();
+        let batch = ColumnBatch::settled(vec![], len, memory.reserve(0).unwrap()).unwrap();
+        let input = single_batch(Some(batch), context);
+        let double = LogicalType::Scalar(ScalarType::F64);
+        let score = Expr::Call { name: "cosine_distance".into(), args: vec![Expr::Literal(Value::Null); 2], return_type: double.clone().maybe() };
+        let projections = [Value::F64(-0.0), Value::Null].into_iter().map(|result| Expr::Case {
+            branches: vec![
+                (Expr::Literal(Value::Bool(false)), score.clone()),
+                (Expr::Literal(Value::Bool(true)), Expr::Case {
+                    branches: vec![(Expr::Literal(Value::Bool(true)), Expr::Literal(result))],
+                    otherwise: Box::new(score.clone()),
+                }),
+            ],
+            otherwise: Box::new(Expr::Literal(Value::Null)),
+        }).collect();
+        let mut cursor = BatchExpressions::new(input, Schema::default(), projections, execution.clone());
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let [
+            Column::Arrow { array: doubles, field, logical: Some(ty) },
+            Column::Arrow { array: nulls, logical: Some(LogicalType::Null), .. },
+        ] = page.columns.as_slice() else {
+            panic!("Expected a double column and a null column");
+        };
+        assert_eq!(*ty, double);
+        assert!(!field.is_nullable());
+        let doubles = doubles.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(doubles.len(), len);
+        assert_eq!(doubles.null_count(), 0);
+        assert!(doubles.values().iter().all(|value| value.to_bits() == (-0.0f64).to_bits()));
+        assert_eq!(nulls.data_type(), &DataType::Null);
+        assert_eq!(nulls.len(), len);
+        assert!(memory.peak_bytes() < 2 * len * std::mem::size_of::<Value>());
+        drop(page);
+        drop(cursor);
+        assert_eq!(memory.used_bytes(), baseline);
+    }
+
+    #[tokio::test]
     async fn residual_predicates_borrow_selected_struct_fields_and_list_cells() {
         let source = MemoryBudget::new(1 << 25);
         let large = "x".repeat(1 << 21);
@@ -3423,13 +3471,16 @@ impl BatchCursor for BatchExpressions {
             let scope = self.execution.scope()?;
             let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
             let retained = lease.bytes();
-            if crate::cosine::has_score_output(expression)
-                && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease).await?
+            let value_slots = batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?;
+            let score_bound = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
+            // Extra CASE shapes must leave at least as much room for row evaluation as the value buffer would.
+            if crate::cosine::has_score_output(expression, score_bound <= value_slots)
+                && let Some(column) = evaluate_score_column(&batch, &self.execution, &invocation, &scope, lease, score_bound).await?
             {
                 columns.push(column);
                 continue;
             }
-            lease.grow_to(retained.checked_add(batch.len.checked_mul(std::mem::size_of::<Value>()).ok_or_else(size_error)?).ok_or_else(size_error)?)?;
+            lease.grow_to(retained.checked_add(value_slots).ok_or_else(size_error)?)?;
             let mut values = Vec::with_capacity(batch.len);
             for row in 0..batch.len {
                 let input = BatchRow { batch: &batch, row, admit_dates: false };
@@ -3470,10 +3521,9 @@ impl BatchCursor for BatchExpressions {
 
 async fn evaluate_score_column(
     batch: &ColumnBatch, execution: &crate::context::Execution, invocation: &rtdb_expr::ExpressionInvocation<'_>,
-    scope: &rtdb_expr::EvaluationScope, lease: &mut MemoryReservation,
+    scope: &rtdb_expr::EvaluationScope, lease: &mut MemoryReservation, bound: usize,
 ) -> Result<Option<Column>> {
     let retained = lease.bytes();
-    let bound = batch.len.checked_mul(9).and_then(|bytes| bytes.checked_add(512)).ok_or_else(size_error)?;
     match lease.grow_to(retained.checked_add(bound).ok_or_else(size_error)?) {
         Ok(()) => (),
         Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),

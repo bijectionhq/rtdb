@@ -127,6 +127,49 @@ async fn computed_cosine_demands_only_selected_array_elements_and_rows() {
 }
 
 #[tokio::test]
+async fn multi_branch_cosine_case_preserves_selected_score_bits_and_nulls() {
+    let output = query(
+        "SELECT CASE
+                    WHEN id = 1 THEN COSINE_DISTANCE(ARRAY[1E290,-8E290], ARRAY[1E-290,2E-290])
+                    WHEN 1/(id-1) = 1 THEN COSINE_DISTANCE(ARRAY[1,1/(id-1)], ARRAY[1,1])
+                    WHEN id = 3 THEN NULL
+                    ELSE COSINE_DISTANCE(ARRAY[-1], ARRAY[1])
+                END AS searched_score,
+                CASE id
+                    WHEN 1 THEN COSINE_DISTANCE(ARRAY[1E290,-8E290], ARRAY[1E-290,2E-290])
+                    WHEN 2 THEN COSINE_DISTANCE(ARRAY[1,1], ARRAY[1,1])
+                    WHEN 3 THEN NULL
+                    ELSE 2E0
+                END AS simple_score
+         FROM GENERATE_SERIES(1,64) AS t(id) ORDER BY id",
+    ).await.unwrap();
+    let reference = query("SELECT COSINE_DISTANCE(ARRAY[1E290,-8E290], ARRAY[1E-290,2E-290])").await.unwrap();
+    let [V::F64(searched), V::F64(simple)] = output[0].as_slice() else { panic!("Expected two double scores"); };
+    let [V::F64(reference)] = reference[0].as_slice() else { panic!("Expected a double score"); };
+    assert_eq!(searched.to_bits(), reference.to_bits());
+    assert_eq!(simple.to_bits(), reference.to_bits());
+    assert_eq!(output[1], [V::F64(0.0), V::F64(0.0)]);
+    assert_eq!(output[2], [V::Null, V::Null]);
+    assert_eq!(output.len(), 64);
+    assert!(output[3..].iter().all(|row| row.as_slice() == [V::F64(2.0), V::F64(2.0)]));
+}
+
+#[tokio::test]
+async fn multi_branch_cosine_case_reports_the_first_selected_error_in_projection_order() {
+    let error = query(
+        "SELECT CASE
+                    WHEN id = 2 THEN COSINE_DISTANCE(ARRAY[1], ARRAY[1,2])
+                    WHEN id = 1 THEN COSINE_DISTANCE(ARRAY[0], ARRAY[1])
+                    WHEN 1/(id-1) = 1 THEN COSINE_DISTANCE(ARRAY[1], ARRAY[1])
+                    ELSE NULL
+                END AS first_score,
+                COSINE_DISTANCE(ARRAY[1,1/(id-id)], ARRAY[1,1]) AS second_score
+         FROM GENERATE_SERIES(1,64) AS t(id)",
+    ).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.vector/zero-norm");
+}
+
+#[tokio::test]
 async fn computed_cosine_preserves_element_and_vector_error_precedence() {
     for (arguments, code) in [
         ("v, ARRAY[1,1/n]", "xtdb.expression/division-by-zero"),
