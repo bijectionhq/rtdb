@@ -1,0 +1,27 @@
+[package]
+name = "rtdb-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+journal-contract.workspace = true
+rtdb-crypt = { path = "../crypt" }
+rtdb-format.workspace = true
+rtdb-index.workspace = true
+rtdb-store = { path = "../store" }
+rtdb-tx.workspace = true
+rtdb-types.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rtdb-logkeeper = { workspace = true, features = ["simulation"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true
