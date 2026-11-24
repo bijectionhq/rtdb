@@ -168,6 +168,9 @@
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
 -- A placed SQL snapshot token seals its journal generation and checkpoint digest.
 -- After restart, the reader can rebuild the exact retained cut from that checkpoint and its protected suffix.
+-- Ordered readmission protects the selected published checkpoint and its exact suffix in one journal decision.
+-- It opens the checkpoint's sealed manifest under that hold and admits physical suffix files from applicable replayed records.
+-- An inaccessible checkpoint member cannot be replaced by a similarly named object.
 -- Suffix replay retains custody through answer release and refuses a missing interval or a different installed data head.
 -- An erased replay interval reports erasure.
 -- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.

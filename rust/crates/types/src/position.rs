@@ -25,6 +25,13 @@ pub struct CatalogCut {
     pub through: ReplicaPosition,
 }
 
+/// The published root used to reconstruct an admitted catalog cut.
+#[derive(Clone, Copy)]
+pub struct CatalogCheckpoint {
+    pub boundary: ReplicaPosition,
+    pub root: [u8; 32],
+}
+
 /// Maximum charge of an inline catalog file claim.
 pub const CATALOG_FILE_PATH_BYTES: usize = 4096;
 

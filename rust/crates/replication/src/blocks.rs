@@ -90,7 +90,9 @@ impl RecoveredPartition {
         Ok(self.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?))
     }
 
-    pub(crate) fn allows_catalog_cut_tracking(&self) -> bool { self.refresh_allowed }
+    pub(crate) fn allows_catalog_cut_tracking(&self) -> bool {
+        self.refresh_allowed || self.published_checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some())
+    }
 
     pub(crate) fn confirmation(&self, replica_epoch: StorageEpoch, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Option<RecoveredBlockConfirmation>> {
         if self.erasure_checkpoint { return Ok(None); }

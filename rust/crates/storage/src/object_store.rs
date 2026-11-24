@@ -170,10 +170,27 @@ pub trait ObjectStore: Send + Sync {
     /// Published checkpoint files survive a process restart on the same storage.
     fn syncs_checkpoints(&self) -> bool { false }
     fn index_page_lifecycle(&self) -> Option<&dyn IndexPageLifecycle> { None }
+    /// Opens the storage projection owned by an exact journal snapshot hold.
+    async fn open_log_snapshot(
+        &self, _authority: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> rtdb_types::Result<Arc<dyn ObjectStore>> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb.storage/snapshot-custody",
+            "The storage provider cannot open the journal's exact snapshot"))
+    }
     /// Registers a captured catalog in a shared serving store.
     /// A missing cut represents an opaque capture. Standalone stores need no remote registration.
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         Ok(None)
+    }
+    /// Admits the physical dependencies of one exact catalog checkpoint and suffix.
+    async fn retain_anchored_catalog(
+        &self, cut: rtdb_types::CatalogCut, _base: rtdb_types::CatalogCheckpoint,
+        paths: Option<Arc<[String]>>,
+    ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        match paths {
+            Some(paths) => self.retain_catalog_with_paths(Some(cut), paths).await,
+            None => self.retain_catalog(Some(cut)).await,
+        }
     }
     /// Registers the complete compacted primary and published search paths of the captured catalog.
     async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, _paths: Arc<[String]>)

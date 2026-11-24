@@ -481,9 +481,8 @@ impl Node {
             if let Some(fence) = &self.read_fence {
                 fence.confirm(name).await?;
             }
-            let captured = catalog.database(name)?;
             let current = self.catalog.database(name)?;
-            if !Arc::ptr_eq(&captured.storage, &current.storage) {
+            if !catalog.belongs_to_storage(name, &current.storage)? {
                 return Err(lost_placement(name));
             }
         }
@@ -625,17 +624,23 @@ impl Node {
     pub(crate) async fn recover_sql_snapshot(
         &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
         cancellation: &CancellationToken,
-    ) -> Result<(rtdb_index::Snapshot, Option<Arc<dyn Send + Sync>>)> {
-        let storage = &database.storage;
-        let hold = storage.hold_catalog(Some(cut)).await?;
-        if !hold.is_registered() { return Err(crate::sql_snapshots::unretained()); }
+    ) -> Result<crate::sql_snapshots::RecoveredSqlSnapshot> {
         let replay = cancellation.run_until_cancelled(
             rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
         ).await.ok_or_else(cancelled)??;
-        let dependencies = Arc::new((Arc::clone(&hold), replay.custody()));
+        let installed = &database.storage;
+        let (storage, catalog_hold) = if let Some(owner) = replay.provider() {
+            let view = installed.object_store().open_log_snapshot(owner).await?;
+            (Arc::new(BufferPool::with_budget(view, Arc::clone(installed.budget()))), None)
+        } else {
+            let hold = installed.hold_catalog(Some(cut)).await?;
+            if !hold.is_registered() { return Err(crate::sql_snapshots::unretained()); }
+            (Arc::clone(installed), Some(hold))
+        };
+        let dependencies = Arc::new((catalog_hold.clone(), replay.custody()));
         rtdb_storage::IoRegion::retaining(dependencies, async {
             let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
-                Arc::clone(storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
+                Arc::clone(&storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
             let mut recovered = match checkpoint {
                 Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
                     database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
@@ -644,8 +649,11 @@ impl Node {
             };
             let suffix = recovered.replay_snapshot_suffix(&database.logs, replay, cancellation).await?;
             recovered.partition.publish_catalog_cut(cut)?;
-            let snapshot = recovered.partition.snapshot().with_catalog_read(hold);
-            Ok((rtdb_query::retain_catalog_snapshot(snapshot, storage).await?, suffix))
+            let snapshot = recovered.partition.snapshot();
+            let snapshot = if let Some(hold) = catalog_hold { snapshot.with_catalog_read(hold) } else { snapshot };
+            let partition = rtdb_query::retain_catalog_snapshot(snapshot, &storage).await?;
+            let storage = (!Arc::ptr_eq(installed, &storage)).then_some(storage);
+            Ok(crate::sql_snapshots::RecoveredSqlSnapshot { partition, suffix, storage })
         }).await
     }
 

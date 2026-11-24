@@ -179,6 +179,12 @@ pub(crate) fn unretained() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb/snapshot-unretained", "The exact SQL snapshot cannot be readmitted")
 }
 
+pub(crate) struct RecoveredSqlSnapshot {
+    pub(crate) partition: rtdb_index::Snapshot,
+    pub(crate) suffix: Option<Arc<dyn Send + Sync>>,
+    pub(crate) storage: Option<Arc<rtdb_storage::cache::BufferPool>>,
+}
+
 pub(crate) struct SqlSnapshotAdmission {
     pub(crate) node: crate::Node,
     pub(crate) registry: Arc<SqlSnapshots>,
@@ -220,8 +226,8 @@ impl SqlSnapshotAdmission {
             .filter(|micros| *micros > 0 && *micros <= HOLD_FOR.as_micros() as u64).ok_or_else(unretained)?;
         let deadline = std::time::Instant::now().checked_add(Duration::from_micros(remaining)).ok_or_else(unretained)?;
         let [partition] = current_database.partitions.as_slice() else { return Err(unretained()); };
-        let (snapshot, suffix) = if exact.matches(partition) {
-            (partition.clone(), None)
+        let recovered = if exact.matches(partition) {
+            RecoveredSqlSnapshot { partition: partition.clone(), suffix: None, storage: None }
         } else {
             let cut = partition.catalog_cut().filter(|cut| cut.storage_version == exact.cut.storage_version
                 && cut.storage_epoch == exact.cut.storage_epoch && cut.replica_epoch == exact.cut.replica_epoch)
@@ -245,9 +251,11 @@ impl SqlSnapshotAdmission {
                     else { unretained() }
                 })?
         };
-        if !exact.matches(&snapshot) || !exact.is_live(self.node.now()) { return Err(unretained()); }
-        let snapshot = snapshot.with_system_time_cap(exact.cap).map_err(|_| unretained())?;
-        let view = rtdb_query::SqlSnapshotView::from_exact_partition(current, snapshot, exact.clock, suffix)?;
+        if !exact.matches(&recovered.partition) || !exact.is_live(self.node.now()) { return Err(unretained()); }
+        let snapshot = recovered.partition.with_system_time_cap(exact.cap).map_err(|_| unretained())?;
+        let view = rtdb_query::SqlSnapshotView::from_exact_partition(
+            current, snapshot, exact.clock, recovered.suffix, recovered.storage,
+        )?;
         let view = with_expiry(view, deadline);
         self.node.admit_retained_catalog(&view.catalog, self.identity.as_ref(), cancellation).await?;
         Ok(view)

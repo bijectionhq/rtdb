@@ -14,12 +14,17 @@ pub struct SnapshotReplay {
     cut: CatalogCut,
     after: ReplicaPosition,
     checkpoint: Option<crate::PublishedCheckpoint>,
-    protected: Option<rtdb_storage::log::ProtectedLogRange>,
+    protected: rtdb_storage::log::ProtectedLogSnapshot,
 }
 
 impl SnapshotReplay {
     pub fn custody(&self) -> Option<Arc<dyn Send + Sync>> {
-        self.protected.as_ref().map(|range| Arc::clone(&range.hold))
+        self.protected.provider.as_ref().map(|owner| Arc::clone(owner) as Arc<dyn Send + Sync>)
+            .or_else(|| self.protected.suffix.as_ref().map(|range| Arc::clone(&range.hold)))
+    }
+
+    pub fn provider(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.protected.provider.clone()
     }
 
     pub async fn protect(
@@ -35,14 +40,8 @@ impl SnapshotReplay {
             Some(_) => return Err(unretained()),
             None => logs.replica_floor()?,
         };
-        let protected = if after < cut.through {
-            let next = |position: ReplicaPosition| position.0.checked_add(1).map(ReplicaPosition).ok_or_else(unretained);
-            Some(logs.protected_snapshot_range(next(after)?, next(cut.through)?).await?)
-        } else if after == cut.through {
-            None
-        } else {
-            return Err(unretained());
-        };
+        let root = checkpoint.and_then(|checkpoint| checkpoint.root_sha256).unwrap_or([0; 32]);
+        let protected = logs.protected_snapshot_range(after, cut.through, root).await?;
         Ok(Self { cut, after, checkpoint, protected })
     }
 }
@@ -137,7 +136,7 @@ impl RecoveredPartition {
         if base != after || loaded != checkpoint || (loaded.is_none() && self.block.is_some()) {
             return Err(unretained());
         }
-        let Some(protected) = protected else {
+        let Some(protected) = protected.suffix else {
             return if crate::catalog_cut::completes_snapshot_replay(base.0, after.0, base.0, cut.through.0, false) {
                 Ok(None)
             } else {
@@ -152,6 +151,7 @@ impl RecoveredPartition {
         while let Some(raw) = cancellation.run_until_cancelled(range.next(ReadReservation::new(bound, memory.reserve(bound)?)))
             .await.ok_or_else(crate::progress::cancelled)??
         {
+            let offset = raw.metadata.offset;
             let record = logs.decode_replica(raw)?.ok_or_else(unretained)?;
             let position = record.metadata.position;
             if position <= reached || position > cut.through { return Err(unretained()); }
@@ -206,6 +206,7 @@ impl RecoveredPartition {
                 }
                 ReplicaBody::TriesAdded(message) => {
                     if same_storage(message.storage_version, message.storage_epoch, cut) {
+                        range.admit_snapshot_files(offset)?;
                         self.partition.add_tries(&additions(&message.tries)?, at)?;
                     }
                     self.advance_snapshot_source(message.source_msg_id, slot.is_some())?;
@@ -223,6 +224,7 @@ impl RecoveredPartition {
                     if same_storage(message.storage_version, message.storage_epoch, cut)
                         && let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())
                     {
+                        range.admit_snapshot_files(offset)?;
                         self.partition.add_artefacts_at(&table, artefact_entries(&message.entries), at);
                     }
                     self.advance_snapshot_source(message.source_msg_id, slot.is_some())?;

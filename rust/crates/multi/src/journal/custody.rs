@@ -184,7 +184,7 @@ struct Member {
 
 pub struct OpenedCheckpoint {
     pub checkpoint: RtdbCheckpoint,
-    pub store: Arc<dyn ObjectStore>,
+    pub(crate) store: Arc<ExactStore>,
     pub(super) authority: CheckpointAuthority,
 }
 
@@ -740,13 +740,17 @@ impl ErasureRecords<'_> {
     }
 }
 
-struct ExactStore {
+pub(crate) struct ExactStore {
     bucket: Arc<dyn ObjectStore>,
     prefix: String,
     members: BTreeMap<String, Member>,
 }
 
 impl ExactStore {
+    pub(crate) fn contains(&self, key: &ObjectKey) -> bool {
+        self.members.contains_key(key.as_str())
+    }
+
     fn member(&self, logical: &ObjectKey) -> rtdb_storage::Result<(&Member, ObjectKey)> {
         let member = self
             .members

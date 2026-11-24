@@ -105,12 +105,19 @@ pub struct ProtectedLogRange {
     pub hold: Arc<dyn Send + Sync>,
 }
 
+pub struct ProtectedLogSnapshot {
+    pub suffix: Option<ProtectedLogRange>,
+    pub provider: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
 #[async_trait]
 pub trait LogRange: Send {
     /// The caller reserves this many bytes before each read; returned payloads retain that charge.
     fn allocation_bound(&self) -> usize;
     /// Returns one record from the captured range, or None at its permanent end.
     async fn next(&mut self, reservation: crate::object_store::ReadReservation) -> Result<Option<LogRecord>>;
+    /// Retain provider file addresses from a delivered record accepted by the catalog replay.
+    fn admit_snapshot_files(&mut self, _position: LogOffset) -> Result<()> { Ok(()) }
 }
 
 enum Completion {
@@ -253,6 +260,13 @@ pub trait Log: Send + Sync {
     /// Captures record starts in [from, to), bounded by the current durable tip.
     /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn LogRange>>;
+    /// Holds the requested checkpoint and suffix when the journal owns checkpoint custody.
+    async fn protect_snapshot(
+        &self, from: LogOffset, to: LogOffset, _root: [u8; 32],
+    ) -> Result<ProtectedLogSnapshot> {
+        let suffix = if from == to { None } else { Some(self.protect_range(from, to).await?) };
+        Ok(ProtectedLogSnapshot { suffix, provider: None })
+    }
     /// Acquires the original retained interval and its erasure protection.
     async fn protect_range(&self, _from: LogOffset, _to: LogOffset) -> Result<ProtectedLogRange> {
         Err(Error::Closed("The journal does not admit protected exact replay".into()))

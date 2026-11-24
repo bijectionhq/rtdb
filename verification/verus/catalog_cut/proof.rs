@@ -13,4 +13,6 @@ const CORRESPONDENCE: &[&str] = &[
     include_str!("../../../rust/crates/node/src/sql_snapshots.rs"),
     include_str!("../../../rust/crates/node/src/node.rs"),
     include_str!("../../../rust/crates/query/src/context.rs"),
+    include_str!("../../../rust/crates/multi/src/journal/log.rs"),
+    include_str!("../../../rust/crates/multi/src/journal/hosted/storage/snapshot.rs"),
 ];

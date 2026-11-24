@@ -22,6 +22,7 @@ use rtdb_storage::{
     object_store::ReadReservation,
 };
 use rtdb_types::{Anomaly, BlockIndex, Timestamp};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicI64, Ordering},
@@ -72,6 +73,58 @@ struct Reads {
     maximum: usize,
     unsettled: Mutex<Vec<RequestId>>,
     reader_epoch: Option<u64>,
+}
+
+pub(crate) struct SnapshotFiles {
+    pub(crate) journal: Arc<InstalledJournal>,
+    pub(crate) held: Arc<Held>,
+    pub(crate) epoch: u64,
+    budget: Arc<rtdb_columnar::MemoryBudget>,
+    files: parking_lot::Mutex<SnapshotFileReferences>,
+}
+
+#[derive(Default)]
+struct SnapshotFileReferences {
+    pending: Option<DeliveredReferences>,
+    epochs: BTreeMap<u64, BTreeSet<ObjectName>>,
+    charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
+}
+
+struct DeliveredReferences {
+    position: LogOffset,
+    epoch: u64,
+    names: Vec<ObjectName>,
+    charge: Arc<rtdb_columnar::MemoryReservation>,
+}
+
+impl SnapshotFiles {
+    fn delivered(&self, position: LogOffset, epoch: u64, names: Vec<ObjectName>) -> Result<()> {
+        let charge = self.budget.reserve(256 + names.len() * 96).map_err(storage)?;
+        self.files.lock().pending = Some(DeliveredReferences { position, epoch, names, charge });
+        Ok(())
+    }
+
+    fn admit(&self, position: LogOffset) -> Result<()> {
+        let mut files = self.files.lock();
+        let record = files.pending.take().filter(|record| record.position == position)
+            .ok_or_else(|| Error::Closed("Snapshot replay did not admit its own delivered record".into()))?;
+        if !record.names.is_empty() {
+            files.epochs.entry(record.epoch).or_default().extend(record.names);
+            files.charges.push(record.charge);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn origin(
+        &self, mut name: impl FnMut(u64) -> Result<Option<ObjectName>>,
+    ) -> Result<Option<u64>> {
+        for (epoch, references) in self.files.lock().epochs.iter().rev() {
+            if name(*epoch)?.is_some_and(|name| references.contains(&name)) {
+                return Ok(Some(*epoch));
+            }
+        }
+        Ok(None)
+    }
 }
 
 pub(crate) struct Held {
@@ -483,6 +536,7 @@ impl Reads {
 struct Prepared {
     metadata: ReplayHead,
     end: Cut,
+    record_bytes: u64,
 }
 
 struct Cursor {
@@ -492,6 +546,7 @@ struct Cursor {
     held: Option<Arc<Held>>,
     from: Option<Cut>,
     prepared: Option<Prepared>,
+    snapshot: Option<Arc<SnapshotFiles>>,
 }
 
 impl Cursor {
@@ -503,6 +558,7 @@ impl Cursor {
             held: None,
             from: None,
             prepared: None,
+            snapshot: None,
         }
     }
 
@@ -572,11 +628,13 @@ impl Cursor {
                     },
                     payload_len: payload_len.checked_sub(SEALED_OVERHEAD)
                         .ok_or_else(|| Error::Task("The ordered record is shorter than its seal".into()))?,
-                    allocation_bound: payload_len.saturating_add(DELIVERED_RECORD_OVERHEAD),
+                    allocation_bound: payload_len.saturating_add(DELIVERED_RECORD_OVERHEAD)
+                        .max(usize::try_from(item.record_bytes).map_err(|_| Error::Task("The ordered record is too large".into()))?),
                 };
                 self.prepared = Some(Prepared {
                     metadata,
                     end: item.next,
+                    record_bytes: item.record_bytes,
                 });
                 return Ok(Some(metadata));
             }
@@ -625,7 +683,7 @@ impl Cursor {
         let page = self
             .reads
             .journal
-            .replay(held.hold, from, head.allocation_bound as u64)
+            .replay(held.hold, from, prepared.record_bytes)
             .await
             .map_err(storage)?;
         let first = page
@@ -649,6 +707,13 @@ impl Cursor {
             generation: placement.generation,
             writer_epoch: first.grant.epoch,
         };
+        if let Some(snapshot) = &self.snapshot {
+            let scope = snapshot.held.scope();
+            if page.checkpoint != scope.checkpoint || page.through != scope.through {
+                return Err(Error::Closed("The ordered replay changed its snapshot checkpoint or cut".into()));
+            }
+            snapshot.delivered(head.metadata.offset, first.grant.epoch, first.references.unwrap_or_default())?;
+        }
         let key = JournalKey::new(placement, first.grant.key_generation);
         let open = IoRegion::retaining(
             Arc::clone(held) as Arc<dyn Send + Sync>,
@@ -697,7 +762,6 @@ impl Log for JournalLog {
     fn requires_replica_payload_permit(&self) -> bool { true }
     fn needs_published_recovery_checkpoint(&self) -> bool { true }
     fn install_replica_reference_source(&self, source: ReplicaReferenceSource) -> Result<()> {
-        if self.writer.is_none() { return Ok(()); }
         let blocks = rtdb_replication::BlockStore::new(
             Arc::clone(&source.store), Arc::clone(&source.cache), Arc::clone(&source.memory), source.file_size_target,
         ).map_err(storage)?;
@@ -828,6 +892,48 @@ impl Log for JournalLog {
         Ok(Box::new(self.capture(from, to).await?))
     }
 
+    async fn protect_snapshot(
+        &self, from: LogOffset, to: LogOffset, root: [u8; 32],
+    ) -> Result<rtdb_storage::log::ProtectedLogSnapshot> {
+        let unavailable = || Error::Closed("The exact ordered checkpoint and suffix are unavailable".into());
+        let start = u64::try_from(from.0).map_err(|_| unavailable())?;
+        let end = u64::try_from(to.0).map_err(|_| unavailable())?;
+        let view = self.reads.route().await?;
+        if start < view.erasure_floor { return Err(Error::ErasedUnderView); }
+        if start > end || end > view.head.next_lsn { return Err(unavailable()); }
+        let source = self.reference_source.get().ok_or_else(unavailable)?;
+        let command = Command::ProtectCheckpoint { root, from: start, through: end };
+        let request = self.reads.journal.request(&view, command).map_err(storage)?;
+        let held = match Held::acquire(&self.reads.journal, request, &self.reads.tasks).await {
+            Ok(held) => held,
+            Err(error) => {
+                if start < self.reads.route().await?.erasure_floor { return Err(Error::ErasedUnderView); }
+                return Err(storage(error));
+            }
+        };
+        let scope = held.scope();
+        if scope.checkpoint.root != root || scope.checkpoint.cut != scope.start
+            || scope.start.next_lsn != start || scope.through.next_lsn != end
+        {
+            return Err(unavailable());
+        }
+        let files = Arc::new(SnapshotFiles {
+            journal: Arc::clone(&self.reads.journal),
+            held: Arc::clone(&held),
+            epoch: view.writer.epoch,
+            budget: Arc::clone(&source.source.memory),
+            files: parking_lot::Mutex::default(),
+        });
+        let suffix = (start < end).then(|| {
+            let mut range = Cursor::new(Arc::clone(&self.reads), start, Some(end));
+            range.held = Some(Arc::clone(&held));
+            range.from = Some(scope.start);
+            range.snapshot = Some(Arc::clone(&files));
+            rtdb_storage::log::ProtectedLogRange { range: Box::new(range), hold: held }
+        });
+        Ok(rtdb_storage::log::ProtectedLogSnapshot { suffix, provider: Some(files) })
+    }
+
     async fn protect_range(&self, from: LogOffset, to: LogOffset) -> Result<rtdb_storage::log::ProtectedLogRange> {
         let range = self.capture(from, to).await?;
         if range.end != u64::try_from(to.0).ok() || from >= to {
@@ -892,8 +998,12 @@ impl LogReplayTail for Cursor {
 
 #[async_trait]
 impl LogRange for Cursor {
+    fn admit_snapshot_files(&mut self, position: LogOffset) -> Result<()> {
+        self.snapshot.as_ref().map_or(Ok(()), |snapshot| snapshot.admit(position))
+    }
+
     fn allocation_bound(&self) -> usize {
-        self.reads.maximum.saturating_add(DELIVERED_RECORD_OVERHEAD)
+        self.reads.maximum.saturating_add(DELIVERED_RECORD_OVERHEAD + 32 * MAX_OBJECT_REFERENCES)
     }
 
     async fn next(&mut self, reservation: ReadReservation) -> Result<Option<LogRecord>> {

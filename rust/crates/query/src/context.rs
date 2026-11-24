@@ -28,6 +28,19 @@ async fn hold_snapshot(snapshot: &Snapshot, storage: &BufferPool) -> Result<Arc<
     {
         return Ok(hold);
     }
+    if let Some(cut) = cut {
+        let anchor = match snapshot.table_catalog().block() {
+            Some(block) => block.boundary_replica_position().zip(block.publication_sha256())
+                .map(|(boundary, root)| rtdb_types::CatalogCheckpoint { boundary, root }),
+            None => Some(rtdb_types::CatalogCheckpoint {
+                boundary: rtdb_types::ReplicaPosition::from_epoch_offset(cut.replica_epoch, -1)?,
+                root: [0; 32],
+            }),
+        };
+        if let Some(anchor) = anchor {
+            return storage.hold_anchored_catalog(cut, anchor, paths).await;
+        }
+    }
     storage.hold_catalog_with_paths(cut, paths).await
 }
 
@@ -61,6 +74,7 @@ pub struct CatalogSnapshot {
     read_lease: Option<Arc<rtdb_storage::ReadLease>>,
     read_view: Arc<tokio::sync::OnceCell<Arc<rtdb_storage::HeldView>>>,
     snapshot_suffix: Option<Arc<dyn Send + Sync>>,
+    resumed_storage_owner: Option<Arc<BufferPool>>,
 }
 
 impl CatalogSnapshot {
@@ -71,7 +85,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None, resumed_storage_owner: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
@@ -87,12 +101,23 @@ impl CatalogSnapshot {
     /// Provider requests for this catalog's files begin only while the lease admits them.
     pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
     pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
-    pub(crate) fn reset_sql_snapshot_view(&mut self, suffix: Option<Arc<dyn Send + Sync>>) {
+    pub(crate) fn reset_sql_snapshot_view(
+        &mut self, suffix: Option<Arc<dyn Send + Sync>>, owner: Option<Arc<BufferPool>>,
+    ) {
         self.read_view = Arc::default();
         self.snapshot_suffix = suffix;
+        self.resumed_storage_owner = owner;
         self.fragmenter = None;
         self.fragment_residence = None;
     }
+    /// Checks the placement that authorized the captured or reconstructed catalog.
+    pub fn belongs_to_storage(&self, database: &str, current: &Arc<BufferPool>) -> Result<bool> {
+        let captured = self.database(database)?;
+        let owner = self.resumed_storage_owner.as_ref().filter(|_| database == self.default_database)
+            .unwrap_or(&captured.storage);
+        Ok(Arc::ptr_eq(owner, current))
+    }
+
     pub(crate) async fn held_view(&self) -> Result<Arc<rtdb_storage::HeldView>> {
         self.check_view_lease()?;
         self.read_view.get_or_try_init(|| async {

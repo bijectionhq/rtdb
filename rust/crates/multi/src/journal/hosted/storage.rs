@@ -1,3 +1,5 @@
+mod snapshot;
+
 use super::prefix_retirement::{DESCRIPTOR, GrantDescriptor, local_lifetime};
 use super::reclamation::{ReclamationQueue, queue_prefix};
 use super::{Attachment, AttachmentAdmission, Routes, genesis, invalid};
@@ -138,7 +140,7 @@ impl RemoteStorageFactory for StoreFactory {
         let (grant, hold) = match attachment.admission {
             AttachmentAdmission::Writer { admission } => (admission.grant, admission.recovery),
             AttachmentAdmission::Reader { epoch, hold, .. } => {
-                return self.open_reader(&placement, &attachment, root, io, epoch, hold).await;
+                return self.open_reader(placement, &attachment, root, io, epoch, hold).await;
             }
         };
         let scope = Arc::new(WriteScope {
@@ -213,6 +215,9 @@ impl RemoteStorageFactory for StoreFactory {
         let store = Arc::new(ServingStore {
             lower,
             upper,
+            snapshot: Some(snapshot::Source {
+                placement, keys: Arc::clone(&self.keys), io: Arc::clone(&io), tasks: self.releases.clone(),
+            }),
             reader: None,
             writer: Some(ServingWriter {
                 scope,
@@ -269,13 +274,13 @@ impl StoreFactory {
                 CheckpointAuthority::Upload => BlockDiscovery::AtPublished(published),
                 CheckpointAuthority::Erasure(_) => BlockDiscovery::AtErasure(published),
             };
-            (Some(opened.store), discovery)
+            (Some(opened.store as Arc<dyn ObjectStore>), discovery)
         };
         Ok((lower, blocks))
     }
 
     async fn open_reader(
-        &self, placement: &super::Placement, attachment: &Attachment,
+        &self, placement: Arc<super::Placement>, attachment: &Attachment,
         root: &ObjectKey, io: Arc<IoRegion>, epoch: u64, hold: Hold,
     ) -> Result<OpenedRecoveryStore> {
         let protection = placement.retained_reader(hold)?;
@@ -288,12 +293,12 @@ impl StoreFactory {
             return Err(invalid("The ordered reader epoch changed during attachment"));
         }
         let (lower, blocks) = with_read_lease(deadline, |_| {
-            self.open_checkpoint(placement, attachment, hold, Arc::clone(&io))
+            self.open_checkpoint(&placement, attachment, hold, Arc::clone(&io))
         }).await?;
         let objects = ReplicaObjects {
             installed: placement.worker.placement(), storage_prefix: placement.record.storage_prefix(),
             root: root.clone(), bucket: self.storage.bucket(Arc::clone(&io)).await?,
-            io, storage: self.storage.clone(), keys: Arc::clone(&self.keys),
+            io: Arc::clone(&io), storage: self.storage.clone(), keys: Arc::clone(&self.keys),
         };
         let upper: Arc<dyn ObjectStore> = if hold.start == hold.through && route.writer.grant.is_none() {
             Arc::new(rtdb_storage::MemoryStore::default())
@@ -302,6 +307,7 @@ impl StoreFactory {
         };
         let store = Arc::new(ServingStore {
             lower, upper, writer: None, reader: Some(ServingReader { scope, objects }),
+            snapshot: Some(snapshot::Source { placement, keys: Arc::clone(&self.keys), io, tasks: self.releases.clone() }),
         });
         Ok(OpenedRecoveryStore { store, blocks, audience: None, checkpoint_metadata: None, fragment_storage: None, publication_sealing: None })
     }
@@ -335,6 +341,7 @@ pub(super) fn serving_ledger(
     UnitLedger::new(keys, UnitScope::new(installed, b"serving", &residence), io)
 }
 
+#[derive(Clone)]
 pub(super) struct ReplicaObjects {
     installed: Placement,
     storage_prefix: String,
@@ -472,13 +479,14 @@ pub(super) async fn reopen_source(
     let lower = if genesis(origin.base) {
         None
     } else {
-        Some(custody.open(origin.base).await?.store)
+        Some(custody.open(origin.base).await?.store as Arc<dyn ObjectStore>)
     };
     Ok(Arc::new(ServingStore {
         lower,
         upper,
         writer: None,
         reader: None,
+        snapshot: None,
     }))
 }
 
@@ -489,6 +497,7 @@ struct ServingStore {
     upper: Arc<dyn ObjectStore>,
     writer: Option<ServingWriter>,
     reader: Option<ServingReader>,
+    snapshot: Option<snapshot::Source>,
 }
 
 struct ServingReader {
@@ -571,6 +580,26 @@ where
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    async fn open_log_snapshot(
+        &self, authority: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        let source = self.snapshot.as_ref().ok_or_else(|| invalid("This serving store has no snapshot owner"))?;
+        let files = authority.downcast::<crate::journal::log::SnapshotFiles>()
+            .map_err(|_| invalid("The exact snapshot hold belongs to a different provider"))?;
+        let objects = self.writer.as_ref().map(|writer| &writer.replica_objects)
+            .or_else(|| self.reader.as_ref().map(|reader| &reader.objects))
+            .ok_or_else(|| invalid("The exact snapshot has no serving namespace"))?;
+        source.open(files, objects.clone(), Arc::clone(&self.upper)).await
+    }
+
+    async fn retain_anchored_catalog(
+        &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint,
+        _paths: Option<Arc<[String]>>,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let source = self.snapshot.as_ref().ok_or_else(|| invalid("This serving store has no snapshot owner"))?;
+        source.retain(cut, base).await.map(|hold| Some(hold as Arc<dyn Send + Sync>))
+    }
+
     async fn replica_publication_address(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<(rtdb_types::S3ObjectNamespace, String)>> {
         self.read(key, |store| store.replica_publication_address(key)).await
     }

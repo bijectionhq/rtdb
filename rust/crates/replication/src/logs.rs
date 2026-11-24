@@ -165,10 +165,15 @@ impl PartitionLogs {
         self.replica.range(from, to).await.map_err(Into::into)
     }
     pub(crate) async fn protected_snapshot_range(
-        &self, start: ReplicaPosition, end: ReplicaPosition,
-    ) -> Result<rtdb_storage::log::ProtectedLogRange> {
-        let (from, to) = inspection_offsets(start.0, end.0, self.replica_epoch)?;
-        self.replica.protect_range(from, to).await.map_err(Into::into)
+        &self, after: ReplicaPosition, through: ReplicaPosition, root: [u8; 32],
+    ) -> Result<rtdb_storage::log::ProtectedLogSnapshot> {
+        if after > through { return Err(Anomaly::fault("rtdb.replication/snapshot-range", "The snapshot suffix ends before its checkpoint")); }
+        let inclusive = after.0.checked_add(1).ok_or_else(size_overflow)?;
+        let exclusive = through.0.checked_add(1).ok_or_else(size_overflow)?;
+        let base = ReplicaPosition::from_epoch_offset(self.replica_epoch, 0)?.0;
+        let relative = |position: i64| position.checked_sub(base)
+            .filter(|offset| (0..=(1i64 << 48)).contains(offset)).map(LogOffset).ok_or_else(size_overflow);
+        self.replica.protect_snapshot(relative(inclusive)?, relative(exclusive)?, root).await.map_err(Into::into)
     }
 
     pub fn validate_source_boundary(&self, database: &str, after: SourcePosition) -> Result<()> {

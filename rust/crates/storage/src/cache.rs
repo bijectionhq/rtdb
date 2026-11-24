@@ -230,6 +230,7 @@ pub struct HeldCatalogRead {
     cut: Option<rtdb_types::CatalogCut>,
     registration: Option<Arc<dyn Send + Sync>>,
     catalog_file_paths: Option<Arc<[String]>>,
+    exact: bool,
 }
 
 impl HeldCatalogRead {
@@ -239,7 +240,7 @@ impl HeldCatalogRead {
         match (self.cut, cut) {
             (Some(held), Some(cut)) => held.storage_version == cut.storage_version
                 && held.storage_epoch == cut.storage_epoch && held.replica_epoch == cut.replica_epoch
-                && held.through <= cut.through,
+                && if self.exact { held.through == cut.through } else { held.through <= cut.through },
             (None, None) => true,
             _ => false,
         }
@@ -332,11 +333,25 @@ impl BufferPool {
             Some(paths) => self.store.retain_catalog_with_paths(cut, Arc::clone(paths)).await?,
             None => self.store.retain_catalog(cut).await?,
         };
+        self.finish_catalog_hold(cut, paths, registration, false)
+    }
+
+    pub async fn hold_anchored_catalog(
+        &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint, paths: Option<Arc<[String]>>,
+    ) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        let registration = self.store.retain_anchored_catalog(cut, base, paths.clone()).await?;
+        self.finish_catalog_hold(Some(cut), paths, registration, true)
+    }
+
+    fn finish_catalog_hold(
+        &self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>,
+        registration: Option<Arc<dyn Send + Sync>>, exact: bool,
+    ) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
         if self.store.defers_trie_releases() && registration.is_none() {
             return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-not-held",
                 "The coordinated storage provider returned no catalog hold"));
         }
-        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths }))
+        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths, exact }))
     }
 
     /// Re-admit the same scope through the current owner. The old cohort retains
