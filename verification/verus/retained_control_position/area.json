@@ -1,0 +1,19 @@
+{
+  "summary": "Retained hosted control queries admit exactly the original transaction position without widening the captured or inherited cutoff.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 3,
+  "controls": {
+    "raise_inherited_position": {
+      "defect": "A held position can move to a later event in the same SQL time band.",
+      "mutate": [{"file": "rust/crates/query/src/settings/retained_position.rs", "find": "        if requested > prior {", "replace": "        if requested > prior && requested == captured {"}],
+      "expect": [{"file": "rust/crates/query/src/settings/retained_position.rs", "function": "admit", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 2
+    },
+    "present_head_instead_of_requested": {
+      "defect": "The captured head replaces the historical publication requested by the caller.",
+      "mutate": [{"file": "rust/crates/query/src/settings/retained_position.rs", "find": "    Some(requested)\n}", "replace": "    Some(captured)\n}"}],
+      "expect": [{"file": "rust/crates/query/src/settings/retained_position.rs", "function": "admit", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 2
+    }
+  }
+}
