@@ -74,7 +74,7 @@ async fn log_property_file_requires_admission_before_client_creation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_driver() {
+async fn shared_log_kafka_durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_driver() {
     let cluster = MockCluster::new(1).unwrap();
     cluster.create_topic("log", 1, 1).unwrap();
     let configuration = KafkaClusterConfig::new(cluster.bootstrap_servers());
@@ -84,11 +84,13 @@ async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_d
     let cancellation = CancellationToken::new();
     let driver = tokio::spawn(opened.driver.unwrap().run(cancellation.clone()));
     let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 * 1000;
-    let first = opened.log.enqueue(Bytes::from_static(b"first"), Timestamp(42)).await.unwrap().durable().await.unwrap();
-    let second = opened.log.enqueue(Bytes::from_static(b"second"), Timestamp(43)).await.unwrap().durable().await.unwrap();
+    let shared: &dyn rtdb_storage::log::SharedLog = opened.log.as_ref();
+    assert_eq!(shared.latest().unwrap(), LogOffset(-1));
+    let first = shared.append(Bytes::from_static(b"first"), Timestamp(42)).await.unwrap().durable().await.unwrap();
+    let second = shared.append(Bytes::from_static(b"second"), Timestamp(43)).await.unwrap().durable().await.unwrap();
     assert_eq!(first.offset, LogOffset(0));
     assert_eq!(second.offset, LogOffset(1));
-    assert_eq!(opened.log.latest().unwrap(), second.offset);
+    assert_eq!(shared.latest().unwrap(), second.offset);
     assert_eq!(first.timestamp.0 % 1000, 0);
     options.read_only = true;
     let reader = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
@@ -108,6 +110,13 @@ async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_d
     let bound = range.allocation_bound();
     assert_eq!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().unwrap().metadata, records[0].metadata);
     assert!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().is_none());
+    let shared_reader: &dyn rtdb_storage::log::SharedLog = reader.log.as_ref();
+    let mut cursor = shared_reader.read_after(first.offset).await.unwrap();
+    let head = cursor.poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+    assert_eq!(head.metadata, records[1].metadata);
+    let record = cursor.read_head(head, ReadReservation::new(head.allocation_bound, ())).await.unwrap();
+    assert_eq!(record.payload, Bytes::from_static(b"second"));
+    assert_eq!(cursor.poll_head(Duration::from_millis(20)).await.unwrap(), None);
     let mut tail = reader.log.tail(second.offset).await.unwrap();
     assert!(tail.poll(Duration::from_millis(20)).await.unwrap().is_empty());
     cancellation.cancel();

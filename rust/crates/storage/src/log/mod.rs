@@ -197,6 +197,21 @@ pub struct ReplicaReferenceSource {
     pub file_size_target: i64,
 }
 
+/// The ordered source and replica log port for the default log processor.
+#[async_trait]
+pub trait SharedLog: Send + Sync {
+    /// Accepts one record and fixes its append order.
+    /// The receipt reports the durable position and the provider's recorded timestamp.
+    async fn append(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
+
+    /// Observes the latest durable record position, or the start sentinel for an empty log.
+    fn latest(&self) -> Result<LogOffset>;
+
+    /// Opens ordered replay strictly after a record position or the start sentinel.
+    /// Replay reports a missing retained prefix as an error.
+    async fn read_after(&self, after: LogOffset) -> Result<Box<dyn LogReplayTail>>;
+}
+
 #[async_trait]
 pub trait Log: Send + Sync {
     fn needs_published_recovery_checkpoint(&self) -> bool { false }

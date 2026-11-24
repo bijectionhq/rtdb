@@ -2,7 +2,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::time::Duration;
 use bytes::Bytes;
-use rtdb_storage::{Error, log::{Log, LogMetadata, LogOffset, LogRecord, LocalLog, LocalLogOptions, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}, object_store::ReadReservation};
+use rtdb_storage::{Error, log::{Log, LogMetadata, LogOffset, LogRecord, LocalLog, LocalLogOptions, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions, SharedLog}, object_store::ReadReservation};
 use rtdb_types::{MemoryBudget, Timestamp};
 use tokio_util::sync::CancellationToken;
 
@@ -14,16 +14,18 @@ fn reserve(size: usize, live: &Arc<AtomicUsize>) -> ReadReservation {
 }
 
 #[tokio::test]
-async fn local_replay_charges_the_actual_frame_and_keeps_a_refused_head_available() {
+async fn shared_log_local_replay_charges_the_actual_frame_and_keeps_a_refused_head_available() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("LOG");
     let (log, driver) = LocalLog::open(&path, LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 4 }).unwrap();
     let cancellation = CancellationToken::new();
     let writer = tokio::spawn(driver.run(cancellation.clone()));
-    let first = log.enqueue(Bytes::from_static(b"first"), Timestamp(5)).await.unwrap().durable().await.unwrap();
-    let second = log.enqueue(Bytes::from_static(b""), Timestamp(9)).await.unwrap().durable().await.unwrap();
-    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
-    let replay = tail.replay().unwrap();
+    let shared: &dyn SharedLog = log.as_ref();
+    assert_eq!(shared.latest().unwrap(), LogOffset(-1));
+    let first = shared.append(Bytes::from_static(b"first"), Timestamp(5)).await.unwrap().durable().await.unwrap();
+    let second = shared.append(Bytes::from_static(b""), Timestamp(9)).await.unwrap().durable().await.unwrap();
+    assert_eq!(shared.latest().unwrap(), second.offset);
+    let mut replay = shared.read_after(LogOffset(-1)).await.unwrap();
     let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
     assert_eq!(head.metadata, first);
     assert_eq!(head.payload_len, 5);
@@ -45,7 +47,9 @@ async fn local_replay_charges_the_actual_frame_and_keeps_a_refused_head_availabl
     drop(clone);
     assert_eq!(memory.used_bytes(), 0);
 
+    let mut resumed = shared.read_after(first.offset).await.unwrap();
     let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(resumed.poll_head(Duration::ZERO).await.unwrap(), Some(head));
     assert_eq!(head.metadata, second);
     assert_eq!(second.offset, LogOffset(26));
     assert_eq!(head.allocation_bound, 256);
@@ -70,7 +74,7 @@ async fn local_replay_charges_the_actual_frame_and_keeps_a_refused_head_availabl
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
 
-    let third = log.enqueue(Bytes::from_static(b"third"), Timestamp(10)).await.unwrap().durable().await.unwrap();
+    let third = shared.append(Bytes::from_static(b"third"), Timestamp(10)).await.unwrap().durable().await.unwrap();
     let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
     assert_eq!(head.metadata, third);
     cancellation.cancel();
