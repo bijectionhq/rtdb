@@ -385,6 +385,7 @@ rule RepairUnreadableSearchFile {
 -- A sparse logical conjunction expands the rarest required term's posting directory first and intersects occurrences before reading phrase positions.
 -- Term lookups can share a validated directory traversal while retaining the requested positions of both repeated and missing terms.
 -- A logical run merge reads bounded document and token page pairs and retains the surviving witnesses under the merged erase frontier.
+-- The merge compacts sparse surviving token slices before releasing their source page.
 -- Batched term routing uses one passage through each reached directory page and propagates a failed page read.
 -- Dense posting runs expand score-bounded windows in priority order.
 -- A missing or unreadable term directory schedules repair and uses each run's authenticated locator for term membership.

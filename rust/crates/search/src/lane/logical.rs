@@ -96,19 +96,51 @@ fn scrub_documents(documents: &mut Vec<LogicalDocument>, erases: &Erases) -> boo
 
 fn keep_merge_document(
     documents: &mut BTreeMap<(Iid, usize, TextRevision), LogicalDocument>, erases: &Erases, document: LogicalDocument,
-) -> Result<()> {
+) -> Result<Option<(Iid, usize, TextRevision)>> {
     use std::collections::btree_map::Entry;
 
     if erases.get(&document.iid).is_some_and(|erase| document.position < *erase) {
-        return Ok(());
+        return Ok(None);
     }
-    match documents.entry((document.iid, document.field, document.revision)) {
+    let key = (document.iid, document.field, document.revision);
+    match documents.entry(key) {
         Entry::Vacant(entry) => { entry.insert(document); },
         Entry::Occupied(mut entry) => {
             let prior = entry.get();
             require_matching_revision(prior, &document)?;
-            if document.position > prior.position { entry.insert(document); }
+            if document.position <= prior.position { return Ok(None); }
+            entry.insert(document);
         },
+    }
+    Ok(Some(key))
+}
+
+fn keep_merge_page(
+    documents: &mut BTreeMap<(Iid, usize, TextRevision), LogicalDocument>, erases: &Erases,
+    page: &mut dyn ExactSizeIterator<Item = Result<LogicalDocument>>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let token_bytes = |doc: &LogicalDocument| {
+        let offsets = doc.tokens.value_offsets();
+        (offsets[doc.tokens.len()] - offsets[0]) as usize + doc.tokens.len() * size_of::<i32>()
+    };
+    let mut page_bytes = 0usize;
+    let mut selected = Vec::with_capacity(page.len());
+    for document in page {
+        let document = document?;
+        if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+        page_bytes = page_bytes.saturating_add(token_bytes(&document));
+        if let Some(key) = keep_merge_document(documents, erases, document)? { selected.push(key); }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    let retained = selected.iter().map(|key| token_bytes(&documents[key])).sum::<usize>();
+    // A sparse winner must not pin the token buffer for all discarded rows.
+    if retained.saturating_mul(2) < page_bytes {
+        for key in selected {
+            let document = documents.get_mut(&key).expect("admitted revision");
+            document.tokens = document.tokens.iter().collect();
+        }
     }
     Ok(())
 }
@@ -881,10 +913,7 @@ impl SearchBuilder {
         }
         let mut documents = BTreeMap::new();
         for file in files {
-            file.visit_documents(|document| {
-                if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
-                keep_merge_document(&mut documents, &contents.erases, document)
-            }).await?;
+            file.visit_document_pages(|page| keep_merge_page(&mut documents, &contents.erases, page, cancellation)).await?;
         }
         contents.documents = documents.into_values().collect();
         let receipt = inputs[0].source_receipt.clone().map(|mut receipt| {
@@ -1028,15 +1057,42 @@ mod tests {
         };
         let erases = BTreeMap::from([(iid, (Timestamp(2), None, 0))]);
         let mut documents = BTreeMap::new();
-        keep_merge_document(&mut documents, &erases, doc(1, "erased"))?;
+        let _ = keep_merge_document(&mut documents, &erases, doc(1, "erased"))?;
         assert!(documents.is_empty());
-        keep_merge_document(&mut documents, &erases, doc(2, "survives"))?;
-        keep_merge_document(&mut documents, &erases, doc(4, "survives"))?;
-        keep_merge_document(&mut documents, &erases, doc(3, "survives"))?;
+        let _ = keep_merge_document(&mut documents, &erases, doc(2, "survives"))?;
+        let _ = keep_merge_document(&mut documents, &erases, doc(4, "survives"))?;
+        let _ = keep_merge_document(&mut documents, &erases, doc(3, "survives"))?;
         assert_eq!(documents.len(), 1);
         assert_eq!(documents[&(iid, 0, revision)].position.0, Timestamp(4));
         assert!(keep_merge_document(&mut documents, &erases, doc(5, "conflict")).is_err());
         assert_eq!(documents[&(iid, 0, revision)].position.0, Timestamp(4));
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_merge_detaches_tokens_and_dense_merge_retains_the_page() -> Result<()> {
+        let large = "x".repeat(16_384);
+        let tokens = arrow_array::StringArray::from(vec!["kept", large.as_str()]);
+        let source = tokens.values().as_ptr();
+        let page = || (0..2).map(|row| {
+            let id = row as u8 + 1;
+            Ok(LogicalDocument {
+                iid: Iid([id; 16]), sql_id: None, field: 0, revision: [id; 32],
+                position: (Timestamp(1), None, 0), tokens: tokens.slice(row, 1),
+            })
+        });
+        let token = CancellationToken::new();
+        let mut documents = BTreeMap::new();
+        let erases = BTreeMap::from([(Iid([2; 16]), (Timestamp(2), None, 0))]);
+        keep_merge_page(&mut documents, &erases, &mut page(), &token)?;
+        assert_eq!(documents.len(), 1);
+        let selected = &documents[&(Iid([1; 16]), 0, [1; 32])].tokens;
+        assert_ne!(selected.values().as_ptr(), source);
+        assert_eq!(selected.value(0), "kept");
+        documents.clear();
+        keep_merge_page(&mut documents, &BTreeMap::new(), &mut page(), &token)?;
+        assert_eq!(documents.len(), 2);
+        assert!(documents.values().all(|document| document.tokens.values().as_ptr() == source));
         Ok(())
     }
 

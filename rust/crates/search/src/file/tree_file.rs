@@ -788,11 +788,16 @@ impl TreeFile {
 
     pub(crate) async fn documents(&self) -> Result<Vec<LogicalDocument>> {
         let mut documents = Vec::new();
-        self.visit_documents(|document| { documents.push(document); Ok(()) }).await?;
+        self.visit_document_pages(|page| {
+            for document in page { documents.push(document?); }
+            Ok(())
+        }).await?;
         Ok(documents)
     }
 
-    pub(crate) async fn visit_documents(&self, mut visit: impl FnMut(LogicalDocument) -> Result<()> + Send) -> Result<()> {
+    pub(crate) async fn visit_document_pages(
+        &self, mut visit: impl FnMut(&mut dyn ExactSizeIterator<Item = Result<LogicalDocument>>) -> Result<()> + Send,
+    ) -> Result<()> {
         use rtdb_columnar::EntityIdRef;
         if self.format != LOGICAL_FORMAT_VERSION { return Err(corrupt("Expected a logical search run")); }
         let records = self.reader.leaves(self.directories[&DOCUMENT]).await?;
@@ -809,17 +814,18 @@ impl TreeFile {
             let fields = sequences.column(0).as_primitive::<UInt32Type>();
             let revisions = sequences.column(1).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search revision layout");
             let tokens = sequences.column(2).as_list::<i64>();
-            for row in 0..sequences.len() {
+            let mut documents = (0..sequences.len()).map(|row| {
                 let sql_id = if ids.is_valid(row) {
                     match EntityIdRef::from_handle_bytes(ids.value(row))? { EntityIdRef::Integer(id) => Some(id), _ => None }
                 } else { None };
-                visit(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
+                Ok(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
                     field: fields.value(row) as usize, revision: revisions.value(row).try_into().map_err(fault)?,
                     tokens: tokens.value(row).as_string::<i32>().clone(),
                     position: (Timestamp(sequences.column(3).as_primitive::<Int64Type>().value(row)),
                         super::read_event_position(sequences.column(5).as_ref(), row),
-                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) })?;
-            }
+                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) })
+            });
+            visit(&mut documents)?;
         }
         Ok(())
     }
