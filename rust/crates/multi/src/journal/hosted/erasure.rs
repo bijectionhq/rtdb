@@ -6,11 +6,14 @@ use ordered_logkeeper::ordered::{
     Request, RequestId,
     service::wire::{Decision, SignedRotationSlots},
 };
+use rtdb_storage::ObjectStore;
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
 use crate::journal::{
-    Authority, InstalledJournal, WriterAdmission, custody::CheckpointCustody, refused,
+    Authority, InstalledJournal, WriterAdmission,
+    custody::{CheckpointAuthority, CheckpointCustody, ErasureBinding, Preparation, Reservation},
+    refused,
 };
 use crate::keys::{JournalKey, KeyService};
 
@@ -34,6 +37,18 @@ pub struct PreparedErasure {
     pub erasure: Erasure,
     pub checkpoint: Checkpoint,
     pub rotation: RequestId,
+}
+
+fn binding(erasure: Erasure, rotation: RequestId) -> ErasureBinding {
+    ErasureBinding {
+        operation: erasure.operation,
+        custody_domain: erasure.custody_domain,
+        rotation,
+        fixed_before_ms: match erasure.timing {
+            ErasureTiming::Fixed { before_ms } => Some(before_ms),
+            ErasureTiming::OperationalTarget => None,
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,11 +179,65 @@ impl<'a> ErasureCoordinator<'a> {
         Ok(self)
     }
 
-    pub async fn commit(
+    /// Materializes an already rewritten SQL survivor closure in the protected
+    /// provider allocation. Its catalog must describe the exact quiesced head.
+    pub async fn stage_survivor(
         &self,
-        custody: &dyn ErasureCustody,
         erasure: Erasure,
-    ) -> Result<ErasureCommit> {
+        rotation: RequestId,
+        reservation: Reservation,
+        checkpoint: rtdb_directory::Checkpoint,
+        source: &dyn ObjectStore,
+    ) -> Result<PreparedErasure> {
+        self.require_incumbent(erasure)?;
+        let route = self.custodian.route().await?;
+        if route.writer.grant != Some(erasure.incumbent)
+            || rotation.nonce.is_nil()
+            || rotation.expires_at <= route.position.saturating_add(1)
+            || route.head.next_lsn <= route.checkpoint.cut.next_lsn
+            || reservation.custody.allocation == route.checkpoint.custody.allocation
+            || checkpoint.root_sha256 == Some(route.checkpoint.root)
+        {
+            return Err(invalid(
+                "Erasure staging needs a new root and custody at the exact incumbent head",
+            ));
+        }
+        let origin = Preparation {
+            authority: CheckpointAuthority::Erasure(binding(erasure, rotation)),
+            writer: erasure.incumbent,
+            base: route.checkpoint,
+            through: route.head,
+            checkpoint,
+        };
+        let preparation = origin.ordered(reservation)?;
+        match route.preparing {
+            Some(chosen) if chosen == preparation => (),
+            Some(_) => return Err(invalid("The journal is preparing another checkpoint")),
+            None => {
+                let references = self
+                    .provider
+                    .preflight(&reservation, origin, source)
+                    .await?;
+                self.custodian
+                    .prepare_checkpoint(&route, preparation, references)
+                    .await?;
+            }
+        }
+        self.provider.begin(&reservation, origin).await?;
+        let checkpoint = match self.provider.prepared(reservation, origin).await? {
+            Some(checkpoint) => checkpoint,
+            None => self.provider.prepare(&reservation, origin, source).await?,
+        };
+        let prepared = PreparedErasure {
+            erasure,
+            checkpoint,
+            rotation,
+        };
+        self.reopen(prepared).await?;
+        Ok(prepared)
+    }
+
+    fn require_incumbent(&self, erasure: Erasure) -> Result<()> {
         if erasure.placement != self.worker.placement()
             || !matches!(self.worker.authority(), Authority::Worker { enrollment } if enrollment == erasure.incumbent.enrollment)
         {
@@ -176,6 +245,26 @@ impl<'a> ErasureCoordinator<'a> {
                 "Erasure must address the installed credential of the incumbent",
             ));
         }
+        if erasure.operation.is_nil()
+            || erasure.custody_domain.is_nil()
+            || erasure.timing == (ErasureTiming::Fixed { before_ms: 0 })
+        {
+            return Err(invalid(
+                "Erasure requires an exact operation, custody domain and timing profile",
+            ));
+        }
+        if matches!(erasure.timing, ErasureTiming::Fixed { .. }) && self.authority.is_none() {
+            return Err(evidence::authority_unavailable());
+        }
+        Ok(())
+    }
+
+    pub async fn commit(
+        &self,
+        custody: &dyn ErasureCustody,
+        erasure: Erasure,
+    ) -> Result<ErasureCommit> {
+        self.require_incumbent(erasure)?;
         coordinate(self, self.keys, custody, erasure, self.authority.as_ref()).await
     }
 
@@ -212,7 +301,7 @@ struct Selection {
 #[async_trait]
 trait ErasureJournal: Sync {
     async fn selection(&self) -> Result<Selection>;
-    async fn reopen(&self, checkpoint: Checkpoint) -> Result<()>;
+    async fn reopen(&self, prepared: PreparedErasure) -> Result<()>;
     async fn execute(&self, request: &Request) -> Result<Decision>;
 }
 
@@ -228,8 +317,14 @@ impl ErasureJournal for ErasureCoordinator<'_> {
         })
     }
 
-    async fn reopen(&self, checkpoint: Checkpoint) -> Result<()> {
-        self.provider.open(checkpoint).await?;
+    async fn reopen(&self, prepared: PreparedErasure) -> Result<()> {
+        if self.provider.open(prepared.checkpoint).await?.authority
+            != CheckpointAuthority::Erasure(binding(prepared.erasure, prepared.rotation))
+        {
+            return Err(invalid(
+                "The provider checkpoint belongs to a different erasure attempt",
+            ));
+        }
         Ok(())
     }
 
@@ -291,6 +386,7 @@ async fn coordinate(
                 "The clean checkpoint is outside the quiesced journal head",
             ));
         }
+        let descriptor = binding(erasure, prepared.rotation).descriptor()?;
         if !selected.preparing.is_some_and(|entry| {
             entry.erasure
                 && entry.source == old
@@ -298,13 +394,14 @@ async fn coordinate(
                 && entry.checkpoint == checkpoint.cut
                 && entry.root == checkpoint.root
                 && entry.custody == checkpoint.custody
+                && entry.descriptor == descriptor
         }) {
             return Err(invalid(
                 "The clean checkpoint lacks its exact ordered erasure preparation",
             ));
         }
     }
-    journal.reopen(checkpoint).await?;
+    journal.reopen(prepared).await?;
     let deadline = match erasure.timing {
         ErasureTiming::OperationalTarget => None,
         ErasureTiming::Fixed { before_ms } => {

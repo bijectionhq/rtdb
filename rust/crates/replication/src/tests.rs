@@ -566,6 +566,31 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
 }
 
 #[tokio::test]
+async fn an_erasure_checkpoint_recovers_without_an_upload_confirmation() {
+    use rtdb_format::{catalog::BlockCatalog, keys::block_key};
+    use rtdb_storage::ObjectKey;
+
+    let fixture = produced_memory_checkpoint(true).await;
+    let root_key = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
+    let root = BlockCatalog::decode(&fixture.store.get(&root_key).await.unwrap()).unwrap();
+    let published = PublishedCheckpoint {
+        block: root.block_index(),
+        boundary: root.boundary_replica_position().unwrap(),
+        root_sha256: root.publication_sha256(),
+    };
+    let native = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::AtPublished(published)).await.unwrap();
+    assert!(native.confirmation(StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), &fixture.memory).unwrap().is_some());
+    let survivor = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::AtErasure(published)).await.unwrap();
+    assert!(survivor.confirmation(StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0), &fixture.memory).unwrap().is_none());
+    assert_eq!(survivor.block.as_ref().unwrap().boundary_replica_position(), Some(published.boundary));
+    let wrong = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0),
+        BlockDiscovery::AtErasure(PublishedCheckpoint { root_sha256: None, ..published })).await;
+    assert!(wrong.is_err());
+}
+
+#[tokio::test]
 async fn hosted_checkpoint_recovery_preserves_its_admitted_journal_boundary() {
     use rtdb_format::{block::proto::Block, catalog::BlockCatalog, keys::block_key};
     use rtdb_storage::ObjectKey;

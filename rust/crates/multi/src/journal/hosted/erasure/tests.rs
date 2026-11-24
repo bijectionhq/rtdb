@@ -223,7 +223,7 @@ impl ErasureJournal for CustodyFixture {
         })
     }
 
-    async fn reopen(&self, _: Checkpoint) -> Result<()> {
+    async fn reopen(&self, _: PreparedErasure) -> Result<()> {
         let mut journal = self.journal.lock().unwrap();
         if std::mem::take(&mut journal.append_before_switch) {
             let incumbent = journal.preparing.unwrap().source;
@@ -330,6 +330,7 @@ impl ErasureCustody for CustodyFixture {
                 provider: [4; 32],
             },
         };
+        let rotation = RequestId::fresh(journal.state.position(), RETRY_POSITIONS).unwrap();
         let preparation = CheckpointPreparation {
             erasure: true,
             checkpoint: cut,
@@ -338,7 +339,7 @@ impl ErasureCustody for CustodyFixture {
             base,
             custody: checkpoint.custody,
             usable_bytes: 64,
-            descriptor: [5; 32],
+            descriptor: binding(erasure, rotation).descriptor()?,
         };
         if !self.use_boundary {
             assert_eq!(
@@ -358,7 +359,7 @@ impl ErasureCustody for CustodyFixture {
         let prepared = PreparedErasure {
             erasure,
             checkpoint,
-            rotation: RequestId::fresh(journal.state.position(), RETRY_POSITIONS).unwrap(),
+            rotation,
         };
         *attempt = Some(ErasureProgress::Prepared(prepared));
         Ok(ErasureProgress::Prepared(prepared))
@@ -471,6 +472,27 @@ async fn an_ordinary_boundary_cut_and_a_racing_append_prevent_the_switch() -> Re
     assert_eq!(
         journal.state.writer_state().grant,
         Some(racing.erasure.incumbent)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_different_rotation_identity_cannot_adopt_the_ordered_survivor() -> Result<()> {
+    let mut fixture = Fixture::new().await?;
+    let ErasureProgress::Prepared(mut prepared) = fixture.custody.prepare(fixture.erasure).await?
+    else {
+        panic!("expected a new erasure attempt");
+    };
+    prepared.rotation.nonce = Uuid::new_v4();
+    *fixture.custody.attempt.get_mut().unwrap() = Some(ErasureProgress::Prepared(prepared));
+    assert_eq!(
+        fixture.commit().await.unwrap_err().code,
+        "rtdb.multi/erasure-custody"
+    );
+    let journal = fixture.custody.journal.get_mut().unwrap();
+    assert_eq!(
+        journal.state.writer_state().grant,
+        Some(fixture.erasure.incumbent)
     );
     Ok(())
 }

@@ -365,9 +365,10 @@ impl DatabaseFactory {
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
             if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
                 && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
-                    || resources.blocks != rtdb_replication::BlockDiscovery::AtPublished(rtdb_replication::PublishedCheckpoint {
-                        block: *block, boundary: *through, root_sha256: Some(*root),
-                    })
+                    || !matches!(resources.blocks,
+                        rtdb_replication::BlockDiscovery::AtPublished(checkpoint)
+                        | rtdb_replication::BlockDiscovery::AtErasure(checkpoint)
+                        if checkpoint.block == *block && checkpoint.boundary == *through && checkpoint.root_sha256 == Some(*root))
                     || !recovered.block.as_ref().is_some_and(|loaded| loaded.block_index() == *block
                         && loaded.boundary_replica_position() == Some(*through) && loaded.publication_sha256() == Some(*root)))
             {

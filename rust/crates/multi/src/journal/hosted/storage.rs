@@ -4,7 +4,7 @@ use super::{Attachment, AttachmentAdmission, Routes, genesis, invalid};
 use crate::deployment::CellStorage;
 use crate::journal::{
     InstalledJournal,
-    custody::{CheckpointCustody, Preparation},
+    custody::{CheckpointAuthority, CheckpointCustody, Preparation},
 };
 use crate::keys::{KeyService, UnitLedger, UnitScope};
 use crate::store::{EncryptingStore, ScopedCellWrites};
@@ -264,7 +264,11 @@ impl StoreFactory {
                 )?,
                 root_sha256: checkpoint.root_sha256,
             };
-            (Some(opened.store), BlockDiscovery::AtPublished(published))
+            let discovery = match opened.authority {
+                CheckpointAuthority::Upload => BlockDiscovery::AtPublished(published),
+                CheckpointAuthority::Erasure(_) => BlockDiscovery::AtErasure(published),
+            };
+            (Some(opened.store), discovery)
         };
         Ok((lower, blocks))
     }

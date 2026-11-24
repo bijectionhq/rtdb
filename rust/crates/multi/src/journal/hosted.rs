@@ -8,7 +8,7 @@ mod storage;
 
 use super::{
     Authority, Held, InstalledJournal, InstalledRoute, JournalLog, WriterAdmission,
-    custody::{CheckpointCustody, Preparation, Reservation},
+    custody::{CheckpointAuthority, CheckpointCustody, Preparation, Reservation},
 };
 use crate::keys::{JournalKey, KeyService};
 use async_trait::async_trait;
@@ -472,6 +472,7 @@ impl Placement {
             let origin = match (current.preparing, requested) {
                 (Some(chosen), _) => Preparation::recover(chosen, reservation)?,
                 (None, Some((admission, checkpoint, next))) => Preparation {
+                    authority: CheckpointAuthority::Upload,
                     writer: admission.grant,
                     base: admission.recovery.checkpoint,
                     through: custodian.checkpoint_cut(next).await?,
