@@ -1,0 +1,30 @@
+{
+  "summary": "The installed Flight prefix carries the exact stamp, incarnation and writer grant and both binding and ordered comparison preserve their identities.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 13,
+  "controls": {
+    "substitute_prefix_grant": {
+      "defect": "Decode the incarnation bytes a second time in place of the wire's writer grant.",
+      "mutate": [
+        { "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "find": "    fields.2@ == bytes@.subrange(24, 40),", "replace": "    fields.2@ == bytes@.subrange(8, 24)," },
+        { "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "find": "writer@[j] == bytes@[24 + j]", "replace": "writer@[j] == bytes@[8 + j]" },
+        { "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "find": "        writer[i] = bytes[24 + i];", "replace": "        writer[i] = bytes[8 + i];" },
+        { "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "find": "assert(writer@ =~= bytes@.subrange(24, 40));", "replace": "assert(writer@ =~= bytes@.subrange(8, 24));" }
+      ],
+      "expect": [{ "file": "verification/verus/installed_authority_wire/laws.rs", "function": "decoded_wire_fields_are_original", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 12
+    },
+    "bind_other_revision": {
+      "defect": "Bind any supplied revision to the proof.",
+      "mutate": [{ "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "find": "    expected == Some(visible)\n}", "replace": "    expected.is_some()\n}" }],
+      "expect": [{ "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "function": "revision_matches", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 12
+    },
+    "accept_another_grant": {
+      "defect": "The ordered comparison permits a different installed writer grant at the selected revision.",
+      "mutate": [{ "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "find": "        && writer_matches(writer, observed_writer)", "replace": "" }],
+      "expect": [{ "file": "rust/crates/tx/src/hosted_control/authority_wire.rs", "function": "identity_matches", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 12
+    }
+  }
+}

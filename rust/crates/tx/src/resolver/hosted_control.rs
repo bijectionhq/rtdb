@@ -190,7 +190,7 @@ impl OpenTransaction<'_> {
             Arc::clone(&context), authority.table(), authority.id(), true,
         ).await?;
         let (row, revision) = point.row.ok_or_else(stale)?;
-        if Some(revision) != authority.expected() { return Err(stale()); }
+        if !proof.matches_revision(Some(revision)) { return Err(stale()); }
         let row = row.batch();
         let field = |name| {
             let (index, field) = row.schema_ref().column_with_name(name).ok_or_else(stale)?;
@@ -199,7 +199,7 @@ impl OpenTransaction<'_> {
         let (Value::Utf8(kind), Value::Binary(incarnation), Value::Utf8(writer)) =
             (field("kind")?, field("incarnation")?, field("writer")?)
         else { return Err(stale()); };
-        if !matches!(kind.as_str(), "hosted" | "standalone") || !proof.matches(&incarnation, &writer) {
+        if !proof.matches(&kind, &incarnation, &writer) {
             return Err(stale());
         }
 
