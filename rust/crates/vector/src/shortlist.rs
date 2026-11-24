@@ -8,7 +8,7 @@ use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EncodedEvent, EventBatch}, ipc::{ArrowFile, inspect_file_reserved}};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
-use rtdb_query::IidScope;
+use rtdb_query::{IidScope, visit_projected_data_events};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TemporalBounds};
 use tokio_util::sync::CancellationToken;
@@ -187,20 +187,35 @@ impl FrontierRanker<'_> {
         let definition = self.definition;
         for source in sources {
             let Source::Frontier { data } = source else { continue };
-            let lease = cut.storage.get_or(data, cut.memory).await?;
-            let (mut reader, _metadata) = open_frontier_file(Bytes::from_owner(lease), cut.memory)?;
             let columns = definition.put_columns();
-            for page in 0..reader.page_count() {
-                if cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
-                let _page = cut.memory.reserve(reader.page_allocation_bound(page)?)?;
-                let events = EventBatch::new(reader.read_event_page(page, &columns)?)?;
-                self.rank_batch(&events)?;
-            }
+            self.rank_file(cut, data, &columns).await?;
         }
         for segment in cut.snapshot.iter_segments(&definition.table) {
             for batch in segment.batches() {
                 self.rank_batch(batch.view())?;
             }
+        }
+        Ok(())
+    }
+
+    async fn rank_file(&mut self, cut: Cut<'_>, data: &ObjectKey, columns: &[String]) -> Result<()> {
+        let check_cancelled = || {
+            if cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
+            Ok(())
+        };
+        if cut.storage.object_store().supports_scan_ranges(data) {
+            let visit = visit_projected_data_events(cut.storage, data, cut.memory, columns, check_cancelled,
+                |events| self.rank_batch(events));
+            return cut.cancellation.run_until_cancelled(visit).await.ok_or_else(crate::kmeans::cancelled)?;
+        }
+
+        let lease = cut.storage.get_or(data, cut.memory).await?;
+        let (mut reader, _metadata) = open_frontier_file(Bytes::from_owner(lease), cut.memory)?;
+        for page in 0..reader.page_count() {
+            check_cancelled()?;
+            let _page = cut.memory.reserve(reader.page_allocation_bound(page)?)?;
+            let events = EventBatch::new(reader.read_event_page(page, columns)?)?;
+            self.rank_batch(&events)?;
         }
         Ok(())
     }
