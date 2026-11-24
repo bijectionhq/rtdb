@@ -1055,6 +1055,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
         let view = state.index().view(&source.branch, at, source.layer, now)?;
         Ok(rtdb_node::serving::QueryView {
             custody_groups: Default::default(),
+            custody_contributors: None,
             key_generation: None,
             snapshot: rtdb_query::branch_snapshot(&view, &self.memory)?,
             cut: view.cut(),
@@ -1771,5 +1772,94 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
     assert!(v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap().features.is_empty());
     let status = client.action("rtdb.v1.TxStatus", status_request.into()).await.unwrap_err();
     error(status, v1::AnomalyCategory::Unsupported, "rtdb/default-serving-classic-history");
+    running.stop().await;
+}
+
+struct CustodyMountObservations(rtdb_node::serving::custody_release::OriginalReceipt);
+
+#[async_trait]
+impl rtdb_node::serving::custody_release::OriginalCarrierObservations for CustodyMountObservations {
+    async fn confirmed_writer(
+        &self, _: rtdb_node::serving::custody_release::CustodyCarrierAuthority, _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_node::serving::custody_release::OriginalReceipt> {
+        Ok(self.0.clone())
+    }
+
+    async fn registered_response(
+        &self, _: rtdb_node::serving::custody_release::CustodyCarrierAuthority, _: rtdb_node::serving::custody_release::CustodyResponsePart,
+        _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_node::serving::custody_release::RegisteredCustodyResponse> {
+        Err(rtdb_types::Anomaly::unsupported("test/no-response", "This fixture only mounts the original writer"))
+    }
+
+    async fn registered_carrier(
+        &self, _: rtdb_node::serving::custody_release::CustodyReleaseRegistration, _: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_node::serving::custody_release::OriginalCarrierReceipt> {
+        Err(rtdb_types::Anomaly::unsupported("test/no-carrier", "This fixture only mounts the original writer"))
+    }
+}
+
+#[tokio::test]
+async fn native_original_custody_mount_rechecks_the_writer_and_withdraws_old_owners() {
+    use rtdb_node::serving::{NativeServingAuthority, QuerySource, custody_release::{
+        CustodyCarrierAuthority, CustodyProviderInstallation, OriginalReceipt, OriginalWriterPoint, original_writer_commitment,
+    }};
+    use rtdb_types::rtdb_v1::{At, Basis, Layer};
+    use tokio_util::sync::CancellationToken;
+
+    let incarnation = [74; 16];
+    let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
+        "xtdb", NativeServingAuthority { incarnation, checkpoints: None },
+    );
+    let running = Running::start_with_resources(
+        None, FlightConfig::default(), &[], None, Default::default(), None, Some(Arc::new(resources)),
+    ).await;
+    let catalog = running.node.catalog();
+    let database = catalog.database("xtdb").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let receipt = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![76; 16],
+        ops: vec![v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+            branch: "main".into(), table: "public.installation".into(), if_absent: true,
+            rows: vec![v1::Row { cells: [("_id".into(), integer_cell(1)), ("writer".into(), integer_cell(1))].into(), ..Default::default() }],
+        })) }],
+        ..Default::default()
+    }).await.unwrap();
+    let observed = OriginalReceipt {
+        key: receipt.key,
+        basis: Basis::from_bytes(&receipt.basis.unwrap().value).unwrap(),
+        system_time: Timestamp(receipt.system_time_micros),
+    };
+    let installation = |proof: OriginalReceipt| CustodyProviderInstallation {
+        authority: CustodyCarrierAuthority {
+            incarnation, source_history: [77; 32], installation: [78; 16], registry: [79; 32],
+            original_writer: original_writer_commitment([78; 16], &observed.key),
+        },
+        writer: OriginalWriterPoint { table: TableRef::new("public", "installation"), id: EntityId::Integer(1), valid_at: observed.system_time },
+        observations: Arc::new(CustodyMountObservations(proof)),
+    };
+    let cancellation = CancellationToken::new();
+    let wrong = OriginalReceipt { system_time: observed.system_time.next().unwrap(), ..observed.clone() };
+    assert!(catalog.mount_original_custody_provider("xtdb", installation(wrong), &cancellation).await.is_err());
+    assert!(catalog.original_custody_response_owner("xtdb").is_err());
+    let mount = catalog.mount_original_custody_provider("xtdb", installation(observed.clone()), &cancellation).await.unwrap();
+    assert!(catalog.mount_original_custody_provider("xtdb", installation(observed.clone()), &cancellation).await.is_err());
+    assert!(!database.serving_driver().unwrap().features().contains(&rtdb_tx::transact::ROW_CUSTODY));
+    let owner = catalog.original_custody_response_owner("xtdb").unwrap();
+    let release = owner.response_release(&rtdb_node::SystemClock, &cancellation).unwrap();
+    let source = || QuerySource { branch: "main".into(), at: At::Linearizable, layer: Layer::Merged };
+    let captured = release.capture_ranked(source()).await.unwrap();
+    assert!(captured.view().custody_contributors.as_ref().unwrap().is_empty());
+    drop(mount);
+    assert!(release.capture_ranked(source()).await.is_err());
+    assert!(catalog.original_custody_response_owner("xtdb").is_err());
+    let replacement = catalog.mount_original_custody_provider("xtdb", installation(observed.clone()), &cancellation).await.unwrap();
+    assert!(owner.response_release(&rtdb_node::SystemClock, &cancellation).is_err());
+    assert!(catalog.original_custody_response_owner("xtdb").is_ok());
+    drop(replacement);
     running.stop().await;
 }

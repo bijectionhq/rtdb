@@ -8,7 +8,14 @@ use tokio_util::sync::CancellationToken;
 use super::ServingDriver;
 use crate::Clock;
 
+mod mounted;
 mod original;
+pub(crate) use mounted::CustodyProviderSlot;
+pub use mounted::{
+    CapturedCustodyRank, CustodyContributors, CustodyProviderInstallation, CustodyProviderMount,
+    CustodyResponseOwner, MountedResponseRelease, RegisteredCustodyResponse,
+    custody_frame_commitment,
+};
 pub use original::{
     AttachedCustodyCarrierJournal, OriginalCarrierObservations, OriginalCarrierReceipt,
     OriginalReceipt, OriginalWriterPoint, original_writer_commitment,
@@ -148,14 +155,25 @@ impl ResponseRelease<'_> {
         expected: &BTreeSet<(CustodyGroupId, [u8; 32])>,
         registrations: &[CustodyReleaseRegistration],
     ) -> Result<()> {
-        if expected.len() != registrations.len()
+        self.check_contributors(expected, registrations, None).await
+    }
+
+    async fn check_contributors(
+        &self,
+        expected: &CustodyContributors,
+        registrations: &[CustodyReleaseRegistration],
+        generation: Option<u64>,
+    ) -> Result<()> {
+        if expected.len() > 512
+            || expected.len() != registrations.len()
             || registrations.iter().any(|registration| {
                 !expected.contains(&(registration.group, registration.occurrence))
             })
         {
             return Err(release_unavailable());
         }
-        self.check_registrations(registrations, true).await
+        self.check_registrations(registrations, true, generation)
+            .await
     }
 
     async fn check_live(
@@ -163,13 +181,15 @@ impl ResponseRelease<'_> {
         registration: CustodyReleaseRegistration,
         promoted: bool,
     ) -> Result<()> {
-        self.check_registrations(&[registration], promoted).await
+        self.check_registrations(&[registration], promoted, None)
+            .await
     }
 
     async fn check_registrations(
         &self,
         registrations: &[CustodyReleaseRegistration],
         promoted: bool,
+        generation: Option<u64>,
     ) -> Result<()> {
         let Some(first) = registrations.first() else {
             return Err(release_unavailable());
@@ -200,7 +220,7 @@ impl ResponseRelease<'_> {
             }
         }
         self.driver
-            .check_custody_release_delivery(&groups, &writer, self.cancellation)
+            .check_custody_release_delivery(&groups, &writer, generation, self.cancellation)
             .await?;
         self.require_authority(first.authority)?;
         first.require_live_time(self.clock.now())
@@ -383,8 +403,12 @@ mod tests {
             &self,
             groups: &BTreeSet<CustodyGroupId>,
             writer: &CustodyWriterFence,
+            generation: Option<u64>,
             cancellation: &CancellationToken,
         ) -> Result<()> {
+            if generation == Some(7) {
+                return Err(rtdb_crypt::erased_under_view());
+            }
             let index = self.current_custody(cancellation).await?;
             if !writer.matches(&index)? {
                 return Err(release_unavailable());
@@ -456,6 +480,15 @@ mod tests {
             _: &CancellationToken,
         ) -> Result<OriginalReceipt> {
             Ok(self.writer.clone())
+        }
+
+        async fn registered_response(
+            &self,
+            _: CustodyCarrierAuthority,
+            _: CustodyResponsePart,
+            _: &CancellationToken,
+        ) -> Result<RegisteredCustodyResponse> {
+            Err(release_unavailable())
         }
 
         async fn registered_carrier(
@@ -635,6 +668,13 @@ mod tests {
         release.promote(registration).await.unwrap();
         let expected = [(GROUP, occurrence)].into();
         release.check_all(&expected, &[registration]).await.unwrap();
+        assert_eq!(
+            release
+                .check_contributors(&expected, &[registration], Some(7))
+                .await
+                .unwrap_err(),
+            rtdb_crypt::erased_under_view()
+        );
         let incomplete = [(GROUP, occurrence), ([99; 16], [99; 32])].into();
         assert!(
             release

@@ -37,13 +37,13 @@ impl ServingScope {
         } else {
             projected.source_basis(cut.basis)?
         };
-        let (snapshot, custody_groups) = if projected.index().has_custody_groups() {
+        let (snapshot, custody_groups, _) = if projected.index().has_custody_groups() {
             let vault = vault.ok_or_else(|| Anomaly::unsupported("rtdb/row-custody", "The scoped query has no custody vault"))?;
             super::custody::snapshot(&view, memory, vault).await?
         } else {
-            (rtdb_query::branch_snapshot(&view, memory)?, BTreeSet::new())
+            (rtdb_query::branch_snapshot(&view, memory)?, BTreeSet::new(), None)
         };
-        Ok((QueryView { snapshot, cut, claim: None, custody_groups, key_generation: None }, raw_cut))
+        Ok((QueryView { snapshot, cut, claim: None, custody_groups, custody_contributors: None, key_generation: None }, raw_cut))
     }
 
     pub fn changes(&self, index: &BranchIndex, request: &Changes) -> Result<ChangePage> {

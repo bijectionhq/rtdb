@@ -149,9 +149,9 @@ impl ServingDriver for MultiServing {
                 };
                 let view = index.view(&source.branch, at, source.layer, now)?;
                 let cut = view.cut();
-                let (snapshot, custody_groups) = if index.has_custody_groups() {
+                let (snapshot, custody_groups, custody_contributors) = if index.has_custody_groups() {
                     crate::serving::custody::snapshot(&view, &self.memory, &self.tokens.custody_vault()).await?
-                } else { (rtdb_query::branch_snapshot(&view, &self.memory)?, BTreeSet::new()) };
+                } else { (rtdb_query::branch_snapshot(&view, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
                 let claim = if track {
                     Some(self.tokens.seal_claim(&ClaimEvidence {
                         scope: ClaimScope { branch: source.branch, basis: cut.basis, layer: source.layer },
@@ -170,6 +170,7 @@ impl ServingDriver for MultiServing {
                     cut,
                     claim,
                     custody_groups,
+                    custody_contributors,
                     key_generation: Some(generation),
                 })
             })
@@ -224,12 +225,18 @@ impl ServingDriver for MultiServing {
     }
 
     async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
-                                            cancellation: &CancellationToken) -> Result<()> {
+                                            generation: Option<u64>, cancellation: &CancellationToken) -> Result<()> {
         cancellation.run_until_cancelled(async {
             let vault = self.tokens.custody_vault();
             for &group in groups { vault.check_readable(group).await?; }
-            let index = self.current_custody(cancellation).await?;
-            crate::serving::custody_release::check_release_cut(&index, writer, groups)
+            let mut database = self.database.lock().await;
+            let (index, current_generation) = database.fresh_view().await?;
+            crate::serving::custody_release::check_release_cut(&index, writer, groups)?;
+            database.check_generation(current_generation).await?;
+            if let Some(selected) = generation.filter(|selected| *selected != current_generation) {
+                database.check_generation(selected).await?;
+            }
+            Ok(())
         }).await.ok_or_else(interrupted)?
     }
 

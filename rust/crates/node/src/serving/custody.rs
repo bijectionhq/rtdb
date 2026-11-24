@@ -7,7 +7,7 @@ use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, CustodyPlacementCo
 use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
-use super::ChangePage;
+use super::{ChangePage, custody_release::CustodyContributors};
 
 pub(crate) async fn prepare(request: &mut Transact, vault: &CustodyVault) -> Result<()> {
     let fingerprint = request.logical_sha256()?;
@@ -84,15 +84,22 @@ pub(crate) async fn open(vault: &CustodyVault, group: [u8; 16], stored: &Custody
 
 pub(crate) async fn snapshot(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>, vault: &CustodyVault,
-) -> Result<(Snapshot, BTreeSet<CustodyGroupId>)> {
+) -> Result<(Snapshot, BTreeSet<CustodyGroupId>, Option<CustodyContributors>)> {
     let mut opened = BTreeMap::new();
     let mut groups = BTreeSet::new();
+    let mut contributors = Some(CustodyContributors::new());
     for (table, _) in view.tables() {
         for id in view.ids(table) {
             for event in view.history(table, id) {
                 let Some(image) = event.image.as_ref() else { continue };
                 let Some(group) = image.custody_group else { continue };
                 groups.insert(group);
+                if let Some(selected) = &mut contributors {
+                    match view.custody_event_contributor(table, event) {
+                        Some(contributor) if selected.len() < 512 || selected.contains(&contributor) => { selected.insert(contributor); }
+                        _ => contributors = None,
+                    }
+                }
                 let Some(payload) = &image.custody_payload else { continue };
                 if let std::collections::btree_map::Entry::Vacant(entry) = opened.entry((group, payload.binding)) {
                     entry.insert(open(vault, group, payload).await?);
@@ -111,7 +118,7 @@ pub(crate) async fn snapshot(
         }
         Ok(cells)
     })?;
-    Ok((snapshot, groups))
+    Ok((snapshot, groups, contributors))
 }
 
 pub(crate) async fn check_delivery(index: &BranchIndex, vault: &CustodyVault, groups: &BTreeSet<CustodyGroupId>) -> Result<()> {
@@ -184,6 +191,47 @@ mod tests {
 
     use super::*;
     use crate::serving::{ChangeGroup, ChangeKind, ChangeRow};
+
+    #[tokio::test]
+    async fn ranked_capture_retains_inherited_and_shadowing_custody_groups_before_slicing() {
+        let incarnation = [4; 16];
+        let root_group = [5; 16];
+        let shadow_group = [6; 16];
+        let table = TableRef::new("public", "documents");
+        let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 11)));
+        let claims = ClaimSealer::new(incarnation, [7; 32]);
+        let place = |branch: &str, group: [u8; 16]| Op::PlaceCustodyRow {
+            branch: branch.into(), table: table.clone(),
+            row: Row {
+                id: EntityId::Integer(1), valid: Some(rtdb_types::Interval::ALL.into()),
+                cells: StructFields::from([("carrier".into(), Cell::Value(Value::Binary(group.to_vec())))]),
+                custody_group: Some(group), protected_columns: vec!["carrier".into()], custody_payload: None,
+            },
+            placement: CustodyPlacement {
+                placement_id: group, reservation: None, carrier_column: "carrier".into(), link_column: None, commitments: None,
+            },
+        };
+        let mut state = TransactState::new(incarnation);
+        let root = Op::CreateCustodyGroup { group: root_group };
+        let fork = Op::Fork { child: "child".into(), from: (MAIN_BRANCH.into(), rtdb_types::rtdb_v1::Basis::new(incarnation, 1)), writable: true, expires_at: None };
+        for (position, ops) in [(1, vec![root, place(MAIN_BRANCH, root_group)]),
+            (2, vec![fork, Op::CreateCustodyGroup { group: shadow_group }, place("child", shadow_group)])] {
+            let mut request = Transact {
+                key: vec![position as u8; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(),
+                ops, otherwise: Vec::new(), requires: Vec::new(), custody_request_digest: None, request_memory: None,
+            };
+            prepare(&mut request, &vault).await.unwrap();
+            let Resolution::Append(append) = state.resolve(&request, position, Timestamp(10 + position as i64), &[ROW_CUSTODY], &claims).unwrap() else { panic!() };
+            assert_eq!(state.apply(position, append.into_record()).unwrap().unwrap().outcome, Outcome::Then);
+        }
+        let view = state.index().view("child", At::Latest, Layer::Merged, Timestamp(20)).unwrap();
+        let winner = view.row(&table, &EntityId::Integer(1), Timestamp(20)).unwrap();
+        assert_eq!(winner.image.as_ref().unwrap().custody_group, Some(shadow_group));
+        let (_, groups, contributors) = snapshot(&view, &MemoryBudget::new(1 << 22), &vault).await.unwrap();
+        assert_eq!(groups, BTreeSet::from([root_group, shadow_group]));
+        let expected = view.custody_placements().map(|entry| (entry.group, entry.occurrence.unwrap().commitment(entry.group))).collect();
+        assert_eq!(contributors, Some(expected));
+    }
 
     #[tokio::test]
     async fn placement_preparation_commits_the_exact_binary_carrier_and_link() {
@@ -266,7 +314,8 @@ mod tests {
         let image = row.image.as_ref().unwrap();
         let private = open(&vault, group, image.custody_payload.as_ref().unwrap()).await.unwrap();
         assert_eq!(private.get("private"), Some(&Value::Utf8("protected-string".into())));
-        let (_, groups) = snapshot(&view, &MemoryBudget::new(1 << 22), &vault).await.unwrap();
+        let (_, groups, contributors) = snapshot(&view, &MemoryBudget::new(1 << 22), &vault).await.unwrap();
+        assert!(contributors.is_none());
         check_delivery(state.index(), &vault, &groups).await.unwrap();
         let page = || ChangePage {
             groups: vec![ChangeGroup {
