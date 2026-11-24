@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, cast::AsArray, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_schema::{DataType, Field, UnionMode};
@@ -104,7 +105,15 @@ pub(super) fn gather_column<E: EncodedEvent>(
         empty = arrow_array::new_empty_array(target.data_type());
         arrays.push(empty.as_ref());
     }
-    let build = || copy_event_cells(&arrays, &cells);
+    let build = || {
+        if let [Some(array)] = aligned.as_slice()
+            && sources[0].picks.len() == cells.len()
+            && compact_event_layout(array.as_ref(), false)
+        {
+            return Ok(Arc::clone(array));
+        }
+        copy_event_cells(&arrays, &cells)
+    };
     let array = if let Some(builder) = builder.as_mut() {
         let bound = cells.iter().try_fold(schema_bound(target)?, |bytes, cell| {
             let cell_size = match *cell {
@@ -121,6 +130,37 @@ pub(super) fn gather_column<E: EncodedEvent>(
         return Ok(None);
     }
     Ok(Some(array))
+}
+
+fn compact_event_layout(array: &dyn Array, masked: bool) -> bool {
+    match array.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => {
+            // A final event gather can change the union tags masked by a null parent.
+            if masked { return false; }
+            let union = array.as_union();
+            let mut lengths = [0; 128];
+            for row in 0..union.len() {
+                let length = &mut lengths[union.type_id(row) as usize];
+                if union.value_offset(row) != *length { return false; }
+                *length += 1;
+            }
+            fields.iter().all(|(id, _)| {
+                let child = union.child(id);
+                child.len() == lengths[id as usize] && compact_event_layout(child.as_ref(), false)
+            })
+        }
+        DataType::Struct(_) => array.as_struct().columns().iter()
+            .all(|child| compact_event_layout(child.as_ref(), masked || array.null_count() != 0)),
+        DataType::FixedSizeList(..) => compact_event_layout(
+            array.as_fixed_size_list().values().as_ref(), masked || array.null_count() != 0),
+        DataType::List(_) => compact_event_layout(array.as_list::<i32>().values().as_ref(), false),
+        DataType::Map(..) => {
+            let entries = array.as_map().entries();
+            entries.column(0).logical_null_count() == 0 && compact_event_layout(entries, false)
+        }
+        DataType::RunEndEncoded(..) => false,
+        _ => true,
+    }
 }
 
 fn schema_bound(field: &Field) -> Result<usize> {

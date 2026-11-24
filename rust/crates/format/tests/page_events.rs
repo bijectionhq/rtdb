@@ -276,3 +276,48 @@ fn compaction_retries_nested_undefined_encoding_without_allocating_inactive_unio
     assert!(memory.peak_bytes() < width as usize);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn compaction_keeps_canonical_union_offsets_when_widening_one_arrow_source() {
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    for values in [vec![Value::I64(-1), Value::I64(5)], vec![Value::Null, Value::I64(5)]] {
+        let source_type = if matches!(values[0], Value::Null) { integer.clone().maybe() } else { integer.clone() };
+        let source = StructFields::from([("v".into(), source_type.clone())]);
+        let target = StructFields::from([("v".into(), source_type.join(&text))]);
+        let events = values.into_iter().enumerate().map(|(row, value)| StoredEvent {
+            position: None, origin: None, commit_position: 0, entity_key: None, recency: None,
+            iid: EntityId::Integer(row as i64).iid(), system_from: Timestamp(10), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
+        }).collect::<Vec<_>>();
+        let page = EventBatch::new(build_event_batch_with_recency(&events, Some(source), None, false).unwrap()).unwrap();
+        let page = page.page_events().unwrap();
+        let selected = [ArrowEvent(page[1].clone()), ArrowEvent(page[0].clone()), ArrowEvent(page[0].clone())];
+        let expected = copy_event_batch_with_recency(&[events[1].clone(), events[0].clone(), events[0].clone()],
+            Some(target.clone()), None, false).unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let actual = copy_compaction_batch(&selected, Some(target), None, false, false, &memory).unwrap();
+        assert_eq!(write_file(actual.batch().schema_ref(), std::slice::from_ref(actual.batch())).unwrap(),
+            write_file(expected.schema_ref(), std::slice::from_ref(&expected)).unwrap());
+        drop(actual);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn row_backed_event_columns_admit_all_cells_before_building_the_uri_array() {
+    let event = |value| StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: None, recency: None,
+        iid: EntityId::Integer(1).iid(), system_from: Timestamp(10), valid_time: Interval::ALL,
+        operation: StoredOperation::Put(StructFields::from([("v".into(), value)])),
+    };
+    let fields = StructFields::from([("v".into(), LogicalType::Scalar(ScalarType::Uri))]);
+    let events = [event(Value::Uri("relative".into())), event(Value::I64(2))];
+
+    let built = build_event_batch_with_recency(&events, Some(fields.clone()), None, false).unwrap_err();
+    let copied = copy_event_batch_with_recency(&events, Some(fields), None, false).unwrap_err();
+
+    assert_eq!(built.code, "rtdb/column-type-mismatch");
+    assert_eq!(copied, built);
+    assert!(built.message.unwrap().starts_with("Value at row 1 "));
+}

@@ -137,6 +137,7 @@ config {
 -- Input data and metadata files may use Arrow LZ4-frame or Zstandard buffer compression.
 -- Decompression preserves the rows and metadata supplied to the merge.
 -- A compatible fixed-size float column preserves its float values and list and component validity when gathered into an output page.
+-- A single aligned selection can supply a complete output column when it has the recorded offsets and padding.
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
 -- Their order holds only within their page, and the recency split separates them into different files.

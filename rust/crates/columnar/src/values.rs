@@ -15,6 +15,10 @@ pub fn build_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> 
     build_values(logical, values, true)
 }
 
+pub fn build_array_refs(logical: &LogicalType, values: &[&Value]) -> Result<ArrayRef> {
+    build_values(logical, values, true)
+}
+
 /// Builds a column from scalar evaluation results using bounded temporary cell storage.
 pub fn copy_evaluated_cells(
     ty: &LogicalType, rows: usize, memory: &Arc<crate::MemoryBudget>,

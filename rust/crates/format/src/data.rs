@@ -8,7 +8,7 @@ use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, NullArray,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
+use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
 
 #[cfg(test)]
@@ -1062,8 +1062,8 @@ fn put_columns<E: EncodedEvent>(
         let _scratch = builder.as_deref().zip(read_bytes).map(|(builder, bytes)| builder.reserve_scratch(bytes)).transpose()?;
         let cells = documents.iter().map(|doc| doc.put_cell(&name, &ty)).collect::<Result<Vec<_>>>()?;
         let build = || {
-            let values = cells.iter().map(|cell| cell.as_ref().clone()).collect::<Vec<_>>();
-            if copy { copy_array(&ty, &values) } else { build_array(&ty, &values) }
+            let values = cells.iter().map(|cell| cell.as_ref()).collect::<Vec<_>>();
+            if copy { copy_array_refs(&ty, &values) } else { build_array_refs(&ty, &values) }
         };
         let column = match builder.as_deref_mut() {
             Some(builder) => builder.column(estimate_builder_bytes_refs(&ty, cells.iter().map(|cell| cell.as_ref()))?, build)?,
