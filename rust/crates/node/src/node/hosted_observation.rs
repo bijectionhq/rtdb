@@ -84,7 +84,7 @@ pub struct AppliedOwnedPoint {
     pub relation: OwnedRelation,
     pub id: EntityId,
     pub valid_at: Timestamp,
-    pub expected: Option<Timestamp>,
+    pub expected: Option<rtdb_types::OwnedPointVersion>,
 }
 
 pub struct AppliedReadFloor {
@@ -307,7 +307,7 @@ impl NativeSession {
             } else {
                 point.valid_at
             };
-            let revision = rtdb_query::read_owned_point_revision(
+            let revision = rtdb_query::read_owned_point_version(
                 Arc::clone(&read.context), &read.owner, &point.relation, &point.id, Interval::at(at)?,
             ).await?;
             if revision != point.expected { return Ok(None); }
@@ -508,14 +508,14 @@ impl OwnedReadSession {
         let mut matches = compare_controls(&self.context, &current, controls).await?;
         if let Some(point) = point {
             let valid = Interval::at(point.valid_at)?;
-            let observed = rtdb_query::read_owned_point_revision(
+            let observed = rtdb_query::read_owned_point_version(
                 Arc::clone(&self.context), &self.owner, &point.relation, &point.id, valid,
             ).await?;
             if observed != point.expected {
                 return Err(unavailable());
             }
             if matches {
-                let observed = rtdb_query::read_owned_point_revision(
+                let observed = rtdb_query::read_owned_point_version(
                     Arc::clone(&current), &self.owner, &point.relation, &point.id, valid,
                 ).await?;
                 matches = observed == point.expected;

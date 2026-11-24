@@ -1820,7 +1820,7 @@ impl<'a> OpenTransaction<'a> {
                     Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected })
                         if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION && id == "head"
                             && checked_tip.is_none() => {
-                        checked_tip = Some((*valid_at, *expected));
+                        checked_tip = Some((*valid_at, expected.map(|version| version.history)));
                     }
                     Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
@@ -2248,7 +2248,8 @@ impl<'a> OpenTransaction<'a> {
             };
             let upper = observed.0.checked_add(1).map(Timestamp)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
-            let actual = self.read_owned_revision(owner, relation, id, Interval::new(observed, upper)?).await?;
+            let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+            let actual = rtdb_query::read_owned_point_version(context, owner, relation, id, Interval::new(observed, upper)?).await?;
             if actual != *expected {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
             }

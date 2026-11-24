@@ -61,7 +61,8 @@ fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Stat
         0 => (None, body),
         1 => {
             let (revision, rest) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Truncated applied point revision"))?;
-            (Some(Timestamp(i64::from_be_bytes(*revision))), rest)
+            let (position, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Truncated applied point position"))?;
+            (super::owned_point_expectation(Some(Timestamp(i64::from_be_bytes(*revision))), Some(position))?, rest)
         },
         _ => return Err(invalid("Invalid applied point revision flag")),
     };

@@ -1216,7 +1216,7 @@ mod retained_release_tests {
                 valid_from: None, valid_to: None,
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id, valid_at: Timestamp(4), expected: Some(Timestamp(3)) },
+            TxOp::OwnedCheck { relation: local.clone(), id, valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(3), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(Timestamp(3)), advance_to: None, drop_world: true,
@@ -1267,13 +1267,13 @@ mod retained_release_tests {
                 valid_from: None, valid_to: None,
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local, id: replacement.clone(), valid_at: Timestamp(4), expected: Some(Timestamp(2)) },
+            TxOp::OwnedCheck { relation: local, id: replacement.clone(), valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(2), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
             TxOp::OwnedCheck { relation: relation.clone(), id: replacement.clone(), valid_at: Timestamp(4), expected: None },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.pop();
         operations.push(Operation::Public(TxOp::OwnedCheck {
-            relation, id: replacement, valid_at: Timestamp(4), expected: Some(Timestamp(1)),
+            relation, id: replacement, valid_at: Timestamp(4), expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(1), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }),
         }));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
             world, pin, effect: ProposalLandingEffect::WithPoints,
@@ -1346,7 +1346,7 @@ mod retained_release_tests {
                 valid_from: Some(start), valid_to: Some(Timestamp(20)),
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(Timestamp(2)) },
+            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(2), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
             TxOp::OwnedPublishWorld {
                 world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
                 expected: Some(generation), advance_to: None, drop_world: true,
@@ -1407,7 +1407,7 @@ mod retained_release_tests {
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.extend([
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: later_start, expected: Some(generation) },
+            TxOp::OwnedCheck { relation: local.clone(), id: id.clone(), valid_at: later_start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), None);
         operations.push(Operation::Public(TxOp::OwnedCheck {
@@ -1425,7 +1425,7 @@ mod retained_release_tests {
                 valid_from: Some(second_start), valid_to: Some(Timestamp(30)),
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local, id: second.clone(), valid_at: second_start, expected: Some(generation) },
+            TxOp::OwnedCheck { relation: local, id: second.clone(), valid_at: second_start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
             TxOp::OwnedCheck {
                 relation, id: second, valid_at: second_start, expected: None,
             },
@@ -1443,8 +1443,8 @@ mod retained_release_tests {
                 valid_from: None, valid_to: None,
             },
             TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
-            TxOp::OwnedCheck { relation: local, id: point.clone(), valid_at: start, expected: Some(generation) },
-            TxOp::OwnedCheck { relation: points, id: point, valid_at: start, expected: Some(Timestamp(1)) },
+            TxOp::OwnedCheck { relation: local, id: point.clone(), valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: generation, position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
+            TxOp::OwnedCheck { relation: points, id: point, valid_at: start, expected: Some(rtdb_types::OwnedPointVersion { history: Timestamp(1), position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(1), ordinal: 0 } }) },
         ].into_iter().map(Operation::Public));
         assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
             world, pin, effect: ProposalLandingEffect::WithPoints,
@@ -1962,7 +1962,7 @@ pub(crate) fn hosted_proposal_land(
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision) })
         ] if guarded == &local && checked == &local && observed == &id && *original == pin
             && extent.is_none_or(|extent| {
-                extent.lower() == *valid_at && expected_clock.is_some_and(|tip| *revision <= tip)
+                extent.lower() == *valid_at && expected_clock.is_some_and(|tip| revision.history <= tip)
             }))));
         if extents[0].is_some() {
             let root_window = extents.iter().flatten().all(|extent| operations.iter().any(|op| {

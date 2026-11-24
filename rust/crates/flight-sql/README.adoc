@@ -210,10 +210,12 @@ Check accepts an identity and an observation, with null mutation bounds and docu
 Create, replace, and delete apply in batch order in one atomic transaction.
 
 A nullable `_read_valid_micros: Int64` specifies the point to revalidate before mutation.
-A null `_read_system_micros: Int64` at that point asserts absence, and a non-null value asserts the exact previously observed winning revision.
+At that instant, two nulls in `_read_system_micros: Int64` and `_read_event_position: Binary` assert absence.
+A present point requires both the observed SQL history coordinate and the 16-byte event position.
+The event position contains the original signed 64-bit transaction position and unsigned 64-bit event ordinal, in big-endian order.
 A mutation without a valid instant carries no observation.
-The point reply includes `rtdb.owned.valid_micros` for the observed instant and includes `rtdb.owned.revision_micros` when a row is present.
-These metadata values are signed decimal microseconds.
+The point reply includes `rtdb.owned.valid_micros` as signed decimal microseconds.
+For a present row it also includes `rtdb.owned.revision_micros` as signed decimal microseconds and `rtdb.owned.event_position` as hexadecimal.
 A successful commit reply has the same schema as the create reply.
 An expired deadline or stale observation aborts the entire transaction before mutations apply.
 

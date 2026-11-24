@@ -65,6 +65,40 @@ pub async fn read_owned_point_revision(
     Ok(latest)
 }
 
+/// Compare the original winner of a business-valid point by its event position.
+pub async fn read_owned_point_version(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
+) -> Result<Option<rtdb_types::OwnedPointVersion>> {
+    let columns = [rtdb_types::OWNED_EVENT_POSITION_COLUMN];
+    let Some(mut cursor) = open_owned_point(Arc::clone(&context), owner, relation, id, Some(valid), Some(&columns)).await? else {
+        return Ok(None);
+    };
+    let mut version = None;
+    while let Some(rows) = cursor.next_batch().await? {
+        for row in 0..rows.batch().num_rows() {
+            let history = owned_row_revision(rows.batch(), row, id, &context.memory)?;
+            let position = owned_row_event_position(rows.batch(), row)?;
+            if version.replace(rtdb_types::OwnedPointVersion { history, position }).is_some() {
+                return Err(address_unavailable());
+            }
+        }
+    }
+    Ok(version)
+}
+
+pub fn owned_row_event_position(batch: &arrow_array::RecordBatch, row: usize) -> Result<rtdb_types::EventPosition> {
+    use arrow_array::{Array, BinaryArray};
+
+    let invalid = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/event-position",
+        "The owned point has no original assertion position");
+    let column = batch.column_by_name(rtdb_types::OWNED_EVENT_POSITION_COLUMN)
+        .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+        .filter(|column| row < column.len() && column.is_valid(row)).ok_or_else(invalid)?;
+    let position = rtdb_types::EventPosition::from_bytes(column.value(row).try_into().map_err(|_| invalid())?);
+    if position.transaction.0 < 0 { return Err(invalid()); }
+    Ok(position)
+}
+
 /// Project the original validity endpoints along with a live lifetime point.
 pub async fn open_owned_lifetime_point(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId, valid: Interval,
@@ -737,6 +771,9 @@ async fn open_owned_table_point_with_edges(
     }
     if assertion && !fields.contains(&"_assertion_ordinal") {
         fields.push("_assertion_ordinal");
+    }
+    if assertion && !fields.contains(&rtdb_types::OWNED_EVENT_POSITION_COLUMN) {
+        fields.push(rtdb_types::OWNED_EVENT_POSITION_COLUMN);
     }
     if assertion && name.table.table.split_once('-')
         .is_some_and(|(_, relation)| relation == rtdb_types::OWNED_ATTEMPT_RELATION)

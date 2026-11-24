@@ -1352,7 +1352,7 @@ pub enum TxOp {
         scope: rtdb_types::PlacedAttemptScope, frontier: i64, until: Timestamp,
         region: Option<Arc<rtdb_types::OwnedRangeEvidence>>,
     },
-    OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<Timestamp> },
+    OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<rtdb_types::OwnedPointVersion> },
     OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },
     /// Apply one live nomination and order the same relation's replay floor.
     OwnedSweepExpired {

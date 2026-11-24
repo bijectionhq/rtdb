@@ -176,6 +176,15 @@ impl EventPosition {
     }
 }
 
+/// Private assertion metadata used to compare a held point at ordering.
+pub const OWNED_EVENT_POSITION_COLUMN: &str = "_rtdb_owned_event_position";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedPointVersion {
+    pub position: EventPosition,
+    pub history: Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHeader {
     pub position: Option<EventPosition>,

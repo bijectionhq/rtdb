@@ -1468,6 +1468,7 @@ impl OwnedReadSession {
             self.check_relations(&historical.relations)?;
         }
         Ok(OwnedForkCut {
+            root_point: None,
             basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
@@ -1477,6 +1478,14 @@ impl OwnedReadSession {
             until: self.fork_until,
             scope,
         })
+    }
+
+    pub async fn root_point_at(&self, valid_at: Timestamp) -> Result<Option<rtdb_types::OwnedPointVersion>> {
+        self.require_unscoped_root()?;
+        self.admit_access().await?;
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+        rtdb_query::read_owned_point_version(Arc::clone(&self.context), &self.owner, &relation,
+            &rtdb_types::EntityId::String("head".into()), Interval::at(valid_at)?).await
     }
 
     /// Retain the application publication seen by this original live hold.
@@ -1818,6 +1827,7 @@ impl OwnedReadSession {
         let relation = root.in_world(world)?;
         let mut row = None;
         let mut local_revision = None;
+        let mut local_version = None;
         if let Some(mut cursor) = rtdb_query::open_owned_assertion_point(
             Arc::clone(&context), &self.owner, &relation, id, Some(valid), false,
         ).await? {
@@ -1829,6 +1839,10 @@ impl OwnedReadSession {
                 let revision = rtdb_query::owned_row_revision(batch.batch(), 0, id, &self.context.memory)?;
                 if revision > system { return Err(rtdb_types::OwnedWorld::unavailable()); }
                 local_revision = Some(revision);
+                if observed {
+                    let position = rtdb_query::owned_row_event_position(batch.batch(), 0)?;
+                    local_version = Some(rtdb_types::OwnedPointVersion { history: revision, position });
+                }
                 row = Some(batch);
             }
         }
@@ -1845,7 +1859,7 @@ impl OwnedReadSession {
             let purge_frontier = snapshot.relation_event_frontier(&root.purge_table(&self.owner))?;
             Some(OwnedWorldWitness {
                 world, pin: registered.pin, relation, purge_frontier, scope,
-                observation: OwnedWorldObservation::Point { id: id.clone(), valid_at, revision: local_revision },
+                observation: OwnedWorldObservation::Point { id: id.clone(), valid_at, revision: local_version },
                 until: self.witness_until.min(registered.until),
             })
         } else {
@@ -2823,7 +2837,7 @@ pub struct OwnedWorldWitness {
 
 #[derive(Clone)]
 enum OwnedWorldObservation {
-    Point { id: rtdb_types::EntityId, valid_at: Timestamp, revision: Option<Timestamp> },
+    Point { id: rtdb_types::EntityId, valid_at: Timestamp, revision: Option<rtdb_types::OwnedPointVersion> },
     Relation { local_frontier: Option<i64> },
 }
 
@@ -2899,6 +2913,7 @@ fn world_create_absence_matches_the_observed_valid_instant() {
 }
 
 pub struct OwnedForkCut {
+    root_point: Option<rtdb_types::OwnedPointVersion>,
     basis: Timestamp,
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
@@ -2917,6 +2932,9 @@ enum RetainedWorldCut {
 
 impl OwnedForkCut {
     pub fn basis(&self) -> Timestamp { self.basis }
+    pub fn original_root_point(&mut self, point: Option<rtdb_types::OwnedPointVersion>) {
+        self.root_point = point;
+    }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
     pub fn is_publication(&self) -> bool { self.publication }
     pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> {
@@ -3187,11 +3205,14 @@ impl NativeSession {
         };
         ops.extend(fork.controls.into_iter().map(TxOp::HostedControl));
         if requires_tip {
+            if fork.cut.root_point.map(|version| version.history) != record.parent_publication {
+                return Err(rtdb_types::OwnedWorld::unavailable());
+            }
             ops.push(TxOp::OwnedCheck {
                 relation: rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
                 id: rtdb_types::EntityId::String("head".into()),
                 valid_at: record.basis.system_time,
-                expected: record.parent_publication,
+                expected: fork.cut.root_point,
             });
         }
         let marker = (!refusal.is_empty())

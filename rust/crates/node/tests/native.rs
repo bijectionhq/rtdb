@@ -575,10 +575,18 @@ async fn normal_owned_points_and_commits_keep_colliding_full_ids_independent() {
     let initial = session.state_mut().execute_tx(vec![create(&first, 1), create(&second, 2)], AutonomousTxOptions::default()).await.unwrap();
     assert!(initial.committed(), "{:?}", initial.error());
     let held = session.open_owned_read().await.unwrap();
+    let mut versions = Vec::new();
     for (id, expected) in [(&first, 1), (&second, 2)] {
+        let mut point = held.open_point(&relation, id).await.unwrap().unwrap();
+        let batch = point.next_batch().await.unwrap().unwrap();
+        versions.push(rtdb_types::OwnedPointVersion {
+            history: initial.tx_key().system_time,
+            position: rtdb_query::owned_row_event_position(batch.batch(), 0).unwrap(),
+        });
         let found = rows(held.open_point(&relation, id).await.unwrap().unwrap()).await;
         assert_eq!(found[0][..2], [id.as_value(), Value::I64(expected)]);
     }
+    assert_ne!(versions[0].position, versions[1].position);
 
     let check = |id: &EntityId, expected| TxOp::OwnedCheck {
         relation: relation.clone(), id: id.clone(), valid_at: held.present().system_time, expected,
@@ -587,9 +595,9 @@ async fn normal_owned_points_and_commits_keep_colliding_full_ids_independent() {
         relation: relation.clone(), documents: documents(&second, 3), valid_from: None, valid_to: None,
     };
     let delete = TxOp::OwnedDelete { relation: relation.clone(), id: first.clone(), valid_from: None, valid_to: None };
-    let revision = Some(initial.tx_key().system_time);
     let changed = session.state_mut().execute_tx(
-        vec![check(&first, revision), check(&second, revision), replace, delete], AutonomousTxOptions::default(),
+        vec![check(&first, Some(versions[0])), check(&second, Some(versions[1])), replace, delete],
+        AutonomousTxOptions::default(),
     ).await.unwrap();
     assert!(changed.committed(), "{:?}", changed.error());
     let after = session.open_owned_read().await.unwrap();
@@ -634,8 +642,16 @@ async fn owned_erase_revokes_old_holds_without_erasing_a_colliding_identity() {
     let mut stale_cursor = before.open_point(&relation, &erased).await.unwrap().unwrap();
     let unaffected_cursor = before.open_point(&unrelated, &retained).await.unwrap().unwrap();
     let old_valid = before.present().system_time;
+    let mut observation = before.open_point(&relation, &erased).await.unwrap().unwrap();
+    let batch = observation.next_batch().await.unwrap().unwrap();
+    let expected = Some(rtdb_types::OwnedPointVersion {
+        history: initial.tx_key().system_time,
+        position: rtdb_query::owned_row_event_position(batch.batch(), 0).unwrap(),
+    });
+    drop(batch);
+    drop(observation);
     let purge = session.state_mut().execute_tx(vec![
-        TxOp::OwnedCheck { relation: relation.clone(), id: erased.clone(), valid_at: old_valid, expected: Some(initial.tx_key().system_time) },
+        TxOp::OwnedCheck { relation: relation.clone(), id: erased.clone(), valid_at: old_valid, expected },
         TxOp::OwnedErase { relation: relation.clone(), id: erased.clone() },
     ], AutonomousTxOptions::default()).await.unwrap();
     assert!(purge.committed(), "{:?}", purge.error());

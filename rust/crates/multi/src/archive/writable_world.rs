@@ -1209,7 +1209,8 @@ fn decode_point(
                     .fields()
                     .iter()
                     .zip(batch.columns())
-                    .filter(|(field, _)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal")
+                    .filter(|(field, _)| !matches!(field.name().as_str(),
+                        "_system_from" | "_assertion_ordinal" | rtdb_types::OWNED_EVENT_POSITION_COLUMN)
                         && !(lifetime.is_some() && matches!(field.name().as_str(), "_valid_from" | "_valid_to")))
             };
             let charge = columns().try_fold(4096usize, |bound, (field, column)| {

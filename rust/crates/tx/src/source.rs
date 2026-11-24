@@ -827,8 +827,9 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("id".into(), id.as_value());
             body.insert("valid_at".into(), Value::I64(valid_at.0));
-            body.insert("expected".into(), expected.map_or(Value::Null, |expected| Value::I64(expected.0)));
-            "rtdb-owned-check-v1"
+            body.insert("expected_history".into(), expected.map_or(Value::Null, |version| Value::I64(version.history.0)));
+            body.insert("expected_position".into(), expected.map_or(Value::Null, |version| Value::Binary(version.position.to_bytes().to_vec())));
+            "rtdb-owned-check-v2"
         }
         Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, expiry, scope }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1737,7 +1738,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-check-range-v1" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until"],
             "rtdb-owned-check-range-v2" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "fixed"],
             "rtdb-owned-check-range-v3" => &["relation", "basis_id", "basis_time", "scope", "frontier", "until", "anchor", "entity", "valid_from", "valid_to"],
-            "rtdb-owned-check-v1" => &["relation", "id", "valid_at", "expected"],
+            "rtdb-owned-check-v2" => &["relation", "id", "valid_at", "expected_history", "expected_position"],
             "rtdb-owned-erase-v2" => &["relation", "id"],
             "rtdb-owned-sweep-expired-v2" => &["relation", "id", "created", "expiry", "scope"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
@@ -2066,15 +2067,20 @@ impl SourceOperationReader<'_> {
                     period: read_relative_period(body, offset)?,
                 }
             }
-            "rtdb-owned-check-v1" | "rtdb-owned-delete-v1" => {
+            "rtdb-owned-check-v2" | "rtdb-owned-delete-v1" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned operation has no relation")); };
                 let relation = rtdb_types::OwnedRelation::from_source(relation)?;
                 let id = value("id")?.entity_id()?;
-                if name == "rtdb-owned-check-v1" {
+                if name == "rtdb-owned-check-v2" {
                     let Value::I64(valid_at) = value("valid_at")? else { return Err(invalid("Owned observation has no valid instant")); };
-                    let expected = match value("expected")? {
-                        Value::I64(time) => Some(Timestamp(time)),
-                        Value::Null => None,
+                    let expected = match (value("expected_history")?, value("expected_position")?) {
+                        (Value::Null, Value::Null) => None,
+                        (Value::I64(time), Value::Binary(position)) => {
+                            let position = rtdb_types::EventPosition::from_bytes(position.as_slice().try_into()
+                                .map_err(|_| invalid("Owned observation has an invalid event position"))?);
+                            if position.transaction.0 < 0 { return Err(invalid("Invalid owned observation transaction")); }
+                            Some(rtdb_types::OwnedPointVersion { history: Timestamp(time), position })
+                        }
                         _ => return Err(invalid("Owned observation has an invalid revision")),
                     };
                     TxOp::OwnedCheck { relation, id, valid_at: Timestamp(valid_at), expected }

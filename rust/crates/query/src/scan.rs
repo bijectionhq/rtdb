@@ -1793,6 +1793,16 @@ impl PartitionScan {
                     }).collect::<Result<Vec<_>>>()?;
                     return Ok(Some(crate::columnar::Column::Values(ordinals)));
                 }
+                if self.scan.columns[position].name == rtdb_types::OWNED_EVENT_POSITION_COLUMN
+                    && self.execution.context.catalog.owned_identity().is_some()
+                {
+                    let positions = rows.iter().map(|row| {
+                        let (batch, index) = row.source;
+                        batches[batch as usize].header(index as usize)
+                            .map(|header| header.position.map_or(Value::Null, |position| Value::Binary(position.to_bytes().to_vec())))
+                    }).collect::<Result<Vec<_>>>()?;
+                    return Ok(Some(crate::columnar::Column::Values(positions)));
+                }
                 if self.scan.columns[position].name == rtdb_types::HOSTED_RECEIPT_TX_ID
                     && self.execution.context.catalog.owned_identity().is_some()
                 {

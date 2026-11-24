@@ -102,6 +102,8 @@
 -- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
 -- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.
 -- Owned deadlines and point observations are checked at the ordered cut before owned mutations apply.
+-- A present point identifies the original transaction position and event ordinal.
+-- Equal SQL system times do not make two owned assertions interchangeable.
 -- One grouped owned Flight commit supplies one deadline and batches for distinct relations.
 -- With no relation batches, the commit validates the deadline at its ordered position and changes no owned relation.
 -- Observations across those relations share the ordered cut, and their mutations apply atomically in group and row order.

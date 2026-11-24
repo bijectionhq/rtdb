@@ -544,7 +544,12 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
     let check = |id, expected| TxOp::OwnedCheck { relation: relation.clone(), id, valid_at: Timestamp(10), expected };
     let first = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), source(vec![create]), &context).await.unwrap();
     assert!(first.result().committed());
-    let first_revision = first.result().tx_key().system_time;
+    let point_version = |resolved: &rtdb_tx::ResolvedTx| rtdb_types::OwnedPointVersion {
+        history: resolved.result().tx_key().system_time,
+        position: resolved.writes().tables()[&relation.table("owner")]
+            .batch().unwrap().header(0).unwrap().position.unwrap(),
+    };
+    let first_revision = point_version(&first);
 
     let expired = resolver.resolve_source(
         state.snapshot(), SourcePosition(1), Timestamp(101),
@@ -557,11 +562,13 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
         source(vec![replace(), check(id.clone(), Some(first_revision)), TxOp::owned_deadline(Timestamp(110))]), &context,
     ).await.unwrap();
     assert!(replaced.result().committed());
-    let replacement_revision = replaced.result().tx_key().system_time;
+    let replacement_revision = point_version(&replaced);
 
     let stale = resolver.resolve_source(
         state.snapshot(), SourcePosition(3), Timestamp(103),
-        source(vec![delete(), check(id.clone(), Some(first_revision))]), &context,
+        source(vec![delete(), check(id.clone(), Some(rtdb_types::OwnedPointVersion {
+            history: replacement_revision.history, position: first_revision.position,
+        }))]), &context,
     ).await.unwrap();
     assert_eq!(stale.result().error().unwrap().code, "rtdb.owned/stale-point");
     assert!(!stale.writes().tables().contains_key(&relation.table("owner")));
@@ -579,7 +586,7 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
         source(vec![check(alias.clone(), None), insert_alias]), &context,
     ).await.unwrap();
     assert!(collision.result().committed(), "the exact absence admits a distinct key at the same IID");
-    let alias_revision = collision.result().tx_key().system_time;
+    let alias_revision = point_version(&collision);
 
     let deleted = resolver.resolve_source(
         state.snapshot(), SourcePosition(5), Timestamp(105),

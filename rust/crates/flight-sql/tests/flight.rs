@@ -903,12 +903,16 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
     }
 
     fn row(operation: &str, value: Option<i64>, observed_at: Option<i64>, expected: Option<i64>) -> Vec<u8> {
+        use arrow_array::BinaryArray;
+
+        let different_position = [0u8; 16];
         let schema = Arc::new(Schema::new(vec![
             Field::new("_id", DataType::Int64, false),
             Field::new("_op", DataType::Utf8, false),
             Field::new("value", DataType::Int64, true),
             Field::new("_read_valid_micros", DataType::Int64, true),
             Field::new("_read_system_micros", DataType::Int64, true),
+            Field::new("_read_event_position", DataType::Binary, true),
         ]));
         ipc(RecordBatch::try_new(schema, vec![
             Arc::new(Int64Array::from(vec![1])),
@@ -916,6 +920,7 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
             Arc::new(Int64Array::from(vec![value])),
             Arc::new(Int64Array::from(vec![observed_at])),
             Arc::new(Int64Array::from(vec![expected])),
+            Arc::new([expected.map(|_| different_position.as_slice())].into_iter().collect::<BinaryArray>()),
         ]).unwrap())
     }
 
@@ -931,7 +936,7 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
         body.into()
     }
 
-    async fn point(client: &mut Client, relation: &str) -> (i64, i64) {
+    async fn point(client: &mut Client, relation: &str) -> (i64, i64, i64) {
         let mut body = (relation.len() as u16).to_be_bytes().to_vec();
         body.extend_from_slice(relation.as_bytes());
         body.extend_from_slice(&ipc(RecordBatch::try_new(
@@ -943,7 +948,7 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
         let at = stream.schema().metadata()["rtdb.owned.valid_micros"].parse().unwrap();
         let batch = stream.next().unwrap().unwrap();
         let value = integer(&batch, batch.schema().index_of("value").unwrap(), 0);
-        (at, value)
+        (at, value, stream.schema().metadata()["rtdb.owned.revision_micros"].parse().unwrap())
     }
 
     let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
@@ -955,12 +960,12 @@ async fn grouped_owned_commit_checks_every_relation_before_writing() {
     ])).await.unwrap();
     assert_eq!(created.len(), 1);
     assert_eq!(point(&mut client, "items").await.1, 10);
-    let (at, value) = point(&mut client, "orders").await;
+    let (at, value, history) = point(&mut client, "orders").await;
     assert_eq!(value, 20);
 
     let refused = client.action(commit, grouped(&[
         ("items", row("replace", Some(11), None, None)),
-        ("orders", row("check", None, Some(at), Some(i64::MIN))),
+        ("orders", row("check", None, Some(at), Some(history))),
     ])).await;
     assert_eq!(refused.unwrap_err().message(), "The owned point observation changed before ordering");
     assert_eq!(point(&mut client, "items").await.1, 10);

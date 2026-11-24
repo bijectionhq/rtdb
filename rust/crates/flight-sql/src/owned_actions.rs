@@ -1419,7 +1419,7 @@ impl Service {
     ) -> Result<bool, Status> {
         let source = batch.batch();
         let controls = [
-            "_op", "_read_valid_micros", "_read_system_micros", "_valid_from", "_valid_to",
+            "_op", "_read_valid_micros", "_read_system_micros", "_read_event_position", "_valid_from", "_valid_to",
             "_valid_from_offset_micros", "_valid_to_offset_micros",
         ];
         let positions = owned_payload_columns(source, row, &controls)?;
@@ -1468,7 +1468,10 @@ impl Service {
                 .ok_or_else(|| invalid("Owned observation requires signed microsecond integers"))).transpose()
         };
         let valid_at = signed("_read_valid_micros")?;
-        let expected = signed("_read_system_micros")?;
+        let position = optional("_read_event_position")?.map(|cell| {
+            cell.binary().ok_or_else(|| invalid("Owned observation position must be Binary"))
+        }).transpose()?;
+        let expected = owned_point_expectation(signed("_read_system_micros")?, position)?;
         match valid_at {
             Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: own_id()?, valid_at, expected }),
             None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
@@ -1551,7 +1554,12 @@ impl Service {
                 return Err(invalid("Owned commit _op must be Utf8"));
             };
             let valid_at = optional_micros(row.remove("_read_valid_micros"))?;
-            let expected = optional_micros(row.remove("_read_system_micros"))?;
+            let position = match row.remove("_read_event_position") {
+                None | Some(Value::Null | Value::Undefined) => None,
+                Some(Value::Binary(bytes)) => Some(bytes),
+                _ => return Err(invalid("Owned observation position must be Binary")),
+            };
+            let expected = owned_point_expectation(optional_micros(row.remove("_read_system_micros"))?, position.as_deref())?;
             match valid_at {
                 Some(valid_at) => writes.push(TxOp::OwnedCheck { relation: relation.clone(), id: id.clone(), valid_at, expected }),
                 None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
@@ -2444,7 +2452,8 @@ impl Service {
             Arc::new(Schema::empty())
         };
         let columns = schema.fields().iter().enumerate()
-            .filter_map(|(index, field)| (field.name() != "_assertion_ordinal").then_some(index))
+            .filter_map(|(index, field)| (!matches!(field.name().as_str(),
+                "_assertion_ordinal" | rtdb_types::OWNED_EVENT_POSITION_COLUMN)).then_some(index))
             .collect::<Vec<_>>();
         let metadata_bound = wire::add(wire::schema_bound(&schema)?, wire::mul(pages.len(), 512)?)?;
         let _metadata = call.reserve(wire::add(metadata_bound, wire::mul(ordinals.len(), 32)?)?)?;
@@ -4029,12 +4038,14 @@ impl Service {
             }
             Some(previous)
         };
-        let cut = if renewal {
+        let mut cut = if renewal {
             let predecessor = previous.as_ref().ok_or_else(unsupported)?.snapshot.parent_basis();
             held.snapshot.fork_renewal_cut(scope, predecessor).await.map_err(status)?
         } else {
             cut
         };
+        let root_point = held.snapshot.root_point_at(cut.basis()).await.map_err(status)?;
+        cut.original_root_point(root_point);
         // Deadline, registration, one immutable attempt and a Root head
         // (or the standalone fork's optional tip check).
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4 - usize::from(select_publication);
@@ -4718,8 +4729,20 @@ impl Service {
                 metadata.insert(OWNED_ASSERTION_ORDINAL.into(), ordinal.to_string());
             }
         }
+        if let Some(batch) = batch.filter(|batch| revision.is_some()
+            && batch.num_rows() == 1 && batch.column_by_name(rtdb_types::OWNED_EVENT_POSITION_COLUMN).is_some())
+        {
+            use std::fmt::Write;
+            let position = rtdb_query::owned_row_event_position(batch, 0).map_err(status)?;
+            let mut encoded = String::with_capacity(32);
+            for byte in position.to_bytes() {
+                write!(encoded, "{byte:02x}").expect("String writes are infallible");
+            }
+            metadata.insert("rtdb.owned.event_position".into(), encoded);
+        }
         let columns: Vec<_> = schema.fields().iter().enumerate()
-            .filter(|(_, field)| !matches!(field.name().as_str(), "_system_from" | "_assertion_ordinal" | rtdb_types::HOSTED_RECEIPT_TX_ID))
+            .filter(|(_, field)| !matches!(field.name().as_str(),
+                "_system_from" | "_assertion_ordinal" | rtdb_types::HOSTED_RECEIPT_TX_ID | rtdb_types::OWNED_EVENT_POSITION_COLUMN))
             .map(|(index, _)| index).collect();
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))
@@ -4924,6 +4947,19 @@ fn strip_owned_absence(row: &mut rtdb_types::StructFields<Value>) -> Result<(), 
         row.remove(name.as_str());
     }
     Ok(())
+}
+
+fn owned_point_expectation(history: Option<Timestamp>, position: Option<&[u8]>) -> Result<Option<rtdb_types::OwnedPointVersion>, Status> {
+    match (history, position) {
+        (None, None) => Ok(None),
+        (Some(history), Some(bytes)) => {
+            let bytes = bytes.try_into().map_err(|_| invalid("Owned observation has an invalid event position"))?;
+            let position = rtdb_types::EventPosition::from_bytes(bytes);
+            if position.transaction.0 < 0 { return Err(invalid("Invalid owned observation transaction")); }
+            Ok(Some(rtdb_types::OwnedPointVersion { history, position }))
+        }
+        _ => Err(invalid("An owned expectation requires both its event position and history coordinate")),
+    }
 }
 
 fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
