@@ -105,6 +105,13 @@ Checkpoint dispositions are retained before Logkeeper settles those allocations,
 The serving census requires original-vault receipts through the closing writer epoch, including outstanding retirement intents.
 Destruction evidence binds both readbacks and the incumbent journal disposition.
 The next erasure of this placement requires confirmed destruction for the prior cut.
+The credential-separated replay broker stores enrolled root histories and live duties in one ordered custody-domain record.
+The broker closes membership and admission together for the exact operation and generation.
+Each root signs its original head, readable successor, ordered switch and joined-custody digest for that operation.
+The broker commits the complete domain drain only after it verifies those root statements and every registered worker join.
+Each root then attests its original provider's disposition against that domain drain.
+The broker retains the aggregate completion and opens the next generation after all enlisted roots settle.
+With custody control enabled, a detached broker request registers before accepting plaintext and signs its terminal observation after provider and socket drain.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
 The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring key inventory, custody work roster and latest destruction time.
 The fixed commitment binds both inventories and the deadline to the authenticated switch.

@@ -30,6 +30,7 @@ use crate::{
     store::EncryptingStore,
 };
 
+pub mod domain;
 mod staging;
 mod transfer;
 
@@ -67,7 +68,7 @@ impl History {
 #[derive(Deserialize, Serialize)]
 struct Request {
     token: String,
-    history: History,
+    history: Option<History>,
     action: Action,
 }
 
@@ -79,9 +80,14 @@ enum Action {
     AdmitAppend { epoch: u64, reference: String },
     ObserveAppend { position: i64, reference: String },
     ConfirmTransfer { route: PublishRoute, object: String },
+    Domain { domain: Uuid, command: domain::Action },
 }
 
 impl Action {
+    fn uses_custody_token(&self) -> bool {
+        matches!(self, Self::Domain { command, .. } if command.requires_custodian())
+    }
+
     fn uses_transfer_token(&self) -> bool {
         matches!(self, Self::Publish { route, .. } | Self::ConfirmTransfer { route, .. }
             if route.transfer_position().is_some())
@@ -94,6 +100,7 @@ enum Response {
     Payload { length: usize },
     Publication { version: Option<PhysicalObjectVersion> },
     AppendAdmitted,
+    Domain { view: domain::View },
     Refused { category: AnomalyCategory, code: String },
 }
 
@@ -111,6 +118,7 @@ struct Remote {
     tls: Arc<ClientConfig>,
     token: Arc<str>,
     transfer_token: Option<Arc<str>>,
+    custody_token: Option<Arc<str>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -123,7 +131,10 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    pub fn from_files(endpoint: &str, server_name: &str, ca: &Path, token: &Path, transfer_token: Option<&Path>) -> Result<Self> {
+    pub fn from_files(
+        endpoint: &str, server_name: &str, ca: &Path, token: &Path, transfer_token: Option<&Path>,
+        custody_token: Option<&Path>,
+    ) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         for certificate in CertificateDer::pem_file_iter(ca).map_err(transport)? {
             roots.add(certificate.map_err(transport)?).map_err(transport)?;
@@ -140,14 +151,23 @@ impl Client {
             tls: Arc::new(tls),
             token: Arc::from(Token::read(token)?),
             transfer_token: transfer_token.map(Token::read).transpose()?.map(Arc::from),
+            custody_token: custody_token.map(Token::read).transpose()?.map(Arc::from),
         }))))
     }
 
     pub(crate) fn standalone(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>, tasks: TaskTracker,
     ) -> Result<Self> {
-        let service = Service::open(directory, storage, serving, keys, None, None, None)?;
+        let service = Service::open(directory, storage, serving, keys, None, None, None, None)?;
         Ok(Self(Arc::new(ClientRoute::Standalone { service, tasks })))
+    }
+
+    /// Send a custody-domain command through the original broker's route.
+    pub async fn custody_domain(&self, domain: Uuid, command: domain::Action) -> Result<domain::View> {
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
+        let mut socket = remote.connect(None, Action::Domain { domain, command }).await?;
+        let Response::Domain { view } = socket_work(read_response(&mut socket)).await? else { return Err(invalid_frame()); };
+        Ok(view)
     }
 
     pub(crate) async fn read(
@@ -164,7 +184,7 @@ impl Client {
         };
         let reference = decode_reference(frame)?;
         let action = Action::Read { ticket, position, reference: URL_SAFE_NO_PAD.encode(frame) };
-        let mut socket = remote.connect(history, action).await?;
+        let mut socket = remote.connect(Some(history), action).await?;
         socket_work(async {
             let Response::Payload { length } = read_response(&mut socket).await? else {
                 return Err(invalid_frame());
@@ -183,7 +203,7 @@ impl Client {
     pub(crate) async fn admit_append(&self, history: History, epoch: u64, frame: &[u8]) -> Result<()> {
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Ok(()); };
         let action = Action::AdmitAppend { epoch, reference: URL_SAFE_NO_PAD.encode(frame) };
-        let mut socket = remote.connect(history, action).await?;
+        let mut socket = remote.connect(Some(history), action).await?;
         match socket_work(read_response(&mut socket)).await? {
             Response::AppendAdmitted => Ok(()),
             _ => Err(invalid_frame()),
@@ -193,7 +213,7 @@ impl Client {
     pub(crate) async fn observe_append(&self, history: History, position: i64, frame: &[u8]) -> Result<()> {
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Ok(()); };
         let action = Action::ObserveAppend { position, reference: URL_SAFE_NO_PAD.encode(frame) };
-        let mut socket = remote.connect(history, action).await?;
+        let mut socket = remote.connect(Some(history), action).await?;
         match socket_work(read_response(&mut socket)).await? {
             Response::AppendAdmitted => Ok(()),
             _ => Err(invalid_frame()),
@@ -239,7 +259,7 @@ impl Client {
     async fn confirm_transfer(&self, target: &DeploymentRecord, route: PublishRoute, object: &ObjectKey) -> Result<()> {
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Ok(()); };
         let action = Action::ConfirmTransfer { route, object: object.to_string() };
-        let mut socket = remote.connect(History::of(target)?, action).await?;
+        let mut socket = remote.connect(Some(History::of(target)?), action).await?;
         match socket_work(read_response(&mut socket)).await? {
             Response::AppendAdmitted => Ok(()),
             _ => Err(invalid_frame()),
@@ -260,7 +280,7 @@ impl Client {
             }).await.map_err(transport)?;
         };
         let action = Action::Publish { route, object: object.to_string(), length: bytes.len() };
-        let mut socket = remote.connect(history, action).await?;
+        let mut socket = remote.connect(Some(history), action).await?;
         socket_work(async {
             socket.write_all(&bytes).await.map_err(transport)?;
             socket.flush().await.map_err(transport)?;
@@ -273,8 +293,14 @@ impl Client {
 }
 
 impl Remote {
-    async fn connect(&self, history: History, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        let token = if action.uses_transfer_token() { self.transfer_token.as_ref().ok_or_else(refused)? } else { &self.token };
+    async fn connect(&self, history: Option<History>, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let token = if action.uses_custody_token() {
+            self.custody_token.as_ref().ok_or_else(refused)?
+        } else if action.uses_transfer_token() {
+            self.transfer_token.as_ref().ok_or_else(refused)?
+        } else {
+            &self.token
+        };
         socket_work(async {
             let stream = TcpStream::connect(self.endpoint.as_ref()).await.map_err(transport)?;
             let mut stream = TlsConnector::from(Arc::clone(&self.tls))
@@ -292,26 +318,39 @@ pub struct Service {
     keys: Arc<dyn KeyService>,
     token: Option<Token>,
     transfer_token: Option<Token>,
+    custody_token: Option<Token>,
     custody: ReplayCustody,
     memory: Arc<MemoryBudget>,
+}
+
+struct BrokerDuty {
+    authority: Uuid,
+    generation: u64,
+    id: Uuid,
+    duty: domain::Duty,
+    signer: ring::signature::Ed25519KeyPair,
 }
 
 impl Service {
     pub fn new(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
-        token: &Path, transfer_token: Option<&Path>, task: Option<rtdb_directory::HostedTask>,
+        token: &Path, transfer_token: Option<&Path>, custody_token: Option<&Path>, task: Option<rtdb_directory::HostedTask>,
     ) -> Result<Arc<Self>> {
         let ordinary = Token::read(token)?;
         let transfer = transfer_token.map(Token::read).transpose()?;
-        if transfer.as_ref() == Some(&ordinary) {
-            return Err(Anomaly::incorrect("rtdb.multi/replay-broker-credential", "Recovery transfer requires its own replay broker credential"));
+        let custody = custody_token.map(Token::read).transpose()?;
+        if transfer.as_ref() == Some(&ordinary) || custody.as_ref() == Some(&ordinary)
+            || custody.is_some() && custody == transfer
+        {
+            return Err(Anomaly::incorrect("rtdb.multi/replay-broker-credential", "Transfer, erasure custody and replay require distinct credentials"));
         }
-        Self::open(directory, storage, serving, keys, Some(Token::new(&ordinary)?), transfer.as_deref().map(Token::new).transpose()?, task)
+        Self::open(directory, storage, serving, keys, Some(Token::new(&ordinary)?),
+            transfer.as_deref().map(Token::new).transpose()?, custody.as_deref().map(Token::new).transpose()?, task)
     }
 
     fn open(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>,
-        token: Option<Token>, transfer_token: Option<Token>, task: Option<rtdb_directory::HostedTask>,
+        token: Option<Token>, transfer_token: Option<Token>, custody_token: Option<Token>, task: Option<rtdb_directory::HostedTask>,
     ) -> Result<Arc<Self>> {
         let shares_media = match (&storage, serving) {
             (CellStorage::S3 { config: payload }, CellStorage::S3 { config: serving }) => payload.bucket == serving.bucket,
@@ -329,7 +368,7 @@ impl Service {
             (_, owner) => ReplayCustody::Hosted { owner },
         };
         Ok(Arc::new(Self {
-            directory, storage, namespace, keys, custody, token, transfer_token,
+            directory, storage, namespace, keys, custody, token, transfer_token, custody_token,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
         }))
     }
@@ -499,10 +538,50 @@ impl Service {
 
     async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>) -> Result<()> {
         let request: Request = socket_work(receive_header(socket)).await?;
-        let verifier = if request.action.uses_transfer_token() { &self.transfer_token } else { &self.token };
+        let verifier = if request.action.uses_custody_token() {
+            &self.custody_token
+        } else if request.action.uses_transfer_token() {
+            &self.transfer_token
+        } else {
+            &self.token
+        };
         if !verifier.as_ref().is_some_and(|token| token.accepts(&request.token)) { return Err(refused()); }
-        let history = request.history;
-        match request.action {
+        let Request { action, history, .. } = request;
+        let action = match action {
+            Action::Domain { domain, command } if history.is_none() => {
+                let io = IoRegion::new();
+                let store = self.storage.bucket(io.clone()).await?;
+                let view = domain::execute(store.as_ref(), domain, command).await;
+                io.close_and_wait().await;
+                return socket_work(send_header(socket, &Response::Domain { view: view? })).await;
+            }
+            action => action,
+        };
+        let history = history.ok_or_else(refused)?;
+        if matches!(action, Action::Domain { .. }) { return Err(refused()); }
+        let duty = if self.custody_token.is_some() {
+            let kind = match action {
+                Action::Read { .. } => crate::journal::hosted::erasure::CustodyWork::Egress,
+                _ => crate::journal::hosted::erasure::CustodyWork::Copy,
+            };
+            Some(self.admit_domain_work(history, kind).await?)
+        } else {
+            None
+        };
+        let result = self.dispatch_work(socket, history, action).await;
+        if let Some(duty) = duty
+            && let Err(error) = self.join_domain_work(duty).await
+        {
+            tracing::warn!(code = %error.code, "Replay custody drain remains unsettled");
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, DELIVERY_INTERRUPTED,
+                "The detached replay duty has no durable join"));
+        }
+        result
+    }
+
+    async fn dispatch_work(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>, history: History, action: Action) -> Result<()> {
+        match action {
+            Action::Domain { .. } => Err(refused()),
             Action::Read { ticket, position, reference } => {
                 let frame = URL_SAFE_NO_PAD.decode(reference).map_err(|_| invalid_frame())?;
                 self.read_for_ticket(history, ticket, position, &frame, &self.memory, Some(socket)).await?;
@@ -532,6 +611,49 @@ impl Service {
                 socket_work(send_header(socket, &Response::Publication { version })).await
             }
         }
+    }
+
+    async fn admit_domain_work(
+        &self, history: History, kind: crate::journal::hosted::erasure::CustodyWork,
+    ) -> Result<BrokerDuty> {
+        use ring::signature::KeyPair;
+
+        let record = self.current(history).await?;
+        let authority = domain::directory_domain(self.namespace, &record.org, &record.lineage)?;
+        let io = IoRegion::new();
+        let store = self.storage.bucket(io.clone()).await?;
+        let view = domain::execute(store.as_ref(), authority, domain::Action::Status).await?;
+        let signer = self.domain_signer().await?;
+        let duty = domain::Duty {
+            root: history.deployment, history: domain::directory_history(history)?, kind,
+            verification_key: signer.public_key().as_ref().try_into().expect("Ed25519 key width"),
+        };
+        let id = Uuid::new_v4();
+        let admitted = domain::execute(store.as_ref(), authority,
+            domain::Action::Admit { generation: view.generation, id, duty }).await;
+        io.close_and_wait().await;
+        admitted?;
+        Ok(BrokerDuty { authority, generation: view.generation, id, duty, signer })
+    }
+
+    async fn join_domain_work(&self, work: BrokerDuty) -> Result<()> {
+        let observation: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, work.id.as_bytes())
+            .as_ref().try_into().expect("SHA-256 width");
+        let message = domain::WorkJoin::signing_bytes(work.authority, work.generation, work.id, work.duty, observation)?;
+        let join = domain::WorkJoin { observation, signature: work.signer.sign(&message).as_ref().to_vec() };
+        let io = IoRegion::new();
+        let store = self.storage.bucket(io.clone()).await?;
+        let result = domain::execute(store.as_ref(), work.authority,
+            domain::Action::Join { generation: work.generation, id: work.id, join }).await;
+        io.close_and_wait().await;
+        result.map(drop)
+    }
+
+    async fn domain_signer(&self) -> Result<ring::signature::Ed25519KeyPair> {
+        let mut seed = self.keys.key(".rtdb-custody-domain-drain-signer").await?;
+        let signer = ring::signature::Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|_| refused());
+        seed.fill(0);
+        signer
     }
 
     async fn read_for_ticket(
@@ -1023,7 +1145,7 @@ mod tests {
         let body = Bytes::from(data_frame.encode());
         let broker = Service::open(directory.clone(), CellStorage::Local { root: data.path().join("detached") },
             &CellStorage::Local { root: data.path().join("serving") },
-            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), None, None, None).unwrap();
+            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), None, None, None, None).unwrap();
         let relative = ObjectKey::new(relative).unwrap();
         let opened = broker.open_store(&record, io.clone()).await.unwrap();
         opened.put(&relative, body.clone()).await.unwrap();
