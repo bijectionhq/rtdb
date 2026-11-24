@@ -34,6 +34,7 @@ use rtdb_format::{
         publication_digest,
     },
     keys::{
+        block_index_from_key,
         block_key,
         StorageRoot,
         CURRENT_STORAGE_VERSION,
@@ -72,7 +73,7 @@ use crate::{
     deployment::CellStorage,
     keys::{ArchiveKey, KeyService},
     packing::PackDiscovery,
-    reference::{PrefixedStore, key},
+    reference::{Base, PrefixedStore, key},
     store::{
         EncryptingStore, ROOT_MARKER, open_deployment_store, open_deployment_store_with_archive,
         wall_clock,
@@ -1461,27 +1462,88 @@ async fn replay_archive_plaintext_sizes(store: &dyn ObjectStore, sources: &[Chec
     Ok(sizes)
 }
 
-/// Generic deployment forks cannot adopt governed custody. The exact hosted
-/// world and terminal transfer owners carry the required source admissions.
-pub(crate) async fn require_plain_fork_cut(
-    bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, source_key: &[u8], selected: i64,
+/// Generic deployment forks cannot adopt governed custody. Verify the
+/// selected root before allocating references or copying provider objects.
+fn verify_plain_fork_catalog(
+    source: &DeploymentRecord, selected: i64, catalog: &BlockCatalog,
 ) -> Result<()> {
-    let root = format!("{}/{}", source.storage_prefix(), checkpoint_storage_root()?);
+    if catalog.block_index().0 != selected || !catalog.secondary_databases().is_empty() {
+        return Err(inconsistent("The selected fork checkpoint has a different block or owns secondary databases"));
+    }
+    if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
+        verify_cut(catalog, checkpoint, StorageEpoch(source.log_epoch))?;
+    }
+    if catalog.table_entries()?.iter().any(|entry| rtdb_types::TableRef::owned_schema(&entry.table.schema)) {
+        return Err(unavailable("Generic deployment forks cannot copy governed relation custody"));
+    }
+    Ok(())
+}
+
+/// Called under the source lineage reservation. Verify every logical
+/// dependency and attach only its containing physical unit to the fork.
+pub(crate) async fn reference_fork_checkpoint(
+    bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, source_key: &[u8],
+    child: &DeploymentRecord, selected: i64,
+) -> Result<()> {
+    let version = checkpoint_storage_root()?;
+    let root = format!("{}/{version}", source.storage_prefix());
+    let child_root = format!("{}/{version}", child.storage_prefix());
     let marker = bucket.get_fresh(&key(&format!("{root}/{ROOT_MARKER}"))?).await?;
     if marker.as_ref() != source.id.as_bytes() {
         return Err(inconsistent("The checkpoint belongs to another source"));
     }
-    let store = open_deployment_store(bucket, &root, PackDiscovery::From(selected), wall_clock()).await?;
-    let plaintext = EncryptingStore::new(store, source_key)?;
-    let catalog = BlockCatalog::decode(&plaintext.get_fresh(&key(&block_key(BlockIndex(selected))?)?).await?)?;
-    if catalog.block_index().0 != selected || !catalog.secondary_databases().is_empty() {
-        return Err(inconsistent("The fork checkpoint has another catalog or secondary databases"));
+    let source_base = Base::load(bucket.as_ref(), &root).await?;
+    let source_store = open_deployment_store(bucket.clone(), &root, PackDiscovery::From(selected), wall_clock()).await?;
+    let plaintext = EncryptingStore::new(source_store.clone(), source_key)?;
+    let catalog_key = key(&block_key(BlockIndex(selected))?)?;
+    let catalog = BlockCatalog::decode(&plaintext.get_fresh(&catalog_key).await?)?;
+    verify_plain_fork_catalog(source, selected, &catalog)?;
+    let inventory = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
+    let sources = plan_checkpoint_copy(&plaintext, inventory, None).await?;
+
+    let mut base = Base::default();
+    for member in &sources {
+        if member.metadata_digest.is_some() { member.read(&plaintext).await?; }
+        let physical = source_store.physical_member(&member.name).await?;
+        if base.objects.contains_key(physical.as_str()) { continue; }
+        let original = key(&format!("{root}/{physical}"))?;
+        let (owner, observed) = match bucket.observe_head(&original).await {
+            Ok(observed) => (&root, observed),
+            Err(Error::MissingObject(_)) => {
+                let owner = source_base.objects.get(physical.as_str())
+                    .ok_or_else(|| inconsistent("A fork dependency has no physical owner"))?;
+                let inherited = key(&format!("{owner}/{physical}"))?;
+                (owner, bucket.observe_head(&inherited).await?)
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if observed.version != member.version {
+            return Err(inconsistent("The fork dependency has a different provider publication"));
+        }
+        base.objects.insert(physical.to_string(), owner.to_owned());
     }
-    if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
-        verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
+    base.initialize(bucket.as_ref(), &child_root).await?;
+    let store = open_deployment_store(bucket, &child_root, PackDiscovery::List, wall_clock()).await?;
+    let target = EncryptingStore::new(store, source_key)?;
+    // Bootstrap lists roots in a fork before it publishes its first
+    // checkpoint. An enclosing pack must not expose a later parent root.
+    let blocks = target.list(Some(&key("blocks")?)).await?;
+    if blocks.iter().any(|object| {
+        block_index_from_key(object.key.as_str()).is_ok_and(|block| block.0 > selected)
+    }) {
+        return Err(inconsistent("A fork pack exposes a checkpoint after the selected cut"));
     }
-    if catalog.table_entries()?.iter().any(|entry| rtdb_types::TableRef::owned_schema(&entry.table.schema)) {
-        return Err(unavailable("Generic deployment forks cannot copy governed relation custody"));
+    for batch in sources.chunks(OBSERVATION_BATCH_MEMBERS) {
+        let names = batch.iter().map(|member| member.name.clone()).collect::<Vec<_>>();
+        let observed = target.observe_heads(&names).await?;
+        for member in batch {
+            if observed.get(&member.name).is_none_or(|head| {
+                head.value.size != member.observed_bytes as u64 || head.version != member.version
+            }) {
+                return Err(inconsistent("The fork does not retain the selected physical inventory"));
+            }
+            if member.metadata_digest.is_some() { member.read(&target).await?; }
+        }
     }
     Ok(())
 }
@@ -1515,12 +1577,7 @@ pub(crate) async fn copy_fork_checkpoint(
     let root_source = CheckpointCopySource::observe(&plaintext, catalog_key.clone(), None).await?;
     let catalog_bytes = root_source.read(&plaintext).await?;
     let catalog = BlockCatalog::decode(&catalog_bytes)?;
-    if catalog.block_index() != block || !catalog.secondary_databases().is_empty() {
-        return Err(inconsistent("The selected fork checkpoint has a different block or owns secondary databases"));
-    }
-    if let Some(checkpoint) = source.checkpoint.filter(|checkpoint| checkpoint.block == selected) {
-        verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
-    }
+    verify_plain_fork_catalog(source, selected, &catalog)?;
     let mut closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
     closure.remove(&catalog_key);
     let sources = plan_checkpoint_copy(&plaintext, closure, None).await?;

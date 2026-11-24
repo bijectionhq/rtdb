@@ -2064,7 +2064,7 @@ async fn the_local_reaper_retires_an_original_l0_pack_under_verified_archive_cus
     let storage = cell.storage();
     let keys = cell.keys();
     let child = admin::fork_at_block(
-        &cell.directory, &storage, &keys, "shop", "preview", first.block, Duration::from_secs(60),
+        &cell.directory, &storage, &keys, "shop", "preview", first.block,
     ).await.unwrap();
     let parked = cell.directory.deployment(&deployment).await.unwrap().unwrap();
     let current = parked.checkpoint.unwrap();
@@ -4293,8 +4293,7 @@ async fn a_fork_at_a_past_block_holds_that_blocks_state_and_diverges_from_it() {
     cell.node(holder).agent.flush("shop").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
 
-    assert!(admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-old", 0, Duration::ZERO).await.is_err(), "a block older than the reaper's grace is refused");
-    admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", 0, Duration::from_secs(3600)).await.unwrap();
+    admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", 0).await.unwrap();
     let then = cell.connect("shop-then").await;
     assert_eq!(values(&then, "SELECT _id FROM orders").await, ["0", "1", "2"], "the fork holds the first block's state, and none of what came after");
     then.simple_query("INSERT INTO orders (_id, total) VALUES (50, 1)").await.unwrap();
@@ -4324,13 +4323,13 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     let then = rtdb_types::Timestamp(chrono::DateTime::parse_from_str(&written, "%Y-%m-%d %H:%M:%S%.f%:z").unwrap().timestamp_micros());
     for id in 5..7 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
 
-    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", None, rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
+    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", None, rtdb_types::Timestamp(0), 4 << 20).await.is_err(),
         "a time before the checkpoint is a past block's");
-    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", None, then, Duration::from_secs(3600), 4 << 20).await.unwrap();
+    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", None, then, 4 << 20).await.unwrap();
     admin::fork_time_into(
         &cell.directory, &cell.storage(), &cell.keys(), "shop",
         admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None },
-        None, then, Duration::from_secs(3600), 4 << 20,
+        None, then, 4 << 20,
     ).await.unwrap();
     let external = connect_eventually(&cell, "shop-external-then").await;
     assert_eq!(values(&external, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"]);
@@ -4376,7 +4375,7 @@ async fn a_cross_organisation_fork_owns_its_checkpoint_and_survives_erasure_of_i
     let historical = admin::fork_block_into(
         &cell.directory, &storage, &keys, "shop",
         admin::ForkDestination { name: "shop-historical", org: Some("recipient-org"), hosted_task: None },
-        first.block, Duration::from_secs(3600),
+        first.block,
     ).await.unwrap();
 
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();

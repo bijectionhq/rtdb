@@ -59,7 +59,7 @@ impl Base {
     }
 
     /// Installs the first manifest during preparation of an unpublished fork.
-    async fn initialize(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
+    pub(crate) async fn initialize(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
         self.publish_at(bucket, store, 0).await.map_err(storage)
     }
 
@@ -380,11 +380,13 @@ fn trie_block(name: &str) -> Option<i64> {
     stem.parse::<rtdb_format::keys::TrieKey>().ok().map(|trie| trie.block_index().0)
 }
 
-/// Forks the deployment at `parent` (a prefix in the cell's bucket) into `child`, referencing every object the parent's stores hold or reference, or, from a past block, those it may need.
+/// Builds a fork fixture for the storage simulation and raw reference tests.
+///
 /// A past block's packs are the ones its own pack names, its releases those before it was written, and its trie files those of blocks up to it; every other object is referenced too, since sealing makes anything the fork writes again the same bytes.
 /// A trie file of a later block is the parent's history after the fork point, under a name the fork's own compaction writes with its own rows.
 /// Derived ordered-index objects and retirement journal records stay with their original residence.
-pub async fn fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
+#[doc(hidden)]
+pub async fn simulate_fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
     let past = match at_block { Some(block) => Some((block, block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
     let wanted = |name: &str| {
         if name.starts_with("oversized/") || crate::store::stays_in_source_residence(name) { return false; }
@@ -651,7 +653,7 @@ mod tests {
         for read in ["get", "get_range", "head", "head_fresh", "list", "put"] {
             let bucket = bucket();
             put(&bucket, "parent/v06/row", b"parent").await;
-            fork(bucket.as_ref(), "parent", "child", None).await.unwrap();
+            simulate_fork(bucket.as_ref(), "parent", "child", None).await.unwrap();
             let base = Base::load(bucket.as_ref(), "child/v06").await.unwrap();
             let bucket: Bucket = Arc::new(TransferringStore {
                 inner: bucket,
@@ -695,7 +697,7 @@ mod tests {
     async fn a_cell_copy_recovers_a_reference_that_changes_owner_during_the_read() {
         let (here, there) = (bucket(), bucket());
         put(&here, "parent/v06/row", b"parent").await;
-        fork(here.as_ref(), "parent", "child", None).await.unwrap();
+        simulate_fork(here.as_ref(), "parent", "child", None).await.unwrap();
         let transferring = TransferringStore {
             inner: here.clone(),
             original: key("parent/v06/row").unwrap(),
@@ -711,7 +713,7 @@ mod tests {
     async fn a_cell_copy_fails_when_an_inherited_object_is_missing_at_both_owners() {
         let (here, there) = (bucket(), bucket());
         put(&here, "parent/v06/row", b"parent").await;
-        fork(here.as_ref(), "parent", "child", None).await.unwrap();
+        simulate_fork(here.as_ref(), "parent", "child", None).await.unwrap();
         here.delete(&key("parent/v06/row").unwrap()).await.unwrap();
         assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived").await.is_err());
     }
@@ -744,7 +746,7 @@ mod tests {
         let source = Arc::new(PrefixedStore::new(here.clone(), "source/v06"));
         let source = crate::store::GarbageStore::open(source).await.unwrap();
         source.delete(&key(&intent).unwrap()).await.unwrap();
-        fork(here.as_ref(), "source", "child", None).await.unwrap();
+        simulate_fork(here.as_ref(), "source", "child", None).await.unwrap();
         let base = Base::load(here.as_ref(), "child/v06").await.unwrap();
         assert_eq!(base.objects.into_keys().collect::<Vec<_>>(), ["blocks/b00"]);
         materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
@@ -756,7 +758,7 @@ mod tests {
         let (here, there) = (bucket(), bucket());
         put(&here, "p/v06/blocks/b00", b"parent").await;
         put(&here, &format!("p/v06/{}", crate::store::ROOT_MARKER), b"p").await;
-        fork(here.as_ref(), "p", "c", None).await.unwrap();
+        simulate_fork(here.as_ref(), "p", "c", None).await.unwrap();
         put(&here, "c/v06/blocks/b01", b"child").await;
         materialize(here.as_ref(), "c", there.as_ref(), "c").await.unwrap();
         let mut moved = physical_objects(there.as_ref(), "c/v06").await.unwrap();
@@ -778,7 +780,7 @@ mod tests {
         put(&bucket, &format!("p/v06/{}/{:020}-late", crate::store::GARBAGE_DIRECTORY, 1_500), b"{}").await;
         put(&bucket, "p/v06/tables/t/data/l01-compacted.arrow", b"compacted").await;
         put(&bucket, "p/v06/oversized/b00-parent.binpb", b"an offloaded parent journal frame").await;
-        fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
+        simulate_fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
         let referenced: Vec<String> = Base::load(bucket.as_ref(), "c/v06").await.unwrap().objects.into_keys().collect();
         assert_eq!(referenced, ["tables/t/data/l01-compacted.arrow".to_owned(), format!("{}/{:020}-early", crate::store::GARBAGE_DIRECTORY, 500), pack(0)],
             "a later block's pack and a release after the block are left out; everything else is referenced");
@@ -791,7 +793,7 @@ mod tests {
         let parent = crate::store::open_deployment_store(Arc::clone(&bucket), "p/v06", crate::packing::PackDiscovery::List, Arc::clone(&clock)).await.unwrap();
         for block in 0..2 { parent.put(&key(&rtdb_format::keys::block_key(rtdb_types::BlockIndex(block)).unwrap()).unwrap(), Bytes::from_static(b"catalog")).await.unwrap(); }
         for (name, bytes) in [("tables/t/data/l01-rc-b00.arrow", b"parent's b00"), ("tables/t/data/l01-rc-b01.arrow", b"parent's b01")] { parent.put(&key(name).unwrap(), Bytes::from_static(bytes)).await.unwrap(); }
-        fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
+        simulate_fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
         let child = crate::store::open_deployment_store(Arc::clone(&bucket), "c/v06", crate::packing::PackDiscovery::List, clock).await.unwrap();
         let listed: Vec<String> = child.list(Some(&key("tables").unwrap())).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
         assert_eq!(listed, ["tables/t/data/l01-rc-b00.arrow"], "a compaction output of a block after the fork point is not the fork's");

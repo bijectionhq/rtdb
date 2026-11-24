@@ -863,7 +863,7 @@ mod tests {
         child.parent = Some(parent.id.clone());
         child.storage_namespaces = parent.storage_namespaces;
         directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
-        crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        crate::reference::simulate_fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         super::super::release_region(directory.as_ref(), &child.id, preparation.token, false).await.unwrap();
         let child = directory.publish_fork(child, parent.version, Some(rtdb_directory::ForkPublication::Hosted(preparation))).await.unwrap();
         reap(directory.as_ref(), bucket.as_ref(), &versions, &parent, 0, None, None).await.unwrap();

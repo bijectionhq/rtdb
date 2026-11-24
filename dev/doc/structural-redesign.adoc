@@ -179,7 +179,8 @@ The coordinated collector submits eligible trie and receipt L0 work without a re
 The approved reachability contract replaces the cutoff for deletion.
 For hosted and versioned Classic S3 loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
 Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
-Abandoned remote hold recovery, renewal, full recovery-root integration and the remaining search, fork and uncoordinated timers remain open.
+Generic block and timestamp forks admit under the source lineage reservation and require the selected checkpoint's complete inventory. A same-organisation fork references its actual physical dependencies, including their enclosing packs. Fork admission no longer compares publication age.
+Abandoned remote hold recovery, renewal, full recovery-root integration, and the remaining search and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.

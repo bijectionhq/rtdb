@@ -1149,6 +1149,13 @@ impl GarbageStore {
         Self { inner, packing, index_pages: None, catalog_readers: None, loaded_releases: tokio::sync::OnceCell::new(), released: Mutex::new(BTreeMap::new()), clock }
     }
 
+    pub(crate) async fn physical_member(&self, member: &ObjectKey) -> rtdb_storage::Result<ObjectKey> {
+        match &self.packing {
+            Some(packing) => packing.physical_member(member).await,
+            None => Ok(member.clone()),
+        }
+    }
+
     async fn load_releases(&self) -> rtdb_storage::Result<()> {
         self.loaded_releases.get_or_try_init(|| async {
             let mut loaded = Vec::new();
@@ -1941,7 +1948,7 @@ mod tests {
         let file = key("tables/orders/data/l01-rc-b00.arrow");
         let source = open_deployment_store(bucket.clone(), &source_prefix, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
         source.put(&file, Bytes::from_static(b"original")).await.unwrap();
-        crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        crate::reference::simulate_fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         let child = directory.create_fork(child, parent.version).await.unwrap();
 
         let preparation = rtdb_directory::ForkPreparation { token: Uuid::new_v4(), generation: 0 };
@@ -2500,7 +2507,7 @@ mod tests {
         let parent_view = GarbageStore::open(Arc::new(raw)).await.unwrap();
         for name in ["tables/t/data/kept.arrow", "tables/t/data/parent-drops.arrow", "tables/t/data/child-drops.arrow"] { parent_view.put(&key(name), Bytes::from_static(b"rows")).await.unwrap(); }
         let bucket = LocalStore::open(root).unwrap();
-        crate::reference::fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        crate::reference::simulate_fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         let (child_store, raw) = open_store(root, &child).await;
         let child_view = GarbageStore::open(Arc::new(raw)).await.unwrap();
         assert_eq!(child_view.list(Some(&key("tables"))).await.unwrap().len(), 3, "a fork lists what it references");
@@ -2655,7 +2662,7 @@ mod tests {
         for name in ["inherited", "shadowed"] {
             bucket.put(&parent_object(name), Bytes::from_static(b"parent")).await.unwrap();
         }
-        crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        crate::reference::simulate_fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         let own: crate::reference::Bucket = Arc::new(crate::reference::PrefixedStore::new(bucket.clone(), &child_store));
         let writer = GarbageStore::open(own.clone()).await.unwrap();
         for name in ["shadowed", "owned"] {
@@ -3059,7 +3066,7 @@ mod tests {
         store.put(&key("tables/t/data/l01-rc-b00.arrow"), Bytes::from_static(b"compacted")).await.unwrap();
         store.put(&key("blocks/b00.binpb"), Bytes::from_static(b"catalog")).await.unwrap();
         store.delete(&key("tables/t/data/l01-rc-b00.arrow")).await.unwrap();
-        crate::reference::fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
+        crate::reference::simulate_fork(bucket.as_ref(), "p", "c", Some(0)).await.unwrap();
         let fork = open_deployment_store(Arc::clone(&bucket), "c/v06", crate::packing::PackDiscovery::List, clock).await.unwrap();
         let listed: Vec<String> = fork.list(Some(&key("tables"))).await.unwrap().into_iter().map(|object| object.key.as_str().to_owned()).collect();
         assert_eq!(listed, ["tables/t/data/l01-rc-b00.arrow"], "the release came after the block, though within its millisecond");
@@ -3086,7 +3093,7 @@ mod tests {
         let parent_store = format!("{}/v06", parent.storage_prefix());
         let child_store = format!("{}/v06", child.storage_prefix());
         bucket.put(&key(&format!("{parent_store}/objects/body")), Bytes::from_static(b"parent")).await.unwrap();
-        crate::reference::fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        crate::reference::simulate_fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
 
         let local = Arc::new(crate::reference::PrefixedStore::new(bucket.clone(), &child_store));
         let files = tempfile::tempdir().unwrap();

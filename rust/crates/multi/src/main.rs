@@ -57,7 +57,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi enable-placed-receipt-retirement --directory DIR --name NAME\n\
        rtdb-multi read-width --directory DIR --name NAME --width N\n\
        rtdb-multi unquarantine --directory DIR --name NAME\n\
-       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--org ORG] [--at-block N | --at-time RFC3339] [--grace SECONDS] [--cell-secret FILE]\n\
+       rtdb-multi fork --directory DIR --storage-root PATH --keys PATH --from NAME --name NAME [--org ORG] [--at-block N | --at-time RFC3339] [--cell-secret FILE]\n\
        rtdb-multi bind-journal-inventory --directory DIR --id UUID --version N --bindings FILE\n\
        rtdb-multi delete --directory DIR --storage-root PATH --keys PATH (--name NAME | --id UUID)\n\
        rtdb-multi schedule-disposal --directory DIR --id UUID\n\
@@ -815,13 +815,12 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let record = match (arguments.optional("at-block"), arguments.optional("at-time")) {
                 (None, Some(time)) => {
                     let time = time.parse::<chrono::DateTime<chrono::Utc>>().map_err(|_| usage("--at-time must be an RFC 3339 timestamp".into()))?;
-                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, replay_broker_client(&arguments, "")?.as_ref(), rtdb_types::Timestamp(time.timestamp_micros()),
-                        Duration::from_secs(arguments.number("grace", 3600u64)?), 4 << 20).await?
+                    admin::fork_time_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, replay_broker_client(&arguments, "")?.as_ref(), rtdb_types::Timestamp(time.timestamp_micros()), 4 << 20).await?
                 }
                 (at_block, _) => match at_block {
                 Some(block) => {
                     let block = block.parse().map_err(|_| usage("--at-block must be a block index".into()))?;
-                    admin::fork_block_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, block, Duration::from_secs(arguments.number("grace", 3600u64)?)).await?
+                    admin::fork_block_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, block).await?
                 }
                 None => admin::fork_into(&directory, &storage, key_service(arguments.required("keys")?).await?.as_ref(), from, destination, &rtdb_multi::control::ControlKey(cell_secret(&arguments)?)).await?,
                 },

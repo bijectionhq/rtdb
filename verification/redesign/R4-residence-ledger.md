@@ -137,6 +137,14 @@ A provider request retains its ticket through cancellation and releases it on dr
 An abandoned ticket without drain evidence remains in the ledger.
 Independent maintenance and complete recovery-root retention still require custody and settlement integration.
 
+### Generic fork admission
+
+The source lineage reservation precedes checkpoint inventory reads and orders them against the collector.
+A same-organisation fork resolves the selected root, its table blocks, and every replay member to the original physical object or enclosing pack.
+It publishes just those owner references and verifies that the recipient opens the same inventory before making the fork selectable.
+A fork into a different organisation verifies and copies the selected inventory under the recipient's own storage key.
+Historical block and timestamp admission require the precise dependencies to be present, independent of elapsed time.
+
 ### Hosted trie release records
 
 The leader reads back the installed retirement receipt and registers its exact cut under the matching catalog admission floor.

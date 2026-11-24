@@ -408,7 +408,7 @@ impl World {
         record.parent = Some(source.record.id.clone());
         record.checkpoint = None;
         let bucket = Arc::clone(&self.cells[source.cell]);
-        reference::fork(bucket.as_ref(), &source.record.storage_prefix(), &record.storage_prefix(), at.map(|block| block as i64)).await
+        reference::simulate_fork(bucket.as_ref(), &source.record.storage_prefix(), &record.storage_prefix(), at.map(|block| block as i64)).await
             .map_err(|error| format!("forking d{parent} into d{child}: {error}"))?;
         let forked = match at {
             None => Deployment {

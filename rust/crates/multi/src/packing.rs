@@ -366,6 +366,13 @@ impl PackingStore {
         }).collect()
     }
 
+    pub(crate) async fn physical_member(&self, member: &ObjectKey) -> rtdb_storage::Result<ObjectKey> {
+        match self.locate(member).await? {
+            Some(location) => Ok(self.observe_location(member, location).await?.pack),
+            None => Ok(member.clone()),
+        }
+    }
+
     /// Observes the owned publication named by this member's admitted index.
     pub(crate) async fn retirement_pack(&self, member: &ObjectKey) -> rtdb_storage::Result<Option<(ObjectKey, PhysicalObjectPublication)>> {
         let Some(location) = self.locate(member).await? else { return Ok(None); };
@@ -719,7 +726,7 @@ pub(crate) mod tests {
         for name in [&loose, &table, &root] {
             writer.put(name, plaintext.clone()).await?;
         }
-        crate::reference::fork(raw.as_ref(), "parent", "child", None).await?;
+        crate::reference::simulate_fork(raw.as_ref(), "parent", "child", None).await?;
         let child = crate::store::open_deployment_store(
             raw, "child/v06", PackDiscovery::List, crate::store::wall_clock(),
         ).await?;
