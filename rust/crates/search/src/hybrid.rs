@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, sync::Arc};
 
-use arrow_array::{Float64Array, RecordBatch, UInt64Array, cast::AsArray, types::UInt64Type};
+use arrow_array::{ArrayRef, Float64Array, RecordBatch, UInt32Array, UInt64Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, OwnedBatch};
 use rtdb_types::{Anomaly, EntityId, Result};
@@ -16,11 +16,12 @@ pub const RANK_CONSTANT: f64 = 60.0;
 /// A hit's rank is its 1-based row in its window, and a window must hold each (partition, identity) once.
 /// The fused score adds the contributions in window order, so it is the same binary64 sum on every node.
 /// Equal scores order by typed identity, then partition ordinal; `total` counts the distinct fused hits.
-pub fn fuse_ranked(windows: &[&OwnedSearchBatch], limit: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedSearchBatch> {
-    let mut scores = BTreeMap::<(usize, EntityId), f64>::new();
+/// Each window's name labels a nullable UInt32 column with the hit's rank in that window.
+pub fn fuse_ranked(windows: &[(&str, &OwnedSearchBatch)], limit: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedSearchBatch> {
+    let mut scores = BTreeMap::<(usize, EntityId), (f64, Vec<Option<u32>>)>::new();
     let mut bytes = 4096usize;
     let mut scratch = memory.reserve(bytes)?;
-    for window in windows {
+    for (ordinal, (_, window)) in windows.iter().enumerate() {
         let batch = window.hits.batch();
         let ids = batch.column(0).as_ref();
         let partitions = batch.column(2).as_primitive::<UInt64Type>();
@@ -31,33 +32,44 @@ pub fn fuse_ranked(windows: &[&OwnedSearchBatch], limit: usize, memory: &Arc<Mem
             let id = id.into_owned();
             if !seen.insert((partition, id.clone())) { return Err(invalid()); }
             let contribution = 1.0 / (RANK_CONSTANT + (row + 1) as f64);
-            match scores.entry((partition, id)) {
-                std::collections::btree_map::Entry::Occupied(mut entry) => *entry.get_mut() += contribution,
+            let rank = u32::try_from(row + 1).map_err(|_| invalid())?;
+            let (score, ranks) = match scores.entry((partition, id)) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     bytes = bytes.saturating_add(hit_bytes(&entry.key().1));
                     Arc::get_mut(&mut scratch).expect("fusion owns its scratch").grow_to(bytes)?;
-                    entry.insert(contribution);
+                    entry.insert((0.0, vec![None; windows.len()]))
                 }
-            }
+            };
+            *score += contribution;
+            ranks[ordinal] = Some(rank);
         }
     }
     let total = scores.len();
-    let mut fused: Vec<_> = scores.into_iter().map(|((partition, id), score)| (partition, id, score)).collect();
+    let mut fused: Vec<_> = scores.into_iter().map(|((partition, id), (score, ranks))| (partition, id, score, ranks)).collect();
     fused.sort_by(|left, right| right.2.total_cmp(&left.2)
         .then_with(|| EntityIdRef::from(&left.1).cmp(&EntityIdRef::from(&right.1)))
         .then_with(|| left.0.cmp(&right.0)));
     fused.truncate(limit);
-    let bound = fused.iter().fold(4096usize, |size, (_, id, _)| size.saturating_add(hit_bytes(id).saturating_mul(4)));
+    let bound = fused.iter().fold(4096usize, |size, (_, id, _, _)| {
+        size.saturating_add(hit_bytes(id).saturating_mul(4)).saturating_add(8 * windows.len())
+    });
     let reservation = memory.reserve(bound)?;
-    let schema = Arc::new(Schema::new(vec![
+    let mut fields = vec![
         rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type())?,
         Field::new("score", DataType::Float64, false),
         Field::new("partition", DataType::UInt64, false),
-    ]));
-    let ids = rtdb_columnar::entity_id_array(fused.iter().map(|(_, id, _)| EntityIdRef::from(id)))?;
-    let score = Arc::new(Float64Array::from_iter_values(fused.iter().map(|(_, _, score)| *score)));
-    let partition = Arc::new(UInt64Array::from_iter_values(fused.iter().map(|(partition, _, _)| *partition as u64)));
-    let output = RecordBatch::try_new(schema, vec![ids, score, partition])
+    ];
+    let mut columns: Vec<ArrayRef> = vec![
+        rtdb_columnar::entity_id_array(fused.iter().map(|(_, id, _, _)| EntityIdRef::from(id)))?,
+        Arc::new(Float64Array::from_iter_values(fused.iter().map(|(_, _, score, _)| *score))),
+        Arc::new(UInt64Array::from_iter_values(fused.iter().map(|(partition, _, _, _)| *partition as u64))),
+    ];
+    for (ordinal, (name, _)) in windows.iter().enumerate() {
+        fields.push(Field::new(*name, DataType::UInt32, true));
+        columns.push(Arc::new(UInt32Array::from_iter(fused.iter().map(|(_, _, _, ranks)| ranks[ordinal]))));
+    }
+    let output = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|error| Anomaly::fault("rtdb.search/hybrid-output", error.to_string()))?;
     Ok(OwnedSearchBatch { hits: OwnedBatch::with_reservation(output, reservation)?, total })
 }
@@ -94,8 +106,11 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let text = window(&[(0, "b"), (0, "a"), (1, "c")], &memory);
         let nearest = window(&[(0, "a"), (1, "b"), (0, "b")], &memory);
-        let fused = fuse_ranked(&[&text, &nearest], 3, &memory).unwrap();
+        let fused = fuse_ranked(&[("text_rank", &text), ("nearest_rank", &nearest)], 3, &memory).unwrap();
         assert_eq!(fused.total, 4);
+        let ranks = |name: &str| fused.hits.batch().column_by_name(name).unwrap().as_primitive::<arrow_array::types::UInt32Type>().iter().collect::<Vec<_>>();
+        assert_eq!(ranks("text_rank"), [Some(2), Some(1), None]);
+        assert_eq!(ranks("nearest_rank"), [Some(1), Some(3), Some(2)]);
         let page = fused.into_page().unwrap();
         let hits: Vec<_> = page.hits.iter().map(|hit| (hit.partition, hit.id.clone(), hit.score)).collect();
         let rrf = |rank: f64| 1.0 / (RANK_CONSTANT + rank);
@@ -104,6 +119,6 @@ mod tests {
             (0, EntityId::String("b".into()), rrf(1.0) + rrf(3.0)),
             (1, EntityId::String("b".into()), rrf(2.0)),
         ]);
-        assert!(fuse_ranked(&[&window(&[(0, "a"), (0, "a")], &memory)], 1, &memory).is_err());
+        assert!(fuse_ranked(&[("rank", &window(&[(0, "a"), (0, "a")], &memory))], 1, &memory).is_err());
     }
 }
