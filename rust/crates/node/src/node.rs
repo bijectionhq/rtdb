@@ -1,6 +1,6 @@
 mod historical_owned_read;
 mod hosted_control;
-pub use hosted_control::{AssertionFenceStatus, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader, RootCatalogRead};
+pub use hosted_control::{AssertionFenceStatus, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader, RetiredOriginalFamilyRead, RetiredOriginalFamilySource, RootCatalogRead};
 mod hosted_observation;
 mod transaction_evidence;
 mod funded_mutation_clock;

@@ -283,6 +283,16 @@ Registration observation also requires the current Original control view to cove
 Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
 The placed Original route checks the archive source fence before opening a Root landing and at family plaintext handoff.
 
+### Retired Original control evidence
+
+Hosting can use `OriginalAssertionFamilyReader::current_retired` to verify an authenticated archive selection against the current Original attachment.
+The verifier requires exact coverage of the carrier publication, fence, retired frontier and captured cut in the physical Original history.
+It derives the handoff commitment from the ordered `archive-source-fence.v1` row and checks that the same transaction closed the exact original installation's writer and cleared its placement assignment.
+The current original custody fingerprint and Root audience tablet must match the approved selection.
+Recovery can derive a writer commitment for an existing registry entry by proving its exact pre-fence transaction and checking its creator against the original installation at that transaction.
+This control evidence requires the Original order to be reachable and the selected history to remain readable.
+Successor release admission requires authenticated restore enrollment, an ordered control continuation and positive current disposition under the Original release owner.
+
 ### Ranked response contributor inventory
 
 Ranked held text, nearest and hybrid replies include a complete bounded family inventory, including replies with no hits.

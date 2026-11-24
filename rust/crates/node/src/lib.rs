@@ -38,7 +38,7 @@ pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainR
 pub use node::{DurableRange, FundedMutationClock, MAX_DURABLE_RANGE_BYTES, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
 pub use node::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
-pub use node::{AssertionFenceStatus, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader, RootCatalogRead};
+pub use node::{AssertionFenceStatus, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader, RetiredOriginalFamilyRead, RetiredOriginalFamilySource, RootCatalogRead};
 pub use node::SearchFileFormat;
 #[cfg(feature = "search")]
 pub use rtdb_search::{

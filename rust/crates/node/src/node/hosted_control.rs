@@ -15,6 +15,9 @@ use super::{
     covers_transaction, hosted_source_unavailable, prepare_query,
 };
 
+mod retired_original;
+pub use retired_original::{RetiredOriginalFamilyRead, RetiredOriginalFamilySource};
+
 const RESTORE: &str = "bj_rtdb_restore_hold";
 const ARCHIVE_FENCE: &str = "archive-source-fence.v1";
 
@@ -169,12 +172,7 @@ impl CurrentAssertionFamilyRead {
     }
 
     async fn carrier_point(&self, relation: &str, key: &str) -> Result<HostedControlPoint> {
-        let point = rtdb_query::read_hosted_control_point(
-            Arc::clone(&self.context), TableRef::new("public", relation),
-            &EntityId::String(key.to_owned()), true,
-        ).await?;
-        self.context.check_cancelled()?;
-        Ok(point)
+        read_carrier_point(&self.context, relation, key).await
     }
 
     pub async fn assertion_family_fence(&self, family: Uuid) -> Result<Option<AssertionFamilyFenceMarker>> {
@@ -198,6 +196,14 @@ impl CurrentAssertionFamilyRead {
         self.context.check_cancelled()?;
         Ok(registration.map(|(world, _)| world))
     }
+}
+
+async fn read_carrier_point(
+    context: &Arc<rtdb_query::QueryContext>, relation: &str, key: &str,
+) -> Result<HostedControlPoint> {
+    rtdb_query::read_hosted_control_point(
+        Arc::clone(context), TableRef::new("public", relation), &EntityId::String(key.to_owned()), true,
+    ).await
 }
 
 #[derive(Clone)]
