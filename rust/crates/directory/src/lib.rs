@@ -361,7 +361,7 @@ pub struct DeploymentRecord {
     pub checkpoint_transfer_activation: Option<Box<CheckpointTransferActivation>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hosted_fork_stage: Option<HostedForkStage>,
+    pub fork_stage: Option<ForkStage>,
     /// Terminal same-history repair receipts survive later repairs and moves.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub checkpoint_repair_receipts: BTreeMap<uuid::Uuid, CheckpointRecovery>,
@@ -1162,7 +1162,7 @@ pub struct CheckpointTransferSelection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostedForkStage {
+pub struct ForkStage {
     pub source_lineage: String,
     pub preparation: ForkPreparation,
 }
@@ -1183,7 +1183,7 @@ impl DeploymentRecord {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
             ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
-            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
+            cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
 
@@ -1394,7 +1394,7 @@ pub trait Directory: Send + Sync {
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
     /// Reserves the child ID before hosted fork preparation can write its objects or logs.
-    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord>;
+    async fn stage_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord>;
     /// Creates the child and its name with the parent version check and, for a shared fork, advances the lineage's reference revision in the same transaction.
     async fn create_fork(&self, child: DeploymentRecord, expected_parent: Version) -> Result<DeploymentRecord> {
         self.publish_fork(child, expected_parent, None).await
@@ -1542,39 +1542,41 @@ fn shared_fork_lineage<'a>(child: &'a DeploymentRecord, parent: Option<&Deployme
 }
 
 fn fork_stage_changed() -> Anomaly {
-    Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/fork-stage-changed", "The hosted fork's staged residence has changed")
+    Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/fork-stage-changed", "The fork's staged residence has changed")
 }
 
-fn stage_hosted_fork_record(mut child: DeploymentRecord, parent: &DeploymentRecord, lineage: &LineageState,
+fn stage_fork_record(mut child: DeploymentRecord, parent: &DeploymentRecord, lineage: &LineageState,
     preparation: ForkPreparation) -> Result<DeploymentRecord> {
     shared_fork_lineage(&child, Some(parent), parent.version)?;
-    let owner = lineage.preparations().find_map(|(held, owner)| match owner {
-        PreparationOwner::Hosted { task } if held == preparation => Some(task.clone()),
-        _ => None,
-    }).ok_or_else(fork_stage_changed)?;
-    if child.lifecycle != Lifecycle::Live || child.holder.is_some() || child.hosted_fork_stage.is_some()
+    let owner = lineage.preparations().find_map(|(held, owner)| (held == preparation).then_some(owner))
+        .ok_or_else(fork_stage_changed)?;
+    if child.lifecycle != Lifecycle::Live || child.holder.is_some() || child.fork_stage.is_some()
         || child.checkpoint_stage.is_some() || child.incarnation != 1 || child.epoch > 1
         || child.storage_namespaces != parent.storage_namespaces || !child.storage_regions.is_empty()
     {
         return Err(fork_stage_changed());
     }
     child.lifecycle = Lifecycle::Restoring;
-    child.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
-    child.storage_regions.insert(preparation.token, StorageRegion::Remote {
-        tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
-        archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: None, owner, closed: false, publications: BTreeMap::new(),
-    });
+    child.fork_stage = Some(ForkStage { source_lineage: parent.lineage.clone(), preparation });
+    if let PreparationOwner::Hosted { task } = owner {
+        child.storage_regions.insert(preparation.token, StorageRegion::Remote {
+            tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: None, owner: task.clone(),
+            closed: false, publications: BTreeMap::new(),
+        });
+    }
     Ok(child)
 }
 
 fn fork_stage_version(child: &DeploymentRecord, staged: Option<&DeploymentRecord>, parent: &DeploymentRecord,
     preparation: Option<ForkPublication>) -> Result<Option<Version>> {
-    if child.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
-    let Some(ForkPublication::Hosted(preparation)) = preparation else { return Ok(None); };
+    if child.fork_stage.is_some() { return Err(fork_stage_changed()); }
+    let Some(ForkPublication::Hosted(preparation) | ForkPublication::Local(preparation)) = preparation
+        else { return Ok(None); };
     let staged = staged.ok_or_else(fork_stage_changed)?;
     let mut expected = child.clone();
     expected.lifecycle = Lifecycle::Restoring;
-    expected.hosted_fork_stage = Some(HostedForkStage { source_lineage: parent.lineage.clone(), preparation });
+    expected.fork_stage = Some(ForkStage { source_lineage: parent.lineage.clone(), preparation });
     expected.version = staged.version;
     if child.lifecycle != Lifecycle::Live || !child.storage_regions.is_empty() || *staged != expected { return Err(fork_stage_changed()); }
     Ok(Some(staged.version))
@@ -1602,7 +1604,7 @@ fn prepare_checkpoint_transfer(
         || source.archive_retirement.is_some() || source.checkpoint_capture_retirements.contains_key(&intent.capture)
         || destination.checkpoint_stage.as_deref() != Some(stage)
         || destination.lifecycle != Lifecycle::Restoring || destination.holder.is_some()
-        || destination.parent.is_some() || destination.hosted_fork_stage.is_some()
+        || destination.parent.is_some() || destination.fork_stage.is_some()
     {
         return Err(transfer_changed());
     }
@@ -1616,7 +1618,7 @@ fn prepare_checkpoint_transfer(
     }
     if source.version != selection.source_version || destination.version != selection.destination_version
         || source.writer_pool().is_none() || source.parent.is_some() || source.move_from.is_some()
-        || source.cell_move.is_some() || source.checkpoint_stage.is_some() || source.hosted_fork_stage.is_some()
+        || source.cell_move.is_some() || source.checkpoint_stage.is_some() || source.fork_stage.is_some()
         || source.move_intent.is_some() || source.placement_move.is_some()
         || source.checkpoint_recovery.as_deref().is_some_and(|recovery| recovery.completed_at_ms.is_none())
         || source.has_live_suffix_pins(now_ms()) || destination.checkpoint_transfer_fence.is_some()
@@ -1820,8 +1822,8 @@ fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) 
 }
 
 fn require_fork_stage_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
-    if current.hosted_fork_stage.is_none() && next.hosted_fork_stage.is_none() { return Ok(()); }
-    if current.hosted_fork_stage != next.hosted_fork_stage || next.holder.is_some()
+    if current.fork_stage.is_none() && next.fork_stage.is_none() { return Ok(()); }
+    if current.fork_stage != next.fork_stage || next.holder.is_some()
         || current.parent != next.parent || current.storage_prefix() != next.storage_prefix()
         || current.storage_namespaces != next.storage_namespaces || current.replica_journals != next.replica_journals
         || !matches!((current.lifecycle, next.lifecycle),
@@ -1941,13 +1943,13 @@ impl MemoryDirectory {
         if state.installed_journals.contains(&record.id) || (stage_version.is_none() && state.deployments.contains_key(&record.id)) {
             return Err(exists("Deployment", &record.id));
         }
-        if record.hosted_fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
+        if record.fork_stage.is_none() && state.names.contains_key(&record.name) { return Err(exists("Deployment name", &record.name)); }
         if let Some((lineage, next)) = lineage {
             let stored = next.legacy_revision().map_or_else(|| StoredLineage::Current(next), StoredLineage::Legacy);
             state.reference_revisions.insert(lineage, stored);
         }
         record.version = stage_version.unwrap_or(0) + 1;
-        if record.hosted_fork_stage.is_none() { state.names.insert(record.name.clone(), record.id.clone()); }
+        if record.fork_stage.is_none() { state.names.insert(record.name.clone(), record.id.clone()); }
         if let Some(holder) = &record.holder {
             state.held.entry(holder.clone()).or_default().insert(record.id.clone());
         }
@@ -1982,15 +1984,15 @@ impl Directory for MemoryDirectory {
         Ok(())
     }
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
-        if record.hosted_fork_stage.is_some() { return Err(fork_stage_changed()); }
+        if record.fork_stage.is_some() { return Err(fork_stage_changed()); }
         let mut state = self.state()?;
         self.insert_deployment(&mut state, record, None, None)
     }
-    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
+    async fn stage_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
         let mut state = self.state()?;
         let parent = state.deployments.get(fork_parent_id(&child)?).ok_or_else(fork_conflict)?;
         let lineage = state.reference_revisions.get(&parent.lineage).map(StoredLineage::state).unwrap_or_default();
-        let stage = stage_hosted_fork_record(child, parent, &lineage, preparation)?;
+        let stage = stage_fork_record(child, parent, &lineage, preparation)?;
         self.insert_deployment(&mut state, stage, None, None)
     }
     async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {

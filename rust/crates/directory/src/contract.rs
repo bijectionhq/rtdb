@@ -174,8 +174,8 @@ async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecor
         directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
     }
     assert_eq!(directory.publish_fork(child.clone(), parent.version, publication(preparation)).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
-    let staged = directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
-    let abandoned_stage = directory.stage_hosted_fork(rejected.clone(), abandoned).await.unwrap();
+    let staged = directory.stage_fork(child.clone(), preparation).await.unwrap();
+    let abandoned_stage = directory.stage_fork(rejected.clone(), abandoned).await.unwrap();
     assert_eq!(directory.deployment(&staged.id).await.unwrap().as_ref(), Some(&staged));
     assert!(directory.deployment_by_name(&staged.name).await.unwrap().is_none());
     assert_eq!(directory.create_deployment(child.clone()).await.unwrap_err().code, "rtdb.directory/exists");
@@ -190,7 +190,7 @@ async fn hosted_fork_staging(directory: &dyn Directory, parent: &DeploymentRecor
 
     let published = directory.publish_fork(child, parent.version, publication(preparation)).await.unwrap();
     assert_eq!(published.version, drained.version + 1);
-    assert_eq!(published.hosted_fork_stage, None);
+    assert_eq!(published.fork_stage, None);
     assert_eq!(directory.deployment_by_name(&published.name).await.unwrap(), Some(published.clone()));
     let mut stale_close = drained.clone();
     stale_close.lifecycle = Lifecycle::Deleting;
@@ -227,6 +227,8 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     let mut child = DeploymentRecord::new(format!("{name}-prepared"), &parent.org, vec![], 0);
     child.parent = Some(parent.id.clone());
     child.lineage.clone_from(lineage);
+    let stage = directory.stage_fork(child.clone(), preparation).await.unwrap();
+    assert!(stage.storage_regions.is_empty());
     directory.publish_fork(child, parent.version, Some(crate::ForkPublication::Local(preparation))).await.unwrap();
     assert_eq!(directory.change_lineage(lineage, reserve).await.unwrap_err().code, "rtdb.directory/lineage-changed");
 
@@ -242,11 +244,12 @@ async fn local_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
     assert_eq!(directory.create_fork(late.clone(), parent.version).await.unwrap_err().code, "rtdb.directory/lineage-changed");
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await.unwrap();
     assert_eq!(directory.change_lineage(lineage, prepare).await.unwrap_err().code, "rtdb.directory/lineage-changed");
-    assert_eq!(directory.publish_fork(late.clone(), parent.version, Some(crate::ForkPublication::Local(preparation))).await.unwrap_err().code, "rtdb.directory/lineage-changed");
+    assert_eq!(directory.publish_fork(late.clone(), parent.version, Some(crate::ForkPublication::Local(preparation))).await.unwrap_err().code, "rtdb.directory/fork-stage-changed");
     assert!(directory.deployment(&late.id).await.unwrap().is_none());
 
     let current = ForkPreparation { token: uuid::Uuid::new_v4(), generation: generation + 1 };
     directory.change_lineage(lineage, LineageChange::PrepareFork { preparation: current, local_volume }).await.unwrap();
+    directory.stage_fork(late.clone(), current).await.unwrap();
     directory.publish_fork(late, parent.version, Some(crate::ForkPublication::Local(current))).await.unwrap();
 }
 

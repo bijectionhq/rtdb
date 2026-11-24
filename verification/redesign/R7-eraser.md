@@ -173,3 +173,6 @@ A shared hosted fork reserves membership at the original broker before referenci
 A live Directory publication makes it a dependent root.
 A rejected stage retains the reservation until Directory disposal.
 The published membership binds the source checkpoint and the original resolved suffix before child transaction renumbering.
+Local forks use the same broker reservation and exact inherited basis as hosted forks.
+A local stage holds the volume fence through publication.
+A rejected stage retains its custody reservation until Directory records disposal.

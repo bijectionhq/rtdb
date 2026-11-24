@@ -303,13 +303,18 @@ impl State {
                 }
                 self.roots.insert(*root, *enrollment);
             }
-            Action::ReserveFork { fork } => {
+            Action::ReserveFork { fork, genesis } => {
                 let child = fork.child.deployment;
                 if let Some(prior) = self.forks.get(&child) {
                     if prior == fork { return Ok(()); }
                     return Err(conflict("A different custody enrollment owns this fork"));
                 }
                 self.require_open(self.generation)?;
+                if self.roots.is_empty() && let Some(enrollment) = genesis {
+                    self.apply(&Action::Enroll {
+                        generation: self.generation, root: fork.parent.deployment, enrollment: *enrollment,
+                    })?;
+                }
                 let parent = self.roots.get(&fork.parent.deployment)
                     .ok_or_else(|| conflict("The fork source is outside the custody membership"))?;
                 if parent.history != directory_history(fork.parent)?
@@ -634,7 +639,7 @@ pub enum Action {
         enrollment: Root,
     },
     #[serde(skip)]
-    ReserveFork { fork: ForkEnrollment },
+    ReserveFork { fork: ForkEnrollment, genesis: Option<Root> },
     #[serde(skip)]
     RecordForkBasis { child: Uuid, history: [u8; 32], preparation: rtdb_directory::ForkPreparation, basis: ForkBasis },
     #[serde(skip)]
@@ -901,7 +906,7 @@ mod tests {
             parent, child, enrollment: root(child),
             preparation: rtdb_directory::ForkPreparation { token: Uuid::new_v4(), generation: 0 },
         };
-        let reserve = Action::ReserveFork { fork };
+        let reserve = Action::ReserveFork { fork, genesis: None };
         let begin = Action::Begin { generation: 1, operation: Uuid::new_v4(), target: [19; 32] };
         state.apply(&reserve).unwrap();
         state.apply(&reserve).unwrap();

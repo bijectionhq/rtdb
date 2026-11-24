@@ -99,8 +99,8 @@ mod tests {
     impl Directory for Scripted {
         async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> { self.inner.reserve_installed_journal(id).await }
         async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
-        async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: crate::ForkPreparation) -> Result<DeploymentRecord> {
-            self.inner.stage_hosted_fork(child, preparation).await
+        async fn stage_fork(&self, child: DeploymentRecord, preparation: crate::ForkPreparation) -> Result<DeploymentRecord> {
+            self.inner.stage_fork(child, preparation).await
         }
         async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<crate::ForkPublication>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected_parent, preparation).await }
         async fn lineage_state(&self, lineage: &str) -> Result<crate::LineageState> { self.inner.lineage_state(lineage).await }

@@ -845,7 +845,7 @@ impl PublicationJournal for DirectoryPublications {
                             && crate::archive::admits_checkpoint_transfer_object(record, &fence.destination, key.as_str())
                     }),
                 PublicationOwner::HostedFork => record.lifecycle == Lifecycle::Restoring
-                    && record.hosted_fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),
+                    && record.fork_stage.as_ref().is_some_and(|stage| stage.preparation.token == self.region),
             };
             if !accepts_writes || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
             {
@@ -1025,7 +1025,7 @@ async fn abort_remote_publications(
     let CellStorage::S3 { config } = archive.as_ref().unwrap_or(serving) else {
         return Err(unrecognized());
     };
-    if record.hosted_fork_stage.is_some() {
+    if record.fork_stage.is_some() {
         let bucket = serving.bucket(IoRegion::new()).await?;
         let namespace = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?;
         if namespace.is_none() || namespace != record.storage_namespaces.map(|binding| binding.objects) {
@@ -2006,13 +2006,11 @@ pub async fn run_reaper(
                     }
                     drop(maintenance);
                     if let Some(keys) = keys.as_deref() {
-                        if matches!(storage, CellStorage::S3 { .. }) {
-                            for record in &deployments {
-                                match cancellation.run_until_cancelled(crate::admin::close_abandoned_hosted_fork(directory.as_ref(), record)).await {
-                                    None => return,
-                                    Some(Err(error)) => eprintln!("Hosted fork {} is retained: {}", record.id, error.code),
-                                    Some(Ok(())) => {},
-                                }
+                        for record in &deployments {
+                            match cancellation.run_until_cancelled(crate::admin::close_abandoned_fork(directory.as_ref(), record)).await {
+                                None => return,
+                                Some(Err(error)) => eprintln!("Fork {} is retained: {}", record.id, error.code),
+                                Some(Ok(())) => {},
                             }
                         }
                         for record in &deployments {
@@ -3207,7 +3205,7 @@ mod tests {
         child.storage_namespaces = parent.storage_namespaces;
         let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
         directory.change_lineage(&parent.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
-        directory.stage_hosted_fork(child.clone(), preparation).await.unwrap();
+        directory.stage_fork(child.clone(), preparation).await.unwrap();
         let prefix = key(&child.storage_prefix());
         let object = key(&format!("{prefix}/v06/rows"));
         let target = format!("{root}/{object}").into();
@@ -3224,7 +3222,7 @@ mod tests {
 
         directory.change_lineage(&parent.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
         let stage = directory.deployment(&child.id).await.unwrap().unwrap();
-        crate::admin::close_abandoned_hosted_fork(directory.as_ref(), &stage).await.unwrap();
+        crate::admin::close_abandoned_fork(directory.as_ref(), &stage).await.unwrap();
         let closed = directory.deployment(&child.id).await.unwrap().unwrap();
         assert!(matches!(&closed.storage_regions[&preparation.token], StorageRegion::Remote { closed: true, publications, .. }
             if publications[&attempt].upload_id == upload));

@@ -166,7 +166,7 @@ impl Client {
         }))))
     }
 
-    pub(crate) fn standalone(
+    pub fn standalone(
         directory: Arc<dyn Directory>, storage: CellStorage, serving: &CellStorage, keys: Arc<dyn KeyService>, tasks: TaskTracker,
     ) -> Result<Self> {
         let service = Service::open(directory, storage, serving, keys, None, None, None, None)?;
@@ -183,6 +183,10 @@ impl Client {
 
     /// Send a custody-domain command through the original broker's route.
     pub async fn custody_domain(&self, domain: Uuid, command: domain::Action) -> Result<domain::View> {
+        if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
+            let service = Arc::clone(service);
+            return tasks.spawn(async move { service.domain_action(domain, command).await }).await.map_err(transport)?;
+        }
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
         let mut socket = remote.connect(None, Action::Domain { domain, command }).await?;
         let Response::Domain { view } = socket_work(read_response(&mut socket)).await? else { return Err(invalid_frame()); };
@@ -192,6 +196,10 @@ impl Client {
     pub(crate) async fn enroll_fork(
         &self, parent: History, child: History, preparation: rtdb_directory::ForkPreparation,
     ) -> Result<()> {
+        if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
+            let service = Arc::clone(service);
+            return tasks.spawn(async move { service.reserve_domain_fork(parent, child, preparation).await }).await.map_err(transport)?;
+        }
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
         let mut socket = remote.connect(Some(parent), Action::EnrollFork { child, preparation }).await?;
         match socket_work(read_response(&mut socket)).await? {
@@ -203,6 +211,10 @@ impl Client {
     pub(crate) async fn record_fork_basis(
         &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis,
     ) -> Result<()> {
+        if let ClientRoute::Standalone { service, tasks } = self.0.as_ref() {
+            let service = Arc::clone(service);
+            return tasks.spawn(async move { service.record_domain_fork_basis(child, preparation, basis).await }).await.map_err(transport)?;
+        }
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
         let mut socket = remote.connect(Some(child), Action::RecordForkBasis { preparation, basis }).await?;
         match socket_work(read_response(&mut socket)).await? {
@@ -595,14 +607,8 @@ impl Service {
         let Request { action, history, .. } = request;
         let action = match action {
             Action::Domain { domain, command } if history.is_none() => {
-                let io = IoRegion::new();
-                let store = self.storage.bucket(io.clone()).await?;
-                let view = async {
-                    self.reconcile_domain_forks(store.as_ref(), domain).await?;
-                    domain::execute(store.as_ref(), domain, command).await
-                }.await;
-                io.close_and_wait().await;
-                return socket_work(send_header(socket, &Response::Domain { view: view? })).await;
+                let view = self.domain_action(domain, command).await?;
+                return socket_work(send_header(socket, &Response::Domain { view })).await;
             }
             Action::EnrollFork { child, preparation } => {
                 self.reserve_domain_fork(history.ok_or_else(refused)?, child, preparation).await?;
@@ -670,34 +676,54 @@ impl Service {
         }
     }
 
+    async fn domain_action(&self, authority: Uuid, action: domain::Action) -> Result<domain::View> {
+        let io = IoRegion::new();
+        let store = self.storage.bucket(io.clone()).await?;
+        let result = async {
+            self.reconcile_domain_forks(store.as_ref(), authority).await?;
+            domain::execute(store.as_ref(), authority, action).await
+        }.await;
+        io.close_and_wait().await;
+        result
+    }
+
+    async fn directory_enrollment(&self, authority: Uuid, history: History) -> Result<domain::Root> {
+        use ring::signature::KeyPair;
+
+        let signer = self.fork_signer(authority, history.deployment, "evidence").await?;
+        let admission = self.fork_signer(authority, history.deployment, "admission").await?;
+        Ok(domain::Root {
+            history: domain::directory_history(history)?,
+            verification_key: signer.public_key().as_ref().try_into().expect("Ed25519 key width"),
+            admission_key: admission.public_key().as_ref().try_into().expect("Ed25519 key width"),
+        })
+    }
+
     async fn reserve_domain_fork(
         &self, parent: History, child: History, preparation: rtdb_directory::ForkPreparation,
     ) -> Result<()> {
-        use ring::signature::KeyPair;
-
         let source = self.current(parent).await?;
         let stage = self.current(child).await?;
         if stage.lifecycle != Lifecycle::Restoring || stage.parent.as_deref() != Some(source.id.as_str())
             || stage.org != source.org || stage.lineage != source.lineage
             || stage.storage_namespaces != source.storage_namespaces
-            || !stage.hosted_fork_stage.as_ref().is_some_and(|selected|
+            || !stage.fork_stage.as_ref().is_some_and(|selected|
                 selected.source_lineage == source.lineage && selected.preparation == preparation)
             || !self.directory.lineage_state(&source.lineage).await?.preparations().any(|(held, _)| held == preparation)
         {
             return Err(refused());
         }
         let authority = domain::directory_domain(self.namespace, &source.org, &source.lineage)?;
-        let signer = self.fork_signer(authority, child.deployment, "evidence").await?;
-        let admission = self.fork_signer(authority, child.deployment, "admission").await?;
-        let enrollment = domain::Root {
-            history: domain::directory_history(child)?,
-            verification_key: signer.public_key().as_ref().try_into().expect("Ed25519 key width"),
-            admission_key: admission.public_key().as_ref().try_into().expect("Ed25519 key width"),
-        };
+        let enrollment = self.directory_enrollment(authority, child).await?;
         let fork = domain::ForkEnrollment { parent, child, preparation, enrollment };
+        let local_genesis = matches!(self.custody, ReplayCustody::Local) && source.id == source.lineage;
+        let genesis = if local_genesis { Some(self.directory_enrollment(authority, parent).await?) } else { None };
         let io = IoRegion::new();
         let store = self.storage.bucket(io.clone()).await?;
-        let result = domain::execute(store.as_ref(), authority, domain::Action::ReserveFork { fork }).await;
+        let result = async {
+            self.reconcile_domain_forks(store.as_ref(), authority).await?;
+            domain::execute(store.as_ref(), authority, domain::Action::ReserveFork { fork, genesis }).await
+        }.await;
         io.close_and_wait().await;
         result.map(drop)
     }
@@ -706,7 +732,7 @@ impl Service {
         &self, child: History, preparation: rtdb_directory::ForkPreparation, basis: domain::ForkBasis,
     ) -> Result<()> {
         let stage = self.current(child).await?;
-        if stage.lifecycle != Lifecycle::Restoring || !stage.hosted_fork_stage.as_ref().is_some_and(|selected|
+        if stage.lifecycle != Lifecycle::Restoring || !stage.fork_stage.as_ref().is_some_and(|selected|
             selected.preparation == preparation && selected.source_lineage == stage.lineage)
         {
             return Err(refused());
@@ -752,7 +778,7 @@ impl Service {
             // The directory switches the child and consumes the preparation in
             // one decision. Re-read after that fence before resolving the member.
             let child = self.current(fork.child).await?;
-            let published = child.hosted_fork_stage.is_none();
+            let published = child.fork_stage.is_none();
             if published || child.lifecycle == Lifecycle::Deleted {
                 domain::execute(store, authority, domain::Action::FinishFork { fork, published }).await?;
             }

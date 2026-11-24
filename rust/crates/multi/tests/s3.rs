@@ -296,7 +296,7 @@ async fn exercise_cell(storage: CellStorage) {
     let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
     let parent = cell.directory.deployment_by_name("shop").await.unwrap().unwrap();
     eprintln!("S3 phase: fork parent");
-    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", Some(&cell.fork_broker()), &control()).await.unwrap();
     prove_rejected_fork_disposal(&cell, &child).await;
     let copied = rtdb_multi::reference::stores(bucket.as_ref(), &child.storage_prefix()).await.unwrap();
     for store in &copied {
@@ -350,9 +350,9 @@ async fn prove_rejected_fork_disposal(cell: &Cell, published: &rtdb_directory::D
     let directory = cell.directory.as_ref();
     let storage = cell.storage();
     let keys = cell.keys();
-    assert_eq!(admin::fork(&cell.directory, &storage, &keys, "shop", &published.name, &control()).await.unwrap_err().code, "rtdb.directory/exists");
+    assert_eq!(admin::fork(&cell.directory, &storage, &keys, "shop", &published.name, Some(&cell.fork_broker()), &control()).await.unwrap_err().code, "rtdb.directory/exists");
     let rejected = directory.deployments().await.unwrap().into_iter().find(|record| {
-        record.name == published.name && record.hosted_fork_stage.is_some()
+        record.name == published.name && record.fork_stage.is_some()
     }).unwrap();
     let id = &rejected.id;
     let bucket = storage.bucket(IoRegion::new()).await.unwrap();

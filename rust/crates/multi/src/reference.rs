@@ -522,7 +522,7 @@ impl References {
     pub async fn scan(bucket: &dyn ObjectStore, records: &[DeploymentRecord]) -> Result<Self> {
         let mut references = Self::default();
         for record in records {
-            if record.lifecycle == Lifecycle::Deleted || record.hosted_fork_stage.is_some() { continue; }
+            if record.lifecycle == Lifecycle::Deleted || record.fork_stage.is_some() { continue; }
             for store in stores(bucket, &record.storage_prefix()).await? {
                 // One listing per store, rather than a request per reference, on every reaper pass.
                 let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();

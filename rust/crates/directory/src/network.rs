@@ -30,7 +30,7 @@ enum Op {
     ReceiverClock { domain: uuid::Uuid },
     PublishReceiverClock { domain: uuid::Uuid, publisher: uuid::Uuid, observation: rtdb_types::Timestamp },
     CreateDeployment { record: DeploymentRecord },
-    StageHostedFork { child: DeploymentRecord, preparation: ForkPreparation },
+    StageFork { child: DeploymentRecord, preparation: ForkPreparation },
     CreateFork { child: DeploymentRecord, expected_parent: Version, #[serde(default)] preparation: Option<ForkPublication> },
     SharedReferenceRevision { lineage: String },
     LineageState { lineage: String },
@@ -117,7 +117,7 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
             Reply::InstalledJournalReserved
         }
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
-        Op::StageHostedFork { child, preparation } => Reply::Deployment(directory.stage_hosted_fork(child, preparation).await?),
+        Op::StageFork { child, preparation } => Reply::Deployment(directory.stage_fork(child, preparation).await?),
         Op::CreateFork { child, expected_parent, preparation } => Reply::Deployment(directory.publish_fork(child, expected_parent, preparation).await?),
         Op::SharedReferenceRevision { lineage } => Reply::SharedReferenceRevision(directory.shared_reference_revision(&lineage).await?),
         Op::LineageState { lineage } => Reply::LineageState(directory.lineage_state(&lineage).await?),
@@ -474,8 +474,8 @@ impl Directory for RemoteDirectory {
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         match self.call(Op::CreateDeployment { record }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
-    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
-        match self.call(Op::StageHostedFork { child, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
+    async fn stage_fork(&self, child: DeploymentRecord, preparation: ForkPreparation) -> Result<DeploymentRecord> {
+        match self.call(Op::StageFork { child, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }
     }
     async fn publish_fork(&self, child: DeploymentRecord, expected_parent: Version, preparation: Option<ForkPublication>) -> Result<DeploymentRecord> {
         match self.call(Op::CreateFork { child, expected_parent, preparation }).await? { Reply::Deployment(record) => Ok(record), other => Err(protocol(other)) }

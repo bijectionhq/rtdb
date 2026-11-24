@@ -222,6 +222,15 @@ impl Cell {
 
     pub fn storage(&self) -> CellStorage { self.objects.clone() }
     pub fn keys(&self) -> rtdb_multi::keys::LocalKeyService { rtdb_multi::keys::LocalKeyService::new(self.data.path().join("keys")).unwrap() }
+    pub fn fork_broker(&self) -> rtdb_multi::replay_broker::Client {
+        let root = self.data.path();
+        rtdb_multi::replay_broker::Client::standalone(
+            self.directory.clone(), CellStorage::Local { root: root.join("fork-custody") }, &self.objects,
+            Arc::new(rtdb_multi::keys::LocalKeyService::new(root.join("fork-custody-keys")).unwrap()),
+            tokio_util::task::TaskTracker::new(),
+        ).unwrap()
+    }
+
     pub fn node(&self, index: usize) -> &process::RunningNode { self.nodes[index].as_ref().unwrap() }
 
     pub async fn stop(mut self) -> tempfile::TempDir {

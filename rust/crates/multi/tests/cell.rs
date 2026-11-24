@@ -153,8 +153,8 @@ impl ObservedDirectory {
 impl Directory for ObservedDirectory {
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> { self.inner.reserve_installed_journal(id).await }
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> { self.inner.create_deployment(record).await }
-    async fn stage_hosted_fork(&self, child: DeploymentRecord, preparation: rtdb_directory::ForkPreparation) -> Result<DeploymentRecord> {
-        self.inner.stage_hosted_fork(child, preparation).await
+    async fn stage_fork(&self, child: DeploymentRecord, preparation: rtdb_directory::ForkPreparation) -> Result<DeploymentRecord> {
+        self.inner.stage_fork(child, preparation).await
     }
     async fn publish_fork(&self, child: DeploymentRecord, expected: rtdb_directory::Version, preparation: Option<rtdb_directory::ForkPublication>) -> Result<DeploymentRecord> { self.inner.publish_fork(child, expected, preparation).await }
     async fn lineage_state(&self, lineage: &str) -> Result<rtdb_directory::LineageState> { self.inner.lineage_state(lineage).await }
@@ -1589,7 +1589,7 @@ async fn a_fork_starts_from_its_parents_data_and_diverges_and_a_deletion_leaves_
     client.simple_query("INSERT INTO orders (_id, total) VALUES (2, 20)").await.unwrap();
     drop(client);
 
-    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", Some(&cell.fork_broker()), &control()).await.unwrap();
     assert_eq!((child.lineage.as_str(), child.parent.as_deref()), (parent.lineage.as_str(), Some(parent.id.as_str())));
     let root = cell.data.path().join("objects");
     let own = |prefix: &str| files_under(&root.join(prefix)).into_iter().filter(|path| !path.components().any(|part| part.as_os_str() == rtdb_multi::reference::BASE_MANIFEST)).count();
@@ -2064,7 +2064,7 @@ async fn the_local_reaper_retires_an_original_l0_pack_under_verified_archive_cus
     let storage = cell.storage();
     let keys = cell.keys();
     let child = admin::fork_at_block(
-        &cell.directory, &storage, &keys, "shop", "preview", first.block,
+        &cell.directory, &storage, &keys, "shop", "preview", Some(&cell.fork_broker()), first.block,
     ).await.unwrap();
     let parked = cell.directory.deployment(&deployment).await.unwrap().unwrap();
     let current = parked.checkpoint.unwrap();
@@ -4300,7 +4300,7 @@ async fn a_fork_at_a_past_block_holds_that_blocks_state_and_diverges_from_it() {
     cell.node(holder).agent.flush("shop").await.unwrap();
     client.simple_query("INSERT INTO orders (_id, total) VALUES (99, 1)").await.unwrap();
 
-    admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", 0).await.unwrap();
+    admin::fork_at_block(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", Some(&cell.fork_broker()), 0).await.unwrap();
     let then = cell.connect("shop-then").await;
     assert_eq!(values(&then, "SELECT _id FROM orders").await, ["0", "1", "2"], "the fork holds the first block's state, and none of what came after");
     then.simple_query("INSERT INTO orders (_id, total) VALUES (50, 1)").await.unwrap();
@@ -4332,7 +4332,7 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
 
     assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", None, rtdb_types::Timestamp(0), 4 << 20).await.is_err(),
         "a time before the checkpoint is a past block's");
-    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", None, then, 4 << 20).await.unwrap();
+    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", Some(&cell.fork_broker()), then, 4 << 20).await.unwrap();
     admin::fork_time_into(
         &cell.directory, &cell.storage(), &cell.keys(), "shop",
         admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None, broker: None },
@@ -4428,7 +4428,7 @@ async fn a_fork_publishes_and_trims_only_after_adopting_a_block_from_its_own_log
     for id in 0..8 {
         parent.simple_query(&format!("INSERT INTO orders (_id) VALUES ({id})")).await.unwrap();
     }
-    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", &control()).await.unwrap();
+    let child = admin::fork(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-preview", Some(&cell.fork_broker()), &control()).await.unwrap();
     let preview = cell.connect("shop-preview").await;
     preview.simple_query("INSERT INTO orders (_id) VALUES (8)").await.unwrap();
     let holder = cell.holder("shop-preview").await.unwrap();
