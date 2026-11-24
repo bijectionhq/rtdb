@@ -56,7 +56,8 @@ impl PreparedNearest {
             Projection::Identities,
             true,
             None,
-            |_, _, id, iid, distance, _| {
+            false,
+            |_, _, _, id, iid, distance, _| {
                 let distance = distance.ok_or_else(inconsistent_ranking)?;
                 if after_radius.is_some_and(|after| distance <= after) { return Ok(()); }
                 ranking.push(id, iid.ok_or_else(inconsistent_ranking)?, distance)
@@ -143,6 +144,7 @@ impl PreparedNearest {
                     }
                     *destination = Some(SelectedHit {
                         source: Arc::clone(&source),
+                        probe: None,
                         row,
                         distance_m: Some(distances.value(rank)),
                     });
@@ -213,6 +215,7 @@ pub(super) async fn gather_range(
     selection: &[(EntityIdRef<'_>, Iid)],
     more: bool,
     probe: Option<crate::Probe<'_>>,
+    defer: bool,
 ) -> Result<Page> {
     let reservation = context.memory.reserve(4096 + selection.len() * 256)?;
     let positions = selection.iter().enumerate().map(|(rank, (id, _))| (*id, rank))
@@ -229,7 +232,8 @@ pub(super) async fn gather_range(
     let mut selected = (0..selection.len()).map(|_| None).collect::<Vec<_>>();
     let mut layout = None;
     if let Some(OwnedSpatialScan { mut cursor, document_columns }) = cursor {
-        while let Some(source) = cursor.next_batch().await? {
+        let early_probe = probe.filter(|_| defer);
+        while let Some((source, fallback)) = crate::probe::next_batch(&mut cursor, early_probe, geometry, partition).await? {
             let source = Arc::new(source);
             let batch = source.batch();
             for row in 0..batch.num_rows() {
@@ -241,6 +245,7 @@ pub(super) async fn gather_range(
                 *destination = Some(SelectedHit {
                     distance_m: None,
                     source: Arc::clone(&source),
+                    probe: fallback.clone(),
                     row,
                 });
             }
@@ -265,7 +270,7 @@ pub(super) async fn gather_range(
         };
         if let (Some(probe), Some(evidence)) = (probe, evidence.as_mut()) {
             let columns = crate::probe::summarize(&selected, columns, probe, evidence, &context.memory)?;
-            gather_selected(&selected, &columns, &context.memory)?
+            crate::probe::gather(&selected, &columns, &context.memory)?
         } else {
             gather_selected(&selected, columns, &context.memory)?
         }
