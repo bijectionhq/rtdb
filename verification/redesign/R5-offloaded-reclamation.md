@@ -50,3 +50,13 @@ Enqueue first orders the exact pointer digest at the broker.
 A certified positive receipt transfers custody to the committed journal. After response loss the broker retains and scans the uninspected interval.
 A newer confirmed or sealed journal epoch fences the original writer. Once the broker proves the whole retained interval lacks the pointer and joins provider drain, it records a grant for the exact staged version and settles it.
 Transfer stages enter a separate receipt protocol and still need terminal settlement for bodies left before seeding.
+
+
+### Detached transfer staging
+
+A checkpoint transfer binds the destination staging operation, certified bootstrap and replica position before the provider upload.
+A cell move binds the destination generation and position.
+The broker keeps the provider attempt until a certified destination frame adopts that exact version or the directory closes the destination authority and outstanding provider work drains.
+The producer confirms bounded pages before submitting more drafts.
+A lost upload or journal reply can recover the recorded attempt. A retry after adoption must prove that the pre-existing version is already named by the designated journal position.
+The directory cannot activate a closed generation, and an excluded journal pointer no longer opens a body through the broker.

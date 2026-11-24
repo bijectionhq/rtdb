@@ -1467,6 +1467,7 @@ async fn prepare_cell_move(
         if !same_cell_move(record, &staged) || record.lifecycle != Lifecycle::Moving || record.epoch != staged.epoch
             || record.checkpoint != staged.checkpoint || record.storage_namespaces != staged.storage_namespaces
             || record.storage_prefix() != staged.storage_prefix() || record.log_epoch != staged.log_epoch
+            || record.storage_generation.is_some_and(|generation| record.abandoned_generations.contains_key(&generation))
             || record.ensemble != staged.ensemble || record.replica_journals != staged.replica_journals
             || record.move_from.as_ref().is_some_and(|journals| Some(journals) != staged.move_from.as_ref())
         {

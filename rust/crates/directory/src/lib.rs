@@ -483,12 +483,13 @@ pub enum StorageRegion {
         through: i64,
         custody: ReplayCustody,
     },
+    #[serde(rename = "replica_prepared_publication")]
     ReplicaPublication {
         key: String,
         custody: ReplayCustody,
         closed: bool,
         publications: BTreeMap<uuid::Uuid, StoragePublication>,
-        writer: Option<ReplicaWriterPublication>,
+        draft: Option<ReplicaPreparedPublication>,
     },
     /// A fork has admitted provider I/O against this physical residence.
     ReferenceRead {
@@ -509,12 +510,30 @@ pub enum StorageRegion {
     },
 }
 
-/// A writer's prepared detached object holds the unread journal interval until
-/// the broker finds its exact committed reference or certifies its exclusion.
+/// The authority that can consume a prepared detached provider publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReplicaPublicationRoute {
+    Writer { epoch: u64 },
+    Transfer { operation: uuid::Uuid, bootstrap: [u8; 32], position: i64 },
+    CellTransfer { generation: uuid::Uuid, position: i64 },
+}
+
+impl ReplicaPublicationRoute {
+    pub fn transfer_position(self) -> Option<i64> {
+        match self {
+            Self::Transfer { position, .. } | Self::CellTransfer { position, .. } => Some(position),
+            Self::Writer { .. } => None,
+        }
+    }
+}
+
+/// Retains a detached upload and the original authority that can name it
+/// until the broker verifies its certified position or a terminal exclusion.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ReplicaWriterPublication {
-    pub epoch: u64,
+pub struct ReplicaPreparedPublication {
+    pub route: ReplicaPublicationRoute,
     pub scanned_through: i64,
     pub body_sha256: [u8; 32],
     pub attempt: Option<uuid::Uuid>,
@@ -1194,8 +1213,9 @@ impl DeploymentRecord {
     /// First replica offsets retained by open regions and captures that still need the journal.
     pub fn required_replica_offsets(&self, now_ms: i64) -> impl Iterator<Item = i64> + '_ {
         self.storage_regions.values().filter_map(|region| match region {
-            StorageRegion::ReplicaPublication { writer: Some(writer), .. } if writer.retirement.is_none() =>
-                Some(writer.scanned_through.saturating_add(1)),
+            StorageRegion::ReplicaPublication { draft: Some(draft), .. }
+                if draft.retirement.is_none() && matches!(draft.route, ReplicaPublicationRoute::Writer { .. }) =>
+                Some(draft.scanned_through.saturating_add(1)),
             region => region.first_required_replica(),
         })
             .chain(self.capture_replica_offsets())

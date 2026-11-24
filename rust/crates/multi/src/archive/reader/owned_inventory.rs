@@ -323,34 +323,40 @@ pub(crate) async fn seed_checkpoint_transfer_target(
             let mut chain = artifact.chain();
             while next <= through {
                 let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
-                let first = next;
-                let mut entries = artifact.read_segment(first, through, &mut chain).await?;
-                for entry in &mut entries {
-                    let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? else { continue; };
-                    let offloaded = observe_transfer_payload(&artifact, entry.lsn, &envelope, &mut chain, &memory).await?;
-                    let resolved = offloaded.as_ref().map_or(&envelope, |payload| &payload.resolved);
-                    if let Some(control) = replica_suffix::transfer_control(resolved, stage.checkpoint)? {
-                        entry.payload = control;
-                    } else if let Some(payload) = offloaded.as_ref() {
-                        let broker = broker.ok_or_else(|| unavailable("Detached replay transfer requires its installed broker"))?;
-                        let publication = payload.body.retaining(
-                            broker.seed(&target, &reserved, entry.lsn, &payload.path, payload.body.bytes.clone()),
-                        ).await?;
-                        entry.payload = replica_suffix::target_payload_proxy(&envelope, resolved, &payload.body.bytes, publication)?;
+                let mut entries = artifact.read_segment(next, through, &mut chain).await?;
+                next += entries.len() as i64;
+                for page in entries.chunks_mut(replica_suffix::TRANSFER_PAGE_ENTRIES) {
+                    let first = page[0].lsn;
+                    let last = page.last().ok_or_else(|| inconsistent("The target replica page is empty"))?.lsn;
+                    let mut detached = Vec::new();
+                    for entry in &mut *page {
+                        let Some(envelope) = replica_suffix::admit_record(entry, &mut fence, &mut writer, source_epoch)? else { continue; };
+                        let offloaded = observe_transfer_payload(&artifact, entry.lsn, &envelope, &mut chain, &memory).await?;
+                        let resolved = offloaded.as_ref().map_or(&envelope, |payload| &payload.resolved);
+                        if let Some(control) = replica_suffix::transfer_control(resolved, stage.checkpoint)? {
+                            entry.payload = control;
+                        } else if let Some(payload) = offloaded.as_ref() {
+                            let broker = broker.ok_or_else(|| unavailable("Detached replay transfer requires its installed broker"))?;
+                            let publication = payload.body.retaining(
+                                broker.seed(&target, &reserved, entry.lsn, &payload.path, payload.body.bytes.clone()),
+                            ).await?;
+                            entry.payload = replica_suffix::target_payload_proxy(&envelope, resolved, &payload.body.bytes, publication)?;
+                            detached.push((broker, entry.lsn, payload.path.clone()));
+                        }
+                    }
+                    // Preserve source transaction IDs and term sequences under the target's seal.
+                    for entry in &mut *page {
+                        entry.payload = journal.seed(entry.lsn, entry.payload.clone()).await?;
+                    }
+                    rtdb_logkeeper::bootstrap_committed_page(
+                        &stream, epoch, checkpoint, LogOffset(first), page, last == through,
+                    ).await?;
+                    let proof = rtdb_logkeeper::certify_committed_range(&stream, first, last).await?;
+                    rtdb_logkeeper::verify_certified_range(&proof, page)?;
+                    for (broker, position, object) in detached {
+                        broker.confirm_seed(&target, &reserved, position, &object).await?;
                     }
                 }
-                next += entries.len() as i64;
-                let last = next - 1;
-                // Preserve the source transaction IDs and term sequences under
-                // the target's own seal.
-                for entry in &mut entries {
-                    entry.payload = journal.seed(entry.lsn, entry.payload.clone()).await?;
-                }
-                rtdb_logkeeper::bootstrap_committed_page(
-                    &stream, epoch, checkpoint, LogOffset(first), &entries, last == through,
-                ).await?;
-                let proof = rtdb_logkeeper::certify_committed_range(&stream, first, last).await?;
-                rtdb_logkeeper::verify_certified_range(&proof, &entries)?;
             }
             super::super::replica_artifact::require_chain(chain, expected_chain)?;
             Ok(reserved)

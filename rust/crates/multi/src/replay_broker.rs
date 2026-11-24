@@ -4,7 +4,7 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, ReplicaPayloadCandidate, ReplicaWriterPublication, StoragePublication, StorageRegion};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, ReplicaPayloadCandidate, ReplicaPreparedPublication, ReplicaPublicationRoute as PublishRoute, StoragePublication, StorageRegion};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::{CURRENT_STORAGE_VERSION, oversized_block_index, oversized_key}};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, remote::PublicationJournal, log::{ReplicaPayload, ReplicaPayloadReference}, sealing::{DeliveryIo, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, PhysicalObjectVersion, Result, StorageEpoch};
@@ -31,6 +31,7 @@ use crate::{
 };
 
 mod staging;
+mod transfer;
 
 const MAX_HEADER: usize = 16 << 10;
 const MAX_BODY: usize = 64 << 20;
@@ -77,19 +78,13 @@ enum Action {
     Publish { route: PublishRoute, object: String, length: usize },
     AdmitAppend { epoch: u64, reference: String },
     ObserveAppend { position: i64, reference: String },
+    ConfirmTransfer { route: PublishRoute, object: String },
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum PublishRoute {
-    Writer { epoch: u64 },
-    Transfer { operation: Uuid, bootstrap: [u8; 32], position: i64 },
-    CellTransfer { generation: Uuid, position: i64 },
-}
-
-impl PublishRoute {
-    fn requires_transfer_credential(self) -> bool {
-        !matches!(self, Self::Writer { .. })
+impl Action {
+    fn uses_transfer_token(&self) -> bool {
+        matches!(self, Self::Publish { route, .. } | Self::ConfirmTransfer { route, .. }
+            if route.transfer_position().is_some())
     }
 }
 
@@ -225,6 +220,32 @@ impl Client {
         self.publish_with(History::of(target)?, route, object, bytes).await
     }
 
+    pub(crate) async fn confirm_seed(
+        &self, target: &DeploymentRecord, replica: &rtdb_directory::CheckpointTransferReplica,
+        position: i64, object: &ObjectKey,
+    ) -> Result<()> {
+        self.confirm_transfer(target, PublishRoute::Transfer {
+            operation: replica.bootstrap.terminal.fence.destination.intent.operation,
+            bootstrap: replica.bootstrap.ciphertext_sha256,
+            position,
+        }, object).await
+    }
+
+    pub(crate) async fn confirm_copy(&self, target: &DeploymentRecord, position: i64, object: &ObjectKey) -> Result<()> {
+        let generation = target.storage_generation.ok_or_else(refused)?;
+        self.confirm_transfer(target, PublishRoute::CellTransfer { generation, position }, object).await
+    }
+
+    async fn confirm_transfer(&self, target: &DeploymentRecord, route: PublishRoute, object: &ObjectKey) -> Result<()> {
+        let ClientRoute::Remote(remote) = self.0.as_ref() else { return Ok(()); };
+        let action = Action::ConfirmTransfer { route, object: object.to_string() };
+        let mut socket = remote.connect(History::of(target)?, action).await?;
+        match socket_work(read_response(&mut socket)).await? {
+            Response::AppendAdmitted => Ok(()),
+            _ => Err(invalid_frame()),
+        }
+    }
+
     async fn publish_with(
         &self, history: History, route: PublishRoute, object: &ObjectKey, bytes: Bytes,
     ) -> Result<Option<PhysicalObjectVersion>> {
@@ -253,11 +274,7 @@ impl Client {
 
 impl Remote {
     async fn connect(&self, history: History, action: Action) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        let token = match &action {
-            Action::Publish { route, .. } if route.requires_transfer_credential() =>
-                self.transfer_token.as_ref().ok_or_else(refused)?,
-            _ => &self.token,
-        };
+        let token = if action.uses_transfer_token() { self.transfer_token.as_ref().ok_or_else(refused)? } else { &self.token };
         socket_work(async {
             let stream = TcpStream::connect(self.endpoint.as_ref()).await.map_err(transport)?;
             let mut stream = TlsConnector::from(Arc::clone(&self.tls))
@@ -381,25 +398,9 @@ impl Service {
         for record in self.directory.deployments().await? {
             if cancellation.is_cancelled() { break; }
             for (&id, region) in &record.storage_regions {
-                if let StorageRegion::ReplicaPublication { writer: Some(_), .. } = region {
+                if let StorageRegion::ReplicaPublication { draft: Some(_), .. } = region {
                     if let Err(error) = self.reclaim_staged(&inventory, &record, id, region).await {
                         tracing::warn!(installation = %record.id, stage = %id, code = %error.code, "Detached staging awaits settlement");
-                    }
-                } else if let StorageRegion::ReplicaPublication { custody, closed, publications, .. } = region {
-                    let drained = match custody {
-                        ReplayCustody::Hosted { owner: Some(owner) } => *closed || self.directory.hosted_task_stopped(owner).await?,
-                        _ => false,
-                    };
-                    if drained {
-                        for publication in publications.values() {
-                            inventory.abort_publication(&ObjectKey::new(&publication.key)?, &publication.upload_id).await?;
-                        }
-                        crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
-                            if current.storage_regions.get(&id) == Some(region) {
-                                current.storage_regions.remove(&id);
-                            }
-                            Ok(())
-                        }).await?;
                     }
                 }
             }
@@ -498,10 +499,7 @@ impl Service {
 
     async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>) -> Result<()> {
         let request: Request = socket_work(receive_header(socket)).await?;
-        let verifier = match &request.action {
-            Action::Publish { route, .. } if route.requires_transfer_credential() => &self.transfer_token,
-            _ => &self.token,
-        };
+        let verifier = if request.action.uses_transfer_token() { &self.transfer_token } else { &self.token };
         if !verifier.as_ref().is_some_and(|token| token.accepts(&request.token)) { return Err(refused()); }
         let history = request.history;
         match request.action {
@@ -520,6 +518,12 @@ impl Service {
                 self.observe_staged_append(history, position, &reference).await?;
                 socket_work(send_header(socket, &Response::AppendAdmitted)).await
             }
+            Action::ConfirmTransfer { route, object } if route.transfer_position().is_some() => {
+                let key = ObjectKey::new(object)?;
+                self.confirm_transfer(history, route, &key).await?;
+                socket_work(send_header(socket, &Response::AppendAdmitted)).await
+            }
+            Action::ConfirmTransfer { .. } => Err(refused()),
             Action::Publish { route, object, length } => {
                 let key = ObjectKey::new(object)?;
                 require_publication(history, route, &self.current(history).await?, &key)?;
@@ -595,6 +599,13 @@ impl Service {
         if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) { return Err(invalid_frame()); }
         let body_sha256 = ring::digest::digest(&ring::digest::SHA256, &body)
             .as_ref().try_into().expect("SHA-256 width");
+        let pointer = route.transfer_position().map(|_| transfer::transfer_pointer(key, &envelope, &body)).transpose()?;
+        if let (CellStorage::S3 { config }, Some(pointer)) = (&self.storage, &pointer) {
+            let inventory = CellStorage::s3_inventory(config).await?;
+            if let Some(version) = self.reuse_transfer_upload(&inventory, history, route, key, pointer, body_sha256).await? {
+                return Ok(Some(version));
+            }
+        }
         let region = Uuid::new_v4();
         let local = match self.custody {
             ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
@@ -612,14 +623,10 @@ impl Service {
                 {
                     return Err(refused());
                 }
-                let writer = match route {
-                    PublishRoute::Writer { epoch } if matches!(self.storage, CellStorage::S3 { .. }) => {
-                        Some(staging::reserve_writer_body(record, key, epoch, body_sha256)?)
-                    }
-                    _ => None,
-                };
+                let draft = matches!(self.storage, CellStorage::S3 { .. })
+                    .then(|| staging::reserve_body(record, key, route, body_sha256)).transpose()?;
                 record.storage_regions.insert(region, StorageRegion::ReplicaPublication {
-                    key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(), writer,
+                    key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(), draft,
                 });
                 Ok(())
             }).await?;
@@ -641,8 +648,8 @@ impl Service {
             }.await;
             io.close_and_wait().await;
             let version = version?;
-            if matches!(route, PublishRoute::Writer { .. }) && let Some(version) = &version {
-                self.finish_staged_upload(history, route, region, key, version).await?;
+            if let Some(version) = &version {
+                self.finish_staged_upload(history, route, region, key, version, pointer.as_ref()).await?;
             } else {
                 require_publication(history, route, &self.current(history).await?, key)?;
             }
@@ -669,7 +676,7 @@ impl Service {
         let after = position.checked_sub(1).filter(|after| *after >= -1).ok_or_else(refused)?;
         for _ in 0..CAS_ATTEMPTS {
             let mut record = self.current(history).await?;
-            if matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Deleted)
+            if matches!(record.lifecycle, Lifecycle::Deleting | Lifecycle::Deleted) || transfer::current_generation_abandoned(&record)
                 || !record.storage_regions.get(&ticket).is_some_and(|hold| admits_position(&record, hold, position))
             {
                 return Err(refused());
@@ -802,14 +809,14 @@ impl PublicationJournal for BrokerUpload {
         let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned() };
         crate::admin::update_installation(self.directory.as_ref(), &self.history.deployment.to_string(), |record| {
             require_publication(self.history, self.route, record, &self.logical)?;
-            let Some(StorageRegion::ReplicaPublication { key, closed: false, publications, writer, .. }) =
+            let Some(StorageRegion::ReplicaPublication { key, closed: false, publications, draft, .. }) =
                 record.storage_regions.get_mut(&self.region) else { return Err(refused()); };
             if key.as_str() != self.logical.as_str() || publications.get(&attempt).is_some_and(|prior| prior != &publication) {
                 return Err(refused());
             }
-            if let Some(writer) = writer {
-                if writer.attempt.is_some_and(|prior| prior != attempt) { return Err(refused()); }
-                writer.attempt = Some(attempt);
+            if let Some(draft) = draft {
+                if draft.route != self.route || draft.attempt.is_some_and(|prior| prior != attempt) { return Err(refused()); }
+                draft.attempt = Some(attempt);
             }
             publications.insert(attempt, publication.clone());
             Ok(())

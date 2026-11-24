@@ -211,6 +211,7 @@ Cross-cell handoff retains the original replay interval and republishes each det
 The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
 The detached broker retains an ordinary S3 writer upload until a certified frame adopts its exact pointer or a newer journal epoch excludes it.
 The staging ledger covers lost upload or append replies and settles the recorded publication after provider drain, key withdrawal and exact absence.
+Both transfer producers also stage detached uploads at their exact destination positions and confirm them against certified pages. Retries recover the recorded provider attempt or the exact already certified version. A discarded checkpoint transfer or abandoned cell generation closes broker access before unresolved staging can settle.
 The detached dependency fence advances independently of physical journal trim and older finite replay holds. Old tickets preserve only their admitted positions. New replay admissions start above the fence, and the broker grants only positions outside every remaining dependency.
 Unbounded recovery routes still keep their required ranges in custody.
 Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.

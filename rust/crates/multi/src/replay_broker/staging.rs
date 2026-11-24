@@ -1,16 +1,16 @@
 use rtdb_directory::ReplicaDraftRetirement;
 use rtdb_s3::CreateAttemptPublication;
 
-use super::*;
+use super::{*, transfer::{current_generation_abandoned, transfer_excluded, transfer_pointer_digest}};
 
 const MAX_STAGES: usize = 128;
 const AUDIT_WIDTH: i64 = 64;
 
-pub(super) fn reserve_writer_body(
-    record: &DeploymentRecord, key: &ObjectKey, epoch: u64, body_sha256: [u8; 32],
-) -> Result<ReplicaWriterPublication> {
+pub(super) fn reserve_body(
+    record: &DeploymentRecord, key: &ObjectKey, route: PublishRoute, body_sha256: [u8; 32],
+) -> Result<ReplicaPreparedPublication> {
     let stages = record.storage_regions.values().filter_map(|region| match region {
-        StorageRegion::ReplicaPublication { key, writer: Some(_), .. } => Some(key),
+        StorageRegion::ReplicaPublication { key, draft: Some(_), .. } => Some(key),
         _ => None,
     });
     let mut count = 0;
@@ -27,18 +27,20 @@ pub(super) fn reserve_writer_body(
     let scanned_through = record.checkpoint.filter(|root| root.root_sha256.is_some()).map_or(-1, |root| root.boundary)
         .max(record.replica_anchor.as_ref().map_or(-1, |anchor| anchor.interval[1]));
     if !(-1..i64::MAX).contains(&scanned_through) { return Err(refused()); }
-    Ok(ReplicaWriterPublication { epoch, scanned_through, body_sha256, attempt: None, version: None, reference: None, retirement: None })
+    Ok(ReplicaPreparedPublication { route, scanned_through, body_sha256, attempt: None, version: None, reference: None, retirement: None })
 }
 
 impl Service {
     pub(super) async fn finish_staged_upload(
         &self, history: History, route: PublishRoute, id: Uuid, key: &ObjectKey, version: &PhysicalObjectVersion,
+        pointer: Option<&ReplicaEnvelope>,
     ) -> Result<()> {
         let CellStorage::S3 { config } = &self.storage else { return Err(refused()); };
         let admitted = self.current(history).await?;
-        let Some(StorageRegion::ReplicaPublication { writer: Some(stage), .. }) = admitted.storage_regions.get(&id)
+        let Some(StorageRegion::ReplicaPublication { draft: Some(stage), .. }) = admitted.storage_regions.get(&id)
             else { return Err(refused()); };
         let attempt = stage.attempt.ok_or_else(refused)?;
+        let reference = pointer.map(|pointer| transfer_pointer_digest(pointer, version)).transpose()?;
         let physical = ObjectKey::new(format!("{}/{key}", residence(&admitted)))?;
         let inventory = CellStorage::s3_inventory(config).await?;
         if !matches!(inventory.observe_create_attempt(&physical, Some(attempt)).await?,
@@ -48,14 +50,16 @@ impl Service {
         }
         crate::admin::update_installation(self.directory.as_ref(), &history.deployment.to_string(), |record| {
             require_publication(history, route, record, key)?;
-            let Some(StorageRegion::ReplicaPublication { closed, publications, writer: Some(stage), .. }) =
+            let Some(StorageRegion::ReplicaPublication { closed, publications, draft: Some(stage), .. }) =
                 record.storage_regions.get_mut(&id) else { return Err(refused()); };
-            if !publications.is_empty() || stage.attempt != Some(attempt) || stage.retirement.is_some()
-                || stage.version.as_ref().is_some_and(|prior| prior != version)
+            if !publications.is_empty() || stage.route != route || stage.attempt != Some(attempt)
+                || stage.retirement.is_some() || stage.version.as_ref().is_some_and(|prior| prior != version)
+                || reference.is_some() && stage.reference.is_some_and(|prior| Some(prior) != reference)
             {
                 return Err(refused());
             }
             stage.version = Some(version.clone());
+            if reference.is_some() { stage.reference = reference; }
             *closed = true;
             Ok(())
         }).await?;
@@ -71,11 +75,11 @@ impl Service {
         crate::admin::update_installation(self.directory.as_ref(), &history.deployment.to_string(), |record| {
             require_writer(history, epoch, record)?;
             let stage = record.storage_regions.values_mut().find_map(|region| match region {
-                StorageRegion::ReplicaPublication { key, closed: true, writer: Some(stage), .. }
+                StorageRegion::ReplicaPublication { key, closed: true, draft: Some(stage), .. }
                     if key == reference.object().as_str() => Some(stage),
                 _ => None,
             }).ok_or_else(refused)?;
-            if stage.epoch != epoch || stage.version.as_ref() != Some(version) || stage.body_sha256 != reference.body_sha256()
+            if stage.route != (PublishRoute::Writer { epoch }) || stage.version.as_ref() != Some(version) || stage.body_sha256 != reference.body_sha256()
                 || stage.retirement.is_some()
                 || stage.reference.is_some_and(|prior| prior != digest)
             {
@@ -94,10 +98,11 @@ impl Service {
         let record = self.current(history).await?;
         let hash = ring::digest::digest(&ring::digest::SHA256, frame);
         let Some((id, prior)) = record.storage_regions.iter().find(|(_, region)| {
-            matches!(region, StorageRegion::ReplicaPublication { key, closed: true, writer: Some(stage), .. }
+            matches!(region, StorageRegion::ReplicaPublication { key, closed: true, draft: Some(stage), .. }
                 if key == reference.object().as_str() && stage.version.as_ref() == Some(version)
                     && stage.reference.as_ref().is_some_and(|digest| digest.as_slice() == hash.as_ref())
-                    && stage.retirement.is_none() && position > stage.scanned_through)
+                    && stage.retirement.is_none() && matches!(stage.route, PublishRoute::Writer { .. })
+                    && position > stage.scanned_through)
         }) else { return Ok(()); };
         let stream = crate::admin::administration_stream(self.directory.as_ref(), &record, crate::process::MAXIMUM_LOG_MESSAGE_BYTES).await?;
         let proof = rtdb_logkeeper::certify_committed_range(&stream, position, position).await?;
@@ -114,7 +119,7 @@ impl Service {
     pub(super) async fn reclaim_staged(
         &self, inventory: &rtdb_s3::VersionedInventory, record: &DeploymentRecord, id: Uuid, region: &StorageRegion,
     ) -> Result<()> {
-        let StorageRegion::ReplicaPublication { key, custody, closed, publications, writer: Some(stage) } = region
+        let StorageRegion::ReplicaPublication { key, custody, closed, publications, draft: Some(stage) } = region
             else { return Err(refused()); };
         if !*closed {
             let ReplayCustody::Hosted { owner: Some(owner) } = custody else { return Ok(()); };
@@ -143,12 +148,32 @@ impl Service {
             self.replace_stage(record, id, region, None).await?;
             return Ok(());
         }
-        match self.audit_staged_append(record, stage).await? {
+        let audit = match stage.route {
+            PublishRoute::Writer { epoch } => self.audit_staged_append(record, stage, epoch).await?,
+            _ if transfer_excluded(record, stage.route) => {
+                let position = stage.route.transfer_position().ok_or_else(refused)?;
+                if record.requires_replica_offset(position, rtdb_directory::now_ms()) {
+                    Audit::Pending
+                } else {
+                    Audit::Excluded
+                }
+            }
+            _ if let Some(digest) = stage.reference => {
+                let position = stage.route.transfer_position().ok_or_else(refused)?;
+                if self.transfer_committed(record, stage.route, position, digest).await? {
+                    Audit::Committed
+                } else {
+                    Audit::Pending
+                }
+            }
+            _ => Audit::Pending,
+        };
+        match audit {
             Audit::Pending => Ok(()),
             Audit::Committed => self.replace_stage(record, id, region, None).await.map(drop),
             Audit::Through(through) => {
                 let mut pending = region.clone();
-                let StorageRegion::ReplicaPublication { writer: Some(stage), .. } = &mut pending else { unreachable!(); };
+                let StorageRegion::ReplicaPublication { draft: Some(stage), .. } = &mut pending else { unreachable!(); };
                 stage.scanned_through = through;
                 self.replace_stage(record, id, region, Some(pending)).await.map(drop)
             }
@@ -174,20 +199,28 @@ impl Service {
                     return Ok(());
                 }
                 let mut granted = region.clone();
-                let StorageRegion::ReplicaPublication { writer: Some(stage), .. } = &mut granted else { unreachable!(); };
+                let StorageRegion::ReplicaPublication { draft: Some(stage), .. } = &mut granted else { unreachable!(); };
                 stage.retirement = Some(ReplicaDraftRetirement { token: Uuid::new_v4(), version });
                 self.replace_stage(record, id, region, Some(granted)).await.map(drop)
             }
         }
     }
 
-    async fn replace_stage(
+    pub(super) async fn replace_stage(
         &self, record: &DeploymentRecord, id: Uuid, prior: &StorageRegion, next: Option<StorageRegion>,
     ) -> Result<()> {
         let history = History::of(record)?;
+        let transfer_position = match &next {
+            Some(StorageRegion::ReplicaPublication { draft: Some(draft), .. }) if draft.retirement.is_some() =>
+                draft.route.transfer_position(),
+            _ => None,
+        };
         crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
             if history.matches(current) && current.epoch == record.epoch
                 && current.ensemble == record.ensemble && current.storage_regions.get(&id) == Some(prior)
+                && current.lifecycle == record.lifecycle && current.move_from == record.move_from
+                && current_generation_abandoned(current) == current_generation_abandoned(record)
+                && transfer_position.is_none_or(|position| !current.requires_replica_offset(position, rtdb_directory::now_ms()))
             {
                 match &next {
                     Some(stage) => { current.storage_regions.insert(id, stage.clone()); }
@@ -199,12 +232,12 @@ impl Service {
         Ok(())
     }
 
-    async fn audit_staged_append(&self, record: &DeploymentRecord, stage: &ReplicaWriterPublication) -> Result<Audit> {
-        let replaced = record.epoch > stage.epoch;
+    async fn audit_staged_append(&self, record: &DeploymentRecord, stage: &ReplicaPreparedPublication, epoch: u64) -> Result<Audit> {
+        let replaced = record.epoch > epoch;
         let Some(reference) = stage.reference else {
             return Ok(if replaced { Audit::Excluded } else { Audit::Pending });
         };
-        if record.epoch < stage.epoch { return Err(refused()); }
+        if record.epoch < epoch { return Err(refused()); }
         let stream = crate::admin::administration_stream(self.directory.as_ref(), record, crate::process::MAXIMUM_LOG_MESSAGE_BYTES).await?;
         let frontier = if record.holder.is_none() || record.is_resident_idle() {
             if !replaced { return Ok(Audit::Pending); }

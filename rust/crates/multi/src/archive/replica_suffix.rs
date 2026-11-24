@@ -32,6 +32,8 @@ use rtdb_storage::{IoRegion, ObjectStore, log::ReplicaPayload};
 
 pub(crate) const MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 4096;
+/// Confirm each destination page before reserving more detached drafts.
+pub(super) const TRANSFER_PAGE_ENTRIES: usize = 64;
 const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
 
 pub(super) struct ServingPayloads<'a> {
@@ -454,23 +456,32 @@ pub(crate) async fn reseal_live_journal(
                 let page = certify_committed_range(source_stream, first, last).await?;
                 verify_certified_range(&page, &entries)?;
                 source_cipher.open_page(&mut entries).await?;
-                for entry in &mut entries {
-                    if ReplicaFrame::has_external_payload(&entry.payload)? {
-                        let envelope = ReplicaEnvelope::decode(&entry.payload)?.ok_or_else(suffix_unavailable)?;
-                        let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
-                            .ok_or_else(suffix_unavailable)?;
-                        let object = key(&relative)?;
-                        let (resolved, body) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
-                        let body = Bytes::from_owner(body);
-                        let broker = to.broker.ok_or_else(suffix_unavailable)?;
-                        let publication = broker.copy(target, entry.lsn, &object, body.clone()).await?;
-                        entry.payload = target_payload_proxy(&envelope, &resolved, &body, publication)?;
+                for page in entries.chunks_mut(TRANSFER_PAGE_ENTRIES) {
+                    let first = page[0].lsn;
+                    let last = page.last().ok_or_else(suffix_unavailable)?.lsn;
+                    let mut detached = Vec::new();
+                    for entry in &mut *page {
+                        if ReplicaFrame::has_external_payload(&entry.payload)? {
+                            let envelope = ReplicaEnvelope::decode(&entry.payload)?.ok_or_else(suffix_unavailable)?;
+                            let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
+                                .ok_or_else(suffix_unavailable)?;
+                            let object = key(&relative)?;
+                            let (resolved, body) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
+                            let body = Bytes::from_owner(body);
+                            let broker = to.broker.ok_or_else(suffix_unavailable)?;
+                            let publication = broker.copy(target, entry.lsn, &object, body.clone()).await?;
+                            entry.payload = target_payload_proxy(&envelope, &resolved, &body, publication)?;
+                            detached.push((broker, entry.lsn, object));
+                        }
+                        entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
                     }
-                    entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
+                    bootstrap_committed_page(target_stream, source.epoch, trim, LogOffset(first), page, last == through.0).await?;
+                    let chosen = certify_committed_range(target_stream, first, last).await?;
+                    verify_certified_range(&chosen, page)?;
+                    for (broker, position, object) in detached {
+                        broker.confirm_copy(target, position, &object).await?;
+                    }
                 }
-                bootstrap_committed_page(target_stream, source.epoch, trim, LogOffset(first), &entries, last == through.0).await?;
-                let chosen = certify_committed_range(target_stream, first, last).await?;
-                verify_certified_range(&chosen, &entries)?;
             }
             Ok(())
         },

@@ -697,6 +697,8 @@ contract LogService {
         -- Settlement withdraws the unit key and verifies absence of that provider version. Physical journal trim progresses independently.
         -- A writer reserves a detached publication before uploading and registers the exact pointer before enqueue.
         -- A prepared pointer retains its unread journal interval until a certified frame consumes it or a newer journal epoch excludes it.
+        -- A transfer instead prepares one destination position under its original bootstrap or generation.
+        -- The broker retains that publication until the destination certifies the pointer or the directory closes the destination and its admitted operations drain.
         -- No pointer can be issued for a draft once the original writer's admission is closed.
         -- The broker retires an excluded draft only after upload drain and records the exact provider grant before key withdrawal.
 
