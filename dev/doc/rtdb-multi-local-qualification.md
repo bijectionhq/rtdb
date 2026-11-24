@@ -195,3 +195,68 @@ Use the bootstrap UUID as the exact bridge attachment when granting access to `x
 For a different bridge target, use its name in the grants and add a dedicated password principal with an empty database grant mapping and top-level `deploymentCreatePrincipals: [seed]`.
 That principal can seed the bridge with an explicit name and UUID through the existing Create action.
 The profile rejects wildcard database grants and requires a grant mapping for each UserList principal.
+
+## One Multi writer and three durable keepers
+
+Use a prebuilt Logkeeper executable with the `stream` feature and the protocol revision pinned by the RTDB source.
+Use the same loopback Flight TLS setup above, including the `password` file, and a fresh RTDB data path.
+The development writer keeps object storage and keys on the local filesystem.
+With `--multi-journal-url`, it connects through the production StreamJournal and sends ordered transaction batches through the shared stream writer.
+
+Each keeper needs its own nonzero UUID, loopback address, persistent directory and server certificate.
+Use the same journal CA for the three server certificates and the writer's client certificate.
+Set the keeper's URI SAN to `urn:logkeeper:keeper:<keeper-uuid>` and the writer's URI SAN to `urn:logkeeper:client:rtdb-local-w14`.
+The server certificates need `serverAuth` and the writer certificate needs `clientAuth`.
+The normal journal transport verifies the chain and keeper URI identities.
+The separate Flight endpoint still uses the IP-SAN and CA verification above.
+
+Use the following keeper JSON shape for each process.
+Give the other two keepers their own UUID, paths, zone and port, such as 5449 and 5450.
+
+```json
+{
+  "keeper": "0688c510-835e-4d3a-8b3e-0ff6ce533f01",
+  "listen": "127.0.0.1:5448",
+  "data": "/private/w14/keeper-1",
+  "zone": "local-1",
+  "tls": {
+    "certificate": "/private/w14/keeper-1.pem",
+    "private_key": "/private/w14/keeper-1-key.pem",
+    "ca": "/private/w14/journal-ca.pem"
+  },
+  "clients": ["urn:logkeeper:client:rtdb-local-w14"],
+  "writers": ["urn:logkeeper:client:rtdb-local-w14"],
+  "limits": {
+    "stream_quota_bytes": 8589934592,
+    "max_record_bytes": 33554432,
+    "round_bytes_per_stream": 4194304,
+    "round_requests": 64
+  }
+}
+```
+
+Run `logkeeper keeper --config KEEPER.json` once per keeper.
+Keep all three processes and their durable media available before RTDB starts.
+Place the private writer PEM files at `journal-certificate.pem`, `journal-key.pem` and `journal-ca.pem` in the Flight TLS directory.
+Here `journal-ca.pem` is the journal CA, and `ca.pem` in the earlier Flight commands is the Flight CA.
+
+```bash
+journal_url=logkeeper+tls://127.0.0.1:5448,127.0.0.1:5449,127.0.0.1:5450
+"$RTDB" dev --multi --data "$work/rtdb-w14" --multi-tls-dir "$tls" \
+  --incarnation "$id" --multi-journal-url "$journal_url" --flight-sql-port 0
+```
+
+The selector accepts exactly three distinct loopback socket addresses.
+Reuse the same data path only with the same URL order, keeper identities and keeper media.
+For a fresh trial, choose a fresh bootstrap UUID and data path.
+Wait for the exact writer readiness JSON and verify Flight TLS before beginning the authorized W14 run.
+Use the verified Flight URL with the `grpc+tls://` scheme expected by the benchmark driver.
+
+```bash
+python3 rust/bench/v1_transact_commits.py "$output" --clients 32 \
+  --endpoint "grpc+tls://${flight#https://}" --database xtdb --user xtdb \
+  --password-file "$tls/password" --ca-file "$tls/ca.pem"
+```
+
+Record the selected keeper limits and storage layout with the comparison.
+The three local processes have separate durable journals and share the test host.

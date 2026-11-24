@@ -113,7 +113,13 @@ async fn run() -> Result<()> {
                         options.server_tls().map(|tls| (options.incarnation, tls))
                     }).transpose()?;
                     let expected = qualification.as_ref().map(|(incarnation, _)| *incarnation);
-                    let multi = rtdb_server::multi::MultiRuntime::development_with_incarnation(&options.data, &mut config, memory.clone(), expected).await?;
+                    let stream_journal = match &options.multi_tls {
+                        Some(tls) => tls.stream_journal()?,
+                        None => None,
+                    };
+                    let multi = rtdb_server::multi::MultiRuntime::development_with_incarnation(
+                        &options.data, &mut config, memory.clone(), expected, stream_journal,
+                    ).await?;
                     return serve_multi(config, limit, memory, multi, qualification).await;
                 }
                 #[cfg(not(feature = "multi"))]

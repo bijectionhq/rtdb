@@ -81,7 +81,15 @@ fn multi_development_tls_requires_an_exact_incarnation_and_explicit_local_data()
     ]) else { panic!("expected Multi development startup") };
     assert_eq!(options.multi_tls.unwrap().incarnation.to_string(), id);
 
+    let journal = "logkeeper+tls://127.0.0.1:5448,127.0.0.1:5449,127.0.0.1:5450";
+    let Command::Dev(options) = parse(&[
+        "dev", "--multi", "--data", "fresh", "--multi-tls-dir", "tls",
+        "--incarnation", id, "--multi-journal-url", journal,
+    ]) else { panic!("expected Multi development startup") };
+    assert_eq!(options.multi_tls.unwrap().incarnation.to_string(), id);
+
     let invalid: &[&[&str]] = &[
+        &["dev", "--multi", "--data", "fresh", "--multi-journal-url", journal],
         &["dev", "--data", "fresh", "--multi-tls-dir", "tls", "--incarnation", id],
         &["dev", "--multi", "--multi-tls-dir", "tls", "--incarnation", id],
         &["dev", "--multi", "--data", "fresh", "--multi-tls-dir", "tls"],

@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -25,6 +25,7 @@ use rtdb_node::{
     SystemClock, serving::ServingDriver,
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
+use rtdb_stream_journal::{Credentials, StreamJournal};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp,
     rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
 };
@@ -47,6 +48,44 @@ const CLOCK_DRIFT_MICROS: i64 = 250_000;
 pub const DEVELOPMENT_DATABASE: &str = "xtdb";
 
 type ServingDatabases = Arc<RwLock<BTreeMap<String, Arc<MultiServing>>>>;
+
+pub struct DevelopmentStreamJournal {
+    url: String,
+    credentials: Credentials,
+}
+
+impl DevelopmentStreamJournal {
+    pub fn new(url: &str, credentials: Credentials) -> Result<Self> {
+        let invalid_url = || invalid("Multi development requires exactly three distinct loopback Logkeeper TLS addresses");
+        let addresses = url.strip_prefix("logkeeper+tls://").ok_or_else(invalid_url)?.split(',');
+        let endpoints = addresses.clone().map(str::parse::<SocketAddr>)
+            .collect::<std::result::Result<BTreeSet<_>, _>>().map_err(|_| invalid_url())?;
+        if addresses.count() != 3 || endpoints.len() != 3
+            || endpoints.iter().any(|endpoint| !endpoint.ip().is_loopback() || endpoint.port() == 0)
+        {
+            return Err(invalid_url());
+        }
+        Ok(Self { url: url.to_owned(), credentials })
+    }
+
+    async fn open(&self, path: &Path) -> Result<(Arc<StreamJournal>, Arc<File>)> {
+        let expected: [u8; 32] = Sha256::digest(self.url.as_bytes()).into();
+        if load_or_create(path, || expected)? != expected {
+            return Err(invalid("Multi development data belongs to another journal URL"));
+        }
+        let lock = OpenOptions::new().read(true).write(true).open(path).map_err(io_error)?;
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/development-journal",
+                    "Multi development data already has a local writer"));
+            }
+            Err(error) => return Err(io_error(error)),
+        }
+        let journal = connect_stream_journal(&self.url, &self.credentials).await?;
+        Ok((journal, Arc::new(lock)))
+    }
+}
 
 #[derive(Clone)]
 pub struct MultiRuntime {
@@ -87,7 +126,7 @@ impl MultiRuntime {
         config: &mut NodeConfiguration,
         memory: Arc<MemoryBudget>,
     ) -> Result<Self> {
-        Self::development_with_incarnation(path, config, memory, None).await
+        Self::development_with_incarnation(path, config, memory, None, None).await
     }
 
     pub async fn development_with_incarnation(
@@ -95,6 +134,7 @@ impl MultiRuntime {
         config: &mut NodeConfiguration,
         memory: Arc<MemoryBudget>,
         expected: Option<Uuid>,
+        stream_journal: Option<DevelopmentStreamJournal>,
     ) -> Result<Self> {
         if expected.is_some_and(|id| id.is_nil()) {
             return Err(invalid("Multi development requires a nonzero incarnation"));
@@ -107,10 +147,20 @@ impl MultiRuntime {
         if expected.is_some_and(|expected| database != expected) {
             return Err(invalid("Multi development data belongs to another incarnation"));
         }
-        let journal =
-            FileJournal::open(path.join("journal"), Limits::default()).map_err(io_error)?;
-        let identity = Identity::from(format!("urn:rtdb:dev:{}", Uuid::new_v4()));
-        let journal = Arc::new(journal.handle(identity));
+        let journal_path = path.join("journal");
+        let (journal, batch, writer_lock): (Arc<dyn Journal>, Option<Arc<dyn JournalBatchAppender>>, _) =
+            match stream_journal {
+                Some(stream) => {
+                    let (journal, lock) = stream.open(&journal_path).await?;
+                    let batch = Arc::new(StreamJournalBatch(Arc::clone(&journal)));
+                    (journal, Some(batch), Some(lock))
+                }
+                None => {
+                    let journal = FileJournal::open(journal_path, Limits::default()).map_err(io_error)?;
+                    let identity = Identity::from(format!("urn:rtdb:dev:{}", Uuid::new_v4()));
+                    (Arc::new(journal.handle(identity)), None, None)
+                }
+            };
         let io = IoRegion::new();
         let store = Arc::new(LocalStore::open_in(path.join("objects"), Arc::clone(&io))?);
         let path = path
@@ -125,13 +175,13 @@ impl MultiRuntime {
         }));
         let backends = Backends {
             journal,
-            batch: None,
+            batch,
             store,
             io,
             vault,
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
-            _credential_slot: None,
+            _journal_lock: writer_lock,
         };
         Self::open(
             config,
@@ -202,8 +252,6 @@ impl MultiRuntime {
         memory: Arc<MemoryBudget>,
         follower: Option<NativeFollowerAssignment>,
     ) -> Result<Self> {
-        use rtdb_stream_journal::{Credentials, StreamJournal};
-
         let node = installed_node_ip().await?;
         let peers = if follower.is_none() { Some(required("RTDB_PEERS")?) } else { None };
         let databases = serde_json::from_str(&required("RTDB_DATABASES")?)
@@ -237,15 +285,7 @@ impl MultiRuntime {
                 &format!("RTDB_JOURNAL_{slot}_CA_CERTIFICATE"),
             )?,
         };
-        let journal = StreamJournal::connect(&journal_url, &credentials, Duration::from_secs(5))
-            .await
-            .map_err(|error| {
-                Anomaly::new(
-                    AnomalyCategory::Unavailable,
-                    "rtdb/journal-connect",
-                    error.to_string(),
-                )
-            })?;
+        let journal = connect_stream_journal(&journal_url, &credentials).await?;
         let io = IoRegion::new();
         let store = s3
             .open(
@@ -254,7 +294,6 @@ impl MultiRuntime {
                 Arc::clone(&io),
             )
             .await?;
-        let journal = Arc::new(journal);
         let backends = Backends {
             batch: follower.is_none().then(|| {
                 Arc::new(StreamJournalBatch(Arc::clone(&journal))) as Arc<dyn JournalBatchAppender>
@@ -265,7 +304,7 @@ impl MultiRuntime {
             vault,
             node,
             peers,
-            _credential_slot: Some(Arc::new(lock)),
+            _journal_lock: Some(Arc::new(lock)),
         };
         let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
         if runtime.follower.is_none() {
@@ -1049,7 +1088,7 @@ struct Backends {
     vault: PathBuf,
     node: IpAddr,
     peers: Option<String>,
-    _credential_slot: Option<Arc<File>>,
+    _journal_lock: Option<Arc<File>>,
 }
 
 fn serving_driver(
@@ -1235,10 +1274,14 @@ fn retryable(error: &Anomaly) -> bool {
         )
 }
 
-#[cfg(feature = "s3")]
-struct StreamJournalBatch(Arc<rtdb_stream_journal::StreamJournal>);
+async fn connect_stream_journal(url: &str, credentials: &Credentials) -> Result<Arc<StreamJournal>> {
+    StreamJournal::connect(url, credentials, Duration::from_secs(5)).await
+        .map(Arc::new)
+        .map_err(|error| Anomaly::new(AnomalyCategory::Unavailable, "rtdb/journal-connect", error.to_string()))
+}
 
-#[cfg(feature = "s3")]
+struct StreamJournalBatch(Arc<StreamJournal>);
+
 impl JournalBatchAppender for StreamJournalBatch {
     fn append_batch(
         &self,
@@ -1558,6 +1601,28 @@ mod tests {
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
 
+    #[test]
+    fn development_stream_journal_requires_three_distinct_loopback_tls_endpoints() {
+        let credentials = Credentials {
+            certificate: "certificate.pem".into(),
+            private_key: "key.pem".into(),
+            ca: "ca.pem".into(),
+        };
+        let valid = "logkeeper+tls://127.0.0.1:5448,127.0.0.1:5449,127.0.0.1:5450";
+        assert!(DevelopmentStreamJournal::new(valid, credentials.clone()).is_ok());
+        for invalid in [
+            valid.replace("logkeeper+tls", "logkeeper"),
+            valid.replace("127.0.0.1:5450", "192.0.2.1:5450"),
+            valid.replace("127.0.0.1:5450", "localhost:5450"),
+            valid.replace(":5450", ":5449"),
+            valid.replace(":5450", ":0"),
+            valid.replace(",127.0.0.1:5450", ""),
+            format!("{valid},127.0.0.1:5448"),
+        ] {
+            assert!(DevelopmentStreamJournal::new(&invalid, credentials.clone()).is_err(), "{invalid}");
+        }
+    }
+
     #[tokio::test]
     async fn prepared_follower_open_does_not_bootstrap_a_missing_journal() {
         let data = tempfile::tempdir().unwrap();
@@ -1574,7 +1639,7 @@ mod tests {
             vault,
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
-            _credential_slot: None,
+            _journal_lock: None,
         };
         let incarnation = Uuid::from_u128(1);
         let stream = StreamId(incarnation.as_u128());
@@ -1612,7 +1677,7 @@ mod tests {
         let incarnation = Uuid::from_u128(1);
         let wrong = Uuid::from_u128(2);
         let runtime = MultiRuntime::development_with_incarnation(
-            data.path(), &mut config, memory.clone(), Some(incarnation),
+            data.path(), &mut config, memory.clone(), Some(incarnation), None,
         ).await.unwrap();
         let (handle, driver) = crate::ServerDriver::open_with_multi(
             config, limit, memory.clone(), &runtime,
@@ -1638,7 +1703,7 @@ mod tests {
 
         let mut config = NodeConfiguration::from_yaml_with_environment("", &|_| None, false).unwrap();
         let rejected = MultiRuntime::development_with_incarnation(
-            data.path(), &mut config, memory, Some(wrong),
+            data.path(), &mut config, memory, Some(wrong), None,
         ).await;
         assert!(rejected.is_err());
         assert_eq!(fs::read(&identity).unwrap().as_slice(), incarnation.as_bytes());
