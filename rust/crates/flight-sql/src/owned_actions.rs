@@ -23,7 +23,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_array, entity_id_type, read_entity_id, selected_cell};
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_entity_id, selected_cell, try_entity_id_array};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
@@ -3622,16 +3622,13 @@ impl Service {
             let ids = match rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target) {
                 Ok((_, ids)) if ids.data_type() == target.data_type() => ids,
                 _ => {
-                    let ids = (0..array.len()).map(|row| read_entity_id(source, array.as_ref(), row)).collect::<rtdb_types::Result<Vec<_>>>().map_err(status)?;
-                    let bound = ids.iter().try_fold(4096, |bytes, id| {
-                        let text = match id {
-                            EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(),
-                            _ => 0,
-                        };
+                    let ids = (0..array.len()).map(|row| read_entity_id(source, array.as_ref(), row));
+                    let bound = ids.clone().try_fold(4096, |bytes, id| {
+                        let text = id.map_err(status)?.owned_payload_bytes();
                         wire::add(bytes, wire::add(128, wire::mul(text, 4)?)?)
                     })?;
                     charge = Some(call.reserve(bound)?);
-                    entity_id_array(ids).map_err(status)?
+                    try_entity_id_array(ids).map_err(status)?
                 }
             };
             let distances = Arc::new(page.distance_column());
