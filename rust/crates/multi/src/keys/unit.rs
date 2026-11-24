@@ -111,6 +111,10 @@ impl UnitScope {
         Ok(self.publication_scope(tag).slot(&ObjectKey::new(logical)?))
     }
 
+    pub(crate) fn directory_publication_slot(org: &str, lineage: &str, origin: [u8; 32], object: &ObjectKey) -> UnitSlot {
+        Self::directory_serving(org, lineage).publication_scope(origin).slot(object)
+    }
+
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {

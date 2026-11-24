@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use rtdb_directory::{Checkpoint, DeploymentRecord, Directory, ExactRetirementGrant, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
 use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
@@ -9,9 +10,11 @@ use uuid::Uuid;
 
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release, recovery_covers_release};
 use crate::checkpoint_retention::checkpoint_pack_collectable;
-use rtdb_storage::{IoRegion, sealing::PublicationSealing};
-use crate::keys::KeyService;
+use rtdb_storage::{IoRegion, sealing::{PUBLICATION_ID_BYTES, PublicationSealing}};
+use crate::keys::{KeyService, UnitScope};
 use crate::packing::{PackIndex, block_pack, observe_pack_index, pack_block};
+
+const PUBLICATION_HEADER: u64 = (PUBLICATION_ID_BYTES + crate::cipher::object::SEALED_HEADER_BYTES) as u64;
 use crate::reference::{Base, References, stores};
 
 pub(super) mod tombstones;
@@ -74,6 +77,10 @@ pub(super) trait RetirementProvider: Send + Sync {
         Ok(None)
     }
 
+    async fn terminal_unit_header(&self, _: &ObjectKey, _: &TerminalObjectPublication) -> Result<Option<Bytes>> {
+        Ok(None)
+    }
+
     async fn terminal_pack_index(&self, _: &ObjectKey, _: &TerminalObjectPublication) -> Result<Option<PackIndex>> {
         Ok(None)
     }
@@ -103,6 +110,18 @@ impl RetirementProvider for rtdb_s3::VersionedInventory {
 
     async fn terminal_targets(&self, key: &ObjectKey, release: &ObjectKey, publication: &TerminalObjectPublication) -> Result<Option<[S3TombstoneTarget; 2]>> {
         self.terminal_release_targets(key, release, publication).await
+    }
+
+    async fn terminal_unit_header(&self, key: &ObjectKey, expected: &TerminalObjectPublication) -> Result<Option<Bytes>> {
+        let Some(retirement) = self.enrolled_terminal_retirement().await? else { return Ok(None); };
+        let Some(observed) = retirement.observe_readable(key).await? else { return Err(changed()); };
+        let target = observed.target();
+        if observed.allocation() != expected.allocation || target.namespace != expected.namespace || target.key != expected.key
+            || target.condition != rtdb_types::S3TombstoneCondition::Matches(expected.etag.clone())
+        {
+            return Err(changed());
+        }
+        retirement.read_observed_range(key, &observed, 0..PUBLICATION_HEADER).await.map(Some)
     }
 
     async fn terminal_pack_index(&self, key: &ObjectKey, expected: &TerminalObjectPublication) -> Result<Option<PackIndex>> {
@@ -164,7 +183,15 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
                     continue;
                 }
                 let Some([data_tombstone, release_tombstone]) = provider.terminal_targets(target, marker, publication).await? else { continue; };
-                RetirementWork::Tombstones { deployment: candidate.id.clone(), target: target.to_string(), release: marker.to_string(), data_tombstone, release_tombstone }
+                let slot_origin = if withdrawable_loose_unit(witness) && keys.is_some() {
+                    terminal_slot_origin(bucket, provider, candidate, target, witness, keys, &directory.deployments().await?).await?
+                } else {
+                    None
+                };
+                RetirementWork::Tombstones {
+                    deployment: candidate.id.clone(), target: target.to_string(), release: marker.to_string(),
+                    data_tombstone, release_tombstone, slot_origin,
+                }
             } else {
                 let (Some(version), Some(release_version)) = (&witness.version, &witness.release_version) else { continue; };
                 if witness.pack.is_some() {
@@ -221,12 +248,13 @@ async fn finish(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &
             }
         }
     };
-    erase_granted(directory, provider, lineage, grant).await?;
+    erase_granted(directory, provider, lineage, grant, keys).await?;
     settle(directory, lineage, deployment, retirement).await?;
     Ok(true)
 }
 
-async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvider, lineage: &str, grant: ExactRetirementGrant<'_>) -> Result<()> {
+async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvider, lineage: &str,
+    grant: ExactRetirementGrant<'_>, keys: Option<&dyn KeyService>) -> Result<()> {
     let retirement = grant.retirement();
     match &retirement.work {
         RetirementWork::S3 { target, release, version, release_version, .. } => {
@@ -242,7 +270,21 @@ async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvi
                 crate::residence_trace::record("remove-version", observed);
             }
         }
-        RetirementWork::Tombstones { target, release, data_tombstone, release_tombstone, .. } => {
+        RetirementWork::Tombstones { deployment, target, release, data_tombstone, release_tombstone, slot_origin } => {
+            let withdrawal = if let Some(origin) = slot_origin {
+                let keys = keys.ok_or_else(changed)?;
+                let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
+                let namespace = owner.storage_namespaces.ok_or_else(changed)?;
+                if owner.lineage != lineage || owner.storage_prefix() != retirement.source || keys.namespace_id().await? != namespace.keys {
+                    return Err(changed());
+                }
+                let (_, logical) = target.strip_prefix(&format!("{}/", retirement.source))
+                    .and_then(|tail| tail.split_once('/')).ok_or_else(changed)?;
+                let logical = ObjectKey::new(logical)?;
+                Some((keys, UnitScope::directory_publication_slot(&owner.org, lineage, *origin, &logical)))
+            } else {
+                None
+            };
             let target = ObjectKey::new(target)?;
             let release = ObjectKey::new(release)?;
             let journal = TombstoneJournal::new(directory, lineage, retirement.token);
@@ -252,6 +294,9 @@ async fn erase_granted(directory: &dyn Directory, provider: &dyn RetirementProvi
             });
             crate::residence_trace::record("authorize-tombstones", observed);
             provider.retire_tombstones(&journal, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
+            if let Some((keys, slot)) = withdrawal {
+                keys.withdraw_unit_key(slot, &IoRegion::new()).await?;
+            }
             crate::residence_trace::record("remove-tombstones", observed);
         }
         _ => return Err(changed()),
@@ -437,6 +482,47 @@ enum PackReadiness {
     Covered { block: i64, youngest: i64 },
 }
 
+// These release classes are always loose, including after a reference is relocated.
+fn withdrawable_loose_unit(witness: &ReleaseWitness) -> bool {
+    let logical = &witness.record.key;
+    witness.pack.is_none() && witness.record.trie_floor.is_some()
+        && (rtdb_format::keys::is_catalog_retirement_file(logical) || rtdb_format::keys::is_receipt_l0_file(logical))
+}
+
+async fn terminal_slot_origin(
+    bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, owner: &DeploymentRecord,
+    target: &ObjectKey, witness: &ReleaseWitness, keys: Option<&dyn KeyService>, deployments: &[DeploymentRecord],
+) -> Result<Option<[u8; 32]>> {
+    let Some(publication) = &witness.terminal else { return Ok(None); };
+    if !withdrawable_loose_unit(witness) { return Ok(None); }
+    let logical = &witness.record.key;
+    let Some(keys) = keys else { return Ok(None); };
+    let Some(header) = provider.terminal_unit_header(target, publication).await? else { return Ok(None); };
+    let cipher = super::directory_publications(keys, owner, IoRegion::new())?;
+    let logical = ObjectKey::new(logical)?;
+    if !cipher.applies(&logical) { return Err(changed()); }
+    let (_, origin) = cipher.header(&logical, header).await?;
+
+    // A fork may keep the original ciphertext in another residence. The
+    // last exact release, including a relocated release, owns withdrawal.
+    for peer in deployments.iter().filter(|peer| peer.org == owner.org && peer.lineage == owner.lineage) {
+        for store in stores(bucket, &peer.storage_prefix()).await? {
+            let copy = ObjectKey::new(format!("{store}/{logical}"))?;
+            if &copy == target { continue; }
+            let size = match bucket.head_fresh(&copy).await {
+                Ok(object) => object.size,
+                Err(Error::MissingObject(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if size < PUBLICATION_HEADER { return Err(changed()); }
+            let prefix = bucket.observe_range(&copy, 0..PUBLICATION_ID_BYTES as u64).await?;
+            let copy_origin: [u8; PUBLICATION_ID_BYTES] = prefix.value.as_ref().try_into().map_err(|_| changed())?;
+            if copy_origin == origin { return Ok(None); }
+        }
+    }
+    Ok(Some(origin))
+}
+
 async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, lineage: &str, retirement: &LineageRetirement,
     target: &ObjectKey, release: &ObjectKey, keys: Option<&dyn KeyService>) -> Result<Option<Version>> {
     let root = ObjectKey::new(&retirement.source)?;
@@ -476,6 +562,11 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     let release_name = release.as_str().strip_prefix(&format!("{store}/")).ok_or_else(changed)?;
 
     let deployments = directory.deployments().await?;
+    if let RetirementWork::Tombstones { slot_origin, .. } = &retirement.work {
+        let owner = deployments.iter().find(|owner| owner.id == *deployment).ok_or_else(changed)?;
+        let observed = terminal_slot_origin(bucket, provider, owner, target, &witness, keys, &deployments).await?;
+        if observed != *slot_origin { return Ok(None); }
+    }
     for record in deployments.iter().filter(|record| record.lineage == lineage && record.lifecycle != Lifecycle::Deleted) {
         for referrer in stores(bucket, &record.storage_prefix()).await? {
             let base = Base::load(bucket, &referrer).await?;
