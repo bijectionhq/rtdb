@@ -3252,6 +3252,7 @@ RESIDENCE_AUTHORITY_CONTROLS = (
     ("arm_before_successor", "ErasureHasSuccessor"),
     ("use_revoked_cache", "RevokedCacheClosed"),
     ("skip_transport_deadline", "OnlyLiveTransportWrites"),
+    ("dispose_ignores_answer", "ClosedAfterDrain"),
     ("ack_payload_quorum", "AcknowledgedDecision"),
     ("read_unpublished_decision", "FreshIndexHasPublication"),
     ("lose_decision_on_activation", "DecisionSurvivesActivation"),
