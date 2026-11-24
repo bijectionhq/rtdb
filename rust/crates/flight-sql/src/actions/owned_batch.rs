@@ -204,11 +204,11 @@ impl Service {
                 match selector {
                     0 | 9 => self.held_owned_point(call, request, PointTime::Optional, compact, format).await,
                     1 | 10 => self.held_owned_point(call, request, PointTime::Required, compact, format).await,
-                    2 => self.held_owned_historical_point(call, request, format).await,
-                    3 => self.held_owned_position_point(call, request, format).await,
-                    4 => self.held_world_point(call, request, format).await,
-                    5 => self.held_world_point_at(call, request, false, format).await,
-                    6 => self.held_world_point_at(call, request, true, format).await,
+                    2 => self.held_owned_historical_point(call, request, compact, format).await,
+                    3 => self.held_owned_position_point(call, request, compact, format).await,
+                    4 => self.held_world_point(call, request, compact, format).await,
+                    5 => self.held_world_point_at(call, request, false, compact, format).await,
+                    6 => self.held_world_point_at(call, request, true, compact, format).await,
                     7 if compact.is_none() => self.held_root_cut_point_action(call, request, format).await,
                     _ => Err(invalid("Unsupported held selection entry")),
                 }.map(OwnedIpcReply::into_unary)

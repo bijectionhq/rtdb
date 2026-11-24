@@ -2513,13 +2513,13 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), retained) })
     }
 
-    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &Bytes, compact: Option<CompactIdentity>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned historical point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned historical point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, body, request, PointTime::Optional, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, request, PointTime::Optional, compact)?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, reply_format).await?;
@@ -2527,14 +2527,14 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &Bytes, compact: Option<CompactIdentity>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned position point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let (mask, request) = split_position_mask(request)?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, body, request, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, request, PointTime::Required, compact)?;
         let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
         let cursor = held.snapshot.open_historical_position_point(&relation, &id, system, valid, mask).await.map_err(status)?;
         let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, reply_format).await?;
@@ -4814,14 +4814,14 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, call.reserve(25)?) })
     }
 
-    pub(crate) async fn held_world_point_at(&self, call: &Call, envelope: &Bytes, parent: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_world_point_at(&self, call: &Call, envelope: &Bytes, parent: bool, compact: Option<CompactIdentity>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
-        let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, compact)?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
         let frozen = held.snapshot.ancestor().is_some_and(|(_, inherited)|
             !held.snapshot.clock_mode().is_writable() || system <= inherited);
@@ -4848,12 +4848,12 @@ impl Service {
         Ok(response)
     }
 
-    pub(crate) async fn held_world_point(&self, call: &Call, envelope: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_world_point(&self, call: &Call, envelope: &Bytes, compact: Option<CompactIdentity>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, compact)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
