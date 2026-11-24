@@ -342,12 +342,8 @@ pub(crate) async fn nominate(
         return Ok(None);
     };
     let through = BlockIndex(receipt.through_block());
-    // Expiring metadata can lose its compacted L0 descriptors.
-    if !table.stores_expiring_transaction_metadata()
-        && !catalog.l0_source(table, BlockIndex(-1), through).any(|trie| {
-            trie.state != TrieState::Live && !covered.contains(&trie.key.block_index())
-        })
-    {
+    // A checkpoint can keep directory rows for compacted blocks with no L0 descriptor.
+    if every_block_is_live_or_posted(catalog, table, covered, through) {
         return Ok(Some((through, 0)));
     }
     let entry = request
@@ -373,6 +369,20 @@ pub(crate) async fn nominate(
         return Err(invalid("Directory gap nomination exceeded its budget"));
     }
     Ok(Some((through, inspected)))
+}
+
+fn every_block_is_live_or_posted(catalog: &rtdb_index::TrieCatalog, table: &TableRef, covered: &BTreeSet<BlockIndex>, through: BlockIndex) -> bool {
+    let mut live_l0 = catalog
+        .l0_source(table, BlockIndex(-1), through)
+        .filter(|trie| trie.state == TrieState::Live)
+        .map(|trie| trie.key.block_index())
+        .peekable();
+    let mut posted = covered.range(BlockIndex(0)..=through).copied().peekable();
+    (0..=through.0).map(BlockIndex).all(|block| {
+        let has_live_l0 = live_l0.next_if_eq(&block).is_some();
+        let has_postings = posted.next_if_eq(&block).is_some();
+        has_live_l0 || has_postings
+    })
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly {

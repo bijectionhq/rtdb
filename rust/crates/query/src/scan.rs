@@ -3574,12 +3574,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logical_gap_nomination_reads_live_l0_pages_and_compacted_directory_rows() {
+    async fn logical_gap_nomination_reads_compacted_rows_even_without_l0_descriptors() {
         use rtdb_format::{
+            catalog::TableBlock,
             cow_tree::{self, Edit, NoSummary},
             entity_directory::{self, LogicalEvent},
             log::proto::{EntityDirectoryChange, EntityDirectoryRoot},
         };
+        use rtdb_index::TrieCatalog;
         use rtdb_types::{BlockIndex, EventOrigin};
         use sha2::{Digest, Sha256};
 
@@ -3637,17 +3639,16 @@ mod tests {
         state.add_tries(&BTreeMap::from([(table.clone(), tries)]), Timestamp(1400)).unwrap();
         state.add_artefacts(&table, vec![(newest_trie, directory.to_artefact().unwrap())]);
 
-        let nominate = async |covered: &BTreeSet<BlockIndex>| {
-            let snapshot = state.value().snapshot();
+        let nominate = async |snapshot: &Snapshot, covered: &BTreeSet<BlockIndex>| {
             let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table.clone(), storage.clone());
             let search_queries = SearchQueries::default();
             let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
-            let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
+            let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: snapshot,
                 storage: &storage, canonical_entity_iids: false, counts: Default::default() };
-            let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
+            let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot, storage: &storage,
                 bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
                 current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
-                candidate_iids: None, constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+                candidate_iids: None, constants, verifier: &verifier, partitions: std::slice::from_ref(snapshot) };
             crate::uncovered_history_iids(&request, covered, None, 2).await.unwrap()
         };
         let mut covered: BTreeSet<_> = (0..newest).map(BlockIndex).collect();
@@ -3656,19 +3657,43 @@ mod tests {
             scan_items: newest_rows + 1, decode_bytes: usize::MAX,
         };
         audience_work::within(Some(latest_page_work), async {
-            assert_eq!(nominate(&covered).await, Some(BTreeSet::from([iid(newest)])));
+            assert_eq!(nominate(&state.value().snapshot(), &covered).await, Some(BTreeSet::from([iid(newest)])));
             assert!(audience_work::scan_items(1).is_err());
         }).await;
 
         let compacted = CatalogTrie::notification(TrieKey::new(1, None, vec![], BlockIndex(newest - 1)).unwrap(), 0, None).unwrap();
         state.add_tries(&BTreeMap::from([(table.clone(), vec![compacted])]), Timestamp(1500)).unwrap();
+        let value = state.value();
+        let snapshot = value.snapshot();
         audience_work::within(Some(latest_page_work), async {
-            assert_eq!(nominate(&covered).await, Some(BTreeSet::from([iid(newest)])));
+            assert_eq!(nominate(&snapshot, &covered).await, Some(BTreeSet::from([iid(newest)])));
             assert!(audience_work::scan_items(1).is_err());
         }).await;
 
-        covered.remove(&BlockIndex(3));
-        assert_eq!(nominate(&covered).await, Some(BTreeSet::from([iid(3), iid(newest)])));
+        let missing = BlockIndex(3);
+        covered.remove(&missing);
+        let expected = Some(BTreeSet::from([iid(missing.0), iid(newest)]));
+        assert_eq!(nominate(&snapshot, &covered).await, expected);
+
+        let catalog = value.trie_catalog();
+        let mut partitions = catalog.partitions(&table).unwrap();
+        let missing_key = TrieKey::l0(missing).unwrap();
+        let missing_name = missing_key.to_string();
+        for partition in &mut partitions {
+            partition.tries.retain(|trie| trie.trie_key() != missing_name);
+        }
+        let block = TableBlock::from_parts(BTreeMap::new(), &StructFields::default(), source_rows, partitions).unwrap();
+        let block = catalog.with_entity_directory(&table, block);
+        let loaded = TrieCatalog::load(&BTreeMap::from([(table.clone(), block)]), catalog.file_size_target(), Timestamp(1500)).unwrap();
+        assert!(loaded.trie(&table, &missing_key).is_none());
+        let reloaded = Snapshot::new(Arc::new(loaded), value.table_catalog().clone(), value.live().clone());
+        assert_eq!(nominate(&reloaded, &covered).await, expected);
+
+        covered.insert(missing);
+        audience_work::within(Some(latest_page_work), async {
+            assert_eq!(nominate(&reloaded, &covered).await, Some(BTreeSet::from([iid(newest)])));
+            assert!(audience_work::scan_items(1).is_err());
+        }).await;
     }
 
     #[tokio::test]

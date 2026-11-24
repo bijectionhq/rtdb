@@ -206,6 +206,7 @@ rule SearchJobRuns {
     -- The table also owns event header pages for individual primary tries.
     -- A point read takes a primary trie without entity history from the data pages its metadata routes the requested keys to, so older data narrows the read rather than sending it to a scan.
     -- Gap nomination reads each uncovered block with a live L0 trie from that trie's pages, including within the directory's sealed prefix.
+    -- Gap nomination skips the directory when every block in its sealed prefix has posting coverage or a live L0 trie.
     -- An uncovered compacted block in the sealed prefix is nominated through the captured entity directory.
     -- Compacted history beyond the sealed prefix is nominated from live primary tries.
     -- Primary gap reads count the rows of each decoded page against the inspection budget.
