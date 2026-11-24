@@ -47,6 +47,17 @@ impl DatabaseCatalog {
         self.with_current_attachment(&attachment, || Ok(ticket))
     }
 
+    /// Releases only the captured export, after the trusted owner has drained its uses.
+    #[cfg(feature = "multi")]
+    pub async fn release_deployment_checkpoint(
+        &self, name: &str, ticket: Vec<u8>, cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let attachment = self.database(name)?;
+        let driver = attachment.serving_driver().ok_or_else(export_unavailable)?;
+        driver.release_checkpoint_export(ticket, cancellation).await?;
+        self.with_current_attachment(&attachment, || Ok(()))
+    }
+
     /// Restores into an independently provisioned destination and returns its applied basis.
     #[cfg(feature = "multi")]
     pub async fn restore_deployment_checkpoint(

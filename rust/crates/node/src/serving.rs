@@ -168,6 +168,11 @@ pub trait ServingDriver: Send + Sync {
     }
 
     #[cfg(feature = "multi")]
+    async fn release_checkpoint_export(&self, _ticket: Vec<u8>, _cancellation: &CancellationToken) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/export-checkpoint", "The serving attachment has no ordered checkpoint exports"))
+    }
+
+    #[cfg(feature = "multi")]
     async fn restore_checkpoint(&self, _export: rtdb_db::PinnedExport, _cancellation: &CancellationToken) -> Result<BranchCut> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/restore-checkpoint", "The serving attachment has no independent checkpoint restore"))
     }

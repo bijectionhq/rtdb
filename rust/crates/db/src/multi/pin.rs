@@ -124,6 +124,19 @@ impl MultiDatabase {
         Ok(export)
     }
 
+    /// Orders release of the exact export once its trusted owner has drained the transfer.
+    pub async fn release_export_ticket(&mut self, ticket: &[u8]) -> Result<()> {
+        let ticket = self.tokens.open_export(ticket).await?;
+        self.refresh().await?;
+        let lease = self.authority()?;
+        let closure = self.reachability(lease).await?;
+        let Some(pin) = closure.pins().find(|pin| pin.id == ticket.pin) else { return Ok(()); };
+        if manifest_identity(pin.manifest) != ticket.manifest_sha256 {
+            return Err(Anomaly::incorrect("rtdb/invalid-export", "The pinned checkpoint does not match the export ticket"));
+        }
+        self.append_control(lease, Record::Unpin { id: ticket.pin }).await
+    }
+
     /// Install an independent backing for an exact export. The destination's
     /// journal and KMS own all bytes needed to recover after the append.
     pub async fn restore_export(&mut self, export: &PinnedExport) -> Result<BranchCut> {

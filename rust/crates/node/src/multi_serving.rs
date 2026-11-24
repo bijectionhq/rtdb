@@ -99,6 +99,10 @@ impl ServingDriver for MultiServing {
         cancellation.run_until_cancelled(self.writes.open_export(ticket)).await.ok_or_else(interrupted)?
     }
 
+    async fn release_checkpoint_export(&self, ticket: Vec<u8>, cancellation: &CancellationToken) -> Result<()> {
+        cancellation.run_until_cancelled(self.writes.release_export(ticket)).await.ok_or_else(interrupted)?
+    }
+
     async fn restore_checkpoint(&self, export: rtdb_db::PinnedExport, cancellation: &CancellationToken) -> Result<BranchCut> {
         cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
     }

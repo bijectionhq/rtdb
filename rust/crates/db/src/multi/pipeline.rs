@@ -35,6 +35,7 @@ enum Command {
     Tick(BTreeSet<IpAddr>, Reply<Role>),
     Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
     OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
+    ReleaseExport { ticket: Vec<u8>, reply: Reply<()> },
     Restore { export: PinnedExport, reply: Reply<BranchCut> },
     Retire(Reply<super::DeploymentRetirement>),
 }
@@ -142,6 +143,10 @@ impl WritePipeline {
 
     pub async fn open_export(&self, ticket: Vec<u8>) -> Result<PinnedExport> {
         self.request(|reply| Command::OpenExport { ticket, reply }).await
+    }
+
+    pub async fn release_export(&self, ticket: Vec<u8>) -> Result<()> {
+        self.request(|reply| Command::ReleaseExport { ticket, reply }).await
     }
 
     pub async fn restore(&self, export: PinnedExport) -> Result<BranchCut> {
@@ -271,6 +276,10 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             }
             Command::OpenExport { ticket, reply } => {
                 let result = database.lock().await.open_export_ticket(&ticket).await;
+                let _ = reply.send(result);
+            }
+            Command::ReleaseExport { ticket, reply } => {
+                let result = database.lock().await.release_export_ticket(&ticket).await;
                 let _ = reply.send(result);
             }
             Command::Restore { export, reply } => {

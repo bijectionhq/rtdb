@@ -323,12 +323,14 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     let written = child.transact(&timed).await.unwrap();
     assert!(written.basis > restored.basis);
     assert_eq!(written.outcome, Outcome::Then);
-    writer.release_pin(id).await.unwrap();
+    writer.release_export_ticket(&ticket).await.unwrap();
+    writer.release_export_ticket(&ticket).await.unwrap();
     assert_eq!(writer.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/unknown-pin");
     let replacement = writer.export_ticket(id, selected.basis, None).await.unwrap();
     assert_ne!(replacement, ticket);
     assert_eq!(writer.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/invalid-export");
-    writer.release_pin(id).await.unwrap();
+    assert_eq!(writer.release_export_ticket(&ticket).await.unwrap_err().code, "rtdb/invalid-export");
+    writer.release_export_ticket(&replacement).await.unwrap();
     child.checkpoint(Vec::new()).await.unwrap();
     let mut follower = cluster.node_for(destination, 3, Arc::new(journal.handle(NODE_3_IDENTITY)));
     assert_eq!(follower.tx_status(&timed.key).await.unwrap().basis, written.basis);
