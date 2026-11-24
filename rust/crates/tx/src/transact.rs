@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod operations;
+mod pipeline;
+
+pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Window {
@@ -159,7 +162,7 @@ impl PreparedAppend {
     }
 }
 
-const RECORD_VERSION: u8 = 1;
+const RECORD_VERSION: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransactionRecord {
@@ -192,6 +195,17 @@ pub struct ResolvedTransact {
     before: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt_namespace: Option<[u8; 32]>,
+    /// The writer's clock sample when it admitted the request.
+    submitted_at: Timestamp,
+}
+
+impl ResolvedTransact {
+    /// The admission witness carried in the one durable record of an ordinary transaction:
+    /// the attempt identity (the idempotency key), when the writer admitted it, and the
+    /// SHA-256 commitment to the exact submitted request.
+    pub fn admission(&self) -> (&[u8], Timestamp, [u8; 32]) {
+        (&self.receipt.key, self.submitted_at, self.fingerprint)
+    }
 }
 
 impl ResolvedTransact {
@@ -205,18 +219,35 @@ struct Pending {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct StoredReceipt {
+pub(crate) struct StoredReceipt {
     receipt: Receipt,
     fingerprint: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt_namespace: Option<[u8; 32]>,
 }
 
+/// Durable receipts by receipt namespace, then idempotency key.
+pub(crate) type Receipts = BTreeMap<Option<[u8; 32]>, BTreeMap<Vec<u8>, StoredReceipt>>;
+
+/// What a decision reads: an index, the durable receipts, and whether a timed write is pending.
+pub(crate) struct View<'a> {
+    pub(crate) index: &'a BranchIndex,
+    pub(crate) receipts: &'a Receipts,
+    pub(crate) pending: bool,
+}
+
+/// The commitment to the exact submitted request: the admission witness's source-bytes digest.
+fn fingerprint(request: &Transact) -> Result<[u8; 32]> {
+    serde_json::to_vec(request)
+        .map(|bytes| Sha256::digest(bytes).into())
+        .map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
+}
+
 /// State folded from a single stream. A caller resolves at its fresh committed prefix.
 #[derive(Clone)]
 pub struct TransactState {
     index: BranchIndex,
-    receipts: BTreeMap<Option<[u8; 32]>, BTreeMap<Vec<u8>, StoredReceipt>>,
+    receipts: Receipts,
     pending: Option<Pending>,
 }
 
@@ -313,20 +344,30 @@ impl TransactState {
         &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<Resolution> {
+        let view = View { index: &self.index, receipts: &self.receipts, pending: self.pending.is_some() };
+        Self::resolve_in(view, request, position, now, features, claims, authority).map(|(resolution, _)| resolution)
+    }
+
+    /// Resolves `request` at `position` against `view`. For an append it also returns the
+    /// index after the transaction publishes: exactly what [`TransactState::apply`] computes
+    /// for the record, or for a timed write for its `Settle` (advance to the receipt cut,
+    /// then the effects in order).
+    pub(crate) fn resolve_in(
+        view: View<'_>, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
+        authority: Option<ScopedTransact<'_>>,
+    ) -> Result<(Resolution, Option<BranchIndex>)> {
         validate_key(&request.key)?;
         let receipt_namespace = authority.map(|authority| authority.receipt_namespace);
-        let fingerprint = serde_json::to_vec(request)
-            .map(|bytes| Sha256::digest(bytes).into())
-            .map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))?;
-        if let Some(stored) = self.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
+        let fingerprint = fingerprint(request)?;
+        if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
             if stored.fingerprint != fingerprint {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction"));
             }
-            return Ok(Resolution::Answer(replay(&stored.receipt)));
+            return Ok((Resolution::Answer(replay(&stored.receipt)), None));
         }
 
-        if self.pending.is_some() { return Err(pending_error()); }
-        let head = self.index.head();
+        if view.pending { return Err(pending_error()); }
+        let head = view.index.head();
         let validation = request.ops.is_empty() && request.otherwise.is_empty();
         let before = if validation {
             if !features.contains(&LINEARIZABLE) { return Err(feature_required(LINEARIZABLE)); }
@@ -355,30 +396,34 @@ impl TransactState {
                 system_time: now.max(head.system_time.next()?),
             }
         };
-        let mut base = self.index.clone();
+        let mut base = view.index.clone();
         if !validation { base.advance(cut)?; }
         let decision_time = now.max(cut.system_time);
-        let result = self.decide(request, base, now, decision_time, features, claims, authority.map(|authority| authority.labels));
-        let (outcome, effects) = match result {
+        let advanced = base.clone();
+        let result = Self::decide(request, base, now, decision_time, features, claims, authority.map(|authority| authority.labels));
+        let (outcome, effects, after) = match result {
             Ok(decision) => decision,
-            Err(error) if error.is_caller_error() => (Outcome::Refused { error }, Vec::new()),
+            Err(error) if error.is_caller_error() => (Outcome::Refused { error }, Vec::new(), advanced),
             Err(error) => return Err(error),
         };
         let receipt = Receipt {
             key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome, replayed: false,
         };
         if validation {
-            Ok(Resolution::Answer(receipt))
+            Ok((Resolution::Answer(receipt), None))
         } else {
-            let record = TransactionRecord::Tx(ResolvedTransact { fingerprint, receipt, effects, before, receipt_namespace });
-            Ok(Resolution::Append(PreparedAppend { position, record }))
+            // For a timed write, `after` is the index once it settles at `position + 1`.
+            let record = TransactionRecord::Tx(ResolvedTransact {
+                fingerprint, receipt, effects, before, receipt_namespace, submitted_at: now,
+            });
+            Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
         }
     }
 
     fn decide(
-        &self, request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
+        request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
         features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>,
-    ) -> Result<(Outcome, Vec<BranchEffect>)> {
+    ) -> Result<(Outcome, Vec<BranchEffect>, BranchIndex)> {
         if let Some(feature) = request.require.iter().find(|feature| !features.contains(&feature.as_str())) {
             return Err(feature_required(feature));
         }
@@ -406,13 +451,13 @@ impl TransactState {
             }
             if failed.is_empty() {
                 if !request.ops.is_empty() { then.check_constraints()?; }
-                return Ok((Outcome::Then, then.effects));
+                return Ok((Outcome::Then, then.effects, then.index));
             }
         }
         let mut otherwise = Candidate::new(base, scope);
         otherwise.execute(&request.otherwise)?;
         if !request.otherwise.is_empty() { otherwise.check_constraints()?; }
-        Ok((Outcome::Otherwise { failed }, otherwise.effects))
+        Ok((Outcome::Otherwise { failed }, otherwise.effects, otherwise.index))
     }
 
     /// A writer recovering the prefix orders refusal before admitting another write.

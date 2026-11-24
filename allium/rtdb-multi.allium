@@ -1556,6 +1556,10 @@ rule ResolveAndAppend {
     -- It releases the installed intake prefix independently of subsequent submissions.
     -- The resolved replica record carries the exact attempt identity.
     -- Only its durable applied outcome supplies a causal basis.
+    -- Each ordinary Transact is exactly one appended record. It carries the admission witness: the attempt identity (idempotency key), the writer's admission time and a commitment to the submitted request bytes.
+    -- Resolution never waits for durability. Decisions take consecutive positions; the driver appends them in position order and may group them into one journal request.
+    -- A timed write reserves the next position for its Settle or Refuse; later decisions assume it settles and are appended only after that slot is filled.
+    -- On Refuse, decisions that assumed the settlement were never appended and are decided again; their outcome is not unknown.
     when: TxArrived(holding, tx, key)
 
     requires: holding.state = serving
@@ -1582,6 +1586,7 @@ rule ApplyOnCommit {
     -- A receipt expires one hour after its recorded intake time.
     -- Redemption exchanges the receipt for a causal token naming the installed replica prefix that contains the durable outcome.
     -- Reading at an implicit basis first installs at least the prefix named by the causal token.
+    -- Replies are released only here, in position order: a commitment through a position releases every decision up to it and none after.
     when: AppendCommitted(holding, record: ResolvedTx)
 
     requires: holding.state = serving
@@ -1597,6 +1602,7 @@ rule ApplyOnCommit {
 rule DeposeOnRefusedAppend {
     -- A refusal citing a higher promised epoch means a successor has sealed this holder's loglet.
     -- Speculative state is discarded and queued work is forwarded; nothing unacknowledged was ever visible.
+    -- Withdrawal removes exactly the unacknowledged suffix of decision order, so no acknowledged decision depends on a withdrawn one; its callers learn the outcome by TxStatus.
     when: AppendRefused(holding, promised)
 
     requires: promised > holding.epoch
