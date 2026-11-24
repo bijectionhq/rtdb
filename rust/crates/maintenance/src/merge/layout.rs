@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
-use rtdb_format::{data::{EventBatch, PageEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
+use rtdb_format::{data::{EventBatch, PageEvent}, ipc::ArrowFileWriter, metadata::MetadataBuilder};
 use rtdb_types::{Iid, Result, Timestamp};
 use tokio_util::sync::CancellationToken;
 use super::{MergeConfig, MergeOutput, MergePages, OutputSchema, check_disk, create_file, disk_remaining, limit_writer, open_input, read_page, row_bytes};
@@ -119,7 +119,11 @@ impl FinalWriter<'_> {
                 let page = read(leaf.page)?;
                 if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Merge page row count differs from its page tree")); }
                 charges.push(self.memory.reserve(super::decoded_bound(page.batch())?)?);
-                let restored = rtdb_format::ipc::restore_spill_page_schema(page.batch(), &self.arrow_schema)?;
+                let restored = if page.batch().schema_ref() == &self.arrow_schema {
+                    None
+                } else {
+                    rtdb_format::ipc::restore_spill_page_schema(page.batch(), &self.arrow_schema)?
+                };
                 pages.push(EventBatch::new(restored.unwrap_or_else(|| page.batch().clone()))?);
             }
             if total == 0 { return self.metadata.write_nil(); }
@@ -139,15 +143,10 @@ impl FinalWriter<'_> {
     }
 }
 
-fn read_events(reader: &mut ArrowFile, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Arc<MemoryReservation>)> {
-    let batch = read_page(reader, leaf.page, memory)?;
-    page_events(&batch, leaf, memory)
-}
-
-fn page_events(batch: &rtdb_columnar::OwnedBatch, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Arc<MemoryReservation>)> {
+fn page_events(batch: &OwnedBatch, leaf: &Leaf, memory: &Arc<MemoryBudget>) -> Result<(Vec<PageEvent>, Arc<MemoryReservation>)> {
     let charge = memory.reserve(super::decoded_bound(batch.batch())?)?;
     let events = EventBatch::new(batch.batch().clone())?.page_events()?;
-    if events.len() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
+    if events.len() != leaf.rows { return Err(crate::invalid("Merge page row count differs from its page tree")); }
     Ok((events, charge))
 }
 
@@ -268,14 +267,13 @@ pub(super) fn normalize(input: &MergeOutput, config: &MergeConfig, memory: &Arc<
     if cancellation.is_cancelled() { return Err(crate::closed()); }
     match &input.pages {
         MergePages::Retained(retained) => normalize_to_files(&input.schema, config, memory, data_path, meta_path, cancellation, |output| {
-            let mut read = |page: usize| retained.batches.get(page).cloned().ok_or_else(|| crate::invalid("Retained merge page is missing"));
-            output.tree(&mut read, &input.leaves, 0, config.page_size)?;
-            Ok(())
+            let read = |page: usize| retained.batches.get(page).cloned().ok_or_else(|| crate::invalid("Retained merge page is missing"));
+            normalize_pages(output, read, input, config.page_size)
         }),
         MergePages::Spilled => {
             let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
             normalize_to_files(&input.schema, config, memory, data_path, meta_path, cancellation, |output| {
-                normalize_spill(output, &mut reader, input, config.page_size)
+                normalize_pages(output, |page| read_page(&mut reader, page, memory), input, config.page_size)
             })
         }
         _ => Err(crate::invalid("Merge pages are not ready for normalization")),
@@ -300,10 +298,10 @@ fn normalize_to_files(schema: &OutputSchema, config: &MergeConfig, memory: &Arc<
     Ok((size, details))
 }
 
-fn normalize_spill(output: &mut FinalWriter<'_>, reader: &mut ArrowFile, input: &MergeOutput, page_size: usize) -> Result<()> {
+fn normalize_pages(
+    output: &mut FinalWriter<'_>, mut read: impl FnMut(usize) -> Result<OwnedBatch>, input: &MergeOutput, page_size: usize,
+) -> Result<()> {
     if !input.schema.recency {
-        let memory = output.memory;
-        let mut read = |page| read_page(reader, page, memory);
         output.tree(&mut read, &input.leaves, 0, page_size)?;
     } else if input.leaves.is_empty() { output.metadata.write_nil()?; }
     else {
@@ -315,7 +313,7 @@ fn normalize_spill(output: &mut FinalWriter<'_>, reader: &mut ArrowFile, input: 
         if let Some(width) = width {
             let mut cells: BTreeMap<Timestamp, StreamingTrie> = BTreeMap::new();
             for leaf in &input.leaves {
-                let (events, _charge) = read_events(reader, leaf, output.memory)?;
+                let (events, _charge) = page_events(&read(leaf.page)?, leaf, output.memory)?;
                 for event in events {
                     let boundary = cell_boundary(event.recency.ok_or_else(|| crate::invalid("Historical row has no recency"))?, width)?;
                     cells.entry(boundary).or_insert_with(|| StreamingTrie::new(part.len(), page_size)).add(event, output)?;
@@ -330,7 +328,7 @@ fn normalize_spill(output: &mut FinalWriter<'_>, reader: &mut ArrowFile, input: 
         } else {
             let mut trie = StreamingTrie::new(0, page_size);
             for leaf in &input.leaves {
-                let (events, _charge) = read_events(reader, leaf, output.memory)?;
+                let (events, _charge) = page_events(&read(leaf.page)?, leaf, output.memory)?;
                 for event in events { trie.add(event, output)?; }
             }
             trie.finish(output)?;

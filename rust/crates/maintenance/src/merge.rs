@@ -120,7 +120,7 @@ struct MergePlan {
 }
 
 const RETAINED_MERGE_BYTES: usize = 2 * 1024 * 1024;
-const RETAINED_MERGE_TASKS: usize = 4;
+const RETAINED_MERGE_TASKS: usize = 16;
 
 #[derive(Clone)]
 struct OutputSchema { put: Option<Arc<StructFields<LogicalType>>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool, topology: bool, include_origins: bool, include_positions: bool, redacted_leg: bool }
@@ -128,13 +128,15 @@ struct OutputSchema { put: Option<Arc<StructFields<LogicalType>>>, iid_encoding:
 impl OutputSchema {
     fn supports_retention(&self) -> bool {
         // The spill codec can rewrite nested union slots before the final writer reads them.
-        self.iid_encoding.is_none() && !self.recency && self.put.as_ref().is_none_or(|fields| {
+        self.put.as_ref().is_none_or(|fields| {
             fields.iter().all(|(_, ty)| {
                 let ty = match ty { LogicalType::Maybe(inner) => inner.as_ref(), _ => ty };
                 matches!(ty, LogicalType::Scalar(ScalarType::Bool | ScalarType::I8 | ScalarType::I16
                     | ScalarType::I32 | ScalarType::I64 | ScalarType::U8 | ScalarType::U16
                     | ScalarType::U32 | ScalarType::U64 | ScalarType::F32 | ScalarType::F64
-                    | ScalarType::Utf8 | ScalarType::Binary))
+                    | ScalarType::Utf8 | ScalarType::Binary | ScalarType::FixedSizeBinary(1..)
+                    | ScalarType::DateDay | ScalarType::DateMilli | ScalarType::Time { .. }
+                    | ScalarType::Timestamp { .. } | ScalarType::Duration(_) | ScalarType::Uuid))
             })
         })
     }
@@ -437,7 +439,7 @@ impl SegmentCompactor {
             put, iid_encoding: (self.config.run_end_encoded_iids && initial_recency.is_some()).then_some(RunEndWidth::I32),
             recency: job.recency_mode == RecencyMode::Preserve && carry, keyed, topology, include_origins, include_positions, redacted_leg,
         };
-        let retain_multiple = job.recency_mode == RecencyMode::Preserve && initial_recency.is_none()
+        let retain_multiple = job.recency_mode == RecencyMode::Preserve
             && (2..=RETAINED_MERGE_TASKS).contains(&tasks.len());
         let mut retain = initial_schema.supports_retention() && (tasks.len() == 1 || retain_multiple);
         let plan = MergePlan { tasks, tie_order, source_precedence };
@@ -758,17 +760,30 @@ mod tests {
 
     #[test]
     fn retained_compaction_pages_match_spill_geometry_bytes_and_event_witnesses() {
-        use rtdb_types::{BlockIndex, EventOrigin, EventPosition, TxId};
+        use rtdb_types::{BlockIndex, EventOrigin, EventPosition, TimeUnit, TxId};
 
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryBudget::new(32 << 20);
         let config = MergeConfig { page_size: 3, ..Default::default() };
         let cancellation = CancellationToken::new();
+        let fixed_width = [
+            ("day", Value::DateDay(-2)),
+            ("millis", Value::DateMilli(-1)),
+            ("time", Value::Time { value: 100, unit: TimeUnit::Nanosecond, bit_width: 64 }),
+            ("timestamp", Value::Timestamp { value: -1067, unit: TimeUnit::Nanosecond, timezone: Some("America/New_York".into()) }),
+            ("duration", Value::Duration { value: -3, unit: TimeUnit::Microsecond }),
+            ("uuid", Value::Uuid([0xab; 16])),
+            ("fixed_binary", Value::FixedSizeBinary(vec![4, 5, 6])),
+        ];
+        let mut fields = StructFields::from([
+            ("text".into(), LogicalType::Scalar(ScalarType::Utf8).maybe()),
+            ("number".into(), LogicalType::Scalar(ScalarType::F64)),
+        ]);
+        for (name, value) in &fixed_width {
+            fields.insert((*name).into(), value.logical_type());
+        }
         let schema = OutputSchema {
-            put: Some(Arc::new(StructFields::from([
-                ("text".into(), LogicalType::Scalar(ScalarType::Utf8).maybe()),
-                ("number".into(), LogicalType::Scalar(ScalarType::F64)),
-            ]))),
+            put: Some(Arc::new(fields)),
             iid_encoding: None, recency: false, keyed: true, topology: false,
             include_origins: true, include_positions: true, redacted_leg: true,
         };
@@ -778,12 +793,19 @@ mod tests {
             StoredOperation::Redacted,
             StoredOperation::Delete,
             StoredOperation::Put(StructFields::from([("text".into(), Value::Utf8("b".into())), ("number".into(), Value::F64(2.0))])),
-        ].into_iter().enumerate().map(|(row, operation)| StoredEvent {
-            iid: Iid([[0, 1, 16, 64, 65][row]; 16]), system_from: Timestamp(10 + row as i64),
-            valid_time: Interval::from_micros(row as i64, 100).unwrap(),
-            entity_key: Some(Arc::from([row as u8].as_slice())), commit_position: row as u32 + 1,
-            origin: (row >= 2).then(|| EventOrigin::at([1; 16], row as u64, BlockIndex(1))),
-            position: Some(EventPosition { transaction: TxId(1), ordinal: row as u64 }), recency: None, operation,
+        ].into_iter().enumerate().map(|(row, mut operation)| {
+            if let StoredOperation::Put(document) = &mut operation {
+                for (name, value) in &fixed_width {
+                    document.insert((*name).into(), value.clone());
+                }
+            }
+            StoredEvent {
+                iid: Iid([[0, 1, 16, 64, 65][row]; 16]), system_from: Timestamp(10 + row as i64),
+                valid_time: Interval::from_micros(row as i64, 100).unwrap(),
+                entity_key: Some(Arc::from([row as u8].as_slice())), commit_position: row as u32 + 1,
+                origin: (row >= 2).then(|| EventOrigin::at([1; 16], row as u64, BlockIndex(1))),
+                position: Some(EventPosition { transaction: TxId(1), ordinal: row as u64 }), recency: None, operation,
+            }
         }).collect::<Vec<_>>();
         let input = EventBatch::new(build_event_batch(&rows, schema.put.as_deref().cloned(), None).unwrap()).unwrap();
         let events = input.page_events().unwrap();
@@ -824,6 +846,76 @@ mod tests {
                 let observed = (0..length).map(|row| page.read_event(row).unwrap()).collect::<Vec<_>>();
                 assert_eq!(observed.as_slice(), &rows[offset..offset + length]);
                 offset += length;
+            }
+            drop(retained);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn retained_historical_subtries_match_spill_with_iid_runs_and_recency_cells() {
+        use arrow_array::{RunArray, types::Int32Type};
+        use rtdb_format::metadata::MetadataNode;
+
+        const SIX_HOURS: i64 = 6 * 3_600_000_000;
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryBudget::new(32 << 20);
+        let cancellation = CancellationToken::new();
+        let date = CivilDate::from_ymd(1970, 1, 5).unwrap();
+        for recency in [false, true] {
+            let directory = directory.path().join(recency.to_string());
+            std::fs::create_dir(&directory).unwrap();
+            let config = MergeConfig { page_size: if recency { 4 } else { 8 }, ..Default::default() };
+            let schema = OutputSchema {
+                put: None, iid_encoding: Some(RunEndWidth::I32), recency, keyed: false, topology: false,
+                include_origins: false, include_positions: false, redacted_leg: false,
+            };
+            assert!(schema.supports_retention());
+            let mut retained = MergeOutput::pending(directory.join("retained-spill.arrow"), Some(date), &[1], schema.clone());
+            let mut spilled = MergeOutput::pending(directory.join("spill.arrow"), Some(date), &[1], schema);
+            spilled.start_spill(&config, &memory, &cancellation).unwrap();
+            for task in 0..16u8 {
+                let path = vec![1, task / 4, task % 4];
+                let iid = Iid([64 + (task << 2); 16]);
+                let rows = [2, 1].map(|time| StoredEvent {
+                    iid, system_from: Timestamp(time), valid_time: Interval::ALL,
+                    entity_key: None, commit_position: 0, position: None, origin: None,
+                    operation: StoredOperation::Delete,
+                    recency: recency.then_some(Timestamp(if task % 2 == 0 { 0 } else { SIX_HOURS })),
+                });
+                let events = page(&rows);
+                for output in [&mut retained, &mut spilled] {
+                    output.write(&events, path.clone(), &config, &memory, &cancellation).unwrap();
+                }
+            }
+            let normalize = |output: &mut MergeOutput, name| {
+                output.finish(&config, &memory, &cancellation).unwrap();
+                let data = directory.join(format!("{name}.arrow"));
+                let meta = directory.join(format!("{name}.meta.arrow"));
+                let details = output.normalize(&config, &memory, &data, &meta, &cancellation).unwrap();
+                (std::fs::read(data).unwrap(), std::fs::read(meta).unwrap(), details)
+            };
+            let result = normalize(&mut retained, "retained");
+            assert_eq!(result, normalize(&mut spilled, "spilled"));
+            assert!(!retained.path.exists());
+            let (data, meta, _) = result;
+            let meta = MetadataFile::read(meta.into()).unwrap();
+            let Some(MetadataNode::IidBranch(root)) = meta.nodes().last() else { panic!("missing subtrie root") };
+            assert_eq!(root.as_slice(), &[None, root[1], None, None]);
+            let child = &meta.nodes()[root[1].unwrap()];
+            if recency {
+                let MetadataNode::RecencyBranch(cells) = child else { panic!("missing recency cells") };
+                assert!(cells.iter().map(|(boundary, _)| *boundary).eq([Timestamp(0), Timestamp(SIX_HOURS)]));
+            } else {
+                assert!(matches!(child, MetadataNode::IidBranch(_)));
+            }
+            let mut data = ArrowFile::open(data.into(), None).unwrap();
+            assert_eq!(data.page_count(), if recency { 8 } else { 4 });
+            for index in 0..data.page_count() {
+                let batch = data.read_page(index).unwrap();
+                let iids = batch.column_by_name("_iid").unwrap().as_any().downcast_ref::<RunArray<Int32Type>>().unwrap();
+                let ends = if recency { &[2, 4][..] } else { &[2, 4, 6, 8][..] };
+                assert_eq!(iids.run_ends().values(), ends);
             }
             drop(retained);
             assert_eq!(memory.used_bytes(), 0);
