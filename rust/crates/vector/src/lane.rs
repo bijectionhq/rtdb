@@ -27,8 +27,11 @@ struct Builder(ArtefactDatabase);
 impl Builder {
     async fn read_definitions(&self, snapshot: &PartitionValue, cancellation: &CancellationToken) -> Result<Vec<VectorDefinition>> {
         let database = &self.0;
-        definition::definitions_in(&database.name, vec![snapshot.snapshot()], Arc::clone(&database.storage), Arc::clone(&database.memory),
-            (database.clock)(), cancellation).await
+        let mut definitions = definition::definitions_in(&database.name, vec![snapshot.snapshot()], Arc::clone(&database.storage),
+            Arc::clone(&database.memory), (database.clock)(), cancellation).await?;
+        definitions.extend(definition::owned_definitions_in(&database.name, snapshot.snapshot(), Arc::clone(&database.storage),
+            Arc::clone(&database.memory), (database.clock)(), cancellation).await?);
+        Ok(definitions)
     }
 }
 

@@ -122,6 +122,58 @@ pub async fn definitions_in(
     Ok(definitions)
 }
 
+/// Every owner's approximate vector paths in the snapshot, for the artefact lane.
+pub(crate) async fn owned_definitions_in(
+    database: &str, snapshot: Snapshot, storage: Arc<BufferPool>, memory: Arc<MemoryBudget>, now: impl Into<Instant>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<VectorDefinition>> {
+    let catalogs: Vec<_> = snapshot.tables().into_iter().filter(TableRef::is_owned_vector_catalog).collect();
+    if catalogs.is_empty() { return Ok(Vec::new()); }
+    let catalog = CatalogSnapshot::new(database, BTreeMap::from([(database.to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage })]), false)?;
+    let context = QueryContext::new(catalog, Arc::clone(&memory), now, "UTC", QueryOptions::default(), cancellation)?;
+    let mut definitions = Vec::new();
+    for catalog in catalogs {
+        definitions.extend(owned_catalog_definitions(Arc::clone(&context), &catalog, None).await?);
+    }
+    Ok(definitions)
+}
+
+/// The approximate vector path over `column` of an owned relation, from its owner's catalog.
+pub async fn owned_definition(context: Arc<QueryContext>, table: &TableRef, column: &str) -> Result<Option<VectorDefinition>> {
+    let Some(catalog) = table.owned_vector_catalog() else { return Ok(None) };
+    Ok(owned_catalog_definitions(context, &catalog, None).await?.into_iter()
+        .find(|definition| &definition.table == table && definition.column == column))
+}
+
+async fn owned_catalog_definitions(context: Arc<QueryContext>, catalog: &TableRef, path: Option<&str>) -> Result<Vec<VectorDefinition>> {
+    let Some(mut cursor) = rtdb_query::open_owned_path_catalog(context, catalog, path).await? else { return Ok(Vec::new()) };
+    let mut definitions = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        for row in 0..batch.num_rows() {
+            let cell = |name| rtdb_columnar::ArrowCell::named(batch, name, row);
+            let text = |name| cell(name).and_then(rtdb_columnar::ArrowCell::utf8).map(str::to_owned).ok_or_else(|| malformed(name));
+            let mut columns = cell("columns").and_then(rtdb_columnar::ArrowCell::list).ok_or_else(|| malformed("columns"))?;
+            let column = columns.next().and_then(|cell| cell.utf8()).map(str::to_owned).ok_or_else(|| malformed("columns"))?;
+            if columns.next().is_some() { return Err(malformed("columns")); }
+            let table = TableRef::new(text("schema_name")?, text("table_name")?);
+            if !catalog.owns_path_target(&table) { return Err(malformed("table_name")); }
+            let recall = match cell("recall").map(|cell| read_execution_value(cell.field, cell.array, cell.row)).transpose()? {
+                Some(Value::F64(recall)) => recall,
+                _ => return Err(malformed("recall")),
+            };
+            let dimensions = cell("dimensions").and_then(rtdb_columnar::ArrowCell::int64)
+                .and_then(|dimensions| usize::try_from(dimensions).ok()).filter(|dimensions| *dimensions > 0).ok_or_else(|| malformed("dimensions"))?;
+            definitions.push(VectorDefinition {
+                name: text("_id")?, table, column, partition: Vec::new(), dimensions,
+                approximate: Approximate::new(Method::Ivf, recall)?,
+                generation: cell("version").and_then(rtdb_columnar::ArrowCell::int64).ok_or_else(|| malformed("version"))?,
+            });
+        }
+    }
+    Ok(definitions)
+}
+
 fn malformed(column: &str) -> Anomaly {
     Anomaly::fault("rtdb.vector/malformed-definition", format!("Malformed vector index definition in {column}"))
 }

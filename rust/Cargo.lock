@@ -5226,6 +5226,7 @@ dependencies = [
  "rtdb-temporal",
  "rtdb-text",
  "rtdb-types",
+ "rtdb-vector",
  "serde_json",
  "sha2 0.10.9",
  "stable_deref_trait",

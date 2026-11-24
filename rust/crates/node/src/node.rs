@@ -2586,7 +2586,7 @@ impl OwnedReadSession {
     pub async fn nearest_batch(
         &self, partitions: &[rtdb_search::NearestPartition], query: &rtdb_search::NearestQuery,
         observe: bool, valid: Option<Timestamp>, overlay: Option<rtdb_search::HeldVectorOverlay>,
-    ) -> Result<(rtdb_search::OwnedSearchBatch, Vec<OwnedRangeWitness>)> {
+    ) -> Result<((rtdb_search::OwnedSearchBatch, bool), Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let relations = || partitions.iter().map(|partition| &partition.relation);
         let work = rtdb_search::owned_nearest_batch(self.guard_context(Arc::clone(&self.context), relations())?, &self.owner, partitions, query, valid, overlay);

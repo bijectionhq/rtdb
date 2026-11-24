@@ -21,6 +21,7 @@ rtdb-plan.workspace = true
 rtdb-sql.workspace = true
 rtdb-query.workspace = true
 rtdb-maintenance.workspace = true
+rtdb-vector.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 tokio.workspace = true

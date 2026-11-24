@@ -113,6 +113,10 @@ fn list_component(view: ListView<'_>, index: usize) -> Option<f64> {
     })
 }
 
+pub(crate) fn unit_of(components: &[f32]) -> Option<Vec<f32>> {
+    unit(components.iter().map(|component| Some(f64::from(*component))))
+}
+
 /// Normalizes in f64 in component order, so the stored unit vector is a deterministic function of the input.
 fn unit(components: impl Iterator<Item = Option<f64>>) -> Option<Vec<f32>> {
     let components = components.collect::<Option<Vec<f64>>>()?;

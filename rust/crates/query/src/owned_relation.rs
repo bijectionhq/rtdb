@@ -307,7 +307,18 @@ pub async fn open_owned_root_projection(
     if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns, None).await
+    open_constraint_projection(context, owner, relation, valid, columns, None, None).await
+}
+
+/// A Root projection of the visible rows of the named IIDs.
+pub async fn open_owned_root_projection_of(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid: Timestamp, columns: &[&str], iids: BTreeSet<Iid>,
+) -> Result<Option<QueryCursor>> {
+    if owner.is_empty() || !relation.is_root_data() || columns.is_empty() {
+        return Err(address_unavailable());
+    }
+    open_constraint_projection(context, owner, relation, valid, columns, None, Some(iids)).await
 }
 
 pub async fn open_owned_world_constraint_projection(
@@ -317,7 +328,7 @@ pub async fn open_owned_world_constraint_projection(
     if owner.is_empty() || relation.root_relation().is_none() || columns.is_empty() {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns, None).await
+    open_constraint_projection(context, owner, relation, valid, columns, None, None).await
 }
 
 /// Restrict a receiver projection to one complete installed identity prefix.
@@ -331,12 +342,12 @@ pub async fn open_owned_root_prefix_projection(
     {
         return Err(address_unavailable());
     }
-    open_constraint_projection(context, owner, relation, valid, columns, Some(prefix)).await
+    open_constraint_projection(context, owner, relation, valid, columns, Some(prefix), None).await
 }
 
 async fn open_constraint_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str], prefix: Option<&str>,
+    valid: Timestamp, columns: &[&str], prefix: Option<&str>, iids: Option<BTreeSet<Iid>>,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
@@ -365,7 +376,7 @@ async fn open_constraint_projection(
             value: valid.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
         })),
         system_time: TemporalFilter::Default, clamp_valid_time: false,
-        iids: None, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
+        iids, predicates, matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }
@@ -1107,11 +1118,13 @@ pub async fn open_owned_path_catalog(
     catalog: &TableRef,
     path: Option<&str>,
 ) -> Result<Option<QueryCursor>> {
-    if !catalog.is_owned_path_catalog() && !catalog.is_owned_search_catalog() && !catalog.is_owned_spatial_catalog() {
+    if !catalog.is_owned_path_catalog() && !catalog.is_owned_search_catalog() && !catalog.is_owned_spatial_catalog() && !catalog.is_owned_vector_catalog() {
         return Err(Anomaly::incorrect("rtdb.owned/path-catalog", "Expected an owned path catalog"));
     }
     let fields: &[&str] = if catalog.is_owned_spatial_catalog() {
         &["_id", "schema_name", "table_name", "columns", "version", "geometry_encoding"]
+    } else if catalog.is_owned_vector_catalog() {
+        &["_id", "schema_name", "table_name", "columns", "version", "dimensions", "recall"]
     } else {
         &["_id", "schema_name", "table_name", "columns", "version"]
     };

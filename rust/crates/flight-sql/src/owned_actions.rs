@@ -345,7 +345,9 @@ pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRan
 pub(crate) const SEARCH_HELD_WORLD_AT_V1: &str = "rtdb.owned.SearchHeldWorldAt.v1";
 pub(crate) const SEARCH_HELD_WORLD_V2: &str = "rtdb.owned.SearchHeldWorld.v2";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
-pub(crate) const NEAREST_HELD_OWNED_V1: &str = "rtdb.owned.NearestHeld.v1";
+pub(crate) const NEAREST_HELD_OWNED_V2: &str = "rtdb.owned.NearestHeld.v2";
+pub(crate) const OWNED_NEAREST_APPROXIMATE: &str = "rtdb.owned.nearest_approximate";
+pub(crate) const DECLARE_OWNED_VECTOR_PATH_V1: &str = "rtdb.owned.DeclareVectorPath.v1";
 pub(crate) const HYBRID_HELD_OWNED_V1: &str = "rtdb.owned.HybridHeld.v1";
 pub(crate) const NEAREST_HELD_WORLD_V1: &str = "rtdb.owned.NearestHeldWorld.v1";
 pub(crate) const NEAREST_HELD_WORLD_AT_V1: &str = "rtdb.owned.NearestHeldWorldAt.v1";
@@ -717,13 +719,18 @@ fn owned_nearest_request(call: &Call, request: &[u8]) -> Result<OwnedNearestRequ
         }
         values.push(allowed);
     }
-    let (settings, rest) = rest.split_first_chunk::<3>().ok_or_else(|| invalid("Owned held nearest requires a limit and evidence flag"))?;
+    let (settings, rest) = rest.split_first_chunk::<4>().ok_or_else(|| invalid("Owned held nearest requires a limit, evidence flag and route"))?;
     let k = usize::from(u16::from_be_bytes([settings[0], settings[1]]));
     if !(1..=MAX_NEAREST_K).contains(&k) { return Err(invalid("Owned held nearest limit is out of range")); }
     let observe = match settings[2] {
         0 => false,
         1 => true,
         _ => return Err(invalid("Invalid owned held nearest evidence flag")),
+    };
+    let approximate = match settings[3] {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid("Invalid owned held nearest route")),
     };
     let (dimensions, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest has no dimension count"))?;
     let dimensions = usize::from(u16::from_be_bytes(*dimensions));
@@ -734,6 +741,7 @@ fn owned_nearest_request(call: &Call, request: &[u8]) -> Result<OwnedNearestRequ
         .map(|bytes| f32::from_be_bytes(bytes.try_into().expect("four-byte probe component")))
         .collect::<Vec<_>>();
     let query = rtdb_node::nearest::NearestQuery::new(probe, values, k).map_err(status)?;
+    let query = if approximate { query.approximate() } else { query };
     Ok(OwnedNearestRequest { partitions, query, observe, _reservation: reservation })
 }
 
@@ -1115,6 +1123,25 @@ impl Service {
         } else {
             TxOp::OwnedDeclareSearchPath { relation, name, column }
         };
+        self.owned_write_reply(call, vec![operation]).await
+    }
+
+    /// `rtdb.owned.DeclareVectorPath.v1`: a relation prefix, then one Arrow row of `_id`, `column`, `dimensions` and `recall`.
+    pub(crate) async fn declare_owned_vector_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, arrow) = split_relation(body)?;
+        let batch = request_batch(call, arrow)?;
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
+            return Err(invalid("Owned vector path declaration requires one row with _id, column, dimensions and recall"));
+        }
+        let (rows, _decoded) = upload::documents(batch.batch(), self)?;
+        let (Some(Value::Utf8(name)), Some(Value::Utf8(column)), Some(Value::I64(dimensions)), Some(Value::F64(recall))) =
+            (rows[0].get("_id"), rows[0].get("column"), rows[0].get("dimensions"), rows[0].get("recall"))
+        else {
+            return Err(invalid("Owned vector path declaration requires a text name and column, Int64 dimensions and Float64 recall"));
+        };
+        let name = OwnedRelation::new(name.as_str()).map_err(status)?;
+        let operation = TxOp::OwnedDeclareVectorPath { relation, name, column: column.clone(), dimensions: *dimensions, recall: *recall };
         self.owned_write_reply(call, vec![operation]).await
     }
 
@@ -3677,7 +3704,7 @@ impl Service {
         let overlay = overlay.as_ref()
             .map(|input| self.nearest_shadows(&nearest, input.batch()))
             .transpose()?;
-        let (page, witnesses) = held.snapshot.nearest_batch(
+        let ((page, approximate), witnesses) = held.snapshot.nearest_batch(
             &nearest.partitions, &nearest.query, nearest.observe, valid, overlay,
         ).await.map_err(status)?;
         if let Some(scope) = staged_scope {
@@ -3695,8 +3722,9 @@ impl Service {
             }
         }
         let present = held.snapshot.present().system_time;
-        let scope = owned_rank_scope(b"rtdb.owned.nearest.held.v1\0", body, "");
-        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present))?;
+        let scope = owned_rank_scope(b"rtdb.owned.nearest.held.v2\0", body, "");
+        let reply = self.owned_rank_reply_with(call, page, scope, nonces, present, valid.unwrap_or(present),
+            [(OWNED_NEAREST_APPROXIMATE, if approximate { "1" } else { "0" })])?;
         held.snapshot.check_relations(nearest.partitions.iter().map(|partition| &partition.relation)).map_err(status)?;
         Ok(reply)
     }
@@ -3736,7 +3764,7 @@ impl Service {
         let (text_page, witnesses) = held.snapshot.ranked_search_batch(
             &rank.partitions, rank.query, 0, window, rank.observe, valid, None,
         ).await.map_err(status)?;
-        let (nearest_page, _) = held.snapshot.nearest_batch(&nearest.partitions, &nearest.query, false, valid, None)
+        let ((nearest_page, _), _) = held.snapshot.nearest_batch(&nearest.partitions, &nearest.query, false, valid, None)
             .await.map_err(status)?;
         let page = rtdb_node::hybrid::fuse_ranked(&[&text_page, &nearest_page], limit, self.memory()).map_err(status)?;
         drop((text_page, nearest_page));
@@ -3799,7 +3827,7 @@ impl Service {
     }
 
     /// `NearestHeldWorld.v1`, `NearestHeldWorldAt.v1` and `NearestHeldWorldParentAt.v1`:
-    /// the SearchHeldWorld prefixes followed by the NearestHeld.v1 frame.
+    /// the SearchHeldWorld prefixes followed by the NearestHeld.v2 frame.
     pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
@@ -3954,8 +3982,17 @@ impl Service {
         &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
         present: Timestamp, valid: Timestamp,
     ) -> Result<ActionResult, Status> {
+        self.owned_rank_reply_with(call, page, scope, witnesses, present, valid, [])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn owned_rank_reply_with<const N: usize>(
+        &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
+        present: Timestamp, valid: Timestamp, extra: [(&str, &str); N],
+    ) -> Result<ActionResult, Status> {
         let hits = page.hits.batch();
         let mut metadata = hits.schema_ref().metadata().clone();
+        for (key, value) in extra { metadata.insert(key.into(), value.into()); }
         metadata.insert(OWNED_SEARCH_TOTAL.into(), page.total.to_string());
         metadata.insert(OWNED_SEARCH_SCOPE.into(), scope);
         if !witnesses.is_empty() {

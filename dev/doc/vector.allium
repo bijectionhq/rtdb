@@ -33,6 +33,7 @@ entity ProbePlan {
 -- `IF NOT EXISTS` leaves an existing definition and its generation in place.
 -- Dropping a definition withdraws it at the ordered system cut; its generations become retired artefacts.
 -- IVF is the only method.
+-- An owned Root relation declares its approximate vector path with `rtdb.owned.DeclareVectorPath.v1` in the principal's `.vector-paths` catalog, with the same fields; its partition is the relation.
 -- The method name and the generation file layout participate in every artefact address.
 --
 -- Generations
@@ -66,3 +67,9 @@ entity ProbePlan {
 -- An erased, deleted or superseded version never reaches a result, because resolution at the read cut decides visibility.
 -- A missing or corrupt generation leaves the scan exact.
 -- Results of the approximate route may omit true neighbours; their distances and order are exact.
+--
+-- The held route
+--
+-- `rtdb.owned.NearestHeld.v2` with the approximate route ranks, for each partition with an approximate vector path, the rows of its shortlist resolved at the held cut.
+-- Each round projects only the shortlisted identities, applies the request's filters and computes exact distances; fewer than k passing rows widen the shortlist.
+-- A partition without a path, or whose shortlist exceeds its budget, ranks exactly; the reply states whether any partition ranked a shortlist.

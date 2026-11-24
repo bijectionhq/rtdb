@@ -43,7 +43,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | SPATIAL_HELD_OWNED_V2
         | SPATIAL_HELD_OWNED_V3
         | SEARCH_HELD_OWNED_V5
-        | NEAREST_HELD_OWNED_V1
+        | NEAREST_HELD_OWNED_V2
         | HYBRID_HELD_OWNED_V1
         | HELD_OWNED_RANGE_V1
         | HELD_OWNED_RANGE_V2
@@ -192,6 +192,7 @@ impl Service {
                 crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::DECLARE_OWNED_VECTOR_PATH_V1 => Ok(vec![Ok(self.declare_owned_vector_path_action(&call, &action.body).await?)]),
                 crate::owned_actions::OWNED_SHARED_SEARCH_TEXT_V1 => Ok(vec![Ok(self.owned_shared_search_text_action(&action.body)?)]),
                 crate::owned_actions::OWNED_LAYOUT_CAPABILITIES_V1 => Ok(vec![Ok(self.owned_layout_capabilities_action(&action.body)?)]),
                 crate::owned_actions::OWNED_RELATION_LAYOUT_V1 => Ok(vec![Ok(Box::pin(self.owned_relation_layout_action(&call, &action.body)).await?)]),
@@ -241,7 +242,7 @@ impl Service {
                 PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
-                crate::owned_actions::NEAREST_HELD_OWNED_V1 => Ok(vec![Ok(self.nearest_held_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::NEAREST_HELD_OWNED_V2 => Ok(vec![Ok(self.nearest_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::HYBRID_HELD_OWNED_V1 => Ok(vec![Ok(self.hybrid_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),

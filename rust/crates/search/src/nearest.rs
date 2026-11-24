@@ -9,7 +9,7 @@ use arrow_array::{Float64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_query::QueryContext;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
 
 use crate::OwnedSearchBatch;
 
@@ -36,6 +36,7 @@ pub struct NearestQuery {
     norm: f64,
     filters: Vec<BTreeSet<Vec<u8>>>,
     k: usize,
+    approximate: bool,
 }
 
 impl NearestQuery {
@@ -52,8 +53,11 @@ impl NearestQuery {
         if norm == 0.0 || !norm.is_finite() {
             return Err(Anomaly::incorrect("rtdb.owned/nearest-probe", "Owned nearest requires a nonzero probe"));
         }
-        Ok(Self { probe, norm, filters, k })
+        Ok(Self { probe, norm, filters, k, approximate: false })
     }
+
+    /// Opts into the approximate route for partitions with a published vector path (vector.allium: ApproximateRead).
+    pub fn approximate(mut self) -> Self { self.approximate = true; self }
 
     pub fn dimensions(&self) -> usize { self.probe.len() }
     pub fn filter_count(&self) -> usize { self.filters.len() }
@@ -201,6 +205,15 @@ impl NearestWindow {
         reservation.grow_to(self.bytes.max(reservation.bytes()))
     }
 
+    /// Admits another window's hits and counts its candidates.
+    fn absorb(&mut self, other: NearestWindow) -> Result<()> {
+        self.total = self.total.saturating_add(other.total).saturating_sub(other.hits.len());
+        for hit in &other.hits {
+            self.admit(hit.partition, EntityIdRef::from(&hit.id), hit.distance)?;
+        }
+        Ok(())
+    }
+
     fn finish(self) -> Result<OwnedSearchBatch> {
         let bound = self.hits.iter().try_fold(4096usize, |size, hit| {
             size.checked_add(identity_charge(&hit.id).saturating_mul(4).saturating_add(128))
@@ -222,10 +235,11 @@ impl NearestWindow {
 }
 
 /// Rank the visible vectors of the selected partitions and the staged overlay by exact cosine distance.
+/// An approximate query ranks only the shortlist of each partition with an approximate vector path; it reports whether any did.
 pub async fn owned_nearest_batch(
     context: Arc<QueryContext>, owner: &str, partitions: &[NearestPartition], query: &NearestQuery,
     valid_at: Option<Timestamp>, overlay: Option<HeldVectorOverlay>,
-) -> Result<OwnedSearchBatch> {
+) -> Result<(OwnedSearchBatch, bool)> {
     let distinct: BTreeSet<_> = partitions.iter().map(|partition| &partition.relation).collect();
     if !(1..=32).contains(&partitions.len()) || distinct.len() != partitions.len()
         || partitions.iter().any(|partition| partition.filters.len() != query.filter_count())
@@ -238,39 +252,25 @@ pub async fn owned_nearest_batch(
     if snapshot.system_time_cap() != Some(present) { return Err(uncovered()); }
     let valid = valid_at.unwrap_or(present);
     let mut window = NearestWindow::new(&context.memory, query.k)?;
+    let mut approximated = false;
     for (ordinal, partition) in partitions.iter().enumerate() {
         let shadows = overlay.as_ref().and_then(|overlay| overlay.shadowed(ordinal));
         let mut columns = vec!["_id", partition.vector.as_str()];
         columns.extend(partition.filters.iter().map(String::as_str));
-        let Some(mut cursor) = rtdb_query::open_owned_root_projection(
-            Arc::clone(&context), owner, &partition.relation, valid, &columns,
-        ).await? else { continue; };
-        while let Some(batch) = cursor.next_batch().await? {
-            let batch = batch.batch();
-            let schema = batch.schema_ref();
-            let (id_column, id_field) = schema.column_with_name("_id").ok_or_else(uncovered)?;
-            let (vector_column, vector_field) = schema.column_with_name(&partition.vector).ok_or_else(uncovered)?;
-            let filters = partition.filters.iter()
-                .map(|name| schema.column_with_name(name).ok_or_else(uncovered))
-                .collect::<Result<Vec<_>>>()?;
-            for row in 0..batch.num_rows() {
-                context.check_cancelled_at(row)?;
-                let mut cells = Vec::with_capacity(filters.len());
-                for &(column, field) in &filters {
-                    cells.push(rtdb_columnar::binary_cell(field, batch.column(column).as_ref(), row)?);
-                }
-                if !query.admits(cells.into_iter()) { continue; }
-                let vectors = batch.column(vector_column).as_ref();
-                let bytes = rtdb_columnar::estimate_read_value_bytes(vector_field, vectors, row)?;
-                let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
-                let Some(vector) = read_vector(vector_field, vectors, row)? else { continue; };
-                let Some(distance) = query.distance(&vector)? else { continue; };
-                let ids = batch.column(id_column).as_ref();
-                let id = rtdb_columnar::read_entity_id(id_field, ids, row)?;
-                if shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id)) { continue; }
-                window.admit(ordinal, id, distance)?;
+        if query.approximate {
+            let bounds = TemporalBounds { valid_time: Interval::at(valid)?, system_time: Interval::at(present)? };
+            let cut = rtdb_vector::Cut { snapshot, storage: &database.storage, memory: &context.memory, cancellation: &context.cancellation, bounds };
+            match approximate_partition(&context, owner, partition, query, cut, valid, &columns, shadows, ordinal, &mut window).await {
+                Ok(true) => { approximated = true; continue; }
+                Ok(false) => {}
+                Err(error) if rtdb_vector::declined(&error) => {}
+                Err(error) => return Err(error),
             }
         }
+        let Some(cursor) = rtdb_query::open_owned_root_projection(
+            Arc::clone(&context), owner, &partition.relation, valid, &columns,
+        ).await? else { continue; };
+        rank_rows(&context, cursor, partition, query, shadows, ordinal, &mut window).await?;
     }
     if let Some(overlay) = overlay {
         for (ordinal, id, vector, filters) in &overlay.rows {
@@ -282,7 +282,71 @@ pub async fn owned_nearest_batch(
         }
     }
     context.check_cancelled()?;
-    window.finish()
+    Ok((window.finish()?, approximated))
+}
+
+/// Ranks one partition's shortlist from its approximate vector path, widening it until `k` candidates pass the filters
+/// or every row has been considered. False where the partition has no such path or the shortlist exceeds its budget,
+/// so the caller ranks the partition exactly; nothing reaches the window until the shortlist settles.
+#[allow(clippy::too_many_arguments)]
+async fn approximate_partition(
+    context: &Arc<QueryContext>, owner: &str, partition: &NearestPartition, query: &NearestQuery, cut: rtdb_vector::Cut<'_>,
+    valid: Timestamp, columns: &[&str], shadows: Option<&BTreeSet<EntityId>>, ordinal: usize, window: &mut NearestWindow,
+) -> Result<bool> {
+    let table = partition.relation.table(owner);
+    let Some(definition) = rtdb_vector::owned_definition(Arc::clone(context), &table, &partition.vector).await? else { return Ok(false) };
+    let Some(probe) = rtdb_vector::unit_probe(&query.probe) else { return Ok(false) };
+    let Some(mut shortlist) = rtdb_vector::Shortlist::open(cut, &definition, probe, query.k, None, None, rtdb_vector::Budget::default()).await? else {
+        return Ok(false);
+    };
+    loop {
+        let Some(rtdb_vector::Round { candidates, complete }) = shortlist.round(cut, None).await? else { return Ok(false) };
+        let mut settled = NearestWindow::new(&context.memory, query.k)?;
+        if !candidates.is_empty() && let Some(cursor) = rtdb_query::open_owned_root_projection_of(
+            Arc::clone(context), owner, &partition.relation, valid, columns, candidates,
+        ).await? {
+            rank_rows(context, cursor, partition, query, shadows, ordinal, &mut settled).await?;
+        }
+        if settled.total >= query.k || complete {
+            window.absorb(settled)?;
+            return Ok(true);
+        }
+        if !shortlist.widen() { return Ok(false); }
+    }
+}
+
+/// Admits the projected rows that pass the filters into the window by exact distance.
+async fn rank_rows(
+    context: &Arc<QueryContext>, mut cursor: rtdb_query::QueryCursor, partition: &NearestPartition, query: &NearestQuery,
+    shadows: Option<&BTreeSet<EntityId>>, ordinal: usize, window: &mut NearestWindow,
+) -> Result<()> {
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        let schema = batch.schema_ref();
+        let (id_column, id_field) = schema.column_with_name("_id").ok_or_else(uncovered)?;
+        let (vector_column, vector_field) = schema.column_with_name(&partition.vector).ok_or_else(uncovered)?;
+        let filters = partition.filters.iter()
+            .map(|name| schema.column_with_name(name).ok_or_else(uncovered))
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..batch.num_rows() {
+            context.check_cancelled_at(row)?;
+            let mut cells = Vec::with_capacity(filters.len());
+            for &(column, field) in &filters {
+                cells.push(rtdb_columnar::binary_cell(field, batch.column(column).as_ref(), row)?);
+            }
+            if !query.admits(cells.into_iter()) { continue; }
+            let vectors = batch.column(vector_column).as_ref();
+            let bytes = rtdb_columnar::estimate_read_value_bytes(vector_field, vectors, row)?;
+            let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
+            let Some(vector) = read_vector(vector_field, vectors, row)? else { continue; };
+            let Some(distance) = query.distance(&vector)? else { continue; };
+            let ids = batch.column(id_column).as_ref();
+            let id = rtdb_columnar::read_entity_id(id_field, ids, row)?;
+            if shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id)) { continue; }
+            window.admit(ordinal, id, distance)?;
+        }
+    }
+    Ok(())
 }
 
 /// Read one stored vector cell as f64 components. A missing or null cell has no vector.

@@ -1196,6 +1196,8 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, OwnedPathKind::Spatial(*encoding)).await,
             Operation::Public(TxOp::OwnedDeclareSearchPath { relation, name, column }) =>
                 self.declare_owned_path(relation, name, std::slice::from_ref(column), OwnedPathKind::Search).await,
+            Operation::Public(TxOp::OwnedDeclareVectorPath { relation, name, column, dimensions, recall }) =>
+                self.declare_owned_vector_path(relation, name, column, *dimensions, *recall).await,
             Operation::Public(TxOp::HostedConstraintRefusal) => {
                 Err(Anomaly::incorrect("rtdb.hosted/constraint-receipt", "Unexpected refusal boundary"))
             }
@@ -1393,7 +1395,7 @@ impl<'a> OpenTransaction<'a> {
         let target = relation.table(owner);
         let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
             "The owned declaration would change an installed path column");
-        for catalog in [rtdb_types::OwnedRelation::path_catalog(owner), rtdb_types::OwnedRelation::search_catalog(owner), rtdb_types::OwnedRelation::spatial_catalog(owner)] {
+        for catalog in [rtdb_types::OwnedRelation::path_catalog(owner), rtdb_types::OwnedRelation::search_catalog(owner), rtdb_types::OwnedRelation::spatial_catalog(owner), rtdb_types::OwnedRelation::vector_catalog(owner)] {
             if !snapshot.contains_table(&catalog) { continue; }
             let context = self.context.query_context(snapshot.clone(), self.tx_key().system_time,
                 &self.options.default_tz, self.trace_parent)?.with_accelerators(Arc::from([]));
@@ -1487,6 +1489,7 @@ impl<'a> OpenTransaction<'a> {
             rtdb_types::OwnedRelation::path_catalog(owner),
             rtdb_types::OwnedRelation::search_catalog(owner),
             rtdb_types::OwnedRelation::spatial_catalog(owner),
+            rtdb_types::OwnedRelation::vector_catalog(owner),
         ] {
             if !snapshot.contains_table(&catalog) { continue; }
             let Some(mut cursor) = rtdb_query::open_owned_path_catalog(Arc::clone(&context), &catalog, None).await? else { continue; };
@@ -1647,6 +1650,79 @@ impl<'a> OpenTransaction<'a> {
         }
         let document = RecordBatch::try_from_iter(columns)
             .map_err(|error| Anomaly::fault("rtdb.owned/path-catalog", error.to_string()))?;
+        let header = EventHeader { position: None,
+            commit_position: 0,
+            iid: rtdb_types::EntityId::String(name.name().into()).iid(),
+            system_from: self.tx_key().system_time,
+            valid_time: Interval::ALL,
+            op: EventOp::Put,
+        };
+        let batch = rtdb_format::data::owned_put_batch(
+            Arc::new(StructArray::from(document)), &[header], None, &self.context.memory,
+        )?;
+        self.buffer.append_batch(&catalog, batch)
+    }
+
+    /// Declares an approximate vector path; a repeated declaration must match the installed one exactly.
+    async fn declare_owned_vector_path(
+        &mut self, relation: &rtdb_types::OwnedRelation, name: &rtdb_types::OwnedRelation, column: &str, dimensions: i64, recall: f64,
+    ) -> Result<()> {
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
+        if column.starts_with('_') || !(1..=4096).contains(&dimensions) || !(recall.is_finite() && recall > 0.0 && recall <= 1.0) {
+            return Err(Anomaly::incorrect("rtdb.owned/vector-path", "An owned vector path names one stored column, 1 to 4096 dimensions and a recall target in (0, 1]"));
+        }
+        let target = relation.table(owner);
+        let catalog = rtdb_types::OwnedRelation::vector_catalog(owner);
+        let declaration = self.read_owned_schema(owner, relation).await?;
+        let snapshot = self.snapshot()?;
+        if declaration.is_none() && !snapshot.contains_table(&target) {
+            return Err(Anomaly::incorrect("rtdb.owned/path-relation", "Owned path requires a declared or stored relation"));
+        }
+        if snapshot.contains_table(&catalog) {
+            let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+            if let Some(mut existing) = rtdb_query::open_owned_path_catalog(context, &catalog, Some(name.name())).await? {
+                let different = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/path-exists", "Owned path name has a different declaration");
+                let mut found = false;
+                while let Some(batch) = existing.next_batch().await? {
+                    let batch = batch.batch();
+                    for row in 0..batch.num_rows() {
+                        if found { return Err(different()); }
+                        let cell = |field| ArrowCell::named(batch, field, row);
+                        let text = |field| cell(field).and_then(ArrowCell::utf8);
+                        let mut stored = cell("columns").and_then(ArrowCell::list).ok_or_else(different)?;
+                        let stored_column = stored.next().and_then(|cell| cell.utf8());
+                        let stored_recall = cell("recall").and_then(|cell| rtdb_columnar::read_value(cell.field, cell.array, cell.row).ok());
+                        if text("_id") != Some(name.name())
+                            || text("schema_name") != Some(target.schema.as_str())
+                            || text("table_name") != Some(target.table.as_str())
+                            || stored_column != Some(column) || stored.next().is_some()
+                            || cell("dimensions").and_then(ArrowCell::int64) != Some(dimensions)
+                            || stored_recall != Some(Value::F64(recall))
+                        {
+                            return Err(different());
+                        }
+                        found = true;
+                    }
+                }
+                if found { return Ok(()); }
+            }
+        }
+        use arrow_array::{ArrayRef, Float64Array, Int64Array, StringArray, StructArray, builder::{ListBuilder, StringBuilder}};
+        let _scratch = self.context.memory.reserve(column.len().saturating_add(4096))?;
+        let mut column_names = ListBuilder::with_capacity(StringBuilder::with_capacity(1, column.len()), 1);
+        column_names.values().append_value(column);
+        column_names.append(true);
+        let text = |value| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let document = RecordBatch::try_from_iter([
+            ("_id", text(name.name())),
+            ("schema_name", text(target.schema.as_str())),
+            ("table_name", text(target.table.as_str())),
+            ("columns", Arc::new(column_names.finish()) as ArrayRef),
+            ("version", Arc::new(Int64Array::from(vec![self.tx_key().tx_id.0])) as ArrayRef),
+            ("dimensions", Arc::new(Int64Array::from(vec![dimensions])) as ArrayRef),
+            ("recall", Arc::new(Float64Array::from(vec![recall])) as ArrayRef),
+        ]).map_err(|error| Anomaly::fault("rtdb.owned/path-catalog", error.to_string()))?;
         let header = EventHeader { position: None,
             commit_position: 0,
             iid: rtdb_types::EntityId::String(name.name().into()).iid(),
