@@ -2338,6 +2338,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn world_clock_selects_an_earlier_reading_with_tied_history_time() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let memory = MemoryBudget::new(1 << 24);
+        let world = Iid([12; 16]);
+        let id = EntityId::Uuid(world.0);
+        let table = rtdb_types::OwnedRelation::world_clock_table("alice");
+        let root = TransactionKey { tx_id: TxId(1), system_time: Timestamp(85) };
+        let original = TransactionKey { tx_id: TxId(4), system_time: Timestamp(100) };
+        let later = TransactionKey { tx_id: TxId(7), system_time: original.system_time };
+        for (key, reading) in [(original, 200), (later, 300)] {
+            let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            write.append(table.clone(), StoredEvent {
+                position: None, origin: None, commit_position: 0, recency: None,
+                entity_key: None, iid: world, system_from: key.system_time, valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("_id".into(), id.as_value()), ("clock".into(), Value::I64(reading)),
+                ])),
+            }).unwrap();
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let cancellation = CancellationToken::new();
+        let context = QueryContext::new(catalog, memory, later.system_time, "UTC", QueryOptions::default(), &cancellation).unwrap();
+        for (requested, expected) in [
+            (199, None),
+            (200, Some((original, Timestamp(200)))),
+            (299, Some((original, Timestamp(200)))),
+            (300, Some((later, Timestamp(300)))),
+        ] {
+            let selected = crate::select_owned_world_clock(&context, "alice", world, root, Timestamp(150), Timestamp(requested))
+                .await.unwrap();
+            assert_eq!(selected, expected);
+        }
+        let original_view = context.with_owned_transaction_cut(original, &cancellation).unwrap();
+        assert_eq!(crate::read_owned_world_clock_publication(original_view, "alice", world).await.unwrap(),
+            Some((Timestamp(200), original)));
+    }
+
+    #[tokio::test]
     async fn owned_position_points_and_windows_hide_only_the_selected_commit_suffix() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let relation = rtdb_types::OwnedRelation::new("docs").unwrap();

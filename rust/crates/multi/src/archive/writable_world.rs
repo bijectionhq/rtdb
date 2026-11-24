@@ -283,8 +283,8 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
             resources, |context, basis| async move {
                 let (archived, _charge) = rtdb_query::read_owned_world(Arc::clone(&context), owner, world)
                     .await?.ok_or_else(unavailable)?;
-                let publication = rtdb_query::read_owned_world_clock_revision(context, owner, world).await?;
-                if &archived != original || publication != Some((logical, basis.system_time)) {
+                let publication = rtdb_query::read_owned_world_clock_publication(context, owner, world).await?;
+                if &archived != original || publication != Some((logical, basis)) {
                     return Err(unavailable());
                 }
                 Ok(())
@@ -502,15 +502,15 @@ pub(crate) async fn retain_replayed_checkpoint_world(
                 {
                     return Err(unavailable());
                 }
-                let (system, logical) = rtdb_query::select_owned_world_clock(
-                    &context, owner, source_world, record.inherited_system(), record.initial_clock(), original.logical,
+                let (publication, logical) = rtdb_query::select_owned_world_clock(
+                    &context, owner, source_world, record.basis, record.initial_clock(), original.logical,
                 ).await?.ok_or_else(unavailable)?;
                 if logical != original.logical
-                    || (system == basis.system_time) != (original.system == original.basis.system_time)
+                    || (publication == basis) != (original.system == original.basis.system_time)
                 {
                     return Err(unavailable());
                 }
-                Ok(system)
+                Ok(publication.system_time)
             },
         ).await?;
         ancestors.push(rtdb_directory::CheckpointWorldAncestor {
@@ -1037,7 +1037,7 @@ struct OpenWorld {
     snapshot: OwnedReadSession,
     record: OwnedWorld,
     registered: Timestamp,
-    publication: Option<(Timestamp, Timestamp)>,
+    publication: Option<(Timestamp, TransactionKey)>,
     _schema_charge: Arc<MemoryReservation>,
 }
 
@@ -1076,7 +1076,8 @@ async fn open_world(
     }
     let publication = snapshot.world_application_publication(world.id).await?;
     if publication.is_some_and(|(reading, revision)| {
-        revision > snapshot.present().system_time || !world.admits_clock_publication(reading, revision)
+        revision.tx_id > snapshot.present().tx_id || revision.system_time > snapshot.present().system_time
+            || !world.admits_clock_publication(reading, revision.system_time)
     }) {
         return Err(OwnedWorld::unavailable());
     }

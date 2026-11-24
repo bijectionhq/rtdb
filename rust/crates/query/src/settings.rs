@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{QuerySettings, SettingValue};
-use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxId, Value};
 use crate::{CatalogSnapshot, QueryContext, invalid};
 
 #[async_trait::async_trait]
@@ -174,22 +174,28 @@ impl QueryContext {
     pub fn with_owned_transaction_cut(
         &self, through: TransactionKey, cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<Arc<Self>> {
+        self.with_owned_system_cut(through.system_time, cancellation)?
+            .with_owned_position_cut(through.tx_id)
+    }
+
+    /// Probes a prefix of the captured history without inventing a SQL time for its endpoint.
+    pub fn with_owned_position_cut(mut self: Arc<Self>, through: TxId) -> Result<Arc<Self>> {
+        self.check_cancelled()?;
         let original = self.catalog.database(&self.catalog.default_database)?;
         let [snapshot] = original.partitions.as_slice() else {
             return Err(invalid("owned-transaction-cut", "An owned publication requires one captured partition"));
         };
-        if through.tx_id.0 < 0
-            || snapshot.tx_basis().is_none_or(|basis| through.tx_id > basis.tx_id)
-            || self.catalog.owned_transaction_cut.is_some_and(|cut| through.tx_id > cut)
+        if through.0 < 0
+            || snapshot.tx_basis().is_none_or(|basis| through > basis.tx_id)
+            || self.catalog.owned_transaction_cut.is_some_and(|cut| through > cut)
         {
             return Err(invalid("owned-transaction-cut", "The requested publication is above its captured cut"));
         }
-        let mut context = self.with_owned_system_cut(through.system_time, cancellation)?;
-        let context_mut = Arc::make_mut(&mut context);
-        context_mut.catalog.owned_transaction_cut = Some(through.tx_id);
-        context_mut.catalog.fragmenter = None;
-        context_mut.accelerators = Default::default();
-        Ok(context)
+        let context = Arc::make_mut(&mut self);
+        context.catalog.owned_transaction_cut = Some(through);
+        context.catalog.fragmenter = None;
+        context.accelerators = Default::default();
+        Ok(self)
     }
 
     pub(crate) fn apply_settings(self: Arc<Self>, settings: &QuerySettings, parameters: rtdb_expr::Parameters<'_>) -> Result<Arc<Self>> {

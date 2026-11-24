@@ -331,7 +331,7 @@ impl HeldCheckpointWorld {
     pub fn present(&self) -> TransactionKey { self.open.snapshot.present() }
 
     pub fn application_publication(&self) -> Option<(Timestamp, Timestamp)> {
-        self.open.publication
+        self.open.publication.map(|(reading, publication)| (reading, publication.system_time))
     }
     pub fn initial_clock(&self) -> Timestamp { self.open.record.initial_clock() }
     pub fn clock_mode(&self) -> WorldClockMode { self.open.record.mode }
@@ -1682,6 +1682,7 @@ struct InheritedRelation<'a> {
     initial_clock: Timestamp,
     floor: Timestamp,
     overlay_basis: Timestamp,
+    root_basis: TransactionKey,
     earlier: Vec<Self>,
     schema: &'a rtdb_types::OwnedSchema,
     memory: &'a Arc<MemoryBudget>,
@@ -1731,14 +1732,18 @@ impl<'a> InheritedRelation<'a> {
         require_parent_journal(&root, owner, relation, root_cut).await?;
         require_parent_journal(&overlay, owner, &shadow, floor).await?;
         let overlay_media = overlay;
-        let overlay = if ancestor.system == media_cut {
-            Arc::clone(&overlay_media)
-        } else {
-            overlay_media.with_owned_system_cut(ancestor.system, &overlay_media.cancellation)?
-        };
+        let at_time = overlay_media.with_owned_system_cut(ancestor.system, &overlay_media.cancellation)?;
+        let (reading, publication) = rtdb_query::read_owned_world_clock_publication(at_time, owner, world)
+            .await?.ok_or_else(unavailable)?;
+        if reading != ancestor.logical || publication.system_time != ancestor.system
+            || publication.tx_id > ancestor.basis.tx_id
+            || (publication.tx_id == ancestor.basis.tx_id && publication != ancestor.basis)
+        {
+            return Err(unavailable());
+        }
+        let overlay = overlay_media.with_owned_transaction_cut(publication, &overlay_media.cancellation)?;
         let (record, _charge) = rtdb_query::read_owned_world(Arc::clone(&overlay), owner, world)
             .await?.ok_or_else(unavailable)?;
-        let clock = rtdb_query::read_owned_world_clock_revision(Arc::clone(&overlay), owner, world).await?;
         let root_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&root), owner, relation).await?;
         let overlay_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&overlay), owner, relation).await?;
         if record.dropped || record.pin.0 != *ancestor.pin.as_bytes()
@@ -1750,7 +1755,6 @@ impl<'a> InheritedRelation<'a> {
             })
             || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
             || record.basis != ancestor.source_root || ancestor.source_root.system_time > root_cut
-            || clock != Some((ancestor.logical, ancestor.system))
             || !root_schema.is_some_and(|(actual, _)| &actual == schema)
             || !overlay_schema.is_some_and(|(actual, _)| &actual == schema)
         {
@@ -1758,7 +1762,7 @@ impl<'a> InheritedRelation<'a> {
         }
         Ok(Self {
             root, overlay_media, overlay, owner, relation, shadow, world, initial_clock: record.initial_clock(),
-            floor, overlay_basis: ancestor.system, earlier: Vec::new(), schema, memory,
+            floor, overlay_basis: ancestor.system, root_basis: record.basis, earlier: Vec::new(), schema, memory,
         })
     }
 
@@ -1913,10 +1917,10 @@ impl<'a> InheritedRelation<'a> {
 
     async fn select_clock(&self, requested: Timestamp) -> Result<Option<(Timestamp, Timestamp)>> {
         for writer in self.writers().filter(|writer| writer.initial_clock < requested) {
-            if let Some(clock) = rtdb_query::select_owned_world_clock(
-                &writer.overlay, self.owner, writer.world, writer.floor, writer.initial_clock, requested,
+            if let Some((publication, reading)) = rtdb_query::select_owned_world_clock(
+                &writer.overlay, self.owner, writer.world, writer.root_basis, writer.initial_clock, requested,
             ).await? {
-                return Ok(Some(clock));
+                return Ok(Some((publication.system_time, reading)));
             }
         }
         Ok(None)
@@ -1928,10 +1932,10 @@ impl<'a> InheritedRelation<'a> {
             return Err(unavailable());
         }
         let at = self.overlay.with_owned_system_cut(group, &self.overlay.cancellation)?;
-        let (clock, _) = rtdb_query::read_owned_world_clock_revision(Arc::clone(&at), self.owner, self.world)
-            .await?.filter(|(clock, revision)| *revision == group && *clock > self.initial_clock)
+        let (clock, publication) = rtdb_query::read_owned_world_clock_publication(Arc::clone(&at), self.owner, self.world)
+            .await?.filter(|(clock, revision)| revision.system_time == group && *clock > self.initial_clock)
             .ok_or_else(unavailable)?;
-        Ok((at, clock))
+        Ok((at.with_owned_transaction_cut(publication, &at.cancellation)?, clock))
     }
 
     async fn at(mut self, selected: Option<Timestamp>) -> Result<Self> {

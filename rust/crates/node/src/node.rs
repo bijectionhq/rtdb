@@ -1544,21 +1544,21 @@ impl OwnedReadSession {
             return Err(unavailable());
         }
         if !(1..=32).contains(&world.schemas.relations().count()) { return Err(unavailable()); }
-        let clock = match (world.ancestor_at(system), archived) {
+        let (publication, clock) = match (world.ancestor_at(system), archived) {
             (Some(ancestor), Some(archived)) if world.mode != rtdb_types::WorldClockMode::Proposal
                 && ancestor.basis.system_time < self.present.system_time =>
-                archived.reading(ancestor, system)?,
+                (archived.publication(), archived.reading(ancestor, system)?),
             (None, None) if matches!(world.mode, rtdb_types::WorldClockMode::Held { .. }) => {
                 let relations = world.schemas.relations().map(|(name, _)| rtdb_types::OwnedRelation::new(name))
                     .collect::<Result<Vec<_>>>()?;
-                self.certify_world_accepted_scope(world, &relations, system).await?
+                self.certify_world_clock_publication(world, &relations, system).await?
             },
             _ => return Err(unavailable()),
         };
         self.check_overlay_standing(world).await?;
         cut.live = None;
         cut.basis = system;
-        cut.retained_world = Some(RetainedWorldCut::Overlay(world.id, world.pin, clock));
+        cut.retained_world = Some(RetainedWorldCut::Overlay(world.id, world.pin, publication, clock));
         cut.until = cut.until.min(world.until);
         Ok(cut)
     }
@@ -1761,38 +1761,54 @@ impl OwnedReadSession {
     pub async fn certify_world_accepted_scope(
         &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], system: Timestamp,
     ) -> Result<Timestamp> {
+        Ok(self.certify_world_clock_publication(world, relations, system).await?.1)
+    }
+
+    async fn certify_world_clock_publication(
+        &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], system: Timestamp,
+    ) -> Result<(TransactionKey, Timestamp)> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         if system <= world.inherited_system() { return Err(unavailable()); }
         let context = self.admit_world_accepted_scope(world, relations, system).await?;
-        let context = context.with_owned_system_cut(system, &context.cancellation)?;
-        let (registration, _schema) = rtdb_query::read_owned_world(Arc::clone(&context), &self.owner, world.id)
-            .await?.ok_or_else(unavailable)?;
-        let (clock, publication) = rtdb_query::read_owned_world_clock_revision(context, &self.owner, world.id)
-            .await?.ok_or_else(unavailable)?;
-        // The clock row is private and appears only after its ordered publication is applied.
-        if &registration != world || publication != system || !world.admits_clock_publication(clock, system) {
-            return Err(unavailable());
-        }
-        self.check_relations(relations)?;
-        Ok(clock)
+        let at = context.with_owned_system_cut(system, &context.cancellation)?;
+        let (reading, publication) = rtdb_query::read_owned_world_clock_publication(at, &self.owner, world.id)
+            .await?.filter(|(_, publication)| publication.system_time == system).ok_or_else(unavailable)?;
+        self.check_world_clock_publication(&context, world, relations, publication, reading).await?;
+        Ok((publication, reading))
     }
 
-    /// Seek the protected clock history by logical reading, independently of physical order time.
+    async fn check_world_clock_publication(
+        &self, context: &Arc<QueryContext>, world: &rtdb_types::OwnedWorld,
+        relations: &[rtdb_types::OwnedRelation], publication: TransactionKey, reading: Timestamp,
+    ) -> Result<()> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let at = context.with_owned_transaction_cut(publication, &context.cancellation)?;
+        let (registration, _schema) = rtdb_query::read_owned_world(Arc::clone(&at), &self.owner, world.id)
+            .await?.ok_or_else(unavailable)?;
+        if &registration != world || !world.admits_clock_publication(reading, publication.system_time)
+            || rtdb_query::read_owned_world_clock_publication(at, &self.owner, world.id).await?
+                != Some((reading, publication))
+        {
+            return Err(unavailable());
+        }
+        self.check_relations(relations)
+    }
+
+    /// Seek the protected clock history by logical reading over original positions.
     pub async fn select_world_accepted_scope(
         &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], requested: Timestamp,
     ) -> Result<Option<(Timestamp, Timestamp)>> {
-        let unavailable = rtdb_types::OwnedWorld::unavailable;
         let context = self.admit_world_accepted_scope(world, relations, self.present.system_time).await?;
         let selected = rtdb_query::select_owned_world_clock(
-            &context, &self.owner, world.id, world.inherited_system(), world.initial_clock(), requested,
+            &context, &self.owner, world.id, world.basis, world.initial_clock(), requested,
         ).await?;
-        if let Some((system, reading)) = selected {
-            let confirmed = self.certify_world_accepted_scope(world, relations, system).await?;
-            if confirmed != reading { return Err(unavailable()); }
+        if let Some((publication, reading)) = selected {
+            self.admit_world_accepted_scope(world, relations, publication.system_time).await?;
+            self.check_world_clock_publication(&context, world, relations, publication, reading).await?;
         } else {
             self.admit_world_accepted_scope(world, relations, world.inherited_system()).await?;
         }
-        Ok(selected)
+        Ok(selected.map(|(publication, reading)| (publication.system_time, reading)))
     }
 
     async fn admit_world_accepted_scope(
@@ -1816,10 +1832,10 @@ impl OwnedReadSession {
 
     pub async fn world_application_publication(
         &self, world: rtdb_types::Iid,
-    ) -> Result<Option<(Timestamp, Timestamp)>> {
+    ) -> Result<Option<(Timestamp, TransactionKey)>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
-        let publication = rtdb_query::read_owned_world_clock_revision(
+        let publication = rtdb_query::read_owned_world_clock_publication(
             Arc::clone(&self.context), &self.owner, world,
         ).await?;
         self.check()?;
@@ -2947,7 +2963,7 @@ pub struct OwnedForkCut {
 #[derive(Clone, Copy)]
 enum RetainedWorldCut {
     Parent(rtdb_types::Iid, rtdb_types::Iid),
-    Overlay(rtdb_types::Iid, rtdb_types::Iid, Timestamp),
+    Overlay(rtdb_types::Iid, rtdb_types::Iid, TransactionKey, Timestamp),
 }
 
 impl OwnedForkCut {
@@ -2957,10 +2973,15 @@ impl OwnedForkCut {
     }
     pub fn live(&self) -> Option<TransactionKey> { self.live }
     pub fn is_publication(&self) -> bool { self.publication.is_some() }
-    pub fn positioned_basis(&self) -> Option<TransactionKey> { self.publication.or(self.live) }
+    pub fn positioned_basis(&self) -> Option<TransactionKey> {
+        match self.retained_world {
+            Some(RetainedWorldCut::Overlay(_, _, publication, _)) => Some(publication),
+            _ => self.publication.or(self.live),
+        }
+    }
     pub fn overlay(&self) -> Option<(rtdb_types::Iid, rtdb_types::Iid, Timestamp)> {
         match self.retained_world {
-            Some(RetainedWorldCut::Overlay(world, pin, clock)) => Some((world, pin, clock)),
+            Some(RetainedWorldCut::Overlay(world, pin, _, clock)) => Some((world, pin, clock)),
             Some(RetainedWorldCut::Parent(..)) | None => None,
         }
     }
@@ -2976,9 +2997,11 @@ impl OwnedForkCut {
             && basis.tx_id <= self.issued_on.tx_id && basis.system_time <= self.issued_on.system_time
     }
     pub fn admits_overlay(&self, media: TransactionKey, system: Timestamp) -> bool {
-        self.overlay().is_some() && self.basis == system && system <= media.system_time
+        let Some(RetainedWorldCut::Overlay(_, _, publication, _)) = self.retained_world else { return false; };
+        publication.system_time == system && publication.tx_id <= media.tx_id && system <= media.system_time
+            && (publication.tx_id != media.tx_id || publication == media)
             && media.system_time <= self.issued_on.system_time && media.tx_id <= self.issued_on.tx_id
-            && ((media.tx_id == self.issued_on.tx_id) == (media.system_time == self.issued_on.system_time))
+            && (media.tx_id != self.issued_on.tx_id || media == self.issued_on)
     }
     pub fn until(&self) -> Timestamp { self.until }
     pub fn scope(&self) -> rtdb_types::PlacedAttemptScope { self.scope }

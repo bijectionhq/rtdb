@@ -151,10 +151,11 @@ impl OpenTransaction<'_> {
             let locator = format!("native-transaction/{}", selected.tx_id.0);
             let (receipt, selected_destination) = replay_control(context, &locator).await?;
             replayed_parent_logical_time(&receipt, admission.binding, &archive, selected)?;
-            let (source, clock, _charge) = rtdb_query::read_held_world_publication(
+            let (source, clock, publication, _charge) = rtdb_query::read_held_world_publication(
                 context, owner, Iid(ancestor.world), ancestor.system,
             ).await?;
             if selected_destination != ancestor.system || clock != ancestor.logical
+                || (selected == original && publication != ancestor.basis)
                 || source.pin.0 != ancestor.pin || source.basis != ancestor.source_root
             {
                 return Err(unavailable());
@@ -548,7 +549,7 @@ async fn require_replayed_held_publication(
     }
     let locator = format!("native-transaction/{}", selected.tx_id.0);
     let (receipt, destination) = replay_control(context, &locator).await?;
-    let (record, reading, _charge) =
+    let (record, reading, _publication, _charge) =
         rtdb_query::read_held_world_publication(context, owner, id, destination).await?;
     if destination != selected_destination
         || !replay.matches_parent_receipt(&receipt, selected)

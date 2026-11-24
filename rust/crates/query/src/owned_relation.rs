@@ -1,7 +1,7 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 
 use crate::{PreparedQuery, QueryContext, QueryCursor};
 
@@ -1006,31 +1006,32 @@ async fn open_private_catalog(
 pub async fn read_owned_world_clock(
     context: Arc<QueryContext>, owner: &str, world: Iid,
 ) -> Result<Option<Timestamp>> {
-    Ok(read_owned_world_clock_revision(context, owner, world).await?.map(|(clock, _)| clock))
+    Ok(read_owned_world_clock_publication(context, owner, world).await?.map(|(clock, _)| clock))
 }
 
-/// Returns the logical reading and its actual ordered publication time.
-pub async fn read_owned_world_clock_revision(
+/// Returns the logical reading together with the exact transaction that published it.
+pub async fn read_owned_world_clock_publication(
     context: Arc<QueryContext>, owner: &str, world: Iid,
-) -> Result<Option<(Timestamp, Timestamp)>> {
+) -> Result<Option<(Timestamp, TransactionKey)>> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
     let id = EntityId::Uuid(world.0);
     let Some(mut cursor) = open_owned_table_point(
         Arc::clone(&context), OwnedRelation::world_clock_table(owner), world, Some(&id),
-        None, Some(&["clock"]), false,
+        None, Some(&["clock", rtdb_types::OWNED_EVENT_POSITION_COLUMN]), false,
     ).await? else { return Ok(None); };
     let mut clock = None;
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         if batch.num_rows() == 0 { continue; }
         if clock.is_some() || batch.num_rows() != 1 { return Err(unavailable()); }
-        let revision = owned_row_revision(batch, 0, &id, &context.memory)?;
+        let system_time = owned_row_revision(batch, 0, &id, &context.memory)?;
+        let position = owned_row_event_position(batch, 0)?;
         let (index, field) = batch.schema_ref().column_with_name("clock").ok_or_else(unavailable)?;
         let Value::I64(reading) = rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0)? else {
             return Err(unavailable());
         };
         if !(Timestamp::MIN.0 < reading && reading < Timestamp::MAX.0) { return Err(unavailable()); }
-        clock = Some((Timestamp(reading), revision));
+        clock = Some((Timestamp(reading), TransactionKey { tx_id: position.transaction, system_time }));
     }
     Ok(clock)
 }
@@ -1041,17 +1042,20 @@ pub struct ArchivedHeldClock {
     pin: Iid,
     media_end: TransactionKey,
     source_root: TransactionKey,
-    system: Timestamp,
+    publication: TransactionKey,
     reading: Timestamp,
 }
 
 impl ArchivedHeldClock {
+    pub fn publication(&self) -> TransactionKey { self.publication }
+
     pub fn reading(
         &self, ancestor: &rtdb_types::OwnedWorldAncestor, system: Timestamp,
     ) -> Result<Timestamp> {
         if self.world.0 != ancestor.world || self.pin.0 != ancestor.pin
+            || self.publication.tx_id > self.media_end.tx_id
             || self.media_end != ancestor.basis || self.source_root != ancestor.source_root
-            || self.system != system
+            || self.publication.system_time != system
             || !ancestor.covers(system, self.reading)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
@@ -1071,69 +1075,70 @@ pub async fn read_archived_held_clock(
     if media_end.system_time != context.current_time.as_micros()? {
         return Err(unavailable());
     }
-    let (source, reading, _charge) = read_held_world_publication(context, owner, world, system).await?;
+    let (source, reading, publication, _charge) = read_held_world_publication(context, owner, world, system).await?;
     Ok(ArchivedHeldClock {
-        world, pin: source.pin, media_end, source_root: source.basis, system, reading,
+        world, pin: source.pin, media_end, source_root: source.basis, publication, reading,
     })
 }
 
 /// Open the source registration and the actual clock event at the selected publication.
 pub async fn read_held_world_publication(
     context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
-) -> Result<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)> {
+) -> Result<(rtdb_types::OwnedWorld, Timestamp, TransactionKey, Arc<rtdb_columnar::MemoryReservation>)> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
     let at = context.with_owned_system_cut(system, &context.cancellation)?;
+    let (reading, publication) = read_owned_world_clock_publication(at, owner, world).await?
+        .filter(|(_, publication)| publication.system_time == system)
+        .ok_or_else(unavailable)?;
+    let at = context.with_owned_transaction_cut(publication, &context.cancellation)?;
     let (source, charge) = read_owned_world(Arc::clone(&at), owner, world).await?
         .filter(|(source, _)| !source.dropped
             && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
             && source.inherited_system() < system)
         .ok_or_else(unavailable)?;
-    let (reading, _) = read_owned_world_clock_revision(at, owner, world).await?
-        .filter(|(reading, revision)| *revision == system && source.admits_clock_publication(*reading, *revision))
-        .ok_or_else(unavailable)?;
-    Ok((source, reading, charge))
+    if !source.admits_clock_publication(reading, system) { return Err(unavailable()); }
+    Ok((source, reading, publication, charge))
 }
 
 /// Select an accepted Held or Proposal reading within a certified physical prefix.
 pub async fn select_owned_world_clock(
     context: &Arc<QueryContext>, owner: &str, world: Iid,
-    floor: Timestamp, initial: Timestamp, requested: Timestamp,
-) -> Result<Option<(Timestamp, Timestamp)>> {
+    floor: TransactionKey, initial: Timestamp, requested: Timestamp,
+) -> Result<Option<(TransactionKey, Timestamp)>> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
     let cap = context.current_time.as_micros()?;
-    let Some((latest, publication)) = read_owned_world_clock_revision(Arc::clone(context), owner, world).await?
+    let Some((latest, publication)) = read_owned_world_clock_publication(Arc::clone(context), owner, world).await?
     else { return Ok(None); };
-    if !(floor < publication && publication <= cap && initial < latest) {
+    if floor.tx_id.0 < 0 || floor.tx_id >= publication.tx_id || publication.system_time > cap || initial >= latest {
         return Err(unavailable());
     }
     if latest <= requested {
         return Ok(Some((publication, latest)));
     }
 
-    let mut low = i128::from(floor.0);
-    let mut high = i128::from(publication.0);
-    let mut selected = None;
+    let mut low = floor.tx_id.0;
+    let mut high = publication.tx_id.0;
+    let mut selected = None::<(TransactionKey, Timestamp)>;
     while high - low > 1 {
-        context.check_cancelled()?;
-        let mid = Timestamp((low + (high - low) / 2) as i64);
-        let probe = context.with_owned_system_cut(mid, &context.cancellation)?;
-        match read_owned_world_clock_revision(probe, owner, world).await? {
+        let mid = TxId(low + (high - low) / 2);
+        let probe = Arc::clone(context).with_owned_position_cut(mid)?;
+        match read_owned_world_clock_publication(probe, owner, world).await? {
             Some((reading, revision)) => {
-                if !(floor < revision && revision <= mid && initial < reading && reading < latest)
-                    || selected.is_some_and(|(prior, prior_reading)| revision < prior || reading < prior_reading
+                if !(floor.tx_id < revision.tx_id && revision.tx_id <= mid && initial < reading && reading < latest)
+                    || selected.is_some_and(|(prior, prior_reading)| revision.tx_id < prior.tx_id || reading < prior_reading
                         || (revision == prior) != (reading == prior_reading))
                 {
                     return Err(unavailable());
                 }
                 if reading <= requested {
                     selected = Some((revision, reading));
-                    low = i128::from(mid.0);
+                    low = mid.0;
                 } else {
-                    high = i128::from(revision.0);
+                    high = revision.tx_id.0;
                     if high <= low { return Err(unavailable()); }
                 }
             }
-            None if selected.is_none() => low = i128::from(mid.0),
+            None if selected.is_none() => low = mid.0,
             None => return Err(unavailable()),
         }
     }
