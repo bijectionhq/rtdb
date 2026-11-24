@@ -2,7 +2,7 @@
 
 use super::connection::{Binding, Callback, Connection, connection, remote};
 use super::{JournalEndpoint, StreamConfig, read_index_evidence::valid_reply};
-use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionScope, DecisionStatement, DecisionVote, DecisionVoteRequest, StableDecision};
+use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionScope, DecisionStatement, DecisionVote, DecisionVoteRequest, Handoff, HandoffCertificate, StableDecision};
 use crate::protocol::{AUTHORITY_FRAME_BYTES, Accepted, Append, Check, Commit, DigestPage, DropStream, Entries, Entry, Fetch, LogletCheck, Overwrite, PageDigest, Read, ReadIndexReply, ReadIndexRequest, Refused, Request, RequestBody, Response, ResponseBody, Retire, Seal, Sealed, Trim, encode_frame, read_bounded_frame};
 use bytes::{Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -283,7 +283,7 @@ impl Ensemble {
     pub fn check_synced_request(&self, epoch: u64) -> RequestBody { RequestBody::CheckSynced(Check { stream: self.stream(), epoch }) }
 
     fn loglet_check(&self, epoch: u64) -> LogletCheck {
-        LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone(), certified: self.decision_scope(epoch).is_some() }
+        LogletCheck { stream: self.stream(), epoch, ensemble: self.identity.clone(), certified: self.decision_scope(epoch).is_some(), handoff: None }
     }
 
     pub async fn confirm_authority(&self, server: usize, epoch: u64, port: u16) -> Result<Option<u64>> {
@@ -322,8 +322,39 @@ impl Ensemble {
         Ok(outcome)
     }
 
+    pub async fn export_handoff(&self, handoff: Handoff) -> Result<HandoffCertificate> {
+        if self.decision_scope(handoff.source.epoch).as_ref() != Some(&handoff.source) || !handoff.valid() {
+            return Err(self.decision_error("invalid predecessor authority for a handoff"));
+        }
+        let mut replies: FuturesUnordered<_> = (0..self.len()).map(|server| {
+            let request = RequestBody::ExportHandoff(handoff.clone());
+            async move { (server, self.links[server].call(request).await) }
+        }).collect();
+        let mut exports = Vec::with_capacity(self.config.write_quorum);
+        while let Some((server, reply)) = replies.next().await {
+            match reply {
+                Ok(ResponseBody::DecisionInstallation(vote)) if self.config.servers[server].journal()
+                    .is_some_and(|id| handoff.exporting_journal(&vote).as_deref() == Some(id)) => exports.push(vote),
+                Ok(ResponseBody::Refused(refusal)) if refusal.promised > handoff.source.epoch => {
+                    return Err(Error::Deposed { epoch: handoff.source.epoch, promised: refusal.promised });
+                }
+                _ => {}
+            }
+            if exports.len() == self.config.write_quorum {
+                return Ok(HandoffCertificate { handoff, exports });
+            }
+        }
+        Err(self.decision_error("a sealed predecessor quorum did not attest the handoff"))
+    }
+
     pub async fn activate(&self, server: usize, epoch: u64) -> Result<Ack> {
-        let reply = self.links[server].call(RequestBody::ActivateLoglet(self.loglet_check(epoch))).await;
+        self.activate_with_handoff(server, epoch, None).await
+    }
+
+    pub async fn activate_with_handoff(&self, server: usize, epoch: u64, handoff: Option<HandoffCertificate>) -> Result<Ack> {
+        let mut check = self.loglet_check(epoch);
+        check.handoff = handoff;
+        let reply = self.links[server].call(RequestBody::ActivateLoglet(check)).await;
         self.ack(server, reply)
     }
 

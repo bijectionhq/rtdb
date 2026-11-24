@@ -113,6 +113,99 @@ pub struct StableDecision {
     pub installed: Vec<DecisionInstallation>,
 }
 
+/// A published catalog and recovery inventory cover the omitted prefix.
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct HandoffCheckpoint {
+    #[prost(sint64, tag = "1")]
+    pub through: i64,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub catalog: Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub inventory: Bytes,
+}
+
+/// A sealed predecessor exports exactly one recovered cut to one successor.
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct Handoff {
+    /// Exact predecessor roster, with the epoch of the fence admitting this export.
+    #[prost(message, required, tag = "1")]
+    pub source: DecisionScope,
+    #[prost(message, required, tag = "2")]
+    pub destination: DecisionScope,
+    /// The successor replays from this inclusive LSN.
+    #[prost(sint64, tag = "3")]
+    pub first: i64,
+    #[prost(sint64, tag = "4")]
+    pub through: i64,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub digest: Bytes,
+    /// Decision selected by sealed recovery, if the predecessor published one.
+    #[prost(message, optional, tag = "6")]
+    pub decided: Option<DecisionCertificate>,
+    #[prost(message, optional, tag = "7")]
+    pub checkpoint: Option<HandoffCheckpoint>,
+}
+
+#[derive(Clone, PartialEq, Eq, Message)]
+pub struct HandoffCertificate {
+    #[prost(message, required, tag = "1")]
+    pub handoff: Handoff,
+    #[prost(message, repeated, tag = "2")]
+    pub exports: Vec<DecisionInstallation>,
+}
+
+impl Handoff {
+    pub(crate) fn valid(&self) -> bool {
+        self.source.ensemble().is_some() && self.destination.ensemble().is_some()
+            && self.source.epoch == self.destination.epoch
+            && self.source.stream == self.destination.stream
+            && self.first >= 0 && self.through >= self.first - 1 && self.through < i64::MAX
+            && self.digest.len() == 32
+            && self.checkpoint.as_ref().is_none_or(|checkpoint| {
+                checkpoint.through >= self.first - 1 && checkpoint.through <= self.through
+                    && checkpoint.catalog.len() == 32 && checkpoint.inventory.len() == 32
+            })
+            && self.decided.as_ref().is_none_or(|prior| {
+                prior.authentic() && prior.statement.scope.stream == self.source.stream
+                    && prior.statement.scope.journals == self.source.journals
+                    && prior.statement.scope.quorum == self.source.quorum
+                    && prior.statement.scope.epoch < self.source.epoch
+                    && prior.statement.prefix.through <= self.through
+            })
+    }
+
+    fn message(&self) -> Vec<u8> {
+        signed_bytes(b"rtdb.logkeeper/sealed-handoff/v1\0", self)
+    }
+
+    pub(crate) fn export(&self, signer: &SigningKey) -> DecisionInstallation {
+        DecisionInstallation {
+            key: Bytes::copy_from_slice(&signer.public_key()),
+            signature: Bytes::copy_from_slice(&signer.sign(&self.message())),
+        }
+    }
+
+    pub(crate) fn exporting_journal(&self, vote: &DecisionInstallation) -> Option<String> {
+        let key = <&[u8; 32]>::try_from(vote.key.as_ref()).ok()?;
+        let signature = <&[u8; 64]>::try_from(vote.signature.as_ref()).ok()?;
+        let journal = journal_id(key).to_string();
+        (self.source.journals.binary_search(&journal).is_ok() && verifies(key, &self.message(), signature))
+            .then_some(journal)
+    }
+
+    pub fn fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(self.message()).into()
+    }
+}
+
+impl HandoffCertificate {
+    pub fn authentic(&self) -> bool {
+        if !self.handoff.valid() || self.exports.len() != self.handoff.source.quorum as usize { return false; }
+        let mut journals = BTreeSet::new();
+        self.exports.iter().all(|vote| self.handoff.exporting_journal(vote).is_some_and(|id| journals.insert(id)))
+    }
+}
+
 fn signed_bytes(domain: &[u8], value: &impl Message) -> Vec<u8> {
     let mut message = Vec::with_capacity(domain.len() + value.encoded_len());
     message.extend_from_slice(domain);

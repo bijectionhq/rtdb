@@ -27,7 +27,7 @@ use super::payload::{Item, Source, Stored};
 #[cfg(not(verus_keep_ghost))]
 use super::state::{Decision, StreamState, Window, WriterAuthority};
 #[cfg(not(verus_keep_ghost))]
-use crate::decision::{DecisionCertificate, DecisionVoteRequest};
+use crate::decision::{DecisionCertificate, DecisionVoteRequest, Handoff};
 #[cfg(not(verus_keep_ghost))]
 use crate::history::RetainedChain;
 #[cfg(not(verus_keep_ghost))]
@@ -246,9 +246,34 @@ impl Store {
             }
             RequestBody::DropStream(drop) => (drop.stream, Box::new(move |state| state.drop_stream(drop.epoch))),
             RequestBody::CheckSynced(check) => return self.check_after_durability(&check.stream, admission, |state| state.check_synced(check.epoch)),
+            RequestBody::ExportHandoff(handoff) => {
+                let journal = crate::attestation::journal_id(&self.journal.signer.public_key()).to_string();
+                if !self.journal.is_durable() || !handoff.valid()
+                    || handoff.source.journals.binary_search(&journal).is_err()
+                    || !self.check_handoff_range(&handoff).await
+                {
+                    return Outcome::Now(failed("the sealed journal cannot attest this handoff"));
+                }
+                let receipt = handoff.export(&self.journal.signer);
+                (handoff.source.stream.clone(), Box::new(move |state| state.export_handoff(handoff, receipt)))
+            }
             RequestBody::ActivateLoglet(check) => {
                 let Ok(ensemble) = check.ensemble.as_ref().try_into() else { return Outcome::Now(failed("invalid ensemble digest")); };
-                (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble, check.certified)))
+                if let Some(proof) = check.handoff {
+                    let journal = crate::attestation::journal_id(&self.journal.signer.public_key()).to_string();
+                    if !self.journal.is_durable() || !check.certified || !proof.authentic()
+                        || proof.handoff.destination.stream != check.stream
+                        || proof.handoff.destination.epoch != check.epoch
+                        || proof.handoff.destination.ensemble() != Some(ensemble)
+                        || proof.handoff.destination.journals.binary_search(&journal).is_err()
+                        || !self.check_handoff_range(&proof.handoff).await
+                    {
+                        return Outcome::Now(failed("the successor cannot install this handoff"));
+                    }
+                    (check.stream, Box::new(move |state| state.activate_handoff(proof, check.epoch, ensemble)))
+                } else {
+                    (check.stream, Box::new(move |state| state.activate(check.epoch, ensemble, check.certified)))
+                }
             }
             RequestBody::ReadIndex(request) => {
                 if !self.journal.is_durable() { return Outcome::Now(failed("read indexes require a durable journal")); }
@@ -270,6 +295,10 @@ impl Store {
                             }).cloned(),
                             key: Bytes::new(),
                             signature: Bytes::new(),
+                            handoff: state.handoff.as_ref().filter(|proof| {
+                                proof.handoff.destination.epoch == check.epoch
+                                    && proof.handoff.destination.ensemble() == Some(ensemble)
+                            }).cloned(),
                             };
                             reply.sign(&check, &self.journal.signer);
                             ResponseBody::ReadIndex(reply)
@@ -415,6 +444,33 @@ impl Store {
         }
     }
 
+    async fn check_handoff_range(&self, transfer: &Handoff) -> bool {
+        let Ok(_permit) = self.digest_pages.try_acquire() else { return false; };
+        let mut digest = RetainedChain::new(&transfer.source.stream, transfer.first);
+        let mut next = transfer.first;
+        while next <= transfer.through {
+            let Some(slot) = self.existing(&transfer.source.stream) else { return false; };
+            let selected = {
+                let state = slot.state.lock();
+                if state.promised != transfer.destination.epoch || state.synced != Some(state.promised)
+                    || state.trim >= next || state.last() < transfer.through
+                {
+                    return false;
+                }
+                self.select(&state, next, transfer.through, DIGEST_PAGE_ENTRIES, DIGEST_PAGE_BYTES)
+            };
+            let journal = Arc::clone(&self.journal);
+            let Ok(Ok(entries)) = tokio::task::spawn_blocking(move || journal.resolve(selected)).await else { return false; };
+            if entries.entries.is_empty() { return false; }
+            for entry in entries.entries {
+                if entry.lsn != next { return false; }
+                digest.append(&entry);
+                next += 1;
+            }
+        }
+        digest.bytes().as_slice() == transfer.digest.as_ref()
+    }
+
     /// A repaired journal can establish replay from the exact digest. A copy
     /// remains ineligible to supply an original vote for a timed decision.
     async fn holds_decision_payload(&self, certificate: &DecisionCertificate) -> bool {
@@ -465,8 +521,6 @@ impl Store {
             {
                 return failed("invalid certified predecessor");
             }
-        } else if prefix.predecessor_digest.as_ref() != statement.origin_digest() {
-            return failed("invalid activation predecessor digest");
         }
         let Ok(_permit) = self.digest_pages.try_acquire() else { return failed("decision proof capacity exhausted"); };
         let Some(slot) = self.existing(&statement.scope.stream) else { return failed("the decision stream was not found"); };
@@ -475,6 +529,11 @@ impl Store {
             let state = slot.state.lock();
             if state.promised > statement.scope.epoch {
                 return ResponseBody::Refused(Refused { promised: state.promised, last_lsn: state.last() });
+            }
+            let origin = state.handoff.as_ref().filter(|proof| proof.handoff.destination == statement.scope)
+                .map_or_else(|| statement.origin_digest(), |proof| proof.handoff.fingerprint());
+            if previous.is_none() && prefix.predecessor_digest.as_ref() != origin {
+                return failed("invalid activation predecessor digest");
             }
             if !state.admits_decision(&statement)
                 || (previous.is_none() && (state.certificate.as_ref().is_some_and(|cut| {
@@ -723,7 +782,7 @@ mod tests {
         let journal = Arc::new(journal);
         let (queue, work) = mpsc::unbounded_channel();
         let store = Arc::new(Store::new(Arc::clone(&journal), recovered, queue));
-        let check = |ensemble| LogletCheck { stream: "authority".into(), epoch: 2, ensemble, certified: false };
+        let check = |ensemble| LogletCheck { stream: "authority".into(), epoch: 2, ensemble, certified: false, handoff: None };
         let ensemble = Bytes::from_static(&[7; 32]);
         let Outcome::Durable(installed, _) = store.mutate(RequestBody::Overwrite(Overwrite {
             stream: "authority".into(), epoch: 2, from_lsn: 0, entries: Vec::new(),

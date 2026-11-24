@@ -115,7 +115,10 @@ pub type Writers = Arc<parking_lot::Mutex<std::collections::HashMap<String, std:
 pub trait EnsembleRecorder: Send + Sync {
     /// Records every endpoint a copy can touch before any bytes move.
     async fn reserve_copy(&self, deployment: &str, epoch: u64, servers: &[JournalEndpoint]) -> Result<()>;
-    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()>;
+    async fn record(
+        &self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>,
+        handoff: &rtdb_logkeeper::HandoffCertificate,
+    ) -> Result<()>;
 }
 
 pub(crate) struct LogkeeperLogFactory {
@@ -154,16 +157,44 @@ impl EnsembleRecorder for DirectoryRecorder {
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its log copy was reserved"))
     }
 
-    async fn record(&self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>) -> Result<()> {
+    async fn record(
+        &self, deployment: &str, epoch: u64, ensemble: Vec<rtdb_directory::MemberId>,
+        proof: &rtdb_logkeeper::HandoffCertificate,
+    ) -> Result<()> {
         for _ in 0..8 {
             let current = self.directory.deployment(deployment).await?.ok_or_else(|| Anomaly::incorrect("rtdb.multi/unknown-deployment", format!("No deployment {deployment}")))?;
             if current.epoch != epoch { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/deposed", "The deployment moved on before its new ensemble was recorded")); }
+            let ordered_ids = |members: &[rtdb_directory::MemberId]| {
+                let mut ids: Vec<_> = members.iter().map(|member| member.0.clone()).collect();
+                ids.sort_unstable();
+                ids
+            };
+            let handoff = &proof.handoff;
+            let checkpoint = handoff_checkpoint(&current);
+            if !proof.authentic() || handoff.source.stream != current.stream("replica")
+                || handoff.destination.epoch != epoch || handoff.source.journals != ordered_ids(&current.ensemble)
+                || handoff.destination.journals != ordered_ids(&ensemble)
+                || handoff.source.quorum as usize != crate::deployment::write_quorum(current.ensemble.len())
+                || handoff.destination.quorum as usize != crate::deployment::write_quorum(ensemble.len())
+                || handoff.checkpoint != checkpoint || (handoff.first > 0 && checkpoint.is_none())
+            {
+                return Err(Anomaly::incorrect("rtdb.multi/ensemble-handoff", "The installed predecessor and checkpoint do not attest this successor"));
+            }
             let mut next = current.clone();
             next.ensemble = ensemble.clone();
             if let rtdb_directory::Cas::Applied(_) = self.directory.replace_deployment(next, current.version).await? { return Ok(()); }
         }
         Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.multi/record-contended", "The deployment kept changing while its new ensemble was recorded"))
     }
+}
+
+fn handoff_checkpoint(record: &rtdb_directory::DeploymentRecord) -> Option<rtdb_logkeeper::HandoffCheckpoint> {
+    let checkpoint = record.checkpoint?;
+    Some(rtdb_logkeeper::HandoffCheckpoint {
+        through: checkpoint.boundary,
+        catalog: Bytes::copy_from_slice(&checkpoint.root_sha256?),
+        inventory: Bytes::copy_from_slice(&record.recovery_manifest_sha256?),
+    })
 }
 
 pub(crate) fn frozen_checkpoint(
@@ -271,9 +302,19 @@ impl LogFactory for LogkeeperLogFactory {
                     Some(previous) => {
                         member_ids(previous)?;
                         self.recorder.reserve_copy(&config.deployment, config.epoch, previous).await?;
-                        let moved = rtdb_logkeeper::open_writer_on(vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0, write_quorum: crate::deployment::write_quorum(previous.len()) }], stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, cancellation.clone()).await?;
-                        // Recorded before the writer appends: until then the old ensemble, sealed and complete, still holds everything.
-                        self.recorder.record(&config.deployment, config.epoch, ensemble).await?;
+                        let original = self.holds.directory.deployment(&config.deployment).await?
+                            .filter(|record| record.epoch == config.epoch && record.stream("replica") == stream.stream)
+                            .ok_or_else(|| Anomaly::incorrect("rtdb.multi/ensemble-handoff", "The directory has no current predecessor placement"))?;
+                        let checkpoint = handoff_checkpoint(&original);
+                        let moved = rtdb_logkeeper::open_writer_on_checkpoint(
+                            vec![rtdb_logkeeper::Loglet { servers: previous.clone(), start_lsn: 0,
+                                write_quorum: crate::deployment::write_quorum(previous.len()) }],
+                            stream, config.epoch, rtdb_logkeeper::CopyFrom::Retained, checkpoint, cancellation.clone(),
+                        ).await?;
+                        let proof = moved.activation_handoff().ok_or_else(|| {
+                            Anomaly::incorrect("rtdb.multi/ensemble-handoff", "The moved writer has no certified predecessor")
+                        })?;
+                        self.recorder.record(&config.deployment, config.epoch, ensemble, proof).await?;
                         moved
                     }
                     None => rtdb_logkeeper::open_writer(stream, config.epoch, cancellation.clone()).await?,

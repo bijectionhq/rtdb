@@ -8,7 +8,7 @@
 use super::payload::{Cache, Item, Location, Source, Stored};
 use super::state::{Event, Held, StreamState, Window};
 use super::store::{Slot, Store};
-use crate::decision::{DecisionCertificate, StableDecision};
+use crate::decision::{DecisionCertificate, Handoff, HandoffCertificate, StableDecision};
 use crate::history::RetainedChain;
 use crate::protocol::{Entries, Entry, before_guarded_cutoff};
 use bytes::{Bytes, BytesMut};
@@ -57,6 +57,12 @@ struct Snapshot {
     stability: Option<StableDecision>,
     #[prost(bool, tag = "10")]
     certified: bool,
+    #[prost(bytes = "bytes", tag = "11")]
+    last_ensemble: Bytes,
+    #[prost(message, optional, tag = "12")]
+    export: Option<Handoff>,
+    #[prost(message, optional, tag = "13")]
+    handoff: Option<HandoffCertificate>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -111,13 +117,17 @@ enum Kind {
     InstallCertificate(DecisionCertificate),
     #[prost(message, tag = "16")]
     ExposeCertificate(CertificateExposure),
+    #[prost(message, tag = "19")]
+    ExportHandoff(Handoff),
+    #[prost(message, tag = "20")]
+    InstallHandoff(HandoffCertificate),
 }
 
 #[derive(Clone, PartialEq, Message)]
 struct Record {
     #[prost(uint64, tag = "9")]
     stream: u64,
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 15, 16, 18")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 13, 15, 16, 18, 19, 20")]
     kind: Option<Kind>,
     // An activation is an optional refinement of an existing synced record.
     #[prost(bytes = "bytes", tag = "12")]
@@ -138,6 +148,8 @@ fn record(event: &Event) -> Kind {
         Event::Truncate(from) => Kind::Truncate(*from),
         Event::Append(entry) => Kind::Append(entry.clone()),
         Event::Install(lsn) => Kind::Install(*lsn),
+        Event::ExportHandoff(handoff) => Kind::ExportHandoff(handoff.clone()),
+        Event::InstallHandoff(proof) => Kind::InstallHandoff(proof.clone()),
         Event::InstallCertificate(certificate) => Kind::InstallCertificate(certificate.clone()),
         Event::ExposeCertificate { proof, replay } => Kind::ExposeCertificate(CertificateExposure { proof: proof.clone(), replay: *replay }),
         Event::Commit(lsn) => Kind::Commit(*lsn),
@@ -620,6 +632,9 @@ impl Journal {
                 certificate: state.certificate.clone(),
                 stability: state.stability.clone(),
                 certified: state.certified,
+                last_ensemble: state.last_ensemble.as_ref().map_or_else(Bytes::new, |ensemble| Bytes::copy_from_slice(ensemble)),
+                export: state.export.clone(),
+                handoff: state.handoff.clone(),
             }), &mut buffer);
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
@@ -765,6 +780,9 @@ impl Replay {
                         promised: snapshot.promised, synced: (snapshot.synced != 0).then_some(snapshot.synced),
                         active_ensemble: decode_ensemble(path, &snapshot.active_ensemble)?,
                         certified: snapshot.certified,
+                        last_ensemble: decode_ensemble(path, &snapshot.last_ensemble)?,
+                        export: snapshot.export,
+                        handoff: snapshot.handoff,
                         trim: snapshot.trim, commit: snapshot.commit,
                         installed: snapshot.installed.ok_or_else(|| corrupt(path, "snapshot has no installed decision frontier"))?,
                         certificate: snapshot.certificate,
@@ -801,6 +819,8 @@ impl Replay {
                     }
                 }
                 Kind::Install(lsn) => state.apply(&Event::Install(lsn)),
+                Kind::ExportHandoff(handoff) => state.apply(&Event::ExportHandoff(handoff)),
+                Kind::InstallHandoff(proof) => state.apply(&Event::InstallHandoff(proof)),
                 Kind::InstallCertificate(certificate) => state.apply(&Event::InstallCertificate(certificate)),
                 Kind::ExposeCertificate(exposure) => state.apply(&Event::ExposeCertificate { proof: exposure.proof, replay: exposure.replay }),
                 Kind::Commit(lsn) => state.apply(&Event::Commit(lsn)),

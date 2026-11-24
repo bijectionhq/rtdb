@@ -2,7 +2,7 @@
 //! A client sends `Request`s and receives `Response`s carrying the same id, in any order.
 //! One connection multiplexes every stream; a server decides a connection's mutations in arrival order.
 
-use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionVote, DecisionVoteRequest, StableDecision};
+use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionVote, DecisionVoteRequest, Handoff, HandoffCertificate, StableDecision};
 use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -240,6 +240,8 @@ pub(crate) struct LogletCheck {
     pub ensemble: Bytes,
     #[prost(bool, tag = "4")]
     pub certified: bool,
+    #[prost(message, optional, tag = "5")]
+    pub handoff: Option<HandoffCertificate>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -266,6 +268,8 @@ pub struct ReadIndexReply {
     pub key: Bytes,
     #[prost(bytes = "bytes", tag = "7")]
     pub signature: Bytes,
+    #[prost(message, optional, tag = "8")]
+    pub handoff: Option<HandoffCertificate>,
 }
 
 impl ReadIndexReply {
@@ -380,13 +384,15 @@ pub(crate) enum RequestBody {
     InstallDecision(DecisionCertificate),
     #[prost(message, tag = "36")]
     PublishDecision(StableDecision),
+    #[prost(message, tag = "37")]
+    ExportHandoff(Handoff),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32, 33, 34, 35, 36")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32, 33, 34, 35, 36, 37")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -611,6 +617,7 @@ fn authority_confirmation_and_durable_trim_use_disjoint_requests() {
             epoch: 8,
             ensemble: Bytes::from_static(&[42; 32]),
             certified: false,
+            handoff: None,
         }),
     };
     let decoded = Request::decode(confirm.encode_to_vec().as_slice()).unwrap();

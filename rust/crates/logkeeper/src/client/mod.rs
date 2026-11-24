@@ -10,7 +10,7 @@ mod writer;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use crate::decision::{DecisionCertificate, StableDecision};
+use crate::decision::{DecisionCertificate, HandoffCertificate, StableDecision};
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
 use prost::Message;
@@ -76,6 +76,7 @@ pub struct ActiveLogletReadIndex {
     ensemble: Bytes,
     through: LogOffset,
     decision: Option<StableDecision>,
+    handoff: Option<HandoffCertificate>,
     invocation: [u8; 16],
 }
 
@@ -85,6 +86,7 @@ impl ActiveLogletReadIndex {
     pub fn ensemble(&self) -> &[u8] { &self.ensemble }
     pub fn through(&self) -> LogOffset { self.through }
     pub fn decision(&self) -> Option<&StableDecision> { self.decision.as_ref() }
+    pub fn handoff(&self) -> Option<&HandoffCertificate> { self.handoff.as_ref() }
     pub fn invocation(&self) -> [u8; 16] { self.invocation }
 }
 
@@ -180,13 +182,18 @@ fn earlier(chain: &[Loglet], start: i64, like: &StreamConfig) -> rtdb_types::Res
 /// Lsns stay dense across the move, and [`QuorumLog::loglets`] gives the chain to record and hand to readers.
 /// An `open_writer` or `seal` of the old ensemble at `epoch` or below is refused afterwards.
 pub async fn open_writer_on(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, from: CopyFrom, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
+    open_writer_on_checkpoint(chain, new, epoch, from, None, cancellation).await
+}
+
+/// Opens a moved writer bound to the published checkpoint covering any discarded prefix.
+pub async fn open_writer_on_checkpoint(chain: Vec<Loglet>, new: StreamConfig, epoch: u64, from: CopyFrom, checkpoint: Option<crate::HandoffCheckpoint>, cancellation: CancellationToken) -> rtdb_types::Result<Arc<QuorumLog>> {
     validate(&new)?;
     validate_chain(&chain)?;
     if epoch == 0 { return Err(Anomaly::incorrect("rtdb.logkeeper/invalid-epoch", "writer epochs start at 1")); }
     let previous_loglet = chain.last().expect("validated non-empty");
     let previous = Ensemble::new(loglet_config(previous_loglet, &new)?);
     let ensemble = Arc::new(Ensemble::new(new.clone()));
-    let (writer, start) = Writer::open_moved(&previous, previous_loglet.start_lsn, Arc::clone(&ensemble), epoch, from).await?;
+    let (writer, start) = Writer::open_moved(&previous, previous_loglet.start_lsn, Arc::clone(&ensemble), epoch, from, checkpoint).await?;
     let earlier = earlier(&chain, start, &new)?;
     Ok(Arc::new(QuorumLog { shared: Arc::new(Shared { ensemble, start, earlier, role: Role::Writer(writer), cancellation }) }))
 }
@@ -397,13 +404,22 @@ impl QuorumLog {
                 }
             }
 
-            let confirmed = |through, decision| ActiveLogletReadIndex {
+            let confirmed = |through, decision, handoff| ActiveLogletReadIndex {
                 stream: ensemble.stream(), epoch, ensemble: ensemble.identity().clone(),
-                through: LogOffset(through), decision, invocation: nonce,
+                through: LogOffset(through), decision, handoff, invocation: nonce,
             };
             if let Some(scope) = ensemble.decision_scope(epoch) {
+                let mut handoff: Option<HandoffCertificate> = None;
                 let mut selected: Option<&DecisionCertificate> = None;
                 for (_, reply) in &observed {
+                    if let Some(proof) = &reply.handoff {
+                        if !proof.authentic() || proof.handoff.destination != scope
+                            || handoff.as_ref().is_some_and(|prior| prior.handoff != proof.handoff)
+                        {
+                            return Err(unavailable("the read quorum returned incompatible activation evidence"));
+                        }
+                        handoff = Some(proof.clone());
+                    }
                     let Some(candidate) = &reply.certificate else { continue; };
                     if candidate.statement.scope != scope || !candidate.authentic() {
                         return Err(unavailable("the read quorum returned an invalid decision certificate"));
@@ -420,7 +436,10 @@ impl QuorumLog {
                 }
                 let Some(certificate) = selected else {
                     let inherited = observed.iter().map(|(_, reply)| reply.visible).max().expect("nonempty quorum");
-                    return Ok(confirmed(inherited, None));
+                    if handoff.as_ref().is_some_and(|proof| proof.handoff.through != inherited) {
+                        return Err(unavailable("the inherited cut differs from the attested activation"));
+                    }
+                    return Ok(confirmed(inherited, None, handoff));
                 };
                 let through = certificate.statement.prefix.through;
                 let proof = observed.iter().filter_map(|(_, reply)| reply.stability.as_ref())
@@ -433,11 +452,11 @@ impl QuorumLog {
                     ensemble.ensure_replay(proof.clone()).await?;
                 }
                 proof.observe(ensemble.identity());
-                return Ok(confirmed(through, Some(proof)));
+                return Ok(confirmed(through, Some(proof), handoff));
             }
 
             let selected = observed.iter().map(|(_, reply)| reply.decided).max().expect("nonempty quorum");
-            let confirmed = || confirmed(selected, None);
+            let confirmed = || confirmed(selected, None, None);
             if observed.iter().any(|(_, reply)| reply.visible >= selected) {
                 return Ok(confirmed());
             }
@@ -490,6 +509,13 @@ impl QuorumLog {
     }
 
     /// The stream's chain as this log reads it, oldest first, ending with the loglet it reads or appends to now.
+    pub fn activation_handoff(&self) -> Option<&HandoffCertificate> {
+        match &self.shared.role {
+            Role::Writer(writer) => writer.handoff(),
+            Role::Reader(_) => None,
+        }
+    }
+
     pub fn loglets(&self) -> Vec<Loglet> {
         let shared = &self.shared;
         shared.earlier.iter().map(|loglet| Loglet { servers: loglet.ensemble.config.servers.clone(), start_lsn: loglet.start, write_quorum: loglet.ensemble.config.write_quorum })

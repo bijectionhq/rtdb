@@ -5,7 +5,7 @@
 
 #[cfg(any(test, feature = "simulation"))]
 use crate::protocol::Entries;
-use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionStatement, StableDecision};
+use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionStatement, Handoff, HandoffCertificate, StableDecision};
 use crate::protocol::{Accepted, Entry, EpochRun, Refused, ResponseBody, Sealed, TimedJournalOrigin};
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -24,6 +24,8 @@ pub enum Event {
     Append(Entry),
     Install(i64),
     InstallCertificate(DecisionCertificate),
+    ExportHandoff(Handoff),
+    InstallHandoff(HandoffCertificate),
     ExposeCertificate { proof: StableDecision, replay: bool },
     Commit(i64),
     Trim(i64),
@@ -82,6 +84,9 @@ pub struct StreamState<P = Bytes> {
     pub synced: Option<u64>,
     pub(super) active_ensemble: Option<[u8; 32]>,
     pub(super) certified: bool,
+    pub(super) last_ensemble: Option<[u8; 32]>,
+    pub(super) export: Option<Handoff>,
+    pub(super) handoff: Option<HandoffCertificate>,
     /// Entries at or below this lsn are dropped.
     pub trim: i64,
     pub commit: i64,
@@ -124,7 +129,7 @@ fn dense(first: i64, entries: &[Entry]) -> bool {
 
 impl<P> Default for StreamState<P> {
     fn default() -> Self {
-        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, certified: false, trim: -1, commit: -1, installed: -1, certificate: None, stability: None, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
+        Self { promised: 0, dropped: false, synced: None, active_ensemble: None, certified: false, last_ensemble: None, export: None, handoff: None, trim: -1, commit: -1, installed: -1, certificate: None, stability: None, entries: VecDeque::new(), epoch_runs: VecDeque::new(), retained_bytes: 0 }
     }
 }
 
@@ -184,6 +189,7 @@ impl<P: Payload> StreamState<P> {
             Event::Activate { epoch, ensemble, certified } => {
                 debug_assert_eq!(*epoch, self.promised);
                 self.active_ensemble = Some(*ensemble);
+                self.last_ensemble = Some(*ensemble);
                 self.certified = *certified;
             }
             Event::Truncate(from) => {
@@ -203,6 +209,8 @@ impl<P: Payload> StreamState<P> {
                     payload: P::decided(&entry.payload), observed_sync: None });
             }
             Event::Install(lsn) => self.installed = self.installed.max((*lsn).min(self.last())),
+            Event::ExportHandoff(handoff) => self.export = Some(handoff.clone()),
+            Event::InstallHandoff(handoff) => self.handoff = Some(handoff.clone()),
             Event::InstallCertificate(certificate) => {
                 self.installed = self.installed.max(certificate.statement.prefix.through);
                 self.certificate = Some(certificate.clone());
@@ -398,7 +406,9 @@ impl<P: Payload> StreamState<P> {
     }
 
     pub fn repair(&mut self, epoch: u64, from: i64, entries: Vec<Entry>, commit: i64, ensemble: [u8; 32], certified: bool) -> Decision {
-        if self.promised == epoch && self.active_ensemble.is_some_and(|active| active != ensemble || self.certified != certified) {
+        if self.last_ensemble.is_some_and(|last| last != ensemble)
+            || self.promised == epoch && self.active_ensemble.is_some_and(|active| active != ensemble || self.certified != certified)
+        {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
         let mut overwrite = self.overwrite(epoch, from, entries, true, commit);
@@ -438,10 +448,51 @@ impl<P: Payload> StreamState<P> {
     }
 
     pub fn activate(&mut self, epoch: u64, ensemble: [u8; 32], certified: bool) -> Decision {
-        if self.active_ensemble.is_some_and(|active| active != ensemble || self.certified != certified) || self.check_writer(epoch).is_some() {
+        if self.last_ensemble.is_some_and(|last| last != ensemble)
+            || self.active_ensemble.is_some_and(|active| active != ensemble || self.certified != certified) || self.check_writer(epoch).is_some() {
             return Decision { events: Vec::new(), reply: self.refused() };
         }
         let events = self.active_ensemble.is_none().then_some(Event::Activate { epoch, ensemble, certified }).into_iter().collect();
+        self.persist(events, Self::accepted)
+    }
+
+    pub(super) fn export_handoff(&mut self, handoff: Handoff, vote: DecisionInstallation) -> Decision {
+        let epoch = handoff.source.epoch;
+        let source = handoff.source.ensemble();
+        if self.check_writer(epoch).is_some() || self.active_ensemble.is_some()
+            || (self.last_ensemble != source && !(self.last_ensemble.is_none() && handoff.through == -1))
+            || self.last() != handoff.through || self.trim >= handoff.first || self.installed > handoff.through
+            || self.export.as_ref().is_some_and(|old| old.source.epoch == epoch && old != &handoff)
+            || self.certificate.as_ref().is_some_and(|current| {
+                current.statement.scope.ensemble() == source && handoff.decided.as_ref().is_none_or(|selected| {
+                    current.statement.prefix.through > selected.statement.prefix.through
+                        || (current.statement.prefix.through == selected.statement.prefix.through && current.statement != selected.statement)
+                })
+            })
+        {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        let events = (self.export.as_ref() != Some(&handoff)).then_some(Event::ExportHandoff(handoff));
+        self.persist(events.into_iter().collect(), |_| ResponseBody::DecisionInstallation(vote))
+    }
+
+    pub(super) fn activate_handoff(&mut self, proof: HandoffCertificate, epoch: u64, ensemble: [u8; 32]) -> Decision {
+        let handoff = &proof.handoff;
+        if self.check_writer(epoch).is_some() || handoff.destination.epoch != epoch
+            || handoff.destination.ensemble() != Some(ensemble) || self.last() < handoff.through
+            || self.commit < handoff.through
+            || self.active_ensemble.is_some_and(|active| active != ensemble || !self.certified)
+            || self.handoff.as_ref().is_some_and(|old| {
+                old.handoff.destination.epoch == epoch && old.handoff != *handoff
+            })
+        {
+            return Decision { events: Vec::new(), reply: self.refused() };
+        }
+        let events = if self.handoff.as_ref().is_some_and(|old| old.handoff == *handoff) {
+            Vec::new()
+        } else {
+            vec![Event::InstallHandoff(proof), Event::Activate { epoch, ensemble, certified: true }]
+        };
         self.persist(events, Self::accepted)
     }
 
@@ -644,9 +695,33 @@ mod tests {
 #[cfg(test)]
 mod certificates {
     use super::*;
-    use crate::decision::{DecisionPrefix, DecisionScope};
+    use crate::decision::{DecisionPrefix, DecisionScope, Handoff, HandoffCertificate};
     use crate::attestation::journal_id;
     use rtdb_storage::attestation::SigningKey;
+
+    #[test]
+    fn handoff_authenticates_a_disjoint_destination_and_exact_cut() {
+        let key = || SigningKey::open(&SigningKey::generate().unwrap()).unwrap();
+        let predecessor = key();
+        let successor = key();
+        let scope = |signer: &SigningKey| DecisionScope {
+            stream: "history".into(), epoch: 2, quorum: 1,
+            journals: vec![journal_id(&signer.public_key()).to_string()],
+        };
+        let handoff = Handoff {
+            source: scope(&predecessor), destination: scope(&successor),
+            first: 1, through: 4, digest: Bytes::from_static(&[7; 32]),
+            decided: None, checkpoint: None,
+        };
+        let mut proof = HandoffCertificate { exports: vec![handoff.export(&predecessor)], handoff };
+        assert!(proof.authentic());
+        let original = proof.clone();
+        proof.handoff.destination = scope(&key());
+        assert!(!proof.authentic());
+        let mut proof = original;
+        proof.handoff.through += 1;
+        assert!(!proof.authentic());
+    }
 
     #[test]
     fn certificate_installation_needs_no_local_payload_and_rejects_substitution() {
