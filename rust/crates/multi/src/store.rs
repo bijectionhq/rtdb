@@ -725,10 +725,10 @@ pub(crate) async fn release_region(directory: &dyn Directory, deployment: &str, 
         record.catalog_readers.retain(|_, reader| reader.owner != region);
         let removed_readers = record.catalog_readers.len() != readers;
         match record.storage_regions.get_mut(&region) {
-            Some(StorageRegion::Remote { closed, .. }) if *closed => {
+            Some(StorageRegion::Remote { closed, .. } | StorageRegion::ReplicaPublication { closed, .. }) if *closed => {
                 if !removed_readers { return Ok(()); }
             }
-            Some(StorageRegion::Remote { closed, publications, .. }) if !publications.is_empty() => *closed = true,
+            Some(StorageRegion::Remote { closed, publications, .. } | StorageRegion::ReplicaPublication { closed, publications, .. }) if !publications.is_empty() => *closed = true,
             None if !uncertain && !removed_readers => return Ok(()),
             _ => { record.storage_regions.remove(&region); }
         }
@@ -1102,52 +1102,8 @@ pub struct GarbageRecord {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ReplicaPayloadRelease {
-    record: GarbageRecord,
-    incarnation: u64,
-    log_epoch: i32,
-    position: i64,
-    frame_sha256: [u8; 32],
-}
-
-impl ReplicaPayloadRelease {
-    fn permits(&self, owner: &DeploymentRecord, store: &str, version: &PhysicalObjectVersion) -> bool {
-        let Ok(root) = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0)) else { return false; };
-        let now = rtdb_directory::now_ms();
-        self.incarnation == owner.incarnation && self.log_epoch == owner.log_epoch && self.position >= 0
-            && self.record.key.starts_with("oversized/")
-            && store == format!("{}/{}", owner.storage_prefix(), root.key())
-            && owner.recovery_manifest_sha256.is_some()
-            && owner.checkpoint.is_some_and(|checkpoint| checkpoint.root_sha256.is_some() && checkpoint.boundary > self.position)
-            && owner.replica_anchor.as_ref().is_some_and(|anchor| anchor.interval[1] >= self.position)
-            && owner.replica_payload_trim.as_ref().is_some_and(|trim| trim.belongs_to(owner)
-                && trim.applied && !trim.journals.is_empty() && trim.through >= self.position
-                && trim.journals.iter().all(|endpoint| endpoint.journal().is_some())
-                && trim.candidates.iter().any(|candidate| candidate.position == self.position
-                    && candidate.key == self.record.key && candidate.frame_sha256 == self.frame_sha256
-                    && &candidate.version == version))
-            && !owner.requires_replica_offset(self.position, now)
-    }
-}
-
-async fn publish_replica_payload_release(bucket: &dyn ObjectStore, owner: &DeploymentRecord, relative: String,
-    position: i64, frame_sha256: [u8; 32], version: PhysicalObjectVersion) -> Result<()> {
-    let root = StorageRoot::new(rtdb_format::keys::CURRENT_STORAGE_VERSION, rtdb_types::StorageEpoch(0))?.key();
-    let hash = ring::digest::digest(&ring::digest::SHA256, relative.as_bytes());
-    let suffix = hash.as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-    let path = ObjectKey::new(format!("{}/{root}/{GARBAGE_DIRECTORY}/0-replica-{position}-{suffix}", owner.storage_prefix()))?;
-    let replica = ReplicaPayloadRelease { record: GarbageRecord { key: relative, released_at_ms: 0, trie_floor: None },
-        incarnation: owner.incarnation, log_epoch: owner.log_epoch, position, frame_sha256 };
-    let marker = serde_json::to_vec(&StoredRelease::Replica { replica, version })
-        .map_err(|error| Error::Task(error.to_string()))?;
-    bucket.put(&path, Bytes::from(marker)).await?;
-    Ok(())
-}
-
-#[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum StoredRelease {
-    Replica { replica: ReplicaPayloadRelease, version: PhysicalObjectVersion },
     Exact {
         record: GarbageRecord,
         version: PhysicalObjectVersion,
@@ -1166,7 +1122,6 @@ enum StoredRelease {
 impl StoredRelease {
     fn into_parts(self) -> Option<(GarbageRecord, Option<PhysicalObjectVersion>)> {
         match self {
-            Self::Replica { .. } => None,
             Self::Exact { record, version, .. } => Some((record, Some(version))),
             Self::Terminal { record, .. } => Some((record, None)),
             Self::Path(record) => Some((record, None)),
@@ -1502,7 +1457,6 @@ async fn reap_path_releases(bucket: &dyn ObjectStore, record: &DeploymentRecord,
             let Ok(release) = serde_json::from_slice::<StoredRelease>(&bytes) else { continue };
             let released = match release {
                 StoredRelease::Exact { record, .. } | StoredRelease::Terminal { record, .. } => { exact.insert(record.key); reaped.waiting += 1; continue; }
-                StoredRelease::Replica { .. } => { reaped.waiting += 1; continue; }
                 StoredRelease::Path(record) => record,
             };
             if ordered_index_storage::page_generation(&released.key).is_some()

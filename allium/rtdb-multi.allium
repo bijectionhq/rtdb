@@ -692,6 +692,8 @@ contract LogService {
         -- It matches the supplied reference to the quorum-certified frame and verifies the exact provider publication and body digest.
         -- The detached storage namespace and unit-key vault belong to the broker.
         -- A cross-cell successor reseals detached bodies under its broker and binds the returned publication into the new committed frame.
+        -- The broker grants a body version after the directory fence covers its original position and matching provider uploads and readers have drained.
+        -- Settlement withdraws the unit key and verifies absence of that provider version. Physical journal trim progresses independently.
 
     @invariant TrimFollowsPublication
         -- A deployment's records at or below its checkpoint's lsn may be trimmed; nothing above it may be.

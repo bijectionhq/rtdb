@@ -190,8 +190,6 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
             elif kind == "retirement-recovery-dependency":
                 require(digest(event["anchor"]) and digest(event["frame"]) and 0 <= event["position"] <= event["trim_through"],
                         "retirement has no matching recovery exclusion")
-                require(event["journals"] and len(set(event["journals"])) == len(event["journals"]),
-                        "retirement has no complete set of physical journals")
                 require(event["key"].startswith(event["residence"] + "/") and event["publication"]["version"],
                         "retirement has no exact physical publication")
             elif kind == "authorize-trim":
@@ -295,7 +293,7 @@ def verify_joined(captures):
     for events in captures:
         verify_native(events, verify_catalog_history=False, verify_certificate_history=False)
     events = [event for capture in captures for event in capture]
-    published, catalogs, installed_trims, dependencies, replay_holds, exclusions = {}, {}, {}, {}, {}, {}
+    published, catalogs, recovery_fences, dependencies, replay_holds, exclusions = {}, {}, {}, {}, {}, {}
     certified_pointers = set()
     for event in events:
         kind = event["event"]
@@ -304,10 +302,10 @@ def verify_joined(captures):
             published[identity] = min(event["revision"], published.get(identity, event["revision"]))
         elif kind in {"advance-floor", "close-catalog-admission", "catalog-hold", "catalog-release"}:
             catalogs.setdefault(scoped_catalog(event), []).append(event)
-        elif kind == "apply-trim" and event["settled_revision"] is not None:
-            key = (*replica_scope(event), event["through"], tuple(event["anchor"]), frozenset(event["journals"]))
-            revision = event["settled_revision"]
-            installed_trims[key] = min(revision, installed_trims.get(key, revision))
+        elif kind == "authorize-trim":
+            key = (*replica_scope(event), event["through"], tuple(event["anchor"]))
+            revision = event["revision"]
+            recovery_fences[key] = min(revision, recovery_fences.get(key, revision))
         elif kind == "broker-certified-pointer":
             certified_pointers.add((*broker_pointer(event), event["revision"]))
         elif kind == "admit-recovery":
@@ -334,8 +332,8 @@ def verify_joined(captures):
         elif kind == "hosted-recovery-closure":
             identity = exact_checkpoint(event, event, event["manifest"])
         elif kind == "retirement-recovery-dependency":
-            trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]), frozenset(event["journals"]))
-            require(trim in installed_trims and installed_trims[trim] <= event["revision"],
+            trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]))
+            require(trim in recovery_fences and recovery_fences[trim] <= event["revision"],
                     "dependent retirement lacks the exact installed recovery exclusion")
             joined += 1
             continue

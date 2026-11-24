@@ -4,9 +4,9 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
-use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
+use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, ReplicaPayloadCandidate, StoragePublication, StorageRegion};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::{CURRENT_STORAGE_VERSION, oversized_block_index, oversized_key}};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, log::{ReplicaPayload, ReplicaPayloadReference}, sealing::{DeliveryIo, PlaintextView}};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, remote::PublicationJournal, log::{ReplicaPayload, ReplicaPayloadReference}, sealing::{DeliveryIo, PlaintextView}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, PhysicalObjectVersion, Result, StorageEpoch};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
@@ -295,6 +295,17 @@ impl Service {
     pub async fn serve(
         self: Arc<Self>, listener: TcpListener, tls: Arc<ServerConfig>, cancellation: CancellationToken,
     ) -> Result<()> {
+        let reclaim_stop = cancellation.child_token();
+        let reclaim = tokio::spawn(Arc::clone(&self).run_reclamation(reclaim_stop.clone()));
+        let result = self.serve_connections(listener, tls, cancellation).await;
+        reclaim_stop.cancel();
+        reclaim.await.map_err(transport)?;
+        result
+    }
+
+    async fn serve_connections(
+        self: Arc<Self>, listener: TcpListener, tls: Arc<ServerConfig>, cancellation: CancellationToken,
+    ) -> Result<()> {
         let acceptor = TlsAcceptor::from(tls);
         let slots = Arc::new(Semaphore::new(16));
         let mut connections = JoinSet::new();
@@ -322,6 +333,113 @@ impl Service {
         };
         while connections.join_next().await.is_some() {}
         result
+    }
+
+    async fn run_reclamation(self: Arc<Self>, cancellation: CancellationToken) {
+        let CellStorage::S3 { config } = &self.storage else { return; };
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            if let Err(error) = self.reclaim(config, &cancellation).await {
+                tracing::warn!(code = %error.code, "Detached replay reclamation will retry");
+            }
+        }
+    }
+
+    async fn reclaim(&self, config: &rtdb_s3::S3Config, cancellation: &CancellationToken) -> Result<()> {
+        let inventory = CellStorage::s3_inventory(config).await?;
+        inventory.require_versioned().await?;
+        for record in self.directory.deployments().await? {
+            if cancellation.is_cancelled() { break; }
+            for (&id, region) in &record.storage_regions {
+                if let StorageRegion::ReplicaPublication { custody, closed, publications, .. } = region {
+                    let drained = match custody {
+                        ReplayCustody::Hosted { owner: Some(owner) } => *closed || self.directory.hosted_task_stopped(owner).await?,
+                        _ => false,
+                    };
+                    if drained {
+                        for publication in publications.values() {
+                            inventory.abort_publication(&ObjectKey::new(&publication.key)?, &publication.upload_id).await?;
+                        }
+                        crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
+                            if current.storage_regions.get(&id) == Some(region) {
+                                current.storage_regions.remove(&id);
+                            }
+                            Ok(())
+                        }).await?;
+                    }
+                }
+            }
+            let Some(work) = record.replica_payload_trim.as_deref().filter(|work| work.belongs_to(&record)) else { continue; };
+            for candidate in &work.candidates {
+                if let Err(error) = self.reclaim_one(&inventory, &record, candidate).await {
+                    tracing::warn!(installation = %record.id, position = candidate.position, code = %error.code, "Detached publication is awaiting settlement");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reclaim_one(
+        &self, inventory: &rtdb_s3::VersionedInventory, record: &DeploymentRecord, candidate: &ReplicaPayloadCandidate,
+    ) -> Result<()> {
+        let history = History::of(record)?;
+        let logical = ObjectKey::new(&candidate.key)?;
+        check_publish_key(&logical)?;
+        let residence = residence(record);
+        let physical = ObjectKey::new(format!("{residence}/{logical}"))?;
+        if !inventory.owns_publication(&physical, &candidate.version)
+            || !inventory.exact_retirement_available(&physical, &candidate.version).await?
+        {
+            return Ok(());
+        }
+        let token = Uuid::new_v4();
+        let owner = crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
+            if !history.matches(current) || !permits_release(current, candidate)? {
+                return Ok(());
+            }
+            if let Some(chosen) = current.replica_payload_trim.as_mut().and_then(|work|
+                work.candidates.iter_mut().find(|chosen| same_candidate(candidate, chosen)))
+            {
+                chosen.grant.get_or_insert(token);
+            }
+            Ok(())
+        }).await?;
+        if !history.matches(&owner) { return Ok(()); }
+        let Some(grant) = owner.replica_payload_trim.as_ref().and_then(|work| work.candidates.iter()
+            .find(|chosen| same_candidate(candidate, chosen))).and_then(|chosen| chosen.grant)
+        else { return Ok(()); };
+        let anchor = owner.replica_anchor.as_deref().ok_or_else(refused)?;
+        crate::residence_trace::record("retirement-recovery-dependency", || serde_json::json!({
+            "lineage": owner.lineage, "installation": owner.id, "incarnation": owner.incarnation,
+            "epoch": owner.log_epoch, "stream": owner.stream("replica"), "revision": owner.version,
+            "residence": residence, "retirement": grant, "key": physical.as_str(),
+            "publication": candidate.version, "position": candidate.position, "frame": candidate.frame_sha256,
+            "trim_through": anchor.interval[1], "anchor": anchor.digest,
+        }));
+        let io = IoRegion::new();
+        let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, owner.log_epoch), Arc::clone(&io));
+        let withdrawn = ledger.withdraw(&logical).await;
+        io.close_and_wait().await;
+        withdrawn?;
+        inventory.retire_observed_version(&physical, &candidate.version).await?;
+        crate::residence_trace::record("remove-version", || serde_json::json!({
+            "installation": owner.id, "incarnation": owner.incarnation, "epoch": owner.log_epoch, "lineage": owner.lineage,
+            "residence": residence, "retirement": grant, "key": physical.as_str(), "publication": candidate.version,
+        }));
+        crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
+            if history.matches(current)
+                && let Some(work) = current.replica_payload_trim.as_mut()
+            {
+                work.candidates.retain(|chosen| chosen.grant != Some(grant) || !same_candidate(candidate, chosen));
+            }
+            Ok(())
+        }).await?;
+        Ok(())
     }
 
     async fn dispatch(&self, socket: &mut tokio_rustls::server::TlsStream<DeliveryIo<TcpStream>>) -> Result<()> {
@@ -405,35 +523,63 @@ impl Service {
     }
 
     async fn publish_body(
-        &self, history: History, route: PublishRoute, key: &ObjectKey, body: Bytes, charge: Arc<rtdb_types::MemoryReservation>,
+        &self, history: History, route: PublishRoute, key: &ObjectKey, body: Bytes,
+        charge: Arc<rtdb_types::MemoryReservation>,
     ) -> Result<Option<PhysicalObjectVersion>> {
         check_publish_key(key)?;
         let envelope = ReplicaEnvelope::decode(&body)?.ok_or_else(invalid_frame)?;
         if matches!(envelope.message, ReplicaBody::OversizedMessage(_)) { return Err(invalid_frame()); }
-        let deployment = history.deployment.to_string();
-        let task = match &self.custody {
-            ReplayCustody::Local => None,
-            ReplayCustody::Hosted { owner } => owner.as_ref(),
+        let region = Uuid::new_v4();
+        let local = match self.custody {
+            ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
+            ReplayCustody::Hosted { owner: Some(_) } => None,
+            ReplayCustody::Hosted { owner: None } => return Err(refused()),
         };
-        let version = crate::archive::stage::with_region(
-            self.directory.as_ref(), self.keys.as_ref(), &deployment, &self.storage, task, None, None,
-            |record| {
+        let deployment = history.deployment.to_string();
+        let mut attempted = false;
+        let result = async {
+            attempted = true;
+            let record = crate::admin::update_installation(self.directory.as_ref(), &deployment, |record| {
                 require_publication(history, route, record, key)?;
-                Ok(None)
-            },
-            |record, _, io| async move {
-                require_publication(history, route, &self.current(history).await?, key)?;
-                let files = self.open_store(&record, io).await?;
-                let published = IoRegion::retaining(charge, files.put_with_publication(key, body)).await?;
-                let version = published.and_then(rtdb_types::PhysicalObjectPublication::into_version);
+                if record.replica_payload_trim.as_deref().is_some_and(|trim| trim.belongs_to(record)
+                    && trim.candidates.iter().any(|candidate| candidate.key == key.as_str() && candidate.grant.is_some()))
+                {
+                    return Err(refused());
+                }
+                record.storage_regions.insert(region, StorageRegion::ReplicaPublication {
+                    key: key.to_string(), custody: self.custody.clone(), closed: false, publications: Default::default(),
+                });
+                Ok(())
+            }).await?;
+            let mut io = IoRegion::new();
+            if matches!(self.storage, CellStorage::S3 { .. }) {
+                Arc::get_mut(&mut io).expect("the publication region is private").track_publications(Arc::new(BrokerUpload {
+                    directory: Arc::clone(&self.directory), history, route, region,
+                    logical: key.clone(), physical: ObjectKey::new(format!("{}/{key}", residence(&record)))?,
+                }));
+            }
+            let version: Result<_> = async {
+                let files = self.open_store(&record, Arc::clone(&io)).await?;
+                let written = IoRegion::retaining(charge, files.put_with_publication(key, body)).await?;
+                let version = written.and_then(rtdb_types::PhysicalObjectPublication::into_version);
                 if version.is_none() && matches!(self.storage, CellStorage::S3 { .. }) {
                     return Err(Anomaly::incorrect("rtdb.multi/replay-broker-version", "Detached S3 bodies require versioned custody"));
                 }
                 Ok(version)
-            },
-        ).await?;
-        require_publication(history, route, &self.current(history).await?, key)?;
-        Ok(version)
+            }.await;
+            io.close_and_wait().await;
+            let version = version?;
+            require_publication(history, route, &self.current(history).await?, key)?;
+            Ok(version)
+        }.await;
+        if attempted {
+            self.release(history, region).await;
+        }
+        if local.is_some() {
+            drop(local);
+            self.keys.forget_local_storage_region(region)?;
+        }
+        result
     }
 
     async fn current(&self, history: History) -> Result<DeploymentRecord> {
@@ -528,6 +674,74 @@ impl Service {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
+}
+
+fn same_candidate(left: &ReplicaPayloadCandidate, right: &ReplicaPayloadCandidate) -> bool {
+    left.position == right.position && left.key == right.key
+        && left.frame_sha256 == right.frame_sha256 && left.version == right.version
+}
+
+fn permits_release(record: &DeploymentRecord, candidate: &ReplicaPayloadCandidate) -> Result<bool> {
+    Ok(matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+        && candidate.position >= 0 && candidate.frame_sha256 != [0; 32]
+        && crate::hosted_recovery::checkpoint_decision(record)?.is_some()
+        && record.checkpoint.is_some_and(|root| root.boundary > candidate.position)
+        && record.replica_anchor.as_ref().is_some_and(|anchor|
+            anchor.root_incarnation == record.incarnation && (anchor.interval[0]..=anchor.interval[1]).contains(&candidate.position))
+        && record.replica_payload_trim.as_ref().is_some_and(|work| work.belongs_to(record)
+            && work.candidates.iter().any(|chosen| same_candidate(candidate, chosen)))
+        && !record.requires_replica_offset(candidate.position, rtdb_directory::now_ms())
+        && !record.storage_regions.values().any(|region| {
+            matches!(region, StorageRegion::ReplicaPublication { key, .. } if key == &candidate.key)
+        }))
+}
+
+struct BrokerUpload {
+    directory: Arc<dyn Directory>,
+    history: History,
+    route: PublishRoute,
+    region: Uuid,
+    logical: ObjectKey,
+    physical: ObjectKey,
+}
+
+#[async_trait::async_trait]
+impl PublicationJournal for BrokerUpload {
+    async fn admit(&self, key: &ObjectKey, attempt: Uuid, upload: &str) -> rtdb_storage::Result<()> {
+        if key != &self.physical || attempt.is_nil() || upload.is_empty() {
+            return Err(rtdb_storage::Error::Task("The detached upload has another provider identity".into()));
+        }
+        let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned() };
+        crate::admin::update_installation(self.directory.as_ref(), &self.history.deployment.to_string(), |record| {
+            require_publication(self.history, self.route, record, &self.logical)?;
+            let Some(StorageRegion::ReplicaPublication { key, closed: false, publications, .. }) =
+                record.storage_regions.get_mut(&self.region) else { return Err(refused()); };
+            if key.as_str() != self.logical.as_str() || publications.get(&attempt).is_some_and(|prior| prior != &publication) {
+                return Err(refused());
+            }
+            publications.insert(attempt, publication.clone());
+            Ok(())
+        }).await.map_err(storage_error)?;
+        Ok(())
+    }
+
+    async fn settle(&self, key: &ObjectKey, attempt: Uuid, upload: &str, _submitted: bool) -> rtdb_storage::Result<()> {
+        if key != &self.physical { return Err(rtdb_storage::Error::Task("The detached upload has another provider identity".into())); }
+        crate::admin::update_installation(self.directory.as_ref(), &self.history.deployment.to_string(), |record| {
+            let Some(StorageRegion::ReplicaPublication { publications, .. }) = record.storage_regions.get_mut(&self.region)
+                else { return Ok(()); };
+            if publications.get(&attempt).is_some_and(|prior| prior.key != key.as_str() || prior.upload_id != upload) {
+                return Err(refused());
+            }
+            publications.remove(&attempt);
+            Ok(())
+        }).await.map_err(storage_error)?;
+        Ok(())
+    }
+}
+
+fn storage_error(error: Anomaly) -> rtdb_storage::Error {
+    rtdb_storage::Error::Remote { key: "detached replay broker".into(), message: error.to_string() }
 }
 
 pub(crate) fn residence(record: &DeploymentRecord) -> String {

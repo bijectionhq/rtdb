@@ -482,6 +482,12 @@ pub enum StorageRegion {
         through: i64,
         custody: ReplayCustody,
     },
+    ReplicaPublication {
+        key: String,
+        custody: ReplayCustody,
+        closed: bool,
+        publications: BTreeMap<uuid::Uuid, StoragePublication>,
+    },
     /// A fork has admitted provider I/O against this physical residence.
     ReferenceRead {
         custody: ReplayCustody,
@@ -517,7 +523,7 @@ impl StorageRegion {
             Self::Local { archive, repair_archive, .. } |
             Self::Remote { archive, repair_archive, .. } => (*archive, *repair_archive),
             Self::ReplayPackRetirement { capture: retained, .. } => return *retained == capture,
-            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => return false,
+            Self::ReplicaReplay { .. } | Self::ReplicaPublication { .. } | Self::ReferenceRead { .. } | Self::ExactRetirement { .. } => return false,
         };
         archive_custody::covers_archive(destination.map(|id| id.as_u128()), repair.map(|id| id.as_u128()), capture.as_u128())
     }
@@ -543,7 +549,7 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_metadata_from, .. } |
             Self::Remote { checkpoint_metadata_from, closed: false, .. } => *checkpoint_metadata_from,
-            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } | Self::ReferenceRead { .. }
+            Self::Remote { closed: true, .. } | Self::ReplicaReplay { .. } | Self::ReplicaPublication { .. } | Self::ReferenceRead { .. }
             | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => None,
         }
     }
@@ -561,7 +567,7 @@ impl StorageRegion {
         match self {
             Self::Local { checkpoint_replay_from, .. }
             | Self::Remote { checkpoint_replay_from, closed: false, .. } => *checkpoint_replay_from,
-            Self::Remote { closed: true, .. } | Self::ReferenceRead { .. }
+            Self::Remote { closed: true, .. } | Self::ReplicaPublication { .. } | Self::ReferenceRead { .. }
             | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => None,
             Self::ReplicaReplay { first_required, .. } => Some(*first_required),
         }
@@ -579,7 +585,7 @@ impl StorageRegion {
         match self {
             Self::Local { tracks_ordered_index_pages, .. } |
             Self::Remote { tracks_ordered_index_pages, .. } => *tracks_ordered_index_pages,
-            Self::ReplicaReplay { .. } | Self::ReferenceRead { .. }
+            Self::ReplicaReplay { .. } | Self::ReplicaPublication { .. } | Self::ReferenceRead { .. }
             | Self::ExactRetirement { .. } | Self::ReplayPackRetirement { .. } => false,
         }
     }
@@ -914,7 +920,7 @@ pub struct ReplicaPayloadTrim {
     pub incarnation: u64,
     pub log_epoch: i32,
     pub through: i64,
-    pub journals: BTreeSet<JournalEndpoint>,
+    pub generation: Option<uuid::Uuid>,
     pub applied: bool,
     pub candidates: Vec<ReplicaPayloadCandidate>,
     /// One authenticated publication for each frame in this new trim interval.
@@ -936,11 +942,19 @@ pub struct ReplicaPayloadCandidate {
     /// Digest of the sealed frame at this position in the certified journal.
     pub frame_sha256: [u8; 32],
     pub version: rtdb_types::PhysicalObjectVersion,
+    pub grant: Option<uuid::Uuid>,
 }
 
 impl ReplicaPayloadTrim {
+    pub fn same_journal_work(&self, other: &Self) -> bool {
+        self.incarnation == other.incarnation && self.log_epoch == other.log_epoch
+            && self.generation == other.generation && self.through == other.through
+            && self.journal_units == other.journal_units
+    }
+
     pub fn belongs_to(&self, record: &DeploymentRecord) -> bool {
         self.incarnation == record.incarnation && self.log_epoch == record.log_epoch
+            && self.generation == record.storage_generation
     }
 }
 

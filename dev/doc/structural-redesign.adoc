@@ -190,7 +190,8 @@ Pending archive suffix pins protect their certified journal interval until archi
 Recovery can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
 Enrolled terminal storage can retire loose files with a write witness and an installed release.
-The existing versioned S3 payload collector still waits for the known physical journals to trim. The approved contract requires brokered recovery exclusion and drain before independent payload settlement.
+The versioned S3 replay broker orders an exact provider deletion grant after the certified recovery exclusion and relevant reads and uploads drain.
+An unreachable historical journal cannot delay settlement. Active-journal trim and journal-key retirement are separate work.
 Normal readers register bounded replay holds and retain delivered pointers through provider drain. Archive and transfer reads require an admitted region covering the certified pointer's position.
 The offload retirement record binds the certified sealed frame digest and original replica position to the observed physical publication.
 Installed journal delivery resolves the one payload authenticated at its replica position through the serving lease and unit-key owner.
@@ -200,7 +201,7 @@ Archive suffix capture, terminal transfer replay and timestamp-fork reads redeem
 Checkpoint transfer seeds detached bodies through a separate transfer credential and binds the destination provider publication into the re-sealed pointer.
 Cross-cell handoff retains the original replay interval and republishes each detached body under the destination broker before seeding its journal.
 The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
-Independent payload settlement still requires complete installed references and a recovery dependency fence.
+The directory recovery fence still advances as a contiguous prefix. Exact inventories must let it advance past unrelated finite holds while preserving their covered positions.
 Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
 Inline appends without new provider dependencies publish an empty reference set.
 Installed upload, trie, artefact and detached-body appends resolve their dependencies against the admitted replay catalog and attest the observed S3 publication addresses.

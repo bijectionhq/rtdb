@@ -25,9 +25,11 @@ A third schedule restarts after physical trim or provider deletion but before re
    Provider settlement consumes the same grant after interruption or ambiguous replies.
    Physical journal trim and media destruction have their own authorities and settlement evidence.
 
-The current directory-managed versioned S3 collector still awaits durable physical trim responses.
-That implementation does not yet supply the dependency-fence guarantee.
-A quorum trim or a missing historical medium supplies no access-exclusion evidence by itself.
+The directory-managed versioned S3 broker records its deletion grant against the installed checkpoint and certified recovery fence.
+It waits for matching retained replay ranges and exact upload attempts to drain, withdraws the body key, then confirms absence of the granted provider version.
+Active-quorum trimming and journal-frame key withdrawal are handled separately.
+The production fence still selects a contiguous prefix and can wait on an earlier unrelated hold.
+The bounded model still represents physical trim in the original settlement sequence.
 
 ## Bounded check
 
