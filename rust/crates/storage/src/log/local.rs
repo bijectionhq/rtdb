@@ -393,16 +393,8 @@ impl Drop for LocalLogDriver {
     fn drop(&mut self) { self.progress.close(); }
 }
 
-#[async_trait]
-impl Log for LocalLog {
-    fn retains_synced_history(&self) -> bool { true }
-    fn maximum_append_bytes(&self) -> Option<usize> { Some(self.maximum_message_bytes) }
-
-    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
-        let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
-        super::read_only::file_range(self.reads.clone(), self.path.clone(), maximum, from, to, Some(self.progress.latest()?), self.keys.clone())
-    }
-    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+impl LocalLog {
+    async fn append_record(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         if payload.len() > self.maximum_message_bytes {
             return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.maximum_message_bytes });
         }
@@ -413,9 +405,7 @@ impl Log for LocalLog {
         Ok(AppendReceipt::new(durable))
     }
 
-    fn latest(&self) -> Result<LogOffset> { self.progress.latest() }
-
-    async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
+    async fn open_tail(&self, after: LogOffset) -> Result<LocalTail> {
         let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
         let (path, progress) = (self.path.clone(), self.progress.clone());
         let latest = progress.latest()?;
@@ -430,7 +420,40 @@ impl Log for LocalLog {
                 file.stream_position().map_err(|error| Error::io(path.as_path(), error))
             }).await?
         };
-        Ok(Box::new(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() }))
+        Ok(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() })
+    }
+}
+
+#[async_trait]
+impl super::SharedLog for LocalLog {
+    async fn append(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.append_record(payload, timestamp).await
+    }
+
+    fn latest(&self) -> Result<LogOffset> { self.progress.latest() }
+
+    async fn read_after(&self, after: LogOffset) -> Result<Box<dyn LogReplayTail>> {
+        Ok(Box::new(self.open_tail(after).await?))
+    }
+}
+
+#[async_trait]
+impl Log for LocalLog {
+    fn retains_synced_history(&self) -> bool { true }
+    fn maximum_append_bytes(&self) -> Option<usize> { Some(self.maximum_message_bytes) }
+
+    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
+        let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
+        super::read_only::file_range(self.reads.clone(), self.path.clone(), maximum, from, to, Some(self.progress.latest()?), self.keys.clone())
+    }
+    async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.append_record(payload, timestamp).await
+    }
+
+    fn latest(&self) -> Result<LogOffset> { super::SharedLog::latest(self) }
+
+    async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
+        Ok(Box::new(self.open_tail(after).await?))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {

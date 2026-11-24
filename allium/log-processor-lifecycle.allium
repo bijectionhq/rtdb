@@ -76,6 +76,11 @@ contract DurableTotalOrder {
     -- append returns the position the record now occupies; read_after delivers the records above a position and returns the position reached.
     append: (log: ReplicaLog, term: Integer) -> MessageId
     read_after: (log: ReplicaLog, after: MessageId) -> MessageId
+    latest: (log: ReplicaLog) -> MessageId
+
+    @invariant LatestObservesDurablePosition
+        -- The default log's latest position is its observed durable tip.
+        -- An empty log reports its start position.
 
     @invariant AppendReturnsItsOwnPosition
         -- An accepted append tells its author which position the record now occupies.

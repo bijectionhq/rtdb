@@ -16,7 +16,7 @@ use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
 use rdkafka::{ClientConfig, Message, admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication}, client::DefaultClientContext,
     consumer::{BaseConsumer, Consumer}, error::{KafkaError, RDKafkaErrorCode}, message::BorrowedMessage};
-use rtdb_storage::{Error, IoRegion, Result as StorageResult, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}, sealing::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD}};
+use rtdb_storage::{Error, IoRegion, Result as StorageResult, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}, sealing::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD}};
 use rtdb_types::{Anomaly, Result, Timestamp};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use log_configuration::{ConfiguredLogClient, LogConfiguration, PreparedLogClient, Role};
@@ -222,20 +222,8 @@ async fn ensure_topic(configuration: PreparedLogClient, options: &KafkaLogOption
     Ok(identity)
 }
 
-#[async_trait]
-impl Log for KafkaLog {
-    async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn rtdb_storage::log::LogRange>> {
-        if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
-        let mut options = self.options.clone();
-        options.maximum_poll_records = 1;
-        let consumer = consumer(&self.configuration, &options)?;
-        let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
-        if from.0 < low { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: low }); }
-        let tail = tail::KafkaTail::new(consumer, options, Arc::clone(&self.progress), LogOffset(from.0.min(high) - 1), self.keys.clone())?;
-        let end = high.min(to.0);
-        Ok(Box::new(tail::KafkaRange::new(tail, end, self.options.maximum_message_bytes, self.options.request_timeout)))
-    }
-    async fn enqueue(&self, payload: Bytes, _: Timestamp) -> StorageResult<AppendReceipt> {
+impl KafkaLog {
+    async fn append_record(&self, payload: Bytes) -> StorageResult<AppendReceipt> {
         self.progress.check()?;
         let Access::Writable { queue, bytes, records } = &self.access else { return Err(Error::ReadOnlyLog(self.options.topic.clone().into())); };
         let overhead = if self.keys.is_some() { KAFKA_LOG_SEAL_OVERHEAD } else { 0 };
@@ -262,6 +250,17 @@ impl Log for KafkaLog {
         Ok(AppendReceipt::new(durable))
     }
 
+    fn open_tail(&self, after: LogOffset) -> StorageResult<tail::KafkaTail> {
+        tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after, self.keys.clone())
+    }
+}
+
+#[async_trait]
+impl rtdb_storage::log::SharedLog for KafkaLog {
+    async fn append(&self, payload: Bytes, _: Timestamp) -> StorageResult<AppendReceipt> {
+        self.append_record(payload).await
+    }
+
     fn latest(&self) -> StorageResult<LogOffset> {
         self.progress.check()?;
         let consumer = consumer(&self.configuration, &self.options)?;
@@ -270,6 +269,30 @@ impl Log for KafkaLog {
         self.progress.advance(end - 1);
         Ok(LogOffset(end - 1))
     }
+
+    async fn read_after(&self, after: LogOffset) -> StorageResult<Box<dyn LogReplayTail>> {
+        Ok(Box::new(self.open_tail(after)?))
+    }
+}
+
+#[async_trait]
+impl Log for KafkaLog {
+    async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn rtdb_storage::log::LogRange>> {
+        if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
+        let mut options = self.options.clone();
+        options.maximum_poll_records = 1;
+        let consumer = consumer(&self.configuration, &options)?;
+        let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
+        if from.0 < low { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: low }); }
+        let tail = tail::KafkaTail::new(consumer, options, Arc::clone(&self.progress), LogOffset(from.0.min(high) - 1), self.keys.clone())?;
+        let end = high.min(to.0);
+        Ok(Box::new(tail::KafkaRange::new(tail, end, self.options.maximum_message_bytes, self.options.request_timeout)))
+    }
+    async fn enqueue(&self, payload: Bytes, _: Timestamp) -> StorageResult<AppendReceipt> {
+        self.append_record(payload).await
+    }
+
+    fn latest(&self) -> StorageResult<LogOffset> { rtdb_storage::log::SharedLog::latest(self) }
 
     async fn retained_floor(&self) -> StorageResult<Option<LogOffset>> {
         self.progress.check()?;
@@ -284,13 +307,13 @@ impl Log for KafkaLog {
     }
 
     async fn tail(&self, after: LogOffset) -> StorageResult<Box<dyn LogTail>> {
-        Ok(Box::new(tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after, self.keys.clone())?))
+        Ok(Box::new(self.open_tail(after)?))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Vec<LogRecord>> {
         if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         let after = LogOffset(from.0 - 1);
-        let mut tail = tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after, self.keys.clone())?;
+        let mut tail = self.open_tail(after)?;
         let end = tail.end()?.min(to.0);
         let mut result = Vec::new();
         let mut bytes = 0usize;

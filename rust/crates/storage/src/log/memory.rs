@@ -129,13 +129,38 @@ fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
     Ok(result)
 }
 
+impl MemoryLog {
+    fn append_record(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.enqueue_at(payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
+    }
+
+    fn open_tail(&self, after: LogOffset) -> Result<MemoryTail> {
+        let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        read(&self.shared, next, next)?;
+        Ok(MemoryTail { shared: self.shared.clone(), after })
+    }
+}
+
+#[async_trait]
+impl super::SharedLog for MemoryLog {
+    async fn append(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
+        self.append_record(payload, timestamp)
+    }
+
+    fn latest(&self) -> Result<LogOffset> { self.shared.progress.latest() }
+
+    async fn read_after(&self, after: LogOffset) -> Result<Box<dyn LogReplayTail>> {
+        Ok(Box::new(self.open_tail(after)?))
+    }
+}
+
 #[async_trait]
 impl Log for MemoryLog {
     fn maximum_append_bytes(&self) -> Option<usize> { Some(self.shared.maximum_message_bytes) }
     fn maximum_guarded_append_bytes(&self) -> Option<usize> { self.maximum_append_bytes() }
 
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
-        self.enqueue_at(payload, |payload| self.shared.timestamps.timestamp(payload, timestamp))
+        self.append_record(payload, timestamp)
     }
 
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> Result<AppendReceipt> {
@@ -145,7 +170,7 @@ impl Log for MemoryLog {
         self.enqueue_at(payload, |_| guard.sample())
     }
 
-    fn latest(&self) -> Result<LogOffset> { self.shared.progress.latest() }
+    fn latest(&self) -> Result<LogOffset> { super::SharedLog::latest(self) }
 
     async fn retained_floor(&self) -> Result<Option<LogOffset>> {
         Ok(Some(LogOffset(self.shared.records.lock().first)))
@@ -156,9 +181,7 @@ impl Log for MemoryLog {
     }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
-        let next = after.0.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
-        read(&self.shared, next, next)?;
-        Ok(Box::new(MemoryTail { shared: self.shared.clone(), after }))
+        Ok(Box::new(self.open_tail(after)?))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
