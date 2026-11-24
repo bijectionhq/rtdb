@@ -98,7 +98,7 @@ impl Service {
                             features.push("query.linearizable".into());
                         }
                         if features.iter().any(|feature| feature == "query") {
-                            features.extend(["sql.search-analyzer-stats", "sql.cosine-distance-f32", "sql.ranked-window"]
+                            features.extend(["sql.search-analyzer-stats", "sql.cosine-distance-f32", "sql.ranked-window", "sql.spatial-predicates"]
                                 .map(str::to_owned));
                         }
                         if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported()

@@ -582,6 +582,8 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
         | "cosine_distance" | "cosine_distance_f32" | "rank_admitted_count" => 2..=2,
         "match" => 2..=3,
         "search_score" => 2..=6,
+        "spatial_match" => 4..=5,
+        "spatial_distance" => 4..=6,
         "approximate_nearest" => 3..=3,
         "round" => 1..=2,
         "least" | "greatest" | "str" | "format" | "concat" => 1..=usize::MAX,

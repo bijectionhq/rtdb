@@ -11,6 +11,9 @@ use geometry::{
 };
 use rtdb_types::{Anomaly, Result, SpatialGeometryEncoding};
 
+mod sql;
+pub(crate) use sql::call;
+
 pub const WORK_STEPS: usize = 10_000_000;
 pub const WORK_BYTES: usize = 8 << 20;
 

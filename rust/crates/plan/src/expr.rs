@@ -46,6 +46,13 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         }
         return Ok(LogicalType::Scalar(S::I64));
     }
+    if matches!(name.as_str(), "spatial_match" | "spatial_distance") {
+        let (arity, ty) = if name == "spatial_match" { (4..=5, S::Bool) } else { (4..=6, S::F64) };
+        if !arity.contains(&arguments.len()) {
+            return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for {name}")));
+        }
+        return Ok(LogicalType::Scalar(ty).maybe());
+    }
     if name == "approximate_nearest" {
         if arguments.len() != 3 {
             return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "approximate_nearest requires a column, a probe vector and a limit"));

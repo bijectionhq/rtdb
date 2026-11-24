@@ -54,3 +54,27 @@ ORDER BY hits.distance, ENTITY_SORT_KEY(hits._id)
 
 The exact recipe has `approximate = false`; it never requests an IVF shortlist.
 Reject a zero or malformed probe at admission even when the candidate relation is empty.
+
+## Exact spatial predicates and nearest
+
+`SPATIAL_MATCH(geometry, region, encoding, predicate[, radius_m])` evaluates the existing exact WGS84 predicates on binary geometry.
+Use equality on each typed partition column alongside the geometry predicate.
+The stored encoding is `tagged-wkb-v1`, `bijection-geometry-v1` or `bijection-position-v1`; the query region uses tagged WKB.
+`SPATIAL_DISTANCE(geometry, origin, encoding, metric[, radius_m[, after_radius_m]])` takes a Point origin and an explicit `wgs84_geometry_m` or `wgs84_reported_center_m` metric.
+The first metric admits geometry rows, and the second also admits observed positions by their reported centers.
+The optional upper radius is inclusive and the optional lower radius is exclusive.
+A missing geometry or an ineligible distance gives SQL null.
+
+Build a bounded, materialized source at the held valid instant with the equality predicates already applied.
+Compute `SPATIAL_DISTANCE` once per candidate in a materialized CTE.
+Project `_id`, `_rtdb_written_basis`, and the requested document columns from those same rows.
+Require `query.written-basis` for the revision projection and check that each hit has a non-null revision.
+Keep the original Query basis and claim, including when no row is returned.
+
+For a nearest page of size `k`, use `WHERE distance IS NOT NULL` and order by `distance, ENTITY_SORT_KEY(_id)`, fetching `k + 1` rows.
+The extra row's distance is the next-distance bound.
+Keep the anchor from the last delivered row and use `distance > $after_distance OR (distance = $after_distance AND ENTITY_SORT_KEY(_id) > $after_key)` on the next exact-cut Query.
+Keep the original radius and exclusive lower bound independent of that anchor.
+For an unranked range order and seek by the complete identity key alone.
+Bind any application continuation to the original basis, branch, layer, valid instant, projection, predicate, probe and exact partition values.
+These SQL expressions perform bounded exact refinement over the resolved source.

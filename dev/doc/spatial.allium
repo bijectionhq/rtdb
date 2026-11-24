@@ -92,6 +92,10 @@ entity SpatialPostings {
 -- Every matching row inspected on the first page has a canonical Point geometry before the held filter can certify matches.
 -- A winner gather resolves the selected complete identity at the original present and requires the same winning system revision.
 -- A winner gather uses the original relation release guard and issues no additional witness.
+-- Exact SQL spatial expressions apply the same geometry kernel to the resolved row at the tracked Query cut.
+-- A SQL nearest query chooses a WGS84 metric, applies an inclusive upper and exclusive lower radius, and orders by distance and complete identity.
+-- SQL keyset paging uses the last delivered distance and identity on the original cut.
+-- One extra row supplies the next-distance bound, and each selected hit carries its written basis and document projection.
 -- An observed read with an admitted placed witness scope, including an empty page, binds the relation frontier for ordered validation.
 -- Erasure orders against the held admission, and its newly compacted source carries no erased posting.
 -- Superseded source tries and their derived files follow trie-cat.allium and gc.allium.
