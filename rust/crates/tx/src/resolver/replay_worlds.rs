@@ -238,10 +238,9 @@ impl OpenTransaction<'_> {
                     .await?;
             }
             self.record_replayed_registration(replay, &world)?;
-            self.buffer.put(
-                OwnedRelation::world_catalog().table(owner),
-                world.record(),
-                Interval::ALL,
+            self.stage_replayed_topology(
+                replay, OwnedRelation::world_catalog().table(owner), world.id,
+                registration.position, world.record(),
             )?;
         }
 
@@ -257,7 +256,8 @@ impl OpenTransaction<'_> {
                     self.trace_parent,
                 )?
                 .with_accelerators(Arc::from([]));
-            for (id, clock) in effects.clocks {
+            for publication in effects.clocks {
+                let (id, clock) = (publication.world, publication.reading);
                 let (world, charge) = rtdb_query::read_owned_world(Arc::clone(&updated), owner, id)
                     .await?
                     .ok_or_else(OwnedWorld::unavailable)?;
@@ -275,13 +275,12 @@ impl OpenTransaction<'_> {
                 {
                     return Err(OwnedWorld::unavailable());
                 }
-                self.buffer.put(
-                    OwnedRelation::world_clock_table(owner),
+                self.stage_replayed_topology(
+                    replay, OwnedRelation::world_clock_table(owner), id, publication.position,
                     StructFields::from([
                         ("_id".into(), Value::Uuid(id.0)),
                         ("clock".into(), Value::I64(clock.0)),
                     ]),
-                    Interval::ALL,
                 )?;
                 if matches!(world.mode, WorldClockMode::Held { .. }) {
                     self.record_replayed_held_publication(replay, &world, clock)?;
@@ -363,6 +362,25 @@ impl OpenTransaction<'_> {
             self.record_owned_change(&relation, shadow.id, change, shadow.valid, shadow.position, Ok(None))?;
         }
         Ok(())
+    }
+
+    fn stage_replayed_topology(
+        &mut self, replay: &HostedReplay, table: TableRef, world: Iid,
+        position: Option<std::num::NonZeroU32>, record: StructFields<Value>,
+    ) -> Result<()> {
+        let Some(position) = position else { return self.buffer.put(table, record, Interval::ALL); };
+        replay.require_assertion_line(position.get(), world.0)?;
+        self.buffer.append_archived_world_effect(&table, StoredEvent {
+            position: None,
+            origin: None,
+            commit_position: 0,
+            entity_key: None,
+            iid: world,
+            system_from: self.tx_key().system_time,
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(record),
+            recency: None,
+        }, position)
     }
 
     fn record_replayed_registration(&mut self, replay: &HostedReplay, world: &OwnedWorld) -> Result<()> {

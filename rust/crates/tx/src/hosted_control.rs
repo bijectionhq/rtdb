@@ -430,6 +430,14 @@ impl HostedReplay {
         format!("native-transaction/{}", self.source.tx_id.0)
     }
 
+    pub(crate) fn original_receipt_key(&self) -> [u8; 8] {
+        self.source.tx_id.0.to_be_bytes()
+    }
+
+    pub(crate) fn destination_locator(destination: rtdb_types::TxId) -> String {
+        format!("native-destination/{}", destination.0)
+    }
+
     pub(crate) fn world_omissions_locator(&self) -> String {
         format!("native-world-omissions/{}", self.source.tx_id.0)
     }

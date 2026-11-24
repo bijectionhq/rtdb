@@ -98,6 +98,7 @@ struct MergeFile {
     recency: Option<CivilDate>,
     carries_recency: bool,
     keyed: bool,
+    topology: bool,
     include_origins: bool,
     include_positions: bool,
     redacted_leg: bool,
@@ -105,11 +106,16 @@ struct MergeFile {
     leaves: Vec<layout::Leaf>,
 }
 
-struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool, include_origins: bool, include_positions: bool, redacted_leg: bool }
+struct OutputSchema { put: Option<StructFields<LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool, topology: bool, include_origins: bool, include_positions: bool, redacted_leg: bool }
 
 impl OutputSchema {
     fn batch(&self, events: &[PageEvent], memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
         let batch = copy_compaction_batch(events, self.put.clone(), self.iid_encoding, self.recency, self.redacted_leg, memory)?;
+        let batch = if self.topology {
+            rtdb_format::data::with_topology_commit_positions(batch, memory)?
+        } else {
+            batch
+        };
         if self.include_origins && batch.batch().column_by_name(rtdb_format::data::EVENT_ORIGIN_FIELD).is_none() {
             return rtdb_format::data::append_origins(&batch, std::iter::repeat_n(None, events.len()), memory);
         }
@@ -120,6 +126,8 @@ impl OutputSchema {
         let mut fields = schema.fields().to_vec();
         if self.keyed {
             fields.push(Arc::new(rtdb_format::data::entity_key_field()));
+        }
+        if self.keyed || self.topology {
             fields.push(Arc::new(rtdb_format::data::commit_position_field()));
         }
         if self.include_origins { fields.push(Arc::new(rtdb_format::data::event_origin_field())); }
@@ -359,6 +367,7 @@ impl SegmentCompactor {
             inputs.push(InputSegment { key: key.clone(), metadata, reader, _reservations: vec![reservation, metadata_charge] });
         }
         let keyed = job.table.is_owned_event_data();
+        let topology = job.table.is_owned_world_topology();
         let include_origins = inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::EVENT_ORIGIN_FIELD).is_ok());
         if inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::ENTITY_KEY_FIELD).is_ok() != keyed) {
             return Err(crate::invalid("Compaction input does not have the required entity-key layout"));
@@ -382,7 +391,7 @@ impl SegmentCompactor {
         }
         let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
         let initial_carry = job.recency_mode == RecencyMode::Preserve && carry;
-        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, keyed, include_origins, include_positions, redacted_leg, &self.config, &self.memory)?];
+        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, keyed, topology, include_origins, include_positions, redacted_leg, &self.config, &self.memory)?];
         for task in tasks {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let mut rows = Vec::new();
@@ -436,7 +445,7 @@ impl SegmentCompactor {
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
                     else {
                         let index = outputs.len();
-                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, keyed, include_origins, include_positions, redacted_leg, &self.config, &self.memory)?);
+                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, keyed, topology, include_origins, include_positions, redacted_leg, &self.config, &self.memory)?);
                         index
                     }
                 } else { 0 };
@@ -482,16 +491,16 @@ impl SegmentCompactor {
 
 impl MergeFile {
     fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<StructFields<LogicalType>>, keyed: bool,
-        include_origins: bool, include_positions: bool, redacted_leg: bool, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency, keyed, include_origins, include_positions, redacted_leg };
+        topology: bool, include_origins: bool, include_positions: bool, redacted_leg: bool, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency, keyed, topology, include_origins, include_positions, redacted_leg };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
-        Ok(Self { path, part: part.to_vec(), recency, carries_recency, keyed, include_origins, include_positions, redacted_leg, writer: Some(writer), leaves: Vec::new() })
+        Ok(Self { path, part: part.to_vec(), recency, carries_recency, keyed, topology, include_origins, include_positions, redacted_leg, writer: Some(writer), leaves: Vec::new() })
     }
     fn write(&mut self, events: &[PageEvent], path: Vec<u8>, put: &Option<StructFields<LogicalType>>, config: &MergeConfig,
         memory: &Arc<MemoryBudget>) -> Result<()> {
         if events.is_empty() { return Ok(()); }
-        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency, keyed: self.keyed, include_origins: self.include_origins, include_positions: self.include_positions, redacted_leg: self.redacted_leg };
+        let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && self.recency.is_some()).then_some(RunEndWidth::I32), recency: self.carries_recency, keyed: self.keyed, topology: self.topology, include_origins: self.include_origins, include_positions: self.include_positions, redacted_leg: self.redacted_leg };
         let writer = self.writer.as_mut().ok_or_else(|| crate::invalid("Merge file already ended"))?;
         limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
         let batch = schema.batch(events, memory)?;
@@ -558,6 +567,30 @@ mod tests {
     fn page(events: &[StoredEvent]) -> Vec<PageEvent> { EventBatch::new(build_event_batch(events, None, None).unwrap()).unwrap().page_events().unwrap() }
 
     #[test]
+    fn topology_pages_keep_original_positions_and_positionless_readmission() {
+        let memory = MemoryBudget::new(1 << 24);
+        let id = rtdb_types::EntityId::Uuid([1; 16]);
+        let record = StructFields::from([("_id".into(), id.as_value())]);
+        let put = Some(StructFields::from([("_id".into(), id.as_value().logical_type())]));
+        let schema = OutputSchema {
+            put, iid_encoding: None, recency: false, keyed: false, topology: true,
+            include_origins: false, include_positions: false, redacted_leg: false,
+        };
+        for position in [0, 7] {
+            let stored = StoredEvent {
+                position: None, origin: None, commit_position: position, entity_key: None,
+                iid: id.iid(), system_from: Timestamp(10), valid_time: Interval::ALL,
+                operation: StoredOperation::Put(record.clone()), recency: None,
+            };
+            let input = EventBatch::new(build_event_batch(&[stored], schema.put.clone(), None).unwrap()).unwrap();
+            let batch = schema.batch(&input.page_events().unwrap(), &memory).unwrap();
+            assert_eq!(batch.batch().schema(), schema.schema().unwrap());
+            let view = EventBatch::new(batch.batch().clone()).unwrap();
+            assert_eq!(view.header(0).unwrap().commit_position, position);
+        }
+    }
+
+    #[test]
     fn normalization_retains_governed_event_keys_and_positions_in_the_output_file() {
         let directory = tempfile::tempdir().unwrap();
         let spill = directory.path().join("merge.arrow");
@@ -571,7 +604,7 @@ mod tests {
             entity_key: Some(Arc::from(key)), iid: Iid([1; 16]), system_from: Timestamp(100),
             valid_time: Interval::ALL, operation: StoredOperation::Delete, recency: None,
         });
-        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, false, false, false, &config, &memory).unwrap();
+        let mut spill = MergeFile::new(spill, None, false, &[], &None, true, false, false, false, false, &config, &memory).unwrap();
         spill.write(&page(&events), vec![], &None, &config, &memory).unwrap();
         spill.finish(&config).unwrap();
         layout::normalize(&spill, &None, &config, &memory, &data, &metadata, &CancellationToken::new()).unwrap();
@@ -658,7 +691,7 @@ mod tests {
         let (normalized, _charges) = resolve_same_time(&page(&[redacted.clone(), earlier.clone()]), &memory).unwrap();
         assert_eq!(normalized.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [redacted.header(), earlier.header()]);
         let mut spill = MergeFile::new(
-            directory.path().join("merge.arrow"), None, false, &[], &None, true, true, false, true, &config, &memory,
+            directory.path().join("merge.arrow"), None, false, &[], &None, true, false, true, false, true, &config, &memory,
         ).unwrap();
         spill.write(&normalized[..1], vec![], &None, &config, &memory).unwrap();
         spill.write(&normalized[1..], vec![], &None, &config, &memory).unwrap();
@@ -686,8 +719,9 @@ mod tests {
             operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(transaction))])),
             recency: None,
         });
-        let page = page(&events);
-        let (surviving, _charges) = resolve_same_time(&page, &memory).unwrap();
+        let fields = StructFields::from([("value".into(), LogicalType::Scalar(rtdb_types::ScalarType::I64))]);
+        let input = EventBatch::new(build_event_batch(&events, Some(fields), None).unwrap()).unwrap();
+        let (surviving, _charges) = resolve_same_time(&input.page_events().unwrap(), &memory).unwrap();
         assert_eq!(surviving.iter().map(EncodedEvent::header).collect::<Vec<_>>(), events.map(|event| event.header()));
     }
 

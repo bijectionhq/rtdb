@@ -461,6 +461,11 @@ impl TableRef {
             })
     }
 
+    pub fn is_owned_world_topology(&self) -> bool {
+        self.supported_owned_name() && self.table.split_once('-').is_some_and(|(_, name)|
+            matches!(name, OWNED_WORLD_CATALOG | OWNED_WORLD_CLOCKS))
+    }
+
     pub fn supported_owned_name(&self) -> bool {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {

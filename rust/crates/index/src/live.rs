@@ -471,8 +471,10 @@ impl LiveTable {
         let include_origins = self.chunks.iter().any(|(_, batch)| batch.view().has_origin_column());
         let mut schema = empty.arrow().schema();
         let include_positions = self.chunks.iter().any(|(_, batch)| batch.view().has_position_column());
-        if include_origins || include_positions {
+        let topology = self.table.is_owned_world_topology();
+        if topology || include_origins || include_positions {
             let mut fields = schema.fields().to_vec();
+            if topology { fields.push(Arc::new(rtdb_format::data::commit_position_field())); }
             if include_origins { fields.push(Arc::new(rtdb_format::data::event_origin_field())); }
             if include_positions { fields.push(Arc::new(rtdb_format::data::event_position_field())); }
             schema = Arc::new(arrow_schema::Schema::new(fields));
@@ -540,6 +542,11 @@ impl BlockPages<'_> {
             batch.view().event_ref(offset as usize, &batch.put_field_types)
         }).collect::<Result<Vec<_>>>()?;
         let batch = owned_event_batch(&events, Some(self.table.column_types.clone()), true, &self.memory)?;
+        let batch = if self.table.table.is_owned_world_topology() {
+            rtdb_format::data::with_topology_commit_positions(batch, &self.memory)?
+        } else {
+            batch
+        };
         if self.include_origins && batch.batch().column_by_name(rtdb_format::data::EVENT_ORIGIN_FIELD).is_none() {
             return rtdb_format::data::append_origins(&batch, std::iter::repeat_n(None, events.len()), &self.memory);
         }
@@ -581,9 +588,16 @@ impl StagedWrite {
         if predecessor.is_some_and(|previous| previous.tx_id >= tx_key.tx_id || previous.system_time > tx_key.system_time) {
             return Err(invalid("Transaction key does not advance its predecessor"));
         }
-        for write in tables.values() {
-            if write.batch().is_some_and(|batch| !batch.has_system_time(tx_key.system_time)) {
-                return Err(invalid("Staged event has another transaction's system time"));
+        for (table, write) in &tables {
+            if let Some(batch) = write.batch() {
+                if !batch.has_system_time(tx_key.system_time) {
+                    return Err(invalid("Staged event has another transaction's system time"));
+                }
+                if batch.view().has_commit_positions() && !table.is_owned_event_data() && !table.is_owned_world_topology()
+                    && batch.headers.0.iter().any(|header| header.commit_position != 0)
+                {
+                    return Err(invalid("A commit position requires an owned fact or world topology"));
+                }
             }
         }
         Ok(Self { tx_key, predecessor, block_index, tables })
@@ -968,15 +982,17 @@ impl TransactionBuffer {
         self.stage_event(table, event, 0)
     }
 
-    /// Stage an archived world effect whose ordinal was carried by its own replay frame.
+    /// Stage an archived world overlay or topology effect with its original ordinal.
     pub fn append_archived_world_effect(
         &mut self,
         table: &TableRef,
         event: StoredEvent,
         position: NonZeroU32,
     ) -> Result<()> {
-        if !table.is_owned_event_data() || table.owned_world_scope().1.is_none() {
-            return Err(invalid("A positioned archive world effect requires an owned overlay"));
+        if !(table.is_owned_event_data() && table.owned_world_scope().1.is_some())
+            && !table.is_owned_world_topology()
+        {
+            return Err(invalid("A positioned archive world effect requires its owned relation"));
         }
         self.require_archived_position(position)?;
         self.stage_event(table, event, position.get())?;

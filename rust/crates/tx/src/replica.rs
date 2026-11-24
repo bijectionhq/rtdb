@@ -254,7 +254,10 @@ fn verify_archive_replay(
     };
     let frontier = binding(NATIVE_FRONTIER)?.ok_or_else(mismatch)?;
     let replay = HostedReplay::decode_resolved(&frontier, key.system_time)?;
-    if binding(&replay.transaction_locator())?.as_deref() != Some(frontier.as_slice()) {
+    if binding(&replay.transaction_locator())?.as_deref() != Some(frontier.as_slice())
+        || binding(&HostedReplay::destination_locator(key.tx_id))?.as_deref()
+            .is_some_and(|source| source != replay.original_receipt_key().as_slice())
+    {
         return Err(mismatch());
     }
     let mut positions: BTreeSet<_> = replay.commit_positions().iter().copied().collect();
@@ -276,7 +279,8 @@ fn verify_archive_replay(
         }
     }
     for (table, write) in tables {
-        if !table.is_owned_event_data() {
+        let topology = table.is_owned_world_topology();
+        if !table.is_owned_event_data() && !topology {
             continue;
         }
         if let Some(batch) = write.batch() {
@@ -289,7 +293,14 @@ fn verify_archive_replay(
                     if !positions.remove(&event.commit_position) {
                         return Err(mismatch());
                     }
-                    let line = table.owned_world_scope().1.map_or([0; 16], |world| world.0);
+                    let line = if topology {
+                        if event.op != rtdb_types::EventOp::Put || event.valid_time != Interval::ALL {
+                            return Err(mismatch());
+                        }
+                        event.iid.0
+                    } else {
+                        table.owned_world_scope().1.map_or([0; 16], |world| world.0)
+                    };
                     replay.require_assertion_line(event.commit_position, line)?;
                 }
             }
@@ -521,21 +532,23 @@ mod tests {
             "captured": {"tx_id": 3, "system_time": 4},
             "handoff": null, "through": 4000, "previous": null,
             "source": {"tx_id": 3, "system_time": 4}, "logical_at": 4000,
-            "fingerprint": vec![4; 32], "commit_positions": [1, 2],
-            "assertion_lines": {"lines": [vec![1; 16], vec![2; 16]], "by_position": [0, 1]},
+            "fingerprint": vec![4; 32], "commit_positions": [1, 2, 4],
+            "assertion_lines": {"lines": [vec![1; 16], vec![2; 16]], "by_position": [0, 1, 0]},
         }).to_string().into_bytes();
         let hold = TableRef::new("public", crate::hosted_control::RESTORE);
         let original = EntityId::String("place".into());
-        for (copied, copied_line, omitted, omitted_line, valid) in [
-            (1u32, 1, 2u32, 2, true),
-            (3, 1, 2, 2, false),
-            (2, 2, 2, 2, false),
-            (1, 2, 2, 2, false),
-            (1, 1, 2, 1, false),
+        for (copied, copied_line, omitted, omitted_line, clock_line, source_id, valid) in [
+            (1u32, 1, 2u32, 2, 1, 3i64, true),
+            (3, 1, 2, 2, 1, 3, false),
+            (2, 2, 2, 2, 1, 3, false),
+            (1, 2, 2, 2, 1, 3, false),
+            (1, 1, 2, 1, 1, 3, false),
+            (1, 1, 2, 2, 2, 3, false),
+            (1, 1, 2, 2, 1, 2, false),
         ] {
             let overlay = OwnedRelation::new("locations")?.in_world(Iid([copied_line; 16]))?.table("owner");
             let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
-            transaction.retain_archived_owned_positions(vec![copied])?;
+            transaction.retain_archived_owned_positions(vec![copied, 4])?;
             transaction.append_archived_world_effect(&overlay, StoredEvent { position: None,
                 origin: None,
                 commit_position: 0,
@@ -546,11 +559,21 @@ mod tests {
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), original.as_value())])),
                 recency: None,
             }, std::num::NonZeroU32::new(copied).unwrap())?;
+            let world = Iid([clock_line; 16]);
+            transaction.append_archived_world_effect(&OwnedRelation::world_clock_table("owner"), StoredEvent {
+                position: None, origin: None, commit_position: 0, entity_key: None,
+                iid: world, system_from: key.system_time, valid_time: Interval::ALL,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("_id".into(), Value::Uuid(world.0)), ("clock".into(), Value::I64(30)),
+                ])),
+                recency: None,
+            }, std::num::NonZeroU32::new(4).unwrap())?;
             let mut omission = omitted.to_be_bytes().to_vec();
             omission.extend_from_slice(&[omitted_line; 16]);
             for (id, body) in [
                 (crate::hosted_control::NATIVE_FRONTIER, receipt.clone()),
                 ("native-transaction/3", receipt.clone()),
+                ("native-destination/0", source_id.to_be_bytes().to_vec()),
                 ("native-world-omissions/3", omission),
             ] {
                 transaction.put(hold.clone(), StructFields::from([

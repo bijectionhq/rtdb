@@ -347,8 +347,8 @@ impl EventBatch {
         if let Some(index) = origins && schema.field(index).data_type() != &DataType::FixedSizeBinary(EventOrigin::WIDTH) {
             return Err(invalid("Event origins have an invalid binary width"));
         }
-        if entity_keys.is_some() != commit_positions.is_some() {
-            return Err(invalid("Governed event pages require entity keys and commit positions together"));
+        if entity_keys.is_some() && commit_positions.is_none() {
+            return Err(invalid("Governed event pages require commit positions"));
         }
         if let Some(index) = entity_keys
             && (schema.field(index).is_nullable()
@@ -431,6 +431,7 @@ impl EventBatch {
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     pub fn has_entity_keys(&self) -> bool { self.entity_keys.is_some() }
+    pub fn has_commit_positions(&self) -> bool { self.commit_positions.is_some() }
     pub fn has_origin_column(&self) -> bool { self.origins.is_some() }
     pub fn has_position_column(&self) -> bool { self.event_positions.is_some() }
 
@@ -805,11 +806,17 @@ fn event_batch<E: EncodedEvent>(events: &[E], put_fields: Option<StructFields<Lo
     }).transpose()?;
     let plain = event_columns(&headers, op, iid_encoding, recencies)?;
     if !events.iter().any(|event| event.entity_key().is_some()) {
-        if headers.iter().any(|header| header.commit_position != 0) {
-            return Err(invalid("A commit position requires a governed event"));
-        }
+        let batch = if headers.iter().any(|header| header.commit_position != 0) {
+            let mut fields = plain.schema().fields().to_vec();
+            fields.push(Arc::new(commit_position_field()));
+            let mut columns = plain.columns().to_vec();
+            columns.push(Arc::new(UInt32Array::from_iter_values(headers.iter().map(|header| header.commit_position))));
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)?
+        } else {
+            plain
+        };
         return with_event_positions(
-            with_event_origins(plain, events)?,
+            with_event_origins(batch, events)?,
             headers.iter().map(|header| header.position),
         );
     }
@@ -919,6 +926,20 @@ pub fn append_event_positions(
 
 pub fn entity_key_field() -> Field {
     Field::new(ENTITY_KEY_FIELD, DataType::Binary, false)
+}
+
+/// Keep one topology file schema even for pages containing only readmission rows.
+pub fn with_topology_commit_positions(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
+    let schema = batch.batch().schema_ref();
+    if schema.index_of(COMMIT_POSITION_FIELD).is_ok() {
+        return Ok(batch);
+    }
+    let rows = batch.batch().num_rows();
+    let reservation = memory.reserve(rows.checked_mul(4).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(event_size)?)?;
+    let column = UInt32Array::from(vec![0; rows]);
+    let index = schema.index_of(EVENT_ORIGIN_FIELD).or_else(|_| schema.index_of(EVENT_POSITION_FIELD))
+        .unwrap_or(batch.batch().num_columns());
+    batch.with_inserted_column(index, commit_position_field(), Arc::new(column), reservation)
 }
 
 pub fn commit_position_field() -> Field {

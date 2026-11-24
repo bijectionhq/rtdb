@@ -300,6 +300,14 @@ impl OpenTransaction<'_> {
         if let Some(replay) = &replay {
             self.restore_owned_lifetime_floors(replay, &context).await?;
             self.restore_owned_worlds(replay, &context).await?;
+            self.buffer.put(
+                TableRef::new("public", crate::hosted_control::RESTORE),
+                StructFields::from([
+                    ("_id".into(), Value::Utf8(crate::hosted_control::HostedReplay::destination_locator(self.tx_key().tx_id))),
+                    ("binding".into(), Value::Binary(replay.original_receipt_key().to_vec())),
+                ]),
+                Interval::new(Timestamp(0), Timestamp::MAX)?,
+            )?;
             for (relation, rule) in replay.capacity_declarations() {
                 let relation = OwnedRelation::new(relation)?;
                 self.declare_owned_capacity(&relation, &rule.column, 0, rule.cap, &rule.when).await?;

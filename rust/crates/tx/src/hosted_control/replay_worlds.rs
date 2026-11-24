@@ -13,21 +13,29 @@ use super::WorldReadmission;
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP6";
+const MAGIC: &[u8] = b"BJWP7";
+const WITHOUT_TOPOLOGY_POSITIONS: &[u8] = b"BJWP6";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
 pub(crate) struct ReplayWorlds {
     pub(crate) registrations: Vec<ReplayRegistration>,
-    pub(crate) clocks: Vec<(Iid, Timestamp)>,
+    pub(crate) clocks: Vec<ReplayClockPublication>,
     pub(crate) shadows: Vec<ReplayShadow>,
     pub(crate) omitted_shadows: BTreeMap<NonZeroU32, Iid>,
 }
 
 pub(crate) struct ReplayRegistration {
+    pub(crate) position: Option<NonZeroU32>,
     pub(crate) world: OwnedWorld,
     pub(crate) bind_parent: bool,
     pub(crate) readmission: Option<WorldReadmission>,
+}
+
+pub(crate) struct ReplayClockPublication {
+    pub(crate) position: Option<NonZeroU32>,
+    pub(crate) world: Iid,
+    pub(crate) reading: Timestamp,
 }
 
 pub(crate) struct ReplayShadow {
@@ -74,7 +82,7 @@ struct ArchivedParent {
 }
 
 impl ArchivedWorld {
-    fn into_registration(self) -> Result<ReplayRegistration> {
+    fn into_registration(self, position: Option<NonZeroU32>) -> Result<ReplayRegistration> {
         let mode = match self.mode {
             ArchivedMode::Retained => WorldClockMode::Retained,
             ArchivedMode::Held(start) => WorldClockMode::Held {
@@ -105,7 +113,11 @@ impl ArchivedWorld {
         if world.basis.tx_id.0 < 0 || world.basis.system_time.0 <= 0 {
             return Err(invalid());
         }
+        if position.is_some() && self.readmission.is_some() {
+            return Err(invalid());
+        }
         Ok(ReplayRegistration {
+            position,
             world,
             bind_parent: self.bind_parent,
             readmission: self.readmission,
@@ -115,14 +127,21 @@ impl ArchivedWorld {
 
 impl ReplayWorlds {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        let mut input = Input(bytes.strip_prefix(MAGIC).ok_or_else(invalid)?);
+        let (body, topology_positions) = if let Some(body) = bytes.strip_prefix(MAGIC) {
+            (body, true)
+        } else {
+            (bytes.strip_prefix(WITHOUT_TOPOLOGY_POSITIONS).ok_or_else(invalid)?, false)
+        };
+        let mut input = Input(body);
         let registrations = input.count()?;
         let mut worlds = Self::default();
         let mut ids = BTreeSet::new();
+        let mut positions = BTreeSet::new();
         for _ in 0..registrations {
+            let position = if topology_positions { input.position(&mut positions)? } else { None };
             let world: ArchivedWorld =
                 serde_json::from_slice(input.frame()?).map_err(|_| invalid())?;
-            let registration = world.into_registration()?;
+            let registration = world.into_registration(position)?;
             if !ids.insert(registration.world.id) {
                 return Err(invalid());
             }
@@ -134,23 +153,20 @@ impl ReplayWorlds {
             return Err(invalid());
         }
         for _ in 0..clocks {
+            let position = if topology_positions { input.position(&mut positions)? } else { None };
             let id = Iid(input.fixed()?);
             if id.0 == [0; 16] || !ids.insert(id) {
                 return Err(invalid());
             }
-            worlds.clocks.push((id, Timestamp(input.number()?)));
+            worlds.clocks.push(ReplayClockPublication { position, world: id, reading: Timestamp(input.number()?) });
         }
 
         let shadows = input.count()?;
         if shadows + clocks + registrations > MAX_EFFECTS {
             return Err(invalid());
         }
-        let mut positions = BTreeSet::new();
         for _ in 0..shadows {
-            let position = NonZeroU32::new(u32::from_be_bytes(input.fixed()?));
-            if position.is_some_and(|position| !positions.insert(position)) {
-                return Err(invalid());
-            }
+            let position = input.position(&mut positions)?;
             let world = Iid(input.fixed()?);
             let relation = OwnedRelation::new(input.text()?)?;
             let id = input.text()?;
@@ -199,9 +215,9 @@ impl ReplayWorlds {
             return Err(invalid());
         }
         for _ in 0..omitted {
-            let position = NonZeroU32::new(u32::from_be_bytes(input.fixed()?)).ok_or_else(invalid)?;
+            let position = input.position(&mut positions)?.ok_or_else(invalid)?;
             let world = Iid(input.fixed()?);
-            if world.0 == [0; 16] || !positions.insert(position) {
+            if world.0 == [0; 16] {
                 return Err(invalid());
             }
             worlds.omitted_shadows.insert(position, world);
@@ -220,6 +236,14 @@ impl<'a> Input<'a> {
         let (part, rest) = self.0.split_first_chunk::<N>().ok_or_else(invalid)?;
         self.0 = rest;
         Ok(*part)
+    }
+
+    fn position(&mut self, positions: &mut BTreeSet<NonZeroU32>) -> Result<Option<NonZeroU32>> {
+        let position = NonZeroU32::new(u32::from_be_bytes(self.fixed()?));
+        if position.is_some_and(|position| !positions.insert(position)) {
+            return Err(invalid());
+        }
+        Ok(position)
     }
 
     fn number(&mut self) -> Result<i64> {
@@ -256,6 +280,29 @@ pub(crate) fn invalid() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_world_clock_and_omission_cannot_share_a_position() {
+        let mut body = MAGIC.to_vec();
+        body.extend_from_slice(&0u32.to_be_bytes()); // Registration count.
+        body.extend_from_slice(&1u32.to_be_bytes()); // Clock count.
+        body.extend_from_slice(&3u32.to_be_bytes());
+        body.extend_from_slice(&[1; 16]);
+        body.extend_from_slice(&12i64.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes()); // Overlay count.
+        body.extend_from_slice(&1u32.to_be_bytes()); // Omission count.
+        body.extend_from_slice(&4u32.to_be_bytes());
+        body.extend_from_slice(&[2; 16]);
+
+        let replay = ReplayWorlds::decode(&body).unwrap();
+        let [clock] = replay.clocks.as_slice() else { panic!("Expected one clock"); };
+        assert_eq!(clock.position, NonZeroU32::new(3));
+        assert_eq!(clock.world, Iid([1; 16]));
+        assert_eq!(clock.reading, Timestamp(12));
+        let omission = body.len() - 20;
+        body[omission..omission + 4].copy_from_slice(&3u32.to_be_bytes());
+        assert!(ReplayWorlds::decode(&body).is_err());
+    }
 
     #[test]
     fn replay_world_inventory_refuses_duplicate_or_unqualified_omissions() {
