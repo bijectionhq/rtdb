@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use arrow_buffer::Buffer;
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{
@@ -357,6 +358,17 @@ impl AsRef<[u8]> for TrieInput {
     }
 }
 
+fn open_survivor_input(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+    let layout = inspect_file_reserved(&mut Cursor::new(bytes.as_ref()), |amount| memory.reserve(amount))?;
+    let opening = memory.reserve(layout.opening_allocation_bound()?)?;
+    let file = if layout.uncompressed && layout.dictionary_encoded_bytes == 0 {
+        ArrowFile::from_inspected_buffer(Buffer::from(bytes), None, layout)?
+    } else {
+        ArrowFile::from_inspected_reader(Cursor::new(bytes), None, layout)?
+    };
+    Ok((file, opening))
+}
+
 async fn read_trie(
     store: &dyn ObjectStore,
     key: &ObjectKey,
@@ -372,10 +384,7 @@ async fn read_trie(
     let bytes = store
         .get_reserved_object(key, ReadReservation::funded(length, retained, scratch))
         .await?;
-    let mut file = Cursor::new(TrieInput(bytes));
-    let layout = inspect_file_reserved(&mut file, |amount| events.memory.reserve(amount))?;
-    let _opening = events.memory.reserve(layout.opening_allocation_bound()?)?;
-    let mut file = ArrowFile::from_inspected_reader(file, None, layout)?;
+    let (mut file, _opening) = open_survivor_input(Bytes::from_owner(TrieInput(bytes)), events.memory)?;
     for page in 0..file.page_count() {
         check_cancelled(cancellation)?;
         let _decoded = events.memory.reserve(file.page_allocation_bound(page)?)?;
@@ -532,6 +541,39 @@ fn invalid(message: &str) -> Anomaly {
 mod tests {
     use super::*;
     use rtdb_types::{BlockIndex, Interval, ScalarType, TableRef, Timestamp, TxId};
+
+    #[test]
+    fn compatible_survivor_input_reuses_the_funded_file_body() -> Result<()> {
+        use arrow_array::{ArrayRef, BinaryArray, RecordBatch};
+
+        struct Aligned {
+            buffer: Buffer,
+            _reservation: Arc<MemoryReservation>,
+        }
+        impl AsRef<[u8]> for Aligned {
+            fn as_ref(&self) -> &[u8] { self.buffer.as_slice() }
+        }
+
+        let cells = BinaryArray::from_iter_values([b"survivor".as_slice()]);
+        let batch = RecordBatch::try_from_iter([("body", Arc::new(cells) as ArrayRef)]).unwrap();
+        let file = write_file_pages(batch.schema_ref(), [&batch])?;
+        let memory = MemoryBudget::new(1 << 20);
+        let size = file.len();
+        let bytes = Bytes::from_owner(Aligned {
+            buffer: Buffer::from_slice_ref(&file), _reservation: memory.reserve(size)?,
+        });
+        let span = bytes.as_ref().as_ptr_range();
+        let (mut file, opening) = open_survivor_input(bytes, &memory)?;
+        let page = file.read_page(0)?;
+        let output = page.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert!(span.contains(&output.value(0).as_ptr()));
+        assert_eq!(output.value(0), b"survivor");
+        drop((file, opening));
+        assert_eq!(memory.used_bytes(), size);
+        drop(page);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[test]
     fn survivor_schema_excludes_erased_inference_and_retains_a_later_put() -> Result<()> {

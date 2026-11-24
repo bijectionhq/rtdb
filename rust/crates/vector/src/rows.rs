@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use arrow_array::{BooleanArray, cast::AsArray};
 use arrow_schema::{DataType, UnionMode};
-use rtdb_columnar::{ArrowCell, read_execution_value};
+use rtdb_columnar::{ArrowCell, MemoryReservation, read_execution_value};
 use rtdb_format::data::{EncodedEvent, EventRef, PutColumn};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, ListValue, ListView, NumericSpan, Result, Value};
 use sha2::{Digest, Sha256};
@@ -136,9 +136,13 @@ impl IndexedRows {
         self.rows.sort_by_key(|row| (row.partition, row.iid, row.system_from, row.valid_from, row.valid_to));
     }
 
-    pub(crate) fn push_event(&mut self, event: &EventRef<'_>, definition: &VectorDefinition) -> Result<()> {
+    pub(crate) fn push_event(&mut self, event: &EventRef<'_>, definition: &VectorDefinition, staging: &mut MemoryReservation) -> Result<()> {
         let unit_offset = self.units.len();
-        if let Some(partition) = append_indexable_event_unit(event, definition, self.dimensions, &mut self.units)? {
+        let dimensions = self.dimensions;
+        let rows = &mut self.rows;
+        if let Some(partition) = append_indexable_event_unit_with(event, definition, dimensions, &mut self.units, |units| {
+            admit_staging_row(rows, units, dimensions, staging)
+        })? {
             self.push_row(event.header(), partition, unit_offset);
         }
         Ok(())
@@ -160,6 +164,23 @@ impl IndexedRows {
     }
 }
 
+fn admit_staging_row(rows: &mut Vec<IndexedRow>, units: &mut Vec<f32>, dimensions: usize, staging: &mut MemoryReservation) -> Result<()> {
+    let grow = |capacity: usize, needed: usize| {
+        if capacity >= needed { capacity } else { capacity.saturating_mul(2).max(needed) }
+    };
+    let row_capacity = grow(rows.capacity(), rows.len().saturating_add(1));
+    let unit_capacity = grow(units.capacity(), units.len().saturating_add(dimensions));
+    if row_capacity == rows.capacity() && unit_capacity == units.capacity() { return Ok(()); }
+    staging.grow_to(row_capacity.saturating_mul(size_of::<IndexedRow>())
+        .saturating_add(unit_capacity.saturating_mul(size_of::<f32>())))?;
+    let allocation_error = |error: std::collections::TryReserveError| {
+        Anomaly::fault("rtdb.vector/staging", error.to_string())
+    };
+    rows.try_reserve_exact(row_capacity - rows.len()).map_err(allocation_error)?;
+    units.try_reserve_exact(unit_capacity - units.len()).map_err(allocation_error)?;
+    Ok(())
+}
+
 fn event_value<'a>(event: &'a EventRef<'_>, column: &str) -> Result<Option<Cow<'a, Value>>> {
     match event.put_column(column) {
         Some(PutColumn::Stored(field, array, row)) => Ok(Some(Cow::Owned(read_execution_value(field, array, row)?))),
@@ -169,10 +190,15 @@ fn event_value<'a>(event: &'a EventRef<'_>, column: &str) -> Result<Option<Cow<'
 
 pub(crate) fn append_indexable_event_unit(event: &EventRef<'_>, definition: &VectorDefinition, dimensions: usize,
     output: &mut Vec<f32>) -> Result<Option<Partition>> {
+    append_indexable_event_unit_with(event, definition, dimensions, output, |_| Ok(()))
+}
+
+fn append_indexable_event_unit_with(event: &EventRef<'_>, definition: &VectorDefinition, dimensions: usize,
+    output: &mut Vec<f32>, admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<Option<Partition>> {
     if event.header().op != EventOp::Put { return Ok(None); }
     let Some(PutColumn::Stored(field, array, row)) = event.put_column(&definition.column) else { return Ok(None) };
     let unit_offset = output.len();
-    if !append_cell_unit(ArrowCell { field, array, row }, dimensions, output)? { return Ok(None); }
+    if !append_cell_unit(ArrowCell { field, array, row }, dimensions, output, admit)? { return Ok(None); }
     let partition = match arrow_partition(event, &definition.partition) {
         Some(partition) => partition,
         None => definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
@@ -181,17 +207,18 @@ pub(crate) fn append_indexable_event_unit(event: &EventRef<'_>, definition: &Vec
     Ok(Some(partition))
 }
 
-fn append_cell_unit(cell: ArrowCell<'_>, dimensions: usize, output: &mut Vec<f32>) -> Result<bool> {
+fn append_cell_unit(cell: ArrowCell<'_>, dimensions: usize, output: &mut Vec<f32>, admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
     if cell.is_null()? { return Ok(false); }
     if let Some((values, range)) = cell.float_list_span() {
-        return Ok(range.len() == dimensions && append_unit(output, range.map(|index| values.float_component(index))));
+        if range.len() != dimensions { return Ok(false); }
+        return append_unit_with(output, range.map(|index| values.float_component(index)), admit);
     }
     if let Some(span) = numeric_training_span(cell) {
-        return Ok(span.len() == dimensions && append_unit(output,
-            (0..span.len()).map(|index| span.get(index)?.signed().as_f64())));
+        if span.len() != dimensions { return Ok(false); }
+        return append_unit_with(output, (0..span.len()).map(|index| span.get(index)?.signed().as_f64()), admit);
     }
     let value = read_execution_value(cell.field, cell.array, cell.row)?;
-    Ok(append_value_unit(output, &value, dimensions))
+    append_value_unit(output, &value, dimensions, admit)
 }
 
 fn numeric_training_span(cell: ArrowCell<'_>) -> Option<NumericSpan<'_>> {
@@ -223,12 +250,13 @@ fn numeric_training_span(cell: ArrowCell<'_>) -> Option<NumericSpan<'_>> {
 /// The unit vector of a SQL list value, or none where its cosine distance is undefined.
 pub(crate) fn value_unit(value: &Value, dimensions: usize) -> Option<Vec<f32>> {
     let mut output = Vec::new();
-    append_value_unit(&mut output, value, dimensions).then_some(output)
+    append_value_unit(&mut output, value, dimensions, |_| Ok(()))
+        .expect("unreserved normalization has no admission failure").then_some(output)
 }
 
-fn append_value_unit(output: &mut Vec<f32>, value: &Value, dimensions: usize) -> bool {
-    let Some(view) = value.list_view() else { return false };
-    view.len() == dimensions && append_unit(output, (0..view.len()).map(|index| list_component(view, index)))
+fn append_value_unit(output: &mut Vec<f32>, value: &Value, dimensions: usize, admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
+    let Some(view) = value.list_view().filter(|view| view.len() == dimensions) else { return Ok(false) };
+    append_unit_with(output, (0..view.len()).map(|index| list_component(view, index)), admit)
 }
 
 fn list_component(view: ListView<'_>, index: usize) -> Option<f64> {
@@ -249,13 +277,19 @@ pub(crate) fn unit_of(components: &[f32]) -> Option<Vec<f32>> {
 
 /// Normalizes in f64 in component order, so the stored unit vector is a deterministic function of the input.
 fn append_unit(output: &mut Vec<f32>, components: impl Iterator<Item = Option<f64>> + Clone) -> bool {
+    append_unit_with(output, components, |_| Ok(())).expect("unreserved normalization has no admission failure")
+}
+
+fn append_unit_with(output: &mut Vec<f32>, components: impl Iterator<Item = Option<f64>> + Clone,
+    admit: impl FnOnce(&mut Vec<f32>) -> Result<()>) -> Result<bool> {
     let norm = components.clone().try_fold(0.0, |sum, component| {
         let component = component.filter(|value| value.is_finite())?;
         Some(sum + component * component)
     }).map(f64::sqrt);
-    let Some(norm) = norm.filter(|norm| norm.is_finite() && *norm > 0.0) else { return false };
+    let Some(norm) = norm.filter(|norm| norm.is_finite() && *norm > 0.0) else { return Ok(false) };
+    admit(output)?;
     output.extend(components.map(|component| (component.expect("component checked during normalization") / norm) as f32));
-    true
+    Ok(true)
 }
 
 /// Cosine distance between unit vectors, accumulated in f64 in component order.
@@ -266,6 +300,40 @@ pub(crate) fn unit_distance(left: &[f32], right: &[f32]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_admits_components_and_row_capacity_before_growth() -> Result<()> {
+        use rtdb_types::{Interval, MemoryBudget, Timestamp};
+
+        for dimensions in [2, 1024] {
+            let page_bytes = 4096;
+            let vector_bytes = size_of::<IndexedRow>() + dimensions * size_of::<f32>();
+            let budget = MemoryBudget::new(page_bytes + vector_bytes);
+            let _page = budget.reserve(page_bytes)?;
+            let mut staging = budget.reserve(0)?;
+            let mut arena = IndexedRows::new(dimensions);
+            let unit = std::iter::repeat_n(Some(1.0), dimensions);
+            let admit = |rows: &mut Vec<IndexedRow>, units: &mut Vec<f32>, staging: &mut std::sync::Arc<MemoryReservation>| {
+                append_unit_with(units, unit.clone(), |units| {
+                    admit_staging_row(rows, units, dimensions, std::sync::Arc::get_mut(staging).unwrap())
+                })
+            };
+            assert!(admit(&mut arena.rows, &mut arena.units, &mut staging)?);
+            let header = EventHeader {
+                position: None, iid: Iid([1; 16]), system_from: Timestamp(0), commit_position: 0,
+                valid_time: Interval::ALL, op: EventOp::Put,
+            };
+            arena.push_row(header, Partition::whole(), 0);
+            assert_eq!(staging.bytes(), vector_bytes);
+            let before = (arena.rows.capacity(), arena.units.capacity());
+            let error = admit(&mut arena.rows, &mut arena.units, &mut staging).unwrap_err();
+            assert!(crate::shortlist::declined(&error));
+            assert_eq!((arena.rows.capacity(), arena.units.capacity()), before);
+            assert_eq!(arena.rows.len(), 1);
+            assert_eq!(arena.units.len(), dimensions);
+        }
+        Ok(())
+    }
 
     #[test]
     fn arrow_partition_uses_the_execution_value_digest() -> Result<()> {
@@ -303,7 +371,7 @@ mod tests {
             assert!(numeric_training_span(cell).is_some());
             let expected = value_unit(&read_execution_value(&field, &list, row)?, 2);
             let mut output = vec![42.0];
-            assert_eq!(append_cell_unit(cell, 2, &mut output)?, expected.is_some());
+            assert_eq!(append_cell_unit(cell, 2, &mut output, |_| Ok(()))?, expected.is_some());
             assert_eq!(&output[1..], expected.as_deref().unwrap_or_default());
         }
         Ok(())
