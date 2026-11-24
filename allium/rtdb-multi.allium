@@ -895,6 +895,8 @@ contract EpochScopedStorage {
     @invariant KeyGenerationErasure
         -- A file has an independent data key wrapped under the database key generation.
         -- Journal payloads are encrypted under a database key generation before append.
+        -- The incarnation's claims and page continuations use a separate token key wrapped by the same generation custody.
+        -- Page resumption preserves its generation and its retirement deadline on every route.
         -- Erasure publishes a clean checkpoint recoverable under the next generation and then commits rotation at its cut.
         -- The writer arms the retiring generation's key-grant deadline and trims to the clean checkpoint.
         -- Key custody refuses old-generation delivery at the deadline and destroys the retiring generation once the deadline has elapsed.

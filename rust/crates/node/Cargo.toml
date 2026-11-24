@@ -71,7 +71,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 journal-contract.workspace = true
-rtdb-crypt = { path = "../crypt" }
 tantivy.workspace = true
 
 [[example]]
