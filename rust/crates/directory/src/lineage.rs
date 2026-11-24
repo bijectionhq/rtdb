@@ -62,6 +62,18 @@ impl LineageRetirement {
     }
 }
 
+fn replay_pack_regions_are_covered(owner: &DeploymentRecord, fence: Uuid, capture: Uuid, checkpoint: Checkpoint) -> bool {
+    let mut sweep = None;
+    for (&id, region) in &owner.storage_regions {
+        if id == fence || region.serves_from_replay_archive(capture, checkpoint) { continue; }
+        if !region.admits_archive_read(capture) || sweep.replace(id).is_some() { return false; }
+    }
+    let Some(sweep) = sweep else { return false; };
+    owner.catalog_readers.values().all(|reader| {
+        reader.owner != sweep && reader.owner != fence && owner.storage_regions.contains_key(&reader.owner)
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum RetirementWork {
@@ -293,9 +305,7 @@ impl LineageState {
                     || owner.serving_replay_capture != Some(*capture) || owner.checkpoint != Some(*checkpoint)
                     || owner.checkpoint_capture_retirements.contains_key(capture)
                     || owner.checkpoint_captures.get(capture).is_none_or(|archive| !archive.media_bound || archive.checkpoint != *checkpoint)
-                    || !owner.catalog_readers.is_empty()
-                    || owner.storage_regions.len() != 2
-                    || !owner.storage_regions.values().any(|region| region.admits_archive_read(*capture)))
+                    || !replay_pack_regions_are_covered(owner, retirement.token, *capture, *checkpoint))
             {
                 return Err(lineage_busy());
             }
@@ -506,6 +516,27 @@ mod tests {
         });
         let mut changed = owner.clone();
         changed.serving_replay_capture = Some(Uuid::new_v4());
+        assert!(state.authorize_exact_owned(&changed, &retirement).is_err());
+
+        let serving = Uuid::new_v4();
+        owner.storage_regions.insert(serving, StorageRegion::Local {
+            archive: None, checkpoint_suffix: None, repair_archive: Some(capture),
+            tracks_ordered_index_pages: true, checkpoint_metadata_from: Some(checkpoint.block), checkpoint_replay_from: None,
+        });
+        let held = crate::CatalogReader {
+            owner: serving, storage_root: "v06".into(), replica_epoch: owner.log_epoch,
+            cut: None, catalog_file_paths: None,
+        };
+        owner.catalog_readers.insert(Uuid::new_v4(), held);
+        let mut changed = owner.clone();
+        changed.storage_regions.remove(&serving);
+        assert!(state.authorize_exact_owned(&changed, &retirement).is_err());
+        let mut changed = owner.clone();
+        let raw_reader = Uuid::new_v4();
+        changed.storage_regions.insert(raw_reader, StorageRegion::Local {
+            archive: None, checkpoint_suffix: None, repair_archive: None,
+            tracks_ordered_index_pages: true, checkpoint_metadata_from: Some(checkpoint.block), checkpoint_replay_from: None,
+        });
         assert!(state.authorize_exact_owned(&changed, &retirement).is_err());
         let state = state.authorize_exact_owned(&owner, &retirement).unwrap();
         let state: LineageState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();

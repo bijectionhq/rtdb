@@ -8,7 +8,7 @@ use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget};
 use uuid::Uuid;
 
-use super::{ObservedPack, PackStorage, covered_pack, eligible};
+use super::{ObservedPack, PackStorage, covered_pack, eligible_checkpoint};
 use crate::archive;
 use rtdb_storage::{IoRegion, sealing::PublicationSealing};
 use crate::deployment::CellStorage;
@@ -42,6 +42,14 @@ impl<'a> ReplayRetirement<'a> {
             _ => None,
         }
     }
+}
+
+fn eligible(record: &DeploymentRecord) -> bool {
+    eligible_checkpoint(record)
+        && record.checkpoint.zip(record.serving_replay_capture).is_some_and(|(checkpoint, capture)| {
+            record.storage_regions.values().all(|region| region.serves_from_replay_archive(capture, checkpoint))
+                && record.catalog_readers.values().all(|reader| record.storage_regions.contains_key(&reader.owner))
+        })
 }
 
 pub(in crate::store) async fn reap_hosted(
@@ -192,6 +200,7 @@ async fn authorize(
             Some(terminal)
         }
     };
+    let allow_compacted_receipt = record.storage_regions.is_empty();
     let terminal = terminal.as_ref();
     let target = &target;
     let store = &store;
@@ -204,7 +213,7 @@ async fn authorize(
             _ => false,
         };
         if !same { return Ok(()); }
-        let Some(boundary) = covered_pack(&observed, block, record.log_epoch, &cipher, &archive).await?
+        let Some(boundary) = covered_pack(&observed, block, record.log_epoch, &cipher, &archive, allow_compacted_receipt).await?
             else { return Ok(()); };
         if !crate::checkpoint_retention::replay_archive_covers_pack(block, checkpoint.block, boundary,
             anchor.interval[0], anchor.interval[1], checkpoint.boundary)

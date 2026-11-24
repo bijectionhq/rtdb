@@ -568,6 +568,21 @@ impl StorageRegion {
         )
     }
 
+    /// A serving attachment substitutes archive members before consulting its pack
+    /// locations. An explicit archive copy or an attachment to another root
+    /// cannot attest to that substitution.
+    pub fn serves_from_replay_archive(&self, capture: uuid::Uuid, checkpoint: Checkpoint) -> bool {
+        match self {
+            Self::Local { archive: None, checkpoint_suffix: None, repair_archive: Some(selected),
+                tracks_ordered_index_pages: true, checkpoint_metadata_from, .. }
+            | Self::Remote { archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: Some(selected),
+                tracks_ordered_index_pages: true, closed: false, checkpoint_metadata_from, .. } => {
+                *selected == capture && checkpoint_metadata_from.is_none_or(|block| block >= checkpoint.block)
+            }
+            _ => false,
+        }
+    }
+
     pub fn checkpoint_metadata_from(&self) -> Option<i64> {
         match self {
             Self::Local { checkpoint_metadata_from, .. } |

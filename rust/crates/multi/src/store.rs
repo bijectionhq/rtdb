@@ -235,13 +235,14 @@ impl RemoteStorageFactory for CellStoreFactory {
         {
             return Err(Anomaly::incorrect("rtdb.multi/terminal-storage", "A terminal cell writer requires a scoped S3 role"));
         }
-        let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io).await?;
+        let uses_replay_archive = storage_root.as_str() == crate::archive::checkpoint_storage_root()?;
+        let (record, region, owner, release, checkpoint_metadata) = self.admit_region(&config, io, uses_replay_archive).await?;
         let audience_writer = self.audience_writer(&config, &record).is_some();
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
         let (opened, audience_reads, publications) = IoRegion::reading(rtdb_storage::HeldView::recovery(Arc::clone(&checkpoint_metadata)), async {
-            let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
+            let recovery = if uses_replay_archive {
                 crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone(), audience_writer).await?
             } else {
                 None
@@ -456,6 +457,7 @@ impl CellStoreFactory {
         &self,
         config: &CellStoreConfig,
         parent: Arc<IoRegion>,
+        uses_replay_archive: bool,
     ) -> Result<(DeploymentRecord, Arc<IoRegion>, Uuid, oneshot::Sender<()>, oneshot::Sender<()>)> {
         let directory = self.directory.clone();
         let keys = self.keys.clone();
@@ -504,7 +506,7 @@ impl CellStoreFactory {
                 let checkpoint_replay_from = if config.snapshot_block.is_none() && record.compaction_replay_cutoff.is_none() {
                     checkpoint_startup_replay(record)?
                 } else { None };
-                let repair = crate::archive::serving_archive_operation(record)?;
+                let repair = if uses_replay_archive { crate::archive::serving_archive_operation(record)? } else { None };
                 record.storage_regions.insert(id, if local {
                     StorageRegion::Local { archive: None, checkpoint_suffix: None, repair_archive: repair, tracks_ordered_index_pages: true, checkpoint_metadata_from, checkpoint_replay_from }
                 } else {
@@ -2639,7 +2641,7 @@ mod tests {
             compactor: false,
             snapshot_block: None,
         };
-        let (admitted, region, _, attachment, _metadata) = factory.admit_region(&config, IoRegion::new()).await.unwrap();
+        let (admitted, region, _, attachment, _metadata) = factory.admit_region(&config, IoRegion::new(), true).await.unwrap();
         assert_eq!(admitted.storage_regions.len(), 1);
 
         let (entered, active) = oneshot::channel();
@@ -2660,7 +2662,7 @@ mod tests {
             .await.unwrap_err();
         assert_eq!(pending.code, "rtdb.multi/storage-not-drained");
         assert_eq!(keys.key(&record.key_id()).await.unwrap(), key);
-        assert!(factory.admit_region(&config, IoRegion::new()).await.is_err());
+        assert!(factory.admit_region(&config, IoRegion::new(), true).await.is_err());
 
         complete.send(()).unwrap();
         factory.storage_regions.close();

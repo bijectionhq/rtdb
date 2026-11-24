@@ -19,12 +19,15 @@ pub(super) use hosted::reap_hosted;
 const MAXIMUM_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn eligible(record: &DeploymentRecord) -> bool {
+    record.storage_regions.is_empty() && record.catalog_readers.is_empty() && eligible_checkpoint(record)
+}
+
+fn eligible_checkpoint(record: &DeploymentRecord) -> bool {
     let Some(checkpoint) = record.checkpoint.filter(|checkpoint| checkpoint.root_sha256.is_some()) else { return false; };
     let Some(capture) = record.serving_replay_capture.and_then(|id| record.checkpoint_captures.get(&id))
         else { return false; };
     record.lifecycle == Lifecycle::Live
         && record.holder.is_none() && record.parent.is_none() && record.move_from.is_none()
-        && record.storage_regions.is_empty() && record.catalog_readers.is_empty()
         && capture.checkpoint == checkpoint && capture.media_bound && record.recovery_manifest_sha256.is_some()
         && record.replica_anchor.as_ref().is_some_and(|anchor| {
             anchor.root_incarnation == record.incarnation && anchor.interval[0] >= 0
@@ -74,7 +77,7 @@ pub(super) async fn reap(
         let mut erased = 0;
         for (block, pack) in candidates {
             let observed = ObservedPack::raw(bucket, &pack).await?;
-            let Some(boundary) = covered_pack(&observed, block, record.log_epoch, &cipher, &archive).await?
+            let Some(boundary) = covered_pack(&observed, block, record.log_epoch, &cipher, &archive, true).await?
                 else { continue; };
             if !crate::checkpoint_retention::replay_archive_covers_pack(block, checkpoint.block, boundary,
                 anchor.interval[0], anchor.interval[1], checkpoint.boundary)
@@ -95,7 +98,7 @@ pub(super) async fn reap(
 
 async fn covered_pack(
     pack: &ObservedPack<'_>, block: i64, log_epoch: i32,
-    cipher: &PublicationSealing, archive: &ArchivedCheckpoint,
+    cipher: &PublicationSealing, archive: &ArchivedCheckpoint, allow_compacted_receipt: bool,
 ) -> Result<Option<i64>> {
     let index = &pack.index;
     let root = block_key(BlockIndex(block))?;
@@ -116,7 +119,7 @@ async fn covered_pack(
         if checkpoint_metadata_block(name) == Some(block) { continue; }
         has_replay_member = true;
         let object = key(name)?;
-        if is_block_l0(name, block) && rtdb_format::keys::is_receipt_l0_file(name)
+        if allow_compacted_receipt && is_block_l0(name, block) && rtdb_format::keys::is_receipt_l0_file(name)
             && !archive.contains_original(&object)
         {
             // A complete successor does not need receipt L0 after compaction covers it.
