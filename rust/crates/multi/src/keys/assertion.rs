@@ -13,6 +13,7 @@ use crate::cipher::{Cipher, SEALED_OVERHEAD};
 use super::{DESTROYED, KEY_BYTES, LocalKeyService, io, is_destroyed, new_key};
 
 pub(super) mod family;
+pub(super) mod issuer;
 
 /// The immutable pre-ordering identity. The receiver must bind it to the original
 /// assertion before an accepted-history reader can use the envelope.
@@ -432,10 +433,12 @@ impl LocalKeyService {
 }
 
 pub(super) fn require_other_key_namespace(id: &str) -> Result<()> {
-    if id.starts_with(AssertionStage::KEY_PREFIX) || id.starts_with(family::LOCAL_PREFIX) {
+    if id.starts_with(AssertionStage::KEY_PREFIX) || id.starts_with(family::LOCAL_PREFIX)
+        || id.starts_with(family::LOCAL_ISSUER_PREFIX)
+    {
         return Err(Anomaly::new(
             AnomalyCategory::Forbidden, "rtdb.multi/key-non-exportable",
-            "An assertion stage belongs to its operation broker",
+            "Assertion authority belongs to its operation broker",
         ));
     }
     Ok(())

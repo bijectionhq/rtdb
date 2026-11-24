@@ -11,9 +11,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, LocalKeyService, io};
+use super::issuer::AssertionIssuerScope;
 use crate::keys::{assertion_deadline::AssertionDeadline, malformed};
 
 pub(super) const LOCAL_PREFIX: &str = "assertion-family-";
+pub(super) const LOCAL_ISSUER_PREFIX: &str = "assertion-issuer-";
 pub(in crate::keys) const MAX_RECORD_BYTES: usize = 1024 * 1024;
 const ATTEMPTS: usize = 8;
 const DENIED: &[u8] = b"RTFD\x01";
@@ -173,12 +175,22 @@ impl Family {
 }
 
 #[derive(Clone, Copy)]
-pub(in crate::keys) enum FamilyRecord {
+pub(in crate::keys) enum AssertionVaultRecord {
     Family(Uuid),
     Denial(Position),
+    Issuer(AssertionIssuerScope),
 }
 
-impl fmt::Display for FamilyRecord {
+impl AssertionVaultRecord {
+    fn local_prefix(self) -> &'static str {
+        match self {
+            Self::Family(_) | Self::Denial(_) => LOCAL_PREFIX,
+            Self::Issuer(_) => LOCAL_ISSUER_PREFIX,
+        }
+    }
+}
+
+impl fmt::Display for AssertionVaultRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Family(id) => write!(formatter, "{id}"),
@@ -186,26 +198,27 @@ impl fmt::Display for FamilyRecord {
                 let address = URL_SAFE_NO_PAD.encode(digest(&SHA256, &position.to_bytes()));
                 write!(formatter, "denied-{address}")
             }
+            Self::Issuer(scope) => formatter.write_str(&URL_SAFE_NO_PAD.encode(scope.address())),
         }
     }
 }
 
 #[async_trait::async_trait]
-pub(in crate::keys) trait FamilyJournal: Send + Sync {
-    async fn read_family(&self, record: FamilyRecord, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>>;
-    async fn write_family(
-        &self, record: FamilyRecord, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
+pub(in crate::keys) trait AssertionVaultJournal: Send + Sync {
+    async fn read_record(&self, record: AssertionVaultRecord, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>>;
+    async fn write_record(
+        &self, record: AssertionVaultRecord, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
     ) -> Result<bool>;
 }
 
 /// Original vault operations for the trusted publication and reaper owners.
 pub struct AssertionFamilies<'a> {
-    journal: &'a dyn FamilyJournal,
+    journal: &'a dyn AssertionVaultJournal,
     region: Arc<IoRegion>,
 }
 
 impl<'a> AssertionFamilies<'a> {
-    pub(in crate::keys) fn new(journal: &'a dyn FamilyJournal, region: Arc<IoRegion>) -> Self {
+    pub(in crate::keys) fn new(journal: &'a dyn AssertionVaultJournal, region: Arc<IoRegion>) -> Self {
         Self { journal, region }
     }
 
@@ -325,7 +338,7 @@ impl<'a> AssertionFamilies<'a> {
         &self, family: Uuid, deadline: &AssertionDeadline<'_>, custody_key: &[u8; 32],
     ) -> Result<()> {
         for _ in 0..ATTEMPTS {
-            let (bytes, etag) = self.read_family_bytes(family).await?.ok_or_else(conflict)?;
+            let (bytes, etag) = self.read_record_bytes(family).await?.ok_or_else(conflict)?;
             if bytes.as_ref() == DENIED {
                 return Ok(());
             }
@@ -333,12 +346,12 @@ impl<'a> AssertionFamilies<'a> {
             let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);
             deadline.require_settled_family(&fence, custody_key).await?;
             for position in fence.positions {
-                let address = FamilyRecord::Denial(position);
-                if !self.journal.write_family(address, &self.region, None, Bytes::from_static(DENIED)).await? {
+                let address = AssertionVaultRecord::Denial(position);
+                if !self.journal.write_record(address, &self.region, None, Bytes::from_static(DENIED)).await? {
                     self.require_denial(address).await?;
                 }
             }
-            if self.journal.write_family(FamilyRecord::Family(family), &self.region,
+            if self.journal.write_record(AssertionVaultRecord::Family(family), &self.region,
                 Some(&etag), Bytes::from_static(DENIED)).await?
             {
                 return Ok(());
@@ -348,7 +361,7 @@ impl<'a> AssertionFamilies<'a> {
     }
 
     pub async fn require_position_open(&self, position: Position) -> Result<()> {
-        if let Some((bytes, _)) = self.journal.read_family(FamilyRecord::Denial(position), &self.region).await? {
+        if let Some((bytes, _)) = self.journal.read_record(AssertionVaultRecord::Denial(position), &self.region).await? {
             if bytes.as_ref() != DENIED {
                 return Err(malformed());
             }
@@ -357,22 +370,22 @@ impl<'a> AssertionFamilies<'a> {
         Ok(())
     }
 
-    async fn require_denial(&self, address: FamilyRecord) -> Result<()> {
-        match self.journal.read_family(address, &self.region).await? {
+    async fn require_denial(&self, address: AssertionVaultRecord) -> Result<()> {
+        match self.journal.read_record(address, &self.region).await? {
             Some((bytes, _)) if bytes.as_ref() == DENIED => Ok(()),
             _ => Err(conflict()),
         }
     }
 
-    async fn read_family_bytes(&self, family: Uuid) -> Result<Option<(Bytes, String)>> {
+    async fn read_record_bytes(&self, family: Uuid) -> Result<Option<(Bytes, String)>> {
         if family.is_nil() {
             return Err(conflict());
         }
-        self.journal.read_family(FamilyRecord::Family(family), &self.region).await
+        self.journal.read_record(AssertionVaultRecord::Family(family), &self.region).await
     }
 
     async fn read(&self, family: Uuid) -> Result<Option<(Family, String)>> {
-        let Some((bytes, etag)) = self.read_family_bytes(family).await? else {
+        let Some((bytes, etag)) = self.read_record_bytes(family).await? else {
             return Ok(None);
         };
         if bytes.as_ref() == DENIED {
@@ -389,7 +402,7 @@ impl<'a> AssertionFamilies<'a> {
                 "rtdb.multi/assertion-family-size", "The assertion family exceeds its custody inventory limit",
             ));
         }
-        self.journal.write_family(FamilyRecord::Family(family), &self.region, previous, bytes.into()).await
+        self.journal.write_record(AssertionVaultRecord::Family(family), &self.region, previous, bytes.into()).await
     }
 
     async fn update<T>(
@@ -439,27 +452,27 @@ fn local_record(vault: &LocalKeyService, path: &std::path::Path) -> Result<Optio
 }
 
 #[async_trait::async_trait]
-impl FamilyJournal for LocalKeyService {
-    async fn read_family(&self, record: FamilyRecord, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>> {
+impl AssertionVaultJournal for LocalKeyService {
+    async fn read_record(&self, record: AssertionVaultRecord, region: &Arc<IoRegion>) -> Result<Option<(Bytes, String)>> {
         self.require_assertion_broker()?;
         let owner = self.clone();
         region.run_blocking(move || Ok((|| {
             let vault = owner.archive_vault()?;
-            let path = vault.path(&format!("{LOCAL_PREFIX}{record}"))?;
+            let path = vault.path(&format!("{}{record}", record.local_prefix()))?;
             let _lock = vault.lock_key_shared(&path)?;
             local_record(&vault, &path)
         })())).await?
     }
 
-    async fn write_family(
-        &self, record: FamilyRecord, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
+    async fn write_record(
+        &self, record: AssertionVaultRecord, region: &Arc<IoRegion>, previous: Option<&str>, bytes: Bytes,
     ) -> Result<bool> {
         self.require_assertion_broker()?;
         let owner = self.clone();
         let previous = previous.map(str::to_owned);
         region.run_blocking(move || Ok((|| {
             let vault = owner.archive_vault()?;
-            let path = vault.path(&format!("{LOCAL_PREFIX}{record}"))?;
+            let path = vault.path(&format!("{}{record}", record.local_prefix()))?;
             let _lock = vault.lock_key(&path)?;
             if local_record(&vault, &path)?.as_ref().map(|(_, etag)| etag) != previous.as_ref() {
                 return Ok(false);
