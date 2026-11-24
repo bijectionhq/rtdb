@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::data::StoredOperation;
 use rtdb_index::{IndexBatch, TableWrite};
-use rtdb_types::{EventOp, Iid, Interval, OWNED_ATTEMPT_RELATION, OWNED_ROOT_PUBLICATION_RELATION, OwnedRelation, OwnedWorld, Result, StructFields, TableRef, Timestamp, TransactionKey, Value};
+use rtdb_types::{EventOp, Iid, Interval, OWNED_ATTEMPT_RELATION, OWNED_PUBLIC_ROOT_VERSIONS_RELATION, OWNED_ROOT_PUBLICATION_RELATION, OwnedRelation, OwnedWorld, Result, StructFields, TableRef, Timestamp, TransactionKey, Value};
 
 use crate::{TxOp, source::Operation};
 use super::invalid;
@@ -253,6 +253,7 @@ pub(super) fn verify(
         expected_data.insert(OWNED_ROOT_PUBLICATION_RELATION);
     }
     let mut root_head = false;
+    let mut public_version_seen = false;
     let mut publication_frontiers = BTreeSet::new();
     let mut landed_rows = 0usize;
     let mut landed_positions = BTreeSet::new();
@@ -355,6 +356,18 @@ pub(super) fn verify(
                 if is_data { overlays.insert(world); }
             }
             if is_data {
+                if relation == OWNED_PUBLIC_ROOT_VERSIONS_RELATION {
+                    if !has_root || !expected_data.contains(relation) || public_version_seen || batch.len() != 1 {
+                        return Err(mismatch());
+                    }
+                    records(batch, key, memory, |row| {
+                        if row.len() != 1 || !matches!(row.get("_id"), Some(Value::Utf8(id)) if id == "head") {
+                            return Err(mismatch());
+                        }
+                        Ok(())
+                    })?;
+                    public_version_seen = true;
+                }
                 if relation == OWNED_ROOT_PUBLICATION_RELATION {
                     if !has_root { return Err(mismatch()); }
                     let limit = if landed { crate::MAX_PROPOSAL_LAND_ROWS + 1 } else { 1 };
@@ -377,7 +390,8 @@ pub(super) fn verify(
             } else if table.is_owned_change_journal() {
                 journals.insert(relation);
             }
-            let allows_delete = is_data && world.is_none() && relation != OWNED_ROOT_PUBLICATION_RELATION;
+            let allows_delete = is_data && world.is_none()
+                && !matches!(relation, OWNED_ROOT_PUBLICATION_RELATION | OWNED_PUBLIC_ROOT_VERSIONS_RELATION);
             if delete_root && allows_delete && (batch.len() != 1 || batch.header(0)?.op != EventOp::Delete) {
                 return Err(mismatch());
             }

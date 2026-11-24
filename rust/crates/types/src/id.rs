@@ -210,6 +210,7 @@ const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
 const OWNED_RETIRED_CATALOG: &str = ".retired-relations";
 pub const OWNED_ATTEMPT_RELATION: &str = "fact_attempts";
 pub const OWNED_ROOT_PUBLICATION_RELATION: &str = "fact_publications";
+pub const OWNED_PUBLIC_ROOT_VERSIONS_RELATION: &str = "fact_public_root_versions";
 pub const HOSTED_ROOT_RECEIPTS_TABLE: &str = "bj_fact_root_receipts";
 pub const HOSTED_RECEIPT_TX_ID: &str = "_rtdb_receipt_tx_id";
 const OWNED_WORLD_CLOCKS: &str = ".world-clocks";
@@ -240,7 +241,7 @@ impl OwnedRelation {
 
     pub fn is_root_data(&self) -> bool {
         self.world().is_none() && !self.is_world_catalog()
-            && !matches!(self.name(), OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION)
+            && !matches!(self.name(), OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION | OWNED_PUBLIC_ROOT_VERSIONS_RELATION)
     }
 
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }

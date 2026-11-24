@@ -1798,6 +1798,9 @@ impl<'a> OpenTransaction<'a> {
             }
             for operation in operations {
                 effects = effects.saturating_add(1);
+                if publish_root && crate::hosted_control::source_public_root_version_marker(operation) {
+                    continue;
+                }
                 if publish_root && let Some(markers) = crate::hosted_control::root_partition_frontier_rows(operation) {
                     effects = effects.saturating_add(markers.rows().len() - 1);
                     continue;
@@ -2086,6 +2089,7 @@ impl<'a> OpenTransaction<'a> {
             }
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
+                    _ if root_publication.is_some() && crate::hosted_control::source_public_root_version_marker(operation) => 1,
                     _ if root_publication.is_some() && crate::hosted_control::root_partition_frontier_rows(operation).is_some() => {
                         crate::hosted_control::root_partition_frontier_rows(operation).expect("matched frontier write").rows().len()
                     }

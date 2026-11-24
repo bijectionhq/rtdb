@@ -3137,7 +3137,7 @@ pub struct OwnedRootPublication {
 
 impl OwnedRootPublication {
     fn has_single_fact(&self, admit: impl FnOnce(&TxOp) -> bool) -> bool {
-        let mut facts = self.writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op));
+        let mut facts = self.writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op) && !rtdb_tx::is_public_root_version_marker(op));
         facts.next().is_some_and(admit) && facts.next().is_none()
     }
 }
@@ -3301,7 +3301,7 @@ impl NativeSession {
             })
             || fork.root.as_ref().and_then(|section| section.publication.as_ref()).is_some_and(|root| {
                 root.attempt != fork.attempt || root.writes.is_empty() || root.writes.iter().any(|write| match write {
-                    _ if rtdb_tx::is_root_partition_frontier(write) => false,
+                    _ if rtdb_tx::is_root_partition_frontier(write) || rtdb_tx::is_public_root_version_marker(write) => false,
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                     | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                     _ => true,
@@ -3416,7 +3416,7 @@ impl NativeSession {
                     || root.publication.as_ref().is_none_or(|root| {
                         if root.attempt != sections[0].1.attempt { return true; }
                         let mut facts = root.writes.iter().filter(|op| {
-                            !rtdb_tx::is_proposal_landing_frontier(op) && !rtdb_tx::is_root_partition_frontier(op)
+                            !rtdb_tx::is_proposal_landing_frontier(op) && !rtdb_tx::is_root_partition_frontier(op) && !rtdb_tx::is_public_root_version_marker(op)
                         });
                         let mut rows = 0usize;
                         facts.any(|op| {
@@ -3460,7 +3460,7 @@ impl NativeSession {
         let mut effects = controls.len().saturating_add(root.checks.len()).saturating_add(2 + usize::from(root.clock_slot.is_some()));
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
-                _ if rtdb_tx::is_root_partition_frontier(write) || proposal_land && rtdb_tx::is_proposal_landing_frontier(write) => false,
+                _ if rtdb_tx::is_root_partition_frontier(write) || rtdb_tx::is_public_root_version_marker(write) || proposal_land && rtdb_tx::is_proposal_landing_frontier(write) => false,
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                 | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                 _ => true,

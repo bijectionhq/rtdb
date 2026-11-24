@@ -4287,14 +4287,14 @@ impl Service {
                 match &operation {
                     TxOp::OwnedCheck { relation, .. } if relation.is_root_data() =>
                         root.checks.push(operation),
-                    _ if rtdb_tx::is_root_partition_frontier(&operation) => writes.push(operation),
+                    _ if rtdb_tx::is_root_partition_frontier(&operation) || rtdb_tx::is_public_root_version_marker(&operation) => writes.push(operation),
                     TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                     | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } if relation.is_root_data() =>
                         writes.push(operation),
                     _ => return Err(invalid("Operation is outside the held Root section")),
                 }
             }
-            let facts = writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op)).collect::<Vec<_>>();
+            let facts = writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op) && !rtdb_tx::is_public_root_version_marker(op)).collect::<Vec<_>>();
             if (authored_replacement && !sibling && !proposal_hold
                 && !matches!(facts.as_slice(), [write] if write.is_single_unbounded_root_document(false)))
                 || ((sibling || (proposal_hold && !proposal_shorten))
@@ -4565,7 +4565,7 @@ impl Service {
             match &operation {
                 TxOp::OwnedCheck { relation, .. } if relation.world().is_none() && !relation.is_world_catalog() =>
                     root.checks.push(operation),
-                _ if root_attempt.is_some() && rtdb_tx::is_root_partition_frontier(&operation) =>
+                _ if root_attempt.is_some() && (rtdb_tx::is_root_partition_frontier(&operation) || rtdb_tx::is_public_root_version_marker(&operation)) =>
                     root_writes.push(operation),
                 _ if proposal_land && rtdb_tx::is_proposal_landing_frontier(&operation) =>
                     root_writes.push(operation),
@@ -4578,7 +4578,7 @@ impl Service {
         }
         if let Some(attempt) = root_attempt {
             if root_writes.is_empty() { return Err(invalid("A Root publication requires fact writes")); }
-            let facts = root_writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op)).collect::<Vec<_>>();
+            let facts = root_writes.iter().filter(|op| !rtdb_tx::is_root_partition_frontier(op) && !rtdb_tx::is_public_root_version_marker(op)).collect::<Vec<_>>();
             if (delete_root || proposal_close) && !matches!(facts.as_slice(), [
                 TxOp::OwnedDelete { valid_from: None, valid_to: None, .. }
             ]) {

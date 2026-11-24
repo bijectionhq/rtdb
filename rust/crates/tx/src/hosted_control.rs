@@ -638,7 +638,7 @@ pub(crate) fn retained_release_world(operations: &[crate::source::Operation]) ->
     let mut delete_root = false;
     if !root_partition_frontiers_match(operations) { return None; }
     for op in operations {
-        if root_partition_frontier_rows(op).is_some() { continue; }
+        if root_partition_frontier_rows(op).is_some() || source_public_root_version_marker(op) { continue; }
         match op {
             Operation::Public(TxOp::HostedControl(control)) => controls.push(control),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheckWorldScope { .. }) => (),
@@ -1732,6 +1732,29 @@ fn partition_frontier_rows(
         })
 }
 
+fn public_version_marker(
+    relation: &OwnedRelation, documents: &crate::Documents, from: Option<Timestamp>, to: Option<Timestamp>,
+) -> bool {
+    relation.name() == rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION
+        && from == Some(Timestamp::MIN) && to.is_none_or(|to| to == Timestamp::MAX)
+        && documents.has_exact_presence()
+        && matches!(documents.rows(), [row] if row.len() == 1
+            && matches!(row.get("_id"), Some(Value::Utf8(id)) if id == "head"))
+}
+
+pub fn is_public_root_version_marker(op: &crate::TxOp) -> bool {
+    matches!(op, crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
+        if public_version_marker(relation, documents, *valid_from, *valid_to))
+}
+
+pub(crate) fn source_public_root_version_marker(op: &crate::source::Operation) -> bool {
+    use crate::{TxOp, source::Operation};
+    matches!(op,
+        Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to })
+        | Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only: false, .. }
+        if public_version_marker(relation, documents, *valid_from, *valid_to))
+}
+
 pub fn is_root_partition_frontier(op: &crate::TxOp) -> bool {
     matches!(op, crate::TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }
         if partition_frontier_rows(relation, documents, *valid_from, *valid_to))
@@ -1856,7 +1879,7 @@ pub(crate) fn hosted_proposal_land(
     let mut frontiers = std::collections::BTreeSet::new();
     if !root_partition_frontiers_match(operations) { return None; }
     for op in operations {
-        if root_partition_frontier_rows(op).is_some() { continue; }
+        if root_partition_frontier_rows(op).is_some() || source_public_root_version_marker(op) { continue; }
         if let Some(documents) = proposal_landing_frontier_rows(op) {
             for row in documents.rows() {
                 let Value::Utf8(id) = row.get("_id")? else { return None; };
