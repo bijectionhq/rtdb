@@ -394,3 +394,11 @@ The Azure diagnostic in `traces/azure_copy_completion_diagnostic.rs` reproduces 
 Copy it into `rust/crates/azure/tests/` in an isolated checkout of that revision, then run `BIJECTION_LOCAL_EXECUTION=owner-authorized cargo test --locked -p rtdb-azure --test azure_copy_completion_diagnostic` in its `rust/` directory.
 The fixture speaks Azure's HTTP protocol on loopback and exercises the real Azure and remote-storage adapters.
 A passing diagnostic observes the defect described in the ledger.
+
+=== Bijection consumer contract
+
+The versioned link:contracts/rtdb-consumer-v1.json[RTDB consumer contract] exports named landing wire, held-order, prepared-switch and archive decision guarantees.
+The accompanying link:contracts/rtdb-consumer-v1.proofs.json[proof mapping] identifies each checked owner and distinguishes abstract model facts from shipped decisions.
+The contract version and digest remain stable across compatible RTDB revisions, and each publication of proof evidence identifies the exact checked Git commit.
+Use a new contract version for a changed guarantee.
+Run `verification/check_consumer_contract.py` with the pinned Verus and Lean executables to check each named export and the declared Verus controls in disposable source copies.
