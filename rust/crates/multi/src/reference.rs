@@ -356,7 +356,10 @@ pub async fn holds(bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<
 pub async fn stores(bucket: &dyn ObjectStore, prefix: &str) -> Result<Vec<String>> {
     let strip = format!("{prefix}/");
     let versions: BTreeSet<String> = bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.into_iter()
-        .filter_map(|object| object.key.as_str().strip_prefix(&strip).and_then(|rest| rest.split_once('/')).map(|(version, _)| version.to_owned())).collect();
+        .filter_map(|object| {
+            let (version, _) = object.key.as_str().strip_prefix(&strip)?.split_once('/')?;
+            (version != crate::archive::stage::STAGED_INVENTORY_DIRECTORY).then(|| version.to_owned())
+        }).collect();
     Ok(versions.into_iter().map(|version| format!("{prefix}/{version}")).collect())
 }
 

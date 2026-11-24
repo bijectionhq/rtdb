@@ -29,9 +29,10 @@ use crate::{
 };
 
 pub(super) const STAGED_MANIFEST: &str = "~checkpoint-stage";
+pub(crate) const STAGED_INVENTORY_DIRECTORY: &str = "~checkpoint-inventory";
 
 pub(crate) fn staged_storage_root(record: &DeploymentRecord) -> String {
-    format!("{}/~checkpoint-inventory", record.storage_prefix())
+    format!("{}/{STAGED_INVENTORY_DIRECTORY}", record.storage_prefix())
 }
 
 pub(crate) fn staged_key_id(record: &DeploymentRecord) -> String {
