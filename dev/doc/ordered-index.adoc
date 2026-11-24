@@ -50,7 +50,7 @@ Payload-only changes with the same projected valid-time spans share the previous
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
 The projector selects plain scalar keys from source Arrow columns into compact key batches.
-A contiguous, all-valid selection of text, binary, UUID, whole Boolean bytes, or zoned microsecond timestamps can retain source buffers whose reported allocation capacity fits the projection's memory budget.
+Source projections own their compact key buffers so a narrow selection can release its input file and lease.
 Buffers with an unknown external owner size copy into the projection's own allocation.
 A governed put compares the document identity with the complete borrowed event identity.
 A world shadow uses the logical null state of its field marker to identify a local tombstone.
