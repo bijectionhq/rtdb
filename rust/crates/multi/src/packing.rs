@@ -876,7 +876,7 @@ pub(crate) mod tests {
         let parent = object(&format!("parent/{pack}"));
         raw.put(&parent, contents.clone()).await.unwrap();
         let own = Arc::new(PrefixedStore::new(bucket.clone(), "child"));
-        let base = Base { objects: BTreeMap::from([(pack.to_string(), "parent".into())]) };
+        let base = Base { objects: BTreeMap::from([(pack.to_string(), "parent".into())]), ..Default::default() };
         let reader = PackingStore::open(Arc::new(ReferencingStore::new(own, bucket, base)), PackDiscovery::List).await.unwrap();
         assert_eq!(reader.get_fresh(&root).await.unwrap().as_ref(), b"catalog");
 

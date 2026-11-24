@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_directory::{DeploymentRecord, Lifecycle};
 use rtdb_storage::{Error, ObjectKey, ObjectObservation, ObjectStore, object_store::StoredObject};
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, PhysicalObjectPublication, PhysicalObjectVersion, Result};
 use serde::{Deserialize, Serialize};
 
 /// A cell's object storage: every deployment's stores, by keys relative to the cell's storage root.
@@ -26,11 +26,19 @@ pub const BASE_MANIFEST: &str = "~base";
 
 /// A store's references: for each object it shares, the store, relative to the cell's storage root, that physically holds it under the same key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Base { pub objects: BTreeMap<String, String> }
+#[serde(deny_unknown_fields)]
+pub struct Base {
+    pub objects: BTreeMap<String, String>,
+    pub(crate) publications: BTreeMap<String, PhysicalObjectPublication>,
+}
 
 pub(crate) fn key(name: &str) -> rtdb_storage::Result<ObjectKey> { ObjectKey::new(name.to_owned()).map_err(|error| Error::InvalidKey(error.to_string())) }
 
 fn storage(error: Error) -> Anomaly { error.into() }
+
+fn retains_version(publication: Option<&PhysicalObjectPublication>, version: &PhysicalObjectVersion) -> bool {
+    publication.is_none_or(|expected| matches!(expected, PhysicalObjectPublication::Version(expected) if expected == version))
+}
 
 /// Whether `key`, within a store, is bookkeeping rather than one of its objects.
 fn bookkeeping(key: &str) -> bool { key == crate::store::ROOT_MARKER || key.starts_with(&format!("{BASE_MANIFEST}/")) || key.ends_with(".tmp") }
@@ -51,15 +59,37 @@ impl Base {
             };
             // A pruned slot can receive a delayed write after the first listing.
             if !latest_manifest(bucket, store).await?.is_some_and(|(current, path)| current == sequence && path == name) { continue; }
-            return serde_json::from_slice(&bytes)
-                .map(|base| Some((sequence, base)))
-                .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}")));
+            let base: Base = serde_json::from_slice(&bytes)
+                .map_err(|error| Anomaly::fault("rtdb.multi/base-manifest", format!("{name}: {error}")))?;
+            base.validate(bucket)?;
+            return Ok(Some((sequence, base)));
         }
         Err(manifest_changed(store))
     }
 
+    pub(crate) fn retains_version(&self, store: &str, name: &str, version: &PhysicalObjectVersion) -> bool {
+        self.objects.get(name).is_some_and(|owner| owner == store)
+            && retains_version(self.publications.get(name), version)
+    }
+
+    fn validate(&self, bucket: &dyn ObjectStore) -> Result<()> {
+        let invalid = || Anomaly::fault("rtdb.multi/base-manifest", "A fork reference has no matching physical publication");
+        if self.publications.keys().any(|name| !self.objects.contains_key(name)) { return Err(invalid()); }
+        for (name, owner) in &self.objects {
+            let key = key(&format!("{owner}/{name}"))?;
+            let witness = self.publications.get(name);
+            let address = witness.map(|publication| match publication {
+                PhysicalObjectPublication::Version(version) => (version.namespace.clone(), version.key.clone()),
+                PhysicalObjectPublication::Terminal(terminal) => (terminal.namespace.clone(), terminal.key.clone()),
+            });
+            if address != bucket.s3_publication_address(&key) { return Err(invalid()); }
+        }
+        Ok(())
+    }
+
     /// Installs the first manifest during preparation of an unpublished fork.
     pub(crate) async fn initialize(&self, bucket: &dyn ObjectStore, store: &str) -> Result<()> {
+        self.validate(bucket)?;
         self.publish_at(bucket, store, 0).await.map_err(storage)
     }
 
@@ -80,8 +110,8 @@ impl Base {
     }
 
     async fn withdraw(&self, bucket: &dyn ObjectStore, store: &str, names: &BTreeSet<String>) -> Result<Option<u64>> {
-        let selected: BTreeMap<&str, &str> = names.iter().filter_map(|name| {
-            self.objects.get(name).map(|owner| (name.as_str(), owner.as_str()))
+        let selected: BTreeMap<_, _> = names.iter().filter_map(|name| {
+            self.objects.get(name).map(|owner| (name.as_str(), (owner.as_str(), self.publications.get(name))))
         }).collect();
         if selected.is_empty() { return Ok(None); }
 
@@ -90,7 +120,12 @@ impl Base {
                 return Err(manifest_changed(store));
             };
             let count = current.objects.len();
-            current.objects.retain(|name, owner| selected.get(name.as_str()) != Some(&owner.as_str()));
+            let publications = &current.publications;
+            current.objects.retain(|name, owner| {
+                selected.get(name.as_str()) != Some(&(owner.as_str(), publications.get(name)))
+            });
+            let objects = &current.objects;
+            current.publications.retain(|name, _| objects.contains_key(name));
             if current.objects.len() == count {
                 return Ok(Some(sequence));
             }
@@ -235,9 +270,20 @@ impl ReferencingStore {
         if !matches!(own, Err(Error::MissingObject(_))) { return own; }
         let Some(owner) = self.base.objects.get(key.as_str()) else { return own; };
         let inherited = self::key(&format!("{owner}/{key}"))?;
+        let expected = self.base.publications.get(key.as_str());
+        let read_source = async {
+            if let Some(expected) = expected {
+                require_publication(self.bucket.as_ref(), &inherited, expected).await?;
+            }
+            let result = read(self.bucket.as_ref(), &inherited).await?;
+            if let Some(expected) = expected {
+                require_publication(self.bucket.as_ref(), &inherited, expected).await?;
+            }
+            Ok(result)
+        };
         let result = if let Some(custody) = &self.custody {
             match custody.retain(owner, &inherited).await {
-                Ok(hold) => rtdb_storage::IoRegion::retaining(hold, read(self.bucket.as_ref(), &inherited)).await,
+                Ok(hold) => rtdb_storage::IoRegion::retaining(hold, read_source).await,
                 Err(error) => {
                     // The owner can close before the first own read observes the transferred copy.
                     // Until the copy exists, return the admission failure so the reader can retry.
@@ -248,12 +294,24 @@ impl ReferencingStore {
                 }
             }
         } else {
-            read(self.bucket.as_ref(), &inherited).await
+            read_source.await
         };
         match result {
             // Erasure can copy the object here and remove it from its owner between the two reads.
             Err(Error::MissingObject(_)) => read(self.own.as_ref(), key).await,
             result => result,
+        }
+    }
+}
+
+async fn require_publication(bucket: &dyn ObjectStore, key: &ObjectKey, expected: &PhysicalObjectPublication)
+    -> rtdb_storage::Result<()> {
+    match bucket.retirement_publication(key).await? {
+        Some(observed) if observed == *expected => Ok(()),
+        Some(_) => Err(Error::ConflictingObject(key.to_string())),
+        None => {
+            bucket.head_fresh(key).await?;
+            Err(Error::ConflictingObject(key.to_string()))
         }
     }
 }
@@ -452,7 +510,12 @@ async fn block_packs(bucket: &dyn ObjectStore, parent: &str, block: i64) -> Resu
 /// }
 /// ```
 #[derive(Default)]
-pub struct References { by_object: BTreeMap<String, BTreeSet<String>> }
+pub struct References { by_object: BTreeMap<String, BTreeMap<String, ForkReference>> }
+
+struct ForkReference {
+    publication: Option<PhysicalObjectPublication>,
+    needs_copy: bool,
+}
 
 impl References {
     /// The references of every deployment in `records` that is not deleted.
@@ -463,9 +526,13 @@ impl References {
             for store in stores(bucket, &record.storage_prefix()).await? {
                 // One listing per store, rather than a request per reference, on every reaper pass.
                 let own: BTreeSet<String> = physical_objects(bucket, &store).await?.into_iter().collect();
-                for (name, owner) in Base::load(bucket, &store).await?.objects {
+                let Base { objects, mut publications } = Base::load(bucket, &store).await?;
+                for (name, owner) in objects {
                     let referrers = references.by_object.entry(format!("{owner}/{name}")).or_default();
-                    if !own.contains(&name) { referrers.insert(store.clone()); }
+                    referrers.insert(store.clone(), ForkReference {
+                        needs_copy: !own.contains(&name),
+                        publication: publications.remove(&name),
+                    });
                 }
             }
         }
@@ -476,10 +543,18 @@ impl References {
         self.by_object.contains_key(physical.as_str())
     }
 
+    pub(crate) fn has_declared_version(&self, physical: &ObjectKey, version: &PhysicalObjectVersion) -> bool {
+        self.by_object.get(physical.as_str()).is_some_and(|referrers| {
+            referrers.values().any(|reference| retains_version(reference.publication.as_ref(), version))
+        })
+    }
+
     /// Erases `name` from `store`, first copying it into every store that still references it there.
     pub(crate) async fn erase(&self, bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<()> {
         let physical = format!("{store}/{name}");
-        for referrer in self.by_object.get(&physical).into_iter().flatten() { copy_in(bucket, &physical, bucket, &format!("{referrer}/{name}")).await?; }
+        for (referrer, reference) in self.by_object.get(&physical).into_iter().flatten().filter(|(_, edge)| edge.needs_copy) {
+            copy_in(bucket, &physical, &format!("{referrer}/{name}"), reference.publication.as_ref()).await?;
+        }
         bucket.delete(&key(&physical)?).await.map_err(storage)
     }
 
@@ -498,9 +573,9 @@ pub(crate) async fn preserve_residence(bucket: &dyn ObjectStore, erasure: &crate
     let prefix = format!("{}/", erasure.prefix());
     for (physical, referrers) in References::scan(bucket, others).await?.by_object {
         let Some((_, name)) = physical.strip_prefix(&prefix).and_then(|relative| relative.split_once('/')) else { continue; };
-        for referrer in referrers {
-            match copy_in(bucket, &physical, bucket, &format!("{referrer}/{name}")).await {
-                Err(Error::MissingObject(_)) if crate::store::garbage_released_at(name).is_some() => {}
+        for (referrer, reference) in referrers.into_iter().filter(|(_, edge)| edge.needs_copy) {
+            match copy_in(bucket, &physical, &format!("{referrer}/{name}"), reference.publication.as_ref()).await {
+                Err(Error::MissingObject(_)) if reference.publication.is_none() && crate::store::garbage_released_at(name).is_some() => {}
                 result => result?,
             }
         }
@@ -539,10 +614,21 @@ pub(crate) fn require_disjoint_prefix<'a>(prefix: &ObjectKey, others: impl Itera
     Ok(())
 }
 
-async fn copy_in(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> rtdb_storage::Result<()> {
+async fn copy_in(bucket: &dyn ObjectStore, from: &str, to: &str, expected: Option<&PhysicalObjectPublication>)
+    -> rtdb_storage::Result<()> {
+    let source = key(from)?;
     let target = key(to)?;
-    match to_bucket.head(&target).await { Ok(_) => return Ok(()), Err(Error::MissingObject(_)) => {}, Err(error) => return Err(error) }
-    to_bucket.put(&target, from_bucket.get(&key(from)?).await?).await
+    if let Some(expected) = expected {
+        require_publication(bucket, &source, expected).await?;
+        let bytes = bucket.get_fresh(&source).await?;
+        require_publication(bucket, &source, expected).await?;
+        return bucket.put(&target, bytes).await;
+    }
+    match bucket.head(&target).await {
+        Ok(_) => Ok(()),
+        Err(Error::MissingObject(_)) => bucket.put(&target, bucket.get(&source).await?).await,
+        Err(error) => Err(error),
+    }
 }
 
 /// An earlier attempt can leave objects in the target. Only identical bytes
@@ -599,6 +685,27 @@ pub(crate) async fn materialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fork_claim_retains_only_its_original_physical_version() {
+        let owner = "org/parent/1/v06";
+        let name = "~packs/b00.pack";
+        let version = PhysicalObjectVersion {
+            namespace: rtdb_types::S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
+            key: format!("{owner}/{name}"),
+            version: "original".into(),
+        };
+        let base = Base {
+            objects: BTreeMap::from([(name.into(), owner.into())]),
+            publications: BTreeMap::from([(name.into(), PhysicalObjectPublication::Version(version.clone()))]),
+        };
+        let later = PhysicalObjectVersion { version: "replacement".into(), ..version.clone() };
+        assert!(base.retains_version(owner, name, &version));
+        assert!(!base.retains_version(owner, name, &later));
+        assert!(!base.retains_version("org/other/1/v06", name, &version));
+        assert!(serde_json::from_str::<Base>(r#"{"objects":{}}"#).is_err());
+    }
+
 
     async fn unchanged(_: &ObjectKey, body: Bytes) -> rtdb_storage::Result<Bytes> { Ok(body) }
 
@@ -689,7 +796,7 @@ mod tests {
     #[tokio::test]
     async fn reading_a_manifest_retries_when_its_listed_revision_was_replaced() {
         let bucket = bucket();
-        let base = Base { objects: BTreeMap::from([("row".into(), "parent/v06".into())]) };
+        let base = Base { objects: BTreeMap::from([("row".into(), "parent/v06".into())]), ..Base::default() };
         base.initialize(bucket.as_ref(), "child/v06").await.unwrap();
         let changing = TransferringStore {
             inner: bucket,
@@ -811,10 +918,10 @@ mod tests {
     #[tokio::test]
     async fn a_store_keeps_one_manifest_whose_latest_is_read() {
         let bucket = bucket();
-        let initial = Base { objects: BTreeMap::from([("a".into(), "p/v06".into()), ("b".into(), "p/v06".into())]) };
+        let initial = Base { objects: BTreeMap::from([("a".into(), "p/v06".into()), ("b".into(), "p/v06".into())]), ..Base::default() };
         initial.initialize(bucket.as_ref(), "c/v06").await.unwrap();
         initial.forget_and_prune_locally(bucket.as_ref(), "c/v06", &BTreeSet::from(["a".into()])).await.unwrap();
-        let latest = Base { objects: BTreeMap::from([("b".into(), "p/v06".into())]) };
+        let latest = Base { objects: BTreeMap::from([("b".into(), "p/v06".into())]), ..Base::default() };
         assert_eq!(Base::load(bucket.as_ref(), "c/v06").await.unwrap(), latest);
         assert_eq!(bucket.list(Some(&key("c/v06/~base").unwrap())).await.unwrap().len(), 1, "an older manifest is forgotten once a newer one is written");
     }
@@ -877,7 +984,7 @@ mod tests {
         for prune_slot in [true, false] {
             let store = "child/v06";
             let inner = bucket();
-            let initial = Base { objects: ["a", "b", "c"].into_iter().map(|name| (name.into(), "parent/v06".into())).collect() };
+            let initial = Base { objects: ["a", "b", "c"].into_iter().map(|name| (name.into(), "parent/v06".into())).collect(), ..Base::default() };
             initial.initialize(inner.as_ref(), store).await.unwrap();
             let mut watched = ManifestTestBucket::new(inner.clone());
             watched.pause_put = Some(key(&format!("{store}/{BASE_MANIFEST}/{:020}", 1)).unwrap());
@@ -908,7 +1015,7 @@ mod tests {
     async fn a_load_rejects_a_backfilled_slot_that_is_no_longer_current() {
         let store = "child/v06";
         let inner = bucket();
-        let initial = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into()), ("b".into(), "parent/v06".into())]) };
+        let initial = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into()), ("b".into(), "parent/v06".into())]), ..Base::default() };
         initial.initialize(inner.as_ref(), store).await.unwrap();
         initial.forget_and_prune_locally(inner.as_ref(), store, &BTreeSet::from(["a".into()])).await.unwrap();
         let mut watched = ManifestTestBucket::new(inner.clone());
@@ -922,7 +1029,7 @@ mod tests {
             watched.request_reached.notified().await;
             initial.forget_and_prune_locally(inner.as_ref(), store, &BTreeSet::from(["b".into()])).await.unwrap();
             // The old slot is populated by a late write of an edit made against the seed.
-            let delayed = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into())]) };
+            let delayed = Base { objects: BTreeMap::from([("a".into(), "parent/v06".into())]), ..Base::default() };
             delayed.publish_at(inner.as_ref(), store, 1).await.unwrap();
             watched.resume_request.notify_one();
             assert!(load.await.unwrap().unwrap().objects.is_empty(), "a backfilled slot cannot establish the current manifest");
@@ -932,7 +1039,7 @@ mod tests {
     #[tokio::test]
     async fn a_withdrawal_names_the_observed_owner() {
         let bucket = bucket();
-        let actual = Base { objects: BTreeMap::from([("a".into(), "other/v06".into()), ("b".into(), "parent/v06".into())]) };
+        let actual = Base { objects: BTreeMap::from([("a".into(), "other/v06".into()), ("b".into(), "parent/v06".into())]), ..Base::default() };
         actual.initialize(bucket.as_ref(), "child/v06").await.unwrap();
         let mut observed = actual.clone();
         observed.objects.insert("a".into(), "parent/v06".into());
@@ -950,7 +1057,7 @@ mod tests {
         let store = format!("{}/v06", record.storage_prefix());
         let marker = format!("{}/00000000000000000000-release", crate::store::GARBAGE_DIRECTORY);
         let physical = |name: &str| key(&format!("{store}/{name}")).unwrap();
-        let base = Base { objects: BTreeMap::from([("payload".into(), "parent/v06".into()), (marker.clone(), "parent/v06".into())]) };
+        let base = Base { objects: BTreeMap::from([("payload".into(), "parent/v06".into()), (marker.clone(), "parent/v06".into())]), ..Base::default() };
         base.initialize(inner.as_ref(), &store).await.unwrap();
         let released = Bytes::from(serde_json::to_vec(&serde_json::json!({"key": "payload", "released_at_ms": 0})).unwrap());
         for prefix in [store.as_str(), "parent/v06"] {

@@ -146,7 +146,11 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
             let Some(relative) = witness.target_name().filter(|_| witness.release_version.is_some() || witness.terminal.is_some()) else { continue; };
             if !witness.permits(candidate, &store) { continue; }
             let target = ObjectKey::new(format!("{store}/{relative}"))?;
-            if advisory.is_some_and(|observed| observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key)) { continue; }
+            if advisory.is_some_and(|observed| match (&witness.version, &witness.release_version) {
+                (Some(version), Some(release)) =>
+                    observed.has_declared_version(&target, version) || observed.has_declared_version(&marker.key, release),
+                _ => observed.has_declared_reference(&target) || observed.has_declared_reference(&marker.key),
+            }) { continue; }
             eligible.push((marker.key, target, witness));
         }
         let mut checked = BTreeSet::new();
@@ -475,9 +479,12 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
     for record in deployments.iter().filter(|record| record.lineage == lineage && record.lifecycle != Lifecycle::Deleted) {
         for referrer in stores(bucket, &record.storage_prefix()).await? {
             let base = Base::load(bucket, &referrer).await?;
-            if base.objects.get(relative) == Some(&store) || base.objects.get(release_name) == Some(&store) {
-                return Ok(None);
-            }
+            let retained = match &retirement.work {
+                RetirementWork::S3 { version, release_version, .. } =>
+                    base.retains_version(&store, relative, version) || base.retains_version(&store, release_name, release_version),
+                _ => base.objects.get(relative) == Some(&store) || base.objects.get(release_name) == Some(&store),
+            };
+            if retained { return Ok(None); }
         }
     }
 

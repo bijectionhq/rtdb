@@ -181,7 +181,8 @@ The coordinated collector submits eligible trie and receipt L0 work without a re
 The approved reachability contract replaces the cutoff for deletion.
 For hosted and versioned Classic S3 loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
 Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
-Generic block and timestamp forks admit under the source lineage reservation and require the selected checkpoint's complete inventory. A same-organisation fork references its actual physical dependencies, including their enclosing packs. Fork admission no longer compares publication age.
+Generic block and timestamp forks admit under the source lineage reservation and require the selected checkpoint's complete inventory. A same-organisation fork references its physical dependencies, including enclosing packs and the exact S3 versions or terminal publications.
+Inherited reads and source disposal recheck the original publication. The versioned reaper compares the fork's claim to its exact candidate.
 Hosted installed search runs with exact publication evidence use the same bounded catalog claim and can be submitted without the reader ageing timer.
 A hosted checkpoint subscription renews the exact catalog scope through a fresh storage-ledger admission. Prior readers retain independent claims through provider and delivery drain.
 Directory-managed search staging binds the upload to its writer epoch and storage region. A successor waits for both writer turnover and provider drain before ordering abandonment.

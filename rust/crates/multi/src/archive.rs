@@ -1504,18 +1504,33 @@ pub(crate) async fn reference_fork_checkpoint(
         let physical = source_store.physical_member(&member.name).await?;
         if base.objects.contains_key(physical.as_str()) { continue; }
         let original = key(&format!("{root}/{physical}"))?;
-        let (owner, observed) = match bucket.observe_head(&original).await {
-            Ok(observed) => (&root, observed),
+        let (owner, address, observed) = match bucket.observe_head(&original).await {
+            Ok(observed) => (&root, original, observed),
             Err(Error::MissingObject(_)) => {
                 let owner = source_base.objects.get(physical.as_str())
                     .ok_or_else(|| inconsistent("A fork dependency has no physical owner"))?;
                 let inherited = key(&format!("{owner}/{physical}"))?;
-                (owner, bucket.observe_head(&inherited).await?)
+                let observed = bucket.observe_head(&inherited).await?;
+                (owner, inherited, observed)
             }
             Err(error) => return Err(error.into()),
         };
         if observed.version != member.version {
             return Err(inconsistent("The fork dependency has a different provider publication"));
+        }
+        if bucket.s3_publication_address(&address).is_some() {
+            use rtdb_types::PhysicalObjectPublication;
+
+            let publication = bucket.retirement_publication(&address).await?
+                .ok_or_else(|| inconsistent("A hosted fork dependency has no immutable provider publication"))?;
+            let matches = match &publication {
+                PhysicalObjectPublication::Version(version) => Some(version) == member.version.as_ref(),
+                PhysicalObjectPublication::Terminal(_) => member.version.is_none(),
+            };
+            if !matches || owner != &root && source_base.publications.get(physical.as_str()) != Some(&publication) {
+                return Err(inconsistent("A fork dependency changed its original provider publication"));
+            }
+            base.publications.insert(physical.to_string(), publication);
         }
         base.objects.insert(physical.to_string(), owner.to_owned());
     }

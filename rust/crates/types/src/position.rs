@@ -60,7 +60,8 @@ pub struct TerminalObjectPublication {
     pub etag: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PhysicalObjectPublication {
     Version(PhysicalObjectVersion),
     Terminal(TerminalObjectPublication),

@@ -2037,7 +2037,7 @@ mod tests {
         let ancestor = "parent/v06";
         let ancestor_copy = key(&format!("{ancestor}/{file}"));
         bucket.copy(&physical, &ancestor_copy).await.unwrap();
-        let base = crate::reference::Base { objects: BTreeMap::from([(file.to_string(), ancestor.into())]) };
+        let base = crate::reference::Base { objects: BTreeMap::from([(file.to_string(), ancestor.into())]), ..Default::default() };
         let manifest = key(&format!("{scope}/{}/{:020}", crate::reference::BASE_MANIFEST, 0));
         bucket.put(&manifest, serde_json::to_vec(&base).unwrap().into()).await.unwrap();
 

@@ -18,6 +18,7 @@ use crate::reference::{Base, References, key};
 use crate::store::checkpoint_metadata_block;
 use crate::store::exact_retirement::{settle, tombstones::{TombstoneJournal, retire}};
 
+#[derive(Clone, Copy)]
 enum Publication<'a> {
     Version(&'a PhysicalObjectVersion),
     Tombstone { allocation: Uuid, target: &'a S3TombstoneTarget },
@@ -79,23 +80,27 @@ pub(in crate::store) async fn reap_hosted(
     let references = References::scan(bucket, &deployments).await?;
     for pack in bucket.list(Some(&key(&format!("{prefix}{PACK_DIRECTORY}"))?)).await? {
         let Some(block) = pack.key.as_str().strip_prefix(&prefix).and_then(pack_block) else { continue; };
-        if block >= checkpoint.block || references.has_declared_reference(&pack.key) { continue; }
+        if block >= checkpoint.block { continue; }
         let Some(observed) = observe_pack(bucket, terminal.as_ref(), &pack.key).await? else { continue; };
         if observed.index.entries.keys().all(|name| checkpoint_metadata_block(name) == Some(block)) {
             continue;
         }
         let work = match observed.storage {
             PackStorage::Raw { version: Some(version), .. } => {
-                if !provider.exact_retirement_available(&pack.key, &version).await? { continue; }
+                if references.has_declared_version(&pack.key, &version)
+                    || !provider.exact_retirement_available(&pack.key, &version).await?
+                {
+                    continue;
+                }
                 RetirementWork::ReplayPack {
                     deployment: candidate.id.clone(), target: pack.key.to_string(), version, capture, checkpoint,
                 }
             }
-            PackStorage::Terminal { publication, .. } => RetirementWork::ReplayPackTombstone {
+            PackStorage::Terminal { publication, .. } if !references.has_declared_reference(&pack.key) => RetirementWork::ReplayPackTombstone {
                 deployment: candidate.id.clone(), target: pack.key.to_string(),
                 tombstone: publication.target().clone(), allocation: publication.allocation(), capture, checkpoint,
             },
-            PackStorage::Raw { version: None, .. } => continue,
+            _ => continue,
         };
         let retirement = LineageRetirement {
             token: Uuid::new_v4(),
@@ -189,7 +194,11 @@ async fn authorize(
         return Ok(());
     }
     let references = References::scan(bucket, &directory.deployments().await?).await?;
-    if references.has_declared_reference(&target) { return Ok(()); }
+    let retained = match publication {
+        Publication::Version(version) => references.has_declared_version(&target, version),
+        Publication::Tombstone { .. } => references.has_declared_reference(&target),
+    };
+    if retained { return Ok(()); }
     let cipher = crate::store::directory_publications(keys, &record, IoRegion::new())?;
     let terminal = match publication {
         Publication::Version(_) => None,

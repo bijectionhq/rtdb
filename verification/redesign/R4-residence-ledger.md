@@ -148,7 +148,9 @@ An opaque or oversized claim keeps the conservative scope. Search staging and un
 
 The source lineage reservation precedes checkpoint inventory reads and orders them against the collector.
 A same-organisation fork resolves the selected root, its table blocks, and every replay member to the original physical object or enclosing pack.
-It publishes just those owner references and verifies that the recipient opens the same inventory before making the fork selectable.
+It publishes those owner references with the provider identity of each S3 dependency and verifies that the recipient opens the same inventory before making the fork selectable.
+A descendant reuses an inherited publication's original identity. Each read or materialization checks it under the source residence's authority.
+The versioned deletion grant intersects these claims by publication identity.
 A fork into a different organisation verifies and copies the selected inventory under the recipient's own storage key.
 Historical block and timestamp admission require the precise dependencies to be present, independent of elapsed time.
 
