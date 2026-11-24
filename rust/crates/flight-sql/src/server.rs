@@ -40,16 +40,28 @@ impl ServerDriver {
         Self::bind_with_clock(config, node, authenticator, Arc::new(SystemClock)).await
     }
     /// Binds the private TLS listener for the installed native database.
-    pub async fn bind_standalone(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, mut tls: rustls::ServerConfig) -> Result<(ServerHandle, Self)> {
+    pub async fn bind_standalone(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, tls: rustls::ServerConfig) -> Result<(ServerHandle, Self)> {
         if !config.address.ip().is_loopback() || config.owned_native_actions || config.hosted_controls.is_some()
             || config.audience.is_some() || config.forwarded_peer.is_some() || config.playground
         {
             return Err(Anomaly::incorrect("rtdb.flight-sql/standalone", "Installed Flight requires a private native listener"));
         }
         config.validate(Some("xtdb"))?;
+        Self::bind_private_tls(config, node, authenticator, tls, Binding::Standalone).await
+    }
+
+    pub async fn bind_loopback_tls(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, tls: rustls::ServerConfig) -> Result<(ServerHandle, Self)> {
+        if !config.address.ip().is_loopback() {
+            return Err(Anomaly::incorrect("rtdb.flight-sql/development-tls", "Development Flight TLS requires a loopback address"));
+        }
+        config.validate(None)?;
+        Self::bind_private_tls(config, node, authenticator, tls, Binding::Ordinary).await
+    }
+
+    async fn bind_private_tls(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, mut tls: rustls::ServerConfig, binding: Binding) -> Result<(ServerHandle, Self)> {
         tls.alpn_protocols = vec![b"h2".to_vec()];
         let listener = TcpListener::bind(config.address).await.map_err(network)?;
-        Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls))), listener, Binding::Standalone)
+        Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls))), listener, binding)
     }
     pub async fn bind_with_clock(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>) -> Result<(ServerHandle, Self)> {
         config.validate(None)?;

@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use rtdb_server::cli::{self, Command, NodeMode};
 
 fn parse(arguments: &[&str]) -> Command { cli::parse(arguments.iter().map(|value| (*value).into()), &|_| None).unwrap() }
@@ -92,6 +92,73 @@ fn multi_development_tls_requires_an_exact_incarnation_and_explicit_local_data()
     for arguments in invalid {
         assert!(cli::parse(arguments.iter().copied().map(str::to_owned), &|_| None).is_err(), "{arguments:?}");
     }
+}
+
+#[test]
+fn multi_tls_development_authn_admits_oidc_or_user_list_only() {
+    use rtdb_auth::{AuthConfig, GrantedAccess};
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    let path = input.path().to_str().unwrap().to_owned();
+    let path = path.as_str();
+    let id = "01234567-89ab-4def-8000-000000000001";
+    let valid = [
+        "dev", "--multi", "--data", "fresh", "--incarnation", id,
+        "--multi-tls-dir", "tls", "--multi-authn", path,
+    ];
+    let Command::Dev(options) = parse(&valid) else { panic!("expected development TLS"); };
+
+    let oidc = r#"authn: !OpenIdConnect
+  issuerUrl: https://127.0.0.1:7777
+  issuerCaCertificate: fixture-ca
+  clientId: rtdb
+  clientSecret: fixture
+  workloadGrants:
+    audience: local-create
+    clientIdPrefix: managed-
+  rules:
+    - method: CLIENT_CREDENTIALS
+"#;
+    input.write_all(oidc.as_bytes()).unwrap();
+    let loaded = options.load_reserved().unwrap();
+    let AuthConfig::OpenIdConnect(auth) = &loaded.configuration().auth else { panic!("expected OIDC"); };
+    assert_eq!(auth.issuer_ca_pem.as_deref(), Some("fixture-ca"));
+    assert_eq!(auth.workload_grants.as_ref().unwrap().audience(), "local-create");
+    assert_eq!(loaded.configuration().flight_sql.as_ref().unwrap().host, "127.0.0.1");
+
+    let user_list = r#"authn: !UserList
+  users:
+    placement: !Argon2id fixture-hash
+  grants:
+    placement:
+      xtdb: READ_WRITE
+"#;
+    std::fs::write(path, user_list).unwrap();
+    let loaded = options.load_reserved().unwrap();
+    let AuthConfig::UserList { grants, .. } = &loaded.configuration().auth else { panic!("expected UserList"); };
+    assert_eq!(grants["placement"]["xtdb"], GrantedAccess::Write);
+
+    for yaml in [
+        "authn: !SingleRootUser {}",
+        "flightSql: {host: '0.0.0.0'}",
+        "",
+    ] {
+        std::fs::write(path, yaml).unwrap();
+        assert!(options.load_reserved().is_err());
+    }
+    for invalid in [
+        format!("{user_list}server: null\n"),
+        user_list.replace("xtdb:", "'*':"),
+        user_list.split("  grants:").next().unwrap().into(),
+    ] {
+        std::fs::write(path, invalid).unwrap();
+        assert!(options.load_reserved().is_err());
+    }
+    #[cfg(feature = "multi")]
+    {
+        std::fs::write(path, format!("{user_list}deploymentCreatePrincipals: [placement]\n")).unwrap();
+        assert!(options.load_reserved().is_ok());
+    }
+    assert!(cli::parse(["dev", "--multi", "--multi-authn", path].map(str::to_owned), &|_| None).is_err());
 }
 
 #[test]

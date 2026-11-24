@@ -214,15 +214,15 @@ impl ServerDriver {
             Some(policy) => Arc::new(HostedTransactionAuthority { auth: auth.clone(), owner: policy.owner.clone() }),
             None => auth.clone(),
         };
-        let (resources, external_sources, mut registrations, override_resources, installed_tls) = match backend {
+        let (resources, external_sources, mut registrations, override_resources, development_tls, installed_tls) = match backend {
             Backend::Configured(install, tls) => {
                 let (resources, sources, registrations) = crate::resources::open(&config, &memory, &metrics)?;
-                (resources, sources, registrations, install, tls)
+                (resources, sources, registrations, install, tls, None)
             }
             Backend::Installed { resources, tls } => {
                 options.compaction_threads = config.compactor.threads;
                 options.artefact_threads = if config.search.enabled { config.search.threads } else { 0 };
-                (*resources, rtdb_node::ExternalSources::new(), Vec::new(), None, tls)
+                (*resources, rtdb_node::ExternalSources::new(), Vec::new(), None, None, tls)
             }
         };
         let mut resources = match transaction_clock {
@@ -316,9 +316,10 @@ impl ServerDriver {
                 addresses.audience_flight = Some(handle.address());
                 flight.push((handle, driver));
             }
-            let (handle, driver) = match &installed_tls {
-                Some(tls) => rtdb_flight_sql::ServerDriver::bind_standalone(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
-                None => rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?,
+            let (handle, driver) = match (&installed_tls, &development_tls) {
+                (Some(tls), _) => rtdb_flight_sql::ServerDriver::bind_standalone(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
+                (None, Some(tls)) => rtdb_flight_sql::ServerDriver::bind_loopback_tls(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
+                (None, None) => rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?,
             };
             addresses.flight_sql = Some(handle.address());
             flight.push((handle, driver));

@@ -135,3 +135,63 @@ Stop the backend with Ctrl-C, then use `kill -TERM "$rtdb_pid"` and `wait "$rtdb
   Preserve the original UUID, launch inputs and Bijection storage when checking the retained installation on restart.
 
 The Bijection transport cases `startup_catalog_checks_only_after_declaration_acceptance` and `original_receipt_survives_a_lost_or_incomplete_reply` cover the declaration and receipt edges separately under `native_store_runtime --lib rtdb::flight_v1`.
+
+## Separate OIDC Create and UserList profiles
+
+Start two processes with separate fresh data directories and bootstrap UUIDs.
+Pass a private UTF-8 YAML file of at most 128 KiB to each process.
+
+```bash
+"$RTDB" dev --multi --data "$data" --multi-tls-dir "$tls" \
+  --incarnation "$bootstrap_id" --multi-authn "$profile" --flight-sql-port 0
+```
+
+The TLS directory supplies `certificate.pem` and `key.pem`.
+Each process uses the private Flight CA that issued its IP-SAN certificate.
+In this profile the YAML supplies the authenticator.
+
+For exact Create, configure the issuer and audience of the dedicated fixture.
+
+```yaml
+authn: !OpenIdConnect
+  issuerUrl: https://127.0.0.1:7777
+  issuerCaCertificate: !Env RTDB_FIXTURE_ISSUER_CA
+  clientId: rtdb
+  clientSecret: !Env RTDB_FIXTURE_OIDC_SECRET
+  workloadGrants:
+    audience: local-create
+    clientIdPrefix: managed-
+  rules:
+    - method: CLIENT_CREDENTIALS
+```
+
+The issuer CA variable contains PEM text.
+Wait for the normal JSON line confirming `xtdb`, the bootstrap UUID and a positive writer epoch.
+Choose an unused database name other than `xtdb` and a different nonzero UUID for the exact Create request and its version 1 grant.
+The catalog reserves that pair on first Create.
+Use `Authorization: Client <base64(client_id:client_secret)>` and check both reply fields.
+If the call sets `x-xtdb-database`, use the grant's target name.
+See [Managed workload grants](rtdb-managed-workload-grants.adoc) for the issuer wire contract.
+Use the correct Flight CA when varying the issuer CA or issuer hostname.
+
+For the fixed-scope bridge, configure each principal with explicit database grants and use Basic credentials against that separate process.
+
+```yaml
+authn: !UserList
+  users:
+    placement: !Argon2id 'PLACEMENT_HASH'
+    conductor: !Argon2id 'CONDUCTOR_HASH'
+  grants:
+    placement:
+      xtdb: READ_WRITE
+    conductor:
+      xtdb: READ_WRITE
+  rules:
+    - method: PASSWORD
+```
+
+Replace the placeholders with hashes from `rtdb hash-password` fed on stdin.
+Use the bootstrap UUID as the exact bridge attachment when granting access to `xtdb`.
+For a different bridge target, use its name in the grants and add a dedicated password principal with an empty database grant mapping and top-level `deploymentCreatePrincipals: [seed]`.
+That principal can seed the bridge with an explicit name and UUID through the existing Create action.
+The profile rejects wildcard database grants and requires a grant mapping for each UserList principal.

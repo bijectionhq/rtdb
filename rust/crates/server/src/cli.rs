@@ -5,7 +5,7 @@ use rtdb_format::database::proto::{LocalLog, LocalStorage, database_config::{Log
 use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
 
-use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
+use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, ParsedYamlDocument, PgwireSettings, FlightSettings};
 
 #[cfg(feature = "multi")]
 mod admin;
@@ -14,7 +14,7 @@ pub use admin::AdminOptions;
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME [--incarnation UUID]\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--multi-authn FILE] [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -35,6 +35,7 @@ pub struct DevOptions {
 pub struct MultiDevTls {
     pub incarnation: uuid::Uuid,
     directory: PathBuf,
+    authn: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +209,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         let mut pgwire_requested = false;
         let mut data_requested = false;
         let mut tls_directory = None;
+        let mut authn = None;
         let mut incarnation = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
@@ -223,6 +225,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                     let directory = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
                         .ok_or_else(|| invalid("--multi-tls-dir requires a directory"))?;
                     tls_directory = Some(PathBuf::from(directory));
+                }
+                "--multi-authn" if authn.is_none() => {
+                    let path = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
+                        .ok_or_else(|| invalid("--multi-authn requires a YAML file"))?;
+                    authn = Some(PathBuf::from(path));
                 }
                 "--incarnation" if incarnation.is_none() => {
                     let raw = arguments.next().ok_or_else(|| invalid("--incarnation requires a UUID"))?;
@@ -241,11 +248,12 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             }
         }
         if options.multi && pgwire_requested { return Err(invalid("Multi development serves Flight SQL; use --flight-sql-port")); }
-        options.multi_tls = match (tls_directory, incarnation) {
-            (None, None) => None,
-            (Some(directory), Some(incarnation)) if options.multi && data_requested && options.flight_sql_port >= 0 => {
-                Some(MultiDevTls { directory, incarnation })
+        options.multi_tls = match (tls_directory, incarnation, authn) {
+            (None, None, None) => None,
+            (Some(directory), Some(incarnation), authn) if options.multi && data_requested && options.flight_sql_port >= 0 => {
+                Some(MultiDevTls { directory, incarnation, authn })
             }
+            (_, _, Some(_)) => return Err(invalid("--multi-authn requires the complete Multi TLS development profile")),
             _ => return Err(invalid("--multi-tls-dir and --incarnation require --multi, explicit --data and an enabled Flight SQL listener")),
         };
         return Ok(Command::Dev(options));
@@ -352,7 +360,11 @@ fn standalone(initialize: bool, mut arguments: impl Iterator<Item = String>) -> 
 impl DevOptions {
     pub fn load_reserved(&self) -> Result<ParsedConfiguration> {
         let memory = MemoryBudget::new(self.allocation_limit_bytes);
-        let mut parsed = ParsedConfiguration::from_yaml("", &ProcessEnvironment, &memory, false)?;
+        let authn = self.multi_tls.as_ref().and_then(|tls| tls.authn.as_deref());
+        let mut parsed = match authn {
+            Some(path) => load_multi_dev_authn(path, &memory)?,
+            None => ParsedConfiguration::from_yaml("", &ProcessEnvironment, &memory, false)?,
+        };
         let config = parsed.configuration_mut();
         let log = self.data.join("log");
         let storage = self.data.join("storage");
@@ -360,12 +372,46 @@ impl DevOptions {
         config.primary.log = Some(Log::LocalLog(LocalLog { path: Some(path(log)?), epoch: Some(0) }));
         config.primary.storage = Some(Storage::LocalStorage(LocalStorage { path: Some(path(storage)?), epoch: Some(0) }));
         config.default_v1_serving = !self.multi;
-        config.auth = rtdb_auth::AuthConfig::SingleRootUser {
-            password: self.multi_tls.as_ref().map(MultiDevTls::password).transpose()?,
-        };
+        if authn.is_none() {
+            config.auth = rtdb_auth::AuthConfig::SingleRootUser {
+                password: self.multi_tls.as_ref().map(MultiDevTls::password).transpose()?,
+            };
+        }
         config.server = Some(PgwireSettings { port: self.pgwire_port, ..Default::default() });
         config.flight_sql = Some(FlightSettings { port: self.flight_sql_port, ..Default::default() });
         Ok(parsed.with_object_sort(self.object_sort))
+    }
+}
+
+fn load_multi_dev_authn(path: &Path, memory: &std::sync::Arc<MemoryBudget>) -> Result<ParsedConfiguration> {
+    use rtdb_auth::{AuthConfig, Method};
+    use rtdb_format::config::Yaml;
+
+    let bytes = Zeroizing::new(read_private_multi_input(path, 128 * 1024)?);
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid("Multi development authn requires UTF-8 YAML"))?;
+    let scrub = |error: Anomaly| Anomaly::new(error.category, error.code, "Invalid Multi development authn configuration");
+    let document = ParsedYamlDocument::from_yaml(text, &ProcessEnvironment, memory).map_err(scrub)?;
+    let Yaml::Mapping(fields) = document.value() else {
+        return Err(invalid("Multi development authn requires a YAML mapping"));
+    };
+    if !fields.contains_key(Yaml::String("authn".into()))
+        || !fields.keys().all(|key| matches!(key.as_str(), Some("authn" | "deploymentCreatePrincipals")))
+    {
+        return Err(invalid("Multi development authn accepts authn and optional deploymentCreatePrincipals"));
+    }
+    let create_principals = fields.contains_key(Yaml::String("deploymentCreatePrincipals".into()));
+    let parsed = document.into_node_configuration(&ProcessEnvironment, false).map_err(scrub)?;
+    match &parsed.configuration().auth {
+        AuthConfig::OpenIdConnect(oidc)
+            if !create_principals && oidc.issuer_url.scheme() == "https"
+                && oidc.workload_grants.as_ref().is_some_and(|grant| grant.assignment().is_none())
+                && !oidc.rules.is_empty()
+                && oidc.rules.iter().all(|rule| rule.method == Method::ClientCredentials) => Ok(parsed),
+        AuthConfig::UserList { users, rules, grants }
+            if !users.is_empty() && !rules.is_empty()
+                && rules.iter().all(|rule| rule.method == Method::Password)
+                && users.keys().all(|user| grants.get(user).is_some_and(|granted| !granted.contains_key("*"))) => Ok(parsed),
+        _ => Err(invalid("Multi development requires HTTPS OIDC Create grants or a password-only UserList with explicit per-database grants")),
     }
 }
 
@@ -385,27 +431,31 @@ impl MultiDevTls {
     }
 
     fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
-        let path = self.directory.join(name);
-        let io_error = |error| invalid(format!("Inspect Multi development TLS input {name}: {error}"));
-        let metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
-        if !metadata.is_file() {
-            return Err(invalid(format!("Multi development TLS input {name} must be a regular file")));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err(invalid(format!("Multi development TLS input {name} must be private")));
-            }
-        }
-        let mut bytes = Vec::new();
-        File::open(&path).map_err(io_error)?.take(limit as u64 + 1)
-            .read_to_end(&mut bytes).map_err(io_error)?;
-        if bytes.len() > limit {
-            return Err(invalid(format!("Multi development TLS input {name} exceeds its size limit")));
-        }
-        Ok(bytes)
+        read_private_multi_input(&self.directory.join(name), limit)
     }
+}
+
+fn read_private_multi_input(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
+    let io_error = |error| invalid(format!("Read Multi development input {name}: {error}"));
+    let metadata = std::fs::symlink_metadata(path).map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(invalid(format!("Multi development input {name} must be a regular file")));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(invalid(format!("Multi development input {name} must be private")));
+        }
+    }
+    let mut bytes = Vec::new();
+    File::open(path).map_err(io_error)?.take(limit as u64 + 1)
+        .read_to_end(&mut bytes).map_err(io_error)?;
+    if bytes.len() > limit {
+        return Err(invalid(format!("Multi development input {name} exceeds its size limit")));
+    }
+    Ok(bytes)
 }
 
 fn repair_checkpoint(value: &str) -> Result<rtdb_node::RepairCheckpoint> {
