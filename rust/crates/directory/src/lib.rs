@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, PhysicalObjectVersion, Result, S3ObjectNamespace};
+use rtdb_types::{Anomaly, AnomalyCategory, JournalEndpoint, PhysicalObjectVersion, Result, S3ObjectNamespace, TerminalObjectPublication};
 use serde::{Deserialize, Serialize};
 
 mod state_file;
@@ -444,6 +444,10 @@ impl ArchiveSourceHold {
 
     pub fn permits_retirement(&self, version: &PhysicalObjectVersion) -> bool {
         self.namespace == version.namespace && self.versions.get(&version.key) != Some(&version.version)
+    }
+
+    pub fn permits_terminal_retirement(&self, publication: &TerminalObjectPublication) -> bool {
+        self.namespace == publication.namespace && !self.versions.contains_key(&publication.key)
     }
 }
 

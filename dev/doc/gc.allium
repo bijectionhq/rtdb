@@ -360,7 +360,8 @@ rule GarbageCollectTries {
     -- Hosted release of a retired search run, an exact sealed artefact, or a directory page waits for an open lineage, drained fork preparations, and the withdrawal of declared fork references to the publication.
     -- A hosted directory page release requires an observed immutable provider publication.
     -- An archive copy or admitted reference read retains a publication while its storage region holds it.
-    -- A version-scoped archive hold permits release only when the recorded provider version proves the publication is outside that hold.
+    -- A version-scoped archive hold permits release when the publication belongs to the hold's provider namespace and falls outside the hold.
+    -- The hold covers the exact provider key and version for a versioned publication and the provider key for a terminal publication.
     -- The collector leaves a held run or page pending for a later cycle.
     -- The reaper validates the current holds again under its physical retirement reservation.
     -- Tables are processed concurrently up to `tableParallelism`, with DELETE

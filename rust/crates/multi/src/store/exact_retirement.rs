@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use rtdb_directory::{Checkpoint, DeploymentRecord, Directory, ExactRetirementGrant, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
+use rtdb_directory::{ArchiveSourceHold, Checkpoint, DeploymentRecord, Directory, ExactRetirementGrant, Lifecycle, LineageChange, LineageRetirement, LineageState, RetirementWork, StorageRegion, Version};
 use rtdb_format::keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key};
 use rtdb_format::log::proto::PublishedObjectVersion;
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
@@ -991,6 +991,8 @@ pub(crate) async fn permits_search_release(directory: &dyn Directory, bucket: &d
     if lineage.open_generation().is_none() || lineage.preparations().next().is_some() { return Ok(false); }
 
     let target = ObjectKey::new(format!("{store}/{key}"))?;
+    let terminal = publication.and_then(PublishedObjectVersion::terminal_publication)
+        .filter(|publication| !publication.namespace.bucket.is_empty() && !publication.key.is_empty());
     let version = publication.filter(|publication| publication.terminal.is_none()).and_then(|publication| {
         let bucket = publication.bucket.as_ref().filter(|bucket| !bucket.is_empty())?;
         let key = publication.key.as_ref().filter(|key| !key.is_empty())?;
@@ -1001,7 +1003,10 @@ pub(crate) async fn permits_search_release(directory: &dyn Directory, bucket: &d
         })
     });
     if general_reference_holds(owner, &[&target])
-        || owner.storage_regions.values().any(|region| archived_source_holds(region, &[version.as_ref()]))
+        || owner.storage_regions.values().filter_map(archive_source_hold).any(|hold| match &terminal {
+            Some(publication) => !hold.permits_terminal_retirement(publication),
+            None => version.as_ref().is_none_or(|version| !hold.permits_retirement(version)),
+        })
     {
         return Ok(false);
     }
@@ -1039,9 +1044,16 @@ fn general_reference_holds(record: &DeploymentRecord, targets: &[&ObjectKey]) ->
 }
 
 fn archived_source_holds(region: &StorageRegion, versions: &[Option<&PhysicalObjectVersion>]) -> bool {
-    let (StorageRegion::Remote { archive_source: Some(hold), .. }
-        | StorageRegion::ReferenceRead { archive_source: Some(hold), .. }) = region else { return false; };
-    versions.iter().any(|version| version.is_none_or(|version| !hold.permits_retirement(version)))
+    archive_source_hold(region).is_some_and(|hold| {
+        versions.iter().any(|version| version.is_none_or(|version| !hold.permits_retirement(version)))
+    })
+}
+
+fn archive_source_hold(region: &StorageRegion) -> Option<&ArchiveSourceHold> {
+    match region {
+        StorageRegion::Remote { archive_source, .. } | StorageRegion::ReferenceRead { archive_source, .. } => archive_source.as_ref(),
+        _ => None,
+    }
 }
 
 fn changed() -> Anomaly {
@@ -1525,6 +1537,36 @@ mod tests {
             if !self.absent(key, version).await? { self.delete(key).await?; }
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_search_release_respects_archive_hold_keys() {
+        let directory = MemoryDirectory::new();
+        let bucket = MemoryStore::default();
+        let mut owner = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let allocation = Uuid::new_v4();
+        owner.storage_namespaces = Some(StorageNamespaces { objects: allocation, keys: [0; 32] });
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
+        let store = format!("{}/{root}", owner.storage_prefix());
+        let namespace = S3ObjectNamespace { bucket: "cell".into(), endpoint: None, region: None };
+        let run = |digest: &str| ObjectKey::new(format!("tables/public$docs/search-runs/{}.f16.arrow", digest.repeat(64))).unwrap();
+        let held = run("a");
+        let unrelated = run("b");
+        let terminal = |key: &ObjectKey| TerminalObjectPublication {
+            namespace: namespace.clone(), key: format!("provider/{store}/{key}"), allocation, etag: "etag".into(),
+        };
+
+        let mut region = super::super::remote_storage_region(Some(Uuid::new_v4()), None);
+        let StorageRegion::Remote { archive_source, .. } = &mut region else { unreachable!() };
+        *archive_source = Some(ArchiveSourceHold::new(namespace.clone(), [(terminal(&held).key, "version".into())].into()));
+        owner.storage_regions.insert(Uuid::new_v4(), region);
+        let owner = directory.create_deployment(owner).await.unwrap();
+
+        let held_publication = PublishedObjectVersion::from(PhysicalObjectPublication::Terminal(terminal(&held)));
+        let unrelated_publication = PublishedObjectVersion::from(PhysicalObjectPublication::Terminal(terminal(&unrelated)));
+        assert!(!permits_search_release(directory.as_ref(), &bucket, &owner, &store, &held, Some(&held_publication)).await.unwrap());
+        assert!(permits_search_release(directory.as_ref(), &bucket, &owner, &store, &unrelated, Some(&unrelated_publication)).await.unwrap());
+        assert!(!permits_search_release(directory.as_ref(), &bucket, &owner, &store, &unrelated, None).await.unwrap());
     }
 
     #[tokio::test]

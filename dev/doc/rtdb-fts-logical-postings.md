@@ -104,6 +104,8 @@ After the source cut is installed and the writer has drained, the collector can 
 If a fresh observation finds the body absent, the collector can remove the intent.
 Adoption and abandonment are mutually exclusive at that allocation.
 The retirement can release the body after reader and checkpoint protection drains.
+In hosted storage, a version-scoped archive hold in the same provider namespace retains a terminal-published run by its provider key.
+A retired run at an unrelated provider key can record its release while the archive copy drains.
 An abandoned allocation remains fenced through checkpoint recovery.
 Incomplete provider uploads are handled by the provider's publication journal where available.
 Hosted storage authenticates ranges of new logical runs and history sidecars with independently encrypted frames.
