@@ -8,8 +8,9 @@ The residence floor and recovery roots protect outstanding readers and replay.
 Collection preserves all observations above the horizon and leaves admitted reads entitled to their held view until release.
 A call needing a physical erasure deadline uses privacy erasure for the protected material in its custody domain.
 Bijection's routine reclaim currently issues SQL `ERASE` batches.
-Its existing deployment contract targets 120 seconds after its irreversible destruction order and requires qualification for a fixed deadline.
-The native handoff must preserve that distinction.
+A custody profile may offer a fixed physical-destruction deadline only if it can enforce the deadline during outage under its declared clock and fault bounds.
+No such profile is installed today.
+The installed profile keeps the 120-second operational target from the irreversible destruction order.
 Migration requires a native collection operation and conversion of those call sites before deadline-driven SQL `ERASE` is enabled.
 Tests must cover live keys in the same physical unit as retired history and a held view admitted before collection.
 
@@ -31,7 +32,7 @@ It states the fate of the source's own ciphertext and decryption grants.
 4. Atomically select the erasing generation, close affected admission and renewal in the publication order, and record destruction obligations for the exact old key slots.
    New views exclude the erased history from that decision.
    A promised deadline budgets both the maximum drain and the provider's evidenced destruction tail from the commit.
-   Until a provider and cache policy qualify, a request may remain pending or receive a failure before a fixed deadline is committed.
+   Admission of a fixed deadline requires a profile that can enforce both bounds during outage.
 5. Previously admitted views may finish under their original exclusive grant deadlines.
    A key authority may withdraw the required material after the drain, when no admitted work can use or release the old body.
    An old view that requires a withdrawn key receives `rtdb/erased-under-view`.
@@ -80,7 +81,7 @@ Installed recovery uses the clean manifest's exact root and replay cut. Its firs
 The erasure coordinator reopens every exact member through its provider and verifies the body and its recorded publication before rotation.
 It then checks the rotation receipt and the installed Logkeeper client's signed proof that both recovery slots on each voter in an accepting quorum were read back.
 The custody adapter owns staging and verifying a complete survivor closure, draining plaintext and egress and enforcing a deadline backed by evidenced destruction of the retiring key slots.
-The current provider profile keeps the 120-second operational target.
+The installed provider profile supports the operational target and refuses fixed-deadline admission.
 The native tests exercise the coordinator with Logkeeper application decisions and a local vault under an injected custody adapter.
 Installed serving reads carry the journal-issued lease through provider access and check it again before returning a body.
 Detached replica objects inherit the servicing lease for cryptography and open in the original writer's key namespace.
