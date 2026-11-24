@@ -122,6 +122,13 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     if !settings.local_compaction && settings.pool != rtdb_directory::MemberPool::Compaction { settings.configuration.compactor.threads = 0; }
     settings.agent.compaction_worker = settings.pool == rtdb_directory::MemberPool::Compaction;
     settings.configuration.indexer.flush_duration = settings.configuration.indexer.flush_duration.min(PLACED_FLUSH_INTERVAL_LIMIT);
+    // YAML omission sets the private-storage default flag.
+    if settings.hosted_task.is_some()
+        && ordered.is_runtime()
+        && settings.configuration.ordered_index_arrow_references_on_private_storage
+    {
+        settings.configuration.ordered_index_arrow_references = true;
+    }
     let options = settings.configuration.node_options(settings.allocation_limit_bytes)?;
     let memory = MemoryBudget::new(options.execution_memory_bytes);
     let writers: crate::logs::Writers = Default::default();

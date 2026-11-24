@@ -130,6 +130,11 @@ pub fn entity_id_type() -> LogicalType {
 
 /// Builds the dense Arrow union used for a batch of complete entity identifiers.
 pub fn entity_id_array<'a>(ids: impl IntoIterator<Item = EntityIdRef<'a>>) -> Result<ArrayRef> {
+    try_entity_id_array(ids.into_iter().map(Ok))
+}
+
+/// Builds the dense identity union from fallibly read cells in row order.
+pub fn try_entity_id_array<'a>(ids: impl IntoIterator<Item = Result<EntityIdRef<'a>>>) -> Result<ArrayRef> {
     let field = to_field("_id", &entity_id_type())?;
     let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { unreachable!() };
     let types = fields.iter().map(|(tag, field)| Ok((tag, from_field(field)?))).collect::<Result<Vec<_>>>()?;
@@ -148,7 +153,7 @@ pub fn entity_id_array<'a>(ids: impl IntoIterator<Item = EntityIdRef<'a>>) -> Re
     let mut offsets = Vec::with_capacity(capacity);
     let mut counts = [0i32; 4];
     for id in ids {
-        let (tag, count) = match id {
+        let (tag, count) = match id? {
             EntityIdRef::String(value) => { text.append_value(value); (strings, &mut counts[0]) }
             EntityIdRef::Keyword(value) => { keyword.append_value(value); (keywords, &mut counts[1]) }
             EntityIdRef::Integer(value) => { integer.append_value(value); (integers, &mut counts[2]) }
@@ -186,6 +191,43 @@ mod tests {
         let field = to_field("_id", &entity_id_type()).unwrap();
         let actual = (0..ids.len()).map(|row| read_entity_id(&field, array.as_ref(), row).unwrap()).collect::<Vec<_>>();
         assert_eq!(actual, ids);
+    }
+
+    #[test]
+    fn rebuilding_arrow_identity_cells_preserves_typed_ids_in_row_order() -> Result<()> {
+        use rtdb_types::Value;
+
+        let uuid = [0xf3; 16];
+        let values = [
+            Value::Utf8("places/東京".into()),
+            Value::Keyword(Keyword::from_name("places/東京")),
+            Value::I32(-3),
+            Value::Uuid(uuid),
+            Value::I32(7),
+        ];
+        let logical = LogicalType::from_legs(values.iter().map(Value::logical_type));
+        let source = to_field("_id", &logical)?;
+        let target = to_field("_id", &entity_id_type())?;
+        let input = crate::build_array(&logical, &values)?;
+        assert!(crate::relayout_arrow_column(Arc::clone(&input), &source, &target).is_err());
+
+        let cells = (0..input.len()).map(|row| read_entity_id(&source, input.as_ref(), row));
+        let output = try_entity_id_array(cells.clone())?;
+        assert_eq!(output.data_type(), target.data_type());
+        let expected = [
+            EntityIdRef::String("places/東京"),
+            EntityIdRef::Keyword("places/東京"),
+            EntityIdRef::Integer(-3),
+            EntityIdRef::Uuid(uuid),
+            EntityIdRef::Integer(7),
+        ];
+        assert_eq!(output.len(), expected.len());
+        for (row, id) in expected.into_iter().enumerate() {
+            assert_eq!(read_entity_id(&target, output.as_ref(), row)?, id);
+        }
+        let invalid_cell = read_entity_id(&source, input.as_ref(), input.len());
+        assert_eq!(try_entity_id_array(cells.chain([invalid_cell])).unwrap_err(), invalid());
+        Ok(())
     }
 
     #[test]

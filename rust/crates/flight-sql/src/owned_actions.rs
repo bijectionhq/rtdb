@@ -23,7 +23,7 @@ use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_array, entity_id_type, read_entity_id, selected_cell};
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_entity_id, selected_cell, try_entity_id_array};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::owned_landing_wire::{self, ControlCommand};
 use self::ordered_controls::OrderedControls;
 use crate::{
-    actions::{OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames},
+    actions::{IpcFrames, OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames},
     error::{arrow, invalid, status, unsupported},
     lease::Leased,
     service::{Call, Service, found},
@@ -3062,7 +3062,7 @@ impl Service {
         self.owned_stream_reply(&schema, &response)
     }
 
-    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let audience = call.session.audience_source().is_some();
         if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
@@ -3144,8 +3144,8 @@ impl Service {
         let present = system.unwrap_or(held.snapshot.present().system_time);
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply_until(schema, page.batch.as_ref().map(OwnedBatch::batch),
-            present, valid_at.unwrap_or(present), None, expiry)?;
+        let reply = self.owned_point_reply_in(self.memory(), schema, page.batch.as_ref().map(OwnedBatch::batch),
+            present, valid_at.unwrap_or(present), None, expiry, reply_format)?;
         if system.is_none() && !matches!(version, HeldRangeFormat::Leading) {
             held.snapshot.check_lifetime_range_release(&relation, expiry).map_err(status)?;
         } else {
@@ -3211,7 +3211,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3285,7 +3285,8 @@ impl Service {
         }
         let schema = schema.as_ref().clone().with_metadata(metadata);
         let rows = count_rows.as_ref().or_else(|| page.as_ref().map(OwnedBatch::batch));
-        let reply = self.owned_point_reply(&schema, rows, system.unwrap_or_else(|| held.snapshot.present()), valid_at, None)?;
+        let reply = self.owned_point_reply_in(self.memory(), &schema, rows,
+            system.unwrap_or_else(|| held.snapshot.present()), valid_at, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -3312,7 +3313,7 @@ impl Service {
         self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)
     }
 
-    pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire) -> Result<ActionResult, Status> {
+    pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held spatial read has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3426,7 +3427,7 @@ impl Service {
             retained = Some((guard, reservation));
             token = Some(nonce);
         }
-        let reply = self.spatial_reply(call, &held, &relation, valid_at, &page, witness, selected_documents, token, prepared.as_ref())?;
+        let reply = self.spatial_reply(call, &held, &relation, valid_at, &page, witness, selected_documents, token, prepared.as_ref(), ipc_stream)?;
         if let (Some((mut filters, reservation)), Some(token), Some(query)) = (retained, token, prepared) {
             filters.insert(token, Arc::new(RetainedSpatialFilter {
                 relation, batch, query, valid_at, _reservation: reservation,
@@ -3435,7 +3436,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8], ranked: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8], ranked: bool, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (held, token, body) = self.spatial_capability(call, body)?;
         let (header, after) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Spatial continuation has no page controls"))?;
@@ -3503,10 +3504,10 @@ impl Service {
             }
             _ => return Err(invalid("Spatial continuation uses another query order")),
         }.map_err(status)?;
-        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, &page, witness, true, Some(token), Some(&filter.query))
+        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, &page, witness, true, Some(token), Some(&filter.query), ipc_stream)
     }
 
-    pub(crate) async fn gather_spatial_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn gather_spatial_owned_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Spatial gather has no hold"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
@@ -3527,7 +3528,7 @@ impl Service {
             .ok_or_else(|| invalid("Spatial gather has no revision"))?;
         let page = held.snapshot.gather_spatial_document(&relation, id, Timestamp(revision.value(row)), &columns)
             .await.map_err(status)?;
-        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), &page, None, true, None, None)
+        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), &page, None, true, None, None, ipc_stream)
     }
 
     pub(crate) fn close_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
@@ -3550,8 +3551,8 @@ impl Service {
     fn spatial_reply(
         &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
         page: &rtdb_spatial::Page, witness: Option<OwnedRangeWitness>, selected_documents: bool, token: Option<Uuid>,
-        query: Option<&RetainedSpatialQuery>,
-    ) -> Result<ActionResult, Status> {
+        query: Option<&RetainedSpatialQuery>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let witness = match witness {
             Some(witness) => {
                 let nonce = match held.remember(call, relation, witness.clone()) {
@@ -3566,7 +3567,7 @@ impl Service {
             }
             None => None,
         };
-        let encode = || self.encode_spatial_reply(call, held, relation, valid_at, page, witness, selected_documents, token);
+        let encode = || self.encode_spatial_reply(call, held, relation, valid_at, page, witness, selected_documents, token, ipc_stream);
         match encode() {
             Err(error) if spatial_memory_refusal(&error)
                 && query.map(RetainedSpatialQuery::discard_probe_matches).transpose()? == Some(true) => encode(),
@@ -3576,8 +3577,8 @@ impl Service {
 
     fn encode_spatial_reply(
         &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
-        page: &rtdb_spatial::Page, witness: Option<Uuid>, selected_documents: bool, token: Option<Uuid>,
-    ) -> Result<ActionResult, Status> {
+        page: &rtdb_spatial::Page, witness: Option<Uuid>, selected_documents: bool, token: Option<Uuid>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let present = held.snapshot.system_time();
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("rtdb.owned.spatial_more".into(), if page.more { "1" } else { "0" }.into());
@@ -3621,16 +3622,13 @@ impl Service {
             let ids = match rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target) {
                 Ok((_, ids)) if ids.data_type() == target.data_type() => ids,
                 _ => {
-                    let ids = (0..array.len()).map(|row| read_entity_id(source, array.as_ref(), row)).collect::<rtdb_types::Result<Vec<_>>>().map_err(status)?;
-                    let bound = ids.iter().try_fold(4096, |bytes, id| {
-                        let text = match id {
-                            EntityIdRef::String(text) | EntityIdRef::Keyword(text) => text.len(),
-                            _ => 0,
-                        };
+                    let ids = (0..array.len()).map(|row| read_entity_id(source, array.as_ref(), row));
+                    let bound = ids.clone().try_fold(4096, |bytes, id| {
+                        let text = id.map_err(status)?.owned_payload_bytes();
                         wire::add(bytes, wire::add(128, wire::mul(text, 4)?)?)
                     })?;
                     charge = Some(call.reserve(bound)?);
-                    entity_id_array(ids).map_err(status)?
+                    try_entity_id_array(ids).map_err(status)?
                 }
             };
             let distances = Arc::new(page.distance_column());
@@ -3643,14 +3641,34 @@ impl Service {
             }
             Some(RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?)
         } else { None };
-        let reply = self.owned_point_reply(&schema, output.as_ref(), present, valid_at, None)?;
+        let format = if ipc_stream { OwnedReplyFormat::StreamV1 } else { OwnedReplyFormat::Unary };
+        let reply = self.owned_point_reply_in(self.memory(), &schema, output.as_ref(), present, valid_at, None, None, format)?;
         drop(charge);
         held.snapshot.check_relations([relation]).map_err(status)?;
         Ok(reply)
     }
 
+    async fn begin_held_rank(&self, call: &Call) -> Result<(), Status> {
+        use rtdb_storage::sealing::PlaintextView;
+
+        PlaintextView::begin_rank_inventory().map_err(status)?;
+        if !self.supports_hosted_upload(call) { return Ok(()); }
+        let Some(host) = self.0.config.owned_world_host.as_ref() else { return Ok(()); };
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let Some(attachment) = attachment else { return Ok(()); };
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        if let Ok(authority) = host.root_rank_authority(crate::WorldCall {
+            node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation,
+        }) {
+            PlaintextView::bind_root_rank_authority(authority).map_err(status)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3724,6 +3742,7 @@ impl Service {
         for row in 0..input.num_rows() {
             if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
                 || partitions.value(row) >= rank.partitions.len() as u64
+                || (rank.partitions[partitions.value(row) as usize].0.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
             {
                 return Err(invalid("Invalid staged search identity"));
             }
@@ -3737,7 +3756,7 @@ impl Service {
     }
 
     pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held nearest has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3797,7 +3816,7 @@ impl Service {
 
     /// Fuses a held text ranking and a held nearest ranking of the same relations at the held cut by reciprocal rank fusion.
     pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held hybrid search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3855,7 +3874,7 @@ impl Service {
 
     /// The world hybrid family: HybridHeldWorld (with staged overlays), HybridHeldWorldAt and HybridHeldWorldParentAt.
     pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world hybrid handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -3944,6 +3963,7 @@ impl Service {
         for row in 0..input.num_rows() {
             if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
                 || partitions.value(row) >= nearest.partitions.len() as u64
+                || (nearest.partitions[partitions.value(row) as usize].relation.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
             {
                 return Err(invalid("Invalid staged nearest identity"));
             }
@@ -3976,7 +3996,7 @@ impl Service {
     /// `NearestHeldWorld.v2`, `NearestHeldWorldAt.v2` and `NearestHeldWorldParentAt.v2`:
     /// the SearchHeldWorld prefixes followed by the NearestHeld.v3 frame.
     pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4054,7 +4074,7 @@ impl Service {
     }
 
     pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4139,17 +4159,16 @@ impl Service {
         &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
         present: Timestamp, valid: Timestamp, reply_format: OwnedReplyFormat<'_>, extra: [(&str, &str); N],
     ) -> Result<OwnedIpcReply, Status> {
-        let (family_inventory, _family_charge) = rtdb_storage::sealing::PlaintextView::rank_inventory().map_err(status)?;
+        let (family_inventory, family_charge) = rtdb_storage::sealing::PlaintextView::rank_inventory().map_err(status)?;
         if family_inventory.len() > 2 && !self.supports_hosted_upload(call) {
+            return Err(unsupported());
+        }
+        if !matches!(reply_format, OwnedReplyFormat::StreamV1) {
             return Err(unsupported());
         }
         let hits = page.hits.batch();
         let mut metadata = hits.schema_ref().metadata().clone();
         for (key, value) in extra { metadata.insert(key.into(), value.into()); }
-        let mut inventory = String::with_capacity(family_inventory.len() * 2);
-        use std::fmt::Write as _;
-        for byte in family_inventory { write!(&mut inventory, "{byte:02x}").expect("writing to a string"); }
-        metadata.insert("rtdb.owned.rank_families".into(), inventory);
         metadata.insert(OWNED_SEARCH_TOTAL.into(), page.total.to_string());
         metadata.insert(OWNED_SEARCH_SCOPE.into(), scope);
         if !witnesses.is_empty() {
@@ -4166,8 +4185,21 @@ impl Service {
             wire::add(bytes, wire::mul(size, 4)?)
         })?;
         let _reply_charge = call.reserve(charge)?;
-        self.owned_point_reply_in(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
-            present, valid, None, None, reply_format)
+        let reply = self.owned_point_reply_in(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
+            present, valid, None, None, reply_format)?;
+        let mut frames = match reply {
+            OwnedIpcReply::Frames(frames) => frames,
+            OwnedIpcReply::Unary(reply) => IpcFrames(reply.body).collect::<Result<Vec<_>, _>>()?,
+        };
+        let inventory = ActionResult { body: wire::retain(family_inventory, family_charge) };
+        let encoded = frames.iter().try_fold(inventory.encoded_len(), |bytes, frame| {
+            wire::add(bytes, frame.encoded_len())
+        })?;
+        if encoded > self.0.config.maximum_message_bytes {
+            return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
+        }
+        frames.insert(0, inventory);
+        Ok(OwnedIpcReply::Frames(frames))
     }
 
     pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

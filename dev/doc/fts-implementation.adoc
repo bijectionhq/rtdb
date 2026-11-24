@@ -70,6 +70,7 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 * *The artefact record locates the Arrow root.*
   Format 14 puts paths to term, posting, document and IID visibility pages in that root.
   Format 15 can inline the authenticated root in the catalog, groups compatible primaries into packs and maps logical versions to primary Arrow rows.
+  Its visibility writer slices the retained primary-position column for each event page.
   See link:rtdb-fts-snapshot-native.md[the format 15 design] for the write and read paths.
   Each directory authenticates the child ranges it references.
   Ranked point scans use one frontier for persisted windows, covered live posting pages and pending candidates.

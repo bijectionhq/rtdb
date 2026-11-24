@@ -155,7 +155,10 @@ Records the derived search rows of a member in the family inventory.
 The member must be the original's assertion or a reserved landing's destination.
 A world entry must carry a capability, which the registration enrolls; that capability then seals exactly that derived row.
 A Root entry carries no capability, because Root derived relations are sealed under the broker-owned R6 slots of their relation.
-Root entries are deduplicated by relation and key.
+A Root entry names a reserved landing destination and uses the physical selector `bjrl1/<family hex>/<destination assertion hex>/<AddressRef>`.
+All hex is lowercase, including the canonical AddressRef. The full selector fits the 512-byte key bound.
+RTDB checks the selector's family and member against the request. Root entries are deduplicated by relation and physical selector.
+A refused or interrupted reservation may retain its inventory entry. Its selector is disjoint from every ordinary Root projection at that address.
 A world slot can enrol multiple fresh stages for the same member across rewrites.
 An exact retry succeeds and conflicting reuse of a stage or slot is refused.
 A family holds at most 2048 derived entries; the next registration is refused with `rtdb.multi/assertion-family-size`.
@@ -252,12 +255,28 @@ Flight and archive rank outputs also carry a bounded current marker check throug
 
 ### Ranked response contributor inventory
 
-Protocol 222 includes a complete bounded family inventory in each held text and nearest reply, including replies with no hits.
+Ranked held text, nearest and hybrid replies include a complete bounded family inventory, including replies with no hits.
 The inventory comes from the admitted corpus before result slicing. It covers non-hit text statistics and vector candidates, and includes protected world shadows that affect the inherited corpus.
-The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field. Root contributors resolve their exact carrier on the same held cut.
-The inventory is `rtdb.owned.rank_families` in the authenticated Arrow schema, as lowercase hex of a big-endian u16 entry count and canonical sorted entries.
-An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root carrier publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
-The bounds are 512 entries of at most 1024 bytes and at most 512 Root carrier probes per rank. Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
+The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field.
+Protected partitions require the installed original rank owner before corpus or scoring work.
+The statistics-only artefact route refuses protected partitions.
+An indexed Root landing registers its physical derivative under `bjrl1/<family hex>/<destination assertion hex>/<canonical AddressRef>` before publication.
+The family and assertion fields are 32 and 64 lowercase hexadecimal characters, respectively, and the full physical selector fits the 512-byte derivative key bound.
+The ranker uses the canonical address for overlay masks, candidate identity, tie breaks, and output.
+Custody and erasure use the full physical selector.
+Before admitting an unshadowed protected Root projection, the ranker reads the payload carrier at `row/<AddressRef>` on the same held valid and system cut.
+For a landed carrier, it also reads `row-position/row/<AddressRef>` from the installed base relation underlying the search relation.
+The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
+The Root contributor uses the journal assertion ordinal.
+Undecorated family-linked projections and multiple visible physical selectors for an unshadowed canonical address refuse.
+Ranked replies require the `x-rtdb-owned-ipc: stream-v1` request header.
+The first Flight action result body carries the binary inventory as a big-endian u16 entry count followed by entries in strictly increasing byte order.
+Even a zero count has its own result body.
+The Arrow IPC schema, any hit batch frames and the end marker follow in the same reply stream.
+The reply admits the combined encoded Flight result sizes under the existing message limit before sending any frame.
+An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root protected journal publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
+The bounds are 512 entries of at most 1024 bytes, at most 512 Root carrier probes per rank, and one journal probe per decorated Root selector.
+Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
 `FamilyResponseRelease.v2` adds exact world-derived input kind 2 and exact Root-derived input kind 3 to the existing response-part hold.
 The consumer retains the inventory in the invocation's original output custody even when it returns only counts, cursors or derived scores.
 Hybrid reads retain the combined text and vector dependencies under that same bound.
@@ -392,6 +411,13 @@ From the fence commit:
 * a dependent hosted fork never opens the family at all, since its deployment identity addresses a different vault record and its capabilities name another deployment.
 
 Root derived rows carry no family capability.
+For an indexed first publication the same private prepared switch creates the Root carrier, row journal and physical projection.
+It checks their exact absence, the absence of an ordinary projection at that AddressRef, and the absence of the ordered family fence.
+The Proposal's raw-address projection, row carrier and protected journal must be witnessed at the same valid instant and ordered source transaction under the original pin.
+The search relation must be the exact journal relation with `_search` appended.
+The original placed vault authenticates the projection's exact reservation and inventory entry before generation staging.
+The switch may also create missing, exactly checked search-relation aliases used by the existing label-unit erasure path.
+Those aliases must name the co-ordered derived relation.
 The fence inventory lists them, and the client's ordered erasure commit erases every listed Root row in the same commit as the protected row's erasure.
 That Root erasure follows R7: the replay broker projects the erase selectors through the authenticated fork bases of every dependent root.
 

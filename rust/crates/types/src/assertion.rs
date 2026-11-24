@@ -297,6 +297,52 @@ impl PlacementBinding {
     }
 }
 
+/// A Root search projection uses its physical key only for custody and
+/// erasure. Overlay and rank identities use the borrowed logical address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootFamilyDerivativeId<'a> {
+    pub family: [u8; 16],
+    pub member: AssertionId,
+    pub address: &'a str,
+}
+
+impl<'a> RootFamilyDerivativeId<'a> {
+    pub const PREFIX: &'static str = "bjrl1/";
+    pub const MAX_KEY_BYTES: usize = 512;
+
+    pub fn parse(key: &'a str) -> Result<Option<Self>, AssertionWireError> {
+        let Some(rest) = key.strip_prefix(Self::PREFIX) else { return Ok(None); };
+        let (family, rest) = rest.split_once('/').ok_or(AssertionWireError)?;
+        let (member, address) = rest.split_once('/').ok_or(AssertionWireError)?;
+        if key.len() > Self::MAX_KEY_BYTES || address.is_empty() || address.len() % 2 != 0
+            || !address.bytes().all(lower_hex)
+        {
+            return Err(AssertionWireError);
+        }
+        let family = decode_lower_hex(family).ok_or(AssertionWireError)?;
+        let member = decode_lower_hex(member).ok_or(AssertionWireError)?;
+        if family == [0; 16] || member == [0; 32] {
+            return Err(AssertionWireError);
+        }
+        Ok(Some(Self { family, member: AssertionId::from_bytes(member), address }))
+    }
+}
+
+fn lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
+fn decode_lower_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
+    if value.len() != N * 2 || !value.bytes().all(lower_hex) {
+        return None;
+    }
+    let mut out = [0; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[2 * index..2 * index + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
 /// The destination slot fixed by the reviewed landing before RTDB assigns
 /// the publication position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,6 +499,19 @@ fn field<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_family_derivative_keeps_logical_and_physical_coordinates_distinct() {
+        let key = format!("bjrl1/{}/{}/010203", "01".repeat(16), "ab".repeat(32));
+        let id = RootFamilyDerivativeId::parse(&key).unwrap().unwrap();
+        assert_eq!(id.family, [1; 16]);
+        assert_eq!(id.member.to_bytes(), [0xab; 32]);
+        assert_eq!(id.address, "010203");
+        assert_eq!(RootFamilyDerivativeId::parse(id.address).unwrap(), None);
+        assert!(RootFamilyDerivativeId::parse(&key.replace("010203", "01AB")).is_err());
+        assert!(RootFamilyDerivativeId::parse(&key.replace("010203", "01/02")).is_err());
+    }
+
 
     #[test]
     fn shadow_has_canonical_layout_and_bounds() {

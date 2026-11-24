@@ -3,8 +3,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch, StructArray, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
-use arrow_buffer::Buffer;
+use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
+use arrow_buffer::{Buffer, MutableBuffer};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use sha2::{Digest, Sha256};
@@ -72,9 +72,23 @@ fn start_rows(table: Table, array: &StructArray, start: usize, len: usize) -> Re
     table.array(vec![list(Arc::new(rows), counts, item)?])
 }
 
+fn text_revision_rows(columns: &[FixedSizeBinaryArray], start: usize, len: usize) -> Result<StructArray> {
+    let mut values = columns[0].slice(start, len);
+    if columns.len() > 1 {
+        let mut bytes = MutableBuffer::new(values.value_data().len() * columns.len());
+        bytes.extend_from_slice(values.value_data());
+        for column in &columns[1..] {
+            bytes.extend_from_slice(column.slice(start, len).value_data());
+        }
+        values = FixedSizeBinaryArray::try_new(values.value_length(), bytes.into(), None).map_err(fault)?;
+    }
+    let item = item_of(&Table::TextRevisions.fields()[0]);
+    Table::TextRevisions.array(vec![list(Arc::new(values), std::iter::repeat_n(len, columns.len()), item)?])
+}
+
 pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, StructArray)>,
     [(_, events), (_, runs), (_, row_runs)]: [(Table, StructArray); 3], plan: PostingPlan,
-    positions: Option<Vec<u32>>, revisions: Option<StructArray>, token_sequences: Option<StructArray>,
+    positions: Option<Vec<u32>>, revisions: Option<Vec<FixedSizeBinaryArray>>, token_sequences: Option<StructArray>,
     erases: Option<StructArray>) -> Result<TermSummaries> {
     let take = |fields: &mut Vec<(Table, StructArray)>, field: Table| -> StructArray {
         let at = fields.iter().position(|(table, _)| *table as usize == field as usize).expect("writer populated this table");
@@ -86,6 +100,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
     let windows = take(&mut fields, Table::Windows);
     let pages = take(&mut fields, Table::Pages);
     let mut routing = BTreeMap::<u8, Vec<Child>>::new();
+    let positions = positions.map(arrow_array::UInt32Array::from);
     let packed = positions.is_some();
     let mut directory = |writer: &mut _, kind, children: Vec<Child>| {
         if packed && children.len() <= 48 && children.iter().all(|child| child.lower.len() + child.upper.len() <= 256) {
@@ -184,19 +199,13 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
                 local_rows.push(row - page_starts.value(page));
             }
             fields.push((Table::Versions, Table::Versions.array(vec![
-                Arc::new(arrow_array::UInt32Array::from(positions[start..end].to_vec())),
+                Arc::new(positions.slice(start, end - start)),
                 Arc::new(arrow_array::UInt32Array::from(members)), Arc::new(arrow_array::UInt32Array::from(pages)),
                 Arc::new(arrow_array::UInt32Array::from(local_rows)),
             ])?));
         }
         if let Some(revisions) = &revisions {
-            let item = item_of(&Table::TextRevisions.fields()[0]);
-            let columns = revisions.column(0).as_list::<i64>();
-            let pieces: Vec<_> = (0..columns.len()).map(|index| columns.value(index).slice(start, end - start)).collect();
-            let refs = pieces.iter().map(|value| value.as_ref()).collect::<Vec<_>>();
-            fields.push((Table::TextRevisions, Table::TextRevisions.array(vec![list(
-                arrow_select::concat::concat(&refs).map_err(fault)?, std::iter::repeat_n(end - start, columns.len()), item,
-            )?])?));
+            fields.push((Table::TextRevisions, text_revision_rows(revisions, start, end - start)?));
         }
         let page = writer.page(fields)?;
         event_pages.push(Child {
@@ -930,6 +939,72 @@ mod tests {
         assert_eq!(first.iter().map(|event| event.document.is_some()).collect::<Vec<_>>(), [false, false]);
         let second = &versions[&second][0];
         assert_eq!((second.member, second.page, second.row), (1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn history_preserves_field_revisions_for_versions_across_visibility_pages() -> Result<()> {
+        use super::super::{BuildMode, IndexedRow, SearchPage, write_group_as};
+        use rtdb_types::{EventPosition, TxId};
+
+        struct HistoryRows(std::ops::Range<u32>);
+
+        fn header(row: u32) -> EventHeader {
+            let mut iid = [0; 16];
+            iid[..4].copy_from_slice(&((row + 1) / 2).to_be_bytes());
+            EventHeader {
+                position: Some(EventPosition { transaction: TxId(i64::from(row) + 1), ordinal: 0 }),
+                iid: Iid(iid),
+                system_from: Timestamp(10_000 - i64::from(row)),
+                commit_position: row,
+                valid_time: Interval::ALL,
+                op: EventOp::Put,
+            }
+        }
+
+        impl SearchPage for HistoryRows {
+            fn len(&self) -> usize { self.0.len() }
+
+            fn row(&mut self, index: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
+                let row = self.0.start + index as u32;
+                let revisions = [Some([row as u8; 32]), (row % 2 == 0).then_some([42; 32])];
+                Ok(IndexedRow { header: header(row), key: None, sql_id: None, values: Vec::new(),
+                    revisions: revisions[..columns.len()].to_vec() })
+            }
+        }
+
+        let all_columns = ["body".to_owned(), "title".to_owned()];
+        let before = EVENT_ROWS as u32 - 1;
+        let after = before + 1;
+        let iid = header(before).iid;
+        let queried = BTreeSet::from([iid]);
+        let budget = MemoryBudget::new(1 << 20);
+        for field_count in [1, 2] {
+            let columns = &all_columns[..field_count];
+            let mut file = tempfile::tempfile().map_err(fault)?;
+            let members = [[Ok(HistoryRows(0..before)), Ok(HistoryRows(before..after + 2))]];
+            write_group_as(columns, members, "history", Some(1), None, &mut file, None, LOGICAL_FORMAT_VERSION, BuildMode::History)?;
+            let locator = TreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION)?;
+            file.rewind().map_err(fault)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(fault)?;
+            let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, columns, "history", 1).await?;
+            tree.verify().await?;
+            let page_sizes = tree.all(VISIBILITY).await?.iter().map(|batch| table(batch, Table::Events).len()).collect::<Vec<_>>();
+            assert_eq!(page_sizes, [EVENT_ROWS, 2]);
+
+            let expected = [[Some([before as u8; 32]), Some([after as u8; 32])], [None, Some([42; 32])]];
+            for (field, [first_revision, second_revision]) in expected.into_iter().take(field_count).enumerate() {
+                let (versions, _charge) = tree.versions(&queried, field, &budget).await?;
+                let versions = versions[&iid].iter().map(|event| {
+                    (event.header.version(), event.member, event.page, event.row, event.revision)
+                }).collect::<Vec<_>>();
+                assert_eq!(versions, [
+                    (header(before).version(), 0, 1, 0, first_revision),
+                    (header(after).version(), 0, 1, 1, second_revision),
+                ]);
+            }
+        }
+        Ok(())
     }
 
     #[test]

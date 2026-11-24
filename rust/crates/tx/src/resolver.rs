@@ -43,7 +43,7 @@ use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
 mod world_constraints;
-pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, WorldConstraintArchive};
+pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, PreparedFamilyDerivative, WorldConstraintArchive};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 

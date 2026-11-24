@@ -215,7 +215,8 @@ impl Service {
                         2 => HeldRangeFormat::FixedValid,
                         _ => HeldRangeFormat::Historical,
                     };
-                    return self.held_owned_range_action(call, request, version).await;
+                    return self.held_owned_range_action(call, request, version, OwnedReplyFormat::Unary)
+                        .await.map(OwnedIpcReply::into_unary);
                 }
                 if call.session.fresh_replica {
                     return Err(Status::permission_denied("The fresh Flight route only admits Root range reads"));
@@ -227,7 +228,8 @@ impl Service {
                     7 => WorldOrder::OverlayRangeAt,
                     _ => unreachable!("validated range selector"),
                 };
-                self.held_world_ordered_action(call, request, order).await
+                self.held_world_ordered_action(call, request, order, OwnedReplyFormat::Unary)
+                    .await.map(OwnedIpcReply::into_unary)
             }
         }
     }

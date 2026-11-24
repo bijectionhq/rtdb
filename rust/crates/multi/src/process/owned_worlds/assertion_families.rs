@@ -143,7 +143,15 @@ impl Scope {
         })
     }
 
-    fn derived(&self, row: FamilyDerivedRow) -> Result<DerivedRow> {
+    fn derived(&self, family: Uuid, row: FamilyDerivedRow) -> Result<DerivedRow> {
+        if row.world.is_none() {
+            let selector = std::str::from_utf8(&row.key).ok()
+                .and_then(|key| rtdb_types::RootFamilyDerivativeId::parse(key).ok().flatten())
+                .ok_or_else(|| scope_mismatch("Root derivatives require a reserved landing selector"))?;
+            if selector.family != *family.as_bytes() || selector.member != row.member {
+                return Err(scope_mismatch("Root derivative selector differs from its family member"));
+            }
+        }
         Ok(DerivedRow {
             member: row.member, world: row.world, relation: row.relation, key: row.key,
             capability: row.capability.map(|stage| self.stage(stage)).transpose()?,
@@ -259,7 +267,7 @@ pub(super) async fn serve(
             FamilyReply::Done
         }
         FamilyRequest::RegisterDerived { family, rows } => {
-            let rows = rows.into_iter().map(|row| scope.derived(row)).collect::<Result<Vec<_>>>()?;
+            let rows = rows.into_iter().map(|row| scope.derived(family, row)).collect::<Result<Vec<_>>>()?;
             families.register_derived(scope.family(family), &rows).await?;
             FamilyReply::Done
         }
@@ -307,4 +315,64 @@ async fn admit_row(
     Ok((enrolled.capability, AssertionAuthoring {
         assertion_id: enrolled.assertion, scope_commitment: enrolled.scope_commitment, codec: enrolled.codec,
     }))
+}
+
+struct RootRankCustody {
+    deployment: Uuid,
+    writer: PlacedAttemptScope,
+    directory: Arc<dyn rtdb_directory::Directory>,
+    keys: Arc<dyn KeyService>,
+    region: Arc<IoRegion>,
+    original: rtdb_node::OriginalAssertionFamilyReader,
+    cancellation: tokio_util::sync::CancellationToken,
+    scope: tokio::sync::OnceCell<Scope>,
+}
+
+pub(super) fn root_rank_authority(
+    session: &NativeSession, deployment: Uuid, directory: Arc<dyn rtdb_directory::Directory>,
+    keys: Arc<dyn KeyService>, cancellation: tokio_util::sync::CancellationToken,
+) -> Result<Arc<dyn rtdb_storage::sealing::RootRankAuthority>> {
+    Ok(Arc::new(RootRankCustody {
+        deployment, directory, keys, cancellation, region: IoRegion::new(), scope: tokio::sync::OnceCell::new(),
+        writer: session.placed_history()?.ok_or_else(OwnedWorld::unavailable)?,
+        original: session.assertion_family_reader()?,
+    }))
+}
+
+#[async_trait::async_trait]
+impl rtdb_storage::sealing::RootRankAuthority for RootRankCustody {
+    async fn require_derivative(&self, selected: rtdb_storage::sealing::RootRankSelection<'_>) -> Result<()> {
+        let scope = self.scope.get_or_try_init(|| async {
+            let record = self.directory.deployment(&self.deployment.to_string()).await?
+                .ok_or_else(OwnedWorld::unavailable)?;
+            let expected = PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
+            if self.writer != expected || record.writer_pool().is_none() {
+                return Err(OwnedWorld::unavailable());
+            }
+            Scope::new(self.deployment, &record)
+        }).await?;
+        let position = rtdb_types::Position {
+            line_generation: scope.root_line, publication: selected.publication, ordinal: selected.ordinal,
+        };
+        let stage = FamilyStage {
+            deployment: Uuid::from_bytes(selected.stage[..16].try_into().expect("stage deployment width")),
+            incarnation: NonZeroU64::new(u64::from_be_bytes(selected.stage[16..24].try_into().expect("stage incarnation width")))
+                .ok_or_else(OwnedWorld::unavailable)?,
+            stage: Uuid::from_bytes(selected.stage[24..].try_into().expect("stage identity width")),
+        };
+        let stage = scope.stage(stage)?;
+        let binding = rtdb_types::RootLandingBinding {
+            position, assertion: selected.assertion, target: selected.target,
+            stage: *stage.identity().as_bytes(), payload_digest: selected.payload_digest, link_digest: selected.link_digest,
+        };
+        let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(OwnedWorld::unavailable)?
+            .with_original_reader(&self.original, self.deployment, &self.cancellation);
+        families.require_root_rank_landing(scope.family(selected.family), stage, binding, selected.relation, selected.selector.as_bytes())
+            .await?;
+        let current = self.original.current(self.deployment, &self.cancellation).await?;
+        if current.assertion_family_fence(selected.family).await?.is_some() {
+            return Err(rtdb_storage::Error::ErasedUnderView.into());
+        }
+        families.track_family_delivery(selected.family)
+    }
 }

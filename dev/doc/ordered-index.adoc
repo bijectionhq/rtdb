@@ -57,8 +57,10 @@ Seeks compare cells in the leaf's Arrow buffers.
 A rewrite interleaves surviving and edited rows with matching key layouts directly into the new buffers.
 Readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
 Private in-memory stores publish Arrow references by default.
+Hosted Multi nodes using `--ecs-cluster` and runtime-installed journal routes (`--installed-cell`) also publish Arrow references by default.
+The link:rtdb-multi-installed-journal.md[installed journal contract] requires workers compatible with those routes, which were introduced after dual-format decoding.
+Other durable and shared stores default to JSON.
 Set `orderedIndexArrowReferences: true` on writers after upgrading every node that reads ordered-index objects in the installation.
-Durable and shared stores default to JSON during the reader rollout.
 Set `orderedIndexArrowReferences: false` to select JSON on any store.
 A legacy manifest's checksum binds the canonical JSON bytes of its layout.
 A new Arrow page can refer to an existing JSON page.

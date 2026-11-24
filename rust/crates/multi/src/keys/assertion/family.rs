@@ -588,6 +588,16 @@ impl<'a> AssertionFamilies<'a> {
                 {
                     return Err(conflict());
                 }
+                if row.world.is_none() {
+                    let selector = std::str::from_utf8(&row.key).ok()
+                        .and_then(|key| rtdb_types::RootFamilyDerivativeId::parse(key).ok().flatten())
+                        .ok_or_else(conflict)?;
+                    if selector.member != row.member
+                        || !record.landings.iter().any(|landing| landing.reservation.destination == row.member)
+                    {
+                        return Err(conflict());
+                    }
+                }
                 if record.derived.contains(row) {
                     continue;
                 }
@@ -607,6 +617,22 @@ impl<'a> AssertionFamilies<'a> {
             }
             Ok(((), changed))
         }).await
+    }
+
+    /// Authenticate the exact enrolled Root slot before its first publication.
+    /// The ordered transaction separately checks the absent family marker.
+    pub async fn require_reserved_root_derivative(
+        &self, family: Uuid, member: AssertionId, relation: &str, key: &[u8],
+    ) -> Result<()> {
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        if !record.landings.iter().any(|landing| landing.reservation.destination == member)
+            || !record.derived.iter().any(|row| row.member == member && row.world.is_none()
+                && row.relation == relation && row.key == key)
+        {
+            return Err(conflict());
+        }
+        Ok(())
     }
 
     pub async fn require_row_capability(
@@ -1092,11 +1118,12 @@ mod tests {
             member: original.assertion, world: Some(world), relation: "fact_l1_search".into(),
             key: b"row".to_vec(), capability: Some(stage(realm)),
         };
-        let root = DerivedRow {
+        let raw_root = DerivedRow {
             member: original.assertion, world: None, relation: "fact_l1_search".into(),
-            key: b"row".to_vec(), capability: None,
+            key: b"01".to_vec(), capability: None,
         };
-        families.register_derived(family, &[derived.clone(), root.clone()]).await?;
+        assert!(families.register_derived(family, &[raw_root.clone()]).await.is_err());
+        families.register_derived(family, &[derived.clone()]).await?;
         families.register_derived(family, &[derived.clone()]).await?;
         let moved = DerivedRow { key: b"other".to_vec(), ..derived.clone() };
         assert!(families.register_derived(family, &[moved]).await.is_err());
@@ -1126,6 +1153,21 @@ mod tests {
         families.register(family, original).await?;
         families.register(family, original).await?;
         families.require_live_occurrence(family, original).await?;
+        let reservation = LandingReservation {
+            source: original.position,
+            destination: AssertionId::from_bytes([3; 32]),
+            capability: stage(realm), link_capability: stage(realm), review_commitment: [7; 32],
+        };
+        families.reserve_landing(family, reservation).await?;
+        let root = DerivedRow {
+            member: reservation.destination,
+            key: format!("bjrl1/{}/{}/01", "01".repeat(16), "03".repeat(32)).into_bytes(),
+            ..raw_root
+        };
+        assert!(families.require_reserved_root_derivative(family, root.member, &root.relation, &root.key).await.is_err());
+        families.register_derived(family, &[root.clone()]).await?;
+        families.require_reserved_root_derivative(family, root.member, &root.relation, &root.key).await?;
+        assert!(families.resolve_member(family, root.member).await.is_err());
         let fence = families.fence(family, original.position, Uuid::new_v4()).await?;
         assert!(fence.assertion_capabilities.contains(&capability));
         assert!(fence.assertion_capabilities.contains(&rewrite.capability));

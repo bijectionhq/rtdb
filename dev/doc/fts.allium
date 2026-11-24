@@ -22,6 +22,10 @@
 -- Published files include the ordered definition version, artifact identity, and exact token length of each run.
 -- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
 -- Both ranking paths apply the same typed overlay shadows before computing corpus statistics.
+-- A protected Root derivative uses its canonical address for shadowing, statistics, scoring and output.
+-- The ranker refuses conflicting physical selectors for one unshadowed canonical address.
+-- A landed derivative enters the corpus only after the held payload carrier and protected row journal identify its accepted Root member and the original vault confirms its registered physical selector.
+-- The bounded Flight custody inventory retains the physical selector and the member's journal position.
 -- Shadow text comes from the selected Arrow field when its presence marker names that field.
 -- Held corpus accounting uses the complete identity's typed payload size and the fixed allowance for its retained entry.
 -- A declared optional text column with only null or absent values contributes an empty corpus.

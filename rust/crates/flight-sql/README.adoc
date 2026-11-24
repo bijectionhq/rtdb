@@ -377,9 +377,11 @@ The point response has the same coordinates as the unmasked historical point.
 
 The ordinary owned endpoint accepts `x-rtdb-owned-ipc: stream-v1` for actions returning a single raw Arrow IPC stream.
 If the owner echoes the header, each Flight result contains one complete Arrow IPC message from the original response, followed by a separate eight-byte IPC end marker.
-Held change feeds, held identity pages and held storage usage can encode these messages directly.
+Held change feeds, held identity pages, held storage usage, ordered range pages and spatial pages can encode these messages directly.
+Spatial opens, continuations and winner gathers use the same negotiated framing.
 The contiguous writer and message slicing remain available for negotiated replies that use the original writer.
-Without negotiation the reply remains one contiguous IPC stream.
+Without negotiation an Arrow-only reply remains one contiguous IPC stream.
+Held text, nearest and hybrid actions require negotiation and send their link:../../../dev/doc/rtdb-assertion-families.md#ranked-response-contributor-inventory[binary contributor inventory] before the Arrow IPC messages.
 The audience endpoint and actions with control envelopes use their existing framing.
 
 `rtdb.owned.ReadPoints.v1` accepts two to 256 held point entries.

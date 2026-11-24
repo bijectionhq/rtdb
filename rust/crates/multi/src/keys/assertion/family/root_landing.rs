@@ -130,16 +130,29 @@ impl AssertionFamilies<'_> {
         require_binding(landing.accepted.as_ref().ok_or_else(conflict)?, binding.position, root_binding_digest(binding))
     }
 
+    pub(crate) async fn require_root_rank_landing(
+        &self, family: Uuid, stage: AssertionStage, binding: RootLandingBinding, relation: &str, key: &[u8],
+    ) -> Result<()> {
+        let record = self.require_live_root_landing(family, stage, binding).await?;
+        if !record.derived.iter().any(|row| row.world.is_none() && row.capability.is_none()
+            && row.member == binding.assertion && row.relation == relation && row.key == key)
+        {
+            return Err(conflict());
+        }
+        Ok(())
+    }
+
     async fn require_live_root_landing(
         &self, family: Uuid, stage: AssertionStage, binding: RootLandingBinding,
-    ) -> Result<()> {
+    ) -> Result<Family> {
         self.require_position_open(binding.position).await?;
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
         let accepted = record.landings.iter().find(|entry| {
             entry.reservation.destination == binding.assertion && entry.reservation.capability == stage
         }).and_then(|entry| entry.accepted.as_ref()).ok_or_else(conflict)?;
-        require_binding(accepted, binding.position, root_binding_digest(binding))
+        require_binding(accepted, binding.position, root_binding_digest(binding))?;
+        Ok(record)
     }
 }
 
@@ -244,6 +257,15 @@ mod tests {
             payload_digest: hash(&payload), link_digest: hash(&link),
         };
         let open = |binding| families.open_root_landing_payload(family, reservation.capability, binding, payload.clone(), &vault);
+        let derivative = DerivedRow {
+            member: reservation.destination, world: None, capability: None,
+            relation: "fact_label_search".into(), key: b"bjrl1/exact".to_vec(),
+        };
+        families.register_derived(family, std::slice::from_ref(&derivative)).await?;
+        let rank = |binding, key| families.require_root_rank_landing(
+            family, reservation.capability, binding, &derivative.relation, key,
+        );
+        assert!(rank(binding, &derivative.key).await.is_err());
         assert!(open(binding).await.is_err());
         let substituted = RootLandingBinding { payload_digest: [7; 32], ..binding };
         assert!(families.activate_root_landing(family, reservation, substituted, link.clone(), &vault).await.is_err());
@@ -252,9 +274,13 @@ mod tests {
         families.activate_root_landing(family, reservation, binding, link.clone(), &vault).await?;
         assert!(open(RootLandingBinding { position: position(4), ..binding }).await.is_err());
         assert_eq!(open(binding).await?, carrier);
+        rank(binding, &derivative.key).await?;
+        assert!(rank(binding, b"bjrl1/other").await.is_err());
+        assert!(rank(RootLandingBinding { position: position(4), ..binding }, &derivative.key).await.is_err());
         let fence = families.fence(family, binding.position, Uuid::new_v4()).await?;
         assert_eq!(fence.positions, BTreeSet::from([original.position, binding.position]));
         assert!(open(binding).await.is_err());
+        assert!(rank(binding, &derivative.key).await.is_err());
         Ok(())
     }
 }
