@@ -172,10 +172,10 @@ impl ScopedCellWrites {
         prefix: &str,
         authorization: Arc<dyn rtdb_s3::WriteAuthorization>,
         io: Arc<IoRegion>,
-    ) -> Result<Arc<dyn ObjectStore>> {
+    ) -> Result<Arc<rtdb_storage::remote::RemoteStore>> {
         let cell = storage.cell_root()?;
         let root = ObjectKey::new(format!("{cell}/{prefix}"))?;
-        self.issuer.open(storage, &cell, &root, authorization, io).await
+        self.issuer.open_remote(storage, &cell, &root, authorization, io).await
     }
 }
 

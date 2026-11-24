@@ -1,9 +1,11 @@
 {
-  "summary": "Exact installed receipt admission, provider retirement and serving-slot retention decisions.",
+  "summary": "Exact installed receipt admission, provider read drain and retirement, and serving-slot retention decisions.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
     "production",
+    "--verify-module",
+    "drain_decision",
     "--verify-module",
     "provider_decision",
     "--verify-module",
@@ -11,7 +13,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 16,
+  "min_verified_functions": 21,
   "controls": {
     "before_exact_fence": {
       "defect": "A fence for another publication of this name admits retirement.",
@@ -178,6 +180,75 @@
         }
       ],
       "min_verified_functions": 15
+    },
+    "delete_with_detached_read": {
+      "defect": "A closed read census authorizes the delete while a detached read still appears in it.",
+      "mutate": [
+        {
+          "file": "rust/crates/storage/src/read_drain_decision.rs",
+          "find": "(admission_closed && !live_reads_seen)",
+          "replace": "admission_closed"
+        },
+        {
+          "file": "rust/crates/storage/src/read_drain_decision.rs",
+          "find": "    admission_closed && !live_reads_seen\n",
+          "replace": "    admission_closed\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "retirement_requires_provider_completion",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 20
+    },
+    "settle_from_replacement": {
+      "defect": "A visible replacement substitutes for exact absence of the old version.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "if exact_absent { ReceiptAction::Reconcile }",
+          "replace": "if exact_absent || !current_compatible { ReceiptAction::Reconcile }"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "    if exact_absent {\n",
+          "replace": "    if exact_absent || !current_compatible {\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "a_visible_replacement_does_not_establish_exact_absence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 20
+    },
+    "skip_replacement_after_exact_absence": {
+      "defect": "A visible replacement still prevents settling a confirmed absent version.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "if exact_absent { ReceiptAction::Reconcile }",
+          "replace": "if exact_absent && current_compatible { ReceiptAction::Reconcile }"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "    if exact_absent {\n",
+          "replace": "    if exact_absent && current_compatible {\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "exact_absence_reconciles_even_with_a_replacement",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 20
     }
   }
 }

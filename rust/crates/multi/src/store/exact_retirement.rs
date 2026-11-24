@@ -546,6 +546,17 @@ impl InstalledPublication {
             }
         }
     }
+
+    /// Called after `available` has authenticated the provider and target.
+    pub(crate) async fn confirmed_absence(&self, key: &ObjectKey, provider: &rtdb_s3::VersionedInventory) -> Result<bool> {
+        match self {
+            Self::Version { version } => provider.exact_retirement_absent(key, version).await,
+            Self::Terminal { .. } => {
+                let Some(provider) = provider.enrolled_terminal_retirement().await? else { return Ok(false); };
+                provider.confirms(key, installed_publication_token(self.withdrawal()?)).await
+            }
+        }
+    }
 }
 
 pub(crate) fn installed_object_name(
@@ -573,15 +584,16 @@ pub(crate) struct InstalledPublicationDeletionGrant<'a> {
 }
 
 impl<'a> InstalledPublicationDeletionGrant<'a> {
-    pub(crate) fn from_journal(
+    pub(crate) async fn after_provider_drain(
         key: &'a ObjectKey, publication: &'a InstalledPublication, fence: ordered_logkeeper::ordered::ObjectFence,
-        placement: ordered_logkeeper::ordered::Placement,
-    ) -> Result<Self> {
+        placement: ordered_logkeeper::ordered::Placement, census: &rtdb_storage::remote::RemoteStore,
+    ) -> Result<Option<Self>> {
         let expected = publication.withdrawal()?;
         if !matches_object_fence(fence.object.name, fence.object.version, expected.name, expected.version) {
             return Err(changed());
         }
-        Ok(Self { key, publication, fence, placement })
+        if !census.close_read_admission(key).await? { return Ok(None); }
+        Ok(Some(Self { key, publication, fence, placement }))
     }
 
     pub(crate) async fn settle(self, provider: &rtdb_s3::VersionedInventory) -> Result<()> {

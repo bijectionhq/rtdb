@@ -272,9 +272,21 @@ Block collection also submits offloaded payloads using the same block-age cutoff
 The queue sits outside the database's storage root and retires with its writer prefix.
 
 A successful request acknowledges the candidate and leaves the bytes available for reads and replay.
-The current writer's storage still grows until an ordered exact-object withdrawal operation and a qualified provider disposal path are available.
-Withdrawal must serialize with new references and cover both crash-selectable checkpoint images, preparations, the typed closure of every retained suffix, Logkeeper's replay, recovery, root and read holds, and RTDB reader leases.
-An inspection of the current route and suffix can assist discovery, but an append, preparation or admission after that inspection can introduce a dependency before a provider effect.
+Installed trie receipt settlement requires an exact ordered withdrawal and qualified provider disposal.
+Withdrawal serializes with new references and covers both crash-selectable checkpoint images, preparations, the typed closure of every retained suffix, and Logkeeper's replay, recovery, root and read holds.
+An authenticated candidate whose exact version is absent settles even when a replacement is visible.
+For an enrolled never-versioned provider, the matching retirement tombstone establishes completion.
+
+With `reclamation_read_drain` enabled in every installed worker and custodian route entry, each serving point read of an eligible S3 trie file creates a unique durable registration before checking the object's admission fence.
+The detached storage task removes its registration after conclusive provider completion, including when the caller has timed out.
+Following the ordered withdrawal, the custodian closes physical read admission and checks the provider census before withdrawing the key or removing the exact publication.
+An expired lease, an ambiguous provider result, or a process loss can leave a registration pending.
+Without a qualified census, the custodian can reconcile confirmed absence and defers destructive effects for receipt candidates.
+
+Enable this mode only after all readers from the previous configuration have joined their provider operations and every serving worker and custodian uses the census.
+The S3 provider must supply strongly consistent conditional creates, point observations and complete listings.
+Grant serving readers create and release access to their read registrations, give the custodian fence creation and census listing access, and preserve active registrations and permanent fences in bucket policy and lifecycle rules.
+The control prefix is `STORAGE_PREFIX/~ordered/GENERATION/EPOCH.lifecycle/.tmp/installed-read-drain/`.
 
 ## Repair the voter cohort
 

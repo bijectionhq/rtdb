@@ -28,30 +28,47 @@ def RetainsServingSlot (sameOrigin sameAttempt : Bool) : Prop :=
 def RetainsPublicationScope (deleted disposed regionsEmpty : Bool) : Prop :=
   deleted = false ∨ disposed = false ∨ regionsEmpty = false
 
-def MayDelete (fenced readersDrained exactMatch : Bool) : Prop :=
-  fenced = true ∧ readersDrained = true ∧ exactMatch = true
+def ProviderDrainCompleted (admissionClosed liveReadsSeen : Bool) : Prop :=
+  admissionClosed = true ∧ liveReadsSeen = false
+
+def MayDelete (fenced admissionClosed liveReadsSeen exactMatch : Bool) : Prop :=
+  fenced = true ∧ ProviderDrainCompleted admissionClosed liveReadsSeen ∧ exactMatch = true
 
 def StableAbsence (listed actual : Bool) : Prop :=
   listed = false ∧ (actual = true → listed = true)
 
-def HostedHeadAllowsRetry (observedMatch : Option Bool) : Prop :=
-  observedMatch = some true ∨ observedMatch = none
+inductive ReceiptAction where
+  | reconcile | retire | defer
+  deriving DecidableEq
+
+def HostedReceiptAction (exactAbsent currentCompatible : Bool) : ReceiptAction :=
+  if exactAbsent then .reconcile else if currentCompatible then .retire else .defer
 
 theorem StableAbsence.excludes_target {listed actual : Bool} (absence : StableAbsence listed actual) :
     actual = false := by
   cases actual <;> simp_all [StableAbsence]
 
+inductive ReaderPhase where
+  | idle | registered | admitted | running
+  deriving DecidableEq
+
 structure State where
   ordered : ObjectWithdrawal.State
-  readersDrained : Bool := false
+  reader : ReaderPhase := .idle
+  admissionClosed : Bool := false
+  leaseExpired : Bool := false
   exactPresent : Bool := true
   replacementPresent : Bool := false
   lostReply : Bool := false
   settled : Bool := false
 
+def liveReadsSeen (s : State) : Bool := s.reader != .idle
+
+def noAdmittedRead (s : State) : Prop := s.reader = .idle ∨ s.reader = .registered
+
 def Safe (s : State) : Prop :=
   ObjectWithdrawal.Safe s.ordered ∧
-  (s.exactPresent = false → s.ordered.fenced = true ∧ s.readersDrained = true) ∧
+  (s.exactPresent = false → s.ordered.fenced = true ∧ s.admissionClosed = true ∧ noAdmittedRead s) ∧
   (s.settled = true → s.exactPresent = false)
 
 theorem ordered_fence_persists {before after : ObjectWithdrawal.State}
@@ -63,10 +80,17 @@ inductive Step : State → State → Prop where
   | order (s : State) (ordered : ObjectWithdrawal.State)
       (step : ObjectWithdrawal.Step s.ordered ordered) :
       Step s { s with ordered := ordered }
-  | drain (s : State) (fenced : s.ordered.fenced = true) :
-      Step s { s with readersDrained := true }
+  | register (s : State) (idle : s.reader = .idle) : Step s { s with reader := .registered }
+  | admit (s : State) (registered : s.reader = .registered) (opened : s.admissionClosed = false)
+      (leased : s.leaseExpired = false) : Step s { s with reader := .admitted }
+  | start (s : State) (admitted : s.reader = .admitted) : Step s { s with reader := .running }
+  | releaseUnadmitted (s : State) (registered : s.reader = .registered) :
+      Step s { s with reader := .idle }
+  | complete (s : State) (running : s.reader = .running) : Step s { s with reader := .idle }
+  | expire (s : State) : Step s { s with leaseExpired := true }
+  | close (s : State) (fenced : s.ordered.fenced = true) : Step s { s with admissionClosed := true }
   | installReplacement (s : State) : Step s { s with replacementPresent := true }
-  | remove (s : State) (ready : MayDelete s.ordered.fenced s.readersDrained s.exactPresent)
+  | remove (s : State) (ready : MayDelete s.ordered.fenced s.admissionClosed (liveReadsSeen s) s.exactPresent)
       (lost : Bool) : Step s { s with exactPresent := false, lostReply := lost }
   | reconcile (s : State) (listed : Bool) (absence : StableAbsence listed s.exactPresent) :
       Step s { s with settled := true }
@@ -83,9 +107,21 @@ theorem step_preserves_safety {before after : State} (safe : Safe before)
   | order _ step =>
       exact ⟨ObjectWithdrawal.order_preserves_separation ordered step,
         fun absent => ⟨ordered_fence_persists step (removed absent).1, (removed absent).2⟩, settled⟩
-  | drain => exact ⟨ordered, fun absent => ⟨(removed absent).1, rfl⟩, settled⟩
+  | register => exact ⟨ordered, fun absent => ⟨(removed absent).1, (removed absent).2.1, Or.inr rfl⟩, settled⟩
+  | admit _ opened _ =>
+      exact ⟨ordered, fun absent => Bool.noConfusion (opened.symm.trans (removed absent).2.1), settled⟩
+  | start admitted =>
+      refine ⟨ordered, fun absent => ?_, settled⟩
+      rcases (removed absent).2.2 with idle | registered <;> simp_all
+  | releaseUnadmitted | complete =>
+      exact ⟨ordered, fun absent => ⟨(removed absent).1, (removed absent).2.1, Or.inl rfl⟩, settled⟩
+  | expire => exact ⟨ordered, removed, settled⟩
+  | close => exact ⟨ordered, fun absent => ⟨(removed absent).1, rfl, (removed absent).2.2⟩, settled⟩
   | installReplacement => exact ⟨ordered, removed, settled⟩
-  | remove ready _ => exact ⟨ordered, fun _ => ⟨ready.1, ready.2.1⟩, fun _ => rfl⟩
+  | remove ready _ =>
+      have idle := ready.2.1.2
+      simp [liveReadsSeen] at idle
+      exact ⟨ordered, fun _ => ⟨ready.1, ready.2.1.1, Or.inl idle⟩, fun _ => rfl⟩
   | reconcile _ absence => exact ⟨ordered, removed, fun _ => absence.excludes_target⟩
 
 theorem trace_preserves_safety {start finish : State} (safe : Safe start)
@@ -102,42 +138,44 @@ theorem trace_preserves_a_present_replacement {start finish : State}
   | next _ step preceding => cases step <;> first | rfl | exact preceding
 
 def initial : State := { ordered := ObjectWithdrawal.empty }
-
-def fenced : State := { initial with ordered := ObjectWithdrawal.withdrawn }
-
-def drained : State := { fenced with readersDrained := true }
-
+def registered : State := { initial with reader := .registered }
+def admitted : State := { registered with reader := .admitted }
+def reading : State := { admitted with reader := .running }
+def expired : State := { reading with leaseExpired := true }
+def fenced : State := { expired with ordered := ObjectWithdrawal.withdrawn }
+def blocked : State := { fenced with admissionClosed := true }
+def drained : State := { blocked with reader := .idle }
 def replaced : State := { drained with replacementPresent := true }
-
 def replyLost : State := { replaced with exactPresent := false, lostReply := true }
-
 def settledAfterLoss : State := { replyLost with settled := true }
 
 theorem initial_is_safe : Safe initial := by
   simp [Safe, initial, ObjectWithdrawal.Safe, ObjectWithdrawal.empty]
 
+theorem reaches_closed_census_with_expired_detached_read : Trace initial blocked :=
+  .next (.next (.next (.next (.next (.next (.empty initial)
+    (.register initial rfl)) (.admit registered rfl rfl rfl)) (.start admitted rfl)) (.expire reading))
+    (.order expired ObjectWithdrawal.withdrawn ObjectWithdrawal.reachable_fence)) (.close fenced rfl)
+
+theorem closed_census_refuses_deletion_with_a_live_detached_read :
+    Trace initial blocked ∧ DisposalLease.MayDispose 10 1 11 ∧
+      ¬ MayDelete blocked.ordered.fenced blocked.admissionClosed (liveReadsSeen blocked) blocked.exactPresent := by
+  refine ⟨reaches_closed_census_with_expired_detached_read, (by decide : 10 + 1 ≤ 11), ?_⟩
+  intro ready
+  exact Bool.noConfusion ready.2.1.2
+
 theorem reaches_replacement : Trace initial replaced :=
-  .next (.next (.next (.empty initial) (.order initial ObjectWithdrawal.withdrawn
-    ObjectWithdrawal.reachable_fence)) (.drain fenced rfl)) (.installReplacement drained)
+  .next (.next reaches_closed_census_with_expired_detached_read (.complete blocked rfl))
+    (.installReplacement drained)
 
 theorem lost_reply_reconciles_with_replacement_present :
-    Trace initial settledAfterLoss ∧ settledAfterLoss.exactPresent = false ∧
-      settledAfterLoss.replacementPresent = true ∧ settledAfterLoss.lostReply = true :=
-  ⟨.next (.next reaches_replacement (.remove replaced ⟨rfl, rfl, rfl⟩ true))
-    (.reconcile replyLost false ⟨rfl, by simp [replyLost]⟩), rfl, rfl, rfl⟩
+    Trace initial settledAfterLoss ∧ HostedReceiptAction true false = .reconcile ∧
+      settledAfterLoss.exactPresent = false ∧ settledAfterLoss.replacementPresent = true ∧
+      settledAfterLoss.lostReply = true :=
+  ⟨.next (.next reaches_replacement (.remove replaced ⟨rfl, ⟨rfl, rfl⟩, rfl⟩ true))
+    (.reconcile replyLost false ⟨rfl, by simp [replyLost]⟩), rfl, rfl, rfl, rfl⟩
 
-theorem hosted_retry_reaches_settlement_from_a_missing_head :
-    ∃ before after, Trace initial before ∧ before.lostReply = true ∧ before.replacementPresent = false ∧
-      HostedHeadAllowsRetry none ∧ Step before after ∧ after.settled = true := by
-  let before := { drained with exactPresent := false, lostReply := true }
-  let after := { before with settled := true }
-  refine ⟨before, after, ?_, rfl, rfl, Or.inr rfl, .reconcile before false ⟨rfl, ?_⟩, rfl⟩
-  · exact .next (.next (.next (.empty initial) (.order initial ObjectWithdrawal.withdrawn
-      ObjectWithdrawal.reachable_fence)) (.drain fenced rfl)) (.remove drained ⟨rfl, rfl, rfl⟩ true)
-  · simp [before]
-
-theorem hosted_retry_skips_a_visible_mismatch : ¬ HostedHeadAllowsRetry (some false) := by
-  simp [HostedHeadAllowsRetry]
+theorem visible_replacement_without_exact_absence_defers : HostedReceiptAction false false = .defer := rfl
 
 def ReconcileFromIncompleteListing (s : State) (listed : Bool) (t : State) : Prop :=
   listed = false ∧ t = { s with settled := true }
@@ -154,20 +192,32 @@ theorem path_only_retry_can_remove_a_replacement :
     ∃ bad, Trace initial replyLost ∧ RetryDeletesCurrent replyLost bad ∧
       replyLost.replacementPresent = true ∧ bad.replacementPresent = false :=
   ⟨{ replyLost with replacementPresent := false },
-    .next reaches_replacement (.remove replaced ⟨rfl, rfl, rfl⟩ true), ⟨rfl, rfl⟩, rfl, rfl⟩
+    .next reaches_replacement (.remove replaced ⟨rfl, ⟨rfl, rfl⟩, rfl⟩ true), ⟨rfl, rfl⟩, rfl, rfl⟩
 
-theorem lease_expiry_alone_allows_an_outstanding_provider_read :
-    ∃ start leaseEnd drift disposedAt completedAt : Nat,
-      start < leaseEnd ∧ DisposalLease.MayDispose leaseEnd drift disposedAt ∧ disposedAt < completedAt :=
-  ⟨9, 10, 1, 11, 12, by decide, (by decide : 10 + 1 ≤ 11), by decide⟩
+def DeleteAfterLeaseExpiry (s t : State) : Prop :=
+  s.ordered.fenced = true ∧ s.leaseExpired = true ∧ t = { s with exactPresent := false }
+
+theorem replacing_completion_with_expiry_deletes_during_a_read :
+    ∃ bad, Trace initial blocked ∧ DeleteAfterLeaseExpiry blocked bad ∧ ¬ Safe bad :=
+  ⟨{ blocked with exactPresent := false }, reaches_closed_census_with_expired_detached_read,
+    ⟨rfl, rfl, rfl⟩, fun safe => by rcases (safe.2.1 rfl).2.2 with idle | registered <;> contradiction⟩
+
+def ReconcileVisibleReplacement (s t : State) : Prop :=
+  s.replacementPresent = true ∧ t = { s with settled := true }
+
+theorem treating_a_visible_replacement_as_absence_settles_a_live_target :
+    ∃ bad, Trace initial replaced ∧ ReconcileVisibleReplacement replaced bad ∧ ¬ Safe bad :=
+  ⟨{ replaced with settled := true }, reaches_replacement, ⟨rfl, rfl⟩,
+    fun safe => Bool.noConfusion (safe.2.2 rfl)⟩
 
 #print axioms trace_preserves_safety
 #print axioms trace_preserves_a_present_replacement
+#print axioms closed_census_refuses_deletion_with_a_live_detached_read
 #print axioms lost_reply_reconciles_with_replacement_present
-#print axioms hosted_retry_reaches_settlement_from_a_missing_head
-#print axioms hosted_retry_skips_a_visible_mismatch
+#print axioms visible_replacement_without_exact_absence_defers
 #print axioms incomplete_listing_can_settle_a_present_target
 #print axioms path_only_retry_can_remove_a_replacement
-#print axioms lease_expiry_alone_allows_an_outstanding_provider_read
+#print axioms replacing_completion_with_expiry_deletes_during_a_read
+#print axioms treating_a_visible_replacement_as_absence_settles_a_live_target
 
 end ExactReclamation

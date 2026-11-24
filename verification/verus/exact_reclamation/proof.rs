@@ -10,6 +10,8 @@ mod catalog {
 
 #[path = "../../../rust/crates/multi/src/reclamation_decision.rs"]
 mod production;
+#[path = "../../../rust/crates/storage/src/read_drain_decision.rs"]
+mod drain_decision;
 #[path = "../../../rust/crates/s3/src/versions/retirement_decision.rs"]
 mod provider_decision;
 mod laws;

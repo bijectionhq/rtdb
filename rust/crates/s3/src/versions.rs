@@ -772,8 +772,10 @@ mod tests {
             let exposes_older = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object</Key><VersionId>old+/=</VersionId><IsLatest>true</IsLatest></Version><Version><Key>encoded root/data/object</Key><VersionId>older</VersionId><IsLatest>false</IsLatest></Version>";
             let continued = "<IsTruncated>true</IsTruncated><NextKeyMarker>encoded root/data/object</NextKeyMarker><NextVersionIdMarker>new</NextVersionIdMarker><Version><Key>encoded root/data/object</Key><VersionId>new</VersionId></Version>";
             let absent = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object-neighbor</Key><VersionId>old+/=</VersionId></Version>";
+            let replacement_only = "<IsTruncated>false</IsTruncated><Version><Key>encoded root/data/object</Key><VersionId>new</VersionId><IsLatest>true</IsLatest></Version>";
             let incomplete = "<IsTruncated>true</IsTruncated><NextKeyMarker>encoded root/data/object</NextKeyMarker>";
             for (method, status, page, cursor) in [
+                ("GET", "200 OK", Some(present), false),
                 ("GET", "200 OK", Some(exposes_older), false),
                 ("GET", "200 OK", Some(present), false),
                 ("DELETE", "204 No Content", None, false),
@@ -785,6 +787,7 @@ mod tests {
                 ("DELETE", "204 No Content", None, false),
                 ("GET", "200 OK", Some(continued), false),
                 ("GET", "200 OK", Some(absent), true),
+                ("GET", "200 OK", Some(replacement_only), false),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(stream);
@@ -820,6 +823,7 @@ mod tests {
                 let error = inventory.retire_observed_version(&key, &rejected).await.expect_err("unbound retirement reached the provider");
                 assert_eq!(error.message.as_deref(), Some("The retirement does not identify an immutable version of this key"));
             }
+            assert!(!inventory.exact_retirement_absent(&key, &observed).await.unwrap());
             let error = inventory.retire_observed_version(&key, &observed).await.expect_err("the current version must keep any older data hidden");
             assert_eq!(error.message.as_deref(), Some("Retiring the current version would expose older data"));
             let error = inventory.retire_observed_version(&key, &observed).await.expect_err("a delete reply alone must not settle retirement");
@@ -827,6 +831,7 @@ mod tests {
             let error = inventory.retire_observed_version(&key, &observed).await.expect_err("an incomplete inventory must not settle retirement");
             assert_eq!(error.message.as_deref(), Some("S3 returned an incomplete version listing marker"));
             inventory.retire_observed_version(&key, &observed).await.expect("pagination must bind the key and version together");
+            assert!(inventory.exact_retirement_absent(&key, &observed).await.unwrap());
             server.await.unwrap();
         }).await.unwrap();
     }

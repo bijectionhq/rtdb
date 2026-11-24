@@ -1,4 +1,4 @@
-use crate::{production::*, provider_decision::*};
+use crate::{drain_decision::*, production::*, provider_decision::*};
 use vstd::prelude::*;
 
 verus! {
@@ -13,6 +13,16 @@ spec fn ReleaseIsCovered(through: int, trim_floor: int, selected_cut: int) -> bo
 
 spec fn ErasureRequiresCustodyJoin(erasure_floor: int) -> bool {
     erasure_floor != 0
+}
+
+spec fn ProviderDrainCompleted(admission_closed: bool, live_reads_seen: bool) -> bool {
+    admission_closed && !live_reads_seen
+}
+
+spec fn HostedReceiptAction(exact_absent: bool, current_compatible: bool) -> ReceiptAction {
+    if exact_absent { ReceiptAction::Reconcile }
+    else if current_compatible { ReceiptAction::Retire }
+    else { ReceiptAction::Defer }
 }
 
 spec fn ExactVersionRemoval(listed_as_current: Option<bool>, other_data: bool) -> bool {
@@ -46,6 +56,21 @@ fn release_is_strictly_below_the_trim_floor(through: i64, trim_floor: u64, selec
 fn retirement_requires_custody_join_after_erasure(erasure_floor: u64) {
     let needs_join = erasure_requires_custody_join(erasure_floor);
     assert(needs_join == ErasureRequiresCustodyJoin(erasure_floor as int));
+}
+
+fn retirement_requires_provider_completion(admission_closed: bool, live_reads_seen: bool) {
+    let ready = provider_drain_completed(admission_closed, live_reads_seen);
+    assert(ready == ProviderDrainCompleted(admission_closed, live_reads_seen));
+}
+
+fn a_visible_replacement_does_not_establish_exact_absence(exact_absent: bool, current_compatible: bool) {
+    let action = hosted_receipt_action(exact_absent, current_compatible);
+    assert((action is Reconcile) ==> (HostedReceiptAction(exact_absent, current_compatible) is Reconcile));
+}
+
+fn exact_absence_reconciles_even_with_a_replacement() {
+    let action = hosted_receipt_action(true, false);
+    assert(action == HostedReceiptAction(true, false));
 }
 
 fn version_delete_requires_the_exact_listing(target_latest: Option<bool>, other_data: bool) {

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider, error::CredentialsError, future};
 use aws_sdk_sts::operation::assume_role::builders::AssumeRoleFluentBuilder;
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
 use serde_json::json;
 
@@ -55,6 +55,11 @@ impl ScopedS3Writes {
 
     pub async fn open(&self, storage: &S3Config, cell_root: &ObjectKey, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>,
                 io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        Ok(self.open_remote(storage, cell_root, root, authorization, io).await?)
+    }
+
+    pub async fn open_remote(&self, storage: &S3Config, cell_root: &ObjectKey, root: &ObjectKey, authorization: Arc<dyn WriteAuthorization>,
+                io: Arc<IoRegion>) -> Result<Arc<RemoteStore>> {
         storage.require_cell_root(cell_root)?;
         let terminal_namespace = if storage.terminal_scope.is_some() {
             if !self.require_conditional_put || root == cell_root || !root.is_under(cell_root) {

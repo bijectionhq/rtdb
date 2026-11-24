@@ -13,6 +13,8 @@ pub use version_step::valid_object_version;
 
 #[path = "remote_catalog.rs"]
 mod catalog;
+#[path = "remote_read_drain.rs"]
+mod read_drain;
 
 pub const S3_RETIREMENT_ATTRIBUTE: &str = "rtdb-retirement";
 
@@ -108,13 +110,13 @@ impl RemoteStore {
     /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
     /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
     pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix, uploads: None, hide_tombstones: false, read_drain: None }), io, cell: false, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Cell storage publishes a final object with one conditional provider
     /// write for untracked cell operations.
     pub fn new_single_put(client: Arc<dyn ProviderStore>, prefix: ObjectKey, io: Arc<IoRegion>) -> Self {
-        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
+        Self { objects: Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: None, hide_tombstones: true, read_drain: None }), io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
     /// Opens a cell store with abortable, journaled publication.
@@ -124,7 +126,7 @@ impl RemoteStore {
         io: Arc<IoRegion>,
         uploads: Arc<dyn PublicationUploads>,
     ) -> Self {
-        let objects = Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true });
+        let objects = Arc::new(RemoteObjects { client, audience_reader: None, prefix: Some(prefix), uploads: Some(uploads), hide_tombstones: true, read_drain: None });
         Self { objects, io, cell: true, version_namespace: None, terminal_allocation: None, catalog: None, classic_versions: None }
     }
 
@@ -142,6 +144,28 @@ impl RemoteStore {
     pub fn with_audience_reader(mut self, reader: Arc<dyn ProviderStore>) -> Self {
         Arc::make_mut(&mut self.objects).audience_reader = Some(reader);
         self
+    }
+
+    pub fn with_read_drain(mut self, scope: fn(&ObjectKey) -> Option<&str>) -> Self {
+        let client = self.objects.client.clone();
+        Arc::make_mut(&mut self.objects).read_drain = Some(ReadDrainOwner { client, scope });
+        self
+    }
+
+    pub fn inherit_read_drain(mut self, owner: &Self) -> Result<Self> {
+        if let Some(drain) = &owner.objects.read_drain {
+            if self.version_namespace != owner.version_namespace || self.objects.prefix != owner.objects.prefix {
+                return Err(Error::Closed("The provider read census belongs to a different storage namespace".into()));
+            }
+            Arc::make_mut(&mut self.objects).read_drain = Some(drain.clone());
+        }
+        Ok(self)
+    }
+
+    /// Close point-read admission and observe the durable census for this key.
+    pub async fn close_read_admission(&self, key: &ObjectKey) -> Result<bool> {
+        let Some(drain) = self.objects.read_drain(key) else { return Ok(false); };
+        drain.close_and_observe().await
     }
 
     /// Enables version observations for a store backed by the specified S3 namespace.
@@ -363,24 +387,23 @@ impl ObjectStore for RemoteStore {
             let path = objects.path(&key);
             let length = usize::try_from(range.end - range.start)
                 .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
-            let response = match objects.read(&key, GetOptions::new().with_range(Some(range.clone())), Some(length)).await {
-                Ok(response) => response,
-                Err(error @ Error::MissingObject(_)) => return Err(error),
-                Err(error) => {
-                    if objects.hide_tombstones && matches!(objects.metadata(&key).await, Err(Error::MissingObject(_))) {
-                        return Err(Error::MissingObject(key.to_string()));
-                    }
-                    return Err(error);
+            let mut check_tombstone = false;
+            let response = objects.with_read(&key, async {
+                let response = objects.read(&key, GetOptions::new().with_range(Some(range.clone())), Some(length)).await
+                    .inspect_err(|error| check_tombstone = objects.hide_tombstones && !matches!(error, Error::MissingObject(_)))?;
+                if response.range != range || response.meta.size < range.end {
+                    return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
                 }
-            };
-            if response.range != range || response.meta.size < range.end {
-                return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: response.meta.size });
+                let version = physical_version(Some(&namespace), &path, response.meta.version.clone());
+                let value = collect_exact_body(response, &key, length, || Error::Remote {
+                    key: key.to_string(), message: "provider returned a different byte range length".into(),
+                }).await?;
+                Ok(ObjectObservation { value, version })
+            }).await;
+            if check_tombstone && matches!(objects.metadata(&key).await, Err(Error::MissingObject(_))) {
+                return Err(Error::MissingObject(key.to_string()));
             }
-            let version = physical_version(Some(&namespace), &path, response.meta.version.clone());
-            let value = collect_exact_body(response, &key, length, || Error::Remote {
-                key: key.to_string(), message: "provider returned a different byte range length".into(),
-            }).await?;
-            Ok(ObjectObservation { value, version })
+            response
         }).await
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
@@ -452,6 +475,13 @@ struct RemoteObjects {
     prefix: Option<ObjectKey>,
     uploads: Option<Arc<dyn PublicationUploads>>,
     hide_tombstones: bool,
+    read_drain: Option<ReadDrainOwner>,
+}
+
+#[derive(Clone)]
+struct ReadDrainOwner {
+    client: Arc<dyn ProviderStore>,
+    scope: fn(&ObjectKey) -> Option<&str>,
 }
 
 impl RemoteObjects {
@@ -478,6 +508,24 @@ impl RemoteObjects {
 
     fn path(&self, key: &ObjectKey) -> Path {
         Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{key}"), None => key.to_string() })
+    }
+
+    fn read_drain<'a>(&'a self, key: &'a ObjectKey) -> Option<read_drain::ReadDrain<'a>> {
+        let owner = self.read_drain.as_ref()?;
+        let scope = (owner.scope)(key)?;
+        let control = format!("{scope}.lifecycle/.tmp/installed-read-drain");
+        let root = Path::from(match &self.prefix {
+            Some(prefix) => format!("{prefix}/{control}"),
+            None => control,
+        });
+        Some(read_drain::ReadDrain::new(owner.client.as_ref(), root, key))
+    }
+
+    async fn with_read<T>(&self, key: &ObjectKey, work: impl Future<Output = Result<T>>) -> Result<T> {
+        match self.read_drain(key) {
+            Some(drain) => drain.read(work).await,
+            None => work.await,
+        }
     }
 
     fn key(relative: &str) -> Result<ObjectKey> {
@@ -604,6 +652,10 @@ impl RemoteObjects {
     }
 
     async fn metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
+        self.with_read(key, self.read_metadata(key)).await
+    }
+
+    async fn read_metadata(&self, key: &ObjectKey) -> Result<ObjectMeta> {
         if self.hide_tombstones || audience_work::is_bounded() {
             return Ok(self.read(key, GetOptions { head: true, ..GetOptions::default() }, Some(0)).await?.meta);
         }
@@ -617,10 +669,16 @@ impl RemoteObjects {
     }
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
-        self.read(key, GetOptions::default(), None).await?.bytes().await.map_err(|error| provider_error(key, error))
+        self.with_read(key, async {
+            self.read(key, GetOptions::default(), None).await?.bytes().await.map_err(|error| provider_error(key, error))
+        }).await
     }
 
     async fn observe_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
+        self.with_read(key, self.read_exact(key, length, namespace)).await
+    }
+
+    async fn read_exact(&self, key: &ObjectKey, length: usize, namespace: Option<&S3ObjectNamespace>) -> Result<ObjectObservation<Bytes>> {
         let path = self.path(key);
         let object = self.read(key, GetOptions::default(), Some(length)).await?;
         let wrong_size = || crate::object_store::wrong_size(key, length);
@@ -638,6 +696,10 @@ impl RemoteObjects {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length });
         }
         if range.is_empty() { return Ok(Bytes::new()); }
+        self.with_read(key, self.read_range(key, range, length)).await
+    }
+
+    async fn read_range(&self, key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Bytes> {
         let requested = usize::try_from(range.end - range.start).map_err(|_| Error::AudienceWorkLimit)?;
         if audience_work::is_bounded() {
             let options = GetOptions { range: Some(GetRange::Bounded(range.clone())), ..Default::default() };
@@ -724,6 +786,10 @@ impl RemoteObjects {
     }
 
     async fn compare_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<ProviderPublication> {
+        self.with_read(key, self.read_existing(key, bytes)).await
+    }
+
+    async fn read_existing(&self, key: &ObjectKey, bytes: Bytes) -> Result<ProviderPublication> {
         let object = self.client.get(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
         let version = object.meta.version.clone();
         let etag = object.meta.e_tag.clone();
@@ -734,6 +800,10 @@ impl RemoteObjects {
     }
 
     async fn publication_confirmed(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<PublicationResult> {
+        self.with_read(key, self.read_publication(key, attempt)).await
+    }
+
+    async fn read_publication(&self, key: &ObjectKey, attempt: uuid::Uuid) -> Result<PublicationResult> {
         match self.client.get_opts(&self.path(key), GetOptions::new().with_head(true)).await {
             Ok(object) => {
                 let expected = attempt.to_string();

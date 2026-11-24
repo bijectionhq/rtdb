@@ -28,6 +28,27 @@ pub(crate) fn erasure_requires_custody_join(erasure_floor: u64) -> bool {
     erasure_floor != 0
 }
 
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+pub(crate) enum ReceiptAction {
+    Reconcile,
+    Retire,
+    Defer,
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if exact_absent { ReceiptAction::Reconcile }
+        else if current_compatible { ReceiptAction::Retire } else { ReceiptAction::Defer },
+))]
+pub(crate) fn hosted_receipt_action(exact_absent: bool, current_compatible: bool) -> ReceiptAction {
+    if exact_absent {
+        ReceiptAction::Reconcile
+    } else if current_compatible {
+        ReceiptAction::Retire
+    } else {
+        ReceiptAction::Defer
+    }
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == (same_origin && same_attempt),
 ))]

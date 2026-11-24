@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{Placement, genesis, prefix_retirement::GrantDescriptor};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
-use crate::reclamation_decision::release_is_covered;
+use crate::reclamation_decision::{ReceiptAction, hosted_receipt_action, release_is_covered};
 use crate::store::{EncryptingStore, exact_retirement::{InstalledPublication, InstalledPublicationDeletionGrant}};
 use crate::reference::{Bucket, PrefixedStore};
 
@@ -30,6 +30,17 @@ const MAXIMUM_CANDIDATE_BYTES: u64 = 16 << 10;
 
 pub(super) fn can_fence_trie_file(key: &str) -> bool {
     is_receipt_trie_file(key) || is_compacted_primary_file(key)
+}
+
+pub(super) fn read_census_scope(key: &ObjectKey) -> Option<&str> {
+    let (source, _) = key.as_str().rsplit_once("/tables/")?;
+    let (grant, _) = source.rsplit_once('/')?;
+    let (_, epoch) = grant.rsplit_once("/~ordered/")?;
+    let (generation, writer) = epoch.split_once('/')?;
+    generation.parse::<u64>().ok()?;
+    writer.parse::<u64>().ok()?;
+    let logical = &key.as_str()[source.len() + 1..];
+    can_fence_trie_file(logical).then_some(grant)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -193,6 +204,11 @@ pub(super) async fn settle_receipts(
     }
     checkpoint.open(route.checkpoint).await?;
     let provider = storage.custody_namespace()?;
+    let census = if placement.reclamation_read_drain {
+        super::storage::serving_bucket(storage, Arc::clone(&io), true).await?.1
+    } else {
+        None
+    };
     let ledger = Arc::new(super::storage::serving_ledger(Arc::clone(keys), route.placement, provider, &source, io));
     let raw = Arc::new(PrefixedStore::new(Arc::clone(&bucket), source.clone()));
     let sealed = EncryptingStore::with_units(raw.clone(), ledger.clone());
@@ -229,17 +245,30 @@ pub(super) async fn settle_receipts(
         }) {
             continue;
         }
-        match raw.retirement_publication(&key).await? {
-            Some(observed) if candidate.publication.matches(&observed) => (),
-            Some(_) => continue,
-            None => match raw.head_fresh(&key).await {
-                Err(Error::MissingObject(_)) => (),
-                Ok(_) => continue,
-                Err(error) => return Err(error.into()),
-            },
+        let exact_absent = candidate.publication.confirmed_absence(&target, &inventory).await?;
+        let current_compatible = if exact_absent { false } else {
+            match raw.retirement_publication(&key).await? {
+                Some(observed) => candidate.publication.matches(&observed),
+                None => match raw.head_fresh(&key).await {
+                    Err(Error::MissingObject(_)) => true,
+                    Ok(_) => false,
+                    Err(error) => return Err(error.into()),
+                },
+            }
+        };
+        match hosted_receipt_action(exact_absent, current_compatible) {
+            ReceiptAction::Reconcile => {
+                tracing::debug!(key = %target, receipt = %entry.key, "Reconciled absent installed publication");
+                continue;
+            }
+            ReceiptAction::Defer => continue,
+            ReceiptAction::Retire => (),
         }
+        let Some(census) = &census else { continue; };
         let Some(fence) = custodian.withdraw_object(&route, candidate.publication.withdrawal()?).await? else { continue; };
-        let grant = InstalledPublicationDeletionGrant::from_journal(&target, &candidate.publication, fence, route.placement)?;
+        let Some(grant) = InstalledPublicationDeletionGrant::after_provider_drain(
+            &target, &candidate.publication, fence, route.placement, census,
+        ).await? else { continue; };
         ledger.withdraw(&key).await?;
         grant.settle(&inventory).await?;
     }
@@ -318,6 +347,22 @@ mod tests {
         assert!(!can_fence_trie_file("tables/public$orders/data/l00-rc-b00.arrow"));
         assert!(!can_fence_trie_file("~packs/b00.pack"));
         assert!(!can_fence_trie_file("blocks/b00.binpb"));
+    }
+
+    #[test]
+    fn r7_replacement_settles_only_from_exact_absence() {
+        assert_eq!(hosted_receipt_action(false, false), ReceiptAction::Defer);
+        assert_eq!(hosted_receipt_action(true, false), ReceiptAction::Reconcile);
+        assert_eq!(hosted_receipt_action(false, true), ReceiptAction::Retire);
+        assert_eq!(hosted_receipt_action(true, true), ReceiptAction::Reconcile);
+    }
+
+    #[test]
+    fn r7_census_uses_the_same_grant_for_serving_and_exact_receipt_keys() {
+        let target = key(format!("{SOURCE_PREFIX}/tables/public$orders/data/l01-rc-b00.arrow"));
+        assert_eq!(read_census_scope(&target), Some(GRANT_PREFIX));
+        assert!(read_census_scope(&key("tables/public$orders/data/l01-rc-b00.arrow")).is_none());
+        assert!(read_census_scope(&key(format!("{SOURCE_PREFIX}/blocks/b00.binpb"))).is_none());
     }
 
     #[tokio::test]
