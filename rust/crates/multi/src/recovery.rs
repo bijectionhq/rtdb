@@ -31,7 +31,8 @@ use crate::{
 
 mod classic_destination;
 
-const FRAME_BYTES: u64 = 2048;
+const FRAME_BYTES: usize = 2048;
+const ORIGINAL_RECEIPT_FRAME_BYTES: usize = 4096;
 const MAX_REPLY_BYTES: usize = 4 << 20;
 const SOCKET_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -165,7 +166,7 @@ enum Action {
     StageClassicMigrationDestination { selection: classic_destination::Selection },
     InstallClassicMigrationDestination { selection: classic_destination::Selection, projection_sha256: [u8; 32] },
     ClassicMigrationDestinationStatus { selection: classic_destination::Selection, classic_cut: Option<rtdb_types::TransactionKey> },
-    ReadClassicMigrationOriginalReceipt { selection: classic_destination::Selection, id: rtdb_types::EntityId },
+    ReadClassicMigrationOriginalReceipt { selection: classic_destination::Selection, id: rtdb_types::EntityId, coverage: Option<classic_destination::CoveragePoint> },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
         stage_operation: Uuid,
@@ -886,8 +887,8 @@ impl RecoveryService {
             Action::ClassicMigrationDestinationStatus { selection, classic_cut } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Status { classic_cut },
             )).await,
-            Action::ReadClassicMigrationOriginalReceipt { selection, id } => Box::pin(self.classic_destination(
-                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::OriginalReceipt { id },
+            Action::ReadClassicMigrationOriginalReceipt { selection, id, coverage } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::OriginalReceipt { id, coverage },
             )).await,
             Action::InspectClassicMigrationInventory { destination, stage_operation, staged_manifest_sha256, ciphertext_sha256 } => {
                 if installation.checkpoint_stage.is_some() || destination.is_nil() || stage_operation.is_nil()
@@ -1238,6 +1239,10 @@ pub async fn serve(
                     .await;
                     return;
                 };
+                if !admits_frame_size(&request.action, line.len()) {
+                    let _ = tokio::time::timeout(SOCKET_DEADLINE, write_reply(&mut socket, &Reply::Refused)).await;
+                    return;
+                }
                 if matches!(request.action, Action::OpenCheckpointStage { .. } | Action::OpenCheckpointStageOwnedEventFiles { .. }) {
                     let _ = service.open_stage(directory, request, socket, stop).await;
                     return;
@@ -1259,6 +1264,15 @@ pub async fn serve(
     result
 }
 
+fn admits_frame_size(action: &Action, bytes: usize) -> bool {
+    let maximum = if matches!(action, Action::ReadClassicMigrationOriginalReceipt { .. }) {
+        ORIGINAL_RECEIPT_FRAME_BYTES
+    } else {
+        FRAME_BYTES
+    };
+    bytes <= maximum
+}
+
 async fn read_request(
     socket: TcpStream,
     acceptor: TlsAcceptor,
@@ -1267,7 +1281,7 @@ async fn read_request(
     // The caller waits for the acknowledgement before it starts PgWire.
     // Reject trailing bytes so the line reader cannot swallow its first frame.
     let mut line = String::new();
-    let mut reader = BufReader::new((&mut socket).take(FRAME_BYTES));
+    let mut reader = BufReader::new((&mut socket).take(ORIGINAL_RECEIPT_FRAME_BYTES as u64));
     reader.read_line(&mut line).await?;
     if !line.ends_with('\n') || !reader.buffer().is_empty() {
         return Err(std::io::Error::new(
@@ -1292,6 +1306,33 @@ async fn write_reply(socket: &mut (impl AsyncWrite + Unpin), reply: &Reply) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_receipt_request_can_carry_the_full_key_and_coverage_point() {
+        let authority = Uuid::new_v4();
+        let mut request = serde_json::json!({
+            "token": "c".repeat(64), "name": "a".repeat(128), "authority": authority, "capture": Uuid::new_v4(),
+            "action": {
+                "operation": "read_classic_migration_original_receipt",
+                "selection": {
+                    "destination": authority, "stage_operation": Uuid::new_v4(), "staged_manifest_sha256": "c".repeat(43),
+                    "ciphertext_sha256": vec![255; 32], "command_id": vec![255; 16], "command_digest": vec![255; 32],
+                    "original_receipt_table": {"schema": "public", "table": "original_receipts"},
+                },
+                "id": {"String": "d".repeat(1040)},
+                "coverage": {"table": {"schema": "public", "table": "admission_controls"}, "id": {"String": "registered_coverage"}},
+            },
+        });
+        let length = serde_json::to_vec(&request).unwrap().len() + 1;
+        assert!(length > FRAME_BYTES);
+        let parsed: Request = serde_json::from_value(request.clone()).unwrap();
+        assert!(admits_frame_size(&parsed.action, length));
+        assert!(!admits_frame_size(&parsed.action, ORIGINAL_RECEIPT_FRAME_BYTES + 1));
+        request["action"] = serde_json::json!({"operation": "capture_checkpoint"});
+        let ordinary: Request = serde_json::from_value(request).unwrap();
+        assert!(!admits_frame_size(&ordinary.action, length));
+    }
+
     use rtdb_directory::MemoryDirectory;
 
     #[tokio::test]

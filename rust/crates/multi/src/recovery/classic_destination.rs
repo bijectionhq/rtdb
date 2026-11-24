@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use super::{RecoveryService, Reply, valid_manifest};
 use crate::archive::{
-    self, ClassicProjection, ClassicRead, ReceiptHistory, ReceiptLookup, StageSelector,
+    self, ClassicProjection, ClassicRead, ReceiptHistory, ReceiptLookup, ReceiptLookups,
+    StageSelector,
 };
 
 #[derive(Deserialize, Serialize)]
@@ -93,9 +94,23 @@ impl Selection {
 
 pub(super) enum Operation {
     Stage,
-    Install { projection_sha256: [u8; 32] },
-    Status { classic_cut: Option<TransactionKey> },
-    OriginalReceipt { id: EntityId },
+    Install {
+        projection_sha256: [u8; 32],
+    },
+    Status {
+        classic_cut: Option<TransactionKey>,
+    },
+    OriginalReceipt {
+        id: EntityId,
+        coverage: Option<CoveragePoint>,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CoveragePoint {
+    table: TableRef,
+    id: EntityId,
 }
 
 #[derive(Serialize)]
@@ -114,6 +129,8 @@ pub(super) struct Evidence {
     candidate: Option<ClassicCandidate>,
     projection: Option<ClassicProjection>,
     original_receipt: Option<ReceiptHistory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_receipt_coverage: Option<ReceiptHistory>,
     mapped_cut: Option<(TransactionKey, rtdb_types::rtdb_v1::Basis)>,
 }
 
@@ -127,9 +144,6 @@ impl RecoveryService {
         selection: Selection,
         operation: Operation,
     ) -> Result<Reply> {
-        let Some(runtime) = self.classic_destination.as_ref() else {
-            return Ok(Reply::Refused);
-        };
         if selection.destination != authority
             || selection.stage_operation.is_nil()
             || selection.stage_operation == authority
@@ -179,7 +193,43 @@ impl RecoveryService {
             candidate: None,
             projection: None,
             original_receipt: None,
+            original_receipt_coverage: None,
             mapped_cut: None,
+        };
+        if let Operation::OriginalReceipt { id, coverage } = operation {
+            let table = evidence
+                .selection
+                .original_receipt_table
+                .clone()
+                .ok_or_else(conflict)?;
+            if coverage
+                .as_ref()
+                .is_some_and(|point| point.table.schema != "public" || point.table.table.is_empty())
+            {
+                return Err(conflict());
+            }
+            let lookups = ReceiptLookups::new(
+                ReceiptLookup::new(table, id),
+                coverage.map(|point| ReceiptLookup::new(point.table, point.id)),
+            )?;
+            let (_, _, readback) = Box::pin(archive::read_classic_migration(
+                directory,
+                &self.storage,
+                self.keys.as_ref(),
+                self.classic_stage_selector(&evidence),
+                authority,
+                evidence.selection.ciphertext_sha256,
+                self.hosted_task.clone(),
+                ClassicRead::Receipt(lookups),
+            ))
+            .await?;
+            let readback = readback.ok_or_else(conflict)?;
+            evidence.original_receipt = Some(readback.receipt);
+            evidence.original_receipt_coverage = readback.coverage;
+            return Ok(Reply::ClassicMigrationDestination { evidence });
+        }
+        let Some(runtime) = self.classic_destination.as_ref() else {
+            return Ok(Reply::Refused);
         };
         let candidate = runtime
             .classic_candidate_status(&evidence.name, authority, request_sha256)
@@ -211,40 +261,17 @@ impl RecoveryService {
                 return Ok(Reply::ClassicMigrationDestination { evidence });
             }
         }
-        let selection = &evidence.selection;
-        let selector = StageSelector {
-            destination: selection.stage_operation,
-            operation: selection.stage_operation,
-            manifest_sha256: selection.staged_manifest_sha256.clone(),
-            source: Some((authority, capture, self.org.clone())),
-            transfer_only: true,
-        };
-        let read = match &operation {
-            Operation::OriginalReceipt { id } => {
-                let table = selection
-                    .original_receipt_table
-                    .clone()
-                    .ok_or_else(conflict)?;
-                ClassicRead::Receipt(ReceiptLookup::new(table, id.clone()))
-            }
-            _ => ClassicRead::Projection(request_sha256),
-        };
-        let (_, prepared, original_receipt) = Box::pin(archive::read_classic_migration(
+        let (_, prepared, _) = Box::pin(archive::read_classic_migration(
             directory,
             &self.storage,
             self.keys.as_ref(),
-            selector,
+            self.classic_stage_selector(&evidence),
             authority,
-            selection.ciphertext_sha256,
+            evidence.selection.ciphertext_sha256,
             self.hosted_task.clone(),
-            read,
+            ClassicRead::Projection(request_sha256),
         ))
         .await?;
-        if let Some(receipt) = original_receipt {
-            evidence.original_receipt = Some(receipt);
-            evidence.candidate = candidate;
-            return Ok(Reply::ClassicMigrationDestination { evidence });
-        }
         let prepared = prepared.ok_or_else(conflict)?;
         if let Some(transactions) = &prepared.transactions {
             let projection = prepared.proof.sha256;
@@ -288,6 +315,16 @@ impl RecoveryService {
         }
         evidence.projection = Some(prepared.proof);
         Ok(Reply::ClassicMigrationDestination { evidence })
+    }
+    fn classic_stage_selector(&self, evidence: &Evidence) -> StageSelector {
+        let selection = &evidence.selection;
+        StageSelector {
+            destination: selection.stage_operation,
+            operation: selection.stage_operation,
+            manifest_sha256: selection.staged_manifest_sha256.clone(),
+            source: Some((evidence.authority, evidence.capture, self.org.clone())),
+            transfer_only: true,
+        }
     }
 }
 

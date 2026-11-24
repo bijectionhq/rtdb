@@ -622,6 +622,8 @@ contract LogService {
         -- The import preserves admitted literal event times and retains their exact transaction cuts under the candidate's native coordinates.
         -- Canonical receipt imports preserve their original namespace, key, fingerprint and outcome under the mapped cut.
         -- Authenticated Original receipt read-through selects the exact control row at the certified scratch replay and returns its retained event coordinates.
+        -- Registered receipt read-through can select the companion coverage control from the same certified scratch replay.
+        -- Original receipt readback depends on Original custody and can proceed during native catalog unavailability.
         -- The retained replay, its covered relations and remaining Original custody remain distinguishable in the private proof.
         -- Status reopens the same native manifest through the ordered restore terminal after an interrupted append or reply.
         -- Route readiness and authority publication require the caller's separate guarded decision.

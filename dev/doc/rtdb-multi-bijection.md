@@ -446,7 +446,7 @@ After fencing, recover the same attempt from its retained state.
 
 ### Private native candidate
 
-Start the recovery listener with `--recovery-native-destination` and the installed native Multi journal, catalog and storage configuration.
+Enable candidate stage, install and status on the recovery listener with `--recovery-native-destination` and the installed native Multi journal, catalog and storage configuration.
 The recovery task uses an enrolled native peer's network identity and its own journal credential slot.
 Send install to the peer selected for the destination stream and use any admitted recovery owner for status.
 The listener authenticates the ordinary recovery envelope against the exact fenced Classic `name`, `authority` and `capture`.
@@ -466,7 +466,9 @@ Every reply uses `classic_migration_destination` and returns the exact `selectio
   Supply optional `classic_cut` with the old `tx_id` and `system_time` to verify an exact retained cut against the reopened native checkpoint and return `mapped_cut`.
 - `read_classic_migration_original_receipt` takes a typed `id`, such as `{"String":"<original receipt row ID>"}`, and returns the selected Original control row history from the exact scratch replay.
   Each retained event includes its original valid-time extent, system time, position, digest and literal document where present.
-  The control row is evidence for Bijection's original request and disclosure interpretation.
+  Pass `coverage` with `{table: {schema, table}, id}` to return `original_receipt_coverage` from that same verified replay.
+  This read uses the Original recovery authority and scratch hold and can proceed independently of the native catalog.
+  The receipt request frame is bounded at 4 KiB including its newline, and each returned control history is bounded at 1 MiB.
 
 Keep the same selection and staged projection digest after any indeterminate response.
 The native proof reports the candidate's catalog reservation basis and the restore record's LSN, writer epoch, key generation, manifest address, ciphertext digest, and checkpoint state digest.
@@ -481,8 +483,12 @@ Retained source transaction `n` maps to native position `n + 1`, provided the ex
 The proof commits to the complete mapping of admitted cuts and the literal source inventory.
 An authenticated inline shared checkpoint can contribute canonical v1 receipts whose installed source coordinates map exactly to those cuts.
 The copy preserves each canonical namespace, key, fingerprint and outcome, and its Original source coordinates remain in the retained evidence.
-The Classic business receipt path uses the original control row key and its retained outcome history.
-It assigns no canonical v1 request identity to a Classic retry token.
+The application selects its Original control relation and exact typed request identity, and selects any separate registered-coverage control at the same cut.
+Use the complete stamped control rows when matching request identity, retained coverage, caller standing, disclosure and the application outcome.
+The application owns the exact control relation names, field interpretation and receipt namespace.
+Retained history evidence carries no live authorization witness.
+A native transaction reference is usable only when the Original receipt already carries authenticated evidence from that producer.
+A Classic-only receipt stays keyed by its Original business identity throughout recovery.
 
 Projection coverage identifies retained Classic bookkeeping, withheld protected carriers, owned relations, system relations and literal relations that need further event translation.
 A sealed canonical checkpoint object needs its original generation and key evidence.

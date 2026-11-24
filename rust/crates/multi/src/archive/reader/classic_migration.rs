@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 mod outcomes;
 mod projection;
-pub(crate) use outcomes::{ReceiptHistory, ReceiptLookup};
+pub(crate) use outcomes::{ReceiptHistory, ReceiptLookup, ReceiptLookups, ReceiptReadback};
 pub(crate) use projection::{ClassicPrepared, ClassicProjection};
 use std::time::Duration;
 
@@ -130,7 +130,7 @@ pub(crate) async fn inspect_classic_migration_inventory(
 pub(crate) enum ClassicRead {
     Inventory,
     Projection([u8; 32]),
-    Receipt(ReceiptLookup),
+    Receipt(ReceiptLookups),
 }
 
 pub(crate) async fn read_classic_migration(
@@ -142,7 +142,7 @@ pub(crate) async fn read_classic_migration(
     ciphertext_sha256: [u8; 32],
     hosted_task: Option<HostedTask>,
     read: ClassicRead,
-) -> Result<(ClassicMigrationInventory, Option<ClassicPrepared>, Option<ReceiptHistory>)> {
+) -> Result<(ClassicMigrationInventory, Option<ClassicPrepared>, Option<ReceiptReadback>)> {
     if selector.source.is_none() || !selector.transfer_only {
         return Err(inconsistent(
             "Classic migration replay requires an authenticated transfer stage",
@@ -303,7 +303,7 @@ pub(crate) async fn read_classic_migration(
                 for table in tables {
                     let kind = RelationKind::of(&table);
                     let rows = projection.as_mut().filter(|_| kind == RelationKind::Literal || is_transactions(&table));
-                    let outcome = receipt.as_mut().filter(|lookup| lookup.table == table);
+                    let outcome = receipt.as_mut().filter(|lookups| lookups.covers(&table));
                     let relation = inspect_relation(&snapshot, table, &pool, &memory, stop, rows, outcome).await?;
                     if let Some(lookup) = &mut receipt { lookup.observe_relation(&relation); }
                     relations.push(relation);
@@ -325,7 +325,7 @@ pub(crate) async fn read_classic_migration(
                     bootstrap: bootstrap.clone(),
                     relations,
                     retained,
-                }, prepared, receipt.map(ReceiptLookup::finish)))
+                }, prepared, receipt.map(ReceiptLookups::finish)))
             })
             .await;
             cancellation.cancel();
@@ -368,7 +368,7 @@ async fn inspect_relation(
     memory: &Arc<MemoryBudget>,
     stop: &CancellationToken,
     mut projection: Option<&mut projection::Projection>,
-    mut receipt: Option<&mut ReceiptLookup>,
+    mut receipt: Option<&mut ReceiptLookups>,
 ) -> Result<RelationInventory> {
     let mut relation = RelationInventory {
         kind: RelationKind::of(&table),
@@ -411,7 +411,7 @@ async fn inspect_relation(
                 if let Some(projection) = projection.as_deref_mut() {
                     projection.observe(&relation.table, event, fingerprint, charge)?;
                 } else if let Some(receipt) = receipt.as_deref_mut() {
-                    receipt.observe(event, fingerprint, charge)?;
+                    receipt.observe(&relation.table, event, fingerprint, charge)?;
                 }
                 fingerprint
             } else {
