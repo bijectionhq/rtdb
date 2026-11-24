@@ -2198,6 +2198,8 @@ surface QueryAccess {
         -- A sparse selection of compatible in-memory maps also stays in Arrow.
         -- A delegated scan sends selected source vectors in Arrow IPC in their scan order.
         -- Each fragment frame preserves its source fields and the coordinator can filter its Arrow vectors by position.
+        -- Compatible contiguous nested selections keep their funded source buffers through reply encoding even across frame splits.
+        -- Reply encoding admits the selected nested spans and any rebased offsets before writing the frame.
         -- A fragment vector that borrows its reply's IPC body keeps the reply allocation charged through its last use.
         -- A delegated reader restores literal expressions from the fragment's Arrow argument page.
         -- The literal page preserves full-width time values, decimal coefficients and their declared types until expression evaluation.
