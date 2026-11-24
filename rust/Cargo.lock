@@ -4743,6 +4743,7 @@ dependencies = [
  "rtdb-temporal",
  "rtdb-trie",
  "rtdb-types",
+ "serde",
 ]
 
 [[package]]

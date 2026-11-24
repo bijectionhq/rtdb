@@ -6,6 +6,8 @@ mod ranking;
 pub use ranking::{QueryRanking, QueryWinners, RankOutcome, RankSource, RankWork, VerifiedRankRow, run_rank_partition};
 mod aggregate;
 mod context;
+mod branch_snapshot;
+pub use branch_snapshot::{branch_snapshot, seal_branch_claim};
 mod parameters;
 pub use parameters::BoundParameters;
 mod cursor;
