@@ -114,6 +114,12 @@ pub enum Authority {
         writer: Applied,
         closure: [u8; 16],
     },
+    CloseWriterGuarded {
+        fence: Fence,
+        writer: Applied,
+        closure: [u8; 16],
+        request_digest: [u8; 32],
+    },
     CloseEmptyAssignment {
         fence: Fence,
         closure: [u8; 16],
@@ -188,6 +194,14 @@ impl Authority {
                 writer,
                 closure,
             } => held(fence) && applied(writer) && *closure != [0; 16],
+            Self::CloseWriterGuarded {
+                fence,
+                writer,
+                closure,
+                request_digest,
+            } => {
+                held(fence) && applied(writer) && *closure != [0; 16] && *request_digest != [0; 32]
+            }
             Self::CloseEmptyAssignment {
                 fence,
                 closure,
@@ -211,7 +225,8 @@ impl Authority {
         let (fence, writer) = match self {
             Self::ReadRoot { fence, writer }
             | Self::Write { fence, writer }
-            | Self::CustodyWrite { fence, writer, .. } => (fence, writer),
+            | Self::CustodyWrite { fence, writer, .. }
+            | Self::CloseWriterGuarded { fence, writer, .. } => (fence, writer),
             _ => return Ok(None),
         };
         let bytes = serde_json::to_vec(&(fence, writer)).map_err(|_| denied())?;
@@ -227,7 +242,7 @@ impl Authority {
             Self::ClaimWriter { .. } => Family::ClaimWriter,
             Self::Write { .. } => Family::Write,
             Self::CustodyWrite { .. } => Family::CustodyWrite,
-            Self::CloseWriter { .. } => Family::CloseWriter,
+            Self::CloseWriter { .. } | Self::CloseWriterGuarded { .. } => Family::CloseWriter,
             Self::CloseEmptyAssignment { .. } => Family::CloseEmptyAssignment,
             _ => return None,
         })
@@ -397,12 +412,14 @@ impl Request {
                 digest,
             } => {
                 if !authority.valid(state.index.head().basis.incarnation())
-                    || matches!(authority, Authority::CloseWriter { closure, .. } | Authority::CloseEmptyAssignment { closure, .. }
+                    || matches!(authority, Authority::CloseWriter { closure, .. } | Authority::CloseWriterGuarded { closure, .. }
+                        | Authority::CloseEmptyAssignment { closure, .. }
                         if key.as_slice() != closure.as_slice())
                 {
                     return Err(denied());
                 }
-                if matches!(authority, Authority::CustodyWrite { request_digest, .. } if request_digest != digest)
+                if matches!(authority, Authority::CustodyWrite { request_digest, .. }
+                    | Authority::CloseWriterGuarded { request_digest, .. } if request_digest != digest)
                 {
                     return Err(denied());
                 }
@@ -439,6 +456,33 @@ impl Request {
         Ok(())
     }
 
+    pub fn check_terminal(
+        &self,
+        state: &TransactState,
+        now: Timestamp,
+        claims: &dyn ClaimVerifier,
+    ) -> Result<()> {
+        self.check_effect(state, now)?;
+        if let Operation::Submit {
+            authority: Authority::CloseWriterGuarded { .. },
+            transaction: Some(transaction),
+            ..
+        } = &self.operation
+        {
+            for guard in &transaction.requires {
+                if !guard.evaluate(
+                    &state.index,
+                    now.max(state.index.head().system_time),
+                    claims,
+                    None,
+                )? {
+                    return Err(stale());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn check_effect(&self, state: &TransactState, now: Timestamp) -> Result<()> {
         self.check_expiry(now)?;
         let Operation::Submit { authority, .. } = &self.operation else {
@@ -458,7 +502,30 @@ impl Point {
         transaction: Option<&Transact>,
     ) -> Result<Transact> {
         self.check_current(state, now, authority)?;
-        let mut control = empty_transaction(key.to_vec());
+        let mut control = match (authority, transaction) {
+            (Authority::CloseWriterGuarded { .. }, Some(guarded)) => {
+                if guarded.key != key
+                    || guarded.requires.is_empty()
+                    || !guarded.guards.is_empty()
+                    || !guarded.ops.is_empty()
+                    || !guarded.otherwise.is_empty()
+                    || guarded.custody_request_digest.is_some()
+                    || guarded.requires.iter().any(|guard| {
+                        guard.after()
+                            || match guard {
+                                Guard::Version { branch, .. }
+                                | Guard::CountAtMost { branch, .. } => branch != MAIN_BRANCH,
+                                Guard::Unchanged(_) => false,
+                            }
+                    })
+                {
+                    return Err(denied());
+                }
+                guarded.clone()
+            }
+            (Authority::CloseWriterGuarded { .. }, None) => return Err(denied()),
+            _ => empty_transaction(key.to_vec()),
+        };
         let (placement, fence_basis, writer, retirement) = match authority {
             Authority::AdvancePlacement { previous, next, .. } => {
                 let retirement = match previous {
@@ -481,7 +548,8 @@ impl Point {
                     evidence.predecessor_retirement_basis,
                 )
             }
-            Authority::CloseWriter { fence, closure, .. } => {
+            Authority::CloseWriter { fence, closure, .. }
+            | Authority::CloseWriterGuarded { fence, closure, .. } => {
                 let evidence = self.fence(state, fence, now)?;
                 (
                     fence.placement.clone(),
@@ -516,7 +584,7 @@ impl Point {
             }
             _ => return Err(denied()),
         };
-        if transaction.is_some() {
+        if transaction.is_some() && !matches!(authority, Authority::CloseWriterGuarded { .. }) {
             return Err(denied());
         }
         let incarnation = state.index.head().basis.incarnation();
@@ -676,7 +744,8 @@ impl Point {
             Authority::ReadRoot { fence, writer }
             | Authority::Write { fence, writer }
             | Authority::CustodyWrite { fence, writer, .. }
-            | Authority::CloseWriter { fence, writer, .. } => {
+            | Authority::CloseWriter { fence, writer, .. }
+            | Authority::CloseWriterGuarded { fence, writer, .. } => {
                 self.fence(state, fence, now)?;
                 self.writer(state, fence, writer, now)?.applied
             }

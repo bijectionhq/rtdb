@@ -216,14 +216,26 @@ fn request_operation(
             },
             Some(required(value.transaction)?),
         ),
-        Wire::CloseWriter(value) => (
-            Authority::CloseWriter {
-                fence: fence(required(value.fence)?)?,
-                writer: applied(required(value.writer)?)?,
-                closure: fixed(value.closure)?,
-            },
-            None,
-        ),
+        Wire::CloseWriter(value) => {
+            let fence = fence(required(value.fence)?)?;
+            let writer = applied(required(value.writer)?)?;
+            let closure = fixed(value.closure)?;
+            let authority = if value.guarded.is_some() {
+                Authority::CloseWriterGuarded {
+                    fence,
+                    writer,
+                    closure,
+                    request_digest: digest,
+                }
+            } else {
+                Authority::CloseWriter {
+                    fence,
+                    writer,
+                    closure,
+                }
+            };
+            (authority, value.guarded)
+        }
         Wire::CloseEmptyAssignment(value) => (
             Authority::CloseEmptyAssignment {
                 fence: fence(required(value.fence)?)?,

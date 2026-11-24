@@ -142,6 +142,8 @@ Converting a fixed-profile authority row requires an explicit installation trans
 | `fence`, `writer`, `request_digest`
 | `close-writer`
 | `fence`, `writer`, `closure`
+| `close-writer-guarded`
+| `fence`, `writer`, `closure`, `request_digest`
 | `close-empty-assignment`
 | `fence`, `closure`, `vacant_epoch`
 | `observe-placement`
@@ -188,6 +190,10 @@ A vacant placement uses an empty assignment and holder and has a positive placem
 A catalog-only vacancy can advance past its last native close by presenting `previous.closed` with that close and using the higher accepted epoch.
 The claim marker is lowercase hex of the exact Claim request key.
 Close uses the 16 closure bytes as its request key and writes `closed:<lowercase closure hex>`.
+A guarded live close uses `WorkloadCloseWriter.guarded` and an independent `close-writer-guarded` grant bound to the whole frozen action.
+Its inner request repeats the key and carries the cold prerequisites as main-branch `requires`.
+The producer owns the only row effect and checks those prerequisites before settlement.
+Both Close forms retain receipts in the `close-writer` family.
 An abandoned placement can close while its exact held fence still has the empty writer marker.
 The issuer must authorize the higher vacant epoch and closure identity for the abandoned candidate.
 Use the 16 closure bytes as the request key and retain the `close-empty-assignment` receipt.

@@ -482,3 +482,47 @@ fn empty_closure_orders_vacancy_and_prevents_a_delayed_claim() {
     );
     applied(journal.turn(PLACEMENT, successor).unwrap(), PLACEMENT);
 }
+
+#[test]
+fn guarded_close_checks_cold_prerequisites_with_the_original_writer() {
+    let mut journal = Writer::new();
+    let (fence, writer) = begin(&mut journal);
+    let check = |key: u8, expect| {
+        let mut tx = empty_transaction(vec![key; 16]);
+        tx.requires.push(Guard::Version {
+            branch: MAIN_BRANCH.into(),
+            table: TableRef::new("public", "installation_authority"),
+            id: EntityId::String("authority".into()),
+            valid_at: Some(Timestamp(0)),
+            expect,
+        });
+        tx
+    };
+    let grant = |key| Authority::CloseWriterGuarded {
+        fence: fence.clone(),
+        writer: writer.clone(),
+        closure: [key; 16],
+        request_digest: [key; 32],
+    };
+    let rejected = submit(grant(12), 12, Some(check(12, Version::Absent)));
+    let Reply::Receipt(refused) = journal.turn(CLOSE, rejected).unwrap() else {
+        panic!("expected receipt")
+    };
+    assert!(
+        matches!(refused.outcome, Outcome::Refused { error } if error.code == REQUIREMENT_FAILED)
+    );
+    let closed = submit(grant(13), 13, Some(check(13, Version::Present)));
+    let close = applied(journal.turn(CLOSE, closed).unwrap(), CLOSE);
+    let predecessor = Predecessor {
+        fence,
+        writer,
+        close,
+        closure: [13; 16],
+    };
+    assert!(matches!(
+        journal
+            .turn(ABSENT, Operation::Predecessor(predecessor))
+            .unwrap(),
+        Reply::Predecessor(_)
+    ));
+}

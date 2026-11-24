@@ -695,7 +695,7 @@ impl MultiDatabase {
         let (upper, receipts) = self.commit_one(lease, write).await?;
         let (position, receipts) = if let Some(cutoff) = admission.cutoff() {
             let upper = upper.max(self.append_authority(lease.epoch)?.upper());
-            let terminal_clock = if request.check_effect(self.durable_transactions(), upper).is_ok() {
+            let terminal_clock = if request.check_terminal(self.durable_transactions(), upper, &claims).is_ok() {
                 upper
             } else {
                 Timestamp::MAX

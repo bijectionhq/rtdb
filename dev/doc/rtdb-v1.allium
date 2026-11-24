@@ -51,6 +51,7 @@ surface StatelessDatabase {
         -- Claim compares the accepted fence version and orders its writer image and receipt together.
         -- Empty assignment closure races Claim on that same fence and publishes a positive vacant fence at the accepted higher epoch when it wins.
         -- The vacant fence preserves the last actual writer retirement and is usable as an exact successor predecessor.
+        -- A guarded live close can require assignment-bound cold prerequisites in the same order as its server-authored closure.
         -- Write and close authenticate the exact fence and original claim receipt before either arm is considered.
         -- The current authority image must match at the configured valid time and at the writer's decision time.
         -- The original writer orders closure, placement replacement and mutation in the same stream.

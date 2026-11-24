@@ -242,6 +242,7 @@ message WorkloadCloseWriter {
   WorkloadFence fence = 1;
   WorkloadApplied writer = 2;
   bytes closure = 3;
+  TransactRequest guarded = 4;
 }
 message WorkloadCloseEmptyAssignment {
   WorkloadFence fence = 1;
