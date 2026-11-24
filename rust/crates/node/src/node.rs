@@ -2906,14 +2906,14 @@ impl OwnedReadSession {
     async fn fixed_range_evidence(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         frontier: i64, valid_at: Timestamp,
-        lower: Option<&rtdb_types::StructFields<Value>>, upper: Option<&rtdb_types::StructFields<Value>>,
+        lower: Option<crate::OwnedKeyBound<'_>>, upper: Option<crate::OwnedKeyBound<'_>>,
     ) -> Result<Option<rtdb_types::FixedRangeEvidence>> {
-        use rtdb_types::{FixedRangeEvidence, FixedRangeKey};
+        use rtdb_types::FixedRangeEvidence;
         let rule = rtdb_query::read_owned_fixed_range_rule(Arc::clone(&self.context), &self.owner, relation).await?;
         let Some(rule) = rule.filter(|rule| rule.valid_at == valid_at && rule.path == path.name()) else { return Ok(None); };
         let revision = self.covered_range_anchor(relation, frontier).await?;
-        let lower = lower.map(|bound| FixedRangeKey::from_bound(bound, &rule.column)).transpose()?;
-        let upper = upper.map(|bound| FixedRangeKey::from_bound(bound, &rule.column)).transpose()?;
+        let lower = lower.map(|bound| bound.fixed_key(&rule.column)).transpose()?;
+        let upper = upper.map(|bound| bound.fixed_key(&rule.column)).transpose()?;
         Ok(Some(FixedRangeEvidence { rule, revision, lower, upper }))
     }
 

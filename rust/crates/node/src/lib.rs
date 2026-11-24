@@ -1,6 +1,6 @@
 mod ordered_index;
 pub use ordered_index::{path_columns_at_cut, stable_owned_path_columns};
-pub use ordered_index::{OwnedCountRequest, OwnedDecimalSum, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, owned_count as count_owned_cut, measure_owned_cut, range_owned_cut};
+pub use ordered_index::{OwnedCountRequest, OwnedDecimalSum, OwnedKeyBound, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound, owned_count as count_owned_cut, measure_owned_cut, range_owned_cut};
 mod session;
 mod sql_snapshots;
 mod resources;

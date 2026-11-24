@@ -67,7 +67,7 @@ impl FixedRangeKey {
         Self::from_parts(binary, id)
     }
 
-    fn from_parts(binary: &[u8], id: &str) -> Result<Self> {
+    pub fn from_parts(binary: &[u8], id: &str) -> Result<Self> {
         if binary.len() > FIXED_RANGE_COMPONENT_BYTES || id.len() > FIXED_RANGE_COMPONENT_BYTES {
             return Err(invalid());
         }

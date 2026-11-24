@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 
 use arrow_array::{Array, BinaryArray, RecordBatch, StringArray};
-use rtdb_node::{OwnedRangePage, OwnedRangeRequest};
+use rtdb_node::{OwnedKeyBound, OwnedRangePage, OwnedRangeRequest};
 
 use super::*;
 
@@ -93,14 +93,15 @@ async fn merge_range(
     if !(1..=128).contains(&request.limit) {
         return Err(unavailable());
     }
-    let mut cursor = request.after.cloned();
+    let mut cursor = None;
     let mut _cursor_charge = None;
     let mut output = Vec::<Key>::new();
     let mut retained = vec![memory.reserve(request.limit * 128)?];
     let mut bytes = 0usize;
     for _ in 0..32 {
         let seek = || OwnedRangeRequest {
-            lower: request.lower, upper: request.upper, after: cursor.as_ref(),
+            lower: request.lower, upper: request.upper,
+            after: cursor.as_ref().map(OwnedKeyBound::Values).or(request.after),
             descending: request.descending, limit: request.limit,
         };
         let mut pages = Vec::with_capacity(layers.len());

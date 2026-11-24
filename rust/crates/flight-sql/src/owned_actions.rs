@@ -3,6 +3,7 @@ mod hosted_upload;
 mod prepared_landing;
 mod hosted_observation;
 mod import_page;
+mod ordered_controls;
 mod packed_groups;
 mod unique;
 
@@ -34,6 +35,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::owned_landing_wire::{self, ControlCommand};
+use self::ordered_controls::OrderedControls;
 use crate::{
     error::{arrow, invalid, status, unsupported},
     lease::Leased,
@@ -846,14 +848,6 @@ fn require_identity(batch: OwnedBatch) -> Result<OwnedBatch, Status> {
         return Err(invalid("Owned action requires an _id column"));
     }
     Ok(batch)
-}
-
-fn compound_bound(value: Option<&Value>) -> Result<Option<&StructFields<Value>>, Status> {
-    match value {
-        Some(Value::Null) => Ok(None),
-        Some(Value::Struct(fields)) => Ok(Some(fields)),
-        _ => Err(invalid("Owned full-key range endpoints must be structs or null")),
-    }
 }
 
 fn require_idle(native: &NativeSession) -> Result<(), Status> {
@@ -2910,36 +2904,35 @@ impl Service {
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_fields {
             return Err(invalid("Owned range requires one row with the fields for its action version"));
         }
-        let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
-        let row = rows.pop().expect("validated one row");
-        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(limit))) =
-            (row.get("path"), row.get("lower"), row.get("upper"), row.get("limit"))
+        let (row, _decoded) = OrderedControls::read(batch.batch(), self)?;
+        let (Some(path), true, true, Some(limit)) =
+            (row.text("path"), row.contains("lower"), row.contains("upper"), row.integer("limit"))
         else { return Err(invalid("Owned range fields have invalid types")); };
-        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
-        let limit = usize::try_from(*limit).map_err(|_| invalid("Owned range limit is out of range"))?;
+        let path = OwnedRelation::new(path).map_err(status)?;
+        let limit = usize::try_from(limit).map_err(|_| invalid("Owned range limit is out of range"))?;
         let valid_at = if matches!(version, HeldRangeFormat::FixedValid | HeldRangeFormat::Historical) {
-            let Some(Value::I64(valid_at)) = row.get("valid_micros") else {
+            let Some(valid_at) = row.integer("valid_micros") else {
                 return Err(invalid("Owned fixed range requires a microsecond valid instant"));
             };
-            let valid_at = Timestamp(*valid_at);
+            let valid_at = Timestamp(valid_at);
             valid_at.next().map_err(status)?;
             Some(valid_at)
         } else { None };
         let system = if matches!(version, HeldRangeFormat::Historical) {
-            let Some(Value::I64(system)) = row.get("system_micros") else {
+            let Some(system) = row.integer("system_micros") else {
                 return Err(invalid("Owned historical range requires a microsecond system cut"));
             };
-            Some(Timestamp(*system))
+            Some(Timestamp(system))
         } else { None };
         let (page, evidence, expiry) = if !matches!(version, HeldRangeFormat::Leading) {
-            let Some(Value::Bool(descending)) = row.get("descending") else {
+            let Some(descending) = row.boolean("descending") else {
                 return Err(invalid("Owned range requires a boolean descending field"));
             };
             let request = OwnedRangeRequest {
-                lower: compound_bound(Some(lower))?,
-                upper: compound_bound(Some(upper))?,
-                after: compound_bound(row.get("after"))?,
-                descending: *descending,
+                lower: row.bound("lower")?,
+                upper: row.bound("upper")?,
+                after: row.bound("after")?,
+                descending,
                 limit,
             };
             if audience {
@@ -2958,9 +2951,9 @@ impl Service {
                 held.snapshot.range_page_by_key_lifetime(&relation, &path, request, valid_at).await
             }
         } else {
-            let lower = (!matches!(lower, Value::Null | Value::Undefined)).then_some(lower);
-            let upper = (!matches!(upper, Value::Null | Value::Undefined)).then_some(upper);
-            held.snapshot.range(&relation, &path, lower, upper, limit).await.map(|page| (page, None, None))
+            let lower = row.leading("lower")?;
+            let upper = row.leading("upper")?;
+            held.snapshot.range(&relation, &path, lower.as_deref(), upper.as_deref(), limit).await.map(|page| (page, None, None))
         }.map_err(status)?;
         let present = system.unwrap_or(held.snapshot.present().system_time);
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
@@ -2989,25 +2982,24 @@ impl Service {
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 + usize::from(historical) {
             return Err(invalid("Owned count requires one row with the fields for its action version"));
         }
-        let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
-        let row = rows.pop().expect("validated one row");
-        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(valid))) =
-            (row.get("path"), row.get("lower"), row.get("upper"), row.get("valid_micros"))
+        let (row, _decoded) = OrderedControls::read(batch.batch(), self)?;
+        let (Some(path), true, true, Some(valid)) =
+            (row.text("path"), row.contains("lower"), row.contains("upper"), row.integer("valid_micros"))
         else { return Err(invalid("Owned count fields have invalid types")); };
-        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
+        let path = OwnedRelation::new(path).map_err(status)?;
         let request = OwnedCountRequest {
-            lower: compound_bound(Some(lower))?,
-            upper: compound_bound(Some(upper))?,
-            valid_at: Timestamp(*valid),
+            lower: row.bound("lower")?,
+            upper: row.bound("upper")?,
+            valid_at: Timestamp(valid),
         };
         let (counted, evidence) = if historical {
-            let Some(Value::I64(system)) = row.get("system_micros") else {
+            let Some(system) = row.integer("system_micros") else {
                 return Err(invalid("Owned historical count requires a microsecond system cut"));
             };
             let counted = if measured {
-                held.snapshot.measure_range_at_system(&relation, &path, request, Timestamp(*system)).await
+                held.snapshot.measure_range_at_system(&relation, &path, request, Timestamp(system)).await
             } else {
-                held.snapshot.count_range_at_system(&relation, &path, request, Timestamp(*system)).await
+                held.snapshot.count_range_at_system(&relation, &path, request, Timestamp(system)).await
             };
             counted.map(|counted| (counted, None))
         } else if measured {
@@ -3053,15 +3045,14 @@ impl Service {
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != fields {
             return Err(invalid("Invalid held world range arguments"));
         }
-        let (mut rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
-        let row = rows.pop().expect("validated one row");
-        let (Some(Value::Utf8(path)), Some(lower), Some(upper), Some(Value::I64(valid_at))) =
-            (row.get("path"), row.get("lower"), row.get("upper"), row.get("valid_micros"))
+        let (row, _decoded) = OrderedControls::read(batch.batch(), self)?;
+        let (Some(path), true, true, Some(valid_at)) =
+            (row.text("path"), row.contains("lower"), row.contains("upper"), row.integer("valid_micros"))
         else { return Err(invalid("Invalid held world range fields")); };
-        let path = OwnedRelation::new(path.as_str()).map_err(status)?;
-        let valid_at = Timestamp(*valid_at);
-        let lower = compound_bound(Some(lower))?;
-        let upper = compound_bound(Some(upper))?;
+        let path = OwnedRelation::new(path).map_err(status)?;
+        let valid_at = Timestamp(valid_at);
+        let lower = row.bound("lower")?;
+        let upper = row.bound("upper")?;
         let (schema, page, witness, count_rows) = if count {
             let request = OwnedCountRequest { lower, upper, valid_at };
             let (rows, witness) = if let Some(system) = system {
@@ -3076,12 +3067,12 @@ impl Service {
             };
             (rows.schema(), None, Some(witness), Some(rows))
         } else {
-            let (Some(after), Some(Value::Bool(descending)), Some(Value::I64(limit))) =
-                (row.get("after"), row.get("descending"), row.get("limit"))
+            let (true, Some(descending), Some(limit)) =
+                (row.contains("after"), row.boolean("descending"), row.integer("limit"))
             else { return Err(invalid("Invalid held world range page")); };
             let request = OwnedRangeRequest {
-                lower, upper, after: compound_bound(Some(after))?, descending: *descending,
-                limit: usize::try_from(*limit).map_err(|_| invalid("Invalid held world range limit"))?,
+                lower, upper, after: row.bound("after")?, descending,
+                limit: usize::try_from(limit).map_err(|_| invalid("Invalid held world range limit"))?,
             };
             let (page, witness) = if let Some(system) = system {
                 if matches!(order, WorldOrder::ParentRangeAt) {

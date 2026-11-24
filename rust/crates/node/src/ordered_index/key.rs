@@ -105,6 +105,11 @@ impl Atom {
 }
 
 impl<'a> AtomRef<'a> {
+    pub(super) fn is_bound(self) -> bool {
+        !matches!(self, Self::FloatOrder(bits)
+            if bits == FLOAT_NAN_ORDER || bits == float_order(0.0) || bits == float_order(-0.0))
+    }
+
     pub(super) fn owned(self) -> Atom {
         match self {
             Self::Bool(value) => Scalar::Bool(value),

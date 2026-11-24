@@ -984,7 +984,7 @@ pub(crate) enum RowBounds<'a> {
     Compound(super::OwnedRangeRequest<'a>),
 }
 
-fn invalid_bound() -> rtdb_types::Anomaly {
+pub(super) fn invalid_bound() -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::incorrect(
         "rtdb.owned/range-bound",
         "Owned range bound does not match its declared path key",
@@ -992,36 +992,53 @@ fn invalid_bound() -> rtdb_types::Anomaly {
 }
 
 fn bound_atom(field: &Field, value: &rtdb_types::Value) -> Result<Atom> {
+    admit_bound_atom(field, Atom::of(value).ok_or_else(invalid_bound)?)
+}
+
+fn admit_bound_atom(field: &Field, atom: Atom) -> Result<Atom> {
     let expected = owned_family(&field.data_type).ok_or_else(invalid_bound)?;
-    Atom::of(value)
-        .filter(|atom| {
-            atom.family() == Some(expected)
-                || (matches!(atom, Atom::Null) && field.name != "_id" && field.data_type.nullable())
-        })
-        .ok_or_else(invalid_bound)
+    if atom.family() == Some(expected)
+        || (matches!(atom, Atom::Null) && field.name != "_id" && field.data_type.nullable())
+    {
+        Ok(atom)
+    } else {
+        Err(invalid_bound())
+    }
 }
 
 fn compound_bound(
     range: &mut Range,
     fields: &[Field],
-    key: Option<&rtdb_types::StructFields<rtdb_types::Value>>,
+    key: Option<super::OwnedKeyBound<'_>>,
     lower: bool,
     strict: bool,
 ) -> Result<()> {
     let Some(key) = key else {
         return Ok(());
     };
-    if key.len() != fields.len() {
+    use super::OwnedKeyBound;
+    let width = match key {
+        OwnedKeyBound::Values(key) => key.len(),
+        OwnedKeyBound::Arrow { .. } => key.arrow_cell().and_then(|cell| cell.structure()).ok_or_else(invalid_bound)?.len(),
+    };
+    if width != fields.len() {
         return Err(invalid_bound());
     }
     let key = fields
         .iter()
-        .map(|field| {
-            let value = key.get(&field.name).ok_or_else(invalid_bound)?;
-            if !field.data_type.legs().contains(&value.logical_type()) {
-                return Err(invalid_bound());
+        .map(|field| match key {
+            OwnedKeyBound::Values(key) => {
+                let value = key.get(&field.name).ok_or_else(invalid_bound)?;
+                if !field.data_type.legs().contains(&value.logical_type()) { return Err(invalid_bound()); }
+                bound_atom(field, value)
             }
-            bound_atom(field, value)
+            OwnedKeyBound::Arrow { .. } => {
+                let cell = key.arrow_field(&field.name).ok_or_else(invalid_bound)?;
+                if !field.data_type.legs().contains(&cell.logical_type()?) { return Err(invalid_bound()); }
+                let atom = AtomRef::from_arrow(cell.field, cell.array, cell.row).map_err(|_| invalid_bound())?;
+                if !atom.is_bound() { return Err(invalid_bound()); }
+                admit_bound_atom(field, atom.owned())
+            }
         })
         .collect::<Result<_>>()?;
     range.cursors.push(CursorBound { key, lower, strict });
@@ -1029,13 +1046,10 @@ fn compound_bound(
 }
 
 impl<'a> RowBounds<'a> {
-    pub(super) fn identity_bound(&self) -> Option<&'a rtdb_types::Value> {
+    pub(super) fn identity_bounds(&self) -> [Option<super::OwnedKeyBound<'a>>; 3] {
         match self {
-            Self::Leading { .. } => None,
-            Self::Compound(request) => [request.lower, request.upper, request.after]
-                .into_iter()
-                .flatten()
-                .find_map(|key| key.get("_id")),
+            Self::Leading { .. } => [None; 3],
+            Self::Compound(request) => [request.lower, request.upper, request.after],
         }
     }
 
@@ -1655,6 +1669,7 @@ impl PartialOrd for Head {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{Date64Array, Float64Array, StructArray};
     use rtdb_columnar::MemoryBudget;
     use rtdb_types::Value;
 
@@ -1705,6 +1720,60 @@ mod tests {
         assert_eq!(memory.used_bytes(), 32 << 10);
         drop(slice);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    fn path_field(name: &str, data_type: LogicalType) -> Field {
+        Field {
+            id: ColumnId(0), name: name.into(), qualifier: None,
+            qualified_only: false, unnamed: false, data_type,
+        }
+    }
+
+    #[test]
+    fn sliced_arrow_selectors_keep_full_key_types_and_descending_strictness() {
+        let array: ArrayRef = Arc::new(StructArray::try_from(vec![
+            ("_id", Arc::new(StringArray::from(vec!["outside", "target"])) as ArrayRef),
+            ("day", Arc::new(Date64Array::from(vec![0, -1])) as ArrayRef),
+        ]).unwrap());
+        let array = array.slice(1, 1);
+        let field = Arc::new(arrow_schema::Field::new("bound", array.data_type().clone(), true));
+        let bound = crate::OwnedKeyBound::Arrow { field: &field, array: &array, row: 0 }.retained();
+        let fields = [
+            path_field("day", LogicalType::Scalar(ScalarType::DateMilli)),
+            path_field("_id", LogicalType::Scalar(ScalarType::Utf8)),
+        ];
+        let request = crate::OwnedRangeRequest {
+            lower: Some(bound.borrowed()), upper: None, after: Some(bound.borrowed()),
+            descending: true, limit: 13,
+        };
+        let (range, reverse, limit) = RowBounds::Compound(request).bind(&fields).unwrap();
+        assert!(reverse);
+        assert_eq!(limit, 13);
+        assert_eq!(range.cursors.len(), 2);
+        assert!(range.cursors[0].lower && !range.cursors[0].strict);
+        assert!(!range.cursors[1].lower && range.cursors[1].strict);
+        for bound in range.cursors {
+            assert_eq!(bound.key, [Atom::Day(-1), Atom::Text("target".into())]);
+        }
+        let mismatched = [path_field("day", LogicalType::Scalar(ScalarType::DateDay)), fields[1].clone()];
+        let mut range = Range::default();
+        let failure = compound_bound(&mut range, &mismatched, Some(bound.borrowed()), true, false).unwrap_err();
+        assert_eq!(failure.code, "rtdb.owned/range-bound");
+    }
+
+    #[test]
+    fn arrow_compound_float_bounds_refuse_both_zero_signs_and_nan() {
+        let array: ArrayRef = Arc::new(StructArray::try_from(vec![
+            ("rating", Arc::new(Float64Array::from(vec![0.0, -0.0, f64::NAN, 1.0])) as ArrayRef),
+        ]).unwrap());
+        let field = Arc::new(arrow_schema::Field::new("bound", array.data_type().clone(), false));
+        let fields = [path_field("rating", LogicalType::Scalar(ScalarType::F64))];
+        for row in 0..4 {
+            let selector = crate::OwnedKeyBound::Arrow { field: &field, array: &array, row };
+            let mut range = Range::default();
+            let result = compound_bound(&mut range, &fields, Some(selector), true, false);
+            assert_eq!(result.is_ok(), row == 3);
+        }
     }
 
     #[test]

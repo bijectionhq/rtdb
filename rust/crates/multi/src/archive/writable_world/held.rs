@@ -1,7 +1,7 @@
 use rtdb_node::OwnedChangeEdge;
 use std::{future::Future, pin::Pin, time::Duration};
 
-use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest};
+use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedKeyBound, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
 use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
 use tokio::sync::{mpsc, oneshot};
@@ -245,8 +245,8 @@ enum ArchiveRead {
         relation: OwnedRelation,
         path: OwnedRelation,
         frontier: i64,
-        lower: Option<StructFields<Value>>,
-        upper: Option<StructFields<Value>>,
+        lower: Option<RetainedKeyBound>,
+        upper: Option<RetainedKeyBound>,
         valid: Timestamp,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         read: OrderedRead,
@@ -299,9 +299,9 @@ enum AncestorRead {
     OverlayIdentities { valid: Timestamp, after: Option<String>, limit: usize },
     Range {
         path: OwnedRelation,
-        lower: Option<StructFields<Value>>,
-        upper: Option<StructFields<Value>>,
-        after: Option<StructFields<Value>>,
+        lower: Option<RetainedKeyBound>,
+        upper: Option<RetainedKeyBound>,
+        after: Option<RetainedKeyBound>,
         descending: bool,
         limit: usize,
         valid: Timestamp,
@@ -321,7 +321,7 @@ enum AncestorResult {
 }
 
 enum OrderedRead {
-    Page { after: Option<StructFields<Value>>, descending: bool, limit: usize },
+    Page { after: Option<RetainedKeyBound>, descending: bool, limit: usize },
     Count,
     Measure,
 }
@@ -1141,7 +1141,8 @@ impl HeldCheckpointWorld {
         &self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'_>, valid: Timestamp,
     ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
         let read = OrderedRead::Page {
-            after: request.after.cloned(), descending: request.descending, limit: request.limit,
+            after: request.after.map(OwnedKeyBound::retained),
+            descending: request.descending, limit: request.limit,
         };
         let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read, None).await?;
         let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
@@ -1196,8 +1197,10 @@ impl HeldCheckpointWorld {
         valid: Timestamp, selected: Option<Timestamp>,
     ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
         let (result, witness) = self.read_ancestor_at(relation, AncestorRead::Range {
-            path, lower: request.lower.cloned(), upper: request.upper.cloned(),
-            after: request.after.cloned(), descending: request.descending,
+            path,
+            lower: request.lower.map(OwnedKeyBound::retained),
+            upper: request.upper.map(OwnedKeyBound::retained),
+            after: request.after.map(OwnedKeyBound::retained), descending: request.descending,
             limit: request.limit, valid,
         }, selected).await?;
         let AncestorResult::Range(page) = result else { return Err(OwnedWorld::unavailable()); };
@@ -1233,7 +1236,8 @@ impl HeldCheckpointWorld {
         valid: Timestamp, system: Timestamp,
     ) -> Result<(OwnedRangePage, OwnedWorldWitness)> {
         let read = OrderedRead::Page {
-            after: request.after.cloned(), descending: request.descending, limit: request.limit,
+            after: request.after.map(OwnedKeyBound::retained),
+            descending: request.descending, limit: request.limit,
         };
         let (result, witness) = self.ordered(relation, path, request.lower, request.upper, valid, read, Some(system)).await?;
         let OrderedResult::Page(page) = result else { return Err(OwnedWorld::unavailable()); };
@@ -1251,8 +1255,8 @@ impl HeldCheckpointWorld {
     }
 
     async fn ordered(
-        &self, relation: OwnedRelation, path: OwnedRelation, lower: Option<&StructFields<Value>>,
-        upper: Option<&StructFields<Value>>, valid: Timestamp, read: OrderedRead, system: Option<Timestamp>,
+        &self, relation: OwnedRelation, path: OwnedRelation, lower: Option<OwnedKeyBound<'_>>,
+        upper: Option<OwnedKeyBound<'_>>, valid: Timestamp, read: OrderedRead, system: Option<Timestamp>,
     ) -> Result<(OrderedResult, OwnedWorldWitness)> {
         self.check_relation(&relation)?;
         Interval::at(valid)?;
@@ -1274,7 +1278,9 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Ordered {
-            relation, path, frontier: witness.purge_frontier(), lower: lower.cloned(), upper: upper.cloned(),
+            relation, path, frontier: witness.purge_frontier(),
+            lower: lower.map(OwnedKeyBound::retained),
+            upper: upper.map(OwnedKeyBound::retained),
             valid, earlier, read, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let result = self.cancellation.run_until_cancelled(result).await
@@ -2484,7 +2490,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             Ok(AncestorResult::Identities(inherited.overlay_identity_page(valid, after.as_deref(), limit).await?)),
                                                         AncestorRead::Range { path, lower, upper, after, descending, limit, valid } => {
                                                             let request = OwnedRangeRequest {
-                                                                lower: lower.as_ref(), upper: upper.as_ref(), after: after.as_ref(),
+                                                                lower: lower.as_ref().map(RetainedKeyBound::borrowed),
+                                                                upper: upper.as_ref().map(RetainedKeyBound::borrowed),
+                                                                after: after.as_ref().map(RetainedKeyBound::borrowed),
                                                                 descending, limit,
                                                             };
                                                             Ok(AncestorResult::Range(inherited.overlay_range(&path, request, valid).await?))
@@ -2851,10 +2859,14 @@ pub(crate) async fn open_held_checkpoint_world(
                                             let schemas = [(relation.clone(), schema)];
                                             exact_historical_parent_context(context, &owner, system, &schemas).await?
                                         } else { context };
-                                        let (lower, upper) = (lower.as_ref(), upper.as_ref());
+                                        let (lower, upper) = (lower.as_ref().map(RetainedKeyBound::borrowed),
+                                            upper.as_ref().map(RetainedKeyBound::borrowed));
                                         let result = match read {
                                             OrderedRead::Page { after, descending, limit } => {
-                                                let request = OwnedRangeRequest { lower, upper, after: after.as_ref(), descending, limit };
+                                                let request = OwnedRangeRequest {
+                                                    lower, upper, after: after.as_ref().map(RetainedKeyBound::borrowed),
+                                                    descending, limit,
+                                                };
                                                 OrderedResult::Page(rtdb_node::range_owned_cut(context, &owner, &relation, &path, request, valid).await?)
                                             }
                                             OrderedRead::Count => {

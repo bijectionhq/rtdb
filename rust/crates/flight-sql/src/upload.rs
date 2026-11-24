@@ -158,10 +158,22 @@ fn decode_documents(
     batch: &RecordBatch, memory: &Arc<MemoryBudget>,
     read: impl Fn(&rtdb_types::LogicalType, &arrow_schema::Field, &dyn arrow_array::Array, usize) -> rtdb_types::Result<Value>,
 ) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
-    let schema = batch.schema(); let mut bound = 8192;
-    for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = wire::add(bound, wire::add(field.name().len(), estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?)?; } }
-    let scratch = memory.reserve(bound).map_err(status)?;
+    let schema = batch.schema();
+    let scratch = reserve_document_decode(batch, memory)?;
     let types = if batch.num_rows() == 0 { Vec::new() } else { schema.fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? };
     let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| Ok((field.name().clone(), read(ty, field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<StructFields<_>, Status>>()).collect::<Result<Vec<_>, _>>()?;
     Ok((rows, scratch))
+}
+
+pub(crate) fn reserve_document_decode(
+    batch: &RecordBatch, memory: &Arc<MemoryBudget>,
+) -> Result<Arc<MemoryReservation>, Status> {
+    let mut bound = 8192;
+    for row in 0..batch.num_rows() {
+        for (column, field) in batch.schema_ref().fields().iter().enumerate() {
+            let bytes = estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?;
+            bound = wire::add(bound, wire::add(field.name().len(), bytes)?)?;
+        }
+    }
+    memory.reserve(bound).map_err(status)
 }

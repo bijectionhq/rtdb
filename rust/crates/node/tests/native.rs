@@ -1093,10 +1093,10 @@ async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     let lower = key(10, 1);
     let upper = key(20, 3);
     let empty_count = || rtdb_node::OwnedCountRequest {
-        lower: Some(&lower), upper: Some(&upper), valid_at: Timestamp(10),
+        lower: Some(OwnedKeyBound::Values(&lower)), upper: Some(OwnedKeyBound::Values(&upper)), valid_at: Timestamp(10),
     };
     let request = rtdb_node::OwnedRangeRequest {
-        lower: Some(&lower), upper: Some(&upper), after: None, descending: false, limit: 1,
+        lower: Some(OwnedKeyBound::Values(&lower)), upper: Some(OwnedKeyBound::Values(&upper)), after: None, descending: false, limit: 1,
     };
     let page = empty.range_page_by_key(&relation, &path, request).await.unwrap();
     assert!(page.batch.is_none());
@@ -1108,7 +1108,7 @@ async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
         ("_id".into(), Value::I64(1)),
     ]);
     let request = rtdb_node::OwnedCountRequest {
-        lower: Some(&malformed), upper: Some(&upper), valid_at: Timestamp(10),
+        lower: Some(OwnedKeyBound::Values(&malformed)), upper: Some(OwnedKeyBound::Values(&upper)), valid_at: Timestamp(10),
     };
     assert_eq!(empty.count_range(&relation, &path, request).await.err().unwrap().code, "rtdb.owned/range-bound");
     let documents = Documents::new(
@@ -1182,7 +1182,7 @@ async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     let upper = key(20, 3);
     for (valid_at, expected) in [(9, 2), (10, 1), (19, 1), (20, 2)] {
         let request = rtdb_node::OwnedCountRequest {
-            lower: Some(&lower), upper: Some(&upper), valid_at: Timestamp(valid_at),
+            lower: Some(OwnedKeyBound::Values(&lower)), upper: Some(OwnedKeyBound::Values(&upper)), valid_at: Timestamp(valid_at),
         };
         let (result, witness) = held.count_range_observed(&relation, &path, request).await.unwrap();
         assert!(witness.is_none(), "standalone counts do not issue ordered witnesses");
@@ -1192,7 +1192,8 @@ async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     }
     for (descending, after, next) in [(false, key(10, 1), 2), (true, key(10, 2), 1)] {
         let request = rtdb_node::OwnedRangeRequest {
-            lower: Some(&lower), upper: Some(&upper), after: Some(&after), descending, limit: 1,
+            lower: Some(OwnedKeyBound::Values(&lower)), upper: Some(OwnedKeyBound::Values(&upper)),
+            after: Some(OwnedKeyBound::Values(&after)), descending, limit: 1,
         };
         let page = held.range_page_by_key(&relation, &path, request).await.unwrap();
         let batch = page.batch.unwrap();
@@ -1208,7 +1209,8 @@ async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
     for cut in [&held, &old] {
         let valid = Timestamp(10);
         let request = rtdb_node::OwnedRangeRequest {
-            lower: Some(&lower), upper: Some(&upper), after: None, descending: false, limit: 1,
+            lower: Some(OwnedKeyBound::Values(&lower)), upper: Some(OwnedKeyBound::Values(&upper)),
+            after: None, descending: false, limit: 1,
         };
         let page = cut.range_page_by_key_at_system(&relation, &path, request, selected, valid).await.unwrap();
         let batch = page.batch.unwrap();
@@ -1218,7 +1220,7 @@ async fn held_owned_range_covers_declared_empty_and_uncheckpointed_relations() {
             Value::I64(1),
         );
         let request = rtdb_node::OwnedCountRequest {
-            lower: Some(&lower), upper: Some(&upper), valid_at: valid,
+            lower: Some(OwnedKeyBound::Values(&lower)), upper: Some(OwnedKeyBound::Values(&upper)), valid_at: valid,
         };
         let result = cut.count_range_at_system(&relation, &path, request, selected).await.unwrap();
         assert_eq!((result.count, result.present, result.valid_at), (2, selected, valid));

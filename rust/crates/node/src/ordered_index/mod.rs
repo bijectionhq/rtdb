@@ -16,7 +16,7 @@ mod usage;
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::RecordBatch;
-use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_value};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_entity_id, read_value};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
@@ -262,18 +262,96 @@ pub struct OwnedRangePage {
     pub batch: Option<rtdb_columnar::OwnedBatch>,
 }
 
-/// Full-key bounds for a covered page. Bound documents name every path column.
+/// A non-null full-key selector at a held Arrow or native document boundary.
+#[derive(Clone, Copy)]
+pub enum OwnedKeyBound<'a> {
+    Arrow {
+        field: &'a arrow_schema::FieldRef,
+        array: &'a arrow_array::ArrayRef,
+        row: usize,
+    },
+    Values(&'a rtdb_types::StructFields<Value>),
+}
+
+/// Selector ownership across the World archive mailbox. Arrow columns keep their input allocation permits.
+pub enum RetainedKeyBound {
+    Arrow {
+        field: arrow_schema::FieldRef,
+        array: arrow_array::ArrayRef,
+        row: usize,
+    },
+    Values(rtdb_types::StructFields<Value>),
+}
+
+impl RetainedKeyBound {
+    pub fn borrowed(&self) -> OwnedKeyBound<'_> {
+        match self {
+            Self::Arrow { field, array, row } => OwnedKeyBound::Arrow { field, array, row: *row },
+            Self::Values(fields) => OwnedKeyBound::Values(fields),
+        }
+    }
+}
+
+impl<'a> OwnedKeyBound<'a> {
+    fn arrow_cell(self) -> Option<ArrowCell<'a>> {
+        match self {
+            Self::Arrow { field, array, row } => Some(ArrowCell { field, array: array.as_ref(), row }),
+            Self::Values(_) => None,
+        }
+    }
+
+    fn arrow_field(self, name: &str) -> Option<ArrowCell<'a>> {
+        self.arrow_cell()?.structure()?.find(|cell| cell.field.name() == name)
+    }
+
+    pub fn retained(self) -> RetainedKeyBound {
+        match self {
+            Self::Arrow { field, array, row } => RetainedKeyBound::Arrow {
+                field: Arc::clone(field), array: Arc::clone(array), row,
+            },
+            Self::Values(fields) => RetainedKeyBound::Values(fields.clone()),
+        }
+    }
+
+    fn identity_type(self) -> Option<Result<LogicalType>> {
+        match self {
+            Self::Values(fields) => fields.get("_id").map(|id| id.entity_id().map(|_| id.logical_type())),
+            Self::Arrow { .. } => self.arrow_field("_id").map(|cell| {
+                read_entity_id(cell.field, cell.array, cell.row)?;
+                cell.logical_type()
+            }),
+        }
+    }
+
+    pub(crate) fn fixed_key(self, column: &str) -> Result<rtdb_types::FixedRangeKey> {
+        use rtdb_types::FixedRangeKey;
+        match self {
+            Self::Values(fields) => FixedRangeKey::from_bound(fields, column),
+            Self::Arrow { .. } => {
+                let invalid = accelerate::invalid_bound;
+                if self.arrow_cell().and_then(|cell| cell.structure()).ok_or_else(invalid)?.len() != 2 {
+                    return Err(invalid());
+                }
+                let key = self.arrow_field(column).and_then(ArrowCell::binary).ok_or_else(invalid)?;
+                let id = self.arrow_field("_id").and_then(ArrowCell::utf8).ok_or_else(invalid)?;
+                FixedRangeKey::from_parts(key, id)
+            }
+        }
+    }
+}
+
+/// Full-key bounds for a covered page. Selectors name every path column.
 pub struct OwnedRangeRequest<'a> {
-    pub lower: Option<&'a rtdb_types::StructFields<Value>>,
-    pub upper: Option<&'a rtdb_types::StructFields<Value>>,
-    pub after: Option<&'a rtdb_types::StructFields<Value>>,
+    pub lower: Option<OwnedKeyBound<'a>>,
+    pub upper: Option<OwnedKeyBound<'a>>,
+    pub after: Option<OwnedKeyBound<'a>>,
     pub descending: bool,
     pub limit: usize,
 }
 
 pub struct OwnedCountRequest<'a> {
-    pub lower: Option<&'a rtdb_types::StructFields<Value>>,
-    pub upper: Option<&'a rtdb_types::StructFields<Value>>,
+    pub lower: Option<OwnedKeyBound<'a>>,
+    pub upper: Option<OwnedKeyBound<'a>>,
     pub valid_at: rtdb_types::Timestamp,
 }
 
@@ -332,7 +410,7 @@ pub(crate) async fn owned_range(
         &definition,
         owner,
         relation,
-        bounds.identity_bound(),
+        bounds.identity_bounds(),
     )
     .await?;
     let work = accelerate::owned_page(
@@ -409,11 +487,8 @@ pub(crate) async fn owned_total_at(
     let [snapshot] = database.partitions.as_slice() else {
         return Err(uncovered_owned_range());
     };
-    let identity = [request.lower, request.upper]
-        .into_iter()
-        .flatten()
-        .find_map(|key| key.get("_id"));
-    let projection = owned_projection(&context, snapshot, &definition, owner, relation, identity).await?;
+    let projection = owned_projection(&context, snapshot, &definition, owner, relation,
+        [request.lower, request.upper, None]).await?;
     let work = accelerate::owned_count(
         &context, snapshot, &database.storage, &definition, projection, request, lifetime, domain,
     );
@@ -426,7 +501,7 @@ async fn owned_projection(
     definition: &Definition,
     owner: &str,
     relation: &rtdb_types::OwnedRelation,
-    identity: Option<&Value>,
+    bounds: [Option<OwnedKeyBound<'_>>; 3],
 ) -> Result<OwnedProjection> {
     let empty = snapshot.owned_routing_inventory(owner, relation)?.data_exhausted();
     let mut types = snapshot.column_types_for(&definition.table, definition.columns.clone());
@@ -436,11 +511,8 @@ async fn owned_projection(
             rtdb_query::read_owned_relation_schema(Arc::clone(context), owner, root.as_ref().unwrap_or(relation))
                 .await?
                 .ok_or_else(uncovered_owned_range)?;
-        let identity = match identity {
-            Some(identity) => {
-                identity.entity_id()?;
-                identity.logical_type()
-            }
+        let identity = match bounds.into_iter().flatten().find_map(OwnedKeyBound::identity_type) {
+            Some(identity) => identity?,
             None => types.get("_id").cloned()
                 .unwrap_or(LogicalType::Scalar(ScalarType::Utf8)),
         };

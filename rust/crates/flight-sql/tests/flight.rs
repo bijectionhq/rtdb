@@ -2443,7 +2443,8 @@ async fn owned_arrow_writes_refuse_a_decimal_coefficient_outside_declared_precis
 
 #[tokio::test]
 async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order() {
-    use arrow_array::{ArrayRef, ListArray, builder::{ListBuilder, StringBuilder}};
+    use arrow_array::{ArrayRef, BinaryArray, BooleanArray, ListArray, NullArray, StructArray, UInt64Array,
+        builder::{ListBuilder, StringBuilder}};
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
 
@@ -2558,6 +2559,47 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
     assert_ne!(replies[0].body, replies[1].body);
     assert_eq!(replies[0].body, scalar);
     assert_eq!(replies[1].body, client.action(scalar_range, range(10)).await.unwrap()[0].body);
+
+    let selector = |value: ArrayRef| Arc::new(StructArray::try_from(vec![
+        ("value", value),
+        ("_id", Arc::new(Int64Array::from(vec![1])) as ArrayRef),
+    ]).unwrap()) as ArrayRef;
+    let full_range = |after: ArrayRef| request(&range_prefix, vec![
+        ("path", Arc::new(StringArray::from(vec!["by_value"]))),
+        ("lower", selector(Arc::new(Int64Array::from(vec![9])))),
+        ("upper", Arc::new(NullArray::new(1))),
+        ("after", after),
+        ("descending", Arc::new(BooleanArray::from(vec![false]))),
+        ("limit", Arc::new(Int64Array::from(vec![2]))),
+    ]);
+    let full = "rtdb.owned.ReadHeldRange.v2";
+    let first = client.action(full, full_range(Arc::new(NullArray::new(1)))).await.unwrap().remove(0).body;
+    let page = StreamReader::try_new(first.as_ref(), None).unwrap().next().unwrap().unwrap();
+    let ids = page.column_by_name("_id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(ids.values().as_ref(), &[1]);
+    let empty = client.action(full, full_range(selector(Arc::new(Int64Array::from(vec![9])))))
+        .await.unwrap().remove(0).body;
+    assert!(StreamReader::try_new(empty.as_ref(), None).unwrap().next().is_none());
+
+    let valid = i64::from_be_bytes(opened[16..24].try_into().unwrap());
+    let aggregate = |lower: ArrayRef| request(&range_prefix, vec![
+        ("path", Arc::new(StringArray::from(vec!["by_value"]))),
+        ("lower", lower),
+        ("upper", Arc::new(NullArray::new(1))),
+        ("valid_micros", Arc::new(Int64Array::from(vec![valid]))),
+    ]);
+    let lower = selector(Arc::new(Int64Array::from(vec![9])));
+    let body = client.action("rtdb.owned.CountHeldRange.v1", aggregate(Arc::clone(&lower)))
+        .await.unwrap().remove(0).body;
+    let counted = StreamReader::try_new(body.as_ref(), None).unwrap().next().unwrap().unwrap();
+    assert_eq!(counted.column(0).as_any().downcast_ref::<UInt64Array>().unwrap().value(0), 1);
+    let body = client.action("rtdb.owned.MeasureHeldRange.v1", aggregate(lower))
+        .await.unwrap().remove(0).body;
+    let measured = StreamReader::try_new(body.as_ref(), None).unwrap().next().unwrap().unwrap();
+    assert_eq!(measured.column(1).as_any().downcast_ref::<BinaryArray>().unwrap().value(0), &9_i128.to_be_bytes());
+    let wrong_width = selector(Arc::new(UInt64Array::from(vec![9])));
+    let refused = client.action("rtdb.owned.CountHeldRange.v1", aggregate(wrong_width)).await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
 
     let mut input = client.request(Action { r#type: scalar_point.into(), body: present });
     input.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
