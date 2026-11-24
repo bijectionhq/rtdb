@@ -70,6 +70,9 @@ List the exact authenticated principal names that may create, delete, export, re
 The default configuration grants no deployment administration access.
 Use the ordinary Flight listener with a verified password or client credential.
 The `rtdb admin` client reads its authorization value from the file supplied through `--authorization-file`.
+Multi nodes use private TCP port 3001 to forward admitted native writes to the selected writer.
+The cluster catalog token authority authenticates and encrypts the peer requests and replies.
+The peer port belongs on the node security group. Clients use the ordinary Flight listener.
 
 Use the link:../conformance/README.adoc[packaged client runner] against the produced image and manifest.
 Backend, fault, storage-interoperability, performance and rollback receipts remain separate release requirements in the matrix.

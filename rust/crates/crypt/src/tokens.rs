@@ -21,6 +21,7 @@ const DERIVATION_CONTEXT: &[u8] = b"rtdb.v1/aes-siv-512/1";
 const TAG_BYTES: usize = 16;
 const HEADER_BYTES: usize = FORMAT.len() + 16 + 8 + 1;
 const MAX_WRAPPED_KEY_BYTES: usize = 64 * 1024;
+pub const MAX_PEER_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct TokenKey {
@@ -162,6 +163,8 @@ enum Purpose {
     ReceiverClock = 4,
     CustodyRead = 5,
     DeploymentErasure = 6,
+    PeerRequest = 7,
+    PeerReply = 8,
 }
 
 impl Purpose {
@@ -177,6 +180,11 @@ impl Purpose {
             Self::ReceiverClock => Anomaly::incorrect("rtdb/invalid-receiver-observation", "Invalid receiver clock observation"),
             Self::CustodyRead => Anomaly::incorrect("rtdb/invalid-custody-read", "Invalid custody read proof"),
             Self::DeploymentErasure => Anomaly::incorrect("rtdb/invalid-deployment-erasure", "Invalid deployment erasure evidence"),
+            Self::PeerRequest | Self::PeerReply => Anomaly::new(
+                AnomalyCategory::Forbidden,
+                "rtdb/invalid-peer-message",
+                "The RTDB peer envelope failed authentication",
+            ),
         }
     }
 
@@ -188,11 +196,31 @@ impl Purpose {
             Self::ReceiverClock => OBSERVATION_BYTES,
             Self::CustodyRead => CUSTODY_READ_HEADER + 48 * MAX_CUSTODY_CONTRIBUTORS,
             Self::DeploymentErasure => ERASURE_EVIDENCE_BYTES,
+            Self::PeerRequest | Self::PeerReply => MAX_PEER_MESSAGE_BYTES,
         }
     }
 }
 
 impl TokenAuthority {
+    /// The cluster catalog's authority authenticates requests already admitted by an RTDB listener.
+    pub async fn seal_peer_request(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let key = self.keys.current().await?;
+        self.seal(&key, Purpose::PeerRequest, message).await
+    }
+
+    pub async fn open_peer_request(&self, message: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        self.open(Purpose::PeerRequest, message).await.map(|(body, _)| body)
+    }
+
+    pub async fn seal_peer_reply(&self, message: &[u8]) -> Result<Vec<u8>> {
+        let key = self.keys.current().await?;
+        self.seal(&key, Purpose::PeerReply, message).await
+    }
+
+    pub async fn open_peer_reply(&self, message: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        self.open(Purpose::PeerReply, message).await.map(|(body, _)| body)
+    }
+
     pub fn custody_vault(&self) -> crate::CustodyVault {
         crate::CustodyVault::new(self.incarnation, Arc::clone(&self.kms))
     }
@@ -650,6 +678,23 @@ mod tests {
                 .map(|encoded| TokenKey::decode(encoded))
                 .transpose()
         }
+    }
+
+    #[tokio::test]
+    async fn peer_envelopes_bind_cluster_incarnation_and_direction() {
+        let database = Uuid::from_u128(61);
+        let kms: Arc<dyn Kms> = Arc::new(crate::LocalKms::new(|| 0));
+        let metadata = TokenKey::create(kms.as_ref(), Generation { database, number: 0 })
+            .await.unwrap().encode();
+        let authority = TokenAuthority::new(database, Arc::clone(&kms), Arc::new(Keys(vec![metadata.clone()])));
+        let request = authority.seal_peer_request(b"canonical request").await.unwrap();
+        let reply = authority.seal_peer_reply(b"settled receipt").await.unwrap();
+        assert_eq!(authority.open_peer_request(&request).await.unwrap().as_slice(), b"canonical request");
+        assert_eq!(authority.open_peer_reply(&reply).await.unwrap().as_slice(), b"settled receipt");
+        assert!(authority.open_peer_request(&reply).await.is_err());
+        assert!(authority.open_peer_reply(&request).await.is_err());
+        let foreign = TokenAuthority::new(Uuid::from_u128(62), kms, Arc::new(Keys(vec![metadata])));
+        assert!(foreign.open_peer_request(&request).await.is_err());
     }
 
     #[tokio::test]

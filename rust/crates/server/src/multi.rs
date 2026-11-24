@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::config::NodeConfiguration;
 
 mod catalog;
+mod peer;
 use catalog::{Status, TransferExport};
 
 const WRITER_LEASE_MICROS: i64 = 5_000_000;
@@ -47,6 +48,7 @@ pub struct MultiRuntime {
     memory: Arc<MemoryBudget>,
     kms: Arc<dyn Kms>,
     backends: Backends,
+    peer: Option<Arc<peer::Peer>>,
 }
 
 impl MultiRuntime {
@@ -189,7 +191,15 @@ impl MultiRuntime {
                 "A bootstrap database cannot use the deployment catalog identity",
             ));
         }
-        let catalog = catalog::Catalog::new(open_database(&backends, &kms, control, false).await?);
+        let control = open_database(&backends, &kms, control, false).await?;
+        let peer = backends.peers.as_ref().map(|_| {
+            peer::Peer::new(
+                backends.node,
+                control.token_authority(),
+                Arc::clone(&memory),
+            )
+        });
+        let catalog = catalog::Catalog::new(control);
         let observed = catalog.read().await?;
         let mut serving = BTreeMap::new();
         for (name, id) in &databases {
@@ -223,8 +233,8 @@ impl MultiRuntime {
         for (name, id) in initial {
             let database = open_database(&backends, &kms, id, true).await?;
             serving.insert(
-                name,
-                Arc::new(MultiServing::new(database, Arc::clone(&memory))),
+                name.clone(),
+                serving_driver(database, &name, &memory, peer.as_ref()),
             );
         }
         config.fixed_databases = Some(
@@ -245,6 +255,7 @@ impl MultiRuntime {
             memory,
             kms,
             backends,
+            peer,
         })
     }
 
@@ -540,6 +551,16 @@ impl MultiRuntime {
     }
 
     pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
+        if let Some(peer) = &self.peer {
+            return tokio::select! {
+                result = self.drive_databases(node, stop) => result,
+                result = peer.serve(self, node, stop) => result,
+            };
+        }
+        self.drive_databases(node, stop).await
+    }
+
+    async fn drive_databases(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         stop.run_until_cancelled(async {
@@ -561,6 +582,9 @@ impl MultiRuntime {
                 Err(error) => return Err(error),
             },
         };
+        if let Some(peer) = &self.peer {
+            peer.observe(&live);
+        }
         match self.reconcile(node, &live).await {
             Ok(()) => (),
             Err(error) if retryable(&error) => (),
@@ -682,7 +706,7 @@ impl MultiRuntime {
         let mut databases = self.databases.write().expect("Multi serving catalog");
         let driver = databases
             .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(MultiServing::new(database, Arc::clone(&self.memory))));
+            .or_insert_with(|| serving_driver(database, name, &self.memory, self.peer.as_ref()));
         check_incarnation(driver, id)?;
         Ok(Arc::clone(driver))
     }
@@ -712,6 +736,19 @@ struct Backends {
     node: IpAddr,
     peers: Option<String>,
     _credential_slot: Option<Arc<File>>,
+}
+
+fn serving_driver(
+    database: MultiDatabase,
+    name: &str,
+    memory: &Arc<MemoryBudget>,
+    peer: Option<&Arc<peer::Peer>>,
+) -> Arc<MultiServing> {
+    let driver = MultiServing::new(database, Arc::clone(memory));
+    Arc::new(match peer {
+        Some(peer) => driver.with_write_route(peer.database(name)),
+        None => driver,
+    })
 }
 
 async fn open_database(

@@ -15,7 +15,7 @@ pub async fn discover_nodes(host: &str) -> Result<BTreeSet<IpAddr>> {
     Ok(addresses.map(|addr| addr.ip()).collect())
 }
 
-pub(crate) fn preferred(database: Uuid, nodes: &BTreeSet<IpAddr>) -> Option<IpAddr> {
+pub fn preferred(database: Uuid, nodes: &BTreeSet<IpAddr>) -> Option<IpAddr> {
     nodes.iter().copied().max_by_key(|address| {
         let mut hash = Sha256::new();
         hash.update(database.as_bytes());

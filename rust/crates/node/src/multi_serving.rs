@@ -45,6 +45,20 @@ pub struct MultiServing {
     incarnation: [u8; 16],
     tokens: TokenAuthority,
     memory: Arc<MemoryBudget>,
+    route: Option<Arc<dyn MultiWriteRoute>>,
+}
+
+/// The host can route an already authorized write to the node appointed for this incarnation.
+#[async_trait]
+pub trait MultiWriteRoute: Send + Sync {
+    async fn forward(
+        &self, incarnation: [u8; 16], request: &Transact, admission: MultiWriteAdmission<'_>,
+    ) -> Result<Option<Receipt>>;
+}
+
+pub enum MultiWriteAdmission<'a> {
+    Ordinary(Option<&'a ServingScope>),
+    CustodyResponse,
 }
 
 impl MultiServing {
@@ -63,7 +77,56 @@ impl MultiServing {
             database,
             writes,
             memory,
+            route: None,
         }
+    }
+
+    pub fn with_write_route(mut self, route: Arc<dyn MultiWriteRoute>) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// Applies the authorized request only under this node's active writer lease.
+    /// Peer ingress calls this entry point and cannot submit a second forwarding attempt.
+    pub async fn transact_local(
+        &self, mut request: Transact, scope: Option<ServingScope>,
+    ) -> Result<Receipt> {
+        if request.contains_response_release() {
+            return Err(crate::serving::custody_release::release_unavailable());
+        }
+        if let Some(scope) = scope {
+            return self.writes.transact_scoped(request, scope.labels, scope.receipt_namespace).await;
+        }
+        if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
+            crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
+        }
+        self.writes.transact(request).await
+    }
+
+    async fn transact_routed(
+        &self, request: Transact, scope: Option<ServingScope>, cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        if request.contains_response_release() {
+            return Err(crate::serving::custody_release::release_unavailable());
+        }
+        cancellation.run_until_cancelled(async {
+            if let Some(route) = &self.route
+                && let Some(receipt) = route.forward(
+                    self.incarnation, &request, MultiWriteAdmission::Ordinary(scope.as_ref()),
+                ).await?
+            {
+                return Ok(receipt);
+            }
+            self.transact_local(request, scope).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    /// Accepts only the narrow ordered response-release command from an admitted peer.
+    pub async fn submit_response_local(&self, request: Transact) -> Result<Receipt> {
+        if !request.is_response_release() {
+            return Err(crate::serving::custody_release::release_unavailable());
+        }
+        self.writes.transact(request).await
     }
 
     pub async fn tick(&self, live_nodes: &BTreeSet<IpAddr>) -> Result<Role> {
@@ -151,9 +214,7 @@ impl ServingDriver for MultiServing {
 
     async fn transact_scoped(&self, request: Transact, scope: ServingScope,
                              cancellation: &CancellationToken) -> Result<Receipt> {
-        cancellation.run_until_cancelled(self.writes.transact_scoped(
-            request, scope.labels, scope.receipt_namespace,
-        )).await.ok_or_else(interrupted)?
+        self.transact_routed(request, Some(scope), cancellation).await
     }
 
     async fn tx_status_scoped(&self, key: &[u8], scope: &ServingScope,
@@ -232,19 +293,10 @@ impl ServingDriver for MultiServing {
 
     async fn transact(
         &self,
-        mut request: Transact,
+        request: Transact,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
-        if request.contains_response_release() { return Err(crate::serving::custody_release::release_unavailable()); }
-        cancellation
-            .run_until_cancelled(async {
-                if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
-                    crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
-                }
-                self.writes.transact(request).await
-            })
-            .await
-            .ok_or_else(interrupted)?
+        self.transact_routed(request, None, cancellation).await
     }
 
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
@@ -273,7 +325,17 @@ impl ServingDriver for MultiServing {
     }
 
     async fn submit_custody_release(&self, command: TrustedCustodyCommand, cancellation: &CancellationToken) -> Result<Receipt> {
-        cancellation.run_until_cancelled(self.writes.transact(command.into_request()?)).await.ok_or_else(interrupted)?
+        let request = command.into_request()?;
+        cancellation.run_until_cancelled(async {
+            if let Some(route) = &self.route
+                && let Some(receipt) = route.forward(
+                    self.incarnation, &request, MultiWriteAdmission::CustodyResponse,
+                ).await?
+            {
+                return Ok(receipt);
+            }
+            self.submit_response_local(request).await
+        }).await.ok_or_else(interrupted)?
     }
 
     async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,

@@ -2,6 +2,7 @@ data "aws_region" "current" {}
 
 locals {
   flight_port = 3000
+  peer_port   = 3001
   multi       = var.mode == "multi"
   secrets = merge({ RTDB_ROOT_PASSWORD = var.root_password_secret }, merge({}, [
     for slot, credential in(var.journal_credentials == null ? {} : var.journal_credentials) : {
@@ -95,7 +96,7 @@ resource "aws_ecs_task_definition" "node" {
     secrets         = [for name, value in local.secrets : { name = name, valueFrom = value }]
     mountPoints     = local.multi ? [{ sourceVolume = "keys", containerPath = "/var/lib/rtdb/keys", readOnly = false }] : []
     stopTimeout     = 90
-    portMappings    = [{ containerPort = local.flight_port, protocol = "tcp" }]
+    portMappings    = concat([{ containerPort = local.flight_port, protocol = "tcp" }], local.multi ? [{ containerPort = local.peer_port, protocol = "tcp" }] : [])
     linuxParameters = { capabilities = { drop = ["ALL"] } }
     logConfiguration = { logDriver = "awslogs", options = {
       awslogs-group         = aws_cloudwatch_log_group.node.name
@@ -149,6 +150,7 @@ resource "aws_ecs_service" "node" {
   depends_on = [
     aws_lb_listener.flight,
     aws_vpc_security_group_ingress_rule.node,
+    aws_vpc_security_group_ingress_rule.write_peers,
     aws_vpc_security_group_egress_rule.node,
     aws_iam_role_policy.objects,
     aws_iam_role_policy.secrets,
