@@ -404,9 +404,9 @@ async fn multi_driver_dueling_dns_views_keep_one_epoch_until_the_winner_lapses()
 async fn multi_driver_hands_off_a_settled_writer_after_a_lost_release_reply() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
-    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(Identity(1)))));
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
     let mut first = cluster.node(1, faults.clone());
-    let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
+    let mut successor = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
     first.create().await.unwrap();
     first.tick(&live(1)).await.unwrap();
     let prior = first.transact(&put(1, 1, "released writer")).await.unwrap();
