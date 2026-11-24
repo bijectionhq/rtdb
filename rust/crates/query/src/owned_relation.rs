@@ -457,6 +457,28 @@ pub async fn open_staged_unique_window(
     open_unique_window(context, owner, relation, column, Some(key), valid, fetch).await
 }
 
+/// Scan a frozen writer's claims at its already admitted historical system cut.
+pub async fn open_archived_world_unique_window(
+    context: Arc<QueryContext>,
+    owner: &str,
+    shadow: &OwnedRelation,
+    column: &str,
+    key: &[u8],
+    valid: Interval,
+    fetch: usize,
+) -> Result<Option<QueryCursor>> {
+    if shadow.root_relation().is_none() {
+        return Err(address_unavailable());
+    }
+    let system = context.current_time.as_micros()?;
+    let database = context.catalog.database(context.catalog.default_database())?;
+    let [snapshot] = database.partitions.as_slice() else { return Err(address_unavailable()); };
+    if snapshot.system_time_cap() != Some(system) {
+        return Err(address_unavailable());
+    }
+    open_unique_window(context, owner, shadow, column, Some(key), valid, fetch).await
+}
+
 async fn open_unique_window(
     context: Arc<QueryContext>,
     owner: &str,

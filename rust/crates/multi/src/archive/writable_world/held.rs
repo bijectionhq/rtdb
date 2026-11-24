@@ -33,36 +33,54 @@ impl rtdb_node::WorldConstraintArchive for WorldArchive {
         let world = check.world;
         let pin = Uuid::from_bytes(world.pin.0);
         let retained = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
-        if retained.ancestor.is_some() || world.ancestor.is_some()
-            || retained.world.as_bytes() != &world.id.0
-            || retained.owner != check.owner
-            || retained.capture.as_bytes() != &world.capture.0
-            || retained.suffix.map(|suffix| Iid(*suffix.as_bytes())) != world.suffix
-            || retained.manifest_sha256 != world.manifest
-            || retained.schema_digest != world.schemas.digest()
-            || retained.basis != world.basis
-            || retained.parent_publication != world.parent_publication
-            || retained.mode != world.mode
-            || retained.until != world.until
+        if retained.owner != check.owner || !matches_retention(world, retained)
             || check.ordered >= retained.until
         {
             return Err(unavailable());
         }
-        let parent = CheckpointReadWorld {
-            deployment: Uuid::parse_str(&installed.id).map_err(|_| unavailable())?,
-            capture: retained.capture,
-            manifest_sha256: retained.manifest_sha256.clone(),
-            suffix: retained.suffix,
-            basis: retained.basis,
-        };
-        admit_capture(&installed, &self.storage, &parent)?;
+        let deployment = Uuid::parse_str(&installed.id).map_err(|_| unavailable())?;
+        let parent = parent_media(deployment, retained);
+        admit_world_media(&installed, &self.storage, deployment, retained)?;
         let resources = CheckpointReadResources {
             node: &self.options, memory: check.memory, cache: Arc::clone(&check.cache), cancellation: check.cancellation,
         };
-        with_checkpoint_context(
+        let ancestor = retained.ancestor.as_ref();
+        let placement = check.placement;
+        let guard = |current: &DeploymentRecord| {
+            let current_pin = current.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
+            if current_pin != retained
+                || PlacedAttemptScope::new(&current.stream("replica"), current.epoch)? != placement
+                || now() >= current_pin.until
+            {
+                return Err(unavailable());
+            }
+            admit_world_media(current, &self.storage, deployment, current_pin)
+        };
+        guard(&installed)?;
+        let result = with_checkpoint_context(
             self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
-            &parent, resources, |context| check.validate(context),
-        ).await
+            &parent, resources.clone(), |context| async move {
+                let Some(ancestor) = ancestor else { return check.validate(context).await; };
+                let media = ancestor_media(deployment, ancestor);
+                with_checkpoint_context(
+                    self.directory.as_ref(), &self.storage, self.keys.as_ref(), self.hosted_task.as_ref(),
+                    &media, resources, |frozen| async move {
+                        let (overlay, shadow) = {
+                            let relation = check.relation();
+                            let schema = world.schemas.relation(relation).ok_or_else(unavailable)?;
+                            let layer = InheritedRelation::open(
+                                Arc::clone(&context), frozen, check.owner, relation, ancestor, schema, check.memory,
+                            ).await?;
+                            (layer.overlay, layer.shadow)
+                        };
+                        check.validate_layers(context, &[(overlay, shadow)]).await
+                    },
+                ).await
+            },
+        ).await;
+        let current = self.directory.deployment(&installed.id).await?.ok_or_else(unavailable)?;
+        guard(&current)?;
+        result
     }
 }
 
