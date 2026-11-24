@@ -105,7 +105,7 @@ impl RecoveredPartition {
         if position <= replay.after || position > replay.cut.through {
             return Err(missing_erasure());
         }
-        let authenticated_head = replay.protected.as_ref().and_then(|range| range.authenticated_head)
+        let authenticated_head = replay.protected.suffix.as_ref().and_then(|range| range.authenticated_head)
             .ok_or_else(missing_erasure)?;
         let cut = replay.cut;
         let checkpoint = replay.checkpoint;
@@ -139,7 +139,14 @@ impl RecoveredPartition {
             boundary: block.boundary_replica_position()?,
             root_sha256: Some(block.publication_sha256()?),
         }));
-        if base != after || loaded != checkpoint || (loaded.is_none() && self.block.is_some()) {
+        let coordinates = |checkpoint: crate::PublishedCheckpoint| (checkpoint.block, checkpoint.boundary);
+        if base != after || loaded.map(coordinates) != checkpoint.map(coordinates)
+            || !crate::catalog_cut::matches_snapshot_root(
+                loaded.and_then(|loaded| loaded.root_sha256),
+                checkpoint.and_then(|issued| issued.root_sha256),
+            )
+            || (loaded.is_none() && self.block.is_some())
+        {
             return Err(unretained());
         }
         let Some(protected) = protected.suffix else {

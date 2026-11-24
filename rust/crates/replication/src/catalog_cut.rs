@@ -3,6 +3,23 @@
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+use rtdb_format::catalog::same_publication_digest;
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (match (loaded, captured) {
+        (Some(left), Some(right)) => left@ == right@,
+        (None, None) => true,
+        _ => false,
+    }),
+))]
+pub(crate) fn matches_snapshot_root(loaded: Option<[u8; 32]>, captured: Option<[u8; 32]>) -> bool {
+    match (loaded, captured) {
+        (Some(left), Some(right)) => same_publication_digest(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures
         out.is_some() <==> tracking && !block_pending && !apply_deferred,

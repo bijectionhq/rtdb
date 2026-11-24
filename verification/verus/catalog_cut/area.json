@@ -5,10 +5,29 @@
     "--verify-module",
     "production",
     "--verify-module",
+    "publication_identity",
+    "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 9,
+  "min_verified_functions": 13,
   "controls": {
+    "resume_with_a_substituted_root_digest": {
+    "mutate": [
+      {
+        "file": "rust/crates/replication/src/catalog_cut.rs",
+        "find": "        (Some(left), Some(right)) => same_publication_digest(left, right),",
+        "replace": "        (Some(left), Some(_)) => same_publication_digest(left, left),"
+      }
+    ],
+    "expect": [
+      {
+        "file": "rust/crates/replication/src/catalog_cut.rs",
+        "function": "matches_snapshot_root",
+        "category": "postcondition not satisfied"
+      }
+    ],
+    "min_verified_functions": 9
+  },
     "cross_pending_block": {
       "mutate": [
         {

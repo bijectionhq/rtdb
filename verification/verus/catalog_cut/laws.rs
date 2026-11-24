@@ -1,4 +1,4 @@
-use crate::production::{completed_prefix, completes_snapshot_replay};
+use crate::production::{completed_prefix, completes_snapshot_replay, matches_snapshot_root};
 use vstd::prelude::*;
 
 verus! {
@@ -47,6 +47,20 @@ pub fn another_checkpoint_cannot_anchor_the_original_suffix(base: i64, loaded: i
 {
     assert(!completes_snapshot_replay(loaded, base, through, through, true));
     assert(completes_snapshot_replay(base, base, base, base, false));
+}
+
+pub fn resume_rejects_a_substituted_root_even_at_the_same_boundary(
+    expected: [u8; 32], loaded: [u8; 32], byte: usize,
+)
+    requires byte < 32, expected@[byte as int] != loaded@[byte as int],
+{
+    assert(!matches_snapshot_root(Some(loaded), Some(expected)));
+}
+
+pub fn genesis_credentials_cannot_resume_a_published_root(expected: [u8; 32]) {
+    assert(!matches_snapshot_root(None, Some(expected)));
+    assert(!matches_snapshot_root(Some(expected), None));
+    assert(matches_snapshot_root(None, None));
 }
 
 }
