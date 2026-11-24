@@ -68,7 +68,7 @@ async fn read_release(bucket: &dyn ObjectStore, key: &ObjectKey) -> Result<Optio
     Ok(Some(ReleaseWitness { record, version, terminal, pack, release_version: observed.version }))
 }
 
-/// A path-only release can withdraw a loose fork edge when an exact copy
+/// A path-only release can withdraw a fork edge when an exact copy
 /// already takes precedence. Physical retirement of either copy remains ordered
 /// by the publication's own release, recovery dependencies and census.
 pub(super) async fn withdraw_inherited_release(
@@ -84,45 +84,55 @@ pub(super) async fn withdraw_inherited_release(
     for marker in bucket.list(Some(&markers)).await? {
         let Some(witness) = read_release(bucket, &marker.key).await? else { continue; };
         if witness.version.is_some() || witness.terminal.is_some() || witness.pack.is_some() { continue; }
-        let name = &witness.record.key;
-        let Some(source_root) = base.objects.get(name).filter(|source| source.as_str() != root) else { continue; };
-        let Some(original) = base.publications.get(name) else { continue; };
-        let source = ObjectKey::new(format!("{source_root}/{name}"))?;
-        let target = ObjectKey::new(format!("{root}/{name}"))?;
-        let Some(replacement) = bucket.retirement_publication(&target).await? else { continue; };
-        let withdrawn = super::with_source_lineage(directory, Some(&candidate.lineage), Some(task), async {
-            let Some(current) = directory.deployment(&candidate.id).await?
-                .filter(|current| current.storage_prefix() == candidate.storage_prefix()
-                    && current.lineage == candidate.lineage && current.org == candidate.org && can_reap(current))
-                else { return Ok(false); };
-            let still_selected = Base::load(bucket, &root).await?;
-            if still_selected.objects.get(name) != Some(source_root) || still_selected.publications.get(name) != Some(original) {
-                return Ok(false);
-            }
-            let source_registered = directory.deployments().await?.into_iter().any(|owner| {
-                owner.org == current.org && owner.lineage == current.lineage
-                    && source_root == &format!("{}/{storage_root}", owner.storage_prefix())
-            });
-            if !source_registered || !same_fork_body(bucket, (&source, original), (&target, &replacement)).await? {
-                return Ok(false);
-            }
-            if witness.record.trie_floor.is_some() {
-                let record = witness.record.clone();
-                let release = match replacement {
-                    PhysicalObjectPublication::Version(version) => StoredRelease::Exact { record, version, pack: None },
-                    PhysicalObjectPublication::Terminal(terminal) => StoredRelease::Terminal { record, terminal, pack: None },
-                };
-                let bytes = Bytes::from(serde_json::to_vec(&release).expect("a release serializes"));
-                let id = ring::digest::digest(&ring::digest::SHA256, &bytes);
-                let id = uuid::Uuid::from_bytes(id.as_ref()[..16].try_into().expect("16 digest bytes"));
-                let timestamp = witness.record.released_at_ms;
-                let marker = ObjectKey::new(format!("{markers}/{timestamp:020}-{}{suffix}", id.simple(), suffix = super::TRIE_RETIREMENT_RELEASE))?;
-                bucket.put(&marker, bytes).await?;
-            }
-            still_selected.forget(bucket, &root, &BTreeSet::from([name.clone()])).await?;
-            Ok(true)
-        }).await?;
-        if withdrawn { break; }
+        for (name, source_root) in &base.objects {
+            let pack = name != &witness.record.key;
+            if source_root == &root || pack && !crate::packing::is_pack_key(name) { continue; }
+            let Some(original) = base.publications.get(name) else { continue; };
+            let source = ObjectKey::new(format!("{source_root}/{name}"))?;
+            let target = ObjectKey::new(format!("{root}/{name}"))?;
+            let Some(replacement) = bucket.retirement_publication(&target).await? else { continue; };
+            let withdrawn = super::with_source_lineage(directory, Some(&candidate.lineage), Some(task), async {
+                let Some(current) = directory.deployment(&candidate.id).await?
+                    .filter(|current| current.storage_prefix() == candidate.storage_prefix()
+                        && current.lineage == candidate.lineage && current.org == candidate.org && can_reap(current))
+                    else { return Ok(false); };
+                let still_selected = Base::load(bucket, &root).await?;
+                if still_selected.objects.get(name) != Some(source_root) || still_selected.publications.get(name) != Some(original) {
+                    return Ok(false);
+                }
+                let source_registered = directory.deployments().await?.into_iter().any(|owner| {
+                    owner.org == current.org && owner.lineage == current.lineage
+                        && source_root == &format!("{}/{storage_root}", owner.storage_prefix())
+                });
+                if !source_registered { return Ok(false); }
+                if pack {
+                    if bucket.retirement_publication(&target).await?.as_ref() != Some(&replacement)
+                        || !crate::packing::read_index(bucket, &target).await?.entries.contains_key(&witness.record.key)
+                    {
+                        return Ok(false);
+                    }
+                }
+                if !same_fork_body(bucket, (&source, original), (&target, &replacement)).await? {
+                    return Ok(false);
+                }
+                if !pack && witness.record.trie_floor.is_some() {
+                    let record = witness.record.clone();
+                    let release = match replacement {
+                        PhysicalObjectPublication::Version(version) => StoredRelease::Exact { record, version, pack: None },
+                        PhysicalObjectPublication::Terminal(terminal) => StoredRelease::Terminal { record, terminal, pack: None },
+                    };
+                    let bytes = Bytes::from(serde_json::to_vec(&release).expect("a release serializes"));
+                    let id = ring::digest::digest(&ring::digest::SHA256, &bytes);
+                    let id = uuid::Uuid::from_bytes(id.as_ref()[..16].try_into().expect("16 digest bytes"));
+                    let timestamp = witness.record.released_at_ms;
+                    let marker = ObjectKey::new(format!("{markers}/{timestamp:020}-{}{suffix}", id.simple(), suffix = super::TRIE_RETIREMENT_RELEASE))?;
+                    bucket.put(&marker, bytes).await?;
+                }
+                still_selected.forget(bucket, &root, &BTreeSet::from([name.clone()])).await?;
+                Ok(true)
+            }).await?;
+            if withdrawn { return Ok(()); }
+        }
     }
     Ok(())
 }
