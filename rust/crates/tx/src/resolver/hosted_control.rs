@@ -102,7 +102,7 @@ impl OpenTransaction<'_> {
                 root_relations.insert(relation.name());
             }
             if let Some(write) = crate::hosted_control::owned_document_write(operation)
-                && write.relation.name() == "fact_sealed_search_erasures"
+                && write.relation.is_root_data() && write.relation.name() == "fact_sealed_search_erasures"
             {
                 if !crate::hosted_control::family_search_erase_marker(&write) { return Err(invalid()); }
                 for row in write.documents.rows() {

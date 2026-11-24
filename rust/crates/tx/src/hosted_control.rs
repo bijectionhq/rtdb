@@ -1825,7 +1825,7 @@ pub(crate) fn family_root_erase(relation: &OwnedRelation) -> bool {
 }
 
 pub(crate) fn family_search_erase_marker(write: &ProposalOverlayWrite<'_>) -> bool {
-    write.relation.name() == "fact_sealed_search_erasures" && !write.create_only
+    write.relation.is_root_data() && write.relation.name() == "fact_sealed_search_erasures" && !write.create_only
         && write.from == Some(Timestamp::MIN) && write.to.is_none_or(|to| to == Timestamp::MAX)
         && write.documents.row_count() > 0 && write.documents.has_exact_presence()
         && write.documents.rows().all(|row| row.only_id() && row.string_id().is_some())
