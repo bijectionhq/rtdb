@@ -69,6 +69,22 @@ async fn eventually<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
     .expect("condition never became observable")
 }
 
+fn ordered_cli(command: &str, manifest: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_rtdb-multi"))
+        .arg(command)
+        .arg("--manifest")
+        .arg(manifest)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn ordered_cli_ok(command: &str, manifest: &Path, args: &[&str]) -> Vec<u8> {
+    let output = ordered_cli(command, manifest, args);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    output.stdout
+}
+
 fn reserve_port() -> std::net::TcpListener {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap()
 }
@@ -881,11 +897,59 @@ async fn exercise_installed_owned_reads() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_trim_and_repair() {
+async fn ordered_cli_reuses_worker_roster_capacity_after_exact_withdrawal() {
+    let authority = Authority::new(Uuid::new_v4(), 4096, 1024, 1);
+    let mut cohort = authority.start("churn").await;
+    let control = authority.data.path().join("worker-control.json");
+    write_json(&control, &json!({
+        "credentials": authority.administrator.credentials,
+        "route": cohort.route,
+    }));
+
+    let withdraw = |enrollment: Enrollment| {
+        ordered_cli_ok("ordered-withdraw", &control, &[
+            "--worker", &enrollment.worker.to_string(), "--serial", &enrollment.serial.to_string(),
+        ]);
+    };
+    let worker = Uuid::new_v4();
+    let blocked = ordered_cli("ordered-enroll", &control, &["--worker", &worker.to_string()]);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("Capacity"));
+    withdraw(authority.enrollments[0]);
+
+    let mut previous = authority.enrollments[1].serial;
+    for _ in 0..8 {
+        let worker = Uuid::new_v4();
+        let enrollment: Enrollment = serde_json::from_slice(&ordered_cli_ok(
+            "ordered-enroll", &control, &["--worker", &worker.to_string()],
+        )).unwrap();
+        assert_eq!(enrollment.worker, worker);
+        assert!(enrollment.serial > previous);
+        previous = enrollment.serial;
+        withdraw(enrollment);
+        let disposed: Enrollment = serde_json::from_slice(&ordered_cli_ok(
+            "ordered-dispose-worker", &control, &[
+                "--worker", &worker.to_string(), "--serial", &enrollment.serial.to_string(),
+                "--disposition", &"01".repeat(32),
+            ],
+        )).unwrap();
+        assert_eq!(disposed, enrollment);
+    }
+    for voter in &mut cohort.voters {
+        voter.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_cli_repairs_the_cohort_after_reconciling_lost_appends_and_reads() {
     const ORDINARY: u64 = 4096;
     let authority = Authority::new(Uuid::new_v4(), ORDINARY, 1024, 1);
     let mut cohort = authority.start("initial").await;
-    let installed: ApplicationRoute = serde_json::from_value(cohort.route.clone()).unwrap();
+    let deployment = authority.placement.deployment.to_string();
+    let installed: ApplicationRoute = serde_json::from_slice(&ordered_cli_ok(
+        "ordered-route", &cohort.voters[0].manifest, &["--deployment", &deployment],
+    )).unwrap();
+    assert_eq!(installed.placement, authority.placement);
     let old = authority.workers[0].client(&cohort.route);
     let next = authority.workers[1].client(&cohort.route);
     let custody = authority.custodian.client(&cohort.route);
@@ -1235,10 +1299,8 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
         .enumerate()
         .map(|(index, voter)| {
             let ticket = authority.data.path().join(format!("reservation-{index}"));
-            voter
-                .manifest()
-                .reserve_repair(authority.placement.deployment, &ticket)
-                .unwrap();
+            ordered_cli_ok("ordered-reserve-repair", &voter.manifest,
+                &["--deployment", &deployment, "--output", ticket.to_str().unwrap()]);
             ticket
         })
         .collect();
@@ -1248,29 +1310,22 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
         .find(|voter| voter.address != failed_voter)
         .unwrap();
     let package = authority.data.path().join("sealed-cohort");
-    assert!(
-        source
-            .manifest()
-            .seal_repair(&successor.group, &[tickets[0].as_path()], &package)
-            .await
-            .is_err()
-    );
+    let seal = |tickets| ordered_cli("ordered-seal-repair", &source.manifest, &[
+        "--destination", successor.group.to_str().unwrap(),
+        "--output", package.to_str().unwrap(), "--tickets", tickets,
+    ]);
+    assert!(!seal(tickets[0].to_str().unwrap()).status.success());
     assert_eq!(route(&next).await.head, selected.head);
-    let tickets: Vec<_> = tickets.iter().map(PathBuf::as_path).collect();
-    source
-        .manifest()
-        .seal_repair(&successor.group, &tickets, &package)
-        .await
-        .unwrap();
+    let tickets = tickets.iter().map(|ticket| ticket.to_str().unwrap()).collect::<Vec<_>>().join(",");
+    let sealed = seal(&tickets);
+    assert!(sealed.status.success(), "{}", String::from_utf8_lossy(&sealed.stderr));
     assert!(matches!(
         next.call(Operation::Route).await.unwrap(),
         Reply::Refused(Refusal::CohortSealed)
     ));
     for voter in &mut successor.voters {
-        voter
-            .manifest()
-            .install_repair(authority.placement.deployment, &package)
-            .unwrap();
+        ordered_cli_ok("ordered-install-repair", &voter.manifest,
+            &["--deployment", &deployment, "--package", package.to_str().unwrap()]);
         voter.start();
     }
     let mut ordered_route: ApplicationRoute = serde_json::from_value(cohort.route.clone()).unwrap();

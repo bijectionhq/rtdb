@@ -374,3 +374,17 @@ The standalone Logkeeper Verus harness includes the admission functions used by 
 The native acceptance source in `rust/crates/multi/tests/ordered_journal.rs` covers lost replies through authenticated journal sockets, and exercises worker replacement and resumption of a prepared checkpoint through RTDB's PGWire and Flight gateways. The linked Logkeeper source has a compact-image round trip at full ordinary capacity and a torn inactive-slot scenario. RTDB's S3 HTTP fixture checks that an unsuccessful conditional tombstone needs retry and exact confirmation. Live-provider qualification still needs to exercise the deployed IAM policy, enrollment, conditional writes, and allocation disposition.
 
 Before a hosted cutover, exercise failed voter and worker replacement with the directory unavailable, ordinary bytes and reader slots full, and a stalled provider operation. Keep the provider usable for at least one completion sequence. Confirm that the surviving quorum retains the original write result and grants a new writer without additional voter allocation. Confirm that a fresh statement reaches the barrier cut, that a protected old read delays trim, and that writes reopen after its hold closes and the exact archived checkpoint becomes usable. Transfer to independently reserved successor media before counting another failure zone as survivable.
+
+### Run ordered administration from RTDB
+
+`rtdb-multi ordered-route --manifest FILE --deployment UUID` emits the application route from a voter manifest.
+`ordered-reserve-repair`, `ordered-seal-repair` and `ordered-install-repair` use the same manifests, signed reservation tickets and repair packages as the standalone Logkeeper commands.
+Run `ordered-reserve-repair --manifest TARGET --deployment UUID --output TICKET` for each successor voter.
+Run `ordered-seal-repair --manifest SOURCE --destination TARGET_GROUP --output PACKAGE --tickets TICKET1,TICKET2` on a predecessor voter's host.
+Run `ordered-install-repair --manifest TARGET --deployment UUID --package PACKAGE` on each successor voter before starting it.
+
+For worker administration pass `--manifest CONTROL_JSON` with the application route and administrator TLS credentials.
+`ordered-enroll --worker UUID` enrolls a new worker and prints its enrollment as JSON.
+Pass `--serial N` with that command to replace the exact prior enrollment.
+`ordered-withdraw --worker UUID --serial N` withdraws the exact enrollment.
+`ordered-dispose-worker --worker UUID --serial N --disposition SHA256` disposes a withdrawn worker using the operator's exact disposition evidence.

@@ -16,6 +16,8 @@ use rtdb_server::config::NodeConfiguration;
 use rtdb_types::{Anomaly, Result};
 use tokio_util::sync::CancellationToken;
 
+mod ordered_admin;
+
 const HELP: &str = "RTDB multi\n\n\
 Usage: rtdb-multi --build-info\n\
        rtdb-multi initialize-directory --state PATH\n\
@@ -29,6 +31,13 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE [--transfer-token-file FILE] [--custody-token-file FILE] --config FILE [--ecs-cluster ARN]\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
+       rtdb-multi ordered-route --manifest FILE --deployment UUID\n\
+       rtdb-multi ordered-enroll --manifest CONTROL_JSON --worker UUID [--serial N]\n\
+       rtdb-multi ordered-withdraw --manifest CONTROL_JSON --worker UUID --serial N\n\
+       rtdb-multi ordered-dispose-worker --manifest CONTROL_JSON --worker UUID --serial N --disposition SHA256\n\
+       rtdb-multi ordered-reserve-repair --manifest FILE --deployment UUID --output FILE\n\
+       rtdb-multi ordered-seal-repair --manifest FILE --destination FILE --output FILE --tickets FILE[,FILE...]\n\
+       rtdb-multi ordered-install-repair --manifest FILE --deployment UUID --package FILE\n\
        rtdb-multi ordered-dispose-expired-worker --manifest CONTROL_JSON --worker UUID --serial N\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
@@ -465,29 +474,10 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 manifest.run(cancellation).await.map_err(failure)
             }
         }
-        "ordered-dispose-expired-worker" => {
-            use ordered_logkeeper::ordered::{Command, Enrollment, Outcome, daemon::ControlManifest};
-
-            let failure = |message| Anomaly::fault("rtdb.multi/ordered-dispose-expired-worker", message);
-            let path = std::path::Path::new(arguments.required("manifest")?);
-            let enrollment = Enrollment {
-                worker: required_uuid(&arguments, "worker")?,
-                serial: arguments
-                    .required("serial")?
-                    .parse()
-                    .map_err(|_| usage("--serial must be an enrollment serial".into()))?,
-            };
-            let outcome = ControlManifest::execute(path, Command::DisposeExpired { enrollment })
-                .await
-                .map_err(|error| failure(error.to_string()))?;
-            if outcome != Outcome::WorkerDisposed(enrollment) {
-                return Err(failure("The journal returned a different disposal result".into()));
-            }
-            let json = serde_json::to_string(&enrollment)
-                .map_err(|error| io(std::io::Error::other(error)))?;
-            println!("{json}");
-            Ok(())
-        }
+        "ordered-route" | "ordered-reserve-repair" | "ordered-seal-repair" | "ordered-install-repair" =>
+            ordered_admin::manifest(command, &arguments).await,
+        "ordered-enroll" | "ordered-withdraw" | "ordered-dispose-worker" | "ordered-dispose-expired-worker" =>
+            ordered_admin::worker(command, &arguments).await,
         "ordered-archive-identity" => {
             let storage = CellStorage::parse(arguments.required("archive-root")?)?;
             let identity = rtdb_multi::journal::hosted::archive_identity(&storage, arguments.required("archive-prefix")?).await?;
