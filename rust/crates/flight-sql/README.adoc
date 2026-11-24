@@ -1076,3 +1076,5 @@ Ordering checks the held predecessor and publishes the clock reading and every g
 A hosted Root publication can include the all-valid `fact_public_root_versions/head` marker. The marker is placed with its application effects and journal and is excluded from the authored assertion census, including when publishing through a world batch or retained release. The application owns which publications advance this relation; the receiver resolves its local sequence to the original transaction position.
 
 The placed Root fork form with clock selector 11 takes a public marker's original transaction position and history coordinate. The writer authenticates it on the live hold and checks the exact marker again when ordering a retained pin or advance.
+
+`rtdb.owned.ReadHeldHostedControlAtPublication.v1` reads the program or application admission in the original prefix of an authenticated public Root publication. It adds position and history before the relation in the held control request.

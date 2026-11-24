@@ -70,10 +70,11 @@ impl OwnedReadSession {
         Ok(cursor)
     }
 
-    /// Read an admitted ordinary control point on this original placed cut.
+    /// Read an admitted control on the original hold or one of its public prefixes.
     pub async fn hosted_control_point(
         &self,
         target: &HostedControlWrite,
+        at: Option<rtdb_types::TransactionKey>,
     ) -> Result<HostedControlPoint> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
@@ -94,8 +95,18 @@ impl OwnedReadSession {
         if snapshot.tx_basis() != Some(self.present) {
             return Err(unavailable());
         }
+        let context = if let Some(at) = at {
+            let marker = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION)?;
+            if self.lookup_publication(&marker, super::OwnedPublicationLookup::Position(at)).await?.is_none() {
+                return Err(unavailable());
+            }
+            self.context.with_owned_transaction_cut(at, &self.context.cancellation)?
+        } else {
+            Arc::clone(&self.context)
+        };
+        let limit = at.unwrap_or(self.present).system_time;
         let point = rtdb_query::read_hosted_control_point(
-            Arc::clone(&self.context),
+            context,
             target.table(),
             target.id(),
             true,
@@ -104,7 +115,7 @@ impl OwnedReadSession {
         if point
             .row
             .as_ref()
-            .is_some_and(|(_, revision)| *revision > self.present.system_time)
+            .is_some_and(|(_, revision)| *revision > limit)
         {
             return Err(unavailable());
         }

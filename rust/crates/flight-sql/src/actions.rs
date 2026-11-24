@@ -15,6 +15,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | OBSERVE_HELD_HOSTED_V1
         | CONFIRM_APPLIED_HOSTED_V6
         | READ_HELD_HOSTED_CONTROL_V3
+        | READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1
         | READ_HELD_ROOT_CATALOG_V1
         | OPEN_OWNED_SCOPED_READ_V2
         | OPEN_OWNED_READ_AS_OF_V2
@@ -151,7 +152,8 @@ impl Service {
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 => Ok(vec![Ok(Box::pin(self.confirm_hosted_source_action(&call, &action.body)).await?)]),
-                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V3 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V3 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 => Ok(vec![Ok(Box::pin(self.read_held_root_catalog_action(&call, &action.body)).await?)]),
                 crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1 => Ok(vec![Ok(self.offer_funded_mutation_clock_action(&call, &action.body).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),

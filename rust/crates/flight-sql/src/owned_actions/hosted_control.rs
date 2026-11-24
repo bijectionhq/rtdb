@@ -2,6 +2,7 @@ use super::*;
 use rtdb_node::RootCatalogRead;
 
 pub(crate) const READ_HELD_HOSTED_CONTROL_V3: &str = "rtdb.owned.ReadHeldHostedControl.v3";
+pub(crate) const READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1: &str = "rtdb.owned.ReadHeldHostedControlAtPublication.v1";
 pub(crate) const READ_HELD_ROOT_CATALOG_V1: &str = "rtdb.owned.ReadHeldRootCatalog.v1";
 
 pub(super) fn require_audience_control(
@@ -115,12 +116,20 @@ impl Service {
         &self,
         call: &Call,
         body: &[u8],
+        positioned: bool,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (handle, body) = body
             .split_first_chunk::<16>()
             .ok_or_else(|| invalid("Hosted control point has no held handle"))?;
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (at, body) = if positioned {
+            if call.session.audience_source().is_some() { return Err(unsupported()); }
+            let (at, body) = split_world_publication(body)?;
+            (Some(at), body)
+        } else {
+            (None, body)
+        };
         let (table, ipc) = split_relation(body)?;
         admit_control_targets(policy, [&table])?;
         let batch = request_batch(call, ipc)?;
@@ -146,6 +155,11 @@ impl Service {
         let _key = call.reserve(id.len() * 4 + 1024)?;
         require_audience_control(&call.session, table.name(), id)?;
         let scope = self.hosted_control_scope(call).await?;
+        if positioned && !matches!((table.name(), id),
+            ("bj_fact_root_program", "active") | ("bj_fact_root_admission", "application"))
+        {
+            return Err(Status::permission_denied("A public publication admits executable controls only"));
+        }
         let target = rtdb_tx::HostedControlWrite::check(
             table,
             scope,
@@ -155,10 +169,10 @@ impl Service {
         .map_err(status)?;
         let point = held
             .snapshot
-            .hosted_control_point(&target)
+            .hosted_control_point(&target, at)
             .await
             .map_err(status)?;
-        let present = held.snapshot.system_time();
+        let present = at.map_or_else(|| held.snapshot.system_time(), |at| at.system_time);
         let fields = |schema: &Schema| {
             schema
                 .fields()
