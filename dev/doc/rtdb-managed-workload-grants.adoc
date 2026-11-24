@@ -86,55 +86,81 @@ RTDB derives the stable receipt namespace as SHA-256 of the ASCII bytes `rtdb.v1
 Each string uses UTF-8 bytes prefixed by its unsigned 64-bit big-endian byte length.
 The issuer string is the configured URL in RTDB's parsed URL form.
 Create retries use the existing exact catalog reservation.
-The workload namespace is available for future keyed operations on the original database.
+Assignment uses the same namespace derivation for keyed operations on the original database.
 
-Workload sessions admit the Create action and the existing authentication handshake on the ordinary managed listener.
+Version 1 workload sessions admit the Create action and the existing authentication handshake on the ordinary managed listener.
 Legacy unscoped principals use the existing configured authorization policy.
 W13 label principals continue to use their existing projection, expiry and receipt namespace.
 
 == Required ordered interface for placement and assignment
 
-Placement, transaction, status, recovery, checkpoint and custody actions require separate permission and a route with the corresponding exact admission and retained-receipt contract.
-The interface below defines inputs and results for the original writer integration.
-It is a handoff for a future wire version.
+Assignment credentials use version 2 with the same top-level audience, database, incarnation, grant ID and expiry fields.
+Replace `operations` with one typed `authority` object.
+Version 1 Create grants retain their existing shape.
+Use separate stable subject and grant ID pairs for each positive operation authority and issue recovery permissions separately.
+
+The operator enables assignment on the intended Multi service by adding the trusted authority point.
+
+[source,yaml]
+----
+    assignment:
+      relation: public.bj_installation
+      rowId: authority
+      validAtMicros: 0
+----
+
+Put these fields under `authn.workloadGrants`.
+Use the same point for the life of the original incarnation and across its writers.
+The branch is always `main`.
+The point is outside the issuer claim and the client request.
+Keep the operator and issuer responsible for the admitted Original and its accepted assignment.
+Use a separate local OIDC Create profile and a fixed `!UserList` placement and Conductor profile until the exact assignment route is qualified.
+
+[cols="1,3"]
+|===
+| `authority.role` | Remaining authority fields
+
+| `advance-placement`
+| `installation_intent`, `previous`, `next`
+| `claim-writer`
+| `fence`
+| `write`
+| `fence`, `writer`
+| `close-writer`
+| `fence`, `writer`, `closure`
+| `observe-placement`
+| `fence`
+| `predecessor-evidence`
+| `predecessor`
+| `receipt-recovery`
+| `original_namespace`, `family`
+| `attempt-settlement`
+| `original_namespace`, `family`, `key`, `request_digest`
+|===
+
+The authority uses the following JSON shapes.
 
 [source,text]
 ----
-ordered_submit(
-    verified_grant: { database, incarnation, grant_id, namespace, expires_at, authority },
-    key: bytes[16..64],
-    operation: AdvancePlacement { expected_fence, next, predecessor_closure }
-             | ClaimWriter { expected_fence, claim }
-             | CloseWriter { expected_fence, writer, closure }
-             | Write { expected_fence, writer, transaction }
-             | SettleAttempt { attempt, request_digest }
-) -> retained_receipt
-
-ordered_status(
-    verified_grant: { database, incarnation, grant_id, namespace, expires_at, authority },
-    key: bytes[16..64]
-) -> retained_receipt | unknown
-
-ordered_predecessor_evidence(
-    verified_grant: { database, incarnation, expires_at, authority },
-    predecessor: { retired_assignment, original_writer, writer_receipt, close_receipt }
-) -> exact_cut_evidence
-
-authority = PlacementAdvance { installation_intent, expected_fence, next }
-          | WriterClaim { assignment, fence_basis }
-          | WriterClose { assignment, fence_basis, original_writer }
-          | WriterWrite { assignment, fence_basis, original_writer }
-          | ReceiptRecovery { original_namespace, operation_family }
-          | AttemptSettlement { original_namespace, attempt, request_digest }
-          | PredecessorEvidence { exact_predecessor }
-assignment = { placement_epoch, assignment_id, holder }
-expected_fence = { assignment, written_basis }
-predecessor_closure = { retired_assignment, original_writer, applied_receipt }
-writer = {
-    point: { configured_relation, exact_row_id, valid_at_micros },
-    applied_receipt: { key, basis, system_time_micros }
-}
+placement = { epoch, assignment: null | { assignment_id, holder } }
+applied = { namespace, key, basis, system_time_micros }
+fence = { placement, applied }
+predecessor = { fence, writer: applied, close: applied, closure }
+previous = { kind: "empty" } | { kind: "vacant", fence }
+         | { kind: "closed", predecessor }
+family = "advance-placement" | "claim-writer" | "write" | "close-writer"
 ----
+
+The epoch is a positive unsigned 64-bit integer.
+Holder is a bounded identity string.
+The installation intent, assignment ID and closure are nonzero 16-byte identifiers.
+The namespace and request digest are 32 bytes, the key is 16 through 64 bytes, and Basis is an opaque 24-byte token.
+Represent each byte field in UserInfo as an array of unsigned byte integers.
+
+The protobuf definitions in `rust/proto/rtdb.v1.proto` specify the new `rtdb.v1.ManagedWorkload` action.
+A mutation returns a `ManagedWorkloadResponse` with the retained receipt and its original namespace.
+For reads, send the exact named proof in the corresponding action arm with an empty request key.
+The existing `rtdb.v1.TxStatus` request takes only the key and uses the credential's explicit receipt-recovery namespace and family.
 
 * Build `verified_grant` only from a configured issuer's authenticated authorization.
 For an assignment, bind the accepted holder, placement epoch and assignment to the grant.

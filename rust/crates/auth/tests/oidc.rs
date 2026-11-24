@@ -305,3 +305,43 @@ async fn principals_and_device_requests_keep_response_payloads_charged_until_the
     drop(device);
     assert_eq!(script.memory.used_bytes(), 0);
 }
+
+#[tokio::test]
+async fn assignment_recovery_uses_a_distinct_bounded_authority() {
+    use rtdb_tx::transact::workload::{Authority, Family, Point};
+
+    let incarnation = [7; 16];
+    let original_namespace = [8; 32];
+    let mut claim = json!({
+        "version":2, "audience":"cell", "database":"catalog", "incarnation":incarnation,
+        "grant_id":([9; 16]), "expires_at_micros":800_000,
+        "authority":{"role":"receipt-recovery", "original_namespace":original_namespace, "family":"write"}
+    });
+    let point = Point::new("public.bj_installation", "authority".into(), Timestamp(0)).unwrap();
+    let config = WorkloadGrantConfig::new("cell".into(), "workload-".into()).unwrap();
+    let configured = config.clone().with_assignment(point.clone());
+
+    let (auth, _, _) = setup_with_workload(vec![
+        (200, json!({"access_token":"scoped", "expires_in":1})),
+        (200, json!({"sub":"recovery", "rtdb_workload_grant":claim})),
+    ], false, Some(configured.clone())).await;
+    let principal = auth.verify_client_credentials("workload-recovery", "secret").await.unwrap();
+    let grant = principal.workload_grant().unwrap();
+    assert_eq!(grant.assignment("catalog", incarnation, Timestamp(0)).unwrap(),
+        (&Authority::ReceiptRecovery { original_namespace, family: Family::Write }, &point, Timestamp(800_000)));
+    assert!(grant.assignment("catalog", [6; 16], Timestamp(0)).is_err());
+    assert!(grant.admit(WorkloadOperation::CreateDeployment, "catalog", incarnation, Timestamp(0)).is_err());
+    assert!(principal.authorize_database("catalog", rtdb_node::DatabaseAccess::Write).is_err());
+    assert!(principal.revalidate(Timestamp(800_000)).await.is_err());
+
+    let unauthorized = claim.clone();
+    claim["authority"]["relation"] = json!("public.caller_selected");
+    for (claim, config) in [(unauthorized, config), (claim, configured)] {
+        let (auth, _, _) = setup_with_workload(vec![
+            (200, json!({"access_token":"scoped", "expires_in":1})),
+            (200, json!({"sub":"recovery", "rtdb_workload_grant":claim})),
+        ], false, Some(config)).await;
+        assert_eq!(auth.verify_client_credentials("workload-recovery", "secret").await.err().unwrap().code,
+            "rtdb.auth/workload-grant");
+    }
+}

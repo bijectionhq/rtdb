@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use rtdb_auth::{AddressBlock, AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret, WorkloadGrantConfig};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
-use rtdb_types::{Anomaly, Result};
+use rtdb_tx::transact::workload::Point;
+use rtdb_types::{Anomaly, Result, Timestamp};
 use super::invalid;
 
 pub(super) fn default_auth(environment: &impl Fn(&str) -> Option<String>) -> AuthConfig { AuthConfig::SingleRootUser { password: environment("XTDB_PASSWORD").map(Secret::new) } }
@@ -51,10 +52,19 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
 
 fn workload_grants(value: Yaml) -> Result<WorkloadGrantConfig> {
     let mut fields = YamlFields::new(value, "workloadGrants")?;
-    let config = WorkloadGrantConfig::new(
+    let mut config = WorkloadGrantConfig::new(
         fields.required_string("audience")?,
         fields.required_string("clientIdPrefix")?,
     )?;
+    if let Some(assignment) = fields.take("assignment") {
+        let mut fields = YamlFields::new(assignment, "workloadGrants.assignment")?;
+        let relation = fields.required_string("relation")?;
+        let row_id = fields.required_string("rowId")?;
+        let valid_at = fields.required_string("validAtMicros")?.parse()
+            .map_err(|_| invalid("workloadGrants.assignment.validAtMicros must be an integer"))?;
+        fields.finish()?;
+        config = config.with_assignment(Point::new(&relation, row_id, Timestamp(valid_at))?);
+    }
     fields.finish()?;
     Ok(config)
 }

@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 mod custody_release;
 mod operations;
 mod pipeline;
+pub mod workload;
 
 pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};

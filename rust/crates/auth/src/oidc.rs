@@ -145,7 +145,7 @@ impl Provider {
             (Some(config), Some(claim), None) => {
                 let expiry = token.expires_at.ok_or_else(workload_grant::invalid_grant)?;
                 Some(Scope::Workload(VerifiedWorkloadGrant::from_userinfo(
-                    claim, self.issuer.as_str(), config.audience(), user, expiry, self.clock.now(),
+                    claim, self.issuer.as_str(), config, user, expiry, self.clock.now(),
                 )?))
             }
             (Some(_), _, _) | (None, Some(_), _) => return Err(workload_grant::invalid_grant()),

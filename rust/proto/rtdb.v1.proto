@@ -184,6 +184,87 @@ message TransactRequest {
   repeated Guard requires = 7;
 }
 message TxStatusRequest { bytes key = 1; }
+
+message WorkloadHolder { bytes assignment_id = 1; string holder = 2; }
+message WorkloadPlacement { uint64 epoch = 1; WorkloadHolder assignment = 2; }
+message WorkloadApplied {
+  bytes namespace = 1;
+  bytes key = 2;
+  Basis basis = 3;
+  sint64 system_time_micros = 4;
+}
+message WorkloadFence { WorkloadPlacement placement = 1; WorkloadApplied applied = 2; }
+message WorkloadPredecessor {
+  WorkloadFence fence = 1;
+  WorkloadApplied writer = 2;
+  WorkloadApplied close = 3;
+  bytes closure = 4;
+}
+message WorkloadAdvancePlacement {
+  bytes installation_intent = 1;
+  WorkloadPlacement next = 2;
+  oneof previous {
+    google.protobuf.Empty empty = 3;
+    WorkloadFence vacant = 4;
+    WorkloadPredecessor closed = 5;
+  }
+}
+message WorkloadClaimWriter { WorkloadFence fence = 1; }
+message WorkloadWrite {
+  WorkloadFence fence = 1;
+  WorkloadApplied writer = 2;
+  TransactRequest transaction = 3;
+}
+message WorkloadCloseWriter {
+  WorkloadFence fence = 1;
+  WorkloadApplied writer = 2;
+  bytes closure = 3;
+}
+message WorkloadObservePlacement { WorkloadFence fence = 1; }
+enum WorkloadFamily {
+  WORKLOAD_FAMILY_UNSPECIFIED = 0;
+  WORKLOAD_FAMILY_ADVANCE_PLACEMENT = 1;
+  WORKLOAD_FAMILY_CLAIM_WRITER = 2;
+  WORKLOAD_FAMILY_WRITE = 3;
+  WORKLOAD_FAMILY_CLOSE_WRITER = 4;
+}
+message WorkloadSettleAttempt {
+  bytes original_namespace = 1;
+  WorkloadFamily family = 2;
+  bytes request_digest = 3;
+}
+message ManagedWorkloadRequest {
+  bytes key = 1;
+  oneof operation {
+    WorkloadAdvancePlacement advance_placement = 2;
+    WorkloadClaimWriter claim_writer = 3;
+    WorkloadWrite write = 4;
+    WorkloadCloseWriter close_writer = 5;
+    WorkloadObservePlacement observe_placement = 6;
+    WorkloadPredecessor predecessor_evidence = 7;
+    WorkloadSettleAttempt settle_attempt = 8;
+  }
+}
+message WorkloadEvidence {
+  WorkloadApplied applied = 1;
+  WorkloadPlacement placement = 2;
+  string writer = 3;
+  Basis predecessor_retirement_basis = 4;
+}
+message ManagedWorkloadResponse {
+  bytes receipt_namespace = 4;
+  oneof result {
+    Receipt receipt = 1;
+    WorkloadEvidence placement = 2;
+    WorkloadPredecessorEvidence predecessor = 3;
+  }
+}
+message WorkloadPredecessorEvidence {
+  WorkloadEvidence fence = 1;
+  WorkloadEvidence writer = 2;
+  WorkloadEvidence close = 3;
+}
+
 message Guard {
   oneof guard {
     Claim unchanged = 1;

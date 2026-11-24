@@ -1,4 +1,5 @@
 use rtdb_types::{Anomaly, Result, Timestamp};
+use rtdb_tx::transact::workload::{Authority, Point};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -11,6 +12,7 @@ pub(super) const MAX_LIFETIME_MICROS: i64 = 300_000_000;
 pub struct WorkloadGrantConfig {
     audience: String,
     client_id_prefix: String,
+    assignment: Option<Point>,
 }
 
 impl WorkloadGrantConfig {
@@ -30,8 +32,16 @@ impl WorkloadGrantConfig {
         Ok(Self {
             audience,
             client_id_prefix,
+            assignment: None,
         })
     }
+
+    pub fn with_assignment(mut self, point: Point) -> Self {
+        self.assignment = Some(point);
+        self
+    }
+
+    pub fn assignment(&self) -> Option<&Point> { self.assignment.as_ref() }
 
     pub fn audience(&self) -> &str {
         &self.audience
@@ -56,30 +66,36 @@ struct Claim<'a> {
     incarnation: [u8; 16],
     grant_id: [u8; 16],
     expires_at_micros: i64,
-    operations: [WorkloadOperation; 1],
+    operations: Option<[WorkloadOperation; 1]>,
+    authority: Option<Authority>,
 }
 
 pub struct VerifiedWorkloadGrant {
     database: String,
     incarnation: [u8; 16],
-    operation: WorkloadOperation,
+    permission: Permission,
     receipt_namespace: [u8; 32],
     expires_at: Timestamp,
 }
 
+enum Permission {
+    Create(WorkloadOperation),
+    Assignment { authority: Box<Authority>, point: Point },
+}
+
 impl VerifiedWorkloadGrant {
     pub(super) fn from_userinfo(
-        claim: &serde_json::Value,
+        raw: &serde_json::Value,
         issuer: &str,
-        audience: &str,
+        config: &WorkloadGrantConfig,
         subject: &str,
         token_expiry: Timestamp,
         now: Timestamp,
     ) -> Result<Self> {
-        let claim = Claim::deserialize(claim).map_err(|_| invalid_grant())?;
+        let claim = Claim::deserialize(raw).map_err(|_| invalid_grant())?;
         let lifetime = claim.expires_at_micros.checked_sub(now.0);
-        if claim.version != 1
-            || claim.audience != audience
+        let audience = config.audience();
+        if claim.audience != audience
             || !valid_identity(subject)
             || !valid_identity(claim.database)
             || claim.database == "*"
@@ -90,7 +106,14 @@ impl VerifiedWorkloadGrant {
         {
             return Err(invalid_grant());
         }
-        let [operation] = claim.operations;
+        let permission = match (claim.version, claim.operations, claim.authority, config.assignment()) {
+            (1, Some([operation]), None, _) if claim_field_absent(raw, "authority") =>
+                Permission::Create(operation),
+            (2, None, Some(authority), Some(point)) if claim_field_absent(raw, "operations")
+                && authority.valid(claim.incarnation) =>
+                Permission::Assignment { authority: Box::new(authority), point: point.clone() },
+            _ => return Err(invalid_grant()),
+        };
         let mut hash = Sha256::new();
         hash.update(b"rtdb.v1/workload-receipt\0");
         hash.update(claim.incarnation);
@@ -102,7 +125,7 @@ impl VerifiedWorkloadGrant {
         Ok(Self {
             database: claim.database.into(),
             incarnation: claim.incarnation,
-            operation,
+            permission,
             receipt_namespace: hash.finalize().into(),
             expires_at: Timestamp(claim.expires_at_micros).min(token_expiry),
         })
@@ -123,13 +146,26 @@ impl VerifiedWorkloadGrant {
         incarnation: [u8; 16],
         now: Timestamp,
     ) -> Result<()> {
-        if self.operation != operation
+        if !matches!(self.permission, Permission::Create(granted) if granted == operation)
             || self.database != database
             || self.incarnation != incarnation
         {
             return Err(invalid_grant());
         }
         self.revalidate(now)
+    }
+
+    pub fn assignment(&self, database: &str, incarnation: [u8; 16], now: Timestamp)
+        -> Result<(&Authority, &Point, Timestamp)>
+    {
+        if self.database != database || self.incarnation != incarnation {
+            return Err(invalid_grant());
+        }
+        self.revalidate(now)?;
+        match &self.permission {
+            Permission::Assignment { authority, point } => Ok((authority, point, self.expires_at)),
+            Permission::Create(_) => Err(invalid_grant()),
+        }
     }
 
     pub(super) fn revalidate(&self, now: Timestamp) -> Result<()> {
@@ -140,16 +176,16 @@ impl VerifiedWorkloadGrant {
     }
 
     pub(super) fn memory_bytes(&self) -> usize {
-        self.database.capacity()
+        self.database.capacity() + match &self.permission {
+            Permission::Create(_) => 0,
+            Permission::Assignment { .. } => 8192,
+        }
     }
 }
 
-fn valid_identity(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 255
-        && value.trim() == value
-        && !value.chars().any(char::is_control)
-}
+fn valid_identity(value: &str) -> bool { rtdb_tx::transact::workload::bounded(value) }
+
+fn claim_field_absent(raw: &serde_json::Value, key: &str) -> bool { raw.get(key).is_none() }
 
 pub(super) fn invalid_grant() -> Anomaly {
     forbidden(

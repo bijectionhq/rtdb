@@ -17,6 +17,12 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
             let mut authentication = json!({"kind":"openid-connect", "issuer":endpoint(oidc.issuer_url.as_str(), "authn.issuerUrl", report), "client_id":oidc.client_id, "client_secret":"[redacted]", "rules":oidc.rules});
             if let Some(grants) = &oidc.workload_grants {
                 authentication["workload_grants"] = json!({"audience":grants.audience(), "client_id_prefix":grants.client_id_prefix()});
+                if let Some(point) = grants.assignment() {
+                    authentication["workload_grants"]["assignment"] = json!({
+                        "relation": format!("{}.{}", point.table.schema, point.table.table),
+                        "row_id": point.id, "valid_at_micros": point.valid_at.0,
+                    });
+                }
             }
             authentication
         }
