@@ -290,6 +290,7 @@ A broker tombstone refuses both further opens and reuse of that stage.
 The hosted S3 key service has a distinct object prefix for assertion capabilities.
 It refuses versioned custody and uses conditional writes for staging and withdrawal.
 Native ingress, exact ordered placement, current disclosure and the multi-custodian destruction barrier still need to use this envelope before assertion erasure can be offered.
+See [the fixed assertion deadline](../../verification/redesign/R7-eraser.md#option-2-assertion-deadline) for the private custody ledger, passive backup frame and deployment obligations.
 
 ### Wake
 

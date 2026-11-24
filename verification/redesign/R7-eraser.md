@@ -53,6 +53,29 @@ Search artefacts do not supply ambient statistics.
 Two-argument scores therefore depend only on the resolved row and query.
 Corpus-relative queries derive their statistics from the applicable admitted rows or receive them explicitly.
 
+## Option 2 assertion deadline
+
+The intended fixed assertion profile orders the logical fence and exact destruction obligations together.
+New reads, opens, copies, replays, restores and derivations observe the fence from commit.
+Admitted readers have at most 120 seconds from the fence through their final release. A Bijection reader has a tighter 90-second cap. These bounds run concurrently.
+The original physical deadline is 30 days from that commit. The engineering target is 24 hours. A covering hold suspends only the physical clock, and the requester sees only the original deadline and logical receipt.
+
+[AssertionDeadline](../../rust/crates/multi/src/keys/assertion_deadline.rs) resumes private obligations from the original custody journal.
+The irreversible order fences hold placement for that obligation. It precedes dispatch. The worker records independently signed dispositions, receives all release-drain dispositions before dispatching destruction, and persists a signed per-order deadline statement after the exact roster settles.
+The statement includes the original fence, original and effective deadlines, terminal observation, and the roster and settlement digests.
+Its scope includes every recoverable capability and affected recoverable derivative enrolled in the profile. Ciphertext may age out normally after key destruction. Approved metadata residue and independently controlled copies are excluded.
+[The S3 journal](../../rust/crates/multi/src/keys/s3/assertion_deadline.rs) keeps this state in a separate namespace of the current-key vault.
+Only an installed original authority with bounded scheduling, drain, provider work and recovery can offer the profile.
+
+[AssertionBackup](../../rust/crates/multi/src/keys/assertion.rs) defines the passive Option 2 backup entry.
+RTAB version 1 carries the original stage identity and sealed assertion envelope. Restore matches the stage from authenticated placement, then uses the original current authority for an open.
+The vault and its tombstones are outside the backup. A file-system snapshot of the local broker is outside the admitted fixed profile.
+Raw deployment-key transfer cannot install an assertion stage. Restoring a passive record cannot create or rewrite a capability.
+
+Native ordered sealed ingress, the exact original fence and roster, current release admission, and installed holder adapters are required before operating this profile.
+The scheduler supports bounded page reads and exact retry, while a configured capacity and fault envelope has yet to establish a service bound.
+A per-deadline cohort report also needs an authenticated closed roster of orders for that cohort and an authorized audit route.
+
 ## Operation-only capture revocation
 
 The local archive broker gives checkpoint readers and exporters key operations under the original capture authority.

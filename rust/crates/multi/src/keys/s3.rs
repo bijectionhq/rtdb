@@ -14,6 +14,7 @@ use super::{
     require_matching_key, journal::key_error, unit::{self, OPERATION_LIMIT},
 };
 
+mod assertion_deadline;
 mod captures;
 mod units;
 

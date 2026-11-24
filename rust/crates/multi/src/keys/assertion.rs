@@ -86,6 +86,66 @@ impl AssertionEnvelope {
     }
 }
 
+/// Passive backup record for an assertion envelope. The record contains no
+/// capability or tombstone. Restore must obtain the expected stage from the
+/// original ordered effect and use the live issuer for any subsequent open.
+pub struct AssertionBackup {
+    stage: AssertionStage,
+    envelope: AssertionEnvelope,
+}
+
+impl AssertionBackup {
+    const HEADER: &[u8; 5] = b"RTAB\x01";
+    const ENVELOPE_OFFSET: usize = Self::HEADER.len() + 16 + 8 + 16;
+
+    pub fn new(stage: AssertionStage, envelope: AssertionEnvelope) -> Self {
+        Self { stage, envelope }
+    }
+
+    pub fn restore(self, expected: AssertionStage) -> Result<AssertionEnvelope> {
+        if self.stage != expected {
+            return Err(Self::invalid());
+        }
+        Ok(self.envelope)
+    }
+
+    fn invalid() -> Anomaly {
+        Anomaly::incorrect("rtdb.multi/assertion-backup", "Invalid assertion backup or original stage")
+    }
+}
+
+impl From<AssertionBackup> for Bytes {
+    fn from(backup: AssertionBackup) -> Self {
+        let envelope = Bytes::from(backup.envelope);
+        let mut frame = BytesMut::with_capacity(AssertionBackup::ENVELOPE_OFFSET + envelope.len());
+        frame.extend_from_slice(AssertionBackup::HEADER);
+        frame.extend_from_slice(backup.stage.deployment.as_bytes());
+        frame.extend_from_slice(&backup.stage.incarnation.get().to_be_bytes());
+        frame.extend_from_slice(backup.stage.stage.as_bytes());
+        frame.extend_from_slice(&envelope);
+        frame.freeze()
+    }
+}
+
+impl TryFrom<Bytes> for AssertionBackup {
+    type Error = Anomaly;
+
+    fn try_from(bytes: Bytes) -> Result<Self> {
+        if !bytes.starts_with(Self::HEADER) || bytes.len() < Self::ENVELOPE_OFFSET {
+            return Err(Self::invalid());
+        }
+        let offset = Self::HEADER.len();
+        let deployment = Uuid::from_slice(&bytes[offset..offset + 16]).map_err(|_| Self::invalid())?;
+        let incarnation = u64::from_be_bytes(bytes[offset + 16..offset + 24].try_into().map_err(|_| Self::invalid())?);
+        let incarnation = NonZeroU64::new(incarnation).ok_or_else(Self::invalid)?;
+        let stage = Uuid::from_slice(&bytes[offset + 24..Self::ENVELOPE_OFFSET]).map_err(|_| Self::invalid())?;
+        Ok(Self {
+            stage: AssertionStage::new(deployment, incarnation, stage)?,
+            envelope: bytes.slice(Self::ENVELOPE_OFFSET..).try_into()?,
+        })
+    }
+}
+
 #[async_trait::async_trait]
 pub trait AssertionKeyService: Send + Sync {
     /// The caller retains the original frame for retry and reconciles unused
@@ -112,11 +172,7 @@ impl AssertionKeyService for LocalKeyService {
     async fn seal_assertion_stage(
         &self, stage: AssertionStage, region: &Arc<IoRegion>, plaintext: Bytes,
     ) -> Result<AssertionEnvelope> {
-        if !self.provision_archive_keys {
-            return Err(Anomaly::unsupported(
-                "rtdb.multi/assertion-vault", "Assertion staging requires the local operation broker",
-            ));
-        }
+        self.require_assertion_broker()?;
         let authority = self.clone();
         region.run_blocking(move || {
             let seal = || {
@@ -141,6 +197,7 @@ impl AssertionKeyService for LocalKeyService {
     async fn open_assertion_stage(
         &self, stage: AssertionStage, region: &Arc<IoRegion>, envelope: AssertionEnvelope,
     ) -> Result<Bytes> {
+        self.require_assertion_broker()?;
         let authority = self.clone();
         let vault = region.run_blocking(move || Ok(authority.archive_vault())).await??;
         let operation = archive::LocalArchiveKey {
@@ -163,6 +220,7 @@ impl AssertionKeyService for LocalKeyService {
     async fn retire_assertion_stage(
         &self, stage: AssertionStage, region: &Arc<IoRegion>,
     ) -> Result<()> {
+        self.require_assertion_broker()?;
         let authority = self.clone();
         region.run_blocking(move || {
             let retire = || {
@@ -180,6 +238,17 @@ impl AssertionKeyService for LocalKeyService {
             };
             Ok(retire())
         }).await?
+    }
+}
+
+impl LocalKeyService {
+    fn require_assertion_broker(&self) -> Result<()> {
+        if !self.provision_archive_keys {
+            return Err(Anomaly::unsupported(
+                "rtdb.multi/assertion-vault", "Assertion custody requires the local operation broker",
+            ));
+        }
+        self.require_service_root()
     }
 }
 
@@ -227,11 +296,19 @@ mod tests {
 
         let retained = Bytes::from(first);
         assert!(AssertionEnvelope::try_from(retained.slice(..BODY_OFFSET)).is_err());
+        let backup = Bytes::from(AssertionBackup::new(a, retained.try_into()?));
+        assert!(AssertionBackup::try_from(backup.clone())?.restore(b).is_err());
+        let raw_service = LocalKeyService::new(directory.path())?;
+        assert!(raw_service.retire_assertion_stage(a, &region).await.is_err());
+        assert!(raw_service.open_assertion_stage(a, &region,
+            AssertionBackup::try_from(backup.clone())?.restore(a)?).await.is_err());
+
         vault.retire_assertion_stage(a, &region).await?;
         vault.retire_assertion_stage(missing, &region).await?;
         let reopened = LocalKeyService::with_archive_broker(directory.path())?;
         reopened.retire_assertion_stage(a, &region).await?;
-        let erased = reopened.open_assertion_stage(a, &region, retained.try_into()?).await.unwrap_err();
+        let restored = AssertionBackup::try_from(backup)?.restore(a)?;
+        let erased = reopened.open_assertion_stage(a, &region, restored).await.unwrap_err();
         assert_eq!(erased.code, "rtdb/erased-under-view");
         assert!(reopened.seal_assertion_stage(a, &region, secret.clone()).await.is_err());
         assert!(reopened.seal_assertion_stage(missing, &region, secret).await.is_err());
