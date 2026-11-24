@@ -539,10 +539,10 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
     }
     let seal = Seal::default();
     let stop = CancellationToken::new();
-    let first = fixture.blocks.produce_with_search(&pending.prepared, &pending.boundary, BTreeMap::new(), &stop, Some(&seal)).await.unwrap();
+    let first = fixture.blocks.produce_with_search(&pending.prepared, &pending.boundary, BTreeMap::new(), &stop, Some(&seal), None).await.unwrap();
     let root = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
     fixture.store.delete(&root).await.unwrap();
-    let second = fixture.blocks.produce_with_search(&pending.prepared, &pending.boundary, BTreeMap::new(), &stop, None).await.unwrap();
+    let second = fixture.blocks.produce_with_search(&pending.prepared, &pending.boundary, BTreeMap::new(), &stop, None, None).await.unwrap();
     assert_eq!(seal.0.load(Ordering::Relaxed), 1);
     assert_eq!(first.catalog, second.catalog);
     assert_eq!(first.tries, second.tries);
@@ -2452,7 +2452,7 @@ async fn one_clock_stamps_the_boot_claim_external_transaction_and_source_flush()
         let claim = ReplicaEnvelope::decode(&claim.payload).unwrap().unwrap();
         assert_eq!(claim.term, Term(1));
         assert_eq!(claim.term_sequence, Some(TermSequence(0)));
-        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, placed_slot_reservation: None })));
+        assert!(matches!(claim.message, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, placed_slot_reservation: None, serving_record: None })));
 
         time.store(3_000_000, Ordering::SeqCst);
         let result = observer.term().unwrap()

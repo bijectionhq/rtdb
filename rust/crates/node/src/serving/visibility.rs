@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use rtdb_index::branches::BranchIndex;
-use rtdb_tx::transact::{ScopedTransact, Transact};
+use rtdb_tx::transact::ScopedTransact;
 use rtdb_types::{
     Anomaly, MemoryBudget,
     rtdb_v1::{LabelScope, MAIN_BRANCH},
@@ -12,12 +11,7 @@ use super::*;
 
 pub const ROW_VISIBILITY: &str = "row-visibility";
 
-pub struct ScopedSubmission {
-    pub transaction: Transact,
-    pub attempt: uuid::Uuid,
-    pub submitted_at: Timestamp,
-    pub source: Bytes,
-}
+pub type ScopedSubmission = TransactSubmission;
 
 #[derive(Clone)]
 pub struct ServingScope {

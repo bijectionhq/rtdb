@@ -100,6 +100,14 @@ pub enum BranchEffect {
     Erase { branch: Option<Branch>, table: TableRef, id: EntityId },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchWrite {
+    pub branch: Branch,
+    pub table: TableRef,
+    pub id: EntityId,
+    pub valid: Option<Interval>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BranchData {
     base: Option<(Branch, Basis)>,
@@ -142,6 +150,8 @@ pub struct BranchIndex {
     catalog: Arc<BTreeMap<TableRef, Arc<Vec<(Basis, BranchTable)>>>>,
     changed_catalog: Option<Basis>,
     erased: Option<Basis>,
+    #[serde(skip)]
+    writes: Arc<Vec<BranchWrite>>,
 }
 
 impl BranchIndex {
@@ -159,11 +169,22 @@ impl BranchIndex {
         Self {
             head, times: Arc::new(BTreeMap::from([(0, head.system_time)])),
             branches: Arc::new(BTreeMap::from([(MAIN_BRANCH.into(), Arc::new(main))])),
-            catalog: Arc::default(), changed_catalog: None, erased: None,
+            catalog: Arc::default(), changed_catalog: None, erased: None, writes: Arc::default(),
         }
     }
 
     pub fn head(&self) -> BranchCut { self.head }
+
+    pub fn writes_at(&self, basis: Basis) -> Vec<BranchWrite> {
+        if basis == self.head.basis { self.writes.as_ref().clone() } else { Vec::new() }
+    }
+
+    pub fn before(&self, basis: Basis) -> Result<Option<BranchCut>> {
+        self.require_incarnation(basis)?;
+        Ok(self.times.range(..basis.position()).next_back().map(|(&position, &system_time)| {
+            BranchCut { basis: Basis::new(basis.incarnation(), position), system_time }
+        }))
+    }
 
     pub fn cut(&self, at: At) -> Result<BranchCut> {
         match at {
@@ -356,6 +377,7 @@ impl BranchIndex {
             return Err(Anomaly::fault("rtdb/transaction-order", "The applied transaction cut must advance position and system time"));
         }
         self.head = cut;
+        Arc::make_mut(&mut self.writes).clear();
         Arc::make_mut(&mut self.times).insert(cut.basis.position(), cut.system_time);
         Ok(())
     }
@@ -374,9 +396,11 @@ impl BranchIndex {
                     self.changed_catalog = Some(basis);
                 }
                 let generation = definitions.last().expect("table definition").1.generation;
+                let write = BranchWrite { branch: branch.clone(), table: table.clone(), id: event.id.clone(), valid: Some(event.valid) };
                 let branch = self.changed_branch(&branch)?;
                 let rows = Arc::make_mut(branch.tables.entry(table).or_default());
                 Arc::make_mut(rows.events.entry(event.id.clone()).or_default()).push((generation, event));
+                Arc::make_mut(&mut self.writes).push(write);
             }
             BranchEffect::Fork { child, from, writable, expires_at } => {
                 if from.1 >= basis || self.has_branch(&child) || !self.has_branch(&from.0) {
@@ -408,6 +432,7 @@ impl BranchIndex {
                     let rows = Arc::make_mut(data.tables.entry(table.clone()).or_default());
                     rows.events.remove(&id);
                     rows.erased.insert(id.clone(), basis);
+                    Arc::make_mut(&mut self.writes).push(BranchWrite { branch: name.clone(), table: table.clone(), id: id.clone(), valid: None });
                 }
                 self.erased = Some(basis);
             }

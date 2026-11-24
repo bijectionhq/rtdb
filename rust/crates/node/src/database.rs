@@ -535,7 +535,7 @@ impl DatabaseFactory {
                 Some(builder)
             } else { None };
             let search = builders.iter().find(|(_, builder)| builder.prepares_serving_search()).map(|(_, builder)| Arc::clone(builder));
-            let replica_driver = if history.is_some() || search.is_some() {
+            let mut replica_driver = if history.is_some() || search.is_some() {
                 replica_driver.with_serving_search(Arc::new(PrepareSearch { search, history }))
             } else { replica_driver };
             let publisher: Option<Arc<dyn CompactionPublisher>> = match (&self.compaction_relay, read_only) {
@@ -580,7 +580,17 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
+            let mut serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
+            if serving.is_none() && self.options.replication.enabled
+                && configuration.external_source.is_none()
+                && let Some(authority) = self.resources.native_serving_authority(&name, &configuration)?
+            {
+                let handle = replica_driver.attach_native_serving(replication.clone(), authority, self.options.automatic_gc).await?;
+                serving = Some(Arc::new(crate::serving::default::DefaultServing {
+                    handle, memory: Arc::clone(&self.memory), clock: Arc::clone(&self.clock),
+                    writable: !read_only && self.options.replication.may_lead,
+                }));
+            }
             let incarnation = serving.as_ref().map(|driver| uuid::Uuid::from_bytes(driver.incarnation()));
             let tokens = tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
                 self.resources.token_kms(), Arc::clone(&self.clock), incarnation);

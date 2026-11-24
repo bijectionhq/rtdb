@@ -51,6 +51,7 @@ async-trait.workspace = true
 tempfile.workspace = true
 rtdb-maintenance.workspace = true
 rtdb-metrics.workspace = true
+rtdb-replication.workspace = true
 
 [lints]
 workspace = true

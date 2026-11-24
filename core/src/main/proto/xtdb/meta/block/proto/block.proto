@@ -95,4 +95,8 @@ message Block {
 
     // Written by the Rust producer after its table block writes complete.
     TableBlockManifest table_block_manifest = 12;
+
+    // The applied-branch image at this replica boundary, inline or named by a canonical object key.
+    bytes serving_checkpoint = 13;
+    string serving_checkpoint_object = 14;
 }

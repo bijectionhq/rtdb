@@ -6,13 +6,16 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPages, BlockPreparation, CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
+use rtdb_format::journal::{ObjectId, ObjectKind};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, cache::BufferPool};
+use rtdb_store::Reachability;
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::logs::PartitionReplay;
+use crate::serving::ServingCheckpoint;
 use crate::{AppliedProgress, PartitionLogs, ReplicaRecord, TermFence};
 
 pub struct RecoveredPartition {
@@ -423,6 +426,29 @@ impl BlockStore {
         Ok(self.store.list(Some(&directory)).await?.into_iter().filter_map(|entry| block_index_from_key(entry.key.as_str()).ok()).max())
     }
 
+    pub(crate) async fn collect_serving_checkpoints(&self, database: uuid::Uuid, epoch: u64, cancellation: &CancellationToken) -> Result<()> {
+        let Some(local) = self.store.local_maintenance_store().filter(|store| store.defers_trie_releases()) else { return Ok(()); };
+        let Some(custody) = local.try_lock_recovery_deletion().await? else { return Ok(()); };
+        IoRegion::retaining(custody, async {
+            let files = self.store.list(Some(&ObjectKey::new(format!("db/{database}/file"))?)).await?;
+            let mut roots = Vec::new();
+            for stored in self.store.list(Some(&ObjectKey::new("blocks")?)).await? {
+                check_cancelled(cancellation)?;
+                let Ok(index) = block_index_from_key(stored.key.as_str()) else { continue; };
+                let catalog = self.load_fresh_catalog(index).await?;
+                if let Some(key) = &catalog.as_proto().serving_checkpoint_object {
+                    let id = key.parse::<ObjectId>()?;
+                    if id.kind != ObjectKind::File { return Err(invalid("Invalid serving checkpoint object kind")); }
+                    roots.push(id);
+                }
+            }
+            let reachable = Reachability::from_roots(database, epoch, roots)?;
+            let plan = reachable.plan_gc(files.iter().map(|object| &object.key));
+            check_cancelled(cancellation)?;
+            plan.execute(self.store.as_ref()).await
+        }).await
+    }
+
     async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;
         self.decode_catalog(index, lease.as_slice())
@@ -578,12 +604,12 @@ impl BlockStore {
     }
     /// Cancellation is observed between pages and completed storage operations; an upload already started is awaited.
     pub async fn produce_cancellable(&self, prepared: &BlockPreparation, boundary: &ReplicaRecord, databases: BTreeMap<String, DatabaseConfig>, cancellation: &CancellationToken) -> Result<ProducedBlock> {
-        self.produce_with_search(prepared, boundary, databases, cancellation, None).await
+        self.produce_with_search(prepared, boundary, databases, cancellation, None, None).await
     }
 
     pub(crate) async fn produce_with_search(&self, prepared: &BlockPreparation, boundary: &ReplicaRecord,
         databases: BTreeMap<String, DatabaseConfig>, cancellation: &CancellationToken,
-        search: Option<&dyn crate::ServingSearchBuilder>) -> Result<ProducedBlock> {
+        search: Option<&dyn crate::ServingSearchBuilder>, serving_checkpoint: Option<ServingCheckpoint>) -> Result<ProducedBlock> {
         check_cancelled(cancellation)?;
         let ReplicaBody::BlockBoundary(message) = &boundary.envelope.message else { return Err(invalid("Block production requires a boundary")); };
         let index = BlockIndex(message.block_index.unwrap_or_default());
@@ -597,6 +623,10 @@ impl BlockStore {
         if exists {
             let (catalog, tables) = self.load(index).await?;
             validate_boundary(&catalog, prepared, boundary)?;
+            if let Some(checkpoint) = serving_checkpoint {
+                checkpoint.verify(self.store.as_ref(), catalog.as_proto().serving_checkpoint.as_deref(),
+                    catalog.as_proto().serving_checkpoint_object.as_deref()).await?;
+            }
             return Ok(ProducedBlock { catalog, tries: l0_tries(index, &tables)? });
         }
         let table_catalog = prepared.table_catalog()?;
@@ -671,6 +701,11 @@ impl BlockStore {
         }
         let tx_key = prepared.value().live().latest_completed_tx();
         check_cancelled(cancellation)?;
+        let (serving_checkpoint, serving_checkpoint_object) = match serving_checkpoint {
+            Some(checkpoint) => checkpoint.store(self, cancellation).await?,
+            None => (None, None),
+        };
+        check_cancelled(cancellation)?;
         let mut catalog = BlockCatalog::from_proto(block_pb::Block {
             block_index: Some(index.0), latest_completed_tx: tx_key.map(|key| block_pb::TxKey { tx_id: Some(key.tx_id.0), system_time: Some(key.system_time.0) }),
             latest_processed_msg_id: message.latest_processed_msg_id,
@@ -680,6 +715,7 @@ impl BlockStore {
             term_id: Some(boundary.envelope.term.0), boundary_term_seq: boundary.envelope.term_sequence.map(|sequence| sequence.0),
             naming_epoch: Some(i64::try_from(prepared.value().trie_catalog().naming_epoch()).map_err(|_| invalid("Naming epoch exceeds the block format"))?),
             table_block_manifest: Some(block_pb::TableBlockManifest { sha256_by_oid }),
+            serving_checkpoint, serving_checkpoint_object,
         })?;
         self.store.put(&key, Bytes::from(catalog.encode_for_publication())).await?;
         Ok(ProducedBlock { catalog, tries })

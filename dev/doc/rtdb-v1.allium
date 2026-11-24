@@ -68,6 +68,7 @@ surface StatelessDatabase {
     @guarantee ChangesCoverage
         -- Changes reports its covered interval even when there are no changes for the selected tables.
         -- An applied-position route takes its coverage from the driver's retained effect history.
+        -- After opening a default branch checkpoint, the retained change interval starts at the checkpoint's basis.
         -- A reported erasure has a key when keys are requested and omits both row images.
         -- A returned page carries whole system-time groups.
         -- An expired starting cut returns the cursor-expired code.

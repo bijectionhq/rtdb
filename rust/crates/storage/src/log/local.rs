@@ -778,6 +778,12 @@ mod tests {
             let reader = ReadOnlyLocalLog::open_in(&path, Default::default(), IoRegion::new())?;
             assert_eq!(reader.journal_lineage(), Some(lineage));
             assert_eq!(reader.read_range(first.offset, second.offset).await?[0].payload.as_ref(), b"legacy");
+            let shared = reader.shared().expect("coordinated read-only local log");
+            let mut cursor = shared.read_after(first.offset).await?;
+            let head = cursor.poll_head(Duration::ZERO).await?.unwrap();
+            let delivery = cursor.read_head(head, ReadReservation::new(head.allocation_bound, ())).await?;
+            assert_eq!(delivery.metadata, second);
+            assert_eq!(delivery.payload.as_ref(), b"after migration");
             let mut range = migrated.range(first.offset, second.offset).await?;
             let charge = range.allocation_bound();
             let memory = rtdb_types::MemoryBudget::new(charge);
