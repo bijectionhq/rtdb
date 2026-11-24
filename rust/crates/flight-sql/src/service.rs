@@ -148,6 +148,7 @@ impl Call {
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
+    pub(crate) fn retain_request(&self, bytes: Bytes) -> Bytes { wire::retain(bytes, Arc::clone(&self._reservation)) }
     pub fn close_session(&self) {
         self.service.retire_session(&self.session);
     }
@@ -617,7 +618,7 @@ impl FlightService for Service {
         let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
         if crate::v1::is_action(&request.get_ref().r#type) {
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await.map_err(crate::v1::error::map_status)?;
-            return self.v1_action(call, request.into_inner());
+            return self.v1_action(call, request.into_inner()).await;
         }
         let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)

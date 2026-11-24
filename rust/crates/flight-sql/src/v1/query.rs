@@ -6,9 +6,9 @@ use std::{
 use arrow_flight::FlightData;
 use prost::Message;
 use rtdb_crypt::tokens::{PageToken, TokenIssuer};
-use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
+use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::QuerySource};
 use rtdb_query::{QueryContext, QueryCursor};
-use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimScope, Layer}};
+use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, Layer}};
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -166,6 +166,7 @@ impl Service {
             .ok_or_else(|| error::incorrect("Query requires a Source"))?;
         let layer = proto::Layer::try_from(source.layer)
             .map_err(|_| error::incorrect("Unknown source layer"))?;
+        let claim_layer = match layer { proto::Layer::Merged => Layer::Merged, proto::Layer::Local => Layer::Local };
         let selection = source.at.as_ref().and_then(|at| at.selection.as_ref());
         if source.at.is_some() && selection.is_none() {
             return Err(error::incorrect("Empty At selector"));
@@ -201,55 +202,69 @@ impl Service {
             Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
             None => (None, None),
         };
-        let minimum = match (continuation, selection) {
-            (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
-            (None, Some(Selection::AtLeast(basis))) => Some(tokens::read_basis(scope, basis)?),
-            _ => None,
-        };
-        if let Some(minimum) = minimum.filter(|minimum| *minimum != Timestamp::MIN) {
-            self.0.node.wire_await_time(
-                &call.database, call.session.caller.principal.as_ref(), minimum, MAX_WAIT, &call.cancellation,
-            ).await.map_err(error::anomaly)?;
-        }
-        let context = self
-            .wire_context(
-                call,
-                &database,
-                continuation.is_none() && matches!(selection, Some(Selection::Linearizable(_))),
-            )
-            .await?;
-        let present = head(&context, &call.database)?;
-        let page = match continuation {
-            Some(page) => page,
-            None => {
-                let now = self.0.node.now();
-                let (cut, clock) = match selection {
-                    Some(Selection::AsOfMicros(time)) => {
-                        (present.min(Timestamp(*time)), Timestamp(*time))
-                    }
-                    Some(Selection::Exactly(basis)) => {
-                        let cut = tokens::read_basis(scope, basis)?;
-                        (cut, cut)
-                    }
-                    _ => (present, now),
-                };
-                PageToken {
-                    basis: tokens::basis(scope, cut),
-                    clock,
-                    offset: 0,
-                    request: request_hash,
-                }
+        let (context, page, cut) = if let Some(driver) = database.serving_driver() {
+            let now = self.0.node.now();
+            let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
+            let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
+            let view = driver.query(query_source, false, now, &call.cancellation).await.map_err(error::anomaly)?;
+            let cut = view.cut.system_time;
+            let clock = if exact { cut } else { clock };
+            let context = self.wire_context(call, &database, false).await?
+                .with_wire_snapshot(view.snapshot, cut, clock.into()).map_err(error::anomaly)?;
+            let page = PageToken { basis: view.cut.basis, clock, offset, request: request_hash };
+            (context, page, cut)
+        } else {
+            let minimum = match (continuation, selection) {
+                (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
+                (None, Some(Selection::AtLeast(basis))) => Some(tokens::read_basis(scope, basis)?),
+                _ => None,
+            };
+            if let Some(minimum) = minimum.filter(|minimum| *minimum != Timestamp::MIN) {
+                self.0.node.wire_await_time(
+                    &call.database, call.session.caller.principal.as_ref(), minimum, MAX_WAIT, &call.cancellation,
+                ).await.map_err(error::anomaly)?;
             }
+            let context = self
+                .wire_context(
+                    call,
+                    &database,
+                    continuation.is_none() && matches!(selection, Some(Selection::Linearizable(_))),
+                )
+                .await?;
+            let present = head(&context, &call.database)?;
+            let page = match continuation {
+                Some(page) => page,
+                None => {
+                    let now = self.0.node.now();
+                    let (cut, clock) = match selection {
+                        Some(Selection::AsOfMicros(time)) => {
+                            (present.min(Timestamp(*time)), Timestamp(*time))
+                        }
+                        Some(Selection::Exactly(basis)) => {
+                            let cut = tokens::read_basis(scope, basis)?;
+                            (cut, cut)
+                        }
+                        _ => (present, now),
+                    };
+                    PageToken {
+                        basis: tokens::basis(scope, cut),
+                        clock,
+                        offset: 0,
+                        request: request_hash,
+                    }
+                }
+            };
+            let cut = tokens::read_basis(scope, &page.basis.into())?;
+            if cut > present {
+                return Err(error::unavailable(
+                    "Database has not applied the requested basis",
+                ));
+            }
+            let context = context
+                .with_wire_cut(cut, page.clock.into())
+                .map_err(error::anomaly)?;
+            (context, page, cut)
         };
-        let cut = tokens::read_basis(scope, &page.basis.into())?;
-        if cut > present {
-            return Err(error::unavailable(
-                "Database has not applied the requested basis",
-            ));
-        }
-        let context = context
-            .with_wire_cut(cut, page.clock.into())
-            .map_err(error::anomaly)?;
         let parameters = request
             .params_ipc
             .as_deref()
@@ -267,7 +282,7 @@ impl Service {
         let claim = if request.track {
             let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("query.track"))?;
             let evidence = ClaimEvidence {
-                scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: Layer::Merged },
+                scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: claim_layer },
                 footprint,
             };
             let value = issuer.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
@@ -281,6 +296,35 @@ impl Service {
         };
         Ok(OpenedQuery { cursor, database, issuer, page, limit, trailer })
     }
+}
+
+fn applied_source(
+    source: &proto::Source,
+    layer: Layer,
+    selection: Option<&Selection>,
+    continuation: Option<PageToken>,
+    now: Timestamp,
+) -> Result<(QuerySource, Timestamp, u64), Status> {
+    let read_basis = |basis: &proto::Basis| Basis::from_bytes(&basis.value).map_err(error::anomaly);
+    let (at, clock, offset) = match continuation {
+        Some(page) => (At::Exactly(page.basis), page.clock, page.offset),
+        None => match selection {
+            None | Some(Selection::Latest(_)) => (At::Latest, now, 0),
+            Some(Selection::AtLeast(basis)) => (At::AtLeast(read_basis(basis)?), now, 0),
+            Some(Selection::Exactly(basis)) => (At::Exactly(read_basis(basis)?), now, 0),
+            Some(Selection::Linearizable(_)) => (At::Linearizable, now, 0),
+            Some(Selection::AsOfMicros(time)) => (At::AsOf(Timestamp(*time)), Timestamp(*time), 0),
+        },
+    };
+    Ok((
+        QuerySource {
+            branch: source.branch.clone(),
+            at,
+            layer,
+        },
+        clock,
+        offset,
+    ))
 }
 
 struct Parameters {

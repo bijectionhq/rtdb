@@ -46,6 +46,7 @@ pub struct Database {
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    serving: Option<Arc<dyn crate::serving::ServingDriver>>,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     pub(crate) await_authority: crate::AwaitAuthority,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
@@ -65,11 +66,20 @@ impl Database {
     pub fn serves_audience_storage(&self, source: uuid::Uuid) -> bool {
         self.audience_storage.as_ref().is_some_and(|storage| storage.source == source)
     }
-    /// Identifies the database attachment that issued a wire token.
-    /// A new attachment receives a new identity.
+    pub fn serving_driver(&self) -> Option<&dyn crate::serving::ServingDriver> { self.serving.as_deref() }
+
     pub async fn wire_incarnation(&self) -> Result<uuid::Uuid> { self.tokens.incarnation().await }
-    pub async fn token_authority(&self) -> Result<rtdb_crypt::tokens::TokenAuthority> { self.tokens.authority().await }
-    pub fn wire_tokens_supported(&self) -> bool { self.tokens.supported() }
+
+    pub async fn token_authority(&self) -> Result<rtdb_crypt::tokens::TokenAuthority> {
+        if let Some(authority) = self.serving_driver().and_then(|driver| driver.token_authority()) {
+            return Ok(authority);
+        }
+        self.tokens.authority().await
+    }
+
+    pub fn wire_tokens_supported(&self) -> bool {
+        self.serving_driver().and_then(|driver| driver.token_authority()).is_some() || self.tokens.supported()
+    }
 
     /// The writer calls this after committing the rotation and recovers using its original deadline.
     pub async fn apply_token_key_rotation(&self, next: u64, unreadable_by: i64) -> Result<()> {
@@ -562,10 +572,12 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
+            let serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
+            let incarnation = serving.as_ref().map(|driver| uuid::Uuid::from_bytes(driver.incarnation()));
             let tokens = tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
-                self.resources.token_kms(), Arc::clone(&self.clock));
+                self.resources.token_kms(), Arc::clone(&self.clock), incarnation);
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
-                audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
+                audience_storage: resources.audience_storage, logs, replication, serving, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });

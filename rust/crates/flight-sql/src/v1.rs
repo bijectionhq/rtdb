@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::{self as flight, FlightData, sql::Any};
 use bytes::Bytes;
 use prost::{Message, Name};
+use rtdb_node::serving::TransactSubmission;
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::QueryContext;
 use rtdb_types::Timestamp;
@@ -17,6 +18,7 @@ mod changes;
 pub(crate) mod error;
 mod query;
 mod tokens;
+mod transact;
 
 const API: &str = "rtdb.v1";
 const MAX_PAGE_ROWS: u32 = 4096;
@@ -56,7 +58,7 @@ fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
 }
 
 impl Service {
-    pub(crate) fn v1_action(
+    pub(crate) async fn v1_action(
         &self,
         call: Call,
         action: flight::Action,
@@ -79,11 +81,17 @@ impl Service {
                         .map(str::to_owned),
                     );
                     if let Ok(database) = self.0.node.catalog().database(&call.database) {
-                        if database.wire_tokens_supported() {
-                            features.extend(["query.track", "query.page"].map(str::to_owned));
-                        }
-                        if database.wire_linearizable_reads() {
+                        if let Some(driver) = database.serving_driver() {
+                            features = driver.features().iter().map(|feature| (*feature).to_owned()).collect();
+                        } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
+                        }
+                        if database.wire_tokens_supported() {
+                            for feature in ["query.track", "query.page"] {
+                                if !features.iter().any(|existing| existing == feature) {
+                                    features.push(feature.into());
+                                }
+                            }
                         }
                     }
                 }
@@ -101,20 +109,11 @@ impl Service {
                 }
                 .encode_to_vec()
             }),
-            "rtdb.v1.Transact" => {
-                decode::<proto::TransactRequest>(action.body).and_then(|request| {
-                    check_key(&request.key)?;
-                    Err(error::unsupported(
-                        request.require.first().map_or("transact", String::as_str),
-                    ))
-                })
-            }
-            "rtdb.v1.TxStatus" => {
-                decode::<proto::TxStatusRequest>(action.body).and_then(|request| {
-                    check_key(&request.key)?;
-                    Err(error::unsupported("tx-status"))
-                })
-            }
+            "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
+            "rtdb.v1.TxStatus" => match decode(action.body) {
+                Ok(request) => self.v1_tx_status(&call, request).await,
+                Err(status) => Err(status),
+            },
             _ => Err(error::unsupported("admin")),
         };
         let result = outcome.map_err(|status| call.error(status))?;
@@ -128,6 +127,52 @@ impl Service {
             })],
         )
         .map_err(error::map_status)
+    }
+
+    async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
+        let submitted_at = self.0.node.now();
+        let request: proto::TransactRequest = decode(source.clone())?;
+        check_key(&request.key)?;
+        let access = if request.ops.is_empty() && request.otherwise.is_empty() {
+            DatabaseAccess::Read
+        } else {
+            DatabaseAccess::Write
+        };
+        let database = self.wire_attachment(call, access).await?;
+        let driver = database.serving_driver().ok_or_else(|| {
+            error::unsupported(request.require.first().map_or("transact", String::as_str))
+        })?;
+        let transaction = transact::request(request, call.memory())?;
+        let request = TransactSubmission {
+            transaction,
+            attempt: uuid::Uuid::new_v4(),
+            submitted_at,
+            source: call.retain_request(source),
+        };
+        let receipt = driver
+            .transact(request, &call.cancellation)
+            .await
+            .map_err(error::anomaly)?;
+        self.check_attachment(call, &database)?;
+        Ok(transact::receipt(receipt).encode_to_vec())
+    }
+
+    async fn v1_tx_status(
+        &self,
+        call: &Call,
+        request: proto::TxStatusRequest,
+    ) -> Result<Vec<u8>, Status> {
+        check_key(&request.key)?;
+        let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
+        let driver = database
+            .serving_driver()
+            .ok_or_else(|| error::unsupported("tx-status"))?;
+        let receipt = driver
+            .tx_status(&request.key, &call.cancellation)
+            .await
+            .map_err(error::anomaly)?;
+        self.check_attachment(call, &database)?;
+        Ok(transact::receipt(receipt).encode_to_vec())
     }
 
     pub(crate) async fn v1_get(
@@ -153,22 +198,33 @@ impl Service {
         branch: &str,
         layer: proto::Layer,
     ) -> Result<Arc<Database>, Status> {
+        if !rtdb_types::rtdb_v1::valid_branch_name(branch) {
+            return Err(error::incorrect("Invalid branch name"));
+        }
+        let database = self.wire_attachment(call, DatabaseAccess::Read).await?;
+        if database.serving_driver().is_none() {
+            if branch != "main" {
+                return Err(error::unsupported("branches"));
+            }
+            if layer != proto::Layer::Merged {
+                return Err(error::unsupported("branch.local-layer"));
+            }
+        }
+        Ok(database)
+    }
+
+    async fn wire_attachment(
+        &self,
+        call: &Call,
+        access: DatabaseAccess,
+    ) -> Result<Arc<Database>, Status> {
         if call.session.audience_source().is_some() || call.session.fresh_replica {
             return Err(error::unsupported("rtdb.v1.route"));
-        }
-        if branch.is_empty() {
-            return Err(error::incorrect("Source requires a branch"));
-        }
-        if branch != "main" {
-            return Err(error::unsupported("branches"));
-        }
-        if layer != proto::Layer::Merged {
-            return Err(error::unsupported("branch.local-layer"));
         }
         call.session
             .caller
             .principal
-            .authorize_database(&call.database, DatabaseAccess::Read)
+            .authorize_database(&call.database, access)
             .map_err(error::anomaly)?;
         self.admit_database(&call.database)
             .await

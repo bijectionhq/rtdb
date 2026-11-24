@@ -34,6 +34,7 @@ pub(super) struct DatabaseTokens {
     read_only: bool,
     custody: Custody,
     clock: Arc<dyn Clock>,
+    driver_incarnation: Option<Uuid>,
     incarnation: OnceCell<Uuid>,
     authority: OnceCell<DatabaseAuthority>,
 }
@@ -56,6 +57,7 @@ impl DatabaseTokens {
         store: Arc<dyn ObjectStore>,
         kms: Option<Arc<dyn Kms>>,
         clock: Arc<dyn Clock>,
+        driver_incarnation: Option<Uuid>,
     ) -> Self {
         let volatile = matches!(
             &config.storage,
@@ -77,12 +79,16 @@ impl DatabaseTokens {
             read_only: read_only && !volatile,
             custody,
             clock,
+            driver_incarnation,
             incarnation: OnceCell::new(),
             authority: OnceCell::new(),
         }
     }
 
     pub(super) async fn incarnation(&self) -> Result<Uuid> {
+        if let Some(incarnation) = self.driver_incarnation {
+            return Ok(incarnation);
+        }
         self.incarnation
             .get_or_try_init(|| async {
                 let marker = ObjectKey::new(format!("{}/incarnation", self.prefix))?;

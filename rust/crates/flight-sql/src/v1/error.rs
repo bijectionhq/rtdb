@@ -42,7 +42,17 @@ fn error(
     feature: Option<&str>,
     retry_after_millis: Option<u64>,
 ) -> Status {
-    let grpc = match category {
+    as_status(Error {
+        category: category as i32,
+        code: code.into(),
+        message: message.into(),
+        feature: feature.map(str::to_owned),
+        retry_after_millis,
+    })
+}
+
+fn as_status(detail: Error) -> Status {
+    let grpc = match detail.category() {
         Category::Incorrect => Code::InvalidArgument,
         Category::Unsupported => Code::Unimplemented,
         Category::NotFound => Code::NotFound,
@@ -53,14 +63,7 @@ fn error(
         Category::Interrupted => Code::Cancelled,
         Category::Fault | Category::Unspecified => Code::Internal,
     };
-    let mut status = Status::new(grpc, message);
-    let detail = Error {
-        category: category as i32,
-        code: code.into(),
-        message: message.into(),
-        feature: feature.map(str::to_owned),
-        retry_after_millis,
-    };
+    let mut status = Status::new(grpc, &detail.message);
     status.metadata_mut().insert_bin(
         "rtdb-error-bin",
         MetadataValue::from_bytes(&detail.encode_to_vec()),
@@ -83,6 +86,10 @@ fn code(category: Category) -> &'static str {
 }
 
 pub fn anomaly(native: Anomaly) -> Status {
+    as_status(detail(native))
+}
+
+pub(super) fn detail(native: Anomaly) -> Error {
     let category = match native.category {
         _ if matches!(
             native.code.as_str(),
@@ -102,8 +109,9 @@ pub fn anomaly(native: Anomaly) -> Status {
         Native::Fault => Category::Fault,
     };
     let stable = match native.code.as_str() {
-        "rtdb/erased-under-view" => "rtdb/erased-under-view",
-        "rtdb/cursor-expired" => "rtdb/cursor-expired",
+        "rtdb/erased-under-view" | "rtdb/cursor-expired" | "rtdb/unknown-branch" => {
+            native.code.as_str()
+        }
         _ => code(category),
     };
     let retry = (category == Category::Busy).then(|| {
@@ -114,16 +122,17 @@ pub fn anomaly(native: Anomaly) -> Status {
             .unwrap_or(100)
     });
     let message = native.message.as_deref().unwrap_or(stable);
-    error(
-        category,
-        stable,
-        message,
-        native
+    Error {
+        category: category as i32,
+        code: stable.to_owned(),
+        message: message.to_owned(),
+        feature: native
             .context
             .get("feature")
-            .and_then(serde_json::Value::as_str),
-        retry,
-    )
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        retry_after_millis: retry,
+    }
 }
 
 #[derive(serde::Deserialize)]
