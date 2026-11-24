@@ -118,6 +118,7 @@ impl DatabaseCatalog {
     /// Whether this node's databases are tenants placed by an outside authority, each visible only to its own sessions.
     pub fn is_placed(&self) -> bool { matches!(self.membership, Membership::Placed) }
     pub fn is_managed(&self) -> bool { matches!(self.membership, Membership::Managed(_)) }
+    pub fn is_durable_default(&self) -> bool { matches!(self.membership, Membership::Durable { .. }) }
     pub fn database(&self, name: &str) -> Result<Arc<Database>> {
         match self.value.read().entries.get(name) {
             Some(Entry::Open { database, .. }) => Ok(Arc::clone(database)),

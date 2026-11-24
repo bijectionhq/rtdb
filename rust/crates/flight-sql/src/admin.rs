@@ -50,8 +50,17 @@ pub trait DeploymentAdminAuthority: std::fmt::Debug + Send + Sync {
 
 impl Service {
     pub(crate) fn supports_admin_action(&self, call: &Call, name: &str) -> bool {
-        self.has_admin_route(call)
-            && (!matches!(name, CREATE | DELETE) || self.0.node.catalog().is_managed())
+        if !self.has_admin_route(call) {
+            return false;
+        }
+        let catalog = self.0.node.catalog();
+        match name {
+            CREATE | DELETE => catalog.is_managed(),
+            RESTORE | FORK if catalog.is_durable_default() => {
+                self.0.config.default_checkpoint_restore_directory.is_some()
+            }
+            _ => true,
+        }
     }
 
     pub(crate) fn has_admin_route(&self, call: &Call) -> bool {
@@ -139,16 +148,32 @@ impl Service {
                     )
                     .map_err(error::anomaly)?;
                 let basis = basis(request.basis)?;
-                let checkpoint = catalog
-                    .export_deployment_checkpoint(
-                        &request.deployment,
-                        pin(&request.pin)?,
-                        basis,
-                        request.retain_until_micros.map(Timestamp),
-                        &call.cancellation,
-                    )
-                    .await
-                    .map_err(error::anomaly)?;
+                let pin = pin(&request.pin)?;
+                let retain_until = request.retain_until_micros.map(Timestamp);
+                let checkpoint = if catalog.is_durable_default() {
+                    self.0
+                        .node
+                        .export_default_checkpoint(
+                            &request.deployment,
+                            pin,
+                            basis,
+                            retain_until,
+                            None,
+                            &call.cancellation,
+                        )
+                        .await
+                } else {
+                    catalog
+                        .export_deployment_checkpoint(
+                            &request.deployment,
+                            pin,
+                            basis,
+                            retain_until,
+                            &call.cancellation,
+                        )
+                        .await
+                }
+                .map_err(error::anomaly)?;
                 Ok(proto::CheckpointExport {
                     checkpoint,
                     basis: Some(basis_wire(basis)),
@@ -175,6 +200,18 @@ impl Service {
                             rtdb_node::DeploymentTransfer::Restore {
                                 ticket: request.checkpoint,
                             },
+                            &call.cancellation,
+                        )
+                        .await
+                } else if catalog.is_durable_default() {
+                    let parent = self.default_restore_directory()?;
+                    self.0
+                        .node
+                        .restore_default_checkpoint(
+                            &request.from,
+                            &request.deployment,
+                            &request.checkpoint,
+                            parent,
                             &call.cancellation,
                         )
                         .await
@@ -223,6 +260,36 @@ impl Service {
                             &call.cancellation,
                         )
                         .await
+                } else if catalog.is_durable_default() {
+                    let parent = self.default_restore_directory()?;
+                    if request.from == request.deployment || request.deployment == "xtdb" {
+                        return Err(error::incorrect(
+                            "Fork needs a distinct Default destination",
+                        ));
+                    }
+                    let checkpoint = self
+                        .0
+                        .node
+                        .export_default_checkpoint(
+                            &request.from,
+                            pin,
+                            basis,
+                            retain_until,
+                            None,
+                            &call.cancellation,
+                        )
+                        .await
+                        .map_err(error::anomaly)?;
+                    self.0
+                        .node
+                        .restore_default_checkpoint(
+                            &request.from,
+                            &request.deployment,
+                            &checkpoint,
+                            parent,
+                            &call.cancellation,
+                        )
+                        .await
                 } else {
                     catalog
                         .fork_deployment_checkpoint(
@@ -244,6 +311,14 @@ impl Service {
             }
             _ => Err(error::unsupported("admin")),
         }
+    }
+
+    fn default_restore_directory(&self) -> Result<&std::path::Path, Status> {
+        self.0
+            .config
+            .default_checkpoint_restore_directory
+            .as_deref()
+            .ok_or_else(|| error::unsupported("default-checkpoint-restore"))
     }
 }
 

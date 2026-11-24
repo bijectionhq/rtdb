@@ -73,6 +73,9 @@ The `rtdb admin` client reads its authorization value from the file supplied thr
 Multi nodes use private TCP port 3001 to forward admitted native writes to the selected writer.
 The cluster catalog token authority authenticates and encrypts the peer requests and replies.
 The peer port belongs on the node security group. Clients use the ordinary Flight listener.
+On a durable Default Local installation, export selects a retained plain checkpoint whose published Basis matches the request.
+Set `defaultCheckpointRestoreDirectory` to an absolute, provisioned Local directory to enable RestoreDeployment and ForkDeployment on that installation.
+The selected destination first installs independent storage and its fresh incarnation. The Default catalog then orders its attachment.
 
 Use the link:../conformance/README.adoc[packaged client runner] against the produced image and manifest.
 Backend, fault, storage-interoperability, performance and rollback receipts remain separate release requirements in the matrix.

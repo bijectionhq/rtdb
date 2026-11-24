@@ -3,7 +3,7 @@ use std::{fs, io::Write, path::{Path, PathBuf}, sync::Arc};
 use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{catalog::BlockCatalog, keys::block_key, log::proto};
+use rtdb_format::{catalog::BlockCatalog, keys::{block_index_from_key, block_key}, log::proto};
 use rtdb_storage::{HeldView, IoRegion, LocalStore, ObjectKey, ObjectStore, cache::BufferPool, object_store::ReadReservation};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCheckpoint, CatalogCut, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
@@ -320,14 +320,16 @@ impl NativeServingHandle {
         if status.first_erasure.is_some() { return Err(protected()); }
         let snapshot = self.replication.serving_partition().ok_or_else(unavailable)?;
         let blocks = logs.recovery_block_store(snapshot.trie_catalog().file_size_target())?;
-        let older = if let Some(publication) = requested {
+        let block = if let Some(publication) = requested {
             let root = blocks.load_fresh_catalog(publication.block).await?;
             if publication.root_sha256.is_none() || root.publication_sha256() != publication.root_sha256
                 || root.boundary_replica_position() != Some(publication.boundary)
             { return Err(unavailable()); }
-            Some(root)
-        } else { None };
-        let block = older.as_ref().or_else(|| snapshot.table_catalog().block()).ok_or_else(unavailable)?;
+            root
+        } else {
+            let latest = snapshot.table_catalog().block().ok_or_else(unavailable)?;
+            find_retained_publication(&blocks, &self.authority, latest, basis, cancellation).await?
+        };
         let selection = Selection {
             pin, basis, until, block: block.block_index(), boundary: block.boundary_replica_position().ok_or_else(unavailable)?,
             source: block.latest_source_position().ok_or_else(unavailable)?, storage_epoch: logs.storage_epoch,
@@ -336,7 +338,7 @@ impl NativeServingHandle {
         selection.alive(self.replication.serving_clock())?;
         let installed = status.installed.ok_or_else(unavailable)?;
         if selection.boundary.epoch() != logs.replica_epoch || selection.boundary > installed.replica
-            || selection.source > installed.source || !logs.confirms_recovery_checkpoint(block).await
+            || selection.source > installed.source || !logs.confirms_recovery_checkpoint(&block).await
         { return Err(unavailable()); }
         let cut = CatalogCut { storage_version: logs.storage_version, storage_epoch: logs.storage_epoch,
             replica_epoch: logs.replica_epoch, through: selection.boundary };
@@ -535,6 +537,44 @@ async fn stage_export(blocks: &BlockStore, authority: &NativeServingAuthority, s
     let manifest = hash(&body);
     store.put(&manifest_key(&namespace)?, Bytes::from(body)).await?;
     Ok(PinControl { selection, manifest })
+}
+
+async fn find_retained_publication(
+    blocks: &BlockStore, authority: &NativeServingAuthority, latest: &BlockCatalog, basis: Basis,
+    cancellation: &CancellationToken,
+) -> Result<BlockCatalog> {
+    let store = blocks.object_store().as_ref();
+    let has_basis = async |block: &BlockCatalog| -> Result<bool> {
+        let wire = block.as_proto();
+        let Some(image) = authority.read_checkpoint(
+            store, wire.serving_checkpoint.as_deref(), wire.serving_checkpoint_object.as_deref(),
+        ).await? else { return Ok(false); };
+        let (fold, _, shared) = decode_checkpoint_image(image.bytes(), authority.incarnation)?;
+        Ok(shared && fold.index().head().basis == basis)
+    };
+    if has_basis(latest).await? {
+        return Ok(latest.clone());
+    }
+    let directory = ObjectKey::new("blocks")?;
+    let mut retained = store.list(Some(&directory)).await?.into_iter()
+        .filter_map(|object| block_index_from_key(object.key.as_str()).ok())
+        .filter(|index| *index < latest.block_index())
+        .collect::<Vec<_>>();
+    retained.sort_unstable_by(|left, right| right.cmp(left));
+    for index in retained {
+        if cancellation.is_cancelled() {
+            return Err(Anomaly::new(AnomalyCategory::Interrupted, "rtdb/checkpoint-export", "The export was interrupted"));
+        }
+        let block = match blocks.load_fresh_catalog(index).await {
+            Ok(block) => block,
+            Err(error) if error.category == AnomalyCategory::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if has_basis(&block).await? {
+            return Ok(block);
+        }
+    }
+    Err(unavailable())
 }
 
 async fn verify_plain_image(store: &dyn ObjectStore, authority: &NativeServingAuthority, block: &BlockCatalog, selection: &Selection) -> Result<()> {

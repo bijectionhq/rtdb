@@ -66,6 +66,8 @@ pub struct NodeConfiguration {
     pub flight_sql: Option<FlightSettings>,
     #[cfg(feature = "multi")]
     pub(crate) deployment_admin: Option<std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>>,
+    #[cfg(feature = "multi")]
+    pub(crate) default_checkpoint_restore_directory: Option<PathBuf>,
     pub health: Option<HealthSettings>,
     pub remotes: BTreeMap<String, RemoteConfig>,
     pub primary: DatabaseConfig,
@@ -152,6 +154,8 @@ impl NodeConfiguration {
             Self { playground: false, server: None, flight_sql: None,
                 #[cfg(feature = "multi")]
                 deployment_admin: None,
+                #[cfg(feature = "multi")]
+                default_checkpoint_restore_directory: None,
                 health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, search: search(None)?, auth: authentication::default_auth(environment),
                 tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, default_v1_serving: false, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
@@ -165,6 +169,12 @@ impl NodeConfiguration {
             let auth = fields.take("authn").map(|value| authentication::decode(value, environment)).transpose()?.unwrap_or_else(|| authentication::default_auth(environment));
             #[cfg(feature = "multi")]
             let deployment_admin = authentication::deployment_administrators(fields.sequence("deploymentAdminPrincipals")?)?;
+            #[cfg(feature = "multi")]
+            let default_checkpoint_restore_directory = fields.string("defaultCheckpointRestoreDirectory")?.map(PathBuf::from);
+            #[cfg(feature = "multi")]
+            if default_checkpoint_restore_directory.as_ref().is_some_and(|directory| !directory.is_absolute()) {
+                return Err(invalid("defaultCheckpointRestoreDirectory requires an absolute path"));
+            }
             #[cfg(feature = "multi")]
             if deployment_admin.is_some() && !flight_sql.as_ref().is_some_and(|flight| flight.port >= 0) {
                 return Err(invalid("deploymentAdminPrincipals requires an ordinary Flight SQL listener"));
@@ -180,6 +190,8 @@ impl NodeConfiguration {
             Self { playground: false, server, flight_sql,
                 #[cfg(feature = "multi")]
                 deployment_admin,
+                #[cfg(feature = "multi")]
+                default_checkpoint_restore_directory,
                 health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;

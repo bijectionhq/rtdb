@@ -229,6 +229,8 @@ impl ServerDriver {
                 hosted_controls: settings.hosted_controls.clone(), custody_providers,
                 #[cfg(feature = "multi")]
                 deployment_admin: config.deployment_admin.clone(),
+                #[cfg(feature = "multi")]
+                default_checkpoint_restore_directory: config.default_checkpoint_restore_directory.clone(),
                 reserved_applied_source: settings.audience.map(|(_, audience)| audience.source()),
                 ..Default::default() };
             if let Some((address, audience)) = settings.audience {
@@ -236,6 +238,8 @@ impl ServerDriver {
                     address, audience: Some(audience), reserved_applied_source: None, playground: false, owned_world_host: None, custody_providers: Default::default(),
                     #[cfg(feature = "multi")]
                     deployment_admin: None,
+                    #[cfg(feature = "multi")]
+                    default_checkpoint_restore_directory: None,
                     ..ordinary.clone()
                 };
                 let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(reserved, node.clone(), auth.clone()).await?;

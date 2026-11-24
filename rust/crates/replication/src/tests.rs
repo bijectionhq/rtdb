@@ -1368,6 +1368,10 @@ async fn default_orders_an_exact_pin_and_reopens_independent_backing() {
     let cancellation = CancellationToken::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         let committed = serving.transact(serving_source_put(1), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        let selected_source_position = fixture.handle.flush().await.unwrap();
+        fixture.handle.await_source(selected_source_position, &cancellation).await.unwrap();
+        let later = serving.transact(serving_source_put(2), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        assert_ne!(committed.basis, later.basis);
         let source_position = fixture.handle.flush().await.unwrap();
         fixture.handle.await_source(source_position, &cancellation).await.unwrap();
         let pin = uuid::Uuid::from_bytes([9; 16]);
@@ -1380,7 +1384,7 @@ async fn default_orders_an_exact_pin_and_reopens_independent_backing() {
         assert_eq!(retry.path, copy.path);
         assert!(copy.path.starts_with(target.path()));
         assert_eq!(copy.basis, committed.basis);
-        assert_eq!(copy.source, source_position);
+        assert_eq!(copy.source, selected_source_position);
         let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&copy.path).unwrap());
         assert_eq!(store.get_fresh(&ObjectKey::new("checkpoint-restore-receipt").unwrap()).await.unwrap().as_ref(), &ticket[..]);
         let blocks = BlockStore::new(store.clone(), Arc::new(BufferPool::new(store, 1 << 24)), Arc::clone(&fixture.memory), 100_000_000).unwrap();
