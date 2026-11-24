@@ -9,7 +9,7 @@ use rtdb_columnar::{
 };
 use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
-use rtdb_query::QueryContext;
+use rtdb_query::{CandidateIids, QueryContext};
 use rtdb_storage::ObjectKey;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
 
@@ -665,13 +665,7 @@ pub(super) async fn visit_matches(
     work.charge(region.steps).map_err(kernel::geometry_error)?;
     let partition = (request.partition.len() == definition.partition.len())
         .then(|| Partition::of(request.partition.iter().map(|part| part.as_ref())));
-    let mut candidates = Candidates {
-        ids: BTreeSet::new(),
-        allowance: context.memory.reserve(0)?,
-        unindexed_rows: 0,
-        unindexed_bytes: 0,
-        indexed_bytes: 0,
-    };
+    let mut candidates = Candidates::new(&context.memory)?;
     let database = context
         .catalog
         .database(context.catalog.default_database())?;
@@ -749,14 +743,15 @@ pub(super) async fn visit_matches(
     let geometry = (region.location.is_some() || matches!(projection, Projection::Documents))
         .then_some(definition.geometry.as_str());
     let partition = definition.partition[..request.partition.len()].to_vec();
-    let cursor = rtdb_query::open_owned_spatial_scan(
+    let iids = candidates.finish()?;
+    let cursor = rtdb_query::open_owned_spatial_refinement(
         Arc::clone(&context),
         owner,
         relation,
         geometry,
         &partition,
         request.valid_at,
-        candidates.ids,
+        iids,
         projection,
         include_iid,
     )
@@ -862,6 +857,23 @@ struct Candidates {
 }
 
 impl Candidates {
+    fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self {
+            ids: BTreeSet::new(),
+            allowance: memory.reserve(0)?,
+            unindexed_rows: 0,
+            unindexed_bytes: 0,
+            indexed_bytes: 0,
+        })
+    }
+
+    fn finish(self) -> Result<CandidateIids> {
+        let Self { ids, allowance, .. } = self;
+        let iids = CandidateIids::from_set(ids, allowance.budget())?;
+        drop(allowance);
+        Ok(iids)
+    }
+
     fn insert(&mut self, iid: Iid) -> Result<()> {
         if self.ids.contains(&iid) {
             return Ok(());
@@ -909,6 +921,33 @@ mod tests {
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use rtdb_columnar::{build_struct_array, entity_id_array, entity_id_type, read_value, to_field};
     use rtdb_types::{LogicalType, Value};
+
+    #[test]
+    fn spatial_candidate_handoff_releases_the_tree_allowance_at_the_cap() -> Result<()> {
+        let memory = MemoryBudget::new(8 << 20);
+        let mut candidates = Candidates::new(&memory)?;
+        let iid = |index: usize| Iid((index as u128).to_be_bytes());
+        for index in (0..MAX_CANDIDATES).rev() {
+            candidates.insert_unindexed(iid(index))?;
+        }
+        candidates.insert(iid(0))?;
+        assert_eq!(candidates.insert(iid(MAX_CANDIDATES)).unwrap_err().code, postings::work_limit().code);
+        assert_eq!(candidates.insert_unindexed(iid(0)).unwrap_err().code, postings::work_limit().code);
+        let tree_bytes = memory.used_bytes();
+
+        let retained = candidates.finish()?;
+        assert!(retained.iter().eq((0..MAX_CANDIDATES).map(iid)));
+        let arrow_bytes = memory.used_bytes();
+        assert!(arrow_bytes >= MAX_CANDIDATES * 16);
+        assert!(arrow_bytes < tree_bytes);
+        let shared = retained.clone();
+        drop(retained);
+        assert_eq!(shared.len(), MAX_CANDIDATES);
+        assert_eq!(memory.used_bytes(), arrow_bytes);
+        drop(shared);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
 
     #[test]
     fn spatial_selection_orders_ties_by_the_typed_arrow_identity() -> Result<()> {

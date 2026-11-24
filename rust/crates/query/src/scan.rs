@@ -809,7 +809,12 @@ impl ScanCursor {
     pub async fn new(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<Self> {
         let context = Arc::clone(&execution.context);
         let database = context.catalog.database(&scan.table.name.database)?;
-        Self::over(scan, execution, pushdowns, &database.partitions, &database.storage, true, None).await
+        let restricted_iids = context.catalog.owned_spatial_candidates(&scan.table.name);
+        if restricted_iids.is_some() && scan.iids.is_some() {
+            return Err(invalid("scan-iid-scope", "An owned spatial candidate scan already has a fixed IID scope"));
+        }
+        Self::over_with_queries(scan, execution, pushdowns, &database.partitions, &database.storage,
+            true, None, &SearchQueries::default(), restricted_iids).await
     }
     /// A scan of the given partitions of its database, which share `storage`.
     /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
@@ -2786,6 +2791,72 @@ mod tests {
     use rtdb_trie::TrieConfig;
     use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn owned_spatial_refinement_scans_only_retained_iids_and_preserves_empty_projection() -> Result<()> {
+        use crate::{CandidateIids, OwnedSpatialProjection, open_owned_spatial_refinement};
+        use rtdb_types::OwnedRelation;
+
+        let state = PartitionState::empty(TrieConfig::default())?;
+        let memory = MemoryBudget::new(1 << 24);
+        let relation = OwnedRelation::new("places")?;
+        let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+        let selected = EntityId::Uuid([0x40; 16]);
+        let excluded = EntityId::Uuid([0x80; 16]);
+        let expired = EntityId::Uuid([0; 16]);
+        let mut write = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
+        for (owner, id, location, valid_time) in [
+            ("alice", &selected, 1, Interval::ALL),
+            ("alice", &excluded, 2, Interval::ALL),
+            ("bob", &selected, 3, Interval::ALL),
+            ("alice", &expired, 4, Interval::new(Timestamp(0), Timestamp(50))?),
+        ] {
+            write.append(relation.table(owner), StoredEvent {
+                position: None, origin: None, commit_position: 0, recency: None,
+                entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
+                system_from: key.system_time, valid_time,
+                operation: StoredOperation::Put(StructFields::from([
+                    ("_id".into(), id.as_value()), ("location".into(), Value::Binary(vec![location])),
+                ])),
+            })?;
+        }
+        state.apply(&write.stage()?)?;
+
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![state.snapshot()], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false)?;
+        let context = QueryContext::new(catalog, Arc::clone(&memory), key.system_time, "UTC",
+            QueryOptions::default(), &CancellationToken::new())?;
+        let projection = OwnedSpatialProjection::SelectedDocuments(&["location"]);
+        let open = |iids, projection| open_owned_spatial_refinement(
+            Arc::clone(&context), "alice", &relation, None, &[], key.system_time, iids, projection, true,
+        );
+        let empty = CandidateIids::from_sorted(&[], &memory)?;
+        assert!(open(empty.clone(), OwnedSpatialProjection::Identities).await?.is_none());
+        let empty = open(empty, projection).await?.unwrap();
+        let mut cursor = empty.cursor;
+        assert!(cursor.next_batch().await?.is_none());
+        let empty_schema = cursor.runtime_schema().clone();
+        assert_eq!(empty.document_columns.iter().map(|&index| empty_schema.fields()[index].name.as_str())
+            .collect::<Vec<_>>(), ["_id", "location", "_system_from"]);
+
+        for count in [1, 4096u128] {
+            let sorted = (0..(count - 1)).map(|index| Iid(index.to_be_bytes()))
+                .chain([selected.iid()]).collect::<Vec<_>>();
+            let iids = CandidateIids::from_sorted(&sorted, &memory)?;
+            let mut scan = open(iids, projection).await?.unwrap();
+            assert_eq!(scan.cursor.runtime_schema(), &empty_schema);
+            let page = scan.cursor.next_batch().await?.unwrap();
+            let batch = page.batch();
+            assert_eq!(batch.num_rows(), 1);
+            let physical_iids = IidView::new(batch.column_by_name("_iid").unwrap().as_ref())?;
+            assert_eq!(physical_iids.get(0)?, selected.iid());
+            let (index, field) = batch.schema_ref().column_with_name("location").unwrap();
+            assert_eq!(rtdb_columnar::binary_cell(field, batch.column(index).as_ref(), 0)?, Some(&[1][..]));
+            assert!(scan.cursor.next_batch().await?.is_none());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn fts_arrow_scan_keeps_shared_queries_and_candidate_vectors_between_accelerators() {

@@ -4,7 +4,7 @@ use rtdb_columnar::EntityIdRef;
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 
-use crate::{PreparedQuery, QueryContext, QueryCursor};
+use crate::{CandidateIids, PreparedQuery, QueryContext, QueryCursor, context::OwnedSelection};
 
 /// Opens a single admitted IID read without granting SQL access to the owned namespace.
 pub async fn open_owned_point(
@@ -1072,20 +1072,52 @@ pub struct OwnedSpatialScan {
     pub document_columns: Vec<usize>,
 }
 
-/// Scans resolved rows of a held owned relation for spatial refinement.
+enum SpatialScanIids {
+    Gather(BTreeSet<Iid>),
+    Refine(CandidateIids),
+}
+
+/// Scans resolved rows of a held owned relation for spatial document gather.
 pub async fn open_owned_spatial_scan(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
     geometry: Option<&str>, partition: &[String], valid_at: Timestamp,
-    iids: std::collections::BTreeSet<Iid>, projection: OwnedSpatialProjection<'_>, include_iid: bool,
+    iids: BTreeSet<Iid>, projection: OwnedSpatialProjection<'_>, include_iid: bool,
+) -> Result<Option<OwnedSpatialScan>> {
+    open_spatial_scan(context, owner, relation, geometry, partition, valid_at,
+        SpatialScanIids::Gather(iids), projection, include_iid).await
+}
+
+/// Refines a retained physical IID selection against the held owned relation.
+pub async fn open_owned_spatial_refinement(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    geometry: Option<&str>, partition: &[String], valid_at: Timestamp,
+    iids: CandidateIids, projection: OwnedSpatialProjection<'_>, include_iid: bool,
+) -> Result<Option<OwnedSpatialScan>> {
+    open_spatial_scan(context, owner, relation, geometry, partition, valid_at,
+        SpatialScanIids::Refine(iids), projection, include_iid).await
+}
+
+async fn open_spatial_scan(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    geometry: Option<&str>, partition: &[String], valid_at: Timestamp,
+    iids: SpatialScanIids, projection: OwnedSpatialProjection<'_>, include_iid: bool,
 ) -> Result<Option<OwnedSpatialScan>> {
     if owner.is_empty() || relation.world().is_some() || relation.is_world_catalog() {
         return Err(address_unavailable());
     }
-    if iids.is_empty() && !projection.has_documents() { return Ok(None); }
+    let empty = match &iids {
+        SpatialScanIids::Gather(iids) => iids.is_empty(),
+        SpatialScanIids::Refine(iids) => iids.is_empty(),
+    };
+    if empty && !projection.has_documents() { return Ok(None); }
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(), table: relation.table(owner),
     };
-    let mut context = context.for_owned_relation(name.clone(), None);
+    let (selection, iids) = match iids {
+        SpatialScanIids::Gather(iids) => (OwnedSelection::Relation, Some(iids)),
+        SpatialScanIids::Refine(iids) => (OwnedSelection::SpatialCandidates(iids), None),
+    };
+    let mut context = context.for_owned_selection(name.clone(), selection);
     Arc::make_mut(&mut context).spatial_refinement = include_iid && !projection.has_documents();
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
     let mut fields = vec!["_id"];
@@ -1120,7 +1152,7 @@ pub async fn open_owned_spatial_scan(
         valid_time: TemporalFilter::At(Expr::Literal(Value::Timestamp {
             value: valid_at.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()),
         })),
-        system_time: TemporalFilter::Default, clamp_valid_time: false, iids: Some(iids),
+        system_time: TemporalFilter::Default, clamp_valid_time: false, iids,
         predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     let cursor = PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await?;

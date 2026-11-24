@@ -90,7 +90,7 @@ mod owned_unique;
 mod owned_range;
 mod owned_range_order;
 pub use owned_range::{verify_owned_entity_region, verify_owned_fixed_range};
-pub use owned_relation::OwnedSpatialScan;
+pub use owned_relation::{OwnedSpatialScan, open_owned_spatial_refinement};
 pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, OWNED_UNIQUE_PATHS_MAX, OWNED_UNIQUE_POLICY_ID, lookup_owned_unique, owned_unique_key_id, owned_unique_path_key, read_owned_unique_policy};
 pub use owned_relation::{
     ArchivedHeldClock, OwnedChangeEntry, OwnedIdentityCandidates, OwnedSpatialProjection, open_owned_artefact_candidate, open_owned_artefact_candidates, open_owned_assertion_point, open_owned_capacity_point, open_owned_identity_page, open_owned_identity_page_all_valid, open_owned_identity_prefix, open_owned_path_catalog, open_owned_point, open_owned_point_at_system, open_owned_root_prefix_projection, open_owned_root_projection, open_owned_root_projection_of,
