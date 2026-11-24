@@ -3,6 +3,7 @@ use rtdb_index::{IndexBatch, TableWrite};
 use rtdb_types::{BlockIndex, CatalogCut, OwnedWorld, ReplicaPosition, StorageEpoch, StorageVersion};
 use sha2::{Digest, Sha256};
 
+use super::prepared_landing_basis::{LandingBasis, generation_matches};
 use super::*;
 
 // The generation travels in the same retained source frame as its footprint.
@@ -128,6 +129,18 @@ fn require_landing(primary: &[Operation], refusal: &[Operation]) -> Result<()> {
     Ok(())
 }
 
+fn landing_basis(predecessor: TransactionKey, block: BlockIndex, catalog: CatalogCut) -> LandingBasis {
+    LandingBasis {
+        predecessor_id: predecessor.tx_id.0,
+        predecessor_time: predecessor.system_time.0,
+        block: block.0,
+        storage_version: catalog.storage_version.0,
+        storage_epoch: catalog.storage_epoch.0,
+        replica_epoch: catalog.replica_epoch.0,
+        replica_through: catalog.through.0,
+    }
+}
+
 impl PreparedLanding {
     pub(super) fn choose(
         self, base: &Snapshot, assigned: TransactionKey, slot: Option<crate::OwnedClockSlot>,
@@ -141,11 +154,13 @@ impl PreparedLanding {
         // All data and control predicates were evaluated at this exact cut,
         // with this assigned clock. Any intervening publication, catalog or
         // epoch change invalidates the entire read and inheritance proof.
-        if self.writes.predecessor() != base.tx_basis()
-            || self.writes.block_index() != base.block_index()
-            || Some(self.catalog) != base.catalog_cut()
-            || self.writes.tx_key().system_time != assigned.system_time
-        {
+        let prepared = landing_basis(
+            self.writes.predecessor().ok_or_else(stale)?, self.writes.block_index(), self.catalog,
+        );
+        let installed = landing_basis(
+            base.tx_basis().ok_or_else(stale)?, base.block_index(), base.catalog_cut().ok_or_else(stale)?,
+        );
+        if !generation_matches(prepared, installed, self.writes.tx_key().system_time.0, assigned.system_time.0) {
             return Err(stale());
         }
         Ok((self.writes, self.refused))
