@@ -3714,7 +3714,8 @@ impl Service {
         let overlay = match overlay {
             Some(shadows) => {
                 let analyzer = held.snapshot.search_analyzer(&rank.partitions).await.map_err(status)?;
-                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query).map_err(status)?)
+                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query, || held.snapshot.check())
+                    .map_err(status)?)
             }
             None => None,
         };
@@ -3742,7 +3743,9 @@ impl Service {
         Ok(reply)
     }
 
-    fn search_shadows(&self, rank: &OwnedRankRequest<'_>, input: &RecordBatch) -> Result<rtdb_node::TextShadows, Status> {
+    fn search_shadows<'a>(
+        &self, rank: &OwnedRankRequest<'_>, input: &'a RecordBatch,
+    ) -> Result<rtdb_node::TextShadows<'a>, Status> {
         if !rank.observe || !(1..=64).contains(&input.num_rows()) || input.num_columns() != 3 {
             return Err(invalid("Staged search requires bounded rows and original evidence"));
         }
@@ -3752,21 +3755,11 @@ impl Service {
         let (Some(partitions), Some(ids), Some(text)) = (partitions, ids, text) else {
             return Err(invalid("Invalid staged search overlay layout"));
         };
-        let mut shadows = rtdb_node::TextShadows::default();
-        for row in 0..input.num_rows() {
-            if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
-                || partitions.value(row) >= rank.partitions.len() as u64
-                || (rank.partitions[partitions.value(row) as usize].0.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
-            {
-                return Err(invalid("Invalid staged search identity"));
-            }
-            shadows.push(
-                partitions.value(row) as usize,
-                rtdb_types::EntityId::String(ids.value(row).to_owned()),
-                (!text.is_null(row)).then(|| text.value(row)),
-            );
-        }
-        Ok(shadows)
+        rtdb_node::TextShadows::try_new(partitions, ids, text, |partition, id| {
+            !id.is_empty() && rank.partitions.get(partition).is_some_and(|(relation, _)| {
+                !(relation.name().ends_with("_search") && id.starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
+            })
+        }).ok_or_else(|| invalid("Invalid staged search identity"))
     }
 
     pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
@@ -3854,7 +3847,8 @@ impl Service {
         let text_overlay = match hybrid.text_overlay.as_ref().map(|input| self.search_shadows(rank, input.batch())).transpose()? {
             Some(shadows) => {
                 let analyzer = held.snapshot.search_analyzer(&rank.partitions).await.map_err(status)?;
-                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query).map_err(status)?)
+                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query, || held.snapshot.check())
+                    .map_err(status)?)
             }
             None => None,
         };

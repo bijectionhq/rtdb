@@ -1072,7 +1072,7 @@ impl HeldCheckpointWorld {
     }
     pub async fn ranked_search(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp, staged: Option<rtdb_node::TextShadows>,
+        valid: Timestamp, staged: Option<rtdb_node::TextShadows<'_>>,
     ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         if staged.is_some() && (self.clock_mode() != WorldClockMode::Proposal || valid != self.present().system_time) {
             return Err(OwnedWorld::unavailable());
@@ -1097,7 +1097,7 @@ impl HeldCheckpointWorld {
     async fn ranked_search_on_cut(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
-        staged: Option<rtdb_node::TextShadows>,
+        staged: Option<rtdb_node::TextShadows<'_>>,
     ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
@@ -1162,8 +1162,11 @@ impl HeldCheckpointWorld {
             (Vec::new(), rtdb_plan::Analyzer::Simple)
         };
         let overlay = if use_overlay {
-            let staged = staged.unwrap_or_default();
-            let corpus = staged.into_corpus(Arc::clone(&self.memory), analyzer, &query)?;
+            let memory = Arc::clone(&self.memory);
+            let corpus = match staged {
+                Some(staged) => staged.into_corpus(memory, analyzer, &query, || self.check())?,
+                None => rtdb_node::HeldTextCorpus::new(memory, analyzer, &query)?,
+            };
             Some(self.search_overlay(&partitions, &columns, valid, corpus, &guard,
                 earlier.map(|(system, _)| system)).await?)
         } else {

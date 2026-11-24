@@ -198,7 +198,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn ranked_search<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize,
-        limit: usize, valid: Timestamp, staged: Option<rtdb_node::TextShadows>,
+        limit: usize, valid: Timestamp, staged: Option<rtdb_node::TextShadows<'a>>,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>> {
         Box::pin(HeldCheckpointWorld::ranked_search(self, partitions, query, offset, limit, valid, staged))
     }
