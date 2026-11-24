@@ -117,7 +117,9 @@ impl Shortlist {
             let start = generation.probed.min(probes);
             generation.probed = generation.probed.max(probes);
             let key = &generation.key;
-            let blocks = futures::stream::iter(generation.clusters[start..probes].iter().map(|cluster| {
+            let clusters = &generation.clusters;
+            let blocks = futures::stream::iter((start..probes).map(|index| {
+                let cluster = &clusters[index];
                 async move {
                     let bytes = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
                     Block::read(Buffer::from(Bytes::from_owner(bytes)), cluster, dimensions)

@@ -452,7 +452,7 @@ mod tests {
         for selected in [contiguous, reordered, gapped] {
             let mut bytes = Vec::new();
             let (length, digest) = write_block(&mut bytes, &schema, &rows, &selected).unwrap();
-            let cluster = Cluster { partition: source[0].partition, centroid: 0..2, range: 0..length, rows: 2, digest };
+            let cluster = Cluster { range: 0..length, rows: 2, digest };
             let buffer = Buffer::from_vec(bytes);
             let batch = decode(buffer.clone(), &schema, Some(selected.len())).unwrap();
             assert_eq!(buffer.as_slice(), encode(&schema, batch).unwrap().as_slice());
