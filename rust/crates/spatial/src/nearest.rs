@@ -409,11 +409,12 @@ impl RankingBuilder {
     fn finish(self, check: impl Fn() -> Result<()>) -> Result<OwnedBatch> {
         check()?;
         let Self {
+            // Local bindings drop in reverse order, so the buffers release before their charge.
+            mut memory,
             mut keys,
             mut offsets,
             mut distances,
             mut iids,
-            mut memory,
             ..
         } = self;
         let count = u32::try_from(distances.len()).map_err(|_| work_limit())?;
@@ -631,6 +632,28 @@ fn rank_key_growth_falls_back_to_exact_need_and_refuses_without_appending() -> R
         Iid::MAX
     );
     drop(ranking);
+    assert_eq!(memory.used_bytes(), 0);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn rank_cancelled_after_sort_releases_its_buffer_reservation() -> Result<()> {
+    let memory = MemoryBudget::new(1 << 20);
+    let mut builder = RankingBuilder::new(&memory)?;
+    builder.push(EntityIdRef::Integer(1), Iid::MIN, 1.0)?;
+    let checked = std::cell::Cell::new(false);
+    let error = builder
+        .finish(|| {
+            if checked.replace(true) {
+                assert!(memory.used_bytes() > 0);
+                Err(crate::postings::cancelled())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert_eq!(error.code, crate::postings::cancelled().code);
     assert_eq!(memory.used_bytes(), 0);
     Ok(())
 }
