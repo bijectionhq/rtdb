@@ -2566,7 +2566,9 @@ pub(crate) async fn open_held_checkpoint_world(
     let cancellation = session.state().cancellation().child_token();
     // On RPC cancellation the worker still completes the storage-region drain.
     let opening = cancellation.clone().drop_guard();
-    let projections = Arc::new(WorldProjectionCustody::new(Arc::clone(&archive.keys), deployment, open.incarnation));
+    let projections = Arc::new(WorldProjectionCustody::new(
+        Arc::clone(&archive.keys), deployment, open.incarnation, session.assertion_family_reader()?, cancellation.clone(),
+    ));
     let archive_projections = Arc::clone(&projections);
     let worker = cancellation.clone();
     let backing_memory = Arc::clone(&memory);

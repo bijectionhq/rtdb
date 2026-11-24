@@ -2,7 +2,8 @@ use std::{num::NonZeroU64, sync::Arc};
 
 use bytes::Bytes;
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
-use rtdb_node::nearest::{HeldVectorOverlay, NearestPartition, NearestQuery};
+use rtdb_node::{OriginalAssertionFamilyReader, nearest::{HeldVectorOverlay, NearestPartition, NearestQuery}};
+use tokio_util::sync::CancellationToken;
 use rtdb_storage::IoRegion;
 use rtdb_types::{AssertionId, EntityId, OwnedRelation, OwnedWorld, Result};
 use serde::Deserialize;
@@ -23,6 +24,8 @@ pub(super) struct WorldProjectionCustody {
     deployment: Uuid,
     incarnation: u64,
     region: Arc<IoRegion>,
+    original: OriginalAssertionFamilyReader,
+    cancellation: CancellationToken,
 }
 
 struct ProjectionCarrier<'a> {
@@ -73,8 +76,11 @@ enum SearchRow<'a> {
 }
 
 impl WorldProjectionCustody {
-    pub(super) fn new(keys: Arc<dyn KeyService>, deployment: Uuid, incarnation: u64) -> Self {
-        Self { keys, deployment, incarnation, region: IoRegion::new() }
+    pub(super) fn new(
+        keys: Arc<dyn KeyService>, deployment: Uuid, incarnation: u64,
+        original: OriginalAssertionFamilyReader, cancellation: CancellationToken,
+    ) -> Self {
+        Self { keys, deployment, incarnation, region: IoRegion::new(), original, cancellation }
     }
 
     async fn row<'a>(
@@ -99,7 +105,8 @@ impl WorldProjectionCustody {
         let stage = AssertionStage::new(carrier.deployment, NonZeroU64::new(carrier.incarnation).ok_or_else(invalid)?, carrier.stage)?;
         let family = family_vault_address(self.deployment, carrier.family);
         let slot = WorldRowSlot { world: Uuid::from_bytes(world.0), relation: relation.name(), key: key.as_bytes() };
-        let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(invalid)?;
+        let families = self.keys.assertion_families(Arc::clone(&self.region)).ok_or_else(invalid)?
+            .with_original_reader(&self.original, self.deployment, &self.cancellation);
         let vault = self.keys.assertion_keys().ok_or_else(invalid)?;
         let opened = async {
             families.require_derived_capability(family, stage, carrier.member, slot).await?;

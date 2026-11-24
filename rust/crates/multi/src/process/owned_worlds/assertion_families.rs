@@ -172,7 +172,9 @@ pub(super) async fn serve(
     let scope = Scope::new(deployment, record)?;
     scope.admit_lines(session, &request).await?;
     let region = IoRegion::new();
-    let families = keys.assertion_families(Arc::clone(&region)).ok_or_else(OwnedWorld::unavailable)?;
+    let original = session.assertion_family_reader()?;
+    let families = keys.assertion_families(Arc::clone(&region)).ok_or_else(OwnedWorld::unavailable)?
+        .with_original_reader(&original, deployment, session.state().cancellation());
     let vault = || keys.assertion_keys().ok_or_else(OwnedWorld::unavailable);
     Ok(match request {
         FamilyRequest::Scope => FamilyReply::Scope {

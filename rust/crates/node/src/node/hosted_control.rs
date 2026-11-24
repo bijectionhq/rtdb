@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use rtdb_query::{HostedControlPoint, QueryCursor};
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, Result};
+use rtdb_types::{
+    ASSERTION_FAMILY_FENCES, Anomaly, AnomalyCategory, AssertionFamilyFenceMarker, EntityId, Iid,
+    OwnedWorld, PlacedAttempt, PlacedAttemptScope, Result, TableRef, TransactionKey,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -132,6 +135,7 @@ impl OwnedReadSession {
 pub struct CurrentAssertionFamilyRead {
     context: Arc<rtdb_query::QueryContext>,
     owner: String,
+    applied_source: Option<TransactionKey>,
 }
 
 impl CurrentAssertionFamilyRead {
@@ -149,6 +153,14 @@ pub struct OriginalAssertionFamilyReader {
     owner: String,
     identity: Arc<dyn SessionIdentity>,
     attachment: std::sync::Weak<Database>,
+    scope: PlacedAttemptScope,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssertionFenceStatus {
+    Pending,
+    Aborted,
+    Ordered,
 }
 
 impl OriginalAssertionFamilyReader {
@@ -174,7 +186,38 @@ impl OriginalAssertionFamilyReader {
             return Err(unavailable());
         }
         context.check_cancelled()?;
-        Ok(CurrentAssertionFamilyRead { context, owner: self.owner.clone() })
+        Ok(CurrentAssertionFamilyRead { context, owner: self.owner.clone(), applied_source: receipt.applied })
+    }
+
+    pub async fn fence_status(
+        &self, deployment: Uuid, family: Uuid, attempt: PlacedAttempt,
+        marker: AssertionFamilyFenceMarker, cancellation: &CancellationToken,
+    ) -> Result<AssertionFenceStatus> {
+        let unavailable = hosted_source_unavailable;
+        if !self.scope.same_history(attempt.scope()) || !attempt.belongs_to(Some(&self.owner)) {
+            return Err(unavailable());
+        }
+        let current = self.current(deployment, cancellation).await?;
+        let selected = rtdb_query::read_hosted_control_point(
+            Arc::clone(&current.context),
+            TableRef::new("public", ASSERTION_FAMILY_FENCES),
+            &EntityId::String(family.simple().to_string()),
+            true,
+        ).await?;
+        current.context.check_cancelled()?;
+        if let Some((row, _)) = selected.row {
+            let body = rtdb_columnar::ArrowCell::named(row.batch(), "body", 0)
+                .and_then(|cell| cell.binary()).ok_or_else(unavailable)?;
+            if AssertionFamilyFenceMarker::decode(body).ok() != Some(marker) {
+                return Err(unavailable());
+            }
+            return Ok(AssertionFenceStatus::Ordered);
+        }
+        if current.applied_source.is_some_and(|key| key.tx_id.0 >= attempt.position().0) {
+            Ok(AssertionFenceStatus::Aborted)
+        } else {
+            Ok(AssertionFenceStatus::Pending)
+        }
     }
 }
 
@@ -183,12 +226,10 @@ impl NativeSession {
         let unavailable = hosted_source_unavailable;
         let owner = self.state.user().filter(|owner| !owner.is_empty()).ok_or_else(unavailable)?.to_owned();
         let database = self.service.database()?;
-        if database.placed_writer_scope().is_none() {
-            return Err(unavailable());
-        }
+        let scope = database.placed_writer_scope().ok_or_else(unavailable)?;
         Ok(OriginalAssertionFamilyReader {
             node: self.service.node.clone(), database: self.state.database().to_owned(), owner,
-            identity: Arc::clone(&self.service.identity), attachment: Arc::downgrade(&database),
+            identity: Arc::clone(&self.service.identity), attachment: Arc::downgrade(&database), scope,
         })
     }
 

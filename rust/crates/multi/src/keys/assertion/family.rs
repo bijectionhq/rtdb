@@ -7,8 +7,10 @@ use std::{collections::BTreeSet, fmt, fs, io::ErrorKind, sync::Arc};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use ring::digest::{Context, SHA256, digest};
+use rtdb_node::{AssertionFenceStatus, OriginalAssertionFamilyReader};
 use rtdb_storage::IoRegion;
-use rtdb_types::{Anomaly, AnomalyCategory, AssertionId, PlacementBinding, Position, Result};
+use tokio_util::sync::CancellationToken;
+use rtdb_types::{Anomaly, AnomalyCategory, AssertionFamilyFenceMarker, AssertionId, EntityId, OwnedRelation, PlacedAttempt, PlacementBinding, Position, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -238,6 +240,14 @@ struct WorldRewrite {
     row: EnrolledWorldRow,
 }
 
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingFence {
+    client_family: Uuid,
+    attempt: Vec<u8>,
+    marker: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Family {
@@ -247,6 +257,7 @@ struct Family {
     landings: Vec<Landing>,
     derived: Vec<DerivedRow>,
     fenced: Option<Uuid>,
+    pending_fence: Option<PendingFence>,
 }
 
 impl Family {
@@ -291,6 +302,14 @@ impl Family {
         assertion_capabilities.extend(self.derived.iter().filter_map(|row| row.capability));
         let derived = self.derived.iter().cloned().collect();
         FamilyFence { order, positions, assertion_capabilities, link_capabilities, derived }
+    }
+
+    fn require_unclaimed(&self) -> Result<()> {
+        if self.pending_fence.is_some() {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/assertion-family-fence-pending",
+                "An original source attempt holds the family inventory"));
+        }
+        Ok(())
     }
 
     fn require_live(&self) -> Result<()> {
@@ -342,22 +361,37 @@ pub(in crate::keys) trait AssertionVaultJournal: Send + Sync {
 pub struct AssertionFamilies<'a> {
     journal: &'a dyn AssertionVaultJournal,
     region: Arc<IoRegion>,
+    original: Option<OriginalFenceRead<'a>>,
+}
+
+struct OriginalFenceRead<'a> {
+    reader: &'a OriginalAssertionFamilyReader,
+    deployment: Uuid,
+    cancellation: &'a CancellationToken,
 }
 
 impl<'a> AssertionFamilies<'a> {
     pub(in crate::keys) fn new(journal: &'a dyn AssertionVaultJournal, region: Arc<IoRegion>) -> Self {
-        Self { journal, region }
+        Self { journal, region, original: None }
+    }
+
+    pub fn with_original_reader(
+        mut self, reader: &'a OriginalAssertionFamilyReader, deployment: Uuid, cancellation: &'a CancellationToken,
+    ) -> Self {
+        self.original = Some(OriginalFenceRead { reader, deployment, cancellation });
+        self
     }
 
     pub async fn enroll_original(&self, family: Uuid, original: EnrolledWorldRow) -> Result<()> {
         for _ in 0..ATTEMPTS {
-            if let Some((prior, _)) = self.read(family).await? {
+            if let Some((prior, _)) = self.read_current(family, true).await? {
                 prior.require_live()?;
+                prior.require_unclaimed()?;
                 return if prior.original == original { Ok(()) } else { Err(conflict()) };
             }
             let record = Family {
                 original, original_position: None, rewrites: Vec::new(),
-                landings: Vec::new(), derived: Vec::new(), fenced: None,
+                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None,
             };
             if self.write(family, None, &record).await? {
                 return Ok(());
@@ -466,7 +500,7 @@ impl<'a> AssertionFamilies<'a> {
     /// The caller owns the final release fence and draining previously admitted work.
     pub async fn require_live_occurrence(&self, family: Uuid, occurrence: FamilyOccurrence) -> Result<()> {
         self.require_position_open(occurrence.position).await?;
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
         if (record.original_at(occurrence.position) && record.original.assertion == occurrence.assertion
             && record.original.capability == occurrence.capability) || record.landings.iter().any(|landing| {
@@ -517,7 +551,7 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn require_row_capability(
         &self, family: Uuid, row: EnrolledWorldRow, slot: WorldRowSlot<'_>,
     ) -> Result<()> {
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
         if record.original == row || record.rewrites.iter().any(|rewrite| rewrite.row == row)
             || record.landings.iter().any(|landing| {
@@ -534,24 +568,64 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn require_derived_capability(
         &self, family: Uuid, stage: AssertionStage, member: AssertionId, slot: WorldRowSlot<'_>,
     ) -> Result<()> {
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
         if record.derived_capability(stage, member, slot) { Ok(()) } else { Err(conflict()) }
     }
 
     /// Admits sealing the private link of an enrolled reservation.
     pub async fn require_reserved(&self, family: Uuid, reservation: LandingReservation) -> Result<()> {
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
         if record.landings.iter().any(|landing| landing.reservation == reservation) { Ok(()) } else { Err(conflict()) }
     }
 
     pub async fn plan_fence(&self, family: Uuid, selected: Position, order: Uuid) -> Result<FamilyFence> {
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, false).await?.ok_or_else(conflict)?;
         if order.is_nil() || !record.contains(selected) {
             return Err(conflict());
         }
-        Ok(record.fence_inventory(record.fenced.unwrap_or(order)))
+        let pending = record.pending_fence.as_ref().map(|pending| {
+            AssertionFamilyFenceMarker::decode(&pending.marker).map_err(|_| malformed())
+        }).transpose()?;
+        Ok(record.fence_inventory(record.fenced.or(pending.map(|marker| marker.order)).unwrap_or(order)))
+    }
+
+    pub async fn claim_fence(
+        &self, family: Uuid, client_family: Uuid, marker: AssertionFamilyFenceMarker, attempt: PlacedAttempt,
+        root_erases: &BTreeSet<(&OwnedRelation, &EntityId)>,
+    ) -> Result<()> {
+        let pending = PendingFence {
+            client_family, attempt: attempt.encode().to_vec(), marker: marker.to_bytes().to_vec(),
+        };
+        for _ in 0..ATTEMPTS {
+            let (mut record, etag) = self.read(family).await?.ok_or_else(conflict)?;
+            record.require_live()?;
+            if record.pending_fence.as_ref() == Some(&pending) {
+                return Ok(());
+            }
+            record.require_unclaimed()?;
+            if !record.contains(marker.selected) {
+                return Err(conflict());
+            }
+            let fence = record.fence_inventory(marker.order);
+            let roots = fence.derived.iter().filter(|row| row.world.is_none());
+            if marker.inventory != fence.vault_inventory() || roots.clone().count() != root_erases.len() {
+                return Err(conflict());
+            }
+            for row in roots {
+                let relation = OwnedRelation::new(row.relation.as_str())?;
+                let id = EntityId::String(std::str::from_utf8(&row.key).map_err(|_| conflict())?.to_owned());
+                if !root_erases.contains(&(&relation, &id)) {
+                    return Err(conflict());
+                }
+            }
+            record.pending_fence = Some(pending.clone());
+            if self.write(family, Some(&etag), &record).await? {
+                return Ok(());
+            }
+        }
+        Err(contention())
     }
 
     /// The selected original, or any active landed copy, closes the same
@@ -630,6 +704,32 @@ impl<'a> AssertionFamilies<'a> {
         Ok(Some((decode_family(&bytes)?, etag)))
     }
 
+    async fn read_current(&self, family: Uuid, recover: bool) -> Result<Option<(Family, String)>> {
+        for _ in 0..ATTEMPTS {
+            let Some((mut record, etag)) = self.read(family).await? else { return Ok(None); };
+            let Some(pending) = record.pending_fence.as_ref() else { return Ok(Some((record, etag))); };
+            let original = self.original.as_ref().ok_or_else(|| Anomaly::new(
+                AnomalyCategory::Unavailable, "rtdb.multi/assertion-family-fence-source",
+                "The pending family fence requires the original ordered marker",
+            ))?;
+            let attempt = PlacedAttempt::decode(&pending.attempt).map_err(|_| malformed())?;
+            let marker = AssertionFamilyFenceMarker::decode(&pending.marker).map_err(|_| malformed())?;
+            match original.reader.fence_status(
+                original.deployment, pending.client_family, attempt, marker, original.cancellation,
+            ).await? {
+                AssertionFenceStatus::Pending => return Ok(Some((record, etag))),
+                AssertionFenceStatus::Aborted => (),
+                AssertionFenceStatus::Ordered => record.fenced = Some(marker.order),
+            }
+            record.pending_fence = None;
+            if !recover {
+                return Ok(Some((record, etag)));
+            }
+            self.write(family, Some(&etag), &record).await?;
+        }
+        Err(contention())
+    }
+
     async fn write(&self, family: Uuid, previous: Option<&str>, record: &Family) -> Result<bool> {
         let bytes = serde_json::to_vec(record)
             .map_err(|_| Anomaly::fault("rtdb.multi/assertion-family-record", "Cannot encode family custody record"))?;
@@ -643,7 +743,8 @@ impl<'a> AssertionFamilies<'a> {
         &self, family: Uuid, edit: impl Fn(&mut Family) -> Result<(T, bool)>,
     ) -> Result<T> {
         for _ in 0..ATTEMPTS {
-            let (mut record, etag) = self.read(family).await?.ok_or_else(conflict)?;
+            let (mut record, etag) = self.read_current(family, true).await?.ok_or_else(conflict)?;
+            record.require_unclaimed()?;
             let (result, changed) = edit(&mut record)?;
             if !changed || self.write(family, Some(&etag), &record).await? {
                 return Ok(result);
@@ -913,6 +1014,34 @@ mod tests {
         assert!(families.require_derived_capability(family, capability, original.assertion, slot).await.is_err());
         assert!(families.require_row_capability(family, rewrite, slot).await.is_err());
         assert!(families.register_derived(family, &[derived]).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pending_fence_claim_freezes_the_exact_inventory_and_requires_its_source() -> Result<()> {
+        use rtdb_types::{PlacedAttemptScope, SourcePosition};
+
+        let directory = tempfile::tempdir().unwrap();
+        let vault = LocalKeyService::with_archive_broker(directory.path())?;
+        let families = vault.assertion_families(IoRegion::new()).unwrap();
+        let family = Uuid::new_v4();
+        let original = FamilyOccurrence {
+            position: position(1), assertion: AssertionId::from_bytes([1; 32]), capability: stage(Uuid::new_v4()),
+        };
+        families.enroll_original(family, enrolment(original)).await?;
+        families.register(family, original).await?;
+        let order = Uuid::new_v4();
+        let plan = families.plan_fence(family, original.position, order).await?;
+        let marker = AssertionFamilyFenceMarker { selected: original.position, order, inventory: plan.vault_inventory() };
+        let attempt = PlacedAttemptScope::new("assertion-fence", 1)?.issue().identify(SourcePosition(2), Some("owner"))?;
+        let roots = BTreeSet::new();
+        let stale = AssertionFamilyFenceMarker { inventory: [0; 32], ..marker };
+        assert!(families.claim_fence(family, family, stale, attempt, &roots).await.is_err());
+        families.require_live_occurrence(family, original).await?;
+        families.claim_fence(family, family, marker, attempt, &roots).await?;
+        families.claim_fence(family, family, marker, attempt, &roots).await?;
+        assert!(families.require_live_occurrence(family, original).await.is_err());
+        assert!(families.fence(family, original.position, order).await.is_err());
         Ok(())
     }
 
