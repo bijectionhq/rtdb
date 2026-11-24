@@ -23,7 +23,7 @@ use super::{
 };
 
 const CAPACITY: usize = 64;
-const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "row-visibility"];
+const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "row-visibility", "branches"];
 const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, "row-visibility"];
 type Reply<T> = oneshot::Sender<Result<T>>;
 

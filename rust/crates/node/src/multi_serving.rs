@@ -63,7 +63,7 @@ impl ServingDriver for MultiServing {
 
     fn features(&self) -> &[&str] {
         &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
-          "query.linearizable", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
+          "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
     }
 
     fn supports_row_visibility(&self) -> bool { true }
