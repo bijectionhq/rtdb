@@ -47,12 +47,14 @@ pub(crate) async fn definitions(
     now: Timestamp,
     cancellation: &CancellationToken,
 ) -> Result<Vec<Definition>> {
+    let native = TableRef::new("xt", rtdb_types::rtdb_v1::SPATIAL_BUILD_CATALOG);
+    let has_native = snapshot.contains_table(&native);
     let tables: Vec<_> = snapshot
         .tables()
         .into_iter()
         .filter(TableRef::is_owned_spatial_catalog)
         .collect();
-    if tables.is_empty() {
+    if tables.is_empty() && !has_native {
         return Ok(Vec::new());
     }
     let catalog = CatalogSnapshot::new(
@@ -79,8 +81,11 @@ pub(crate) async fn definitions(
         if let Some(cursor) =
             rtdb_query::open_owned_path_catalog(Arc::clone(&context), &table, None).await?
         {
-            output.extend(collect(cursor, &table).await?);
+            output.extend(collect(cursor, Some(&table)).await?);
         }
+    }
+    if has_native && let Some(cursor) = rtdb_query::open_native_spatial_builds(context).await? {
+        output.extend(collect(cursor, None).await?);
     }
     Ok(output)
 }
@@ -101,7 +106,7 @@ pub(crate) async fn held_definition(
     let cursor = rtdb_query::open_owned_path_catalog(context, &catalog, Some(path.name()))
         .await?
         .ok_or_else(absent)?;
-    let mut definitions = collect(cursor, &catalog).await?;
+    let mut definitions = collect(cursor, Some(&catalog)).await?;
     let definition = definitions.pop().ok_or_else(absent)?;
     if !definitions.is_empty()
         || definition.name != path.name()
@@ -125,14 +130,17 @@ fn malformed() -> Anomaly {
     Anomaly::fault("rtdb.spatial/path-catalog", "The spatial path catalog contains an invalid declaration")
 }
 
-async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Definition>> {
+async fn collect(mut cursor: QueryCursor, owned_catalog: Option<&TableRef>) -> Result<Vec<Definition>> {
     let mut output = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         for row in 0..batch.num_rows() {
             let cell = |name| ArrowCell::named(batch, name, row);
             let text = |name| cell(name).and_then(ArrowCell::utf8).ok_or_else(malformed);
-            let name = text("_id")?;
+            let name = match owned_catalog {
+                Some(_) => text("_id")?.to_owned(),
+                None => format!("{}~native", text("index_name")?),
+            };
             let schema = text("schema_name")?;
             let table = text("table_name")?;
             let columns = cell("columns")
@@ -143,20 +151,22 @@ async fn collect(mut cursor: QueryCursor, catalog: &TableRef) -> Result<Vec<Defi
                 .ok_or_else(malformed)?;
             let encoding = path_geometry_encoding(cell("geometry_encoding"))?;
             let table = TableRef::new(schema, table);
-            if !(1..=16).contains(&columns.len()) || !catalog.owns_path_target(&table) {
+            if !(1..=16).contains(&columns.len())
+                || owned_catalog.is_some_and(|catalog| !catalog.owns_path_target(&table))
+            {
                 return Err(malformed());
             }
             let mut columns = columns.map(|column| {
                 column
                     .utf8()
-                    .filter(|name| !name.starts_with('_'))
+                    .filter(|name| owned_catalog.is_none() || !name.starts_with('_'))
                     .map(str::to_owned)
                     .ok_or_else(malformed)
             });
             let geometry = columns.next().ok_or_else(malformed)??;
             let partition = columns.collect::<Result<_>>()?;
             output.push(Definition {
-                name: name.to_owned(),
+                name,
                 table,
                 geometry,
                 encoding,

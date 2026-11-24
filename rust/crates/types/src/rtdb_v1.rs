@@ -12,6 +12,7 @@ pub const WRITTEN_BASIS_COLUMN: &str = "_rtdb_written_basis";
 pub const QUERY_WRITTEN_BASIS: &str = "query.written-basis";
 pub const CLEAR_RANK_INPUT: &str = "query.clear-rank-input";
 pub const RANKED_INDEX_DECLARATIONS: &str = "declare.ranked-index";
+pub const SPATIAL_BUILD_CATALOG: &str = "native_spatial_builds";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]

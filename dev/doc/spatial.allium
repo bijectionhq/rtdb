@@ -24,6 +24,10 @@ entity SpatialPostings {
 -- A declaration after a drop has a fresh generation.
 -- A path can index original Bijection geometry or position images in an existing Binary document column.
 -- The encoding is part of the path declaration and stays fixed for its generation.
+-- The Default shared-main projection stages the spatial build definition with the applied native declaration.
+-- The staged definition carries the declared column order, encoding, and original native position.
+-- The spatial writer assigns native generations their own artefact addresses and uses the same posting format.
+-- Dropping the table withdraws the build definition from the shared-main projection.
 -- Native WKB and Bijection images admit their binary ordinates directly into typed geometry.
 -- Admission counts the exact canonical JSON byte length with bounded scalar scratch.
 -- Readiness at a held cut requires current-generation postings on the durable sources scheduled for spatial indexing.

@@ -1,12 +1,12 @@
-use std::{cmp::Reverse, collections::BTreeSet, sync::Arc};
+use std::{cmp::Reverse, collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation};
-use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage}};
+use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RankedIndexKind, RowImage}};
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
-    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH}};
+    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SPATIAL_BUILD_CATALOG}};
 use tokio_util::sync::CancellationToken;
 
 pub(super) fn data_table(table: &TableRef) -> bool {
@@ -173,7 +173,48 @@ pub(crate) fn stage_source(snapshot: Snapshot, prior: &BranchIndex, source: Sour
             _ => (),
         }
     }
+    stage_spatial_builds(prior, effects, &mut buffer, memory)?;
     buffer.stage()
+}
+
+fn stage_spatial_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &mut TransactionBuffer, memory: &Arc<MemoryBudget>) -> Result<()> {
+    let declarations = effects.iter().filter_map(|effect| match effect {
+        BranchEffect::Declare { table, definition } if data_table(table) => Some((table, definition)),
+        _ => None,
+    });
+    let _scratch = memory.reserve(declarations.clone().count().saturating_mul(128))?;
+    let final_tables: BTreeMap<_, _> = declarations.collect();
+    let catalog = TableRef::new("xt", SPATIAL_BUILD_CATALOG);
+    for (table, final_definition) in final_tables {
+        let old = prior.definition(table, prior.head().basis).filter(|definition| !definition.dropped);
+        let final_indexes = &final_definition.ranked_indexes;
+        let id = |name: &str| format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table);
+        if let Some(old) = old {
+            for (name, declaration) in &old.ranked_indexes {
+                if matches!(&declaration.definition.kind, RankedIndexKind::Spatial { .. })
+                    && !final_indexes.get(name).is_some_and(|index| matches!(&index.definition.kind, RankedIndexKind::Spatial { .. }))
+                {
+                    buffer.delete(catalog.clone(), &EntityId::String(id(name)), Interval::ALL)?;
+                }
+            }
+        }
+        for (name, declaration) in final_indexes {
+            let RankedIndexKind::Spatial { geometry_encoding } = &declaration.definition.kind else { continue; };
+            if old.and_then(|old| old.ranked_indexes.get(name)) == Some(declaration) { continue; }
+            let Ok(generation) = i64::try_from(declaration.position) else { continue; };
+            let row = StructFields::from([
+                ("_id".into(), Value::Utf8(id(name))),
+                ("index_name".into(), Value::Utf8(name.clone())),
+                ("schema_name".into(), Value::Utf8(table.schema.clone())),
+                ("table_name".into(), Value::Utf8(table.table.clone())),
+                ("columns".into(), Value::list(declaration.definition.columns.iter().cloned().map(Value::Utf8).collect())),
+                ("geometry_encoding".into(), Value::Utf8(geometry_encoding.clone())),
+                ("version".into(), Value::I64(generation)),
+            ]);
+            buffer.put(catalog.clone(), row, Interval::ALL)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_protected(image: &RowImage) -> bool { image.custody_group.is_some() || image.custody_payload.is_some() }
@@ -225,6 +266,46 @@ fn append(buffer: &mut TransactionBuffer, table: &TableRef, iid: Iid, valid_time
 mod tests {
     use super::*;
     use rtdb_types::{EventOp, Value};
+
+    #[test]
+    fn the_ordered_native_spatial_definition_stages_its_generation_and_withdraws_on_drop() {
+        use rtdb_index::branches::{RankedIndexDeclaration, RankedIndexDefinition};
+        use rtdb_tx::transact::Outcome;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let partition = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        let table = TableRef::new("public", "places");
+        let catalog = TableRef::new("xt", SPATIAL_BUILD_CATALOG);
+        let mut index = BranchIndex::new([7; 16]);
+        let basis = Basis::new([7; 16], 20);
+        let define = BranchEffect::Declare { table: table.clone(), definition: BranchTable {
+            ranked_indexes: [("by_geometry".into(), RankedIndexDeclaration {
+                definition: RankedIndexDefinition {
+                    columns: vec!["geometry".into(), "region".into()],
+                    kind: RankedIndexKind::Spatial { geometry_encoding: "tagged-wkb-v1".into() },
+                },
+                position: basis.position(),
+            })].into(),
+            ..Default::default()
+        }};
+        let receipt = |basis, time| Receipt { basis, system_time: Timestamp(time), key: vec![1; 16], outcome: Outcome::Then,
+            replayed: false, erasure: None };
+        let write = stage_source(partition.snapshot(), &index, SourcePosition(30), &receipt(basis, 10), std::slice::from_ref(&define), &memory).unwrap();
+        let batch = write.tables()[&catalog].batch().unwrap();
+        let event = batch.view().read_event(0).unwrap();
+        let StoredOperation::Put(row) = event.operation else { panic!("expected a build definition"); };
+        assert_eq!(row.get("version"), Some(&Value::I64(20)));
+        assert_eq!(row.get("columns"), Some(&Value::list(vec![Value::Utf8("geometry".into()), Value::Utf8("region".into())])));
+        let iid = event.iid;
+        partition.apply(&write).unwrap();
+        index.advance(BranchCut { basis, system_time: Timestamp(10) }).unwrap();
+        index.apply(define).unwrap();
+        let drop = BranchEffect::Declare { table, definition: BranchTable { dropped: true, ..Default::default() } };
+        let write = stage_source(partition.snapshot(), &index, SourcePosition(31), &receipt(Basis::new([7; 16], 21), 11), &[drop], &memory).unwrap();
+        let event = write.tables()[&catalog].batch().unwrap().view().read_event(0).unwrap();
+        assert!(matches!(event.operation, StoredOperation::Delete));
+        assert_eq!(event.iid, iid);
+    }
 
     #[test]
     fn a_protected_assertion_only_masks_the_previously_clear_overlap_at_its_stored_iid() {
