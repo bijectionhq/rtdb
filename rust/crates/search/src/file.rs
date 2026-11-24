@@ -1606,7 +1606,8 @@ mod tests {
         let tree = Arc::new(TreeFile::remote(pool.clone(), key.clone(), cache.clone(), &locator, &columns, "remote-v14", 42, None).await.unwrap());
         let term = Query::parse("invoice");
         let scoring = Arc::new(Scorer::new(term.clone(), None)).for_ranking().unwrap();
-        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer, &memory).await.unwrap();
         assert_eq!(rank.bound().unwrap().integer_id(), Some(0));
         assert!(rank.expand(None, &mut 0).await.unwrap().is_empty());
         let mut hits = Vec::new();
@@ -1648,7 +1649,7 @@ mod tests {
         let bad_key = ObjectKey::new("search/bad-tree").unwrap();
         store.put(&bad_key, damaged.into()).await.unwrap();
         let bad = Arc::new(TreeFile::remote(pool.clone(), bad_key, cache, &locator, &columns, "remote-v14", 42, None).await.unwrap());
-        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.is_err());
+        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer, &memory).await.is_err());
     }
 
     #[test]

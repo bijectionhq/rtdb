@@ -1122,7 +1122,9 @@ mod tests {
         let scoring = Query::parse("audit");
         let bounds = TemporalBounds { valid_time: Interval::at(Timestamp(2)).unwrap(), system_time: Interval::at(Timestamp(2)).unwrap() };
         let scorer = Arc::new(Scorer::new(scoring.clone(), None)).for_ranking().unwrap();
-        let mut rank = super::super::TreeRanked::open(Arc::clone(&tree), 0, &matching, &scorer, bounds, super::super::TreeRankOrder::Integer).await.unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let mut rank = super::super::TreeRanked::open(Arc::clone(&tree), 0, &matching, &scorer, bounds,
+            super::super::TreeRankOrder::Integer, &memory).await.unwrap();
         assert_eq!(rank.bound().unwrap().integer_id(), Some(0));
         let mut actual = BTreeMap::new();
         while rank.bound().is_some() {
