@@ -409,6 +409,7 @@
 --      A silent writer and uncertified staged suffix add no dependency when a quorum, hold and selected applied cut are available.
 --      An enrolled ordered reader can protect replay and apply the barrier while the writer grant is vacant.
 --      Ordinary Flight release consumes durable, authenticated range evidence at a protected applied cut of the same history.
+--      The optional hosted applied point can carry a complete typed handle and checks the original revision and event position on the original and newly pinned catalogs.
 --      A replay-safe unpinned read may retry within the same lineage before output, with its causal floor and audience intact.
 --      A read transaction retains its captured basis across later statements.
 --      Each explicit snapshot token identifies the basis the caller selected.

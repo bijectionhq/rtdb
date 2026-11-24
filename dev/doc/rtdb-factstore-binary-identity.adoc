@@ -58,6 +58,15 @@ Public pgwire accepts the existing text, keyword, signed integer and UUID entity
   Replay constraint member receipts keep the Utf8 member key and use holder marker `02` followed by the existing big-endian u64 length and raw bytes for a Binary holder.
   Where a prepared Sample membership exclusion names a Binary identity, send SHA-256 of byte `ff` followed by the raw identity payload in the existing sorted digest list.
 
+== Applied confirmation
+
+In Bijection's `owned_flight.rs`, update `AppliedPointCheck` and `HeldRead::confirm_applied_hosted_read` to send flag `02` for a Binary fact point.
+After the relation prefix send a big-endian u16 equal to `1 + address_bytes.len()`, tag byte `04` and the raw canonical address bytes.
+The raw address payload is 1 to 4096 bytes.
+Send the original signed i64 valid instant and the existing absence byte or presence byte with the original signed i64 revision and 16-byte event position.
+Keep flag `00` for no point and flag `01` with a raw Utf8 key for publication markers and other text points.
+The floor, deadline, following hosted control groups and confirmation reply keep their existing framing.
+
 == Bijection source work
 
 * Carry typed keys through `crates/native_store_runtime/src/rtdb/fact_points.rs` and `fact_points/write_runs.rs`, including `FactHeader`, `FactRun`, boxed or packed `Entry` rows, reposting, and the shared point builders.

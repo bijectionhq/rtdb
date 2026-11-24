@@ -44,17 +44,23 @@ fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Stat
     let (kind, body) = body.split_first().ok_or_else(|| invalid("Applied confirmation requires a point flag"))?;
     match kind {
         0 => return Ok((None, body)),
-        1 => (),
+        1 | 2 => (),
         _ => return Err(invalid("Applied confirmation supports at most one point")),
     }
     let (relation, body) = split_relation(body)?;
     let (size, body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Missing applied point key size"))?;
     let size = usize::from(u16::from_be_bytes(*size));
-    if !(1..=4096).contains(&size) {
+    let typed = *kind == 2;
+    let tag_bytes = usize::from(typed);
+    if !(1 + tag_bytes..=4096 + tag_bytes).contains(&size) {
         return Err(invalid("Applied point key exceeds its bound"));
     }
     let (id, body) = body.split_at_checked(size).ok_or_else(|| invalid("Truncated applied point key"))?;
-    let id = std::str::from_utf8(id).map_err(|_| invalid("Applied point key is not UTF-8"))?;
+    let id = if typed {
+        EntityId::from_handle_bytes(id).map_err(status)?
+    } else {
+        EntityId::String(std::str::from_utf8(id).map_err(|_| invalid("Applied point key is not UTF-8"))?.to_owned())
+    };
     let (valid_at, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing applied point valid time"))?;
     let (present, body) = body.split_first().ok_or_else(|| invalid("Missing applied point revision flag"))?;
     let (expected, body) = match present {
@@ -67,7 +73,7 @@ fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Stat
         _ => return Err(invalid("Invalid applied point revision flag")),
     };
     Ok((Some(AppliedOwnedPoint {
-        relation, id: EntityId::String(id.to_owned()),
+        relation, id,
         valid_at: Timestamp(i64::from_be_bytes(*valid_at)), expected,
     }), body))
 }
@@ -227,5 +233,31 @@ mod tests {
         assert_eq!(point.valid_at, Timestamp(17));
         assert!(point.expected.is_none());
         assert_eq!(remaining, &[7]);
+    }
+
+    #[test]
+    fn applied_confirmation_reads_the_complete_binary_key_before_the_original_point_stamp() {
+        let mut body = vec![2, 0, 1, b'r', 0, 4, 4, 0, 255, 0];
+        body.extend_from_slice(&17_i64.to_be_bytes());
+        body.push(1);
+        body.extend_from_slice(&13_i64.to_be_bytes());
+        let position = rtdb_types::EventPosition { transaction: rtdb_types::TxId(6), ordinal: 8 };
+        body.extend_from_slice(&position.to_bytes());
+        body.extend_from_slice(&[0, 1, 9]);
+        let (point, controls) = applied_point(&body).unwrap();
+        let point = point.unwrap();
+        assert_eq!(point.id, EntityId::Binary(vec![0, 255, 0]));
+        assert_eq!(point.valid_at, Timestamp(17));
+        assert_eq!(point.expected, Some(rtdb_types::OwnedPointVersion { history: Timestamp(13), position }));
+        assert_eq!(controls, &[0, 1, 9]);
+
+        body[6] = 5;
+        let error = applied_point(&body[..10]).err().unwrap();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.message(), "Invalid complete typed identity");
+
+        body[0] = 1;
+        let error = applied_point(&body).err().unwrap();
+        assert_eq!(error.message(), "Applied point key is not UTF-8");
     }
 }
