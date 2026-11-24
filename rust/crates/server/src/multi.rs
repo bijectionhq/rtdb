@@ -870,6 +870,10 @@ fn io_error(error: io::Error) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_flight_sql::{
+        DeploymentAdminAction, DeploymentAdminAuthority, admin_client::DeploymentAdminClient,
+        rtdb::admin::v1::CreateDeploymentRequest,
+    };
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
 
@@ -891,13 +895,46 @@ mod tests {
     }
 
     async fn restart() {
+        #[derive(Debug)]
+        struct ReportProvisioner;
+
+        impl DeploymentAdminAuthority for ReportProvisioner {
+            fn authorize(
+                &self,
+                principal: &rtdb_auth::Principal,
+                action: DeploymentAdminAction<'_>,
+            ) -> Result<()> {
+                if principal.user_id() == Some("xtdb")
+                    && matches!(
+                        action,
+                        DeploymentAdminAction::Create {
+                            deployment: "reports"
+                        }
+                    )
+                {
+                    return Ok(());
+                }
+                Err(Anomaly::new(
+                    AnomalyCategory::Forbidden,
+                    "rtdb.test/admin",
+                    "The fixture admits report creation only",
+                ))
+            }
+        }
+
         let data = tempfile::tempdir().unwrap();
         let mut expected = None;
         let key = vec![37; 16];
         for reopen in [false, true] {
             let limit = 256 << 20;
-            let mut config =
-                NodeConfiguration::from_yaml_with_environment("", &|_| None, false).unwrap();
+            let mut config = NodeConfiguration::from_yaml_with_environment("", &|_| None, false)
+                .unwrap()
+                .with_deployment_admin(Arc::new(ReportProvisioner));
+            config.auth = rtdb_auth::AuthConfig::SingleRootUser {
+                password: Some(rtdb_auth::Secret::new("secret")),
+            };
+            config.flight_sql.as_mut().unwrap().host = "127.0.0.1".into();
+            config.flight_sql.as_mut().unwrap().port = 0;
             let memory =
                 MemoryBudget::new(config.node_options(limit).unwrap().execution_memory_bytes);
             let runtime = MultiRuntime::development(data.path(), &mut config, Arc::clone(&memory))
@@ -934,16 +971,25 @@ mod tests {
                 );
             } else {
                 runtime.tick(handle.node()).await.unwrap();
-                handle
-                    .node()
-                    .create_managed_deployment("reports".into())
+                let endpoint = format!("http://{}", handle.addresses().flight_sql.unwrap());
+                let mut admin = DeploymentAdminClient::connect(endpoint, "Basic eHRkYjpzZWNyZXQ=")
                     .await
                     .unwrap();
-                handle
-                    .node()
-                    .create_managed_deployment("reports".into())
+                let rejected = admin
+                    .create(CreateDeploymentRequest {
+                        deployment: "another".into(),
+                    })
                     .await
-                    .unwrap();
+                    .unwrap_err();
+                assert_eq!(rejected.category, AnomalyCategory::Forbidden);
+                let create = CreateDeploymentRequest {
+                    deployment: "reports".into(),
+                };
+                assert_eq!(
+                    admin.create(create.clone()).await.unwrap().deployment,
+                    "reports"
+                );
+                assert_eq!(admin.create(create).await.unwrap().deployment, "reports");
                 let receipt = driver
                     .transact(
                         Transact {
