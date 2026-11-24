@@ -396,9 +396,13 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
                 (array, Arc::clone(field), logical.clone())
             }
             Column::Selected(selected) => {
-                let (vector, reservation) = selected.fragment_vector(rows.clone(), memory)?;
-                reservations.push(reservation);
-                vector
+                if let Some(slice) = selected.fragment_slice(rows.clone()) {
+                    slice
+                } else {
+                    let (vector, reservation) = selected.fragment_vector(rows.clone(), memory)?;
+                    reservations.push(reservation);
+                    vector
+                }
             }
             _ => return Err(invalid("fragment-encode", "Fragment column lacks its packed Arrow vector")),
         };
