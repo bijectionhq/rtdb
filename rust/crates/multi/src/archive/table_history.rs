@@ -205,7 +205,8 @@ impl HostedTableReplay {
                     block,
                     HistoryRow::Header {
                         header: event.header,
-                        origin: event.origin,
+                        origin: Some(event.origin),
+                        page_row: 0,
                     },
                 )?;
             }
@@ -215,6 +216,8 @@ impl HostedTableReplay {
         if !directory.has_erases() && (suffix_blocks != retained_suffix || !admitted.is_empty()) {
             return Err(unavailable());
         }
+        let mut columns = read.put_columns.to_vec();
+        if !columns.iter().any(|column| column == "_id") { columns.push("_id".to_owned()); }
         for trie in read.snapshot.trie_catalog().current_tries(read.table) {
             if payloads.is_empty() {
                 break;
@@ -225,6 +228,7 @@ impl HostedTableReplay {
                 read.cancellation,
                 &entry.slug,
                 &trie.key,
+                &columns,
                 |batch| {
                     for row in 0..batch.len() {
                         let Some(origin) = batch.origin(row)? else {

@@ -245,7 +245,7 @@ fn record_history_row(source: HistoryRow<'_>, columns: &[String], analyzer: rtdb
     if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
     let (mut header, origin, row) = match source {
         HistoryRow::Stored { batch, row } => (batch.header(row)?, batch.origin(row)?, row),
-        HistoryRow::Header { header, origin } => (header, Some(origin), 0),
+        HistoryRow::Header { header, origin, page_row } => (header, origin, page_row),
     };
     if header.op == EventOp::Redacted {
         return Err(fault("Search repair requires assertion-level redaction coverage"));
@@ -358,7 +358,7 @@ impl SearchBuilder {
         let mut total = 0i64;
         let mut selected = 0i64;
         let mut observed = std::collections::BTreeSet::new();
-        let read = HistoryRead { snapshot, storage: &self.storage, memory: &self.memory, cancellation, table: &index.table, blocks };
+        let read = HistoryRead { snapshot, storage: &self.storage, memory: &self.memory, cancellation, table: &index.table, blocks, put_columns: columns };
         let Some(coverage) = source.visit_table(read, &mut |block, row| {
             if block.0 < 0 || block > boundary.block_index() { return Err(fault("Search history has an invalid source block")); }
             total = total.checked_add(1).ok_or_else(|| fault("Search replay row count overflow"))?;
@@ -1100,9 +1100,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl TableHistorySource for TableReplay {
-        async fn visit_table(&self, _: HistoryRead<'_>, visit: &mut HistoryVisitor<'_>) -> Result<Option<HistoryCoverage>> {
+        async fn visit_table(&self, read: HistoryRead<'_>, visit: &mut HistoryVisitor<'_>) -> Result<Option<HistoryCoverage>> {
             for (block, batch) in self.0.iter().enumerate() {
-                visit(BlockIndex(block as i64), HistoryRow::Stored { batch, row: 0 })?;
+                let block = BlockIndex(block as i64);
+                let history = if read.blocks.binary_search(&block.0).is_ok() {
+                    HistoryRow::Stored { batch, row: 0 }
+                } else {
+                    HistoryRow::Header { header: batch.header(0)?, origin: batch.origin(0)?, page_row: 0 }
+                };
+                visit(block, history)?;
             }
             Ok(Some(HistoryCoverage::Native { lineage: "native/journal".into(), through: REPLAY_THROUGH }))
         }

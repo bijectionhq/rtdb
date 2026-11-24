@@ -51,7 +51,7 @@ pub(crate) fn term_stats(nodes: &StructArray, row: usize, doc_freq: u32) -> Resu
 }
 pub(crate) use layout::FileDigestWriter;
 pub(crate) use page_tree::PageCache;
-pub(crate) use tree_file::{EncodedTreeLocator, MAX_ROOT_BYTES, TreeFile, TreeLocator};
+pub(crate) use tree_file::{EncodedTreeLocator, MAX_ROOT_BYTES, TreeFile, TreeLocation, TreeLocator};
 pub(crate) use tree_file::LogicalDocument;
 pub(crate) use tree_rank::{TreeRankOrder, TreeRanked};
 pub(crate) use write::{BuildMode, write_group_as};
@@ -1581,7 +1581,7 @@ mod tests {
         store.put(&key, bytes.clone().into()).await.unwrap();
         let pool = Arc::new(BufferPool::new(store.clone(), 16 << 20));
         let cache = Arc::new(PageCache::new(4 << 20));
-        let tree = Arc::new(TreeFile::remote(pool.clone(), key.clone(), cache.clone(), &locator, &columns, "remote-v14", 42).await.unwrap());
+        let tree = Arc::new(TreeFile::remote(pool.clone(), key.clone(), cache.clone(), &locator, &columns, "remote-v14", 42, None).await.unwrap());
         let term = Query::parse("invoice");
         let scoring = Arc::new(Scorer::new(term.clone(), None)).for_ranking().unwrap();
         let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.unwrap();
@@ -1625,7 +1625,7 @@ mod tests {
         damaged[term_ref.offset as usize + term_ref.metadata as usize] ^= 1;
         let bad_key = ObjectKey::new("search/bad-tree").unwrap();
         store.put(&bad_key, damaged.into()).await.unwrap();
-        let bad = Arc::new(TreeFile::remote(pool.clone(), bad_key, cache, &locator, &columns, "remote-v14", 42).await.unwrap());
+        let bad = Arc::new(TreeFile::remote(pool.clone(), bad_key, cache, &locator, &columns, "remote-v14", 42, None).await.unwrap());
         assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.is_err());
     }
 

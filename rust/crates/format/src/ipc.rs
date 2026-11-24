@@ -302,6 +302,12 @@ pub struct PageDecoder {
     dictionaries: Vec<arrow_ipc::Block>,
 }
 
+#[derive(Clone, Copy)]
+pub enum PageProjection<'a> {
+    Iid,
+    PutColumns(&'a [String]),
+}
+
 impl PageDecoder {
     pub fn from_footer(bytes: &[u8], data_end: u64, projection: Option<Vec<usize>>) -> Result<Self> {
         let footer = arrow_ipc::root_as_footer(bytes).map_err(invalid)?;
@@ -369,6 +375,13 @@ impl PageDecoder {
         block_bound(self.block(page)?, bytes, false)
     }
 
+    /// Includes the schema allocations needed when a full page backs a projected query.
+    pub fn full_page_decode_bound(&self, page: usize, bytes: &[u8]) -> Result<usize> {
+        let body = self.page_bound(page, bytes)?;
+        let (schema, _) = schema_metrics(&self.schema, decoded_schema::MAX_DEPTH)?;
+        allocation_add(body, schema)
+    }
+
     pub fn dictionary_bound(&self, index: usize, bytes: &[u8]) -> Result<usize> {
         block_bound(self.dictionary(index)?, bytes, true)
     }
@@ -381,27 +394,52 @@ impl PageDecoder {
 
     pub fn decode_iid_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
         let iid = self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
-        match self.decode_projected(page, &bytes, projection::Selection::Iid) {
+        match self.decode_projected_page(page, &bytes, PageProjection::Iid) {
             Ok(batch) => Ok(batch),
             Err(_) => self.decode_page(page, bytes)?.project(&[iid]).map_err(invalid),
         }
     }
 
     pub fn decode_event_page(&self, page: usize, bytes: Buffer, put_columns: &[String]) -> Result<RecordBatch> {
-        match self.decode_projected(page, &bytes, projection::Selection::PutColumns(put_columns)) {
+        match self.decode_projected_page(page, &bytes, PageProjection::PutColumns(put_columns)) {
             Ok(batch) => Ok(batch),
             // Some reference layouts use undefined union legs or unknown null counts.
             Err(_) => self.decode_page(page, bytes),
         }
     }
 
-    fn decode_projected(&self, page: usize, bytes: &Buffer, selection: projection::Selection<'_>) -> Result<RecordBatch> {
+    /// Admits selected decode allocations while `wire` owns the already-funded IPC bytes.
+    /// `None` leaves full-page admission to the caller.
+    pub fn decode_projected_page_reserved<G>(
+        &self, page: usize, wire: impl AsRef<[u8]> + Send + 'static, selection: PageProjection<'_>,
+        mut reserve: impl FnMut(usize) -> Result<G>,
+    ) -> Result<Option<(RecordBatch, G)>> {
+        if matches!(selection, PageProjection::Iid) {
+            self.source_schema.index_of("_iid").map_err(crate::data::event_arrow_error)?;
+        }
+        let bytes = wire.as_ref();
+        let (batch, version, body) = self.projected_block(page, bytes)?;
+        let Some((bound, workspace)) = projection::allocation_bound(&bytes[body..], batch, &self.decoded_schema, version, selection)? else {
+            return Ok(None);
+        };
+        let charge = reserve(bound)?;
+        let _workspace = (workspace != 0).then(|| reserve(workspace)).transpose()?;
+        let bytes = Buffer::from(Bytes::from_owner(wire));
+        Ok(self.decode_projected_page(page, &bytes, selection).ok().map(|batch| (batch, charge)))
+    }
+
+    fn decode_projected_page(&self, page: usize, bytes: &Buffer, selection: PageProjection<'_>) -> Result<RecordBatch> {
+        let (batch, version, body) = self.projected_block(page, bytes)?;
+        projection::decode(&bytes.slice(body), batch, &self.decoded_schema, version, selection)
+    }
+
+    fn projected_block<'a>(&self, page: usize, bytes: &'a [u8]) -> Result<(arrow_ipc::RecordBatch<'a>, arrow_ipc::MetadataVersion, usize)> {
         let block = self.block(page)?;
         let (header, metadata_end) = block_message(block, bytes)?;
         let message = arrow_ipc::root_as_message(&bytes[header]).map_err(invalid)?;
         check_block_message(&message, bytes.len() - metadata_end, false)?;
         let batch = message.header_as_record_batch().ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
-        projection::decode(&bytes.slice(metadata_end), batch, &self.decoded_schema, message.version(), selection)
+        Ok((batch, message.version(), metadata_end))
     }
 
     pub fn decode_page(&self, page: usize, bytes: Buffer) -> Result<RecordBatch> {
@@ -845,43 +883,52 @@ fn framed_message_allocation_bound(header: &[u8], body: &[u8], metadata_length: 
 fn framed_message_bound(header: &[u8], body: &[u8], metadata_length: usize, field_bound: fn(usize) -> Result<usize>) -> Result<usize> {
     let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
     if let Some(schema) = message.header_as_schema() { validate_decimal_metadata(schema)?; }
-    message_bound(&message, metadata_length, body.len(), field_bound, |start| {
-        let prefix: [u8; 8] = body.get(start..allocation_add(start, 8)?).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
-        Ok(i64::from_le_bytes(prefix))
-    })
+    message_bound(&message, metadata_length, body.len(), field_bound, |start| compressed_buffer_length(body, start))
 }
 
 fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, field_bound: fn(usize) -> Result<usize>, mut compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
     let mut bound = allocation_add(8192, allocation_add(allocation_mul(header_length, 16)?, allocation_mul(body_length, 4)?)?)?;
     if usize::try_from(message.bodyLength()).map_err(invalid)? > body_length { return Err(invalid("Arrow message body is truncated")); }
     if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
-        if let Some(compression) = batch.compression() {
-            let scratch = match compression.codec() {
-                arrow_ipc::CompressionType::LZ4_FRAME => 64 << 20,
-                arrow_ipc::CompressionType::ZSTD => 1 << 20,
-                _ => return Err(invalid("Unknown Arrow compression codec")),
-            };
-            bound = allocation_add(bound, scratch)?;
-        }
+        bound = allocation_add(bound, codec_workspace(batch)?)?;
         if let Some(nodes) = batch.nodes() {
             for node in nodes { bound = allocation_add(bound, field_bound(usize::try_from(node.length()).map_err(invalid)?)?)?; }
         }
         if let Some(buffers) = batch.buffers() {
             for buffer in buffers {
-                let start = usize::try_from(buffer.offset()).map_err(invalid)?;
-                let length = usize::try_from(buffer.length()).map_err(invalid)?;
-                if allocation_add(start, length)? > body_length { return Err(invalid("Arrow buffer exceeds its message body")); }
-                let decoded = if batch.compression().is_some() && length != 0 {
-                    if length < 8 { return Err(invalid("Compressed Arrow buffer has no length")); }
-                    let decoded = compressed_length(start)?;
-                    if decoded == -1 { length - 8 } else { usize::try_from(decoded).map_err(invalid)? }
-                } else { length };
-                bound = allocation_add(bound, allocation_add(allocation_mul(decoded, 4)?, 512)?)?;
+                let (decoded, _) = decoded_buffer_length(buffer, body_length, batch.compression().is_some(), &mut compressed_length)?;
+                bound = allocation_add(bound, decoded_buffer_bound(decoded)?)?;
             }
         }
     }
     Ok(bound)
 }
+
+fn codec_workspace(batch: arrow_ipc::RecordBatch<'_>) -> Result<usize> {
+    match batch.compression().map(|compression| compression.codec()) {
+        None => Ok(0),
+        Some(arrow_ipc::CompressionType::LZ4_FRAME) => Ok(64 << 20),
+        Some(arrow_ipc::CompressionType::ZSTD) => Ok(1 << 20),
+        _ => Err(invalid("Unknown Arrow compression codec")),
+    }
+}
+
+fn compressed_buffer_length(body: &[u8], start: usize) -> Result<i64> {
+    let prefix: [u8; 8] = body.get(start..allocation_add(start, 8)?).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
+    Ok(i64::from_le_bytes(prefix))
+}
+
+fn decoded_buffer_length(buffer: &arrow_ipc::Buffer, body_length: usize, compressed: bool, compressed_length: impl FnOnce(usize) -> Result<i64>) -> Result<(usize, bool)> {
+    let start = usize::try_from(buffer.offset()).map_err(invalid)?;
+    let length = usize::try_from(buffer.length()).map_err(invalid)?;
+    if allocation_add(start, length)? > body_length { return Err(invalid("Arrow buffer exceeds its message body")); }
+    if !compressed || length == 0 { return Ok((length, false)); }
+    if length < 8 { return Err(invalid("Compressed Arrow buffer has no length")); }
+    let decoded = compressed_length(start)?;
+    if decoded == -1 { Ok((length - 8, false)) } else { Ok((usize::try_from(decoded).map_err(invalid)?, decoded > 0)) }
+}
+
+fn decoded_buffer_bound(length: usize) -> Result<usize> { allocation_add(allocation_mul(length, 4)?, 512) }
 
 fn validate_lz4_lengths(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result<()> {
     let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) else { return Ok(()); };
@@ -987,34 +1034,39 @@ fn allocation_mul(left: usize, right: usize) -> Result<usize> { left.checked_mul
 
 /// Bounds schema clones, decimal translation tables and encoded schema/footer scratch without allocating.
 /// Reserve before encoding, and retain the guard until the derived schema objects are released.
-pub fn schema_translation_bound(schema: &Schema) -> Result<usize> { Ok(schema_metrics(schema)?.0) }
-fn dictionary_count(schema: &Schema) -> Result<usize> { Ok(schema_metrics(schema)?.1) }
-fn schema_metrics(schema: &Schema) -> Result<(usize, usize)> {
-    fn metadata(entries: &HashMap<String, String>) -> Result<usize> {
-        entries.iter().try_fold(0, |bytes, (key, value)| allocation_add(bytes, allocation_add(512, allocation_mul(allocation_add(key.len(), value.len())?, 16)?)?))
+pub fn schema_translation_bound(schema: &Schema) -> Result<usize> { Ok(schema_metrics(schema, 64)?.0) }
+fn dictionary_count(schema: &Schema) -> Result<usize> { Ok(schema_metrics(schema, 64)?.1) }
+fn schema_metadata_bound(entries: &HashMap<String, String>) -> Result<usize> {
+    entries.iter().try_fold(0, |bytes, (key, value)| allocation_add(bytes, allocation_add(512, allocation_mul(allocation_add(key.len(), value.len())?, 16)?)?))
+}
+
+fn field_metadata_bound(field: &arrow_schema::Field) -> Result<usize> {
+    allocation_add(allocation_mul(field.name().len(), 16)?, schema_metadata_bound(field.metadata())?)
+}
+
+fn schema_metrics(schema: &Schema, max_depth: usize) -> Result<(usize, usize)> {
+    fn field(value: &arrow_schema::Field, depth: usize, max_depth: usize) -> Result<(usize, usize)> {
+        let (bytes, dictionaries) = data_type(value.data_type(), depth, max_depth)?;
+        Ok((allocation_add(bytes, field_metadata_bound(value)?)?, dictionaries))
     }
-    fn field(value: &arrow_schema::Field, depth: usize) -> Result<(usize, usize)> {
-        let (bytes, dictionaries) = data_type(value.data_type(), depth)?;
-        Ok((allocation_add(bytes, allocation_add(allocation_mul(value.name().len(), 16)?, metadata(value.metadata())?)?)?, dictionaries))
-    }
-    fn data_type(value: &arrow_schema::DataType, depth: usize) -> Result<(usize, usize)> {
+    fn data_type(value: &arrow_schema::DataType, depth: usize, max_depth: usize) -> Result<(usize, usize)> {
         use arrow_schema::DataType;
-        if depth > 64 { return Err(invalid("Arrow schema exceeds the encoding depth limit")); }
+        if depth > max_depth { return Err(invalid("Arrow schema exceeds the encoding depth limit")); }
         let mut bytes = 4096; let mut dictionaries = 0;
         let mut add = |(next_bytes, next_dictionaries)| -> Result<()> { bytes = allocation_add(bytes, next_bytes)?; dictionaries = allocation_add(dictionaries, next_dictionaries)?; Ok(()) };
         match value {
-            DataType::Struct(fields) => for value in fields { add(field(value, depth + 1)?)?; },
-            DataType::Union(fields, _) => for (_, value) in fields.iter() { add(field(value, depth + 1)?)?; },
-            DataType::List(value) | DataType::LargeList(value) | DataType::ListView(value) | DataType::LargeListView(value) | DataType::FixedSizeList(value, _) | DataType::Map(value, _) => add(field(value, depth + 1)?)?,
-            DataType::RunEndEncoded(ends, values) => { add(field(ends, depth + 1)?)?; add(field(values, depth + 1)?)?; }
-            DataType::Dictionary(key, value) => { add(data_type(key, depth + 1)?)?; add(data_type(value, depth + 1)?)?; add((0, 1))?; }
+            DataType::Struct(fields) => for value in fields { add(field(value, depth + 1, max_depth)?)?; },
+            DataType::Union(fields, _) => for (_, value) in fields.iter() { add(field(value, depth + 1, max_depth)?)?; },
+            DataType::List(value) | DataType::LargeList(value) | DataType::ListView(value) | DataType::LargeListView(value) | DataType::FixedSizeList(value, _) | DataType::Map(value, _) => add(field(value, depth + 1, max_depth)?)?,
+            DataType::RunEndEncoded(ends, values) => { add(field(ends, depth + 1, max_depth)?)?; add(field(values, depth + 1, max_depth)?)?; }
+            DataType::Dictionary(key, value) => { add(data_type(key, depth + 1, max_depth)?)?; add(data_type(value, depth + 1, max_depth)?)?; add((0, 1))?; }
             DataType::Timestamp(_, Some(zone)) => add((allocation_mul(zone.len(), 16)?, 0))?,
             _ => {}
         }
         Ok((bytes, dictionaries))
     }
-    schema.fields().iter().try_fold((allocation_add(65_536, metadata(schema.metadata())?)?, 0), |(bytes, dictionaries), value| {
-        let (next_bytes, next_dictionaries) = field(value, 0)?;
+    schema.fields().iter().try_fold((allocation_add(65_536, schema_metadata_bound(schema.metadata())?)?, 0), |(bytes, dictionaries), value| {
+        let (next_bytes, next_dictionaries) = field(value, 0, max_depth)?;
         Ok((allocation_add(bytes, next_bytes)?, allocation_add(dictionaries, next_dictionaries)?))
     })
 }

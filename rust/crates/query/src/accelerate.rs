@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeBinaryArray, Float64Array, Int64Array, builder::FixedSizeBinaryBuilder};
+use arrow_buffer::Buffer;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::keys::TrieKey;
@@ -126,7 +127,7 @@ impl<'a> ScanRequest<'a> {
         let scores = rows.iter().map(|winner| (winner.row.version.iid, winner.key.score)).collect();
         let Some(scores) = CandidateScores::from_verified(scores, self.memory)? else { return Ok(None); };
         let iids = CandidateIids::build(scores.iids.len(), scores.iter().map(|(iid, _)| iid), self.memory)?;
-        let rows = match self.verifier.gather_ranked(rows.into_iter().map(|winner| winner.row).collect()).await {
+        let rows = match self.verifier.gather_ranked(rows).await {
             Ok(rows) => rows,
             Err(error) if error.code == "rtdb/memory-budget-exceeded" => BTreeMap::new(),
             Err(error) => return Err(error),
@@ -145,7 +146,7 @@ pub trait CandidateVerifier: Send + Sync {
         _scorer: &rtdb_text::Scorer) -> Result<Option<Vec<crate::VerifiedRankRow>>> { Ok(None) }
 
     /// Gathers the scan's output columns from verified versions after ranking.
-    async fn gather_ranked(&self, _rows: Vec<ResolvedSearchRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
+    async fn gather_ranked(&self, _rows: Vec<crate::VerifiedRankRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
 
     /// The IIDs whose visible version at the scan's cut satisfies every predicate of the scan, or `None` where this verifier cannot say.
     async fn retain_visible(&self, _iids: &CandidateIids) -> Result<Option<CandidateIids>> { Ok(None) }
@@ -155,6 +156,15 @@ pub trait CandidateVerifier: Send + Sync {
 pub enum SearchRowLocation {
     Persisted { trie: TrieKey, page: u32, row: u32 },
     Live(RowSource),
+}
+
+impl SearchRowLocation {
+    pub(crate) fn persisted_page(&self) -> Option<(&TrieKey, u32)> {
+        match self {
+            Self::Persisted { trie, page, .. } => Some((trie, *page)),
+            Self::Live(_) => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -282,6 +292,107 @@ pub struct ScanSelection {
     pub scores: Option<CandidateScores>,
 }
 
+pub struct OrderedIidBuffer {
+    values: Vec<[u8; 16]>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl OrderedIidBuffer {
+    pub fn with_capacity(capacity: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(Self::reserved_bytes(capacity)?)?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(capacity).map_err(|error| crate::invalid("ordered-iid-capacity", error))?;
+        Ok(Self { values, reservation })
+    }
+
+    fn reserved_bytes(capacity: usize) -> Result<usize> {
+        capacity.checked_mul(16).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| crate::invalid("ordered-iid-capacity", "Ordered IID buffer exceeds addressable memory"))
+    }
+
+    pub fn len(&self) -> usize { self.values.len() }
+    pub fn is_empty(&self) -> bool { self.values.is_empty() }
+    pub fn iter(&self) -> impl Iterator<Item = Iid> + '_ { self.values.iter().copied().map(Iid) }
+
+    pub fn push(&mut self, iid: Iid) {
+        assert!(self.len() < self.values.capacity(), "Ordered IID buffer requires admitted capacity");
+        self.values.push(iid.0);
+    }
+
+    fn reserve(&mut self, capacity: usize) -> Result<()> {
+        let current = self.values.capacity();
+        if capacity <= current { return Ok(()); }
+
+        let retained = Self::reserved_bytes(capacity)?;
+        let peak = retained.checked_add(current * 16)
+            .ok_or_else(|| crate::invalid("ordered-iid-capacity", "Ordered IID growth exceeds addressable memory"))?;
+        let charge = Arc::get_mut(&mut self.reservation).expect("Ordered IID buffer owns its reservation");
+        let previous = charge.bytes();
+        charge.grow_to(peak)?;
+        let growth = self.values.try_reserve_exact(capacity - self.values.len());
+        charge.shrink_to(if growth.is_ok() { retained } else { previous })?;
+        growth.map_err(|error| crate::invalid("ordered-iid-capacity", error))
+    }
+
+    fn sort_distinct(&mut self) {
+        self.values.sort_unstable();
+        self.values.dedup();
+    }
+
+    /// Merges a posting chunk into a sorted, distinct aggregate. An empty buffer starts the aggregate.
+    pub fn merge_distinct(&mut self, mut chunk: Self, limit: usize) -> Result<bool> {
+        debug_assert!(self.values.windows(2).all(|pair| pair[0] < pair[1]));
+        chunk.sort_distinct();
+        chunk.values.retain(|iid| self.values.binary_search(iid).is_err());
+        let mut previous = self.len();
+        let mut added = chunk.len();
+        let Some(len) = previous.checked_add(added).filter(|&len| len <= limit) else {
+            return Ok(false);
+        };
+        if added == 0 { return Ok(true); }
+        if previous == 0 {
+            *self = chunk;
+            return Ok(true);
+        }
+
+        let capacity = self.values.capacity();
+        if len > capacity {
+            let preferred = len.max(capacity.saturating_mul(2)).min(limit);
+            if let Err(error) = self.reserve(preferred) {
+                if preferred == len || error.code != "rtdb/memory-budget-exceeded" { return Err(error); }
+                self.reserve(len)?;
+            }
+        }
+        self.values.resize(len, [0; 16]);
+        let mut write = len;
+        while added != 0 {
+            write -= 1;
+            if previous != 0 && self.values[previous - 1] > chunk.values[added - 1] {
+                previous -= 1;
+                self.values[write] = self.values[previous];
+            } else {
+                added -= 1;
+                self.values[write] = chunk.values[added];
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn into_sorted_membership(mut self) -> Result<CandidateIids> {
+        if !self.values.windows(2).all(|pair| pair[0] < pair[1]) { self.sort_distinct(); }
+        let Self { values, reservation } = self;
+        let values = FixedSizeBinaryArray::try_new(16, Buffer::from_vec(values.into_flattened()), None)
+            .map_err(|error| crate::invalid("candidate-iid", error))?;
+        Ok(CandidateIids { values, _reservation: reservation })
+    }
+
+    pub(crate) fn sorted_membership(&self, memory: &Arc<MemoryBudget>) -> Result<CandidateIids> {
+        let mut sorted = Self::with_capacity(self.len(), memory)?;
+        sorted.values.extend_from_slice(&self.values);
+        sorted.into_sorted_membership()
+    }
+}
+
 #[derive(Clone)]
 pub struct CandidateIids {
     values: FixedSizeBinaryArray,
@@ -388,8 +499,8 @@ pub enum OrderedScan {
 
 #[async_trait]
 pub trait OrderedCandidates: Send {
-    /// A bounded prefix of the remaining IIDs in index order. An empty batch ends the seek.
-    async fn next_iids(&mut self, maximum: usize) -> Result<Vec<Iid>>;
+    /// An admitted prefix of the remaining IIDs in index order. `None` ends the seek.
+    async fn next_iids(&mut self, maximum: usize) -> Result<Option<OrderedIidBuffer>>;
 }
 
 #[async_trait]

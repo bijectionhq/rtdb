@@ -14,6 +14,7 @@ use arrow_ipc::{
     writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions},
 };
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
+#[cfg(test)]
 use bytes::Bytes;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Result};
@@ -565,6 +566,10 @@ impl Postings {
         self.0.bytes
     }
 
+    pub fn heap_bytes_excluding(&self, backing: &Buffer) -> Result<usize> {
+        Ok(self.0.bytes_excluding(backing)? - size_of::<RecordBatch>())
+    }
+
     pub fn at(&self, row: usize) -> (Bucket, Tuple<'_>, AddressRef<'_>) {
         let level =
             arrow::<UInt8Array>(self.0.batch.column(0).as_ref()).expect("validated bucket level");
@@ -603,7 +608,7 @@ impl Postings {
         Ok(bytes)
     }
 
-    pub fn decode(bytes: Bytes, max_rows: usize) -> Result<(Self, Bytes)> {
+    pub fn decode(bytes: Buffer, max_rows: usize) -> Result<(Self, Buffer)> {
         let (batch, suffix) = KeyBatch::decode(bytes, max_rows, BatchKind::Posting)?;
         let postings = Self(batch);
         for row in 0..postings.len() {
@@ -1103,6 +1108,12 @@ impl KeyBatch {
     pub fn retained_bytes(&self) -> usize {
         self.bytes
     }
+
+    pub fn bytes_excluding(&self, backing: &Buffer) -> Result<usize> {
+        Ok(rtdb_columnar::shared_allocation_size_excluding(&self.batch, backing)?
+            .saturating_add(self.layouts.len().saturating_mul(256)))
+    }
+
     pub fn batch(&self) -> &RecordBatch {
         &self.batch
     }
@@ -1151,7 +1162,7 @@ impl KeyBatch {
         })
     }
 
-    pub fn decode(bytes: Bytes, max_rows: usize, kind: BatchKind) -> Result<(Self, Bytes)> {
+    pub fn decode(bytes: Buffer, max_rows: usize, kind: BatchKind) -> Result<(Self, Buffer)> {
         let length = |offset| -> Result<usize> {
             let raw = bytes.get(offset..offset + 4).ok_or_else(invalid)?;
             Ok(u32::from_le_bytes(raw.try_into().map_err(format_error)?) as usize)
@@ -1250,9 +1261,9 @@ impl KeyBatch {
         if nodes.next().is_some() || buffers.next().is_some() {
             return Err(invalid());
         }
-        let body = bytes.slice(body_start..body_end);
+        let body = bytes.slice_with_length(body_start, body_len);
         let body = if body.as_ptr().align_offset(ALIGNMENT) == 0 {
-            Buffer::from(body)
+            body
         } else {
             Buffer::from_slice_ref(body.as_ref())
         };
@@ -1272,10 +1283,8 @@ impl KeyBatch {
         {
             return Err(invalid());
         }
-        // The body can be a view into a complete stored page, including its suffix.
-        let mut keys = Self::new(layouts, batch, kind.prefix(), false)?;
-        keys.bytes = keys.bytes.saturating_add(body_start);
-        Ok((keys, bytes.slice(body_end..)))
+        let keys = Self::new(layouts, batch, kind.prefix(), false)?;
+        Ok((keys, bytes.slice(body_end)))
     }
 }
 
@@ -1357,6 +1366,10 @@ pub(super) struct ProjectedKeys {
 }
 
 impl ProjectedKeys {
+    pub fn allocation_bytes() -> usize {
+        size_of::<Self>() - size_of::<RecordBatch>() + 2 * size_of::<usize>()
+    }
+
     pub fn new(batch: KeyBatch, memory: Arc<MemoryReservation>) -> Arc<Self> {
         Arc::new(Self {
             batch,
@@ -1826,7 +1839,7 @@ mod tests {
             .unwrap();
         let mut unaligned = vec![0];
         unaligned.extend_from_slice(&encoded);
-        let (postings, suffix) = Postings::decode(Bytes::from(unaligned).slice(1..), 64).unwrap();
+        let (postings, suffix) = Postings::decode(Buffer::from_vec(unaligned).slice(1), 64).unwrap();
         assert_eq!(suffix.as_ref(), b"suffix");
         assert_eq!(postings.len(), rows.len());
         for (row, &(bucket, tuple, iid)) in keys.iter().enumerate() {
@@ -1864,7 +1877,7 @@ mod tests {
             }
         }
         let bytes = Bytes::from_owner(Aligned(aligned));
-        let (postings, _) = Postings::decode(bytes.clone(), 64).unwrap();
+        let (postings, _) = Postings::decode(Buffer::from(bytes.clone()), 64).unwrap();
         let AtomRef::Text(value) = postings.at(0).1.cell(0) else {
             panic!("expected text");
         };

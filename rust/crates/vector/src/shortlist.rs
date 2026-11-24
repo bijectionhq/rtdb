@@ -98,8 +98,8 @@ impl Shortlist {
         let mut opened = Vec::new();
         for source in &sources {
             let Source::Generation { key, locator } = source else { continue };
-            let bytes = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
-            let directory = Directory::read(Buffer::from(Bytes::from_owner(bytes)), locator)?;
+            let lease = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
+            let directory = Directory::read(lease, locator, cut.memory)?;
             if directory.dimensions != definition.dimensions { return Ok(None); }
             if let Some(generation) = Opened::rank(key, &directory, &probe, partition, cut.memory)? {
                 opened.push(generation);
@@ -121,8 +121,8 @@ impl Shortlist {
             let blocks = futures::stream::iter((start..probes).map(|index| {
                 let cluster = &clusters[index];
                 async move {
-                    let bytes = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
-                    Block::read(Buffer::from(Bytes::from_owner(bytes)), cluster, dimensions)
+                    let lease = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
+                    Block::read(lease, cluster, dimensions, cut.memory)
                 }
             })).buffer_unordered(8);
             futures::pin_mut!(blocks);
@@ -320,7 +320,9 @@ mod tests {
         let mut bytes = Vec::new();
         let locator = write_generation(rows, &mut bytes, &CancellationToken::new()).unwrap().locator;
         let range = locator.directory_range();
-        let directory = Directory::read(Buffer::from_slice_ref(&bytes[range.start as usize..range.end as usize]), &locator).unwrap();
+        let decode_memory = MemoryBudget::new(1 << 20);
+        let directory_bytes = Bytes::from(bytes).slice(range.start as usize..range.end as usize);
+        let directory = Directory::read(directory_bytes, &locator, &decode_memory).unwrap();
         let expected: Vec<_> = (0..directory.len()).filter(|&row| directory.partition(row) == selected)
             .map(|row| directory.cluster(row).range).collect();
         assert!(!expected.is_empty() && expected.len() < directory.len());

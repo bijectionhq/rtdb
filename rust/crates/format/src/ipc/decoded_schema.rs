@@ -7,6 +7,8 @@ use rtdb_types::Result;
 
 use super::invalid;
 
+pub(super) const MAX_DEPTH: usize = 128;
+
 #[derive(Clone, Copy)]
 enum FieldPosition { TopLevel, Child, MapEntries, MapKey }
 
@@ -64,7 +66,7 @@ fn dense_union_can_be_null(data_type: &DataType) -> bool {
 }
 
 fn adapt_type(data_type: &DataType, depth: usize, position: FieldPosition) -> Result<DataType> {
-    if depth > 128 { return Err(invalid("Arrow decoding schema exceeds 128 levels")); }
+    if depth > MAX_DEPTH { return Err(invalid("Arrow decoding schema exceeds 128 levels")); }
     let child = |field| adapt_field(field, depth + 1, FieldPosition::Child);
     Ok(match data_type {
         DataType::Struct(fields) => DataType::Struct(fields.iter().enumerate().map(|(index, field)| {

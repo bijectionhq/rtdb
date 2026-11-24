@@ -51,4 +51,4 @@ pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpo
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
 pub use serving::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeCheckpointAuthority, NativeServingAuthority, NativeServingHandle, NativeServingScope, NativeServingView};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};
-pub use table_replay::RetainedTableReplay;
+pub use table_replay::{RetainedHistory, RetainedTableReplay};

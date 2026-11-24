@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use arrow_buffer::Buffer;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -25,6 +26,7 @@ use super::{
 
 const FANOUT: usize = 64;
 const PAGE_CACHE_LIMIT: usize = 8 << 20;
+const ARC_HEADER_BYTES: usize = 2 * size_of::<usize>();
 type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,6 +156,24 @@ impl Key {
                 Self::Row(address) => address.key.len(),
                 Self::Revision(_) => 0,
             }
+    }
+
+    fn owned_backing_bytes(&self) -> usize {
+        match self {
+            Self::Posting { tuple: KeyRow::Arrow(..), .. } | Self::Revision(_) => 0,
+            Self::Posting { tuple: KeyRow::Fence(atoms), address, .. } => {
+                let initial = ARC_HEADER_BYTES.saturating_add(address.key.len());
+                atoms.iter().fold(initial, |bytes, atom| {
+                    let payload = match atom {
+                        Atom::Text(value) => value.capacity(),
+                        Atom::Binary(value) => value.capacity(),
+                        _ => 0,
+                    };
+                    bytes.saturating_add(size_of::<Atom>()).saturating_add(payload)
+                })
+            }
+            Self::Row(address) => address.key.len(),
+        }
     }
 }
 
@@ -350,7 +370,7 @@ impl Measure {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Pointer {
     pub digest: String,
     pub(super) generation: i64,
@@ -359,11 +379,34 @@ pub(super) struct Pointer {
     pub(super) measure: Measure,
     pub(super) first: Key,
     pub(super) last: Key,
+    #[serde(skip)]
+    pub(super) _memory: Option<Arc<MemoryReservation>>,
 }
+
+impl PartialEq for Pointer {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
+            && self.generation == other.generation
+            && self.size == other.size
+            && self.entries == other.entries
+            && self.measure == other.measure
+            && self.first == other.first
+            && self.last == other.last
+    }
+}
+
+impl Eq for Pointer {}
 
 impl Pointer {
     pub(super) fn exists_by(&self, block: i64) -> bool {
         self.entries > 0 && (0..=block).contains(&self.generation)
+    }
+
+    pub(super) fn owned_backing_bytes(&self) -> usize {
+        (size_of::<Self>() + ARC_HEADER_BYTES)
+            .saturating_add(self.digest.capacity())
+            .saturating_add(self.first.owned_backing_bytes())
+            .saturating_add(self.last.owned_backing_bytes())
     }
 }
 
@@ -459,6 +502,25 @@ impl Page {
                 .map(|child| child.first().bytes() + child.last().bytes() + 128)
                 .sum(),
         }
+    }
+
+    fn decoded_bytes(&self, backing: &Buffer) -> Result<usize> {
+        let heap = match self {
+            Self::Leaf(leaf) => {
+                let postings = leaf.postings.as_ref()
+                    .map(|postings| postings.heap_bytes_excluding(backing))
+                    .transpose()?
+                    .unwrap_or(0);
+                leaf.metadata.iter().fold(
+                    postings.saturating_add(leaf.metadata.capacity().saturating_mul(size_of::<Entry>()))
+                        .saturating_add(leaf.first.owned_backing_bytes())
+                        .saturating_add(leaf.last.owned_backing_bytes()),
+                    |bytes, entry| bytes.saturating_add(entry.key.owned_backing_bytes()),
+                )
+            }
+            Self::Branch(children) => children.capacity().saturating_mul(size_of::<Link>()),
+        };
+        Ok(heap.saturating_add(size_of::<Node>() + ARC_HEADER_BYTES))
     }
 }
 
@@ -784,12 +846,12 @@ impl Tree {
             return Ok(node);
         }
         let bound = pointer.size.saturating_mul(8).saturating_add(4096);
-        let mut memory = self.memory.reserve(bound)?;
+        let opening = self.memory.reserve(bound)?;
         // Derived index pages are rebuildable, and must never make a durable
         // replica-local copy outside the object owner's erasure inventory.
         let store = self.storage.object_store();
         let bytes = IoRegion::retaining(
-            memory.clone(),
+            opening.clone(),
             self.admitted(store.get_fresh_exact(&object, pointer.size)),
         )
         .await?;
@@ -798,7 +860,9 @@ impl Tree {
         {
             return Err(format_error("Ordered index page checksum mismatch"));
         }
-        let page = decode(bytes, pointer.generation, &memory)?;
+        let mut opening = Arc::try_unwrap(opening)
+            .map_err(|_| format_error("Ordered index page read still owns its opening grant"))?;
+        let (page, sidecars) = decode(bytes, pointer.generation, &mut opening)?;
         let entries = page.entry_count()?;
         let measure = page.measure()?;
         if entries != pointer.entries
@@ -810,16 +874,13 @@ impl Tree {
                 "Ordered index page count or fences differ from its reference",
             ));
         }
-        let retained = page.bytes().saturating_add(256);
-        if retained > bound {
-            return Err(format_error(
-                "Ordered index page exceeded its memory admission",
-            ));
+        let sidecars = sidecars.saturating_add(256);
+        if sidecars > opening.bytes() {
+            return Err(format_error("Ordered index page exceeded its memory admission"));
         }
-        if let Some(memory) = Arc::get_mut(&mut memory) {
-            memory.shrink_to(retained)?;
-        }
-        let retained = memory.bytes();
+        let memory = opening.split_off(sidecars)?;
+        let retained = bound - opening.bytes();
+        drop(opening);
         let node = Arc::new(Node {
             page,
             entries,
@@ -1180,6 +1241,7 @@ impl Tree {
                 measure: node.measure,
                 first: link.first().clone(),
                 last: link.last().clone(),
+                _memory: None,
             });
             written.insert(identity, Arc::clone(&pointer));
             Ok(pointer)
@@ -1236,19 +1298,44 @@ impl Tree {
     }
 }
 
-fn decode(bytes: Bytes, generation: i64, memory: &Arc<MemoryReservation>) -> Result<Page> {
-    let (postings, metadata) = if bytes.starts_with(&ARROW_LEAF_HEADER) {
-        let (postings, suffix) = Postings::decode(bytes.slice(ARROW_LEAF_HEADER.len()..), FANOUT)?;
+fn decode(bytes: Bytes, generation: i64, opening: &mut MemoryReservation) -> Result<(Page, usize)> {
+    if !bytes.starts_with(&ARROW_LEAF_HEADER)
+        && !bytes.starts_with(&correction::HEADER)
+        && !bytes.starts_with(&ipc::CONTINUATION)
+    {
+        let page = decode_legacy(&bytes, generation)?;
+        let retained = page.bytes();
+        return Ok((page, retained));
+    }
+
+    // Provider Bytes can hide a larger allocation. Use one known backing for all Arrow views of the page.
+    let buffer = Buffer::from_vec(Vec::from(bytes).into_boxed_slice().into_vec());
+    let charge = opening.split_off(buffer.capacity())?;
+    let backing = rtdb_columnar::retain_buffer(&buffer, &charge);
+    drop(buffer);
+    let page = decode_arrow(&backing, generation, opening)?;
+    let sidecars = page.decoded_bytes(&backing)?;
+    drop(backing);
+    if let Some(mut unused) = Arc::into_inner(charge) {
+        opening.absorb(&mut unused)?;
+    }
+    Ok((page, sidecars))
+}
+
+fn decode_arrow(backing: &Buffer, generation: i64, opening: &mut MemoryReservation) -> Result<Page> {
+    let (postings, metadata) = if backing.starts_with(&ARROW_LEAF_HEADER) {
+        let (postings, suffix) = Postings::decode(backing.slice(ARROW_LEAF_HEADER.len()), FANOUT)?;
         let metadata = if suffix.is_empty() {
             Vec::new()
         } else {
-            correction::decode(suffix, FANOUT - postings.len(), memory)?
+            correction::decode(suffix, FANOUT - postings.len(), opening)?
         };
         (Some(postings), metadata)
-    } else if bytes.starts_with(&correction::HEADER) {
-        (None, correction::decode(bytes, FANOUT, memory)?)
-    } else if bytes.starts_with(&ipc::CONTINUATION) {
-        let parents = references::decode(ipc::decode(bytes, FANOUT * 2)?, FANOUT, memory)?;
+    } else if backing.starts_with(&correction::HEADER) {
+        (None, correction::decode(backing.clone(), FANOUT, opening)?)
+    } else {
+        let batch = ipc::decode_buffer(backing.clone(), FANOUT * 2)?;
+        let parents = references::decode_page(batch, FANOUT, backing, opening)?;
         if parents.first().is_some_and(|(time, _)| time.is_some()) {
             (
                 None,
@@ -1289,33 +1376,33 @@ fn decode(bytes: Bytes, generation: i64, memory: &Arc<MemoryReservation>) -> Res
                 children.into_iter().map(Link::Stored).collect(),
             ));
         }
-    } else {
-        match serde_json::from_slice(&bytes).map_err(format_error)? {
-            StoredPage::Revisions(revisions) => (
-                None,
-                revisions
-                    .into_iter()
-                    .map(|(time, root)| Entry {
-                        key: Key::Revision(time),
-                        item: Item::Revision(root),
-                    })
-                    .collect(),
-            ),
-            StoredPage::Branch(children)
-                if !children.is_empty()
-                    && children.len() <= FANOUT
-                    && children
-                        .iter()
-                        .all(|child| child.exists_by(generation) && child.first <= child.last)
-                    && children.windows(2).all(|pair| pair[0].last < pair[1].first) =>
-            {
-                return Ok(Page::Branch(
-                    children.into_iter().map(Link::Stored).collect(),
-                ));
-            }
-            _ => return Err(format_error("Invalid ordered index branch")),
-        }
     };
+    decoded_leaf(postings, metadata, generation)
+}
+
+fn decode_legacy(bytes: &[u8], generation: i64) -> Result<Page> {
+    match serde_json::from_slice(bytes).map_err(format_error)? {
+        StoredPage::Revisions(revisions) => decoded_leaf(
+            None,
+            revisions.into_iter().map(|(time, root)| Entry {
+                key: Key::Revision(time),
+                item: Item::Revision(root),
+            }).collect(),
+            generation,
+        ),
+        StoredPage::Branch(children)
+            if !children.is_empty()
+                && children.len() <= FANOUT
+                && children.iter().all(|child| child.exists_by(generation) && child.first <= child.last)
+                && children.windows(2).all(|pair| pair[0].last < pair[1].first) =>
+        {
+            Ok(Page::Branch(children.into_iter().map(Link::Stored).collect()))
+        }
+        _ => Err(format_error("Invalid ordered index branch")),
+    }
+}
+
+fn decoded_leaf(postings: Option<Postings>, metadata: Vec<Entry>, generation: i64) -> Result<Page> {
     if metadata
         .iter()
         .any(|entry| !entry.references_at_or_before(generation))

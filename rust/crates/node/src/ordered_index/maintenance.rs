@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     io::Cursor,
     sync::Arc,
@@ -13,7 +14,7 @@ use rtdb_maintenance::{
 };
 use rtdb_replication::{PartitionLogs, RetainedTableReplay};
 use rtdb_storage::{HeldView, IoRegion, ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, TableRef, Timestamp, WorldShadow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -136,7 +137,7 @@ impl OrderedIndexMaintenance {
             } else {
                 let sources =
                     source_files(snapshot, &definition.table, checkpoint.through, through)?;
-                let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
+                let cuts = erase_cuts(&self.storage, &self.memory, &sources, &source_columns(definition), cancellation).await?;
                 if cuts.cuts.scope == 0 {
                     let mut roots = checkpoint.roots();
                     let advanced =
@@ -162,7 +163,7 @@ impl OrderedIndexMaintenance {
             }
         }
         let sources = source_files(snapshot, &definition.table, -1, through)?;
-        let cuts = erase_cuts(&self.storage, &self.memory, &sources, cancellation).await?;
+        let cuts = erase_cuts(&self.storage, &self.memory, &sources, &source_columns(definition), cancellation).await?;
         let mut tree = Tree::new(&self.storage, directory, &self.memory, cuts.cuts.scope).await?;
         tree.arrow_references = self.arrow_references;
         checkpoint::request_collection(&tree, through).await?;
@@ -232,10 +233,23 @@ impl CycleWorker for OrderedIndexMaintenance {
     }
 }
 
+fn source_columns(definition: &Definition) -> Cow<'_, [String]> {
+    if matches!(KeyLayout::for_table(&definition.table), KeyLayout::World)
+        && !definition.columns.iter().any(|column| column == WorldShadow::FIELDS)
+    {
+        let mut columns = definition.columns.clone();
+        columns.push(WorldShadow::FIELDS.to_owned());
+        Cow::Owned(columns)
+    } else {
+        Cow::Borrowed(&definition.columns)
+    }
+}
+
 async fn read_flushed(
     storage: &BufferPool,
     memory: &Arc<MemoryBudget>,
     source: &SourceFile,
+    columns: &[String],
     cancellation: &CancellationToken,
     mut visit: impl FnMut(EventBatch, &Arc<MemoryReservation>, &Arc<MemoryReservation>) -> Result<()> + Send,
 ) -> Result<i64> {
@@ -255,6 +269,7 @@ async fn read_flushed(
     let _footer = memory.reserve(layout.opening_allocation_bound()?)?;
     let buffer = rtdb_columnar::retain_buffer_with_owner(&arrow_buffer::Buffer::from(bytes), input_bytes);
     let mut input = rtdb_format::ipc::ArrowFile::from_inspected_buffer(buffer, None, layout)?;
+    input.project_event_payload(columns);
     let mut rows = 0_i64;
     for page in 0..input.page_count() {
         if cancellation.is_cancelled() {
@@ -326,6 +341,7 @@ async fn erase_cuts(
     storage: &BufferPool,
     memory: &Arc<MemoryBudget>,
     sources: &[SourceFile],
+    retained_columns: &[String],
     cancellation: &CancellationToken,
 ) -> Result<ReplayInputs> {
     let mut inputs = ReplayInputs { cuts: ErasureCuts::default(), decoded: Some(Vec::new()), _charges: Vec::new() };
@@ -339,6 +355,8 @@ async fn erase_cuts(
             inputs.decoded = None;
             inputs._charges.clear();
         }
+        // A retained page will also supply the later ordered-key replay.
+        let columns = if inputs.decoded.is_some() { retained_columns } else { &[] };
         let mut visit = |batch, page: &Arc<MemoryReservation>, opening: &Arc<MemoryReservation>| {
             inputs.cuts.record(source.block, &batch, memory, cancellation)?;
             if inputs.decoded.is_some() {
@@ -349,6 +367,7 @@ async fn erase_cuts(
                 }
                 if retained <= budget {
                     pages.push(batch);
+                    inputs._charges.push(Arc::clone(page));
                 } else {
                     inputs.decoded = None;
                     inputs._charges.clear();
@@ -358,7 +377,7 @@ async fn erase_cuts(
             }
             Ok(())
         };
-        let rows = read_flushed(storage, memory, source, cancellation, &mut visit).await?;
+        let rows = read_flushed(storage, memory, source, columns, cancellation, &mut visit).await?;
         if let Some(decoded) = &mut inputs.decoded {
             decoded.push((rows, pages));
             inputs._charges.extend(footer);
@@ -375,7 +394,7 @@ async fn flushed_changes(
     retain: impl Fn(rtdb_types::EventHeader, AddressRef<'_>) -> bool + Send + Sync,
 ) -> Result<(i64, Changes)> {
     let mut changes = Changes::default();
-    let rows = read_flushed(&tree.storage, &tree.memory, source, cancellation, |batch, _, _| {
+    let rows = read_flushed(&tree.storage, &tree.memory, source, &source_columns(definition), cancellation, |batch, _, _| {
         changes.add_batch(
             &batch,
             0,
@@ -664,6 +683,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn replay_projects_keys_and_keeps_the_original_event_headers() -> Result<()> {
+        use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+        use rtdb_types::{Iid, Interval, StructFields, Value};
+
+        let memory = MemoryBudget::new(32 << 20);
+        let storage = BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20);
+        let event = StoredEvent {
+            iid: Iid([7; 16]), system_from: Timestamp(124), commit_position: 0, entity_key: None,
+            valid_time: Interval::ALL, origin: None, position: None, recency: None,
+            operation: StoredOperation::Put(StructFields::from([
+                ("key".to_owned(), Value::I64(7)), ("payload".to_owned(), Value::Utf8("wide".repeat(512))),
+            ])),
+        };
+        let batch = build_event_batch(std::slice::from_ref(&event), None, None)?;
+        let bytes = rtdb_format::ipc::write_file(batch.schema_ref(), &[batch])?;
+        let source = SourceFile { block: 4, object: ObjectKey::new("test/order-index/projected")?, size: bytes.len(), rows: Some(1) };
+        storage.object_store().put(&source.object, bytes.into()).await?;
+
+        let read = read_flushed(&storage, &memory, &source, &["key".to_owned()], &CancellationToken::new(), |batch, _, _| {
+            let put = batch.put_document()?.expect("original put");
+            assert!(put.column_by_name("key").is_some());
+            assert!(put.column_by_name("payload").is_none());
+            assert_eq!(batch.header(0)?, event.header());
+            Ok(())
+        }).await?;
+        assert_eq!(read, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn erase_discovery_retains_the_decoded_pages_for_small_replays() -> Result<()> {
         use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
         use rtdb_types::{Iid, Interval};
@@ -678,7 +727,7 @@ mod tests {
         let object = ObjectKey::new("test/order-index/input")?;
         let source = SourceFile { block: 4, object, size: bytes.len(), rows: Some(1) };
         storage.object_store().put(&source.object, bytes.into()).await?;
-        let inputs = erase_cuts(&storage, &memory, &[source], &CancellationToken::new()).await?;
+        let inputs = erase_cuts(&storage, &memory, &[source], &[], &CancellationToken::new()).await?;
         assert_eq!(inputs.cuts.scope, 5);
         let address = AddressRef { iid: event.iid, key: &[] }.owned();
         assert_eq!(inputs.cuts.by_address[&address].0, event.header().precedence());

@@ -508,7 +508,7 @@ impl FileError {
 
 /// An opened file, and the buffer pool it was read through: a pool is one database's storage for as long as it is open.
 type OpenedFile = (std::sync::Weak<BufferPool>, Arc<SearchFile>);
-type OpenedTreeKey = (usize, ObjectKey, [u8; 32]);
+type OpenedTreeKey = (usize, ObjectKey, crate::file::TreeLocation);
 type OpenedTree = (std::sync::Weak<BufferPool>, Arc<crate::file::TreeFile>);
 
 /// A trie's search file as a scan reads it: the trie's data file, the identity the file's kept answers go by, the file, and which of its members the trie is.
@@ -658,33 +658,44 @@ impl SearchRuntime {
     pub(crate) async fn tree_file(&self, storage: &Arc<BufferPool>, key: &ObjectKey,
         locator: &crate::file::TreeLocator, columns: &[String], identity: &str, version: i64, fresh: bool)
         -> std::result::Result<Arc<crate::file::TreeFile>, FileError> {
+        self.open_tree(storage, key, locator, columns, identity, version, fresh, None).await
+    }
+
+    async fn open_tree(&self, storage: &Arc<BufferPool>, key: &ObjectKey, locator: &crate::file::TreeLocator,
+        columns: &[String], identity: &str, version: i64, fresh: bool, inline: Option<&str>)
+        -> std::result::Result<Arc<crate::file::TreeFile>, FileError> {
         let share = !fresh && storage.prepaid_metadata_budget().is_none();
-        let cache_key = (Arc::as_ptr(storage) as usize, key.clone(), locator.digest());
+        let cache_key = (Arc::as_ptr(storage) as usize, key.clone(), locator.location());
         if fresh {
             self.search_pages.invalidate(storage, key);
             self.trees.lock().remove(&cache_key);
-        } else if share && let Some((_, tree)) = self.trees.lock().get(&cache_key) {
-            return Ok(tree);
+        } else if share {
+            let cached = self.trees.lock().get(&cache_key);
+            if let Some((_, tree)) = cached {
+                tree.check_identity(columns, identity, version).map_err(FileError::from_anomaly)?;
+                return Ok(tree);
+            }
         }
         let cache = share.then(|| (Arc::clone(storage), key.clone(), Arc::clone(&self.search_pages)));
         let store = storage.object_store();
         let remote = !fresh && store.supports_scan_ranges(key);
         let fresh_locator = fresh.then(|| locator.without_inline_root());
         let locator = fresh_locator.as_ref().unwrap_or(locator);
+        let inline = inline.filter(|_| !fresh).map(|hex| (hex, storage.prepaid_metadata_budget().unwrap_or(&self.file_admission)));
         let result: rtdb_types::Result<_> = async {
             let local = if remote { store.cached_local_file(key).await? } else { store.local_file(key).await? };
             if let Some(local) = local {
                 let bytes = bytes::Bytes::from_owner(crate::Source::mapped(local)?);
                 let weight = bytes.len().saturating_add(65_536);
-                let file = crate::file::TreeFile::local(bytes.into(), cache, locator, columns, identity, version).await?;
+                let file = crate::file::TreeFile::local(bytes.into(), cache, locator, columns, identity, version, inline).await?;
                 Ok((file, Some(weight)))
             } else if remote {
                 let pages = if share { Arc::clone(&self.search_pages) } else { Arc::new(crate::file::PageCache::new(0)) };
-                let file = crate::file::TreeFile::remote(Arc::clone(storage), key.clone(), pages, locator, columns, identity, version).await?;
+                let file = crate::file::TreeFile::remote(Arc::clone(storage), key.clone(), pages, locator, columns, identity, version, inline).await?;
                 Ok((file, Some(65_536)))
             } else {
                 let bytes = bytes::Bytes::from_owner(storage.get(key).await?);
-                let file = crate::file::TreeFile::local(bytes.into(), None, locator, columns, identity, version).await?;
+                let file = crate::file::TreeFile::local(bytes.into(), None, locator, columns, identity, version, inline).await?;
                 Ok((file, None))
             }
         }.await;
@@ -705,12 +716,12 @@ impl SearchRuntime {
     pub(crate) async fn open_logical(&self, storage: &Arc<BufferPool>, slug: &rtdb_format::keys::TableSlug,
         run: &rtdb_format::log::proto::SearchRun, columns: &[String], fresh: bool) -> Result<Arc<crate::file::TreeFile>> {
         let key = ObjectKey::new(run.object_key(slug)?)?;
-        let locator = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode)
-            .filter(|locator| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64)
+        let (locator, inline) = std::str::from_utf8(run.locator()).ok().and_then(crate::file::TreeLocator::decode_route_with_inline)
+            .filter(|(locator, _)| locator.format() == crate::file::LOGICAL_FORMAT_VERSION && locator.length == run.file_size() as u64)
             .ok_or_else(|| rtdb_types::Anomaly::fault("rtdb.search/corrupt-file", "Search run has no matching root locator"))?;
         let identity = crate::lane::run_identity(slug, run.definition_id(), run.definition_version(), &run.blocks, run.rebuild(), run.allocation());
         if fresh { storage.invalidate(&key).await?; }
-        self.tree_file(storage, &key, &locator, columns, &identity, run.definition_version(), fresh).await.map_err(|error| match error {
+        self.open_tree(storage, &key, &locator, columns, &identity, run.definition_version(), fresh, inline).await.map_err(|error| match error {
             FileError::Missing => rtdb_types::Anomaly::fault("rtdb.storage/missing-object", key.as_str()),
             FileError::Corrupt(error) | FileError::Unavailable(error) => error,
         })

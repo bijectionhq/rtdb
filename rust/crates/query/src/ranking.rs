@@ -12,7 +12,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, RowVersion};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::{ResolvedSearchRow, rank_cutoff::RankKey};
+use crate::{ResolvedSearchRow, columnar::ColumnBatch, rank_cutoff::RankKey};
 
 /// A partition's task and its ceiling in the query's SQL rank order.
 pub struct RankWork {
@@ -33,6 +33,12 @@ impl RankWork {
 pub struct VerifiedRankRow {
     pub(crate) key: RankKey,
     pub(crate) row: ResolvedSearchRow,
+    pub(crate) projection: Option<VerifiedRankProjection>,
+}
+
+pub(crate) struct VerifiedRankProjection {
+    pub(crate) columns: Arc<[rtdb_plan::ColumnId]>,
+    pub(crate) batch: ColumnBatch,
 }
 
 impl VerifiedRankRow {
@@ -325,7 +331,7 @@ mod tests {
             origin: None,
             location: SearchRowLocation::Persisted { trie: TrieKey::l0(BlockIndex(0)).unwrap(), page: 0, row: 0 },
             visibility: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL },
-        } }
+        }, projection: None }
     }
 
     #[tokio::test]

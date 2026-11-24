@@ -7,13 +7,13 @@ use std::sync::Arc;
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, UInt32Array, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
 use arrow_buffer::{Buffer, MutableBuffer};
 use bytes::Bytes;
-use rtdb_storage::{ObjectKey, cache::BufferPool};
+use rtdb_storage::{ObjectKey, audience_work, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use sha2::{Digest, Sha256};
 use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
 
-use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{PageRef, Table, Writer, item_of, list, table},
+use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{AuthenticatedPage, PageRef, Table, Writer, item_of, list, table},
     page_tree::{Child, DecodedChild, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
 
 #[cfg(test)]
@@ -313,6 +313,13 @@ pub(crate) struct TreeLocator {
     inline_root: Option<Bytes>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct TreeLocation {
+    length: u64,
+    page: PageRef,
+    format: i32,
+}
+
 pub(crate) struct EncodedTreeLocator {
     pub length: u64,
     pub text: String,
@@ -379,14 +386,18 @@ impl TreeLocator {
     }
 
     pub fn decode(value: &str) -> Option<Self> {
-        Self::decode_inner(value, true)
+        let (mut locator, inline) = Self::decode_route_with_inline(value)?;
+        let expected = locator.page.metadata as usize + locator.page.body as usize;
+        locator.inline_root = inline.and_then(|hex| expand_inline_root(hex, expected))
+            .filter(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == locator.page.digest).map(Bytes::from);
+        Some(locator)
     }
 
     pub fn decode_route(value: &str) -> Option<Self> {
-        Self::decode_inner(value, false)
+        Self::decode_route_with_inline(value).map(|(locator, _)| locator)
     }
 
-    fn decode_inner(value: &str, load_inline: bool) -> Option<Self> {
+    pub fn decode_route_with_inline(value: &str) -> Option<(Self, Option<&str>)> {
         let (format, value) = if let Some(value) = value.strip_prefix("v16:") { (LOGICAL_FORMAT_VERSION, value) }
             else if let Some(value) = value.strip_prefix("v15:") { (PACKED_FORMAT_VERSION, value) }
             else { (TREE_FORMAT_VERSION, value) };
@@ -401,20 +412,30 @@ impl TreeLocator {
         if range.end > length || range.end - range.start > MAX_ROOT_BYTES { return None; }
         let synopsis = fields.next().and_then(decode_hex::<SYNOPSIS_BYTES>).zip(fields.next().and_then(decode_hex::<32>))
             .filter(|(bits, check)| synopsis_digest(&digest, bits) == *check).map(|(bits, _)| Arc::new(bits));
-        let root = if format >= PACKED_FORMAT_VERSION { fields.next() } else { None };
-        let expected = (range.end - range.start) as usize;
-        let inline_root = root.filter(|hex| load_inline && hex.len() <= INLINE_ROOT_BYTES * 2).and_then(decode_bytes)
-            .and_then(|bytes| lz4_flex::block::decompress(&bytes, expected).ok())
-            .filter(|bytes| bytes.len() == expected)
-            .filter(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == digest).map(Bytes::from);
+        let root = if format >= PACKED_FORMAT_VERSION { fields.next().filter(|hex| !hex.is_empty()) } else { None };
         let canonical_uuid_iids = synopsis.is_some() && fields.next().and_then(decode_hex::<32>)
             .is_some_and(|check| check == uuid_evidence_digest(&digest));
-        Some(Self { length, page, synopsis, format, inline_root, canonical_uuid_iids })
+        Some((Self { length, page, synopsis, format, inline_root: None, canonical_uuid_iids }, root))
+    }
+
+    fn admit_inline_root(&self, hex: &str, memory: &Arc<MemoryBudget>) -> Result<Option<AuthenticatedPage>> {
+        if hex.len() > INLINE_ROOT_BYTES * 2 || hex.len() % 2 != 0 { return Ok(None); }
+        let expected = self.page.metadata as usize + self.page.body as usize;
+        let mut reservation = match memory.reserve(expected + hex.len() / 2) {
+            Ok(reservation) => reservation,
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        audience_work::decode_bytes(expected)?;
+        let Some(bytes) = expand_inline_root(hex, expected) else { return Ok(None); };
+        Arc::get_mut(&mut reservation).expect("Inline root expansion owns its reservation").shrink_to(bytes.capacity())?;
+        let bytes = rtdb_columnar::retain_buffer(&Buffer::from_vec(bytes), &reservation);
+        Ok(self.page.authenticate(bytes).ok())
     }
 
     pub fn has_canonical_uuid_iids(&self) -> bool { self.canonical_uuid_iids }
 
-    pub fn digest(&self) -> [u8; 32] { self.page.digest }
+    pub fn location(&self) -> TreeLocation { TreeLocation { length: self.length, page: self.page, format: self.format } }
     pub fn format(&self) -> i32 { self.format }
     pub(crate) fn inline_root_bytes(&self) -> usize { self.inline_root.as_ref().map_or(0, |root| root.len()) }
 
@@ -438,9 +459,15 @@ fn encode_hex(bytes: &[u8]) -> String {
     text
 }
 
-fn decode_bytes(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
-    (0..hex.len()).step_by(2).map(|position| u8::from_str_radix(&hex[position..position + 2], 16).ok()).collect()
+fn expand_inline_root(hex: &str, expected: usize) -> Option<Vec<u8>> {
+    if hex.len() > INLINE_ROOT_BYTES * 2 || hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    let mut compressed = Vec::with_capacity(hex.len() / 2);
+    for position in (0..hex.len()).step_by(2) {
+        compressed.push(u8::from_str_radix(&hex[position..position + 2], 16).ok()?);
+    }
+    let mut bytes = vec![0; expected];
+    let written = lz4_flex::block::decompress_into(&compressed, &mut bytes).ok()?;
+    (written == expected).then_some(bytes)
 }
 
 fn decode_hex<const N: usize>(hex: &str) -> Option<[u8; N]> {
@@ -494,34 +521,28 @@ pub(crate) struct LogicalDocument {
 
 impl TreeFile {
     pub async fn remote(storage: Arc<BufferPool>, object: ObjectKey, cache: Arc<PageCache>, locator: &TreeLocator,
-        columns: &[String], identity: &str, version: i64) -> Result<Self> {
-        Self::open(PageSource::Remote(PageOwner::new(&storage, object, cache)), locator, columns, identity, version).await
+        columns: &[String], identity: &str, version: i64, inline: Option<(&str, &Arc<MemoryBudget>)>) -> Result<Self> {
+        Self::open(PageSource::Remote(PageOwner::new(&storage, object, cache)), locator, columns, identity, version, inline).await
     }
 
     pub async fn local(bytes: Buffer, cache: Option<(Arc<BufferPool>, ObjectKey, Arc<PageCache>)>, locator: &TreeLocator,
-        columns: &[String], identity: &str, version: i64) -> Result<Self> {
+        columns: &[String], identity: &str, version: i64, inline: Option<(&str, &Arc<MemoryBudget>)>) -> Result<Self> {
         if bytes.len() as u64 != locator.length { return Err(corrupt("Search root size disagrees with the object")); }
         let owner = cache.map(|(storage, object, cache)| PageOwner::new(&storage, object, cache));
-        Self::open(PageSource::Local { bytes, owner }, locator, columns, identity, version).await
+        Self::open(PageSource::Local { bytes, owner }, locator, columns, identity, version, inline).await
     }
 
-    async fn open(source: PageSource, locator: &TreeLocator, columns: &[String], identity: &str, version: i64) -> Result<Self> {
+    async fn open(source: PageSource, locator: &TreeLocator, columns: &[String], identity: &str, version: i64,
+        inline: Option<(&str, &Arc<MemoryBudget>)>) -> Result<Self> {
         let reader = TreeReader::new(source, locator.length, locator.format);
-        let root = match &locator.inline_root {
-            Some(bytes) => reader.inline_page(locator.page, bytes.clone())?,
-            None => reader.page(locator.page, PageKind::Root).await?,
+        let root = if let Some((hex, memory)) = inline && let Some(page) = locator.admit_inline_root(hex, memory)? {
+            reader.authenticated_page(page)?
+        } else if let Some(bytes) = &locator.inline_root {
+            reader.inline_page(locator.page, bytes.clone())?
+        } else {
+            reader.page(locator.page, PageKind::Root).await?
         };
-        let header = table(&root, Table::Header);
-        let definitions = header.column(2).as_primitive::<Int64Type>();
-        let names = table(&root, Table::Columns);
-        let keys = header.column(3).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search identity layout");
-        if header.len() != 1 || definitions.is_null(0) || definitions.value(0) != version
-            || header.column(0).as_primitive::<Int32Type>().value(0) != locator.format
-            || header.column(1).as_primitive::<Int32Type>().value(0) != rtdb_text::ANALYZER_VERSION
-            || keys.value(0) != artefact_digest(identity)
-            || !names.column(0).as_string::<i32>().iter().eq(columns.iter().map(|column| Some(column.as_str()))) {
-            return Err(corrupt("Search tree belongs to another index"));
-        }
+        Self::check_root_identity(&root, locator.format, columns, identity, version)?;
         let directories = read_root(&root)?;
         if !directories.keys().copied().eq([POSTING, TERM, DOCUMENT, VISIBILITY, PAGE_ROWS].into_iter()
             .chain((locator.format == LOGICAL_FORMAT_VERSION).then_some(ERASES)))
@@ -530,6 +551,25 @@ impl TreeFile {
         }
         let routes = if locator.format >= PACKED_FORMAT_VERSION { read_inline_routes(&root, &directories)? } else { BTreeMap::new() };
         Ok(Self { reader, root, directories, routes, format: locator.format })
+    }
+
+    fn check_root_identity(root: &RecordBatch, format: i32, columns: &[String], identity: &str, version: i64) -> Result<()> {
+        let header = table(root, Table::Header);
+        let definitions = header.column(2).as_primitive::<Int64Type>();
+        let names = table(root, Table::Columns);
+        let keys = header.column(3).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search identity layout");
+        if header.len() != 1 || definitions.is_null(0) || definitions.value(0) != version
+            || header.column(0).as_primitive::<Int32Type>().value(0) != format
+            || header.column(1).as_primitive::<Int32Type>().value(0) != rtdb_text::ANALYZER_VERSION
+            || keys.value(0) != artefact_digest(identity)
+            || !names.column(0).as_string::<i32>().iter().eq(columns.iter().map(|column| Some(column.as_str()))) {
+            return Err(corrupt("Search tree belongs to another index"));
+        }
+        Ok(())
+    }
+
+    pub fn check_identity(&self, columns: &[String], identity: &str, version: i64) -> Result<()> {
+        Self::check_root_identity(&self.root, self.format, columns, identity, version)
     }
 
     pub(super) fn root(&self) -> &RecordBatch { &self.root }
@@ -869,9 +909,90 @@ fn lower_bound(len: usize, before: impl Fn(usize) -> bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_format::{keys::TableSlug, log::proto::SearchRun};
+    use rtdb_storage::{MemoryStore, ObjectStore, audience_work::Limits};
     use rtdb_text::{Query, Scorer};
     fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Interval, TemporalBounds, Timestamp};
+
+    fn logical_run(columns: &[String]) -> Result<(TableSlug, SearchRun, Vec<u8>, std::ops::Range<usize>)> {
+        use super::super::{BuildMode, SearchRow, write_group_as};
+
+        let slug = TableSlug::recorded("docs")?;
+        let mut run = SearchRun {
+            definition_id: Some("docs-f16".into()), definition_version: Some(1), blocks: vec![0],
+            source_rows: Some(1), ..Default::default()
+        };
+        let identity = crate::lane::run_identity(&slug, run.definition_id(), run.definition_version(), &run.blocks, run.rebuild(), run.allocation());
+        let rows = vec![SearchRow {
+            position: None, identity: None, iid: [1; 16], system_from: 1, valid_from: 0, valid_to: i64::MAX,
+            op: EventOp::Put, values: vec![Some(tokens("invoice"))],
+        }];
+        let mut bytes = Vec::new();
+        let (_, _, written) = write_group_as(columns, [[Ok(rows)]], &identity, Some(1), None, &mut bytes, None,
+            LOGICAL_FORMAT_VERSION, BuildMode::Postings)?;
+        let encoded = written.unwrap().encode(false);
+        let (locator, inline) = TreeLocator::decode_route_with_inline(&encoded.text).unwrap();
+        assert!(inline.is_some());
+        let range = locator.page.range()?;
+        run.digest = Some(Sha256::digest(&bytes).to_vec());
+        run.file_size = Some(encoded.length as i64);
+        run.locator = Some(encoded.text.into_bytes());
+        Ok((slug, run, bytes, range.start as usize..range.end as usize))
+    }
+
+    fn root_work(decode_bytes: usize) -> Limits {
+        Limits { provider_requests: 0, provider_bytes: 0, provider_metadata_bytes: 0, scan_items: 0, decode_bytes }
+    }
+
+    #[tokio::test]
+    async fn logical_inline_root_spends_one_decode_and_warm_reuse_checks_identity() -> Result<()> {
+        let columns = ["body".to_owned()];
+        let (slug, mut run, _, range) = logical_run(&columns)?;
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let runtime = crate::SearchRuntime::with_logical_search(1 << 20);
+
+        let denied = audience_work::within(Some(root_work(range.len() - 1)), runtime.logical_file(&storage, &slug, &run, &columns)).await;
+        assert_eq!(denied.err().unwrap().code, "rtdb.storage/audience-work-limit");
+        let opened = audience_work::within(Some(root_work(range.len())), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        let warm = audience_work::within(Some(root_work(0)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        assert!(Arc::ptr_eq(&opened, &warm));
+        run.rebuild = Some(1);
+        let mismatched = audience_work::within(Some(root_work(0)), runtime.logical_file(&storage, &slug, &run, &columns)).await;
+        assert_eq!(mismatched.err().unwrap().code, "rtdb.search/corrupt-file");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logical_fresh_and_unusable_inline_roots_read_the_persisted_root() -> Result<()> {
+        let columns = ["body".to_owned()];
+        let (slug, mut run, bytes, range) = logical_run(&columns)?;
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let runtime = crate::SearchRuntime::with_logical_search(1 << 20);
+        let key = ObjectKey::new(run.object_key(&slug)?)?;
+
+        let mut corrupted = bytes.clone();
+        corrupted[range.start] ^= 1;
+        store.put(&key, corrupted.into()).await?;
+        let opened = runtime.logical_file(&storage, &slug, &run, &columns).await?;
+        let fresh = runtime.open_logical(&storage, &slug, &run, &columns, true).await;
+        assert_eq!(fresh.err().unwrap().code, "rtdb.search/corrupt-file");
+        drop(opened);
+        store.delete(&key).await?;
+        store.put(&key, bytes.clone().into()).await?;
+        audience_work::within(Some(root_work(range.len())), runtime.open_logical(&storage, &slug, &run, &columns, true)).await?;
+
+        let constrained = crate::SearchRuntime::with_logical_search(0);
+        audience_work::within(Some(root_work(range.len())), constrained.logical_file(&storage, &slug, &run, &columns)).await?;
+
+        let mut wrong_root = bytes[range.clone()].to_vec();
+        wrong_root[0] ^= 1;
+        let (prefix, _) = std::str::from_utf8(run.locator()).unwrap().rsplit_once(':').unwrap();
+        run.locator = Some(format!("{prefix}:{}", encode_hex(&lz4_flex::block::compress(&wrong_root))).into_bytes());
+        audience_work::within(Some(root_work(range.len() * 2)), runtime.logical_file(&storage, &slug, &run, &columns)).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn term_routing_reports_corruption_without_recharging_a_warm_ancestor() -> Result<()> {
@@ -991,7 +1112,7 @@ mod tests {
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
-        let tree = Arc::new(TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "tree", 42).await.unwrap());
+        let tree = Arc::new(TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "tree", 42, None).await.unwrap());
         let found = tree.events(rows[900].iid).await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].system_from, 1);
@@ -1043,10 +1164,10 @@ mod tests {
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
-        let tree = TreeFile::local(Buffer::from_vec(bytes.clone()), None, &locator, &columns, "sparse", 1).await?;
+        let tree = TreeFile::local(Buffer::from_vec(bytes.clone()), None, &locator, &columns, "sparse", 1, None).await?;
         let skipped = tree.page_reference_for_test(DOCUMENT, &ordinal(DOCUMENT_ROWS)).await?.unwrap();
         bytes[skipped.range()?.start as usize] ^= 1;
-        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "sparse", 1).await?;
+        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "sparse", 1, None).await?;
         let query = Query::parse("\"overdue invoice\"");
         let memory = MemoryBudget::new(16 << 20);
         let exact = Arc::new(tree.exact(&columns, 0, &[&query], false, memory.reserve(4 << 20)?).await?);
@@ -1110,9 +1231,9 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         let bytes = Buffer::from_vec(bytes);
-        let tree = TreeFile::local(bytes.clone(), None, &locator, &columns, "pack", 1).await.unwrap();
+        let tree = TreeFile::local(bytes.clone(), None, &locator, &columns, "pack", 1, None).await.unwrap();
         tree.verify().await.unwrap();
-        TreeFile::local(bytes, None, &fallback, &columns, "pack", 1).await.unwrap().verify().await.unwrap();
+        TreeFile::local(bytes, None, &fallback, &columns, "pack", 1, None).await.unwrap().verify().await.unwrap();
         let first = Iid([1; 16]);
         let second = Iid([9; 16]);
         let queried = BTreeSet::from([first, second, Iid([5; 16])]);
@@ -1175,7 +1296,7 @@ mod tests {
             file.rewind().map_err(fault)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(fault)?;
-            let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, columns, "history", 1).await?;
+            let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, columns, "history", 1, None).await?;
             tree.verify().await?;
             let page_sizes = tree.all(VISIBILITY).await?.iter().map(|batch| table(batch, Table::Events).len()).collect::<Vec<_>>();
             assert_eq!(page_sizes, [EVENT_ROWS, 2]);

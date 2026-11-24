@@ -3165,15 +3165,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270#7239466e27dd9b62c0056ca2589ba47b5ae76270"
-dependencies = [
- "bytes",
-]
-
-[[package]]
-name = "journal-contract"
-version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8#c6531760536758526f7a5b77daaffc6bba51fcb8"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=17e3d70e91745da54d62ff7db59d0b4c6ad2da27#17e3d70e91745da54d62ff7db59d0b4c6ad2da27"
 dependencies = [
  "bytes",
 ]
@@ -3347,37 +3339,13 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270#7239466e27dd9b62c0056ca2589ba47b5ae76270"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=17e3d70e91745da54d62ff7db59d0b4c6ad2da27#17e3d70e91745da54d62ff7db59d0b4c6ad2da27"
 dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
- "libc",
- "parking_lot",
- "prost",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror",
- "tokio",
- "tokio-rustls 0.26.6",
- "tokio-util",
- "uuid",
- "x509-parser",
-]
-
-[[package]]
-name = "logkeeper"
-version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8#c6531760536758526f7a5b77daaffc6bba51fcb8"
-dependencies = [
- "bytes",
- "crc32fast",
- "fs2",
- "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8)",
+ "journal-contract",
  "libc",
  "parking_lot",
  "prost",
@@ -3390,6 +3358,7 @@ dependencies = [
  "tokio-rustls 0.26.6",
  "tokio-util",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -4786,7 +4755,7 @@ name = "rtdb-db"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
+ "journal-contract",
  "rtdb-crypt",
  "rtdb-format",
  "rtdb-index",
@@ -4903,9 +4872,11 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
+ "arrow-data",
  "arrow-flight",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
@@ -4913,6 +4884,7 @@ dependencies = [
  "chrono",
  "futures",
  "hmac 0.12.1",
+ "lz4_flex",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
@@ -5032,8 +5004,8 @@ name = "rtdb-journal-logkeeper"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
- "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
+ "journal-contract",
+ "logkeeper",
  "tempfile",
  "tokio",
 ]
@@ -5098,7 +5070,7 @@ dependencies = [
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
+ "journal-contract",
  "parking_lot",
  "prost",
  "rtdb-storage",
@@ -5177,7 +5149,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
- "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8)",
+ "logkeeper",
  "openssl",
  "parking_lot",
  "prost",
@@ -5230,7 +5202,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
+ "journal-contract",
  "parking_lot",
  "prost",
  "prost-types",
@@ -5523,7 +5495,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=7239466e27dd9b62c0056ca2589ba47b5ae76270)",
+ "journal-contract",
  "regex",
  "reqwest 0.13.4",
  "rtdb-auth",

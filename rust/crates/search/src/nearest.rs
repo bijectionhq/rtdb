@@ -6,7 +6,6 @@ use std::{
 };
 
 use arrow_array::{Array, Float32Array, Float64Array, RecordBatch, UInt64Array};
-use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionMode};
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_plan::Catalog;
@@ -109,26 +108,9 @@ impl From<InvalidComponents> for Anomaly {
     }
 }
 
-enum ShadowVector {
-    Staged { vector: Option<ScalarBuffer<f32>>, filters: Vec<Option<Buffer>> },
-    World(Distance),
-}
-
-impl ShadowVector {
-    fn distance(&self, query: &NearestQuery) -> Distance {
-        match self {
-            Self::Staged { vector: Some(vector), filters } if query.admits(filters.iter().map(Option::as_deref)) => {
-                query.distance(vector.iter().copied().map(f64::from))
-            }
-            Self::Staged { .. } => Ok(None),
-            Self::World(distance) => *distance,
-        }
-    }
-}
-
-/// Exact staged shadows. Each shadow masks the stored identity in its partition.
+/// Each shadow masks the stored identity in its partition, even when it has no score.
 pub struct HeldVectorOverlay {
-    rows: Vec<(usize, EntityId, ShadowVector)>,
+    rows: Vec<(usize, EntityId, Distance)>,
     shadows: BTreeMap<usize, BTreeSet<EntityId>>,
     _retained: Arc<MemoryReservation>,
 }
@@ -138,15 +120,20 @@ impl HeldVectorOverlay {
         Ok(Self { rows: Vec::new(), shadows: BTreeMap::new(), _retained: memory.reserve(4096)? })
     }
 
-    /// The slices come from the admitted staged batch and retain its Arrow allocation charge.
-    pub fn shadow_staged(
-        &mut self, partition: usize, id: EntityId, vector: Option<ScalarBuffer<f32>>, filters: Vec<Option<Buffer>>,
+    /// Score admitted staged cells while borrowed. A component refusal surfaces during ranking.
+    pub fn shadow_staged<'a>(
+        &mut self, partition: usize, id: EntityIdRef<'_>, vector: Option<&[f32]>,
+        filters: impl ExactSizeIterator<Item = Option<&'a [u8]>>, query: &NearestQuery,
     ) -> Result<()> {
-        self.reserve_shadow(&id, vector.as_ref().map_or(0, |vector| vector.len()),
-            filters.iter().flatten().map(|filter| filter.len()).sum())?;
+        self.reserve_shadow(id, id.owned_payload_bytes())?;
         if self.rows.len() == MAX_NEAREST_SHADOWS { return Err(overlay_invalid()); }
+        let id = id.into_owned();
         self.register_shadow(partition, &id)?;
-        self.rows.push((partition, id, ShadowVector::Staged { vector, filters }));
+        let distance = match vector {
+            Some(vector) if query.admits(filters) => query.distance(vector.iter().copied().map(f64::from)),
+            _ => Ok(None),
+        };
+        self.rows.push((partition, id, distance));
         Ok(())
     }
 
@@ -169,15 +156,15 @@ impl HeldVectorOverlay {
             Some(cell) => rtdb_columnar::binary_cell(cell.field, cell.array, cell.row),
             None => Ok(None),
         }).collect::<Result<Vec<_>>>()?;
-        self.reserve_shadow(&id, vector.as_ref().map_or(0, VectorCell::len),
-            filters.iter().flatten().map(|filter| filter.len()).sum())?;
+        let payload_bytes = (vector.as_ref().map_or(0, VectorCell::len) * 8)
+            .saturating_add(filters.iter().flatten().map(|filter| filter.len()).sum());
+        self.reserve_shadow(EntityIdRef::from(&id), payload_bytes)?;
         self.register_shadow(partition, &id)?;
-        // Retain the score or its refusal until overlay ranking so the source batch can be released here.
         let distance = match vector {
             Some(vector) if query.admits(filters.into_iter()) => vector.distance(query),
             _ => Ok(None),
         };
-        self.rows.push((partition, id, ShadowVector::World(distance)));
+        self.rows.push((partition, id, distance));
         Ok(())
     }
 
@@ -185,22 +172,22 @@ impl HeldVectorOverlay {
         &mut self, partition: usize, id: EntityId, vector: impl ExactSizeIterator<Item = f32>,
         filters: &[Option<&[u8]>], query: &NearestQuery,
     ) -> Result<()> {
-        self.reserve_shadow(&id, vector.len(), filters.iter().flatten().map(|key| key.len()).sum())?;
+        let payload_bytes = (vector.len() * 8)
+            .saturating_add(filters.iter().flatten().map(|key| key.len()).sum());
+        self.reserve_shadow(EntityIdRef::from(&id), payload_bytes)?;
         self.register_shadow(partition, &id)?;
         let distance = if query.admits(filters.iter().copied()) {
             query.distance(vector.map(f64::from))
         } else {
             Ok(None)
         };
-        self.rows.push((partition, id, ShadowVector::World(distance)));
+        self.rows.push((partition, id, distance));
         Ok(())
     }
 
-    fn reserve_shadow(&mut self, id: &EntityId, components: usize, filter_bytes: usize) -> Result<()> {
-        // These charges also govern admission for shadows backed by an already charged batch.
+    fn reserve_shadow(&mut self, id: EntityIdRef<'_>, additional_bytes: usize) -> Result<()> {
         let bytes = identity_charge(id)
-            .saturating_add(components * 8)
-            .saturating_add(filter_bytes)
+            .saturating_add(additional_bytes)
             .saturating_add(256);
         let retained = Arc::get_mut(&mut self._retained).expect("exclusive overlay reservation");
         retained.grow_to(retained.bytes().saturating_add(bytes))
@@ -247,10 +234,11 @@ impl NearestWindow {
         if at < self.k {
             let full = self.hits.len() == self.k;
             let removed = if full {
-                identity_charge(&self.hits.last().expect("a full window has a last hit").id) + 128
+                let last = self.hits.last().expect("a full window has a last hit");
+                identity_charge(EntityIdRef::from(&last.id)) + 128
             } else { 0 };
             let bytes = (self.bytes - removed)
-                .saturating_add(size_of::<Value>() + id.owned_payload_bytes() + 128);
+                .saturating_add(identity_charge(id) + 128);
             self.reserve_hits(bytes)?;
             if full { drop(self.hits.pop()); }
             self.hits.insert(at, NearestHit { partition, id: id.into_owned(), distance });
@@ -296,7 +284,7 @@ impl NearestWindow {
             } else {
                 break;
             };
-            bytes = bytes.saturating_add(identity_charge(&winner.id).saturating_add(128));
+            bytes = bytes.saturating_add(identity_charge(EntityIdRef::from(&winner.id)).saturating_add(128));
         }
         // A refusal here lets the caller rank the partition exactly into the original window.
         self.reserve_hits(bytes)?;
@@ -314,7 +302,7 @@ impl NearestWindow {
 
     fn finish(self) -> Result<OwnedSearchBatch> {
         let bound = self.hits.iter().try_fold(4096usize, |size, hit| {
-            size.checked_add(identity_charge(&hit.id).saturating_mul(4).saturating_add(128))
+            size.checked_add(identity_charge(EntityIdRef::from(&hit.id)).saturating_mul(4).saturating_add(128))
                 .ok_or_else(|| Anomaly::fault("rtdb.search/nearest-output", "Nearest output size overflow"))
         })?;
         let reservation = self.memory.budget().reserve(bound)?;
@@ -373,9 +361,9 @@ pub async fn owned_nearest_batch(
         rank_rows(&context, cursor, partition, query, shadows, ordinal, &mut window, sealed.then_some((owner, valid))).await?;
     }
     if let Some(overlay) = overlay {
-        for (ordinal, id, vector) in &overlay.rows {
+        for (ordinal, id, distance) in &overlay.rows {
             if *ordinal >= partitions.len() { return Err(overlay_invalid()); }
-            let Some(distance) = vector.distance(query)? else { continue; };
+            let Some(distance) = (*distance)? else { continue; };
             window.admit(*ordinal, EntityIdRef::from(id), distance)?;
         }
     }
@@ -598,8 +586,8 @@ fn score_decoded_list(list: &ListValue, query: &NearestQuery) -> Result<Distance
     Ok(if valid { query.finish_distance(dot, norm) } else { Err(InvalidComponents) })
 }
 
-fn identity_charge(id: &EntityId) -> usize {
-    size_of::<Value>() + EntityIdRef::from(id).owned_payload_bytes()
+fn identity_charge(id: EntityIdRef<'_>) -> usize {
+    size_of::<Value>() + id.owned_payload_bytes()
 }
 
 fn not_a_vector() -> Anomaly {
@@ -844,34 +832,51 @@ mod tests {
     #[test]
     fn nearest_overlay_refuses_a_repeated_shadow() {
         let memory = MemoryBudget::new(1 << 20);
+        let nearest = query(Vec::new(), 1);
         let mut overlay = HeldVectorOverlay::new(&memory).unwrap();
-        overlay.shadow_staged(0, EntityId::String("a".into()), Some(vec![1.0].into()), Vec::new()).unwrap();
-        overlay.shadow_staged(1, EntityId::String("a".into()), None, Vec::new()).unwrap();
-        assert!(overlay.shadow_staged(0, EntityId::String("a".into()), None, Vec::new()).is_err());
+        let id = EntityIdRef::String("a");
+        overlay.shadow_staged(0, id, Some(&[1.0, 0.0]), std::iter::empty(), &nearest).unwrap();
+        overlay.shadow_staged(1, id, None, std::iter::empty(), &nearest).unwrap();
+        assert!(overlay.shadow_staged(0, id, None, std::iter::empty(), &nearest).is_err());
     }
 
     #[test]
-    fn nearest_staged_spans_keep_the_admitted_arrow_charge_until_ranking() {
+    fn nearest_staged_shadows_release_arrow_and_keep_scores_and_refusals() {
         use arrow_array::ArrayRef;
 
         let memory = MemoryBudget::new(1 << 20);
-        let vector = Arc::new(Float32Array::from(vec![-9.0, 3.0, 0.0])) as ArrayRef;
-        let filter = Arc::new(BinaryArray::from(vec![b"no".as_slice(), b"yes".as_slice(), b"no".as_slice()])) as ArrayRef;
+        let nearest = query(vec![BTreeSet::from([b"yes".to_vec()])], 1);
+        let vector = Arc::new(Float32Array::from(vec![-9.0, 3.0, 0.0, f32::NAN, 2.0])) as ArrayRef;
+        let filter = Arc::new(BinaryArray::from(vec![
+            b"no".as_slice(), b"yes".as_slice(), b"no".as_slice(), b"no".as_slice(), b"no".as_slice(),
+        ])) as ArrayRef;
         let batch = RecordBatch::try_from_iter([("vector", vector), ("filter", filter)]).unwrap();
         let source = OwnedBatch::new(batch, &memory).unwrap();
         let charge = Arc::downgrade(source.reservation());
         let vector = source.batch().column(0).as_any().downcast_ref::<Float32Array>().unwrap();
         let filter = source.batch().column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
         let mut overlay = HeldVectorOverlay::new(&memory).unwrap();
-        overlay.shadow_staged(0, EntityId::Integer(1), Some(vector.values().slice(1, 2)),
-            vec![Some(filter.values().slice_with_length(2, 3))]).unwrap();
+        let initial_bytes = overlay._retained.bytes();
+        let invalid = &vector.values()[3..5];
+        for (id, vector, filter) in [
+            (1, Some(&vector.values()[1..3]), Some(filter.value(1))),
+            (2, Some(invalid), Some(filter.value(0))),
+            (3, None, Some(filter.value(1))),
+            (4, Some(invalid), Some(filter.value(1))),
+        ] {
+            overlay.shadow_staged(0, EntityIdRef::Integer(id), vector, [filter].into_iter(), &nearest).unwrap();
+        }
         drop(source);
 
-        let nearest = query(vec![BTreeSet::from([b"yes".to_vec()])], 1);
-        assert!(charge.upgrade().is_some());
-        assert_eq!(overlay.rows[0].2.distance(&nearest).unwrap(), Some(0.0));
-        drop(overlay);
         assert!(charge.upgrade().is_none());
+        assert_eq!(overlay._retained.bytes() - initial_bytes, 4 * (size_of::<Value>() + 256));
+        assert_eq!(overlay.rows[0].2.unwrap(), Some(0.0));
+        assert!(overlay.contains_shadow(0, &EntityId::Integer(2)));
+        assert_eq!(overlay.rows[1].2.unwrap(), None);
+        assert!(overlay.contains_shadow(0, &EntityId::Integer(3)));
+        assert_eq!(overlay.rows[2].2.unwrap(), None);
+        let error = Anomaly::from(overlay.rows[3].2.unwrap_err());
+        assert_eq!(error.code, "rtdb.owned/nearest-dimension");
     }
 
     #[test]
@@ -898,8 +903,8 @@ mod tests {
 
         assert!(overlay.contains_shadow(0, &filtered));
         assert!(overlay.contains_shadow(0, &refused));
-        assert_eq!(overlay.rows[0].2.distance(&nearest).unwrap(), None);
-        let error = Anomaly::from(overlay.rows[1].2.distance(&nearest).unwrap_err());
+        assert_eq!(overlay.rows[0].2.unwrap(), None);
+        let error = Anomaly::from(overlay.rows[1].2.unwrap_err());
         assert_eq!(error.code, "rtdb.owned/nearest-dimension");
     }
 }

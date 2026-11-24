@@ -1,8 +1,9 @@
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
+use arrow_schema::DataType;
 use rtdb_types::{Anomaly, Result};
 
 pub use rtdb_types::{MemoryBudget, MemoryReservation};
@@ -48,6 +49,7 @@ impl BatchBuilder {
 pub struct OwnedBatch {
     batch: RecordBatch,
     reservation: Arc<MemoryReservation>,
+    schema_reservation: Option<Arc<MemoryReservation>>,
 }
 
 impl OwnedBatch {
@@ -63,17 +65,40 @@ impl OwnedBatch {
         if batch.get_array_memory_size() > reservation.bytes() && shared_allocation_size(&batch)? > reservation.bytes() {
             return Err(Anomaly::incorrect("rtdb/undersized-reservation", "Batch allocation exceeds its reservation"));
         }
-        let arrays = batch.columns().iter().map(|array| {
-            attach_data(array.to_data(), &reservation).map(make_array)
-        }).collect::<Result<Vec<_>>>()?;
-        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-        let batch = RecordBatch::try_new_with_options(batch.schema(), arrays, &options).map_err(super::arrow_error)?;
-        Ok(Self { batch, reservation })
+        let batch = attach_batch(batch, |buffer| retain_buffer(buffer, &reservation))?;
+        Ok(Self { batch, reservation, schema_reservation: None })
+    }
+
+    /// Adopts a batch under its decode grant, leaving already funded backing with its existing owners.
+    pub fn with_shared_buffers(batch: RecordBatch, grant: &mut MemoryReservation,
+        schema_reservation: Arc<MemoryReservation>, is_funded: impl Fn(BufferIdentity) -> bool,
+    ) -> Result<Self> {
+        let mut allocations = BTreeMap::new();
+        let mut bytes = std::mem::size_of::<RecordBatch>();
+        for array in batch.columns() {
+            bytes = sum(bytes, array_descriptors(array)?)?;
+            visit_buffers(&array.to_data(), &mut |buffer| {
+                count_new_buffer(&mut allocations, buffer, &is_funded)
+            })?;
+        }
+        let bytes = allocations.into_values().try_fold(bytes, sum)?;
+        let reservation = grant.split_off(bytes)?;
+        let batch = attach_batch(batch, |buffer| {
+            if is_funded(BufferIdentity::of(buffer)) { buffer.clone() }
+            else { retain_buffer(buffer, &reservation) }
+        })?;
+        Ok(Self { batch, reservation, schema_reservation: Some(schema_reservation) })
+    }
+
+    /// Carries the owners through a layout change with already funded backing buffers.
+    pub fn with_retained_buffers(&self, batch: RecordBatch) -> Self {
+        Self { batch, reservation: Arc::clone(&self.reservation), schema_reservation: self.schema_reservation.clone() }
     }
 
     /// Cloned Arrow arrays retain the reservation through their allocation owners.
     pub fn batch(&self) -> &RecordBatch { &self.batch }
     pub fn reservation(&self) -> &Arc<MemoryReservation> { &self.reservation }
+    pub fn owns_schema(&self) -> bool { self.schema_reservation.is_some() }
 
     pub fn with_appended_column(&self, field: arrow_schema::Field, column: arrow_array::ArrayRef,
         reservation: Arc<MemoryReservation>) -> Result<Self> {
@@ -92,7 +117,7 @@ impl OwnedBatch {
         columns.insert(index, make_array(attach_data(column.to_data(), &reservation)?));
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone()));
         let batch = RecordBatch::try_new(schema, columns).map_err(super::arrow_error)?;
-        Ok(Self { batch, reservation: Arc::clone(&self.reservation) })
+        Ok(self.with_retained_buffers(batch))
     }
 
     pub fn with_replaced_column(&self, index: usize, column: arrow_array::ArrayRef,
@@ -103,7 +128,7 @@ impl OwnedBatch {
         let mut columns = self.batch.columns().to_vec();
         columns[index] = make_array(attach_data(column.to_data(), &reservation)?);
         let batch = RecordBatch::try_new(self.batch.schema(), columns).map_err(super::arrow_error)?;
-        Ok(Self { batch, reservation: Arc::clone(&self.reservation) })
+        Ok(self.with_retained_buffers(batch))
     }
 
     /// Copies distinct rows from batches with the same physical schema, in the specified order.
@@ -142,7 +167,7 @@ impl OwnedBatch {
 
     pub fn slice(&self, offset: usize, length: usize) -> Result<Self> {
         check_slice(offset, length, self.batch.num_rows())?;
-        Ok(Self { batch: self.batch.slice(offset, length), reservation: Arc::clone(&self.reservation) })
+        Ok(self.with_retained_buffers(self.batch.slice(offset, length)))
     }
 
     pub fn select(&self, selection: &Selection) -> Result<Self> {
@@ -164,7 +189,9 @@ impl OwnedBatch {
                     return Err(Anomaly::fault("rtdb/selection-allocation-bound", "Arrow selection exceeded its reserved allocation bound"));
                 }
                 Arc::get_mut(&mut reservation).ok_or_else(|| Anomaly::fault("rtdb/shared-allocation-reservation", "Selection reservation escaped before allocation completed"))?.shrink_to(bytes)?;
-                Self::with_reservation(batch, reservation)
+                let mut owned = Self::with_reservation(batch, reservation)?;
+                owned.schema_reservation = self.schema_reservation.clone();
+                Ok(owned)
             }
         }
     }
@@ -172,6 +199,15 @@ impl OwnedBatch {
 
 /// Counts each buffer base address once, using the largest capacity reported for it.
 pub fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
+    allocation_size(batch, None)
+}
+
+/// Counts retained batch allocations apart from the backing charged by `buffer`'s owner.
+pub fn shared_allocation_size_excluding(batch: &RecordBatch, buffer: &Buffer) -> Result<usize> {
+    allocation_size(batch, Some(buffer.data_ptr().as_ptr() as usize))
+}
+
+fn allocation_size(batch: &RecordBatch, excluded: Option<usize>) -> Result<usize> {
     let mut buffers = BTreeMap::new();
     let mut descriptors = std::mem::size_of::<RecordBatch>();
     for array in batch.columns() {
@@ -179,6 +215,7 @@ pub fn shared_allocation_size(batch: &RecordBatch) -> Result<usize> {
             .ok_or_else(allocation_overflow)?;
         collect_buffers(&array.to_data(), &mut buffers);
     }
+    if let Some(base) = excluded { buffers.remove(&base); }
     buffers.values().try_fold(descriptors, |size, capacity| size.checked_add(*capacity).ok_or_else(allocation_overflow))
 }
 
@@ -191,6 +228,121 @@ fn collect_buffers(data: &ArrayData, buffers: &mut BTreeMap<usize, usize>) {
     for child in data.child_data() {
         collect_buffers(child, buffers);
     }
+}
+
+/// Returns a conservative count of distinct buffer bytes visible through the Arrow views.
+/// Unsupported payloads receive zero credit, and out-of-bounds ranges return `None`.
+pub fn visible_buffer_bytes(columns: &[ArrayRef]) -> Option<usize> {
+    let mut ranges = Vec::new();
+    for column in columns {
+        let data = column.to_data();
+        collect_visible_ranges(&data, 0..data.len(), &mut ranges)?;
+    }
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut end = 0;
+    let mut bytes = 0usize;
+    for range in ranges {
+        bytes = bytes.checked_add(range.end.saturating_sub(range.start.max(end)))?;
+        end = end.max(range.end);
+    }
+    Some(bytes)
+}
+
+fn collect_visible_ranges(
+    data: &ArrayData, rows: Range<usize>, ranges: &mut Vec<Range<usize>>,
+) -> Option<()> {
+    if rows.start > rows.end || rows.end > data.len() {
+        return None;
+    }
+    if rows.is_empty() {
+        return Some(());
+    }
+
+    let slots = offset_range(&rows, data.offset())?;
+    let nulls = if let Some(nulls) = data.nulls() {
+        if rows.end > nulls.len() {
+            return None;
+        }
+        let bits = offset_range(&rows, nulls.offset())?;
+        add_buffer_range(nulls.buffer(), bitmap_bytes(bits), ranges)?;
+        (nulls.null_count() != 0)
+            .then(|| nulls.slice(rows.start, rows.len()))
+            .filter(|nulls| nulls.null_count() != 0)
+    } else {
+        None
+    };
+
+    match data.data_type() {
+        DataType::Struct(_) => {
+            // Arrow's StructArray::to_data has already applied the parent offset to its children.
+            if data.offset() != 0 { return None; }
+            if nulls.is_none() {
+                for child in data.child_data() {
+                    collect_visible_ranges(child, rows.clone(), ranges)?;
+                }
+            }
+        }
+        DataType::FixedSizeList(_, width) => {
+            if nulls.is_none() {
+                let children = scale_range(slots, usize::try_from(*width).ok()?)?;
+                collect_visible_ranges(data.child_data().first()?, children, ranges)?;
+            }
+        }
+        DataType::List(_) | DataType::Binary | DataType::Utf8 => {
+            let offsets = data.buffers().first()?;
+            let positions = slots.start..slots.end.checked_add(1)?;
+            let offset_bytes = scale_range(positions.clone(), std::mem::size_of::<i32>())?;
+            add_buffer_range(offsets, offset_bytes, ranges)?;
+            let offsets = offsets.typed_data::<i32>().get(positions)?;
+            // Arrow permits null slots to enclose payload bytes or child rows.
+            if nulls.is_some_and(|nulls| offsets.windows(2).zip(nulls.iter()).any(|(pair, valid)| {
+                !valid && pair[0] != pair[1]
+            })) {
+                return Some(());
+            }
+            let start = usize::try_from(*offsets.first()?).ok()?;
+            let end = usize::try_from(*offsets.last()?).ok()?;
+            let values = start..end;
+            if matches!(data.data_type(), DataType::List(_)) {
+                collect_visible_ranges(data.child_data().first()?, values, ranges)?;
+            } else {
+                add_buffer_range(data.buffers().get(1)?, values, ranges)?;
+            }
+        }
+        DataType::Boolean => add_buffer_range(data.buffers().first()?, bitmap_bytes(slots), ranges)?,
+        DataType::FixedSizeBinary(width) => {
+            let values = scale_range(slots, usize::try_from(*width).ok()?)?;
+            add_buffer_range(data.buffers().first()?, values, ranges)?;
+        }
+        ty => {
+            if let Some(width) = ty.primitive_width() {
+                add_buffer_range(data.buffers().first()?, scale_range(slots, width)?, ranges)?;
+            }
+        }
+    }
+    Some(())
+}
+
+fn offset_range(range: &Range<usize>, offset: usize) -> Option<Range<usize>> {
+    Some(range.start.checked_add(offset)?..range.end.checked_add(offset)?)
+}
+
+fn scale_range(range: Range<usize>, width: usize) -> Option<Range<usize>> {
+    Some(range.start.checked_mul(width)?..range.end.checked_mul(width)?)
+}
+
+fn bitmap_bytes(bits: Range<usize>) -> Range<usize> {
+    bits.start / 8..bits.end.div_ceil(8)
+}
+
+fn add_buffer_range(buffer: &Buffer, bytes: Range<usize>, ranges: &mut Vec<Range<usize>>) -> Option<()> {
+    if bytes.start > bytes.end || bytes.end > buffer.len() {
+        return None;
+    }
+    if !bytes.is_empty() {
+        ranges.push(offset_range(&bytes, buffer.as_ptr() as usize)?);
+    }
+    Some(())
 }
 
 #[derive(Clone, Debug)]
@@ -252,20 +404,101 @@ pub fn retain_buffer_with_owner(buffer: &Buffer, owner: Arc<dyn Send + Sync>) ->
     unsafe { Buffer::from_custom_allocation(start, buffer.len(), owner) }
 }
 
-fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<ArrayData> {
-    let buffers = data.buffers().iter().map(|buffer| retain_buffer(buffer, reservation)).collect::<Vec<_>>();
-    let children = data.child_data().iter().map(|child| attach_data(child.clone(), reservation)).collect::<Result<Vec<_>>>()?;
+fn attach_batch(batch: RecordBatch, own: impl Fn(&Buffer) -> Buffer) -> Result<RecordBatch> {
+    let arrays = batch.columns().iter().map(|array| attach_buffers(array.to_data(), &own).map(make_array))
+        .collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(batch.schema(), arrays, &options).map_err(super::arrow_error)
+}
+
+fn attach_buffers(data: ArrayData, own: &impl Fn(&Buffer) -> Buffer) -> Result<ArrayData> {
+    let buffers = data.buffers().iter().map(own).collect::<Vec<_>>();
+    let children = data.child_data().iter().map(|child| attach_buffers(child.clone(), own)).collect::<Result<Vec<_>>>()?;
     let nulls = data.nulls().map(|nulls| {
-        let buffer = retain_buffer(nulls.buffer(), reservation);
+        let buffer = own(nulls.buffer());
         NullBuffer::new(BooleanBuffer::new(buffer, nulls.offset(), nulls.len()))
     });
     data.into_builder().buffers(buffers).child_data(children).nulls(nulls).build().map_err(super::arrow_error)
+}
+
+fn attach_data(data: ArrayData, reservation: &Arc<MemoryReservation>) -> Result<ArrayData> {
+    attach_buffers(data, &|buffer| retain_buffer(buffer, reservation))
 }
 
 /// Keeps a copy's allocation charge with its Arrow buffers through moves and slices.
 pub fn retain_array(array: ArrayRef, reservation: &Arc<MemoryReservation>) -> Result<ArrayRef> {
     attach_data(array.to_data(), reservation).map(make_array)
 }
+
+/// Identifies backing storage while its Arrow buffers remain live.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BufferIdentity { base: usize, capacity: usize }
+
+impl BufferIdentity {
+    fn of(buffer: &Buffer) -> Self {
+        Self { base: buffer.data_ptr().as_ptr() as usize, capacity: buffer.capacity() }
+    }
+}
+
+/// An Arrow array with separately owned backing allocations that can be shared by other arrays.
+pub struct RetainedArray {
+    array: ArrayRef,
+    buffers: BTreeSet<BufferIdentity>,
+    descriptors: Arc<MemoryReservation>,
+}
+
+impl RetainedArray {
+    pub fn new(array: ArrayRef, grant: &mut MemoryReservation, is_funded: impl Fn(BufferIdentity) -> bool) -> Result<Self> {
+        let data = array.to_data();
+        let mut allocations = BTreeMap::new();
+        let mut descriptors = sum(256, array_descriptors(&array)?)?;
+        visit_buffers(&data, &mut |buffer| {
+            descriptors = sum(descriptors, 128)?;
+            count_new_buffer(&mut allocations, buffer, &is_funded)
+        })?;
+        // One IPC body can back multiple slices, and a delta can keep only some of those slices.
+        let descriptors = grant.split_off(descriptors)?;
+        let allocations = allocations.into_iter().map(|(key, bytes)| Ok((key, grant.split_off(bytes)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let data = attach_buffers(data, &|buffer| match allocations.get(&BufferIdentity::of(buffer)) {
+            Some(reservation) => retain_buffer(buffer, reservation),
+            None => buffer.clone(),
+        })?;
+        let mut buffers = BTreeSet::new();
+        visit_buffers(&data, &mut |buffer| {
+            buffers.insert(BufferIdentity::of(buffer));
+            Ok(())
+        })?;
+        Ok(Self { array: make_array(data), buffers, descriptors })
+    }
+
+    pub fn array(&self) -> &ArrayRef { &self.array }
+    pub fn funds(&self, buffer: BufferIdentity) -> bool { self.buffers.contains(&buffer) }
+    pub fn descriptor_bytes(&self) -> usize { self.descriptors.bytes() }
+}
+
+fn visit_buffers(data: &ArrayData, visit: &mut impl FnMut(&Buffer) -> Result<()>) -> Result<()> {
+    for buffer in data.buffers().iter().chain(data.nulls().map(NullBuffer::buffer)) { visit(buffer)?; }
+    for child in data.child_data() { visit_buffers(child, visit)?; }
+    Ok(())
+}
+
+fn count_new_buffer(allocations: &mut BTreeMap<BufferIdentity, usize>, buffer: &Buffer,
+    is_funded: &impl Fn(BufferIdentity) -> bool,
+) -> Result<()> {
+    let identity = BufferIdentity::of(buffer);
+    if !is_funded(identity) {
+        let bytes = allocations.entry(identity).or_insert(identity.capacity);
+        *bytes = sum(*bytes, 128)?;
+    }
+    Ok(())
+}
+
+fn array_descriptors(array: &ArrayRef) -> Result<usize> {
+    array.get_array_memory_size().checked_sub(array.get_buffer_memory_size()).ok_or_else(allocation_overflow)
+}
+
+fn sum(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(allocation_overflow) }
 
 fn selection_bound(batch: &RecordBatch, indices: &[u32]) -> Result<usize> {
     let mut bound = indices.len().checked_mul(std::mem::size_of::<u32>()).ok_or_else(allocation_overflow)?;

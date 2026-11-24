@@ -18,7 +18,7 @@ use rtdb_columnar::{
     BatchBuilder, MemoryReservation, OwnedBatch, retain_buffer_with_owner, to_field,
 };
 use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, UnaryOp};
-use rtdb_query::{CandidateIids, ConstantEvaluator, ScanSelection, OrderedBatches, OrderedCandidates, OrderedScan, ScanAccelerator, ScanRequest};
+use rtdb_query::{ConstantEvaluator, OrderedBatches, OrderedCandidates, OrderedIidBuffer, OrderedScan, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_types::{AnomalyCategory, Iid, LogicalType, Result, ScalarType, TimeUnit, Timestamp};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -37,29 +37,23 @@ const MAX_OWNED_REPLAY_ROWS: i64 = 4_096;
 
 pub(crate) struct OrderedIndexAccelerator;
 
-async fn collect_candidates(request: &ScanRequest<'_>) -> Result<Option<Vec<Iid>>> {
+async fn collect_candidates(request: &ScanRequest<'_>) -> Result<Option<OrderedIidBuffer>> {
     let Some(OrderedScan::Payload { mut candidates, .. }) = exact(request, None, &[]).await? else {
         return Ok(None);
     };
-    let mut selected = Vec::new();
-    loop {
-        match candidates.next_iids(BATCH_ROWS).await {
-            Ok(batch) if batch.is_empty() => break,
-            Ok(batch) => {
-                selected.extend(batch);
-                if selected.len() > MAX_CANDIDATES {
-                    selected.sort_unstable();
-                    selected.dedup();
-                    if selected.len() > MAX_CANDIDATES { return Ok(None); }
-                }
+    let collected: Result<_> = async {
+        let mut selected = OrderedIidBuffer::with_capacity(0, request.memory)?;
+        while let Some(chunk) = candidates.next_iids(BATCH_ROWS).await? {
+            if !selected.merge_distinct(chunk, MAX_CANDIDATES)? {
+                return Ok(None);
             }
-            Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
-            Err(_) => return Ok(None),
         }
+        Ok(Some(selected))
+    }.await;
+    match collected {
+        Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
+        result => result,
     }
-    selected.sort_unstable();
-    selected.dedup();
-    Ok(Some(selected))
 }
 
 #[async_trait]
@@ -67,16 +61,15 @@ impl ScanAccelerator for OrderedIndexAccelerator {
     fn accepts_arrow_iids(&self) -> bool { true }
 
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
-        Ok(collect_candidates(request).await?.map(|ids| ids.into_iter().collect()))
+        let Some(ids) = collect_candidates(request).await? else { return Ok(None); };
+        let mut keys = BTreeSet::new();
+        for iid in ids.iter() { keys.insert(iid); }
+        Ok(Some(keys))
     }
 
     async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
         let Some(ids) = collect_candidates(request).await? else { return Ok(None); };
-        match CandidateIids::from_sorted(&ids, request.memory) {
-            Ok(iids) => Ok(Some(ScanSelection { iids, scores: None })),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
-            Err(error) => Err(error),
-        }
+        Ok(Some(ScanSelection { iids: ids.into_sorted_membership()?, scores: None }))
     }
 
     async fn ordered(
@@ -1125,12 +1118,14 @@ struct PostingCandidates(Option<MatchingPostings>);
 
 #[async_trait]
 impl OrderedCandidates for PostingCandidates {
-    async fn next_iids(&mut self, maximum: usize) -> Result<Vec<Iid>> {
+    async fn next_iids(&mut self, maximum: usize) -> Result<Option<OrderedIidBuffer>> {
         let Some(postings) = &mut self.0 else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let capacity = maximum.min(BATCH_ROWS);
-        let mut ids = Vec::with_capacity(capacity);
+        if capacity == 0 { return Ok(None); }
+        if postings.scan.cancellation.is_cancelled() { return Err(cancelled()); }
+        let mut ids = OrderedIidBuffer::with_capacity(capacity, &postings.scan.tree.memory)?;
         while ids.len() < capacity {
             let Some(head) = postings.next().await? else {
                 self.0 = None;
@@ -1138,7 +1133,7 @@ impl OrderedCandidates for PostingCandidates {
             };
             ids.push(head.address().iid);
         }
-        Ok(ids)
+        Ok((!ids.is_empty()).then_some(ids))
     }
 }
 

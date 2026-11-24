@@ -212,6 +212,13 @@ impl MemoryReservation {
         Ok(())
     }
 
+    /// Transfers part of this grant to an independently released reservation.
+    pub fn split_off(&mut self, bytes: usize) -> Result<Arc<Self>> {
+        self.bytes = self.bytes.checked_sub(bytes)
+            .ok_or_else(|| Anomaly::incorrect("rtdb/undersized-reservation", "Allocation exceeds its reservation"))?;
+        Ok(Arc::new(Self { budget: Arc::clone(&self.budget), bytes }))
+    }
+
     /// Moves an existing charge between reservations on the same budget without acquiring it again.
     pub fn absorb(&mut self, other: &mut Self) -> Result<()> {
         if !Arc::ptr_eq(&self.budget, &other.budget) {

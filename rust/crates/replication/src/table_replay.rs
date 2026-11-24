@@ -4,7 +4,8 @@ use rtdb_format::{catalog::BlockCatalog, data::EventBatch, envelope::ReplicaBody
 use rtdb_index::{LiveIndex, LiveTable, Snapshot, TableCatalog, TrieCatalog};
 use rtdb_storage::{log::LogRange, object_store::ReadReservation};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, EventHeader, EventOrigin, MemoryBudget, ReplicaPosition, Result, SourcePosition, StorageEpoch, TableRef, Term, TransactionKey};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, TermFence, blocks::matches_catalog_boundary, repair_decision::exclusive_replay_end,
@@ -24,6 +25,11 @@ pub struct RetainedTableReplay<'a> {
     awaiting_upload: Option<BlockIndex>,
     last_boundary: Option<ReplicaPosition>,
     finished: bool,
+}
+
+pub enum RetainedHistory<'a> {
+    Page(&'a EventBatch),
+    Header { header: EventHeader, origin: Option<EventOrigin>, page_row: usize },
 }
 
 impl<'a> RetainedTableReplay<'a> {
@@ -56,8 +62,54 @@ impl<'a> RetainedTableReplay<'a> {
 
     pub async fn next_block(
         &mut self, cancellation: &CancellationToken,
-        mut visit: impl FnMut(BlockIndex, &EventBatch) -> Result<()> + Send,
+        visit: impl FnMut(BlockIndex, &EventBatch) -> Result<()> + Send,
     ) -> Result<Option<(BlockIndex, i64)>> {
+        let Some((block, live)) = self.next_live_block(cancellation).await? else { return Ok(None); };
+        Self::visit_pages(block, &live, self.logs.memory(), cancellation, visit).await?;
+        Ok(Some((block, i64::from(live.row_count()))))
+    }
+
+    pub async fn next_history_block(
+        &mut self, cancellation: &CancellationToken, payload_blocks: &[i64],
+        mut visit: impl FnMut(BlockIndex, RetainedHistory<'_>) -> Result<()> + Send,
+    ) -> Result<Option<(BlockIndex, i64)>> {
+        let Some((block, live)) = self.next_live_block(cancellation).await? else { return Ok(None); };
+        if payload_blocks.binary_search(&block.0).is_ok()
+            || self.table.is_owned_event_data() || self.table.is_owned_world_topology()
+        {
+            Self::visit_pages(block, &live, self.logs.memory(), cancellation, |block, page| visit(block, RetainedHistory::Page(page))).await?;
+        } else if live.row_count() > 0 {
+            for leaf in live.trie().leaves() {
+                if cancellation.is_cancelled() { return Err(crate::progress::cancelled()); }
+                let (rows, _sort) = leaf.sorted_rows_in(&live, self.logs.memory())?;
+                for (page_row, row) in rows.into_iter().enumerate() {
+                    let source = live.row(row)?;
+                    let header = source.batch.header(source.row)?;
+                    let origin = source.batch.view().origin(source.row)?;
+                    visit(block, RetainedHistory::Header { header, origin, page_row })?;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(Some((block, i64::from(live.row_count()))))
+    }
+
+    async fn visit_pages(
+        block: BlockIndex, live: &LiveTable, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+        mut visit: impl FnMut(BlockIndex, &EventBatch) -> Result<()> + Send,
+    ) -> Result<()> {
+        if live.row_count() == 0 { return Ok(()); }
+        let pages = live.block_pages(memory)?;
+        for leaf in live.trie().leaves() {
+            if cancellation.is_cancelled() { return Err(crate::progress::cancelled()); }
+            let batch = pages.copy(&leaf.sorted_rows(live)?)?;
+            visit(block, &EventBatch::new(batch.batch().clone())?)?;
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    }
+
+    async fn next_live_block(&mut self, cancellation: &CancellationToken) -> Result<Option<(BlockIndex, LiveTable)>> {
         if self.finished { return Ok(None); }
         let memory = self.logs.memory();
         let bound = self.range.allocation_bound();
@@ -117,16 +169,7 @@ impl<'a> RetainedTableReplay<'a> {
                     self.awaiting_upload = (!terminal).then_some(block);
                     self.last_boundary = Some(record.metadata.position);
                     self.block = BlockIndex(block.0.checked_add(1).ok_or_else(|| invalid("The replay block index overflows"))?);
-                    if live.row_count() > 0 {
-                        let pages = live.block_pages(memory)?;
-                        for leaf in live.trie().leaves() {
-                            if cancellation.is_cancelled() { return Err(crate::progress::cancelled()); }
-                            let batch = pages.copy(&leaf.sorted_rows(&live)?)?;
-                            visit(block, &EventBatch::new(batch.batch().clone())?)?;
-                            tokio::task::yield_now().await;
-                        }
-                    }
-                    return Ok(Some((block, i64::from(live.row_count()))));
+                    return Ok(Some((block, live)));
                 }
                 ReplicaBody::BlockUploaded(upload) => {
                     if self.awaiting_upload.is_some_and(|block| upload.block_index == Some(block.0))
