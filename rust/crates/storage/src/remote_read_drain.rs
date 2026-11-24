@@ -71,8 +71,18 @@ impl<'a> ReadDrain<'a> {
             }
             Err(error) => return Err(super::provider_error(self.key, error)),
         }
-        let live_reads_seen = self.client.list(Some(&self.readers())).try_next().await
-            .map_err(|error| super::provider_error(self.key, error))?.is_some();
+        let readers = self.readers();
+        let mut registrations = self.client.list(Some(&readers));
+        let mut live_reads_seen = false;
+        while let Some(registration) = registrations.try_next().await
+            .map_err(|error| super::provider_error(self.key, error))?
+        {
+            live_reads_seen = true;
+            eprintln!(
+                "WARN Provider read registration is blocking installed reclamation object_key={} registration={}",
+                self.key, registration.location
+            );
+        }
         Ok(decision::provider_drain_completed(true, live_reads_seen))
     }
 }
@@ -140,10 +150,18 @@ mod tests {
     async fn r7_ambiguous_provider_completion_remains_in_the_census() {
         let provider = Arc::new(InMemory::new());
         let worker = store(provider.clone());
+        let custodian = store(provider.clone());
         let target = ObjectKey::new("grant/target").unwrap();
         let _: Result<()> = worker.objects.with_read(&target, async {
             Err(Error::Remote { key: target.to_string(), message: "Lost provider outcome".into() })
         }).await;
-        assert!(!store(provider).close_read_admission(&target).await.unwrap());
+        let drain = worker.objects.read_drain(&target).unwrap();
+        let registrations = provider.list(Some(&drain.readers())).try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(registrations.len(), 1);
+        let registration = &registrations[0].location;
+        for _ in 0..2 {
+            assert!(!custodian.close_read_admission(&target).await.unwrap());
+            assert_eq!(provider.head(registration).await.unwrap().location, *registration);
+        }
     }
 }

@@ -277,16 +277,27 @@ Withdrawal serializes with new references and covers both crash-selectable check
 An authenticated candidate whose exact version is absent settles even when a replacement is visible.
 For an enrolled never-versioned provider, the matching retirement tombstone establishes completion.
 
-With `reclamation_read_drain` enabled in every installed worker and custodian route entry, each serving point read of an eligible S3 trie file creates a unique durable registration before checking the object's admission fence.
+Installed S3 serving storage enables the read-drain census for every worker and custodian.
+Start both roles with census support when the cell first serves installed journals.
+Each serving point read of an eligible trie file creates a unique durable registration before checking the object's admission fence.
 The detached storage task removes its registration after conclusive provider completion, including when the caller has timed out.
 Following the ordered withdrawal, the custodian closes physical read admission and checks the provider census before withdrawing the key or removing the exact publication.
-An expired lease, an ambiguous provider result, or a process loss can leave a registration pending.
-Without a qualified census, the custodian can reconcile confirmed absence and defers destructive effects for receipt candidates.
+A registration can outlast its lease.
+An ambiguous provider result or a process loss can leave an orphaned registration.
+Configure an alert on the custodian's WARN event `Provider read registration is blocking installed reclamation`.
+The event includes the provider registration key and the cell-relative object key.
+Reclamation continues to defer while any registration remains, regardless of its age.
 
-Enable this mode only after all readers from the previous configuration have joined their provider operations and every serving worker and custodian uses the census.
-The S3 provider must supply strongly consistent conditional creates, point observations and complete listings.
-Grant serving readers create and release access to their read registrations, give the custodian fence creation and census listing access, and preserve active registrations and permanent fences in bucket policy and lifecycle rules.
-The control prefix is `STORAGE_PREFIX/~ordered/GENERATION/EPOCH.lifecycle/.tmp/installed-read-drain/`.
+The control prefix under the configured S3 cell root is `STORAGE_PREFIX/~ordered/GENERATION/EPOCH.lifecycle/.tmp/installed-read-drain/`.
+Each object has a `closed` fence and registration keys under `reads/` inside its census directory.
+
+- Serving roles, including the custodian when it reads a checkpoint source, need `s3:PutObject` for create-only writes and `s3:DeleteObject` for release on registration keys, plus `s3:GetObject` for `HeadObject` on fence keys. [Required S3 permissions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-with-s3-policy-actions.html)
+- The custodian also needs `s3:PutObject` on fence keys and `s3:ListBucket` on the bucket for complete `ListObjectsV2` scans of the registration prefixes.
+- Qualify strongly consistent conditional creates, fence observations that return HTTP 404 for missing fences, and complete listings with the deployed credentials.
+  S3 uses the caller's `s3:ListBucket` permission to distinguish a missing object from access denial for `HeadObject`. [S3 HeadObject permissions](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html)
+- Keep the control prefix outside bucket-wide and temporary-object lifecycle rules that expire or transition its objects.
+  Preserve active and orphaned registrations, permanent fences, and any version or delete-marker history that determines their current visibility.
+  Scope automatic expiration positively to other prefixes or tags. [S3 Lifecycle configuration](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intro-lifecycle-rules.html)
 
 ## Repair the voter cohort
 

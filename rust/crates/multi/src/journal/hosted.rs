@@ -55,8 +55,6 @@ struct Definition {
     archive: crate::deployment::CellStorage,
     archive_prefix: String,
     journal_window_bytes: Option<u64>,
-    #[serde(default)]
-    reclamation_read_drain: bool,
     endpoints: Vec<WorkerEndpoint>,
     #[serde(default)]
     checkpoint_reservations: Vec<Reservation>,
@@ -82,7 +80,6 @@ pub(crate) struct Placement {
     archive: crate::deployment::CellStorage,
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
-    reclamation_read_drain: bool,
     nomination: tokio::sync::Mutex<Option<Request>>,
     worker_disposal: tokio::sync::Mutex<Option<Request>>,
     reader_opening: parking_lot::Mutex<std::sync::Weak<Held>>,
@@ -267,7 +264,6 @@ impl Routes {
                 archive: entry.archive,
                 archive_prefix: ObjectKey::new(entry.archive_prefix)?,
                 journal_window_bytes: entry.journal_window_bytes,
-                reclamation_read_drain: entry.reclamation_read_drain,
                 custody_work,
                 erasure_signer,
                 nomination: Default::default(),

@@ -204,11 +204,7 @@ pub(super) async fn settle_receipts(
     }
     checkpoint.open(route.checkpoint).await?;
     let provider = storage.custody_namespace()?;
-    let census = if placement.reclamation_read_drain {
-        super::storage::serving_bucket(storage, Arc::clone(&io), true).await?.1
-    } else {
-        None
-    };
+    let (_, census) = super::storage::serving_bucket(storage, Arc::clone(&io)).await?;
     let ledger = Arc::new(super::storage::serving_ledger(Arc::clone(keys), route.placement, provider, &source, io));
     let raw = Arc::new(PrefixedStore::new(Arc::clone(&bucket), source.clone()));
     let sealed = EncryptingStore::with_units(raw.clone(), ledger.clone());

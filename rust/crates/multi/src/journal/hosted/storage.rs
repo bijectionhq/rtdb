@@ -172,7 +172,7 @@ impl RemoteStorageFactory for StoreFactory {
         let installed = placement.worker.placement();
         let grant_prefix = grant_prefix(&storage_prefix, installed.generation, grant.epoch);
         let io = local_lifetime(&self.storage, &grant_prefix, &io)?;
-        let (bucket, s3) = serving_bucket(&self.storage, Arc::clone(&io), placement.reclamation_read_drain).await?;
+        let (bucket, s3) = serving_bucket(&self.storage, Arc::clone(&io)).await?;
         let prefix = source_prefix(&storage_prefix, installed.generation, grant.epoch, root);
         let queue_prefix = queue_prefix(&grant_prefix);
         let (writer, queue_writer): (Option<crate::reference::Bucket>, Option<crate::reference::Bucket>) = match (&self.storage, &self.scoped_writes, s3) {
@@ -306,7 +306,7 @@ impl StoreFactory {
         }).await?;
         let objects = ReplicaObjects {
             installed: placement.worker.placement(), storage_prefix: placement.record.storage_prefix(),
-            root: root.clone(), bucket: serving_bucket(&self.storage, Arc::clone(&io), placement.reclamation_read_drain).await?.0,
+            root: root.clone(), bucket: serving_bucket(&self.storage, Arc::clone(&io)).await?.0,
             io: Arc::clone(&io), storage: self.storage.clone(), keys: Arc::clone(&self.keys),
         };
         let upper: Arc<dyn ObjectStore> = if hold.start == hold.through && route.writer.grant.is_none() {
@@ -323,15 +323,11 @@ impl StoreFactory {
 }
 
 pub(super) async fn serving_bucket(
-    storage: &CellStorage, io: Arc<IoRegion>, drain: bool,
+    storage: &CellStorage, io: Arc<IoRegion>,
 ) -> Result<(crate::reference::Bucket, Option<Arc<RemoteStore>>)> {
     let CellStorage::S3 { config } = storage else { return Ok((storage.bucket(io).await?, None)); };
     let s3 = Box::pin(config.open_cell(&config.cell_root()?, &BTreeMap::new(), io)).await?;
-    let s3 = if drain {
-        Arc::new(Arc::unwrap_or_clone(s3).with_read_drain(super::reclamation::read_census_scope))
-    } else {
-        s3
-    };
+    let s3 = Arc::new(Arc::unwrap_or_clone(s3).with_read_drain(super::reclamation::read_census_scope));
     Ok((s3.clone(), Some(s3)))
 }
 
@@ -385,7 +381,7 @@ impl ReplicaObjects {
             installed: placement.worker.placement(),
             storage_prefix: placement.record.storage_prefix(),
             root: ObjectKey::new(crate::archive::checkpoint_storage_root()?)?,
-            bucket: serving_bucket(storage, Arc::clone(&io), placement.reclamation_read_drain).await?.0,
+            bucket: serving_bucket(storage, Arc::clone(&io)).await?.0,
             storage: storage.clone(),
             io,
             keys,
@@ -487,7 +483,7 @@ pub(super) async fn reopen_source(
         &grant_prefix(&storage_prefix, generation, origin.writer.epoch),
         io,
     )?;
-    let (bucket, _) = serving_bucket(storage, Arc::clone(&io), placement.reclamation_read_drain).await?;
+    let (bucket, _) = serving_bucket(storage, Arc::clone(&io)).await?;
     let ledger = serving_ledger(
         keys,
         placement.worker.placement(),

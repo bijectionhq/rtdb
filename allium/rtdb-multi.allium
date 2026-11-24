@@ -587,9 +587,11 @@ contract LogService {
         -- The queue retains each candidate independently of checkpoint selection and conveys no permission to remove its object.
         -- Physical removal requires an exact withdrawal decision ordered against reference admission.
         -- Every selectable checkpoint and pending preparation, every retained typed replay suffix, every live journal hold, and every live RTDB reader lease protect their dependencies from withdrawal.
-        -- Each provider read registers against the serving object before testing the physical admission fence and retains its registration through conclusive provider completion.
+        -- Installed S3 reads of reclaimable serving objects register before testing the physical admission fence and retain their registrations through conclusive provider completion.
         -- The withdrawal owner closes the object's physical admission before observing an empty provider census.
         -- Ambiguous provider completion retains the read's registration.
+        -- The withdrawal owner reports the identity of each registration it observes blocking reclamation.
+        -- A registration remains pending until conclusive completion permits release.
         -- Physical removal follows the withdrawal fence and the drain of previously admitted operations for that object.
         -- Exact stable absence settles the nominated publication even when a different current publication is visible.
         -- An authorized retirement of a superseded grant's prefix covers that prefix's candidate records as well.
