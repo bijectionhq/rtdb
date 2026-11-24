@@ -8,9 +8,7 @@ use prost::Message;
 use rtdb_node::LastSubmittedTx;
 use tonic::{Response, Status};
 use uuid::Uuid;
-pub(crate) use owned_batch::{
-    IpcFrames, OWNED_IPC_HEADER, OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames,
-};
+pub(crate) use owned_batch::{IpcFrames, OWNED_IPC_HEADER, OwnedIpcReply, SelectionEncoder};
 
 use crate::{error::{arrow, cancelled, invalid, status, unsupported}, lease::{Leased, Lookup}, protocol, service::{CLOSE_SESSION, Call, Output, Service, found, action_result_stream}, state::{ConnectionResource, Prepared, PreparedScope, Transaction}, ticket, wire};
 
@@ -198,27 +196,39 @@ impl Service {
                         crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1 => HostedDecisionWire::ImportPage,
                         _ => HostedDecisionWire::Packed,
                     };
-                    Ok(vec![Ok(self.decide_hosted_action(&call, &action.body, wire).await?)])
+                    return self.decide_hosted_action(&call, &action.body, wire, ipc_stream).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 => Ok(vec![Ok(self.declare_owned_fixed_range_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 => Ok(vec![Ok(self.declare_owned_capacity_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V2 => Ok(vec![Ok(self.declare_owned_single_column_path_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::DECLARE_OWNED_VECTOR_PATH_V1 => Ok(vec![Ok(self.declare_owned_vector_path_action(&call, &action.body).await?)]),
+                crate::owned_actions::DECLARE_OWNED_FIXED_RANGE_V1 =>
+                    return self.declare_owned_fixed_range_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_CAPACITY_V2 =>
+                    return self.declare_owned_capacity_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_UNIQUE_PATH_V1 =>
+                    return self.declare_owned_single_column_path_action(&call, &action.body, true, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_SEARCH_PATH_V2 =>
+                    return self.declare_owned_single_column_path_action(&call, &action.body, false, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_VECTOR_PATH_V1 =>
+                    return self.declare_owned_vector_path_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::OWNED_SHARED_SEARCH_TEXT_V1 => Ok(vec![Ok(self.owned_shared_search_text_action(&action.body)?)]),
                 crate::owned_actions::OWNED_LAYOUT_CAPABILITIES_V1 => Ok(vec![Ok(self.owned_layout_capabilities_action(&action.body)?)]),
                 crate::owned_actions::OWNED_RELATION_LAYOUT_V1 => Ok(vec![Ok(Box::pin(self.owned_relation_layout_action(&call, &action.body)).await?)]),
                 crate::owned_actions::DECLARE_OWNED_RELATION_V1 | crate::owned_actions::DECLARE_OWNED_RELATION_V2 => {
                     let v2 = action_type == crate::owned_actions::DECLARE_OWNED_RELATION_V2;
-                    Ok(vec![Ok(self.declare_owned_relation_action(&call, &action.body, v2).await?)])
+                    return self.declare_owned_relation_action(&call, &action.body, v2, ipc_stream).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.drop_owned_spatial_path_action(&call, &action.body).await?)]),
-                crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V2 => Ok(vec![Ok(self.drop_owned_spatial_path_batch_action(&call, action.body).await?)]),
-                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::TaggedSpatial).await?)]),
-                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V2 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::EncodedSpatial).await?)]),
-                crate::owned_actions::OWNED_SPATIAL_READINESS_V1 => Ok(vec![Ok(self.spatial_path_readiness_action(&call, &action.body).await?)]),
-                crate::owned_actions::DECLARE_OWNED_PATH_V1 => Ok(vec![Ok(self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered).await?)]),
-                crate::owned_actions::CREATE_OWNED_V1 => Ok(vec![Ok(self.create_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V1 =>
+                    return self.drop_owned_spatial_path_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DROP_OWNED_SPATIAL_PATH_V2 =>
+                    return self.drop_owned_spatial_path_batch_action(&call, action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V1 =>
+                    return self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::TaggedSpatial, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_SPATIAL_PATH_V2 =>
+                    return self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::EncodedSpatial, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::OWNED_SPATIAL_READINESS_V1 =>
+                    return self.spatial_path_readiness_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::DECLARE_OWNED_PATH_V1 =>
+                    return self.declare_owned_path_action(&call, &action.body, crate::owned_actions::PathDeclarationWire::Ordered, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::CREATE_OWNED_V1 =>
+                    return self.create_owned_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 => Ok(vec![Ok(Box::pin(self.confirm_hosted_source_action(&call, &action.body)).await?)]),
@@ -229,13 +239,14 @@ impl Service {
                 crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
                 COMMIT_OWNED_V1 | COMMIT_OWNED_V2 => {
                     let format = if action_type == COMMIT_OWNED_V1 { CommitFormat::Single } else { CommitFormat::Grouped };
-                    Ok(vec![Ok(self.commit_owned_action(&call, &action.body, format).await?)])
+                    return self.commit_owned_action(&call, &action.body, format, ipc_stream).await.map(ActionReplies::Owned);
                 }
                 COMMIT_OWNED_V3 | COMMIT_ORDERED_V1 | COMMIT_OWNED_V4 => {
                     let format = if action_type == COMMIT_ORDERED_V1 { CommitFormat::Ordered } else { CommitFormat::Grouped };
-                    Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, format, action_type == COMMIT_OWNED_V4).await?)])
+                    return self.commit_owned_witnessed_action(&call, &action.body, format, action_type == COMMIT_OWNED_V4, ipc_stream).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::COMMIT_OWNED_V7 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
+                crate::owned_actions::COMMIT_OWNED_V7 =>
+                    return self.commit_owned_counted_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V2 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AT_PUBLICATION_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, true).await?)]),
@@ -299,10 +310,14 @@ impl Service {
                     return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::FixedValid, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_RANGE_V4 =>
                     return self.held_owned_range_action(&call, &action.body, crate::owned_actions::HeldRangeFormat::Historical, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_OWNED_COUNT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, false).await?)]),
-                crate::owned_actions::HELD_OWNED_COUNT_V2 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, false).await?)]),
-                crate::owned_actions::HELD_OWNED_MEASURE_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, true).await?)]),
-                crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, true).await?)]),
+                crate::owned_actions::HELD_OWNED_COUNT_V1 =>
+                    return self.held_owned_count_action(&call, &action.body, false, false, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_COUNT_V2 =>
+                    return self.held_owned_count_action(&call, &action.body, true, false, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_MEASURE_V1 =>
+                    return self.held_owned_count_action(&call, &action.body, false, true, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 =>
+                    return self.held_owned_count_action(&call, &action.body, true, true, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2 | crate::owned_actions::READ_HELD_WORLD_CHANGES_V4 => {
                     let descending = action_type == crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2;
                     return self.held_world_changes_action(&call, &action.body, descending, ipc_stream).await.map(ActionReplies::Owned);
@@ -317,9 +332,12 @@ impl Service {
                 }
                 crate::owned_actions::HELD_LOOKUP_PUBLICATION_V1 => Ok(vec![Ok(self.held_lookup_publication_action(&call, &action.body).await?)]),
                 HELD_TABLE_PUBLICATION_SEQUENCE_V1 => Ok(vec![Ok(self.held_table_publication_sequence_action(&call, &action.body).await?)]),
-                crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 => Ok(vec![Ok(self.held_expiry_candidates_action(&call, &action.body).await?)]),
-                crate::owned_actions::APPLY_HELD_EXPIRY_V1 => Ok(vec![Ok(self.apply_held_expiry_action(&call, &action.body).await?)]),
-                crate::owned_actions::NOMINATE_HELD_EXPIRY_V1 => Ok(vec![Ok(self.nominate_held_expiry_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 =>
+                    return self.held_expiry_candidates_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::APPLY_HELD_EXPIRY_V1 =>
+                    return self.apply_held_expiry_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::NOMINATE_HELD_EXPIRY_V1 =>
+                    return self.nominate_held_expiry_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_CHANGES_V3 =>
                     return self.held_owned_changes_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(self.held_owned_unique_action(&call, &action.body).await?)]),
@@ -331,9 +349,12 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_ABSENT_KEYS_V1 => Ok(vec![Ok(Box::pin(self.held_owned_absent_keys_action(&call, &action.body)).await?)]),
                 crate::owned_actions::HELD_OWNED_FIXED_POINT_V1 =>
                     return self.held_owned_point(&call, &action.body, PointTime::Required, false, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
-                crate::owned_actions::HELD_WORLD_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
-                crate::owned_actions::HELD_WORLD_VALID_V2 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 =>
+                    return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_VALID_AT_V1 =>
+                    return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_WORLD_VALID_V2 =>
+                    return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_IDENTITIES_AT_V1 | crate::owned_actions::HELD_WORLD_IDENTITIES_AT_V1
                 | crate::owned_actions::HELD_WORLD_IDENTITIES_V1 | crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_AT_V1
                 | crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => {
@@ -350,9 +371,11 @@ impl Service {
                     };
                     return self.held_world_identities_action(&call, &action.body, mode, reply_format).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 => Ok(vec![Ok(self.held_protected_coverage_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 =>
+                    return self.held_protected_coverage_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V1 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 => Ok(vec![Ok(self.held_protected_carriers_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 =>
+                    return self.held_protected_carriers_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_SHARED_COLUMN_CENSUS_V1 =>
                     return self.held_world_shared_column_census_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 =>
@@ -378,9 +401,12 @@ impl Service {
                     return self.held_owned_position_point(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_ROOT_CUT_POINT_V1 =>
                     return self.held_root_cut_point_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_OWNED_VALID_DURING_V2 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Timeline).await?)]),
-                crate::owned_actions::HELD_OWNED_VALID_REGION_V1 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Region).await?)]),
-                crate::owned_actions::HELD_OWNED_POSITION_VALID_DURING_V1 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Positioned).await?)]),
+                crate::owned_actions::HELD_OWNED_VALID_DURING_V2 =>
+                    return self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Timeline, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_VALID_REGION_V1 =>
+                    return self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Region, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_POSITION_VALID_DURING_V1 =>
+                    return self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Positioned, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::CLOSE_OWNED_READ_V1 => {
                     self.close_owned_read_action(&call, &action.body)?;
                     Ok(Vec::new())
@@ -409,8 +435,8 @@ impl Service {
                         action_type == crate::owned_actions::DECIDE_WORLD_CUT_V2).await?)])
                 }
                 crate::owned_actions::DECIDE_HELD_WORLDS_V3 | crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2 => {
-                    Ok(vec![Ok(self.decide_held_worlds_action(&call, &action.body,
-                        action_type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2).await?)])
+                    return self.decide_held_worlds_action(&call, &action.body,
+                        action_type == crate::owned_actions::SWITCH_PREPARED_PROPOSAL_V2, ipc_stream).await.map(ActionReplies::Owned);
                 }
                 crate::owned_actions::READ_OWNED_V1 =>
                     return self.read_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),

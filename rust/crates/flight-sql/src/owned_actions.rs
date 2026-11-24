@@ -19,12 +19,11 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration}
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
-use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_entity_id, selected_cell, try_entity_id_array};
-use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
+use rtdb_format::ipc::OwnedStream;
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
@@ -37,7 +36,7 @@ use uuid::Uuid;
 use crate::owned_landing_wire::{self, ControlCommand};
 use self::ordered_controls::OrderedControls;
 use crate::{
-    actions::{IpcFrames, OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames},
+    actions::{OwnedIpcReply, SelectionEncoder},
     error::{arrow, invalid, status, unsupported},
     lease::Leased,
     service::{Call, Service, found},
@@ -1070,7 +1069,7 @@ impl Service {
         Ok(ActionResult { body })
     }
 
-    pub(crate) async fn declare_owned_relation_action(&self, call: &Call, body: &[u8], v2: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_relation_action(&self, call: &Call, body: &[u8], v2: bool, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, json) = split_relation(body)?;
         if json.len() > rtdb_types::OwnedSchema::MAX_JSON_BYTES {
@@ -1079,20 +1078,20 @@ impl Service {
         let _decoded = call.reserve(wire::add(wire::mul(json.len(), 8)?, 4096)?)?;
         let schema = rtdb_types::OwnedSchema::from_json(json).map_err(status)?;
         if schema.is_v2() != v2 { return Err(invalid("Owned declaration version disagrees with its action")); }
-        self.owned_write_reply(call, vec![TxOp::OwnedDeclareRelation { relation, schema }]).await
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclareRelation { relation, schema }], ipc_stream).await
     }
 
-    pub(crate) async fn drop_owned_spatial_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn drop_owned_spatial_path_action(&self, call: &Call, body: &[u8], ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, body) = split_relation(body)?;
         let (name, tail) = split_relation(body)?;
         if !tail.is_empty() { return Err(invalid("Owned spatial path removal has trailing bytes")); }
-        self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }]).await
+        self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }], ipc_stream).await
     }
 
     pub(crate) async fn drop_owned_spatial_path_batch_action(
-        &self, call: &Call, body: Bytes,
-    ) -> Result<ActionResult, Status> {
+        &self, call: &Call, body: Bytes, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let batch = decode_retained_batch(call, body)?;
         let batch = batch.batch();
@@ -1103,12 +1102,12 @@ impl Service {
             .ok_or_else(|| invalid("Owned spatial path removal requires a text relation and name"));
         let relation = OwnedRelation::new(text("relation")?).map_err(status)?;
         let name = OwnedRelation::new(text("name")?).map_err(status)?;
-        self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }]).await
+        self.owned_write_reply(call, vec![TxOp::OwnedDropSpatialPath { relation, name }], ipc_stream).await
     }
 
     pub(crate) async fn declare_owned_path_action(
-        &self, call: &Call, body: &Bytes, wire: PathDeclarationWire,
-    ) -> Result<ActionResult, Status> {
+        &self, call: &Call, body: &Bytes, wire: PathDeclarationWire, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = decode_retained_batch(call, body.slice_ref(arrow))?;
@@ -1143,10 +1142,10 @@ impl Service {
                 }
             }
         };
-        self.owned_write_reply(call, vec![declaration]).await
+        self.owned_write_reply(call, vec![declaration], ipc_stream).await
     }
 
-    pub(crate) async fn declare_owned_fixed_range_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_fixed_range_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
@@ -1159,10 +1158,10 @@ impl Service {
             (row.get("path"), row.get("column"), row.get("valid_micros"))
         else { return Err(invalid("Fixed range declaration has invalid field types")); };
         let rule = rtdb_types::FixedRangeRule { path: path.clone(), column: column.clone(), valid_at: Timestamp(*valid_micros) };
-        self.owned_write_reply(call, vec![TxOp::OwnedDeclareFixedRange { relation, rule }]).await
+        self.owned_write_reply(call, vec![TxOp::OwnedDeclareFixedRange { relation, rule }], ipc_stream).await
     }
 
-    pub(crate) async fn declare_owned_capacity_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_capacity_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
@@ -1171,11 +1170,11 @@ impl Service {
         }
         let (rows, _decoded) = upload::domain_documents(batch.batch(), self)?;
         let operation = owned_capacity_declaration(relation, &rows[0])?;
-        self.owned_write_reply(call, vec![operation]).await
+        self.owned_write_reply(call, vec![operation], ipc_stream).await
     }
 
     /// A unique path takes `_id` and `column`; a search path also takes its `analyzer`.
-    pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &Bytes, unique: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &Bytes, unique: bool, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
@@ -1197,11 +1196,11 @@ impl Service {
             let analyzer = rtdb_plan::parse_analyzer(analyzer).map_err(status)?;
             TxOp::OwnedDeclareSearchPath { relation, name, column, analyzer }
         };
-        self.owned_write_reply(call, vec![operation]).await
+        self.owned_write_reply(call, vec![operation], ipc_stream).await
     }
 
     /// `rtdb.owned.DeclareVectorPath.v1`: a relation prefix, then one Arrow row of `_id`, `column`, `dimensions` and `recall`.
-    pub(crate) async fn declare_owned_vector_path_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_vector_path_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
@@ -1216,7 +1215,7 @@ impl Service {
         };
         let name = OwnedRelation::new(name.as_str()).map_err(status)?;
         let operation = TxOp::OwnedDeclareVectorPath { relation, name, column: column.clone(), dimensions: *dimensions, recall: *recall };
-        self.owned_write_reply(call, vec![operation]).await
+        self.owned_write_reply(call, vec![operation], ipc_stream).await
     }
 
     fn require_generic_owned_target(&self, call: &Call, relation: &OwnedRelation) -> Result<(), Status> {
@@ -1229,7 +1228,7 @@ impl Service {
         Ok(())
     }
 
-    pub(crate) async fn create_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn create_owned_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         self.require_generic_owned_target(call, &relation)?;
@@ -1239,7 +1238,7 @@ impl Service {
                 if let Some(documents) = upload::owned_payload(&batch, self.memory())? {
                     return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs {
                         relation, documents, create_only: true, valid_from: None, valid_to: None,
-                    }]).await;
+                    }], ipc_stream).await;
                 }
             } else {
                 let rows = batch.batch().num_rows();
@@ -1261,7 +1260,7 @@ impl Service {
                         }
                     });
                 }
-                return self.owned_write_reply(call, operations).await;
+                return self.owned_write_reply(call, operations, ipc_stream).await;
             }
         } else if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
             && batch.batch().column_by_name("_absent").is_none()
@@ -1269,7 +1268,7 @@ impl Service {
         {
             return self.owned_write_reply(call, vec![TxOp::OwnedArrowDocs {
                 relation, documents, create_only: true, valid_from: None, valid_to: None,
-            }]).await;
+            }], ipc_stream).await;
         }
         let (mut rows, _decoded) = upload::owned_documents(batch.batch(), call.memory())?;
         for row in &mut rows { strip_owned_absence(row)?; }
@@ -1277,27 +1276,27 @@ impl Service {
             relation, documents: Documents::new(rows, self.memory()).map_err(status)?,
             valid_from: None, valid_to: None,
         };
-        self.owned_write_reply(call, vec![operation]).await
+        self.owned_write_reply(call, vec![operation], ipc_stream).await
     }
 
-    pub(crate) async fn commit_owned_action(&self, call: &Call, body: &Bytes, format: CommitFormat) -> Result<ActionResult, Status> {
-        self.commit_owned(call, body, body, format, Vec::new(), false, Vec::new()).await
+    pub(crate) async fn commit_owned_action(&self, call: &Call, body: &Bytes, format: CommitFormat, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
+        self.commit_owned(call, body, body, format, Vec::new(), false, Vec::new(), ipc_stream).await
     }
 
-    pub(crate) async fn commit_owned_counted_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_counted_action(&self, call: &Call, envelope: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (conditions, body, _counts) = owned_count_conditions(call, body, None, false)?;
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, true)?;
-        self.commit_owned(call, envelope, body, CommitFormat::Ordered, witnesses, false, conditions).await
+        self.commit_owned(call, envelope, body, CommitFormat::Ordered, witnesses, false, conditions, ipc_stream).await
     }
 
-    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, envelope: &Bytes, format: CommitFormat, erase_allowed: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn commit_owned_witnessed_action(&self, call: &Call, envelope: &Bytes, format: CommitFormat, erase_allowed: bool, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         let body = envelope.as_ref();
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let allow_empty = erase_allowed || matches!(format, CommitFormat::Ordered);
         let (witnesses, body, _framing) = self.owned_witness_prefix(call, body, allow_empty)?;
-        self.commit_owned(call, envelope, body, format, witnesses, erase_allowed, Vec::new()).await
+        self.commit_owned(call, envelope, body, format, witnesses, erase_allowed, Vec::new(), ipc_stream).await
     }
 
     fn owned_witness_prefix<'a>(
@@ -1526,14 +1525,20 @@ impl Service {
     }
 
     pub(crate) async fn decide_hosted_action(
-        &self, call: &Call, envelope: &Bytes, wire: HostedDecisionWire,
-    ) -> Result<ActionResult, Status> {
-        self.decide_hosted(call, envelope, HostedDecisionInput::Inline(wire)).await
+        &self, call: &Call, envelope: &Bytes, wire: HostedDecisionWire, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
+        self.decide_hosted_reply(call, envelope, HostedDecisionInput::Inline(wire), ipc_stream).await
     }
 
     async fn decide_hosted(
         &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>,
     ) -> Result<ActionResult, Status> {
+        self.decide_hosted_reply(call, envelope, input, false).await.map(OwnedIpcReply::into_unary)
+    }
+
+    async fn decide_hosted_reply(
+        &self, call: &Call, envelope: &Bytes, input: HostedDecisionInput<'_>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         self.hosted_control_policy(call)?;
         let (authority, body) = Self::installed_authority(envelope)?;
         let ([flags], body) = body.split_first_chunk::<1>()
@@ -1735,7 +1740,7 @@ impl Service {
         if let Some(tick) = slot {
             self.wait_for_clock_slot(call, tick).await?;
         }
-        self.owned_write_reply_with_reads(call, writes, Vec::new(), worlds).await
+        self.owned_write_reply_with_reads(call, writes, Vec::new(), worlds, ipc_stream).await
     }
 
     fn decode_hosted_control_groups(
@@ -1798,7 +1803,7 @@ impl Service {
         Ok((controls, held))
     }
 
-    async fn commit_owned(&self, call: &Call, envelope: &Bytes, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, conditions: Vec<TxOp>) -> Result<ActionResult, Status> {
+    async fn commit_owned(&self, call: &Call, envelope: &Bytes, body: &[u8], format: CommitFormat, witnesses: Witnesses, erase_allowed: bool, conditions: Vec<TxOp>, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let group_limit = match format {
             CommitFormat::Single => 1,
@@ -1819,7 +1824,7 @@ impl Service {
         writes.extend(conditions);
         let effects = if erase_allowed { CommitEffects::Replay } else { CommitEffects::Facts };
         let _rows = self.decode_owned_commit_groups(call, envelope, groups, &mut writes, &mut rows_left, effects)?;
-        self.owned_write_reply_with_witnesses(call, writes, witnesses).await
+        self.owned_write_reply_with_witnesses(call, writes, witnesses, ipc_stream).await
     }
 
     fn decode_owned_commit_groups(
@@ -2118,20 +2123,20 @@ impl Service {
         Ok(())
     }
 
-    async fn owned_write_reply(&self, call: &Call, operations: Vec<TxOp>) -> Result<ActionResult, Status> {
-        self.owned_write_reply_with_witnesses(call, operations, Vec::new()).await
+    async fn owned_write_reply(&self, call: &Call, operations: Vec<TxOp>, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
+        self.owned_write_reply_with_witnesses(call, operations, Vec::new(), ipc_stream).await
     }
 
     async fn owned_write_reply_with_witnesses(
-        &self, call: &Call, operations: Vec<TxOp>, witnesses: Witnesses,
-    ) -> Result<ActionResult, Status> {
-        self.owned_write_reply_with_reads(call, operations, witnesses, Vec::new()).await
+        &self, call: &Call, operations: Vec<TxOp>, witnesses: Witnesses, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
+        self.owned_write_reply_with_reads(call, operations, witnesses, Vec::new(), ipc_stream).await
     }
 
     async fn owned_write_reply_with_reads(
         &self, call: &Call, mut operations: Vec<TxOp>, witnesses: Witnesses,
-        mut worlds: Vec<HostedWorldRead>,
-    ) -> Result<ActionResult, Status> {
+        mut worlds: Vec<HostedWorldRead>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
@@ -2158,10 +2163,10 @@ impl Service {
         drop(worlds);
         if let Some(error) = outcome.error() { return Err(status(error.clone())); }
         if !outcome.committed() { return Err(Status::aborted("Owned write did not commit")); }
-        self.owned_tx_reply(&native, outcome.tx_key()).await
+        self.owned_tx_reply(&native, outcome.tx_key(), ipc_stream).await
     }
 
-    async fn owned_tx_reply(&self, native: &NativeSession, tx: rtdb_types::TransactionKey) -> Result<ActionResult, Status> {
+    async fn owned_tx_reply(&self, native: &NativeSession, tx: rtdb_types::TransactionKey, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         let original = native.owned_commit_observation(tx).await.map_err(status)?;
         let mut clock = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(1, rtdb_tx::OrderedClockEvidence::WIDTH);
         match original {
@@ -2178,7 +2183,7 @@ impl Service {
             Arc::new(Int64Array::from(vec![tx.system_time.0])),
             Arc::new(clock.finish()),
         ]).map_err(arrow)?;
-        self.owned_action_reply(&schema, Some(&batch))
+        self.encode_owned_stream_reply(self.memory(), &schema, &[batch], ipc_stream)
     }
 
     pub(crate) async fn open_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -2625,14 +2630,14 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_valid_during_action(
-        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode,
-    ) -> Result<ActionResult, Status> {
-        self.held_owned_valid_during(call, body, mode, false).await
+        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
+        self.held_owned_valid_during(call, body, mode, false, ipc_stream).await
     }
 
     pub(crate) async fn held_owned_valid_during(
-        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, compact: bool,
-    ) -> Result<ActionResult, Status> {
+        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, compact: bool, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
@@ -2680,7 +2685,7 @@ impl Service {
             None => held.snapshot.open_valid_during_observed(&relation, &id, valid, system).await,
         }.map_err(status)?;
         let read = HistoryRead::Observed { read: history, held: &held, relation: &relation };
-        let reply = self.history_reply(call, &id, read, valid, system, None).await?;
+        let reply = self.history_reply(call, &id, read, valid, system, None, ipc_stream).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2716,7 +2721,7 @@ impl Service {
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
-        let reply = self.owned_point_reply_in(self.memory(), &schema, Some(&rows), system, valid, None, None, reply_format)?;
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), system, valid, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2754,12 +2759,12 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         // The reply's valid coordinate is the system cut it enumerated.
-        let reply = self.owned_point_reply_in(self.memory(), &schema, Some(&rows), system, system, None, None, reply_format)?;
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), system, system, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn held_protected_coverage_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_protected_coverage_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         use base64::{Engine, engine::general_purpose::STANDARD};
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
@@ -2783,7 +2788,7 @@ impl Service {
             (OWNED_RANGE_WITNESS.into(), nonce.simple().to_string()),
         ].into());
         let at = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(&schema, None, at, at, None)?;
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, None, at, at, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2800,7 +2805,7 @@ impl Service {
         Ok(ActionResult { body: wire::retain(vec![u8::from(present)], call.reserve(64)?) })
     }
 
-    pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
@@ -2839,7 +2844,7 @@ impl Service {
         }
         let schema = rows.schema_ref().as_ref().clone().with_metadata(metadata);
         let at = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(&schema, Some(&rows), at, at, None)?;
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), at, at, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2944,7 +2949,7 @@ impl Service {
         let mut results = Vec::with_capacity(page.versions.len() + 1);
         for version in page.versions {
             let reply = self.history_reply(call, &id, HistoryRead::Archived(version.timeline.into_iter()),
-                Interval::ALL, selected, Some((version.sequence, version.system))).await?;
+                Interval::ALL, selected, Some((version.sequence, version.system)), false).await?.into_unary();
             bytes = wire::add(bytes, reply.encoded_len())?;
             if bytes > self.0.config.maximum_message_bytes {
                 return Err(Status::resource_exhausted("Earlier parent version page exceeds the Flight response limit"));
@@ -2979,7 +2984,7 @@ impl Service {
         let mut results = Vec::with_capacity(page.versions.len() + 1);
         for version in page.versions {
             let reply = self.history_reply(call, &id, HistoryRead::Version(version.timeline), Interval::ALL, present,
-                Some((version.revision, version.system_time))).await?;
+                Some((version.revision, version.system_time)), false).await?.into_unary();
             bytes = wire::add(bytes, reply.encoded_len())?;
             if bytes > self.0.config.maximum_message_bytes {
                 return Err(Status::resource_exhausted("Owned version page exceeds the Flight response limit"));
@@ -3002,8 +3007,8 @@ impl Service {
 
     async fn history_reply(
         &self, call: &Call, id: &EntityId, mut read: HistoryRead<'_>, valid: rtdb_types::Interval,
-        present: Timestamp, version: Option<(u64, Timestamp)>,
-    ) -> Result<ActionResult, Status> {
+        present: Timestamp, version: Option<(u64, Timestamp)>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let (from, to) = (valid.lower(), valid.upper());
         let as_of = version.map_or(present, |(_, system)| system);
         let mut pages = Vec::new();
@@ -3073,7 +3078,7 @@ impl Service {
             let batch = page.batch();
             RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()).map_err(arrow)
         }).collect::<Result<Vec<_>, _>>()?;
-        self.owned_stream_reply(&schema, &response)
+        self.encode_owned_stream_reply(self.memory(), &schema, &response, ipc_stream)
     }
 
     pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &Bytes, version: HeldRangeFormat, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
@@ -3158,7 +3163,7 @@ impl Service {
         let present = system.unwrap_or(held.snapshot.present().system_time);
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply_in(self.memory(), schema, page.batch.as_ref().map(OwnedBatch::batch),
+        let reply = self.encode_owned_point_reply(self.memory(), schema, page.batch.as_ref().map(OwnedBatch::batch),
             present, valid_at.unwrap_or(present), None, expiry, reply_format)?;
         if system.is_none() && !matches!(version, HeldRangeFormat::Leading) {
             held.snapshot.check_lifetime_range_release(&relation, expiry).map_err(status)?;
@@ -3168,7 +3173,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &Bytes, historical: bool, measured: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &Bytes, historical: bool, measured: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held count has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3215,8 +3220,8 @@ impl Service {
         let schema = batch.schema();
         let observed = witnessed_schema(call, &held, &relation, &schema, evidence)?;
         let output_schema = observed.as_ref().map_or(schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply_until(output_schema, Some(&batch),
-            counted.present, counted.valid_at, None, counted.expiry)?;
+        let reply = self.encode_owned_point_reply(self.memory(), output_schema, Some(&batch),
+            counted.present, counted.valid_at, None, counted.expiry, reply_format)?;
         if historical {
             held.snapshot.check_relation(&relation).map_err(status)?;
         } else {
@@ -3299,13 +3304,13 @@ impl Service {
         }
         let schema = schema.as_ref().clone().with_metadata(metadata);
         let rows = count_rows.as_ref().or_else(|| page.as_ref().map(OwnedBatch::batch));
-        let reply = self.owned_point_reply_in(self.memory(), &schema, rows,
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, rows,
             system.unwrap_or_else(|| held.snapshot.present()), valid_at, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn spatial_path_readiness_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn spatial_path_readiness_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Spatial path readiness has no held handle"))?;
@@ -3324,7 +3329,7 @@ impl Service {
         let batch = RecordBatch::try_from_iter([("ready", Arc::new(BooleanArray::from(vec![ready])) as ArrayRef)])
             .map_err(arrow)?;
         let present = held.snapshot.system_time();
-        self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)
+        self.encode_owned_point_reply(self.memory(), batch.schema_ref(), Some(&batch), present, present, None, None, reply_format)
     }
 
     pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
@@ -3656,7 +3661,7 @@ impl Service {
             Some(RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?)
         } else { None };
         let format = if ipc_stream { OwnedReplyFormat::StreamV1 } else { OwnedReplyFormat::Unary };
-        let reply = self.owned_point_reply_in(self.memory(), &schema, output.as_ref(), present, valid_at, None, None, format)?;
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, output.as_ref(), present, valid_at, None, None, format)?;
         drop(charge);
         held.snapshot.check_relations([relation]).map_err(status)?;
         Ok(reply)
@@ -4193,24 +4198,13 @@ impl Service {
             wire::add(bytes, wire::mul(size, 4)?)
         })?;
         let _reply_charge = call.reserve(charge)?;
-        let reply = self.owned_point_reply_in(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
             present, valid, None, None, reply_format)?;
-        let mut frames = match reply {
-            OwnedIpcReply::Frames(frames) => frames,
-            OwnedIpcReply::Unary(reply) => IpcFrames(reply.body).collect::<Result<Vec<_>, _>>()?,
-        };
         let inventory = ActionResult { body: wire::retain(family_inventory, family_charge) };
-        let encoded = frames.iter().try_fold(inventory.encoded_len(), |bytes, frame| {
-            wire::add(bytes, frame.encoded_len())
-        })?;
-        if encoded > self.0.config.maximum_message_bytes {
-            return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
-        }
-        frames.insert(0, inventory);
-        Ok(OwnedIpcReply::Frames(frames))
+        reply.prepend_frame(inventory, self.0.config.maximum_message_bytes)
     }
 
-    pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry candidates need the original held handle"))?;
@@ -4238,12 +4232,12 @@ impl Service {
         }
         let schema = batch.schema().as_ref().clone().with_metadata(metadata);
         let present = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(&schema, Some(&batch), present, present, None)?;
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&batch), present, present, None, None, reply_format)?;
         held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn nominate_held_expiry_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn nominate_held_expiry_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry nomination needs the original held handle"))?;
@@ -4256,12 +4250,12 @@ impl Service {
             ("expiry_micros", Arc::new(Int64Array::from(vec![expiry.0])) as ArrayRef),
         ]).map_err(arrow)?;
         let present = held.snapshot.present().system_time;
-        let reply = self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)?;
+        let reply = self.encode_owned_point_reply(self.memory(), batch.schema_ref(), Some(&batch), present, present, None, None, reply_format)?;
         held.snapshot.check_live_point_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn apply_held_expiry_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn apply_held_expiry_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         self.hosted_control_policy(call)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry apply needs the original held handle"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Expiry apply needs a deadline"))?;
@@ -4280,7 +4274,7 @@ impl Service {
         ).await.map_err(status)?;
         if let Some(error) = committed.error() { return Err(status(error.clone())); }
         if !committed.committed() { return Err(Status::aborted("Owned expiry did not commit")); }
-        self.owned_tx_reply(&session, committed.tx_key()).await
+        self.owned_tx_reply(&session, committed.tx_key(), ipc_stream).await
     }
 
     pub(crate) async fn held_owned_changes_action(
@@ -4856,7 +4850,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, envelope: &Bytes, selection: WorldHistoricalRead) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, envelope: &Bytes, selection: WorldHistoricalRead, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
@@ -4913,7 +4907,7 @@ impl Service {
             Arc::new(Int64Array::from_iter_values(slices.iter().map(|(valid, _)| valid.upper().0))),
             Arc::new(Int64Array::from_iter_values(slices.iter().map(|(_, revision)| revision.0))),
         ]).map_err(arrow)?;
-        let reply = self.owned_action_reply(&schema, Some(&rows))?;
+        let reply = self.encode_owned_stream_reply(self.memory(), &schema, &[rows], ipc_stream)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -4948,7 +4942,7 @@ impl Service {
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string())].into()
         );
-        self.owned_point_reply_in(self.memory(), &schema, Some(&rows), held.snapshot.present(), valid,
+        self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), held.snapshot.present(), valid,
             None, None, reply_format)
     }
 
@@ -5007,7 +5001,7 @@ impl Service {
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
-        let reply = self.owned_point_reply_in(
+        let reply = self.encode_owned_point_reply(
             self.memory(), &schema, Some(&rows), system.unwrap_or_else(|| held.snapshot.present()), valid,
             None, None, reply_format,
         )?;
@@ -5062,9 +5056,9 @@ impl Service {
                 .collect::<Result<Vec<_>, _>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
-            self.owned_point_reply_in(self.memory(), &schema, Some(&batch), result.present, valid_at, Some(revision), result.until, reply_format)
+            self.encode_owned_point_reply(self.memory(), &schema, Some(&batch), result.present, valid_at, Some(revision), result.until, reply_format)
         } else {
-            self.owned_point_reply_in(self.memory(), &Schema::empty().with_metadata(metadata), None, result.present, valid_at, None, None, reply_format)
+            self.encode_owned_point_reply(self.memory(), &Schema::empty().with_metadata(metadata), None, result.present, valid_at, None, None, reply_format)
         }
     }
 
@@ -5394,7 +5388,7 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), reply_charge) })
     }
 
-    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn decide_held_worlds_action(&self, call: &Call, envelope: &Bytes, prepared_proposal: bool, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let policy = self.hosted_control_policy(call)?;
@@ -5720,7 +5714,7 @@ impl Service {
             sections, root, observed, fingerprint, controls, deadline,
         ).await.map_err(status)?;
         drop(observations);
-        self.owned_tx_reply(&session, committed).await
+        self.owned_tx_reply(&session, committed, ipc_stream).await
     }
 
     fn decode_world_writes(
@@ -5856,7 +5850,7 @@ impl Service {
     ) -> Result<OwnedIpcReply, Status> {
         let Some(mut cursor) = result else {
             let schema = with_point_witness(&Schema::empty(), witness(None)?);
-            return self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, reply_format);
+            return self.encode_owned_point_reply(memory, &schema, None, present, valid, None, None, reply_format);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -5905,7 +5899,7 @@ impl Service {
                 }
                 schema = schema.with_metadata(metadata);
             }
-            let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until, reply_format)?;
+            let reply = self.encode_owned_point_reply(memory, &schema, Some(rows), present, valid, Some(revision), until, reply_format)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
             }
@@ -5914,20 +5908,25 @@ impl Service {
             let schema = if path_columns.is_some() { wire::OwnedSchema::empty(memory)? }
                 else { wire::plan_schema(cursor.runtime_schema(), memory)? };
             let schema = with_point_witness(&schema, witness(None)?);
-            self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, reply_format)
+            self.encode_owned_point_reply(memory, &schema, None, present, valid, None, None, reply_format)
         }
     }
 
     fn owned_point_reply(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>) -> Result<ActionResult, Status> {
-        self.owned_point_reply_until(schema, batch, present, valid, revision, None)
-    }
-
-    fn owned_point_reply_until(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>) -> Result<ActionResult, Status> {
-        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, until, OwnedReplyFormat::Unary)
-            .map(OwnedIpcReply::into_unary)
+        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, None, None)
     }
 
     fn owned_point_reply_in(
+        &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
+        present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
+        selection: Option<&mut SelectionEncoder>,
+    ) -> Result<ActionResult, Status> {
+        let format = selection.map_or(OwnedReplyFormat::Unary, OwnedReplyFormat::Selection);
+        self.encode_owned_point_reply(memory, schema, batch, present, valid, revision, until, format)
+            .map(OwnedIpcReply::into_unary)
+    }
+
+    fn encode_owned_point_reply(
         &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
         present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
         reply_format: OwnedReplyFormat<'_>,
@@ -5980,10 +5979,6 @@ impl Service {
         self.encode_owned_stream_reply(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default(), stream)
     }
 
-    fn owned_action_reply(&self, schema: &Schema, batch: Option<&RecordBatch>) -> Result<ActionResult, Status> {
-        self.owned_stream_reply(schema, batch.map(std::slice::from_ref).unwrap_or_default())
-    }
-
     fn owned_stream_reply(&self, schema: &Schema, pages: &[RecordBatch]) -> Result<ActionResult, Status> {
         self.owned_stream_reply_in(self.memory(), schema, pages)
     }
@@ -5995,22 +5990,7 @@ impl Service {
     fn encode_owned_stream_reply(
         &self, memory: &Arc<MemoryBudget>, schema: &Schema, pages: &[RecordBatch], stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
-        let bytes = pages.iter().try_fold(0, |bytes, batch| wire::add(bytes, batch.get_array_memory_size()))?;
-        let bound = wire::add(wire::schema_bound(schema)?, wire::mul(bytes, 8)?)?;
-        let _encoding = memory.reserve(bound).map_err(status)?;
-        if stream && pages.iter().all(|page| page.schema_ref().as_ref() == schema)
-            && let Ok(frames) = encode_ipc_frames(schema, pages)
-        {
-            return retain_ipc_frames(memory, frames, self.0.config.maximum_message_bytes);
-        }
-        // The original writer still decides the status and precedence of codec refusals.
-        let bytes = write_arrow_stream(schema, pages, IpcWriteOptions::default()).map_err(status)?;
-        let reply = ActionResult { body: bytes.into() };
-        if reply.encoded_len() > self.0.config.maximum_message_bytes {
-            return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
-        }
-        let retained = memory.reserve(reply.body.len()).map_err(status)?;
-        Ok(OwnedIpcReply::Unary(ActionResult { body: wire::retain(reply.body, retained) }))
+        OwnedIpcReply::encode(memory, schema, pages, stream, self.0.config.maximum_message_bytes)
     }
 }
 
@@ -6361,6 +6341,8 @@ mod audience_projection_tests {
 mod world_point_tests {
     use super::*;
     use arrow_array::cast::AsArray;
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
     use rtdb_types::{LogicalType, ScalarType};
 
     #[test]
