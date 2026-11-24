@@ -1,3 +1,4 @@
+use rtdb_node::OwnedChangeEdge;
 use std::{future::Future, pin::Pin, time::Duration};
 
 use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest};
@@ -178,8 +179,8 @@ enum ArchiveRead {
     ParentChangesAt {
         relation: OwnedRelation,
         selected: Timestamp,
-        after: Timestamp,
-        through: Timestamp,
+        after: OwnedChangeEdge,
+        through: OwnedChangeEdge,
         limit: usize,
         reverse: bool,
         schema: rtdb_types::OwnedSchema,
@@ -288,7 +289,7 @@ impl ClockCut {
 
 enum AncestorRead {
     Point { id: EntityId, valid: Interval },
-    Changes { after: Timestamp, through: Timestamp, limit: usize, reverse: bool },
+    Changes { after: OwnedChangeEdge, through: OwnedChangeEdge, limit: usize, reverse: bool },
     Clock(ClockCut),
     SelectClock(Timestamp),
     PathTouch { id: EntityId, path: OwnedRelation, group: Timestamp, valid: Timestamp, images: bool },
@@ -410,15 +411,15 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn changes(
-        &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool,
+        &self, relations: &[OwnedRelation], after: OwnedChangeEdge, through: OwnedChangeEdge, limit: usize, descending: bool,
     ) -> Result<rtdb_node::OwnedMergedChanges> {
         self.check()?;
         let guard = self.open.snapshot.relation_release_guard(relations)?;
-        if let Some((_, system)) = self.ancestor() {
-            if !self.clock_mode().is_writable() || after < system {
+        if let Some(ancestor) = self.open.record.ancestor() {
+            if !self.clock_mode().is_writable() || after < ancestor.publication.into() {
                 return Err(OwnedWorld::unavailable());
             }
-            self.preflight_accepted_scope(relations, system).await?;
+            self.archived_accepted_clock(relations, ClockCut::Publication(ancestor.publication)).await?;
         } else {
             self.require_accepted_archive_scope(relations).await?;
         }
@@ -720,11 +721,11 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn parent_changes_at(
-        &self, relation: &OwnedRelation, selected: Timestamp, after: Timestamp,
-        through: Timestamp, limit: usize, reverse: bool,
+        &self, relation: &OwnedRelation, selected: Timestamp, after: OwnedChangeEdge,
+        through: OwnedChangeEdge, limit: usize, reverse: bool,
     ) -> Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)> {
         self.check_relation(relation)?;
-        if after > through || through > selected || selected > self.parent_basis().system_time {
+        if after > through || through.time > selected || selected > self.parent_basis().system_time {
             return Err(OwnedWorld::unavailable());
         }
         let schema = self.historical_parent_schema(relation)?.clone();
@@ -743,8 +744,8 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn ancestor_changes(
-        &self, relation: &OwnedRelation, selected: Timestamp, after: Timestamp,
-        through: Timestamp, limit: usize, reverse: bool,
+        &self, relation: &OwnedRelation, selected: Timestamp, after: OwnedChangeEdge,
+        through: OwnedChangeEdge, limit: usize, reverse: bool,
     ) -> Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)> {
         if self.ancestor().is_none_or(|(_, cap)| cap != selected) {
             return Err(OwnedWorld::unavailable());
@@ -1861,18 +1862,23 @@ impl<'a> InheritedRelation<'a> {
     }
 
     async fn changes(
-        &self, after: Timestamp, through: Timestamp, limit: usize, reverse: bool,
+        &self, after: impl Into<OwnedChangeEdge>, through: impl Into<OwnedChangeEdge>,
+        limit: usize, reverse: bool,
     ) -> Result<rtdb_node::OwnedMergedChanges> {
         let unavailable = OwnedWorld::unavailable;
-        if after < self.root.current_time.as_micros()? || after > through || through > self.overlay_basis {
+        let after = after.into();
+        let through = through.into();
+        let root = self.earlier.first().map_or(self.root_basis, |writer| writer.root_basis);
+        if after < root.into() || after > through || through.time > self.overlay_basis
+            || (through.time == self.overlay_basis && matches!(through.order, rtdb_node::ChangeEdgeOrder::Publication { .. })
+                && through > self.publication.into())
+        {
             return Err(unavailable());
         }
         if after == through {
-            let writer = if after == self.root.current_time.as_micros()? {
-                self.earlier.first().unwrap_or(self)
-            } else {
-                self.writer_at(after)?
-            };
+            let writer = self.writers().find(|writer|
+                OwnedChangeEdge::from(writer.root_basis) <= after && after.time <= writer.overlay_basis)
+                .ok_or_else(unavailable)?;
             return rtdb_node::archived_changes_at_cut(
                 Arc::clone(&writer.overlay_media), self.owner, &writer.shadow, after, through, limit, reverse,
             ).await;
@@ -1881,25 +1887,27 @@ impl<'a> InheritedRelation<'a> {
         let newest = self.writers().collect::<Vec<_>>();
         for index in 0..newest.len() {
             let writer = newest[if reverse { index } else { newest.len() - 1 - index }];
-            let lower = writer.floor.max(after);
-            let upper = writer.overlay_basis.min(through);
+            let lower = OwnedChangeEdge::from(writer.root_basis).max(after);
+            let upper = OwnedChangeEdge::from(writer.publication).min(through);
             if lower >= upper { continue; }
             let remaining = limit.checked_sub(page.as_ref().map_or(0, |page| page.commits.len()))
                 .ok_or_else(unavailable)?;
-            if remaining == 0 {
-                page.as_mut().ok_or_else(unavailable)?.stop_at_last_group()?;
+            let band = rtdb_node::archived_changes_at_cut(
+                Arc::clone(&writer.overlay_media), self.owner, &writer.shadow, lower, upper, remaining.max(1), reverse,
+            ).await?;
+            if remaining == 0 && let Some(next) = band.commits.first() {
+                page.as_mut().ok_or_else(unavailable)?.stop_before(next.publication)?;
                 break;
             }
-            let band = rtdb_node::archived_changes_at_cut(
-                Arc::clone(&writer.overlay_media), self.owner, &writer.shadow, lower, upper, remaining, reverse,
-            ).await?;
             match &mut page {
                 Some(page) => page.append_archive_band(band, reverse)?,
                 None => page = Some(band),
             }
             if page.as_ref().is_some_and(|page| !page.is_complete()) { break; }
         }
-        page.ok_or_else(unavailable)
+        let mut page = page.ok_or_else(unavailable)?;
+        page.complete_at(if reverse { after } else { through });
+        Ok(page)
     }
 
     async fn version(
@@ -1913,6 +1921,7 @@ impl<'a> InheritedRelation<'a> {
         self = self.cut_at(group)?;
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(unavailable)?);
         let page = self.changes(before, group, 1, false).await?;
+        if !page.is_time_projectable() { return Err(unavailable()); }
         let [commit] = page.commits.as_slice() else { return Err(unavailable()); };
         let [changes] = commit.changes.as_slice() else { return Err(unavailable()); };
         if commit.publication.system_time != group || changes.relation != *self.relation
@@ -2260,11 +2269,12 @@ async fn require_parent_journal(
     let floor = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, 0).await?;
     let first = rtdb_query::read_owned_journal_header(Arc::clone(context), owner, relation, 1).await?;
     let head = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, entries - 1).await?;
-    if floor.value != Value::Null || floor.publication.system_time != first.committed_at
+    if floor.value != Value::Null || floor.publication != first.publication
         || floor.through_events >= first.through_events || (floor.through_events != 0 && selected < floor.publication.system_time)
         || head.through_events != data_events || head.publication.system_time > context.current_time.as_micros()?
-        || (entries > 2 && (head.publication.system_time <= first.committed_at || head.through_events <= first.through_events))
-        || (entries == 2 && (head.publication.system_time != first.committed_at || head.through_events != first.through_events))
+        || (entries > 2 && (head.publication.tx_id <= first.publication.tx_id
+            || !first.publication.at_or_before(head.publication) || head.through_events <= first.through_events))
+        || (entries == 2 && (head.publication != first.publication || head.through_events != first.through_events))
         || !matches!(head.value, Value::List(touches) if !touches.is_empty())
     {
         return Err(unavailable());
@@ -2405,13 +2415,17 @@ pub(crate) async fn open_held_checkpoint_world(
                                             AncestorRead::Clock(cut) => Some(cut.system()),
                                             AncestorRead::Version { group, .. }
                                                 | AncestorRead::PathTouch { group, .. } => Some(*group),
-                                            AncestorRead::Changes { through, .. } => Some(*through),
+                                            AncestorRead::Changes { through, .. } => Some(through.time),
                                             _ => None,
                                         });
                                         let ancestors = if let AncestorRead::Clock(ClockCut::Publication(publication)) = &read {
                                             let through = ancestors.iter().position(|layer| publication.at_or_before(layer.publication))
                                                 .ok_or_else(OwnedWorld::unavailable)?;
                                             &ancestors[..=through]
+                                        } else if let AncestorRead::Changes { through, .. } = &read {
+                                            let layers = (ancestors.partition_point(|layer|
+                                                OwnedChangeEdge::from(layer.publication) < *through) + 1).min(ancestors.len());
+                                            &ancestors[..layers]
                                         } else {
                                             frozen_prefix(&ancestors, needed)
                                         };

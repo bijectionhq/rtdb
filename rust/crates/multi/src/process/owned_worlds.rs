@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use futures::future::BoxFuture;
 use rtdb_directory::{Directory, HostedTask};
 use rtdb_flight_sql::{OwnedWorldHost, OwnedWorldRead, PreparedReplayParent, RetainedReplayWorld, WorldCall, WorldIdentityPage, WorldPointResult, WorldPointRow};
-use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
+use rtdb_node::{OwnedChangeEdge, NodeOptions, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorld, Result, Timestamp, TransactionKey, WorldClockMode};
 use uuid::Uuid;
 
@@ -262,7 +262,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     fn close(&self) { HeldCheckpointWorld::close(self); }
 
     fn changes<'a>(
-        &'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool,
+        &'a self, relations: &'a [OwnedRelation], after: OwnedChangeEdge, through: OwnedChangeEdge, limit: usize, descending: bool,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>> {
         Box::pin(HeldCheckpointWorld::changes(self, relations, after, through, limit, descending))
     }
@@ -330,15 +330,15 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn parent_changes_at<'a>(
-        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
-        through: Timestamp, limit: usize, reverse: bool,
+        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: OwnedChangeEdge,
+        through: OwnedChangeEdge, limit: usize, reverse: bool,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::parent_changes_at(self, relation, selected, after, through, limit, reverse))
     }
 
     fn ancestor_changes<'a>(
-        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
-        through: Timestamp, limit: usize, reverse: bool,
+        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: OwnedChangeEdge,
+        through: OwnedChangeEdge, limit: usize, reverse: bool,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)>> {
         Box::pin(HeldCheckpointWorld::ancestor_changes(self, relation, selected, after, through, limit, reverse))
     }

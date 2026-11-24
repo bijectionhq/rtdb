@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryReservation;
-use rtdb_node::{Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
+use rtdb_node::{OwnedChangeEdge, Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
 use rtdb_types::{EntityId, Interval, OwnedRelation, OwnedWorldAssertion, Result, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -179,7 +179,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn check_parent_point(&self, relation: &OwnedRelation, until: Option<Timestamp>) -> Result<()>;
     fn check(&self) -> Result<()>;
     fn close(&self);
-    fn changes<'a>(&'a self, relations: &'a [OwnedRelation], after: Timestamp, through: Timestamp, limit: usize, descending: bool)
+    fn changes<'a>(&'a self, relations: &'a [OwnedRelation], after: OwnedChangeEdge, through: OwnedChangeEdge, limit: usize, descending: bool)
         -> BoxFuture<'a, Result<rtdb_node::OwnedMergedChanges>>;
     fn valid_during<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, parent_only: bool,
@@ -206,12 +206,12 @@ pub trait OwnedWorldRead: Send + Sync {
         selected: Timestamp, before: Timestamp, group: Timestamp, valid: Timestamp, images: bool,
     ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>>;
     fn parent_changes_at<'a>(
-        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
-        through: Timestamp, limit: usize, reverse: bool,
+        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: OwnedChangeEdge,
+        through: OwnedChangeEdge, limit: usize, reverse: bool,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)>>;
     fn ancestor_changes<'a>(
-        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: Timestamp,
-        through: Timestamp, limit: usize, reverse: bool,
+        &'a self, relation: &'a OwnedRelation, selected: Timestamp, after: OwnedChangeEdge,
+        through: OwnedChangeEdge, limit: usize, reverse: bool,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedMergedChanges, OwnedWorldWitness)>>;
     fn parent_versions_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, selected: Timestamp,

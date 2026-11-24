@@ -676,7 +676,7 @@ Explicit earlier Root actions also accept a hold on a retained Held child.
 They resolve the selected position, schema, paths and purge history in its pinned Root archive.
 They return Root images and evidence at that position, including point absence and empty pages.
 
-`rtdb.owned.ReadHeldWorldAncestorChanges.v1` uses the same request and response framing as the archived Root change page.
+`rtdb.owned.ReadHeldWorldAncestorChanges.v2` uses the same request and response framing as the archived Root change page.
 The selected position must equal the child's retained Held overlay cut, and the requested interval must start at or after the Root cut.
 `rtdb.owned.ReadHeldWorldVersion.v2` on that child certifies the address in the exact archived Held group, reads its logical clock, and resolves its timeline against the pinned Root.
 A winning Held tombstone leaves an absent slice.
@@ -685,7 +685,7 @@ They certify the exact local clock and path generation and resolve both sides ag
 Exact and as-of selection can also reopen an earlier Held publication on the same retained child.
 Point, valid interval, identity, range and rank requests use that overlay position together with the unchanged pinned Root.
 
-`rtdb.owned.ReadHeldWorldChanges.v1` uses the merged changes framing and reply with a held world handle.
+`rtdb.owned.ReadHeldWorldChanges.v4` uses the merged changes framing and reply with a held world handle.
 It returns ordered local overlay groups after the supplied revision at or above the inherited basis.
 A retained Held child begins its journal at the inherited Held position and has no local writes. The archived parent is fixed.
 The scope must retain journal coverage and certified purge history. A local tombstone emits a delete.
@@ -855,10 +855,14 @@ The action submits no transaction and returns no fact or control rows. Expired, 
 
 === Reading a merged held change feed
 
-`rtdb.owned.ReadHeldMergedChanges.v1` takes the 16-byte held handle, an exclusive signed Int64 ordered system time in big-endian microseconds, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by that many relation prefixes.
-Supply one to 32 distinct preadmitted owner root relation names and a limit of one to 128 commits.
-The server seeks each selected relation's exact journal at the same held cut and refuses gaps or an exclusive cursor that predates uncovered history.
-A relation with a proven empty history contributes no commits.
+`rtdb.owned.ReadHeldMergedChanges.v4` takes a 16-byte held handle, a lower exclusive edge, an upper inclusive edge, a big-endian unsigned 16-bit commit limit, and a big-endian unsigned 16-bit relation count followed by the relation prefixes.
+Each edge contains signed big-endian Int64 history microseconds, a signed big-endian Int64 transaction position, and one tag byte.
+Tag 0 with position -1 covers an entire history-time band, tag 1 includes the supplied transaction, and tag 2 ends immediately before that transaction.
+Each row carries `system_time_micros`, `transaction_position`, and `changes`, whose groups include their relation-local sequence and touches.
+Coverage metadata carries the complete edge and the completion flag.
+An incomplete descending page returns an edge immediately before its oldest emitted publication.
+The archived and live world routes use the same position-bearing reply.
+A point-in-time projection flag identifies when a time-only consumer can represent the page without skipping a tied publication.
 
 The reply is a terminated Arrow stream with `revision: Int64` ordered system microseconds and `changes: List<Struct<relation: Utf8, touches: List<Struct>>>`.
 The touch fields match ReadHeldChanges.v2.

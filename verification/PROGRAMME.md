@@ -162,7 +162,8 @@ The SQL token owner retains the admitted view in the issuing node. Placement-iss
 The stored Held ancestor separates the selected publication position from the archived extent, and destination replay checks both against original position-bearing receipts.
 Owned journal entries bind transaction positions to their relation-local sequence and through-event count.
 Range revalidation examines intervening publications by position, and a relation-local version opens the timeline at its original position.
-Merged change requests with SQL-time continuations withhold ambiguous tied groups. Provider-wide replay correspondence, remaining owned history addressing and funded appointments remain proof obligations.
+Merged Flight change requests and replies carry held publication edges, allowing partial pages inside a tied SQL time band.
+The app projection still needs its scope-local revision and continuation interface. Provider-wide replay correspondence, remaining owned history addressing and funded appointments remain proof obligations.
 
 **Done when:** the production path from stored events to returned rows refines the Lean reference, and the half-open, future-ERASE and tie mutations fail in the composed check.
 

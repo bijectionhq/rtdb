@@ -7,7 +7,7 @@ use rtdb_query::{OwnedJournalHeader, read_owned_change_entry, read_owned_journal
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, OWNED_CHANGE_GROUP_BYTES,
     OWNED_CHANGE_PAGE_BYTES, OWNED_CHANGE_PAGE_GROUPS, OwnedChange, OwnedChangeGroup,
-    OwnedRelation, Result, Timestamp, TransactionKey, Value, change_feed_uncovered,
+    OwnedRelation, Result, Timestamp, TransactionKey, TxId, Value, change_feed_uncovered,
 };
 
 use super::{
@@ -17,37 +17,84 @@ use super::{
 
 pub const OWNED_MERGED_CHANGE_RELATIONS: usize = 32;
 
+/// A SQL as-of edge covers the whole history-time band. A publication edge ends
+/// at the named original transaction inside that band.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct OwnedChangeEdge {
+    pub time: Timestamp,
+    // The last variant sorts after every actual publication at the same time.
+    pub order: ChangeEdgeOrder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ChangeEdgeOrder {
+    Publication { position: TxId, included: bool },
+    AsOf,
+}
+
+impl From<Timestamp> for OwnedChangeEdge {
+    fn from(time: Timestamp) -> Self { Self { time, order: ChangeEdgeOrder::AsOf } }
+}
+
+impl From<TransactionKey> for OwnedChangeEdge {
+    fn from(key: TransactionKey) -> Self {
+        Self { time: key.system_time, order: ChangeEdgeOrder::Publication { position: key.tx_id, included: true } }
+    }
+}
+
+impl OwnedChangeEdge {
+    pub fn before(key: TransactionKey) -> Self {
+        Self { time: key.system_time, order: ChangeEdgeOrder::Publication { position: key.tx_id, included: false } }
+    }
+
+    fn belongs_to(self, head: TransactionKey) -> bool {
+        self.time <= head.system_time && match self.order {
+            ChangeEdgeOrder::Publication { position, .. } => position.0 >= 0 && position <= head.tx_id
+                && (position != head.tx_id || self.time == head.system_time),
+            ChangeEdgeOrder::AsOf => true,
+        }
+    }
+}
+
 pub struct OwnedMergedChanges {
     pub commits: Vec<OwnedChangeCommit>,
     pub retained_bytes: usize,
     _reservations: Vec<Arc<MemoryReservation>>,
     complete: bool,
-    complete_boundary: Timestamp,
+    complete_boundary: OwnedChangeEdge,
+    // A caller projecting back to an as-of edge cannot cross an unexamined tie.
+    tied_continuation: bool,
 }
 
 impl OwnedMergedChanges {
     pub fn is_complete(&self) -> bool { self.complete }
 
-    pub fn covered_through(&self) -> Result<Timestamp> {
+    pub fn covered_edge(&self, descending: bool) -> Result<OwnedChangeEdge> {
         if self.complete {
             return Ok(self.complete_boundary);
         }
-        self.commits
-            .last()
-            .map(|commit| commit.publication.system_time)
-            .ok_or_else(change_feed_uncovered)
+        self.commits.last().map(|commit| {
+            if descending { OwnedChangeEdge::before(commit.publication) } else { commit.publication.into() }
+        }).ok_or_else(change_feed_uncovered)
+    }
+
+    pub fn is_time_projectable(&self) -> bool {
+        !self.tied_continuation && self.commits.windows(2).all(|pair|
+            pair[0].publication.system_time != pair[1].publication.system_time)
+    }
+
+    pub fn covered_through(&self) -> Result<Timestamp> {
+        if !self.is_time_projectable() { return Err(change_feed_uncovered()); }
+        Ok(self.covered_edge(false)?.time)
     }
 
     /// Join a later scan band after this band's certified edge, in scan order.
     /// If the next whole band exceeds the page budget, resume from the last emitted group.
     pub fn append_archive_band(&mut self, mut next: Self, reverse: bool) -> Result<()> {
         if !self.complete
-            || self.commits.last().zip(next.commits.first()).is_some_and(|(prior, next)|
-                prior.publication.system_time == next.publication.system_time
-                    || if reverse { next.publication.tx_id >= prior.publication.tx_id }
-                        else { next.publication.tx_id <= prior.publication.tx_id })
             || next.commits.first().is_some_and(|commit| {
-                if reverse { commit.publication.system_time > self.complete_boundary } else { commit.publication.system_time <= self.complete_boundary }
+                let edge = OwnedChangeEdge::from(commit.publication);
+                if reverse { edge > self.complete_boundary } else { edge <= self.complete_boundary }
             })
         {
             return Err(change_feed_uncovered());
@@ -62,7 +109,7 @@ impl OwnedMergedChanges {
             return Ok(());
         }
         if next.retained_bytes > OWNED_CHANGE_PAGE_BYTES - self.retained_bytes {
-            self.complete = false;
+            self.stop_before(next.commits[0].publication)?;
             return Ok(());
         }
         self.retained_bytes += next.retained_bytes;
@@ -70,13 +117,21 @@ impl OwnedMergedChanges {
         self._reservations.append(&mut next._reservations);
         self.complete_boundary = next.complete_boundary;
         self.complete = next.complete;
+        self.tied_continuation = next.tied_continuation;
         Ok(())
     }
 
-    pub fn stop_at_last_group(&mut self) -> Result<()> {
-        if self.commits.is_empty() { return Err(change_feed_uncovered()); }
+    pub fn stop_before(&mut self, next: TransactionKey) -> Result<()> {
+        let last = self.commits.last().ok_or_else(change_feed_uncovered)?;
         self.complete = false;
+        self.tied_continuation = last.publication.system_time == next.system_time;
         Ok(())
+    }
+
+    /// Extend complete coverage across the remaining empty portion of the
+    /// requested window, after the caller exhausts every selected writer.
+    pub fn complete_at(&mut self, edge: OwnedChangeEdge) {
+        if self.complete { self.complete_boundary = edge; }
     }
 
     /// A single-relation page carries its examined coverage independently of visible groups.
@@ -128,7 +183,7 @@ pub struct OwnedChangeCommit {
 
 pub struct OwnedRelationChanges {
     pub relation: OwnedRelation,
-    sequence: u64,
+    pub sequence: u64,
     pub touches: Vec<OwnedChange>,
 }
 
@@ -245,7 +300,7 @@ impl OwnedReadSession {
             // Decode one accepted group. Its successors are unnecessary
             // while it still has a candidate or needs a later held present.
             let page = self.merged_change_journals(
-                std::slice::from_ref(relation), through, self.present.system_time, 1, if through == Timestamp::MIN { ChangeScan::RetainedStart } else { ChangeScan::Forward },
+                std::slice::from_ref(relation), through.into(), self.present.system_time.into(), 1, if through == Timestamp::MIN { ChangeScan::RetainedStart } else { ChangeScan::Forward },
             ).await?;
             let Some(group) = page.commits.first() else {
                 through = page.covered_through()?;
@@ -288,7 +343,7 @@ impl OwnedReadSession {
                 // revisit this entire group and skip only durable purges.
                 break;
             }
-            through = group.publication.system_time;
+            through = page.covered_through()?;
             if page.complete {
                 through = page.covered_through()?;
                 state = "quiescent";
@@ -305,20 +360,20 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
         after: Timestamp, through: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
-        self.world_merged_changes_ordered(world, relations, after, through, limit, false).await
+        self.world_merged_changes_ordered(world, relations, after.into(), through.into(), limit, false).await
     }
 
     pub async fn world_merged_changes_ordered(
         &self, world: rtdb_types::Iid, relations: &[OwnedRelation],
-        after: Timestamp, through: Timestamp, limit: usize, descending: bool,
+        after: OwnedChangeEdge, through: OwnedChangeEdge, limit: usize, descending: bool,
     ) -> Result<OwnedMergedChanges> {
         let (record, _charge) = self.world_registration(world).await?
             .filter(|(record, _)| !record.dropped && self.present.system_time < record.until)
             .ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-        self.require_change_bounds(after, through)?;
-        let fork = record.inherited_system();
+        self.require_change_bounds(after.time, through.time)?;
+        let fork = record.inherited_position().into();
         if after < fork {
-            return Err(historical_owned_read::below_floor(fork));
+            return Err(historical_owned_read::below_floor(record.inherited_system()));
         }
         if !(1..=OWNED_MERGED_CHANGE_RELATIONS).contains(&relations.len()) {
             return Err(change_feed_uncovered());
@@ -359,20 +414,25 @@ impl OwnedReadSession {
     pub async fn merged_changes_at(
         &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
     ) -> Result<OwnedMergedChanges> {
-        if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
-            return Err(change_feed_uncovered());
-        }
-        self.merged_change_journals(relations, after, through, limit, ChangeScan::Forward).await
+        self.merged_changes_window(relations, after.into(), through.into(), limit, false).await
     }
 
-    /// Merges whole Root groups in descending order within (after, through].
     pub async fn merged_changes_descending(
         &self, relations: &[OwnedRelation], after: Timestamp, through: Timestamp, limit: usize,
+    ) -> Result<OwnedMergedChanges> {
+        self.merged_changes_window(relations, after.into(), through.into(), limit, true).await
+    }
+
+    /// Merge whole Root publications within the authorized held interval.
+    pub async fn merged_changes_window(
+        &self, relations: &[OwnedRelation], after: OwnedChangeEdge, through: OwnedChangeEdge,
+        limit: usize, descending: bool,
     ) -> Result<OwnedMergedChanges> {
         if relations.iter().any(|relation| relation.world().is_some() || relation.is_world_catalog()) {
             return Err(change_feed_uncovered());
         }
-        self.merged_change_journals(relations, after, through, limit, ChangeScan::Reverse).await
+        let scan = if descending { ChangeScan::Reverse } else { ChangeScan::Forward };
+        self.merged_change_journals(relations, after, through, limit, scan).await
     }
 
     /// Admits an exact ordinary journal touch and returns its stable declared path projection.
@@ -425,6 +485,7 @@ impl OwnedReadSession {
         if system <= from || system > through { return Err(change_feed_uncovered()); }
         let before = Timestamp(system.0.checked_sub(1).ok_or_else(change_feed_uncovered)?);
         let page = self.world_merged_changes(world, std::slice::from_ref(relation), before, system, 1).await?;
+        if !page.is_time_projectable() { return Err(change_feed_uncovered()); }
         let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
         let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
         if commit.publication.system_time != system || changes.relation != *relation || !changes.touches.iter().any(|touch| {
@@ -450,7 +511,7 @@ impl OwnedReadSession {
     }
 
     async fn merged_change_journals(
-        &self, relations: &[OwnedRelation], after: Timestamp, upper: Timestamp,
+        &self, relations: &[OwnedRelation], after: OwnedChangeEdge, upper: OwnedChangeEdge,
         limit: usize, scan: ChangeScan,
     ) -> Result<OwnedMergedChanges> {
         if !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
@@ -461,7 +522,9 @@ impl OwnedReadSession {
                 "Invalid merged change page bounds",
             ));
         }
-        self.require_change_bounds(after, upper)?;
+        if after > upper || !after.belongs_to(self.present) || !upper.belongs_to(self.present) {
+            return Err(change_feed_uncovered());
+        }
         self.admit_read().await?;
         for relation in relations.iter().filter(|relation| relation.world().is_none()) {
             self.lifetime_point_policy(relation).await?;
@@ -497,7 +560,7 @@ impl OwnedReadSession {
             if let Some(journal) = journal { journals.push(journal); }
         }
         let in_window = |journal: &Journal<'_>| journal.active()
-            && if reverse { journal.next.publication.system_time > after } else { journal.next.publication.system_time <= upper };
+            && if reverse { OwnedChangeEdge::from(journal.next.publication) > after } else { OwnedChangeEdge::from(journal.next.publication) <= upper };
 
         let mut page = OwnedMergedChanges {
             commits: Vec::with_capacity(limit),
@@ -505,6 +568,7 @@ impl OwnedReadSession {
             _reservations: vec![initial_charge],
             complete: false,
             complete_boundary: if reverse { after } else { upper },
+            tied_continuation: false,
         };
         while page.commits.len() < limit {
             guarded.check_cancelled()?;
@@ -516,11 +580,6 @@ impl OwnedReadSession {
             else {
                 break;
             };
-            // A SQL-time continuation cannot advance within a tied band.
-            // Withhold the ambiguous page until its caller can supply a position.
-            if page.commits.last().is_some_and(|prior| prior.publication.system_time == publication.system_time) {
-                return Err(change_feed_uncovered());
-            }
             let mut changes = Vec::new();
             let mut charges = Vec::new();
             let mut bytes = 0;
@@ -565,6 +624,7 @@ impl OwnedReadSession {
                             "A visible commit exceeds the merged change page budget",
                         ));
                     }
+                    page.stop_before(publication)?;
                     guarded.check_cancelled()?;
                     return Ok(page);
                 }
@@ -593,12 +653,11 @@ impl OwnedReadSession {
             page.commits.push(OwnedChangeCommit { publication, changes });
         }
         guarded.check_cancelled()?;
-        if page.commits.last().is_some_and(|commit| journals.iter().any(|journal|
-            in_window(journal) && journal.next.publication.system_time == commit.publication.system_time))
-        {
-            return Err(change_feed_uncovered());
-        }
         page.complete = journals.iter().all(|journal| !in_window(journal));
+        if !page.complete && let Some(last) = page.commits.last() {
+            page.tied_continuation = journals.iter().any(|journal|
+                in_window(journal) && journal.next.publication.system_time == last.publication.system_time);
+        }
         Ok(page)
     }
 
@@ -673,24 +732,18 @@ impl OwnedReadSession {
         Ok(page)
     }
 
-    async fn version_boundary(
-        &self, relation: &OwnedRelation, journal: &CoveredJournal, time: Timestamp,
-    ) -> Result<i64> {
-        journal_boundary(&self.journal_context(relation)?, &self.owner, relation, journal, time).await
-    }
-
     async fn covered_journal(
         &self, snapshot: &Snapshot, relation: &OwnedRelation, after: Timestamp,
     ) -> Result<Option<CoveredJournal>> {
         if snapshot.tx_basis() != Some(self.present) { return Err(change_feed_uncovered()); }
-        cover_journal(&self.journal_context(relation)?, snapshot, &self.owner, relation, self.present.system_time, after).await
+        cover_journal(&self.journal_context(relation)?, snapshot, &self.owner, relation, self.present.system_time, after.into()).await
     }
 
     async fn seek_changes<'a>(
         &self,
         snapshot: &Snapshot,
         relation: &'a OwnedRelation,
-        after: Timestamp,
+        after: OwnedChangeEdge,
         from_retained_start: bool,
     ) -> Result<Option<Journal<'a>>> {
         let Some(CoveredJournal {
@@ -698,17 +751,20 @@ impl OwnedReadSession {
             first,
             head,
             head_revision,
-        }) = self.covered_journal(snapshot, relation, if from_retained_start { self.present.system_time } else { after }).await?
+        }) = self.covered_journal(snapshot, relation, if from_retained_start { self.present.system_time } else { after.time }).await?
         else {
             return Ok(None);
         };
+        if !from_retained_start && floor.through_events != 0 && after < floor.publication.into() {
+            return Err(change_feed_uncovered());
+        }
         if from_retained_start {
             return Ok(Some(Journal {
                 relation, revision: 1, head: head_revision, head_through: head.through_events,
                 previous_through: floor.through_events, next: first,
             }));
         }
-        if after >= head.publication.system_time {
+        if after >= OwnedChangeEdge::from(head.publication) {
             self.require_journal_head(relation, head_revision, head)
                 .await?;
             return Ok(None);
@@ -724,7 +780,7 @@ impl OwnedReadSession {
             {
                 return Err(change_feed_uncovered());
             }
-            if point.publication.system_time > after {
+            if OwnedChangeEdge::from(point.publication) > after {
                 high = mid;
             } else {
                 low = mid + 1;
@@ -736,10 +792,10 @@ impl OwnedReadSession {
         } else {
             self.journal_header(relation, low - 1).await?
         };
-        if next.publication.system_time <= after
+        if OwnedChangeEdge::from(next.publication) <= after
             || next.through_events <= previous.through_events
             || (low > 1
-                && (previous.publication.system_time > after || !ordered_or_same(low, low - 1, next, previous)))
+                && (OwnedChangeEdge::from(previous.publication) > after || !ordered_or_same(low, low - 1, next, previous)))
             || !ordered_or_same(head_revision, low, head, next)
         {
             return Err(change_feed_uncovered());
@@ -755,27 +811,31 @@ impl OwnedReadSession {
     }
 
     async fn seek_changes_reverse<'a>(
-        &self, snapshot: &Snapshot, relation: &'a OwnedRelation, after: Timestamp, upper: Timestamp,
+        &self, snapshot: &Snapshot, relation: &'a OwnedRelation, after: OwnedChangeEdge, upper: OwnedChangeEdge,
     ) -> Result<Option<Journal<'a>>> {
-        let Some(covered) = self.covered_journal(snapshot, relation, after).await? else { return Ok(None); };
-        if after == upper || upper < covered.first.publication.system_time {
+        let Some(covered) = self.covered_journal(snapshot, relation, after.time).await? else { return Ok(None); };
+        if covered.floor.through_events != 0 && after < covered.floor.publication.into() {
+            return Err(change_feed_uncovered());
+        }
+        if after == upper || upper < OwnedChangeEdge::from(covered.first.publication) {
             return Ok(None);
         }
         // Head checks and binary seek read headers only. No later payload
         // is needed to prove the exact upper boundary.
-        let revision = if upper >= covered.head.publication.system_time {
+        let revision = if upper >= OwnedChangeEdge::from(covered.head.publication) {
             covered.head_revision
         } else {
-            self.version_boundary(relation, &covered, upper.next()?).await? - 1
+            journal_boundary_for(&self.journal_context(relation)?, &self.owner, relation, &covered,
+                |header| OwnedChangeEdge::from(header.publication) <= upper).await? - 1
         };
         if revision < 1 { return Err(change_feed_uncovered()); }
         let next = self.journal_header(relation, revision).await?;
-        if next.publication.system_time > upper
+        if OwnedChangeEdge::from(next.publication) > upper
             || !ordered_or_same(covered.head_revision, revision, covered.head, next)
         {
             return Err(change_feed_uncovered());
         }
-        if next.publication.system_time <= after { return Ok(None); }
+        if OwnedChangeEdge::from(next.publication) <= after { return Ok(None); }
         let previous = if revision == 1 { covered.floor }
             else { self.journal_header(relation, revision - 1).await? };
         if previous.through_events >= next.through_events
@@ -814,18 +874,23 @@ impl OwnedReadSession {
 /// Read whole accepted groups from a pinned Root or world relation archive.
 pub async fn archived_changes_at_cut(
     context: Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
-    after: Timestamp, through: Timestamp, limit: usize, reverse: bool,
+    after: impl Into<OwnedChangeEdge>, through: impl Into<OwnedChangeEdge>, limit: usize, reverse: bool,
 ) -> Result<OwnedMergedChanges> {
     let present = context.current_time.as_micros()?;
+    let after = after.into();
+    let through = through.into();
     let root = relation.root_relation().unwrap_or_else(|| relation.clone());
-    if !root.is_root_data() || after > through || through > present
+    if !root.is_root_data() || after > through || through.time > present
         || !(1..=OWNED_CHANGE_PAGE_GROUPS).contains(&limit)
     {
         return Err(change_feed_uncovered());
     }
     let database = context.catalog.database(context.catalog.default_database())?;
     let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
-    if snapshot.system_time_cap() != Some(present) { return Err(change_feed_uncovered()); }
+    let head = snapshot.tx_basis().ok_or_else(change_feed_uncovered)?;
+    if snapshot.system_time_cap() != Some(present) || !after.belongs_to(head) || !through.belongs_to(head) {
+        return Err(change_feed_uncovered());
+    }
     let initial = (1 + limit) * 512;
     let mut page = OwnedMergedChanges {
         commits: Vec::with_capacity(limit),
@@ -833,15 +898,16 @@ pub async fn archived_changes_at_cut(
         _reservations: vec![context.memory.reserve(initial)?],
         complete: true,
         complete_boundary: if reverse { after } else { through },
+        tied_continuation: false,
     };
     let Some(journal) = cover_journal(&context, snapshot, owner, relation, present, after).await? else {
         context.check_cancelled()?;
         return Ok(page);
     };
-    let first = if after >= journal.head.publication.system_time { journal.head_revision + 1 }
-        else { journal_boundary(&context, owner, relation, &journal, after.next()?).await? };
-    let end = if through >= journal.head.publication.system_time { journal.head_revision + 1 }
-        else { journal_boundary(&context, owner, relation, &journal, through.next()?).await? };
+    let first = journal_boundary_for(&context, owner, relation, &journal,
+        |header| OwnedChangeEdge::from(header.publication) <= after).await?;
+    let end = journal_boundary_for(&context, owner, relation, &journal,
+        |header| OwnedChangeEdge::from(header.publication) <= through).await?;
     if first > end { return Err(change_feed_uncovered()); }
     let count = usize::try_from(end - first).map_err(|_| change_feed_uncovered())?;
     for offset in 0..count.min(limit) {
@@ -849,9 +915,6 @@ pub async fn archived_changes_at_cut(
         let offset = i64::try_from(offset).map_err(|_| change_feed_uncovered())?;
         let seq = if reverse { end - 1 - offset } else { first + offset };
         let header = read_owned_journal_header(Arc::clone(&context), owner, relation, seq).await?;
-        if page.commits.last().is_some_and(|commit| commit.publication.system_time == header.publication.system_time) {
-            return Err(change_feed_uncovered());
-        }
         let previous = if seq == 1 { journal.floor } else {
             read_owned_journal_header(Arc::clone(&context), owner, relation, seq - 1).await?
         };
@@ -863,7 +926,7 @@ pub async fn archived_changes_at_cut(
             || (seq == 1 && previous.publication != header.publication)
             || (seq > 1 && !ordered_or_same(seq, seq - 1, header, previous))
             || !ordered_or_same(journal.head_revision, seq, journal.head, header)
-            || header.publication.system_time <= after || header.publication.system_time > through
+            || OwnedChangeEdge::from(header.publication) <= after || OwnedChangeEdge::from(header.publication) > through
         {
             return Err(change_feed_uncovered());
         }
@@ -893,9 +956,7 @@ pub async fn archived_changes_at_cut(
         let offset = i64::try_from(page.commits.len()).map_err(|_| change_feed_uncovered())?;
         let next = if reverse { end - 1 - offset } else { first + offset };
         let next = read_owned_journal_header(Arc::clone(&context), owner, relation, next).await?;
-        if next.publication.system_time == last.publication.system_time {
-            return Err(change_feed_uncovered());
-        }
+        page.tied_continuation = next.publication.system_time == last.publication.system_time;
     }
     page.complete = page.commits.len() == count;
     context.check_cancelled()?;
@@ -976,7 +1037,7 @@ async fn read_versions_at_cut(
     let purge_floor = rtdb_query::owned_purge_floor(
         Arc::clone(&journal_context), owner, relation, id,
     ).await?;
-    let journal = cover_journal(&journal_context, snapshot, owner, relation, present, present).await?;
+    let journal = cover_journal(&journal_context, snapshot, owner, relation, present, present.into()).await?;
     let history_floor = journal.as_ref()
         .filter(|journal| journal.floor.through_events != 0)
         .map(|journal| journal.floor.publication.system_time);
@@ -1080,11 +1141,19 @@ async fn journal_boundary(
     context: &Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
     journal: &CoveredJournal, time: Timestamp,
 ) -> Result<i64> {
+    journal_boundary_for(context, owner, relation, journal,
+        |header| header.publication.system_time < time).await
+}
+
+async fn journal_boundary_for(
+    context: &Arc<rtdb_query::QueryContext>, owner: &str, relation: &OwnedRelation,
+    journal: &CoveredJournal, consumed: impl Fn(OwnedJournalHeader) -> bool,
+) -> Result<i64> {
     let end = journal.head_revision + 1;
-    if time <= journal.first.publication.system_time {
+    if !consumed(journal.first) {
         return Ok(1);
     }
-    if time > journal.head.publication.system_time {
+    if consumed(journal.head) {
         return Ok(end);
     }
     let (mut low, mut high) = (2, journal.head_revision);
@@ -1097,16 +1166,16 @@ async fn journal_boundary(
         {
             return Err(change_feed_uncovered());
         }
-        if header.publication.system_time < time {
+        if consumed(header) {
             low = mid + 1;
         } else {
             high = mid;
         }
     }
-    if low > 1 && read_owned_journal_header(Arc::clone(context), owner, relation, low - 1).await?.publication.system_time >= time {
+    if low > 1 && !consumed(read_owned_journal_header(Arc::clone(context), owner, relation, low - 1).await?) {
         return Err(change_feed_uncovered());
     }
-    if low < end && read_owned_journal_header(Arc::clone(context), owner, relation, low).await?.publication.system_time < time {
+    if low < end && consumed(read_owned_journal_header(Arc::clone(context), owner, relation, low).await?) {
         return Err(change_feed_uncovered());
     }
     Ok(low)
@@ -1114,11 +1183,11 @@ async fn journal_boundary(
 
 async fn cover_journal(
     context: &Arc<rtdb_query::QueryContext>, snapshot: &Snapshot, owner: &str, relation: &OwnedRelation,
-    present: Timestamp, after: Timestamp,
+    present: Timestamp, after: OwnedChangeEdge,
 ) -> Result<Option<CoveredJournal>> {
     let head_cut = snapshot.tx_basis().filter(|basis| basis.system_time == present)
         .ok_or_else(change_feed_uncovered)?;
-    if after > present { return Err(change_feed_uncovered()); }
+    if after.time > present { return Err(change_feed_uncovered()); }
     let inventory = snapshot.owned_routing_inventory(owner, relation)?;
     if inventory.journal_exhausted() {
         return Ok(None);
@@ -1138,7 +1207,7 @@ async fn cover_journal(
         || !ordered_or_same(head_revision, 1, head, first)
         || head.through_events != root_frontier
         || !head.publication.at_or_before(head_cut)
-        || (after < floor.publication.system_time && floor.through_events != 0)
+        || (after < OwnedChangeEdge::from(floor.publication) && floor.through_events != 0)
     {
         return Err(change_feed_uncovered());
     }
@@ -1177,6 +1246,7 @@ async fn validate_journal_head(
 fn require_path_touch(
     page: &OwnedMergedChanges, relation: &OwnedRelation, id: &EntityId, group: Timestamp, valid: Timestamp,
 ) -> Result<()> {
+    if !page.is_time_projectable() { return Err(change_feed_uncovered()); }
     let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
     let [changes] = commit.changes.as_slice() else { return Err(change_feed_uncovered()); };
     if commit.publication.system_time != group || changes.relation != *relation || !changes.touches.iter().any(|touch| {
@@ -1258,6 +1328,19 @@ fn journal_order_distinguishes_tied_transaction_positions() {
 
 #[cfg(test)]
 #[test]
+fn positions_resume_inside_a_band_in_both_directions() {
+    let time = Timestamp(30);
+    let first = TransactionKey { tx_id: TxId(5), system_time: time };
+    let second = TransactionKey { tx_id: TxId(6), system_time: time };
+    let lower = OwnedChangeEdge::from(first);
+    let upper = OwnedChangeEdge::from(time);
+    assert!(lower < second.into() && OwnedChangeEdge::from(second) <= upper);
+    assert!(lower <= OwnedChangeEdge::before(second) && OwnedChangeEdge::before(second) < second.into());
+    assert!(OwnedChangeEdge::before(first) < lower);
+}
+
+#[cfg(test)]
+#[test]
 fn filtered_relation_page_keeps_the_examined_world_boundary() {
     let relation = OwnedRelation::new("facts").unwrap();
     let valid = Interval::from_micros(10, 20).unwrap();
@@ -1278,7 +1361,8 @@ fn filtered_relation_page_keeps_the_examined_world_boundary() {
         retained_bytes: 0,
         _reservations: Vec::new(),
         complete: false,
-        complete_boundary: Timestamp(40),
+        complete_boundary: Timestamp(40).into(),
+        tied_continuation: false,
     };
     let mut page = page.into_relation_page().unwrap();
     page.retain_identity_region(None, None, Interval::from_micros(20, 21).unwrap()).unwrap();

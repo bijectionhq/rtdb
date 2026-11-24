@@ -17,7 +17,7 @@ use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_array, entity_id_type, read_entity_id, selected_cell};
 use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
-use rtdb_node::{HeldSpatialNearest, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
+use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
 use rtdb_types::{EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
@@ -262,8 +262,8 @@ pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeld
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
 pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V5: &str = "rtdb.owned.PrepareHeldWorldOverlay.v5";
-pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v1";
-pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
+pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V2: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v2";
+pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V2: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v2";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
 pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2";
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
@@ -313,12 +313,12 @@ pub(crate) const HELD_OWNED_COUNT_V1: &str = "rtdb.owned.CountHeldRange.v1";
 pub(crate) const HELD_OWNED_COUNT_V2: &str = "rtdb.owned.CountHeldRange.v2";
 pub(crate) const HELD_OWNED_MEASURE_V1: &str = "rtdb.owned.MeasureHeldRange.v1";
 pub(crate) const HELD_OWNED_MEASURE_AT_V1: &str = "rtdb.owned.MeasureHeldRangeAt.v1";
-pub(crate) const READ_HELD_WORLD_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldWorldChangesDescending.v1";
-pub(crate) const READ_HELD_WORLD_CHANGES_V3: &str = "rtdb.owned.ReadHeldWorldChanges.v3";
+pub(crate) const READ_HELD_WORLD_CHANGES_DESCENDING_V2: &str = "rtdb.owned.ReadHeldWorldChangesDescending.v2";
+pub(crate) const READ_HELD_WORLD_CHANGES_V4: &str = "rtdb.owned.ReadHeldWorldChanges.v4";
 pub(crate) const READ_HELD_WORLD_REGION_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldRegionChanges.v1";
 pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorageUsage.v1";
-pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V1: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v1";
-pub(crate) const HELD_OWNED_MERGED_CHANGES_V3: &str = "rtdb.owned.ReadHeldMergedChanges.v3";
+pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V2: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v2";
+pub(crate) const HELD_OWNED_MERGED_CHANGES_V4: &str = "rtdb.owned.ReadHeldMergedChanges.v4";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
 pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
 pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
@@ -622,6 +622,21 @@ fn count_component(body: &[u8], maximum: usize) -> Result<(&[u8], &[u8]), Status
         return Err(invalid("Owned count component exceeds its bound"));
     }
     body.split_at_checked(length).ok_or_else(|| invalid("Incomplete owned count component"))
+}
+
+fn split_change_edge(body: &[u8]) -> Result<(OwnedChangeEdge, &[u8]), Status> {
+    let (time, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing change history coordinate"))?;
+    let (position, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing change position"))?;
+    let (&kind, body) = body.split_first().ok_or_else(|| invalid("Missing change edge kind"))?;
+    let time = Timestamp(i64::from_be_bytes(*time));
+    let position = i64::from_be_bytes(*position);
+    let order = match (kind, position) {
+        (0, -1) => ChangeEdgeOrder::AsOf,
+        (1 | 2, position) if position >= 0 =>
+            ChangeEdgeOrder::Publication { position: rtdb_types::TxId(position), included: kind == 1 },
+        _ => return Err(invalid("Invalid change edge")),
+    };
+    Ok((OwnedChangeEdge { time, order }, body))
 }
 
 fn split_world_publication(body: &[u8]) -> Result<(TransactionKey, &[u8]), Status> {
@@ -2317,8 +2332,8 @@ impl Service {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent changes require a held world"))?;
         let (selected, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require a selected publication"))?;
-        let (after, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require an exclusive revision"))?;
-        let (through, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require an upper revision"))?;
+        let (after, rest) = split_change_edge(rest)?;
+        let (through, rest) = split_change_edge(rest)?;
         let (limit, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Earlier parent changes require a group limit"))?;
         let (direction, rest) = rest.split_first().ok_or_else(|| invalid("Earlier parent changes require a direction"))?;
         let reverse = match *direction {
@@ -2330,8 +2345,6 @@ impl Service {
         if !tail.is_empty() { return Err(invalid("Earlier parent changes have trailing bytes")); }
         let selected = Timestamp(i64::from_be_bytes(*selected));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-        let after = Timestamp(i64::from_be_bytes(*after));
-        let through = Timestamp(i64::from_be_bytes(*through));
         let limit = usize::from(u16::from_be_bytes(*limit));
         let (page, witness) = if ancestor {
             held.snapshot.ancestor_changes(&relation, selected, after, through, limit, reverse).await
@@ -3301,11 +3314,7 @@ impl Service {
             return Err(status(error));
         }
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
-        let page = if descending {
-            held.snapshot.merged_changes_descending(&relations, after, through, limit).await
-        } else {
-            held.snapshot.merged_changes_at(&relations, after, through, limit).await
-        }.map_err(status)?;
+        let page = held.snapshot.merged_changes_window(&relations, after, through, limit, descending).await.map_err(status)?;
         let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending, None)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
@@ -3336,8 +3345,8 @@ impl Service {
         let (lower, upper, valid, _bounds) = change_region_request(call, request)?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let mut page = held.snapshot.changes(
-            std::slice::from_ref(&relation), Timestamp(i64::from_be_bytes(*after)),
-            Timestamp(i64::from_be_bytes(*through)), usize::from(u16::from_be_bytes(*limit)), false,
+            std::slice::from_ref(&relation), Timestamp(i64::from_be_bytes(*after)).into(),
+            Timestamp(i64::from_be_bytes(*through)).into(), usize::from(u16::from_be_bytes(*limit)), false,
         ).await.map_err(status)?.into_relation_page().map_err(status)?;
         page.retain_identity_region(lower.as_ref(), upper.as_ref(), valid).map_err(status)?;
         let reply = self.owned_changes_reply(&page, held.snapshot.present())?;
@@ -3347,9 +3356,9 @@ impl Service {
 
     fn merged_changes_request(
         &self, call: &Call, request: &[u8],
-    ) -> Result<(Timestamp, Timestamp, usize, Vec<OwnedRelation>, Arc<MemoryReservation>), Status> {
-        let (after, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Merged changes require an exclusive revision"))?;
-        let (through, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Merged changes require an inclusive upper revision"))?;
+    ) -> Result<(OwnedChangeEdge, OwnedChangeEdge, usize, Vec<OwnedRelation>, Arc<MemoryReservation>), Status> {
+        let (after, rest) = split_change_edge(request)?;
+        let (through, rest) = split_change_edge(rest)?;
         let (limit, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Merged changes require a group limit"))?;
         let (count, mut rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Merged changes require a relation count"))?;
         let count = usize::from(u16::from_be_bytes(*count));
@@ -3364,7 +3373,7 @@ impl Service {
             rest = tail;
         }
         if !rest.is_empty() { return Err(invalid("Merged changes have trailing bytes")); }
-        Ok((Timestamp(i64::from_be_bytes(*after)), Timestamp(i64::from_be_bytes(*through)),
+        Ok((after, through,
             usize::from(u16::from_be_bytes(*limit)), relations, charge))
     }
 
@@ -3375,20 +3384,28 @@ impl Service {
 
         let changes_type = LogicalType::list(LogicalType::Struct(StructFields::from([
             ("relation".into(), LogicalType::Scalar(ScalarType::Utf8)),
+            ("relation_sequence".into(), LogicalType::Scalar(ScalarType::U64)),
             ("touches".into(), owned_touches_type()),
         ])));
+        let edge = page.covered_edge(descending).map_err(status)?;
+        let (kind, position) = match edge.order {
+            ChangeEdgeOrder::AsOf => (0, -1),
+            ChangeEdgeOrder::Publication { position, included } => (if included { 1 } else { 2 }, position.0),
+        };
         let mut metadata = std::collections::HashMap::from([
             (OWNED_PRESENT.into(), present.0.to_string()),
-            (OWNED_CHANGE_COVERAGE.into(), page.covered_through().map_err(status)?.0.to_string()),
+            (OWNED_CHANGE_COVERAGE.into(), edge.time.0.to_string()),
+            ("rtdb.owned.change_position".into(), position.to_string()),
+            ("rtdb.owned.change_edge_kind".into(), kind.to_string()),
+            ("rtdb.owned.change_complete".into(), page.is_complete().to_string()),
+            ("rtdb.owned.change_time_projectable".into(), page.is_time_projectable().to_string()),
         ]);
         if let Some(witness) = witness {
             metadata.insert(WORLD_RANGE_WITNESS.into(), witness.simple().to_string());
         }
-        if descending {
-            metadata.insert("rtdb.owned.change_complete".into(), page.is_complete().to_string());
-        }
         let schema = Schema::new(vec![
-            Field::new("revision", DataType::Int64, false),
+            Field::new("system_time_micros", DataType::Int64, false),
+            Field::new("transaction_position", DataType::Int64, false),
             rtdb_columnar::to_field("changes", &changes_type).map_err(status)?,
         ]).with_metadata(metadata);
         if page.commits.is_empty() {
@@ -3396,17 +3413,19 @@ impl Service {
         }
         let schema = Arc::new(schema);
         let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
-        let revisions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.system_time.0));
+        let history = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.system_time.0));
+        let positions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.tx_id.0));
         let changes: Vec<_> = page.commits.iter().map(|commit| Value::list(commit.changes.iter().map(|change| {
             Value::Struct(StructFields::from([
                 ("relation".into(), Value::Utf8(change.relation.name().into())),
+                ("relation_sequence".into(), Value::U64(change.sequence)),
                 ("touches".into(), Value::list(change.touches.iter().map(rtdb_types::OwnedChange::to_value).collect())),
             ]))
         }).collect())).collect();
         let _arrow = self.memory().reserve(rtdb_columnar::estimate_builder_bytes(&changes_type, &changes).map_err(status)?)
             .map_err(status)?;
         let changes = rtdb_columnar::build_array(&changes_type, &changes).map_err(status)?;
-        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(revisions), changes]).map_err(arrow)?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(history), Arc::new(positions), changes]).map_err(arrow)?;
         self.owned_action_reply(&schema, Some(&batch))
     }
 

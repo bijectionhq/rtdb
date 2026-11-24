@@ -40,8 +40,8 @@ fn fresh_replica_action(action: &str) -> bool {
         | HELD_OWNED_MEASURE_V1
         | HELD_OWNED_MEASURE_AT_V1
         | HELD_OWNED_STORAGE_USAGE_V1
-        | HELD_OWNED_MERGED_CHANGES_DESCENDING_V1
-        | HELD_OWNED_MERGED_CHANGES_V3
+        | HELD_OWNED_MERGED_CHANGES_DESCENDING_V2
+        | HELD_OWNED_MERGED_CHANGES_V4
         | HELD_OWNED_CHANGES_V3
         | READ_HELD_UNIQUE_V1
         | READ_HELD_UNIQUE_WINDOW_V1
@@ -192,12 +192,12 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_COUNT_V2 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, false).await?)]),
                 crate::owned_actions::HELD_OWNED_MEASURE_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, true).await?)]),
                 crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, true).await?)]),
-                crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V1 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::READ_HELD_WORLD_CHANGES_V3 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::READ_HELD_WORLD_CHANGES_V4 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 => Ok(vec![Ok(self.held_world_region_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 => Ok(vec![Ok(self.held_owned_storage_usage_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V1 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V3 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V4 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 => Ok(vec![Ok(self.held_expiry_candidates_action(&call, &action.body).await?)]),
                 crate::owned_actions::APPLY_HELD_EXPIRY_V1 => Ok(vec![Ok(self.apply_held_expiry_action(&call, &action.body).await?)]),
                 crate::owned_actions::NOMINATE_HELD_EXPIRY_V1 => Ok(vec![Ok(self.nominate_held_expiry_action(&call, &action.body).await?)]),
@@ -223,8 +223,8 @@ impl Service {
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
                 crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V5 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V2 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V2 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_WORLD_VERSION_V2 => self.held_world_version_action(&call, &action.body).await,
