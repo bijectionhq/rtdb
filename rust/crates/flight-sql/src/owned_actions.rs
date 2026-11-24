@@ -66,7 +66,7 @@ enum HostedDecisionInput<'a> {
     Inline(HostedDecisionWire),
     Streamed {
         packed: packed_groups::PackedGroups<'static>,
-        controls: &'a [u8],
+        controls: &'a Bytes,
     },
 }
 pub(crate) const DECLARE_OWNED_FIXED_RANGE_V1: &str = "rtdb.owned.DeclareFixedRange.v1";
@@ -710,7 +710,7 @@ impl OwnedHybridRequest<'_> {
 pub(crate) const HYBRID_TEXT_RANK: &str = "text_rank";
 pub(crate) const HYBRID_NEAREST_RANK: &str = "nearest_rank";
 
-fn owned_hybrid_request<'a>(call: &Call, request: &'a [u8], overlays: bool) -> Result<OwnedHybridRequest<'a>, Status> {
+fn owned_hybrid_request<'a>(call: &Call, envelope: &Bytes, request: &'a [u8], overlays: bool) -> Result<OwnedHybridRequest<'a>, Status> {
     let (limit, mut request) = request.split_first_chunk::<2>().ok_or_else(|| invalid("Held hybrid search has no limit"))?;
     let limit = usize::from(u16::from_be_bytes(*limit));
     let mut staged = [None, None];
@@ -719,7 +719,7 @@ fn owned_hybrid_request<'a>(call: &Call, request: &'a [u8], overlays: bool) -> R
             let (length, rest) = request.split_first_chunk::<4>().ok_or_else(|| invalid("Held hybrid search has no overlay length"))?;
             let (ipc, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
                 .ok_or_else(|| invalid("Held hybrid search has a truncated overlay"))?;
-            if !ipc.is_empty() { *slot = Some(request_batch(call, ipc)?); }
+            if !ipc.is_empty() { *slot = Some(request_batch(call, call.retain_request_bytes(envelope.slice_ref(ipc)))?); }
             request = rest;
         }
     }
@@ -901,9 +901,9 @@ fn split_position_mask(body: &[u8]) -> Result<((Timestamp, u32), &[u8]), Status>
     Ok(((Timestamp(i64::from_be_bytes(*commit)), u32::from_be_bytes(*from)), rest))
 }
 
-fn decode_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
-    charge_audience_arrow(arrow)?;
-    let stream = OwnedStream::read(arrow, call.memory()).map_err(status)?;
+fn decode_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
+    charge_audience_arrow(&arrow)?;
+    let stream = OwnedStream::read_bytes(arrow, call.memory()).map_err(status)?;
     single_owned_batch(stream)
 }
 
@@ -1018,7 +1018,7 @@ fn owned_scalar<'a, T: Array + 'static>(batch: &'a RecordBatch, name: &str) -> R
     Ok(Some((array, row)))
 }
 
-fn request_batch(call: &Call, arrow: &[u8]) -> Result<OwnedBatch, Status> {
+fn request_batch(call: &Call, arrow: Bytes) -> Result<OwnedBatch, Status> {
     require_identity(decode_batch(call, arrow)?)
 }
 
@@ -1146,10 +1146,10 @@ impl Service {
         self.owned_write_reply(call, vec![declaration]).await
     }
 
-    pub(crate) async fn declare_owned_fixed_range_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_fixed_range_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
+        let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 3 {
             return Err(invalid("Fixed range declaration requires one row with path, column and valid_micros"));
         }
@@ -1162,10 +1162,10 @@ impl Service {
         self.owned_write_reply(call, vec![TxOp::OwnedDeclareFixedRange { relation, rule }]).await
     }
 
-    pub(crate) async fn declare_owned_capacity_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_capacity_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
+        let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
             return Err(invalid("Owned capacity declaration requires one row with column, prefix_bytes, cap and when"));
         }
@@ -1175,10 +1175,10 @@ impl Service {
     }
 
     /// A unique path takes `_id` and `column`; a search path also takes its `analyzer`.
-    pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &[u8], unique: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &Bytes, unique: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
+        let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != if unique { 2 } else { 3 } {
             return Err(invalid("Owned path declaration requires one row with _id, column and, for search, analyzer"));
         }
@@ -1201,10 +1201,10 @@ impl Service {
     }
 
     /// `rtdb.owned.DeclareVectorPath.v1`: a relation prefix, then one Arrow row of `_id`, `column`, `dimensions` and `recall`.
-    pub(crate) async fn declare_owned_vector_path_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn declare_owned_vector_path_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
+        let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 {
             return Err(invalid("Owned vector path declaration requires one row with _id, column, dimensions and recall"));
         }
@@ -1500,7 +1500,8 @@ impl Service {
         let scope = self.hosted_control_scope(call).await?;
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS.checked_sub(ranges.len())
             .ok_or_else(|| invalid("Hosted validation exceeds its condition limit"))?;
-        let (controls, _controls) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, true)?;
+        let control_frame = call.retain_request_bytes(envelope.clone());
+        let (controls, _controls) = self.decode_hosted_control_groups(call, &control_frame, controls, scope, &mut rows_left, true)?;
         let mut operations = Vec::new();
         let _facts = self.decode_owned_commit_groups(call, envelope, facts, &mut operations, &mut rows_left, CommitEffects::Facts)?;
         let _points = call.reserve(wire::mul(operations.len(), std::mem::size_of::<rtdb_node::AppliedOwnedPoint>())?)?;
@@ -1610,7 +1611,11 @@ impl Service {
         } else { (None, body) };
         let mut page = None;
         let mut packed = None;
-        let (facts, controls): (&[u8], &[u8]) = match input {
+        let control_envelope = match &input {
+            HostedDecisionInput::Inline(_) => call.retain_request_bytes(envelope.clone()),
+            HostedDecisionInput::Streamed { .. } => envelope.clone(),
+        };
+        let (facts, control_frame): (&[u8], Bytes) = match input {
             HostedDecisionInput::Inline(format) => {
                 let (length, body) = body.split_first_chunk::<4>()
                     .ok_or_else(|| invalid("Hosted commit has no fact group length"))?;
@@ -1628,18 +1633,18 @@ impl Service {
                         &[0, 0]
                     }
                 };
-                (facts, controls)
+                (facts, control_envelope.slice_ref(controls))
             }
             HostedDecisionInput::Streamed { packed: groups, controls } => {
                 if !body.is_empty() { return Err(invalid("Hosted decision prefix has trailing bytes")); }
                 packed = Some(groups);
-                (&[0, 0], controls)
+                (&[0, 0], controls.clone())
             }
         };
         let fact_groups = ordered_group_count(facts)?;
         let _framing = call.reserve((fact_groups + MAX_COMMIT_GROUPS) * 512)?;
         let facts = owned_groups(facts, false, true)?;
-        let controls = owned_groups(controls, true, false)?;
+        let controls = owned_groups(&control_frame, true, false)?;
         let fact_relations = facts.iter().map(|(relation, _)| relation)
             .chain(page.iter().map(import_page::ImportPage::relation))
             .chain(packed.iter().flat_map(packed_groups::PackedGroups::relations))
@@ -1658,7 +1663,7 @@ impl Service {
         let mut writes = vec![TxOp::OwnedDeadline { until: deadline, recheck_at_staging, journal_before }];
         writes.extend(slot.map(|slot| TxOp::OwnedClockSlot { slot }));
         writes.extend(conditions);
-        let (mut controls, _held) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, false)?;
+        let (mut controls, _held) = self.decode_hosted_control_groups(call, &control_frame, controls, scope, &mut rows_left, false)?;
         rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         if let Some(offer) = funded {
             let reading = offer.slot.reading;
@@ -1712,7 +1717,7 @@ impl Service {
             hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
             let mut alternative = Vec::new();
             let (controls, held) = self.decode_hosted_control_groups(
-                call, controls, scope, &mut rows_left, false,
+                call, &control_envelope, controls, scope, &mut rows_left, false,
             )?;
             if funded.is_some_and(|offer| !offer.admits_terminal(&controls)) {
                 return Err(invalid("Funded mutation refusal requires the original receipt"));
@@ -1734,7 +1739,7 @@ impl Service {
     }
 
     fn decode_hosted_control_groups(
-        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, scope: rtdb_types::PlacedAttemptScope,
+        &self, call: &Call, frame: &Bytes, groups: Vec<(OwnedRelation, &[u8])>, scope: rtdb_types::PlacedAttemptScope,
         rows_left: &mut usize, require_checks: bool,
     ) -> Result<(Vec<rtdb_tx::HostedControlWrite>, Vec<Arc<MemoryReservation>>), Status> {
         use rtdb_tx::HostedControlWrite;
@@ -1742,7 +1747,7 @@ impl Service {
         let mut held = Vec::with_capacity(groups.len());
         let mut controls = Vec::new();
         for (relation, arrow) in groups {
-            let batch = request_batch(call, arrow)?;
+            let batch = request_batch(call, frame.slice_ref(arrow))?;
             let rows = batch.batch().num_rows();
             let schema = batch.batch().schema_ref();
             let (id_column, expected_column, check_column) = owned_landing_wire::hosted_check_columns();
@@ -2400,7 +2405,7 @@ impl Service {
         work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
     }
 
-    pub(crate) async fn held_owned_point(&self, call: &Call, body: &[u8], time: PointTime, compact: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_point(&self, call: &Call, body: &Bytes, time: PointTime, compact: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -2409,7 +2414,7 @@ impl Service {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, id, valid, _identity) = selected_point_request(call, request, time, compact)?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, request, time, compact)?;
         if call.session.audience_source().is_some() {
             require_audience_point(&call.session, &relation, &id, held.audience_projection_work.is_none())?;
         }
@@ -2468,13 +2473,13 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), retained) })
     }
 
-    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned historical point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned historical point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Optional, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, request, PointTime::Optional, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
         let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, reply_format).await?;
@@ -2482,14 +2487,14 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned position point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let (mask, request) = split_position_mask(request)?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, request, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
         let cursor = held.snapshot.open_historical_position_point(&relation, &id, system, valid, mask).await.map_err(status)?;
         let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, reply_format).await?;
@@ -2497,7 +2502,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_root_cut_point_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_root_cut_point_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Root cut point has no hold"))?;
         let (history, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Root cut point has no system time"))?;
@@ -2511,7 +2516,7 @@ impl Service {
         let system_time = Timestamp(i64::from_be_bytes(*history));
         let publication = rtdb_types::TransactionKey { system_time, tx_id: rtdb_types::TxId(i64::from_be_bytes(*position)) };
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
+        let (relation, id, valid, _identity) = point_request(call, body, request, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Root cut point has no valid instant"))?;
         let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
         let reply = self.finish_owned_point(call, system_time, valid, &id, cursor, None, reply_format).await?;
@@ -2520,14 +2525,14 @@ impl Service {
     }
 
     fn path_touch_request(
-        &self, call: &Call, request: &[u8],
+        &self, call: &Call, envelope: &Bytes, request: &[u8],
     ) -> Result<(Timestamp, Timestamp, OwnedRelation, OwnedRelation, EntityId, Timestamp, Arc<MemoryReservation>), Status> {
         let (group, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned path touch has no group time"))?;
         let group = Timestamp(i64::from_be_bytes(*group));
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(|| invalid("Owned path touch has no preceding cut"))?);
         let (relation, request) = split_relation(request)?;
         let (path, arrow_bytes) = split_relation(request)?;
-        let batch = request_batch(call, arrow_bytes)?;
+        let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 2 || batch.num_rows() != 1 {
             return Err(invalid("Owned path touch requires one identity and valid instant"));
@@ -2538,7 +2543,7 @@ impl Service {
     }
 
     pub(crate) async fn held_world_version_action(
-        &self, call: &Call, body: &[u8],
+        &self, call: &Call, body: &Bytes,
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World version has no held handle"))?;
@@ -2546,7 +2551,7 @@ impl Service {
         let group = Timestamp(i64::from_be_bytes(*group));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = request_batch(call, arrow_bytes)?;
+        let batch = request_batch(call, call.retain_request_bytes(body.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 3 || batch.num_rows() != 1 {
             return Err(invalid("World version requires one typed identity and two system endpoints"));
@@ -2583,12 +2588,12 @@ impl Service {
     }
 
     pub(crate) async fn held_world_path_touch_action(
-        &self, call: &Call, body: &[u8], images: bool,
+        &self, call: &Call, body: &Bytes, images: bool,
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World path touch has no held handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, body, request)?;
         let [prior, accepted] = held.snapshot.path_touch(&relation, &path, &id, before, group, valid, images).await.map_err(status)?;
         let prior = self.world_point_reply(call, prior, valid, None)?;
         let accepted = self.world_point_reply(call, accepted, valid, None)?;
@@ -2600,13 +2605,13 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_path_touch_action(
-        &self, call: &Call, body: &[u8],
+        &self, call: &Call, body: &Bytes,
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned path touch has no held read handle"))?;
         let (position, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned path touch has no transaction position"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (_, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let (_, group, relation, path, id, valid, _identity) = self.path_touch_request(call, body, request)?;
         let publication = rtdb_types::TransactionKey { system_time: group, tx_id: rtdb_types::TxId(i64::from_be_bytes(*position)) };
         let columns = held.snapshot.path_touch_columns(&relation, &path, &id, publication, valid).await.map_err(status)?;
         let mut replies = Vec::with_capacity(2);
@@ -2620,13 +2625,13 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_valid_during_action(
-        &self, call: &Call, body: &[u8], mode: ValidHistoryMode,
+        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode,
     ) -> Result<ActionResult, Status> {
         self.held_owned_valid_during(call, body, mode, false).await
     }
 
     pub(crate) async fn held_owned_valid_during(
-        &self, call: &Call, body: &[u8], mode: ValidHistoryMode, compact: bool,
+        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, compact: bool,
     ) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
@@ -2645,7 +2650,7 @@ impl Service {
             (None, request)
         };
         let (relation, request) = split_relation(request)?;
-        let legacy = (!compact).then(|| request_batch(call, request)).transpose()?;
+        let legacy = (!compact).then(|| request_batch(call, call.retain_request_bytes(body.slice_ref(request)))).transpose()?;
         let (id, _identity, system, valid) = if compact {
             let (system, request) = selection_time(request)?;
             let (from, request) = selection_time(request)?;
@@ -2681,14 +2686,14 @@ impl Service {
     }
 
     pub(crate) async fn held_owned_identities_action(
-        &self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>,
+        &self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>,
     ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned identity page has no held read handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 4 || batch.num_rows() != 1 {
             return Err(invalid("Owned identity page requires one row with a cut, a bound, and a limit"));
@@ -2719,14 +2724,14 @@ impl Service {
     /// Identities current at the held system cut across all valid time,
     /// for a period table's bounded index build turns.
     pub(crate) async fn held_owned_identities_all_valid_action(
-        &self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>,
+        &self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>,
     ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned identity page has no held read handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 3 || batch.num_rows() != 1 {
             return Err(invalid("An all-valid identity page requires one row with a cut, a limit and a bound"));
@@ -2754,7 +2759,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_protected_coverage_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_protected_coverage_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         use base64::{Engine, engine::general_purpose::STANDARD};
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
@@ -2763,7 +2768,7 @@ impl Service {
             .ok_or_else(|| invalid("Protected carrier coverage has no held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 1 || batch.num_rows() != 1 {
             return Err(invalid("Protected carrier coverage needs one prefix"));
@@ -2783,19 +2788,19 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_row_carrier_exists_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_row_carrier_exists_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Protected row existence needs its held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let (relation, id, _, _identity) = point_request(call, body, request, PointTime::Default)?;
         let present = held.snapshot.protected_row_carrier_exists(&relation, &id, scope).await.map_err(status)?;
         Ok(ActionResult { body: wire::retain(vec![u8::from(present)], call.reserve(64)?) })
     }
 
-    pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_protected_carriers_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
@@ -2803,7 +2808,7 @@ impl Service {
             .ok_or_else(|| invalid("Protected carrier page has no held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 3 || batch.num_rows() != 1 {
             return Err(invalid("Protected carrier page requires a prefix, bound, and limit"));
@@ -2840,12 +2845,12 @@ impl Service {
     }
 
     fn owned_versions_request(
-        &self, call: &Call, request: &[u8],
+        &self, call: &Call, envelope: &Bytes, request: &[u8],
     ) -> Result<(OwnedRelation, EntityId, OwnedVersionRequest, Arc<MemoryReservation>), Status> {
         use rtdb_types::Interval;
 
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = request_batch(call, arrow_bytes)?;
+        let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 7 || batch.num_rows() != 1 {
             return Err(invalid("Owned versions requires one row with identity, system endpoints, and pagination fields"));
@@ -2870,14 +2875,14 @@ impl Service {
     }
 
     pub(crate) async fn held_world_parent_touch_images_action(
-        &self, call: &Call, body: &[u8], images: bool,
+        &self, call: &Call, body: &Bytes, images: bool,
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent touch has no held handle"))?;
         let (selected, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent touch has no selected publication"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let selected = Timestamp(i64::from_be_bytes(*selected));
-        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, body, request)?;
         let [prior, accepted] = held.snapshot.parent_touch_images_at(
             &relation, &path, &id, selected, before, group, valid, images,
         ).await.map_err(status)?;
@@ -2922,7 +2927,7 @@ impl Service {
     }
 
     pub(crate) async fn held_world_parent_versions_action(
-        &self, call: &Call, body: &[u8],
+        &self, call: &Call, body: &Bytes,
     ) -> Result<Vec<ActionResult>, Status> {
         use rtdb_types::Interval;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
@@ -2930,7 +2935,7 @@ impl Service {
         let (selected, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent versions have no selected publication"))?;
         let selected = Timestamp(i64::from_be_bytes(*selected));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, query, _identity) = self.owned_versions_request(call, request)?;
+        let (relation, id, query, _identity) = self.owned_versions_request(call, body, request)?;
         let (page, witness) = held.snapshot.parent_versions_at(&relation, &id, selected, query).await.map_err(status)?;
         let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
         let header_charge = call.reserve(64)?;
@@ -2952,7 +2957,7 @@ impl Service {
         Ok(results)
     }
 
-    pub(crate) async fn held_owned_versions_action(&self, call: &Call, body: &[u8]) -> Result<Vec<ActionResult>, Status> {
+    pub(crate) async fn held_owned_versions_action(&self, call: &Call, body: &Bytes) -> Result<Vec<ActionResult>, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
@@ -2963,7 +2968,7 @@ impl Service {
             if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
             return Err(status(error));
         }
-        let (relation, id, request, _identity) = self.owned_versions_request(call, request)?;
+        let (relation, id, request, _identity) = self.owned_versions_request(call, body, request)?;
         let page = held.snapshot.versions(&relation, &id, request).await.map_err(status)?;
         let present = held.snapshot.system_time();
         let _framing = call.reserve(wire::mul(page.versions.len() + 1, 512)?)?;
@@ -3071,7 +3076,7 @@ impl Service {
         self.owned_stream_reply(&schema, &response)
     }
 
-    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &Bytes, version: HeldRangeFormat, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let audience = call.session.audience_source().is_some();
         if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
@@ -3089,7 +3094,7 @@ impl Service {
             return Err(status(error));
         }
         let (relation, arrow) = split_relation(request)?;
-        let batch = decode_batch(call, arrow)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         let expected_fields = match version {
             HeldRangeFormat::Leading => 4,
             HeldRangeFormat::Full => 6,
@@ -3163,7 +3168,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &[u8], historical: bool, measured: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_count_action(&self, call: &Call, body: &Bytes, historical: bool, measured: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held count has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3173,7 +3178,7 @@ impl Service {
             return Err(status(error));
         }
         let (relation, arrow_bytes) = split_relation(request)?;
-        let batch = decode_batch(call, arrow_bytes)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow_bytes)))?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 4 + usize::from(historical) {
             return Err(invalid("Owned count requires one row with the fields for its action version"));
         }
@@ -3220,7 +3225,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &Bytes, order: WorldOrder, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3234,7 +3239,7 @@ impl Service {
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
         } else { (None, request) };
         let (relation, arrow) = split_relation(request)?;
-        let batch = decode_batch(call, arrow)?;
+        let batch = decode_batch(call, call.retain_request_bytes(body.slice_ref(arrow)))?;
         let count = matches!(order, WorldOrder::ParentCount | WorldOrder::ParentCountAt | WorldOrder::ParentMeasure);
         let fields = if count { 4 } else { 7 };
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != fields {
@@ -3676,7 +3681,7 @@ impl Service {
         Ok(())
     }
 
-    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
@@ -3701,7 +3706,7 @@ impl Service {
             if valid.is_some() { return Err(invalid("A staged search requires current validity")); }
             self.hosted_control_policy(call)?;
             let scope = self.hosted_control_scope(call).await?;
-            (Some(request_batch(call, ipc)?), Some(scope))
+            (Some(request_batch(call, call.retain_request_bytes(body.slice_ref(ipc)))?), Some(scope))
         };
         let prefix_len = body.len() - request.len();
         let rank = owned_rank_request(call, request)?;
@@ -3709,7 +3714,8 @@ impl Service {
         let overlay = match overlay {
             Some(shadows) => {
                 let analyzer = held.snapshot.search_analyzer(&rank.partitions).await.map_err(status)?;
-                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query).map_err(status)?)
+                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query, || held.snapshot.check())
+                    .map_err(status)?)
             }
             None => None,
         };
@@ -3737,7 +3743,9 @@ impl Service {
         Ok(reply)
     }
 
-    fn search_shadows(&self, rank: &OwnedRankRequest<'_>, input: &RecordBatch) -> Result<rtdb_node::TextShadows, Status> {
+    fn search_shadows<'a>(
+        &self, rank: &OwnedRankRequest<'_>, input: &'a RecordBatch,
+    ) -> Result<rtdb_node::TextShadows<'a>, Status> {
         if !rank.observe || !(1..=64).contains(&input.num_rows()) || input.num_columns() != 3 {
             return Err(invalid("Staged search requires bounded rows and original evidence"));
         }
@@ -3747,24 +3755,14 @@ impl Service {
         let (Some(partitions), Some(ids), Some(text)) = (partitions, ids, text) else {
             return Err(invalid("Invalid staged search overlay layout"));
         };
-        let mut shadows = rtdb_node::TextShadows::default();
-        for row in 0..input.num_rows() {
-            if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
-                || partitions.value(row) >= rank.partitions.len() as u64
-                || (rank.partitions[partitions.value(row) as usize].0.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
-            {
-                return Err(invalid("Invalid staged search identity"));
-            }
-            shadows.push(
-                partitions.value(row) as usize,
-                rtdb_types::EntityId::String(ids.value(row).to_owned()),
-                (!text.is_null(row)).then(|| text.value(row)),
-            );
-        }
-        Ok(shadows)
+        rtdb_node::TextShadows::try_new(partitions, ids, text, |partition, id| {
+            !id.is_empty() && rank.partitions.get(partition).is_some_and(|(relation, _)| {
+                !(relation.name().ends_with("_search") && id.starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
+            })
+        }).ok_or_else(|| invalid("Invalid staged search identity"))
     }
 
-    pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held nearest has no handle"))?;
@@ -3789,7 +3787,7 @@ impl Service {
             if valid.is_some() { return Err(invalid("A staged nearest read requires current validity")); }
             self.hosted_control_policy(call)?;
             let scope = self.hosted_control_scope(call).await?;
-            (Some(request_batch(call, ipc)?), Some(scope))
+            (Some(request_batch(call, call.retain_request_bytes(body.slice_ref(ipc)))?), Some(scope))
         };
         let nearest = owned_nearest_request(call, request)?;
         if overlay.is_some() && !nearest.observe {
@@ -3824,7 +3822,7 @@ impl Service {
     }
 
     /// Fuses a held text ranking and a held nearest ranking of the same relations at the held cut by reciprocal rank fusion.
-    pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held hybrid search has no handle"))?;
@@ -3839,7 +3837,7 @@ impl Service {
         let valid = i64::from_be_bytes(*valid);
         let valid = (valid != i64::MIN).then_some(Timestamp(valid));
         if let Some(valid) = valid { rtdb_types::Interval::at(valid).map_err(status)?; }
-        let hybrid = owned_hybrid_request(call, request, true)?;
+        let hybrid = owned_hybrid_request(call, body, request, true)?;
         let staged_scope = if hybrid.staged() {
             if valid.is_some() { return Err(invalid("A staged hybrid search requires current validity")); }
             self.hosted_control_policy(call)?;
@@ -3849,7 +3847,8 @@ impl Service {
         let text_overlay = match hybrid.text_overlay.as_ref().map(|input| self.search_shadows(rank, input.batch())).transpose()? {
             Some(shadows) => {
                 let analyzer = held.snapshot.search_analyzer(&rank.partitions).await.map_err(status)?;
-                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query).map_err(status)?)
+                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query, || held.snapshot.check())
+                    .map_err(status)?)
             }
             None => None,
         };
@@ -3882,7 +3881,7 @@ impl Service {
     }
 
     /// The world hybrid family: HybridHeldWorld (with staged overlays), HybridHeldWorldAt and HybridHeldWorldParentAt.
-    pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &Bytes, mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world hybrid handle"))?;
@@ -3904,7 +3903,7 @@ impl Service {
         let valid = Timestamp(i64::from_be_bytes(*valid));
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
-        let hybrid = owned_hybrid_request(call, request, matches!(mode, WorldHistoricalRead::Current))?;
+        let hybrid = owned_hybrid_request(call, body, request, matches!(mode, WorldHistoricalRead::Current))?;
         let staged_scope = if hybrid.staged() {
             if held.snapshot.clock_mode() != rtdb_types::WorldClockMode::Proposal || valid != held.snapshot.present() {
                 return Err(invalid("Staged world hybrid search requires live Proposal validity"));
@@ -4004,7 +4003,7 @@ impl Service {
 
     /// `NearestHeldWorld.v3`, `NearestHeldWorldAt.v3` and `NearestHeldWorldParentAt.v3`:
     /// the SearchHeldWorld prefixes followed by the NearestHeld.v4 frame.
-    pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &Bytes, mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
@@ -4041,7 +4040,7 @@ impl Service {
                 }
                 self.hosted_control_policy(call)?;
                 let scope = self.hosted_control_scope(call).await?;
-                (Some(request_batch(call, ipc)?), Some(scope), request)
+                (Some(request_batch(call, call.retain_request_bytes(body.slice_ref(ipc)))?), Some(scope), request)
             }
         } else {
             (None, None, request)
@@ -4082,7 +4081,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &Bytes, mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
@@ -4119,7 +4118,7 @@ impl Service {
                 }
                 self.hosted_control_policy(call)?;
                 let scope = self.hosted_control_scope(call).await?;
-                (Some(request_batch(call, ipc)?), Some(scope), request)
+                (Some(request_batch(call, call.retain_request_bytes(body.slice_ref(ipc)))?), Some(scope), request)
             }
         } else {
             (None, None, request)
@@ -4244,12 +4243,12 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn nominate_held_expiry_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn nominate_held_expiry_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry nomination needs the original held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let (relation, id, _, _identity) = point_request(call, body, request, PointTime::Default)?;
         let (nomination, created, expiry) = held.snapshot.nominate_expired_identity(&relation, &id, scope).await.map_err(status)?;
         let batch = RecordBatch::try_from_iter([
             ("nomination", Arc::new(StringArray::from(vec![nomination])) as ArrayRef),
@@ -4262,7 +4261,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn apply_held_expiry_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn apply_held_expiry_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
         self.hosted_control_policy(call)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Expiry apply needs the original held handle"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Expiry apply needs a deadline"))?;
@@ -4272,7 +4271,7 @@ impl Service {
         let (nomination, request) = rest.split_at_checked(length).ok_or_else(|| invalid("Expiry apply nomination is truncated"))?;
         let nomination = std::str::from_utf8(nomination).map_err(|_| invalid("Expiry nomination is not UTF-8"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, _, _identity) = point_request(call, request, PointTime::Default)?;
+        let (relation, id, _, _identity) = point_request(call, body, request, PointTime::Default)?;
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
@@ -4799,25 +4798,27 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, call.reserve(25)?) })
     }
 
-    pub(crate) async fn held_world_point_at(&self, call: &Call, body: &[u8], parent: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_world_point_at(&self, call: &Call, envelope: &Bytes, parent: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
-        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
+        let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
-        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
+        let frozen = held.snapshot.ancestor().is_some_and(|(_, inherited)|
+            !held.snapshot.clock_mode().is_writable() || system <= inherited);
+        let original_scope = if (parent || frozen) && relation.name() == "fact_unit_column_payloads" {
+            if !self.supports_hosted_upload(call) { return Err(unsupported()); }
+            Some(self.hosted_control_scope(call).await?)
+        } else {
+            None
+        };
         let point = if parent {
-            let original_scope = if relation.name() == "fact_unit_column_payloads" {
-                if !self.supports_hosted_upload(call) { return Err(unsupported()); }
-                Some(self.hosted_control_scope(call).await?)
-            } else {
-                None
-            };
             held.snapshot.parent_point_at(&relation, &id, valid, system, original_scope).await
         } else {
-            held.snapshot.accepted_point(&relation, &id, valid, system).await
+            held.snapshot.accepted_point(&relation, &id, valid, system, original_scope).await
         }.map_err(status)?;
         if point.present != system || point.witness.is_some() || point.until.is_some() {
             return Err(history_invalid());
@@ -4827,12 +4828,12 @@ impl Service {
         Ok(response)
     }
 
-    pub(crate) async fn held_world_point(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_world_point(&self, call: &Call, envelope: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
-        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
+        let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
+        let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
@@ -4855,11 +4856,11 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, body: &[u8], selection: WorldHistoricalRead) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_valid_during_action(&self, call: &Call, envelope: &Bytes, selection: WorldHistoricalRead) -> Result<ActionResult, Status> {
         use rtdb_types::Interval;
 
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
-        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
+        let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world history has no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
         let (system, body) = if !matches!(selection, WorldHistoricalRead::Current) {
@@ -4873,7 +4874,7 @@ impl Service {
             _ => return Err(invalid("Invalid owned world history source")),
         };
         let (relation, arrow_bytes) = split_relation(body)?;
-        let batch = request_batch(call, arrow_bytes)?;
+        let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow_bytes)))?;
         let batch = batch.batch();
         if batch.num_columns() != 3 || batch.num_rows() != 1 {
             return Err(invalid("Owned world history requires a typed identity and two valid endpoints"));
@@ -4952,10 +4953,10 @@ impl Service {
     }
 
     pub(crate) async fn held_world_identities_action(
-        &self, call: &Call, body: &[u8], mode: WorldIdentityRead, reply_format: OwnedReplyFormat<'_>,
+        &self, call: &Call, envelope: &Bytes, mode: WorldIdentityRead, reply_format: OwnedReplyFormat<'_>,
     ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
-        let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
+        let (handle, body) = envelope.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
         held.snapshot.check().map_err(status)?;
@@ -4972,7 +4973,7 @@ impl Service {
             (Some(Timestamp(i64::from_be_bytes(*system))), rest)
         } else { (None, body) };
         let (relation, arrow_bytes) = split_relation(body)?;
-        let request = decode_batch(call, arrow_bytes)?;
+        let request = decode_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow_bytes)))?;
         let request = request.batch();
         if request.num_columns() != 3 || request.num_rows() != 1 {
             return Err(invalid("Owned world identities require one valid instant, exclusive bound, and limit"));
@@ -5067,10 +5068,10 @@ impl Service {
         }
     }
 
-    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn publish_held_world_retention_action(&self, call: &Call, envelope: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        let (authority, body) = Self::installed_authority(body)?;
+        let (authority, body) = Self::installed_authority(envelope)?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
         let (publication, body) = split_world_publication(body)?;
         let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
@@ -5095,7 +5096,8 @@ impl Service {
         let groups = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 3;
-        let (mut controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+        let control_frame = call.retain_request_bytes(envelope.clone());
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, &control_frame, groups, scope, &mut rows_left, true)?;
         rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         if controls.iter().any(|control| !control.is_check()) {
             return Err(invalid("Retaining a Held publication requires checked hosted ownership"));
@@ -5250,6 +5252,7 @@ impl Service {
         let mut root_groups = 0;
         let mut count_charges = Vec::new();
         let mut refusal_charges = Vec::new();
+        let control_frame = call.retain_request_bytes(envelope.clone());
         let groups = if publish_root {
             if (previous.is_some() && !authored_replacement)
                 || !(matches!(requested, rtdb_node::WorldClockRequest::Retained) || proposed_publication || proposal_hold || held_publication)
@@ -5282,7 +5285,7 @@ impl Service {
                     .ok_or_else(|| invalid("Incomplete Root cut refusal"))?;
                 let refusal = owned_groups(refusal, true, false)?;
                 hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
-                let (refusal, charges) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;
+                let (refusal, charges) = self.decode_hosted_control_groups(call, &control_frame, refusal, scope, &mut rows_left, false)?;
                 if refusal.is_empty() { return Err(invalid("Missing Root cut refusal receipt")); }
                 root.refusal = refusal;
                 refusal_charges = charges;
@@ -5342,7 +5345,7 @@ impl Service {
             return Err(invalid("Fork exceeds its grouped effect limit"));
         }
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
-        let (mut controls, _charges) = self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, !publish_root)?;
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, &control_frame, groups, scope, &mut rows_left, !publish_root)?;
         rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         if publish_root && (root.publication.is_none() || proposed_publication || held_publication)
             && controls.iter().all(rtdb_tx::HostedControlWrite::is_check) {
@@ -5480,7 +5483,7 @@ impl Service {
                     let (overlay, rest) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)
                         .ok_or_else(|| invalid("Incomplete world overlay"))?;
                     let mut writes = Vec::new();
-                    self.decode_world_writes(call, owned_groups(overlay, true, false)?,
+                    self.decode_world_writes(call, envelope, owned_groups(overlay, true, false)?,
                         mode == rtdb_types::WorldClockMode::Proposal, &mut rows_left, &mut writes, &mut reservations)?;
                     if writes.is_empty() { return Err(invalid("The world overlay has no writes")); }
                     for write in writes.iter().filter(|write| write.create_only) {
@@ -5647,7 +5650,8 @@ impl Service {
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
         let family_fence = controls.iter().any(|(relation, _)| relation.name() == rtdb_types::ASSERTION_FAMILY_FENCES);
-        let (mut controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left,
+        let control_frame = call.retain_request_bytes(envelope.clone());
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, &control_frame, controls, scope, &mut rows_left,
             !family_fence && !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
         rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         if proposal_family_retirement && !controls.iter().any(rtdb_tx::HostedControlWrite::is_assertion_family_marker)
@@ -5657,7 +5661,7 @@ impl Service {
         }
         let _refusal_charge = if !refusal.is_empty() {
             hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;
-            let (refusal, charge) = self.decode_hosted_control_groups(call, refusal, scope, &mut rows_left, false)?;
+            let (refusal, charge) = self.decode_hosted_control_groups(call, &control_frame, refusal, scope, &mut rows_left, false)?;
             if proposal_land && refusal.len() != 2 {
                 return Err(invalid("A landing refusal requires its original receipt and proof"));
             }
@@ -5720,14 +5724,14 @@ impl Service {
     }
 
     fn decode_world_writes(
-        &self, call: &Call, groups: Vec<(OwnedRelation, &[u8])>, proposal: bool, rows_left: &mut usize,
+        &self, call: &Call, envelope: &Bytes, groups: Vec<(OwnedRelation, &[u8])>, proposal: bool, rows_left: &mut usize,
         writes: &mut Vec<rtdb_node::OwnedWorldWrite>, reservations: &mut Vec<Arc<MemoryReservation>>,
     ) -> Result<(), Status> {
         use rtdb_node::OwnedWorldWrite;
         use rtdb_types::{Interval, WorldShadow};
 
         for (relation, arrow) in groups {
-            let batch = request_batch(call, arrow)?;
+            let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow)))?;
             let batch = batch.batch();
             let schema = batch.schema_ref();
             let field = |name| schema.column_with_name(name).map(|(_, field)| field.data_type());
@@ -5791,9 +5795,9 @@ impl Service {
         Ok(())
     }
 
-    pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn read_owned_action(&self, call: &Call, body: &Bytes, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
-        let (relation, id, _, _identity) = point_request(call, body, PointTime::Default)?;
+        let (relation, id, _, _identity) = point_request(call, body, body, PointTime::Default)?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
@@ -6033,10 +6037,10 @@ fn selection_identity(call: &Call, request: &[u8]) -> Result<(EntityId, Arc<Memo
 }
 
 fn selected_point_request(
-    call: &Call, body: &[u8], time: PointTime, compact: bool,
+    call: &Call, envelope: &Bytes, body: &[u8], time: PointTime, compact: bool,
 ) -> Result<(OwnedRelation, EntityId, Option<Timestamp>, Arc<MemoryReservation>), Status> {
     if !compact {
-        return point_request(call, body, time);
+        return point_request(call, envelope, body, time);
     }
     let (relation, request) = split_relation(body)?;
     let (valid, request) = selection_time(request)?;
@@ -6045,10 +6049,10 @@ fn selected_point_request(
 }
 
 fn point_request(
-    call: &Call, body: &[u8], time: PointTime,
+    call: &Call, envelope: &Bytes, body: &[u8], time: PointTime,
 ) -> Result<(OwnedRelation, EntityId, Option<Timestamp>, Arc<MemoryReservation>), Status> {
     let (relation, arrow) = split_relation(body)?;
-    let batch = request_batch(call, arrow)?;
+    let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow)))?;
     let batch = batch.batch();
     let expected_columns = if matches!(time, PointTime::Default) { 1 } else { 2 };
     if batch.num_columns() != expected_columns || batch.num_rows() != 1 {

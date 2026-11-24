@@ -167,12 +167,16 @@ The existing family envelope actions and the derived-stage response hold bind th
 The retained outcome keeps its existing Root unit seal, and recall requires the original Root unit fence and the exact live family member.
 The installed Root line, family vault and receipt must remain reachable.
 The admitted output route covers a registered result with one exact landed Root point as its protected input.
-On a direct held Original parent, the installed live writer can select an earlier exact Root publication and read its opaque protected carrier through the existing parent point route.
+On a held Original parent, the installed live writer can select an earlier exact Root publication and read its opaque protected carrier through the existing parent point route.
 The earlier selection uses the held parent predecessor and requires matching historical declarations and intact purge coverage.
 For a protected row, the same selected publication scopes both the carrier and the protected row journal.
 The two points must agree on the winning publication, and the journal supplies the assertion ordinal for the original family check.
 The application keeps the original unit and family admission through response-part release.
 A shared field uses its same-cut Root winner selector and carrier, with its current original unit fence.
+A nested hold also certifies the frozen ancestry edge and relation coverage before an earlier Root parent point.
+At an exact frozen Held publication, the predecessor certifies the same transaction and accepted reading for the opaque carrier and protected journal.
+The returned positive overlay points identify the physical authoring world. The application must verify that the carrier and journal name the same writer and publication and keep the original family and response admission.
+A frozen overlay tombstone without positioned winner evidence refuses.
 A successor archive copy needs a durable route authenticated to the Original deployment, incarnation, ordered journal position and current family authority.
 A frozen capture proves the historical assertion and bytes. Recall through a new deployment also needs access to the Original ordered marker and release owner through any source retirement.
 Successor replay of a family carrier refuses until that route is available.

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
+use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, UInt32Array, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
 use arrow_buffer::{Buffer, MutableBuffer};
 use bytes::Bytes;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
@@ -13,7 +13,7 @@ use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
 
 use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
-    page_tree::{Child, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
+    page_tree::{Child, DecodedChild, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
 
 pub(super) const POSTING: u8 = 0;
 pub(super) const TERM: u8 = 1;
@@ -60,17 +60,35 @@ pub(super) fn event_key(iid: &[u8], row: u32) -> Vec<u8> {
     key
 }
 
-fn start_rows(table: Table, array: &StructArray, start: usize, len: usize) -> Result<StructArray> {
-    let item = item_of(&table.fields()[0]);
+fn row_runs_for_page(array: &StructArray, start: usize, len: usize) -> Result<StructArray> {
     let column = array.column(0).as_list::<i64>();
-    let values = (0..column.len()).map(|row| column.value(row).slice(start, len)).collect::<Vec<_>>();
-    let first = column.values().as_primitive::<UInt32Type>();
-    let counts = vec![len; values.len()];
-    let rows = arrow_array::UInt32Array::from_iter_values(values.iter().flat_map(|value| {
-        value.as_primitive::<UInt32Type>().values().iter().copied()
-    }));
-    if rows.len() > first.len() { return Err(fault("Search row allocation exceeds its source")); }
-    table.array(vec![list(Arc::new(rows), counts, item)?])
+    let offsets = column.value_offsets();
+    let field_starts = &offsets[..column.len()];
+    let Some(&last_field) = field_starts.last() else { return Ok(array.clone()); };
+    let end = start.checked_add(len).ok_or_else(|| fault("Search row range exceeds its source"))?;
+    if offsets.windows(2).any(|field| end > (field[1] - field[0]) as usize) {
+        return Err(fault("Search row range exceeds its source"));
+    }
+
+    let values = column.values().as_primitive::<UInt32Type>();
+    let count = len.checked_mul(column.len()).filter(|&count| count <= values.len())
+        .ok_or_else(|| fault("Search row allocation exceeds its source"))?;
+    let span = offsets[0] as usize + start..last_field as usize + end;
+    let rows = if span.len() == count {
+        if start == 0 && span.end == offsets[column.len()] as usize {
+            return Ok(array.clone());
+        }
+        values.slice(span.start, count)
+    } else {
+        let mut rows = Vec::with_capacity(count);
+        for &offset in field_starts {
+            let offset = offset as usize;
+            rows.extend_from_slice(&values.values()[offset + start..offset + end]);
+        }
+        UInt32Array::from(rows)
+    };
+    let item = item_of(&Table::RowRuns.fields()[0]);
+    Table::RowRuns.array(vec![list(Arc::new(rows), std::iter::repeat_n(len, column.len()), item)?])
 }
 
 fn text_revision_rows(columns: &[FixedSizeBinaryArray], start: usize, len: usize) -> Result<StructArray> {
@@ -187,7 +205,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
         let end = (start + EVENT_ROWS).min(events.len());
         let start_row = Table::Pages.array(vec![Arc::new(arrow_array::UInt32Array::from(vec![start as u32]))])?;
         let mut fields = vec![(Table::Events, events.slice(start, end - start)), (Table::Pages, start_row),
-            (Table::RowRuns, start_rows(Table::RowRuns, &row_runs, start, end - start)?)];
+            (Table::RowRuns, row_runs_for_page(&row_runs, start, end - start)?)];
         if let Some(positions) = &positions {
             let (mut members, mut pages, mut local_rows) = (Vec::new(), Vec::new(), Vec::new());
             for row in start as u32..end as u32 {
@@ -421,7 +439,7 @@ pub(crate) struct TreeFile {
     reader: TreeReader,
     root: RecordBatch,
     directories: BTreeMap<u8, DirectoryRef>,
-    routes: BTreeMap<u8, Vec<Child>>,
+    routes: BTreeMap<u8, Vec<DecodedChild>>,
     format: i32,
 }
 
@@ -676,8 +694,8 @@ impl TreeFile {
         let ranges: Vec<_> = iids.iter().map(|iid| (event_key(&iid.0, 0), event_key(&iid.0, u32::MAX))).collect();
         let pages = match self.routes.get(&VISIBILITY) {
             Some(children) => children.iter().filter(|child| {
-                let index = ranges.partition_point(|(_, upper)| upper < &child.lower);
-                ranges.get(index).is_some_and(|(lower, _)| lower <= &child.upper)
+                let index = ranges.partition_point(|(_, upper)| upper.as_slice() < child.lower.as_slice());
+                ranges.get(index).is_some_and(|(lower, _)| lower.as_slice() <= child.upper.as_slice())
             }).map(|child| child.page).collect(),
             None => self.reader.covering(self.directories[&VISIBILITY], &ranges).await?,
         };
@@ -789,7 +807,7 @@ impl TreeFile {
     }
 }
 
-fn direct_reference(children: &[Child], key: &[u8]) -> Option<PageRef> {
+fn direct_reference(children: &[DecodedChild], key: &[u8]) -> Option<PageRef> {
     let index = children.partition_point(|child| child.upper.as_slice() < key);
     children.get(index).filter(|child| child.lower.as_slice() <= key).map(|child| child.page)
 }
@@ -810,6 +828,61 @@ mod tests {
     use rtdb_text::{Query, Scorer};
     fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Interval, TemporalBounds, Timestamp};
+
+    #[test]
+    fn row_run_pages_share_contiguous_buffers_and_preserve_ipc_bytes() -> Result<()> {
+        use super::super::{NO_DOC, NULL_DOC};
+
+        let values = UInt32Array::from(vec![99, 80, 10, NO_DOC, 12, 20, NULL_DOC, 22, 23, 90, 99]);
+        let source = |lengths| {
+            let item = item_of(&Table::RowRuns.fields()[0]);
+            Table::RowRuns.array(vec![list(Arc::new(values.slice(1, 9)), lengths, item)?])
+        };
+        let uneven = source([1, 3, 4, 1])?;
+        let even = source([1, 3, 3, 2])?;
+        let cases = [
+            (uneven.slice(1, 1), 1, 2, Some(2), false),
+            (uneven.slice(1, 1), 0, 3, Some(1), true),
+            (even.slice(1, 2), 0, 3, Some(1), true),
+            (uneven.slice(1, 2), 0, 3, Some(1), false),
+            (uneven.slice(1, 2), 1, 2, None, false),
+        ];
+        let encode = |row_runs| -> Result<(PageRef, Vec<u8>)> {
+            let mut bytes = Vec::new();
+            let mut writer = Writer::new(&mut bytes, PACKED_FORMAT_VERSION)?;
+            let page = writer.page([(Table::RowRuns, row_runs)])?;
+            writer.finish()?;
+            Ok((page, bytes))
+        };
+        for (input, start, len, shared_at, shares_list) in cases {
+            let page = row_runs_for_page(&input, start, len)?;
+            let input_list = input.column(0).as_list::<i64>();
+            let page_list = page.column(0).as_list::<i64>();
+            assert_eq!(Arc::ptr_eq(input.column(0), page.column(0)), shares_list);
+            let first = page_list.value_offsets()[0] as usize;
+            let child = page_list.values().as_primitive::<UInt32Type>().values();
+            let source_values = input_list.values().as_primitive::<UInt32Type>().values();
+            if let Some(offset) = shared_at {
+                assert_eq!(child[first..].as_ptr(), source_values[offset..].as_ptr());
+            } else {
+                assert_ne!(child.as_ptr(), source_values[2..].as_ptr());
+                assert_eq!(child.len(), len * input_list.len());
+            }
+
+            let mut copied = Vec::new();
+            for field in 0..input_list.len() {
+                let child = input_list.value(field);
+                let child = child.as_primitive::<UInt32Type>().values();
+                copied.extend_from_slice(&child[start..start + len]);
+            }
+            let item = item_of(&Table::RowRuns.fields()[0]);
+            let reference = Table::RowRuns.array(vec![list(Arc::new(UInt32Array::from(copied)),
+                std::iter::repeat_n(len, input_list.len()), item)?])?;
+            assert_eq!(encode(page)?, encode(reference)?);
+        }
+        assert!(row_runs_for_page(&uneven.slice(1, 2), 1, 3).is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn root_routes_by_term_and_iid_and_preserves_canonical_scores() {

@@ -155,7 +155,7 @@ impl Call {
     pub(crate) fn request_reservation(&self) -> Arc<MemoryReservation> {
         Arc::clone(&self._reservation)
     }
-    pub(crate) fn retain_request(&self, bytes: impl Into<Bytes>) -> Bytes {
+    pub(crate) fn retain_request_bytes(&self, bytes: impl Into<Bytes>) -> Bytes {
         wire::retain(bytes, self.request_reservation())
     }
     pub fn close_session(&self) {

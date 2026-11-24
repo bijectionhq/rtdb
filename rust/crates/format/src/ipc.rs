@@ -630,7 +630,17 @@ impl OwnedStream {
     pub fn read(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let bound = stream_bound(bytes, true, arrow_descriptors)?;
         let reservation = memory.reserve(bound)?;
-        let reader = ArrowStream::from_reader(bytes, None)?;
+        Self::from_stream(ArrowStream::from_reader(bytes, None)?, reservation)
+    }
+
+    /// Requires a complete IPC stream whose input bytes own their allocation charge.
+    pub fn read_bytes(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bound = stream_bound(&bytes, true, arrow_descriptors)?;
+        let reservation = memory.reserve(bound)?;
+        Self::from_stream(ArrowStream::from_bytes(bytes, None)?, reservation)
+    }
+
+    fn from_stream<R: Read>(reader: ArrowStream<R>, reservation: Arc<MemoryReservation>) -> Result<Self> {
         let schema = reader.schema();
         let pages = reader.map(|page| OwnedBatch::with_reservation(page?, Arc::clone(&reservation))).collect::<Result<_>>()?;
         Ok(Self { schema, pages, _reservation: reservation })
@@ -1234,6 +1244,57 @@ pub fn write_arrow_stream(schema: &Schema, pages: &[RecordBatch], options: IpcWr
     let mut bytes = writer.into_inner().map_err(invalid)?;
     patch_schema_frame(&mut bytes, &decimal_schema)?;
     Ok(bytes)
+}
+
+/// Writes one null-free, dictionary-free batch as a native Arrow V5 stream with 64-byte alignment.
+/// Supply node lengths in field traversal order and raw buffers in IPC order, including empty validity slots.
+/// The sink can contain an incomplete stream on error and the caller owns flushing.
+pub fn write_uncompressed_stream_from_buffers(
+    mut output: impl Write, schema: &Schema, rows: usize, node_lengths: &[usize], buffers: &[&[u8]],
+) -> std::result::Result<(), ArrowError> {
+    const ALIGNMENT: usize = 64;
+    const PADDING: [u8; ALIGNMENT] = [0; ALIGNMENT];
+    let length_error = || ArrowError::InvalidArgumentError("Arrow IPC length exceeds the format".into());
+    let ipc_length = |length: usize| i64::try_from(length).map_err(|_| length_error());
+    let options = IpcWriteOptions::try_new(ALIGNMENT, false, arrow_ipc::MetadataVersion::V5)?;
+    let nodes = node_lengths.iter().map(|&len| Ok(arrow_ipc::FieldNode::new(ipc_length(len)?, 0)))
+        .collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+    let mut body_length = 0usize;
+    let descriptors = buffers.iter().map(|buffer| {
+        let descriptor = arrow_ipc::Buffer::new(ipc_length(body_length)?, ipc_length(buffer.len())?);
+        body_length = body_length.checked_add(buffer.len().next_multiple_of(ALIGNMENT)).ok_or_else(length_error)?;
+        Ok(descriptor)
+    }).collect::<std::result::Result<Vec<_>, ArrowError>>()?;
+
+    // Immutable-object retries require the FlatBuffer bytes produced by Arrow's native StreamWriter.
+    let mut builder = flatbuffers::FlatBufferBuilder::new();
+    let descriptors = builder.create_vector(&descriptors);
+    let nodes = builder.create_vector(&nodes);
+    let mut batch = arrow_ipc::RecordBatchBuilder::new(&mut builder);
+    batch.add_length(ipc_length(rows)?);
+    batch.add_nodes(nodes);
+    batch.add_buffers(descriptors);
+    let batch = batch.finish();
+    let mut message = arrow_ipc::MessageBuilder::new(&mut builder);
+    message.add_version(arrow_ipc::MetadataVersion::V5);
+    message.add_header_type(arrow_ipc::MessageHeader::RecordBatch);
+    message.add_bodyLength(ipc_length(body_length)?);
+    message.add_header(batch.as_union_value());
+    let message = message.finish();
+    builder.finish(message, None);
+
+    let schema = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        schema, &mut DictionaryTracker::new(false), &options,
+    );
+    write_message(&mut output, schema, &options)?;
+    let batch_metadata = EncodedData { ipc_message: builder.finished_data().to_vec(), arrow_data: Vec::new() };
+    write_message(&mut output, batch_metadata, &options)?;
+    for buffer in buffers {
+        output.write_all(buffer)?;
+        output.write_all(&PADDING[..buffer.len().next_multiple_of(ALIGNMENT) - buffer.len()])?;
+    }
+    output.write_all(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0])?;
+    Ok(())
 }
 
 /// Writes pages without buffering the complete stream, with metadata in the reference's Java layout; the sink owns and enforces its allocation bound.

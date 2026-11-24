@@ -171,7 +171,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn parent_basis(&self) -> TransactionKey;
     fn ranked_search<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp, staged: Option<rtdb_node::TextShadows>,
+        valid: Timestamp, staged: Option<rtdb_node::TextShadows<'a>>,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
     fn ranked_search_at<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
@@ -294,7 +294,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<(TransactionKey, Timestamp)>>;
     fn accepted_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
-        system: Timestamp,
+        system: Timestamp, original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn read_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,

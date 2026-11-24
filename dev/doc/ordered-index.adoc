@@ -49,12 +49,14 @@ It emits both retractions and insertions when a key or interval moves.
 Payload-only changes with the same projected valid-time spans share the previous root.
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
-The projector selects plain scalar keys from the source Arrow columns.
+The projector selects plain scalar keys from the source Arrow columns into compact, index-owned batches.
 A governed put compares the document identity with the complete borrowed event identity.
 A world shadow uses the logical null state of its field marker to identify a local tombstone.
 A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
 Seeks compare cells in the leaf's Arrow buffers.
-A rewrite interleaves surviving and edited rows with matching key layouts directly into the new buffers.
+A rewrite gathers surviving and edited key rows in tree order, reconciling plain and dense-union columns by key kind.
+Contiguous selections may share compact backing buffers already owned by the index.
+Each rebuilt slot uses the kinds present in the selected rows, with dense-union offsets assigned in selection order.
 Readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
 Private in-memory stores publish Arrow references by default.
 Hosted Multi nodes using `--ecs-cluster` and runtime-installed journal routes (`--installed-cell`) also publish Arrow references by default.

@@ -27,6 +27,8 @@
 -- A landed derivative enters the corpus only after the held payload carrier and protected row journal identify its accepted Root member and the original vault confirms its registered physical selector.
 -- The bounded Flight custody inventory retains the physical selector and the member's journal position.
 -- Shadow text comes from the selected Arrow field when its presence marker names that field.
+-- Staged Flight shadows borrow text from the admitted Arrow batch through analysis.
+-- A staged null text cell shadows its identity in the selected partition without contributing a document.
 -- Held corpus accounting uses the complete identity's typed payload size and the fixed allowance for its retained entry.
 -- A declared optional text column with only null or absent values contributes an empty corpus.
 -- Owned runs carry their full typed identity.
@@ -467,6 +469,8 @@ contract SearchFileLayout {
         -- A term directory records short rank summaries inline and refers to rank pages for larger postings.
         -- Each rank branch bounds the scores of its descendant windows and may prove the first identity at its exact maximum.
         -- Each directory edge authenticates its child byte range.
+        -- Decoded child fences, including inline routes, share the Arrow buffers that hold them and retain any backing reservation.
+        -- Ordinal traversal releases its references to a directory's fence buffers after selecting that directory's children.
         -- A negative discovery synopsis excludes term nominations; IID visibility can still read the same file.
         -- Per-storage cache entries hold authenticated immutable pages and share concurrent reads.
         -- Readers with prepaid cache allocations hold search range leases within those allocations.
@@ -483,6 +487,7 @@ contract SearchFileLayout {
     @invariant OneDocPerRun
         -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
         -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
+        -- Each event page in formats 14 and later records these entries in the file's column order, with each column's entries aligned to the page's events.
         -- A document's rectangles may merge when they have the same system-time interval and adjacent valid-time intervals.
         -- Each rectangle retains the originating event's system-from for cuts by events outside its file.
 

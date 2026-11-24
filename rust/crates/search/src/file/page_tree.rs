@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::{Arc, Weak};
 
-use arrow_array::{Array, ArrayRef, RecordBatch, StructArray, UInt8Array, UInt32Array, UInt64Array,
+use arrow_array::{Array, ArrayRef, BinaryArray, RecordBatch, StructArray, UInt8Array, UInt32Array, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}, cast::AsArray, types::{UInt8Type, UInt32Type, UInt64Type}};
 use arrow_buffer::Buffer;
 use arrow_ipc::{MetadataVersion, reader::FileDecoder};
@@ -86,6 +86,24 @@ pub(super) struct Child {
     pub page: PageRef,
 }
 
+pub(super) struct DecodedChild {
+    pub lower: Buffer,
+    pub upper: Buffer,
+    pub page: PageRef,
+}
+
+impl DecodedChild {
+    fn new(lower: &BinaryArray, upper: &BinaryArray, row: usize, page: PageRef) -> Self {
+        fn fence(column: &BinaryArray, row: usize) -> Buffer {
+            let offsets = column.value_offsets();
+            let start = offsets[row] as usize;
+            column.values().slice_with_length(start, offsets[row + 1] as usize - start)
+        }
+
+        Self { lower: fence(lower, row), upper: fence(upper, row), page }
+    }
+}
+
 pub(super) fn inline_routes(routes: &[(u8, Child)]) -> Result<StructArray> {
     let mut lower = BinaryBuilder::new();
     let mut upper = BinaryBuilder::new();
@@ -99,13 +117,13 @@ pub(super) fn inline_routes(routes: &[(u8, Child)]) -> Result<StructArray> {
     Table::Routes.array(columns)
 }
 
-pub(super) fn read_inline_routes(root: &RecordBatch, directories: &BTreeMap<u8, DirectoryRef>) -> Result<BTreeMap<u8, Vec<Child>>> {
+pub(super) fn read_inline_routes(root: &RecordBatch, directories: &BTreeMap<u8, DirectoryRef>) -> Result<BTreeMap<u8, Vec<DecodedChild>>> {
     let routes = table(root, Table::Routes);
     if routes.len() > 48 || routes.columns().iter().any(|column| column.null_count() != 0) {
         return Err(corrupt("Search root has an invalid inline directory"));
     }
     let (kinds, lower, upper) = (routes.column(0).as_primitive::<UInt8Type>(), routes.column(1).as_binary::<i32>(), routes.column(2).as_binary::<i32>());
-    let mut by_kind = BTreeMap::<u8, Vec<Child>>::new();
+    let mut by_kind = BTreeMap::<u8, Vec<DecodedChild>>::new();
     for row in 0..routes.len() {
         let kind = kinds.value(row);
         let page = locator_at(&routes, 3, row)?;
@@ -114,7 +132,7 @@ pub(super) fn read_inline_routes(root: &RecordBatch, directories: &BTreeMap<u8, 
             || lower.value(row) > upper.value(row) || children.last().is_some_and(|child| child.upper.as_slice() >= lower.value(row)) {
             return Err(corrupt("Search root has unordered inline directory children"));
         }
-        children.push(Child { lower: lower.value(row).to_vec(), upper: upper.value(row).to_vec(), page });
+        children.push(DecodedChild::new(lower, upper, row, page));
     }
     Ok(by_kind)
 }
@@ -390,26 +408,26 @@ impl TreeReader {
         Ok(result)
     }
 
-    async fn children(&self, parent: PageRef) -> Result<Vec<Child>> {
+    async fn children(&self, parent: PageRef) -> Result<Vec<DecodedChild>> {
         let page = self.page(parent, PageKind::Directory).await?;
         Self::decode_children(parent, &page)
     }
 
-    fn decode_children(parent: PageRef, page: &RecordBatch) -> Result<Vec<Child>> {
-        let children = table(&page, Table::Directory);
+    fn decode_children(parent: PageRef, page: &RecordBatch) -> Result<Vec<DecodedChild>> {
+        let children = table(page, Table::Directory);
         if children.len() > FANOUT || children.columns().iter().any(|column| column.null_count() != 0) {
             return Err(corrupt("Search directory page is invalid"));
         }
         let lower = children.column(0).as_binary::<i32>();
         let upper = children.column(1).as_binary::<i32>();
-        let mut decoded: Vec<Child> = Vec::with_capacity(children.len());
+        let mut decoded: Vec<DecodedChild> = Vec::with_capacity(children.len());
         for row in 0..children.len() {
             let page = locator_at(&children, 2, row)?;
             let previous = decoded.last().is_some_and(|child| child.upper.as_slice() >= lower.value(row));
             if previous || lower.value(row) > upper.value(row) || page.range()?.end > parent.offset {
                 return Err(corrupt("Search directory child is out of order"));
             }
-            decoded.push(Child { lower: lower.value(row).to_vec(), upper: upper.value(row).to_vec(), page });
+            decoded.push(DecodedChild::new(lower, upper, row, page));
         }
         Ok(decoded)
     }
@@ -450,18 +468,18 @@ impl TreeReader {
         let mut found = Vec::with_capacity(keys.len());
         let mut level = vec![(directory.page, 0..keys.len())];
         for _ in 0..directory.height {
-            let groups = futures::stream::iter(level).map(|(page, rows)| async move {
-                Ok::<_, rtdb_types::Anomaly>((self.children(page).await?, rows))
-            }).buffered(8).try_collect::<Vec<_>>().await?;
-            level = Vec::new();
-            for (children, rows) in groups {
+            let keys = &keys;
+            level = futures::stream::iter(level).map(|(page, rows)| async move {
+                let children = self.children(page).await?;
                 let selected = &keys[rows.clone()];
+                let mut following = Vec::new();
                 for child in children {
                     let first = selected.partition_point(|key| key.as_slice() < child.lower.as_slice());
                     let last = selected.partition_point(|key| key.as_slice() <= child.upper.as_slice());
-                    if first < last { level.push((child.page, rows.start + first..rows.start + last)); }
+                    if first < last { following.push((child.page, rows.start + first..rows.start + last)); }
                 }
-            }
+                Ok::<_, rtdb_types::Anomaly>(following)
+            }).buffered(8).try_concat().await?;
         }
         for (page, rows) in level { found.extend(ordinals[rows].iter().map(|&ordinal| (ordinal, page))); }
         if found.len() != ordinals.len() { return Err(corrupt("Search page is absent from its directory")); }
@@ -482,5 +500,61 @@ impl TreeReader {
                 .map(|child| (child.page, height - 1)));
         }
         Ok(pages)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::{TREE_FORMAT_VERSION, tree_file::ordinal};
+    use rtdb_storage::{MemoryStore, ObjectStore};
+
+    #[tokio::test]
+    async fn directory_fences_share_leased_bytes_and_ordinals_release_each_page() -> Result<()> {
+        let first = 0;
+        let second = 0x8000_0000;
+        let child = |ordinal_value, page| {
+            let key = ordinal(ordinal_value);
+            Child { lower: key.to_vec(), upper: key.to_vec(), page }
+        };
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(&mut bytes, TREE_FORMAT_VERSION)?;
+        let first_leaf = writer.page([])?;
+        let second_leaf = writer.page([])?;
+        let first_directory = write_directory(&mut writer, vec![child(first, first_leaf)])?.page;
+        let second_directory = write_directory(&mut writer, vec![child(second, second_leaf)])?.page;
+        let root = write_directory(&mut writer, vec![child(first, first_directory), child(second, second_directory)])?.page;
+        writer.finish()?;
+        let directory = DirectoryRef { page: root, height: 2 };
+
+        let page_bytes = |page: PageRef| page.metadata as usize + page.body as usize;
+        let limit = page_bytes(root).max(page_bytes(first_directory)).max(page_bytes(second_directory));
+        assert!(page_bytes(first_directory) + page_bytes(second_directory) > limit);
+        let length = bytes.len() as u64;
+        let object = ObjectKey::new("search/directory-fences")?;
+        let store = Arc::new(MemoryStore::default());
+        store.put(&object, bytes.into()).await?;
+        let pool = Arc::new(BufferPool::new(store, limit));
+        let source = PageSource::Remote(PageOwner::new(&pool, object, Arc::new(PageCache::new(0))));
+        let reader = TreeReader::new(source, length, TREE_FORMAT_VERSION);
+
+        let batch = reader.page(root, PageKind::Directory).await?;
+        let fields = table(&batch, Table::Directory);
+        let mut children = TreeReader::decode_children(root, &batch)?;
+        let last = children.pop().unwrap();
+        assert_eq!(last.lower.as_ptr(), fields.column(0).as_binary::<i32>().value(1).as_ptr());
+        assert_eq!(last.upper.as_ptr(), fields.column(1).as_binary::<i32>().value(1).as_ptr());
+        drop((batch, fields, children));
+        assert_eq!(last.lower.as_slice(), &ordinal(second));
+        assert_eq!(last.upper.as_slice(), &ordinal(second));
+        assert_eq!(pool.pool_retained_bytes(), page_bytes(root));
+        drop(last);
+        assert_eq!(pool.pool_retained_bytes(), 0);
+
+        assert_eq!(reader.find(directory, &ordinal(second)).await?, Some(second_leaf));
+        assert_eq!(reader.find(directory, &ordinal(1)).await?, None);
+        assert_eq!(reader.find_ordinals(directory, vec![first, second]).await?, vec![(first, first_leaf), (second, second_leaf)]);
+        assert_eq!(pool.pool_retained_bytes(), 0);
+        Ok(())
     }
 }

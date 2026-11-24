@@ -292,33 +292,93 @@ impl Layout {
         ))
     }
 
-    fn interleave(self, arrays: &[&dyn Array], indices: &[(usize, usize)], slot: usize) -> Result<(Self, ArrayRef)> {
-        if let Some(kind) = self.plain() {
-            if self.0 == kind.bit() {
-                return Ok((self, interleave_array(arrays, indices)?));
-            }
-            let chosen = indices.iter().map(|&(array, row)| {
-                let kind = if arrays[array].is_null(row) { Kind::Null } else { kind };
-                (kind, array, row)
-            }).collect::<Vec<_>>();
-            return interleave_plain(kind, arrays, &chosen);
+    fn interleave(
+        sources: &[(Self, &dyn Array)],
+        indices: &[(usize, usize)],
+        slot: usize,
+        share_slices: bool,
+    ) -> Result<(Self, ArrayRef)> {
+        let first = sources[0].0;
+        if let Some(kind) = first.plain()
+            && first.0 == kind.bit()
+            && sources.iter().all(|(layout, _)| *layout == first)
+        {
+            let values = sources.iter().map(|&(_, array)| array).collect::<Vec<_>>();
+            return Ok((first, select_array(&values, indices, share_slices)?));
         }
 
-        let unions = arrays.iter().map(|array| arrow::<UnionArray>(*array)).collect::<Result<Vec<_>>>()?;
-        let chosen = indices.iter().map(|&(array, row)| {
-            let union = unions[array];
-            let tag = union.type_id(row);
-            let row = union.value_offset(row);
-            let kind = if union.child(tag).is_null(row) { Kind::Null } else { KINDS[tag as usize] };
-            (kind, array, row)
-        }).collect::<Vec<_>>();
-        let layout = Self(chosen.iter().fold(0, |mask, (kind, _, _)| mask | kind.bit()));
-        let children = |kind: Kind| unions.iter().map(|union| union.child(kind as i8).as_ref()).collect::<Vec<_>>();
+        let unions = sources
+            .iter()
+            .map(|(layout, array)| {
+                if layout.plain().is_some() {
+                    Ok(None)
+                } else {
+                    arrow::<UnionArray>(*array).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let chosen = indices
+            .iter()
+            .map(|&(source, row)| {
+                let (kind, array, row) = if let Some(union) = unions[source] {
+                    let tag = union.type_id(row);
+                    (
+                        KINDS[tag as usize],
+                        union.child(tag).as_ref(),
+                        union.value_offset(row),
+                    )
+                } else {
+                    let (layout, array) = sources[source];
+                    (layout.plain().expect("plain source"), array, row)
+                };
+                let kind = if array.is_null(row) { Kind::Null } else { kind };
+                (kind, source, row)
+            })
+            .collect::<Vec<_>>();
+        let layout = Self(
+            chosen
+                .iter()
+                .fold(0, |mask, (kind, _, _)| mask | kind.bit()),
+        );
+
+        let leg = |kind: Kind| {
+            let mut arrays = Vec::new();
+            let mut remap = vec![0; sources.len()];
+            for (source, &(layout, array)) in sources.iter().enumerate() {
+                if layout.0 & kind.bit() == 0 {
+                    continue;
+                }
+                remap[source] = arrays.len();
+                arrays.push(unions[source].map_or(array, |union| union.child(kind as i8).as_ref()));
+            }
+            (arrays, remap)
+        };
+
         if let Some(kind) = layout.plain() {
             if matches!(kind, Kind::Null | Kind::Unordered) {
                 return Ok((layout, Arc::new(NullArray::new(chosen.len()))));
             }
-            return interleave_plain(kind, &children(kind), &chosen);
+            let (mut arrays, remap) = leg(kind);
+            let nullable = layout.0 & Kind::Null.bit() != 0;
+            let null = nullable.then(|| arrow_array::new_null_array(&kind.data_type(), 1));
+            let null_source = arrays.len();
+            if let Some(null) = null.as_deref() {
+                arrays.push(null);
+            }
+            let rows = chosen
+                .iter()
+                .map(|&(kind, source, row)| {
+                    if kind == Kind::Null {
+                        (null_source, 0)
+                    } else {
+                        (remap[source], row)
+                    }
+                })
+                .collect::<Vec<_>>();
+            return Ok((
+                layout,
+                select_array(&arrays, &rows, share_slices && !nullable)?,
+            ));
         }
 
         let field = layout.field(slot)?;
@@ -326,21 +386,41 @@ impl Layout {
         let mut selected: [Vec<_>; KINDS.len()] = std::array::from_fn(|_| Vec::new());
         let mut tags = Vec::with_capacity(chosen.len());
         let mut offsets = Vec::with_capacity(chosen.len());
-        for (kind, array, row) in chosen {
+        for (kind, source, row) in chosen {
             let rows = &mut selected[kind as usize];
             tags.push(kind as i8);
             offsets.push(i32::try_from(rows.len()).map_err(format_error)?);
-            rows.push((array, row));
+            rows.push((source, row));
         }
-        let children = layout.kinds().map(|kind| {
-            let rows = &selected[kind as usize];
-            if matches!(kind, Kind::Null | Kind::Unordered) {
-                Ok(Arc::new(NullArray::new(rows.len())) as ArrayRef)
-            } else {
-                interleave_array(&children(kind), rows)
-            }
-        }).collect::<Result<Vec<_>>>()?;
-        let union = UnionArray::try_new(fields.clone(), tags.into(), Some(offsets.into()), children).map_err(format_error)?;
+        let mut payload = 0usize;
+        let children = layout
+            .kinds()
+            .map(|kind| {
+                let rows = &mut selected[kind as usize];
+                if matches!(kind, Kind::Null | Kind::Unordered) {
+                    return Ok(Arc::new(NullArray::new(rows.len())) as ArrayRef);
+                }
+                let (arrays, remap) = leg(kind);
+                for (source, _) in rows.iter_mut() {
+                    *source = remap[*source];
+                }
+                let child = select_array(&arrays, rows, share_slices)?;
+                payload = payload.saturating_add(match kind {
+                    Kind::Text => byte_span(arrow::<StringArray>(child.as_ref())?.value_offsets()),
+                    Kind::Binary => {
+                        byte_span(arrow::<BinaryArray>(child.as_ref())?.value_offsets())
+                    }
+                    _ => 0,
+                });
+                if payload > i32::MAX as usize {
+                    return Err(invalid());
+                }
+                Ok(child)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let union =
+            UnionArray::try_new(fields.clone(), tags.into(), Some(offsets.into()), children)
+                .map_err(format_error)?;
         Ok((layout, Arc::new(union)))
     }
 
@@ -361,23 +441,53 @@ fn interleave_array(arrays: &[&dyn Array], indices: &[(usize, usize)]) -> Result
     })
 }
 
-fn interleave_plain(kind: Kind, arrays: &[&dyn Array], chosen: &[(Kind, usize, usize)]) -> Result<(Layout, ArrayRef)> {
-    if matches!(kind, Kind::Null | Kind::Unordered) {
-        return Ok((Layout(kind.bit()), Arc::new(NullArray::new(chosen.len()))));
+fn byte_span(offsets: &[i32]) -> usize {
+    (offsets[offsets.len() - 1] - offsets[0]) as usize
+}
+
+fn select_array(
+    arrays: &[&dyn Array],
+    indices: &[(usize, usize)],
+    share_slices: bool,
+) -> Result<ArrayRef> {
+    if share_slices
+        && let Some(&(source, start)) = indices.first()
+        && indices
+            .iter()
+            .enumerate()
+            .all(|(offset, &index)| index == (source, start + offset))
+    {
+        let slice = arrays[source].slice(start, indices.len());
+        // IPC can carry the rest of a byte through a byte-aligned bitmap slice.
+        let compact_bytes = match slice.data_type() {
+            DataType::Boolean => {
+                let values = arrow::<BooleanArray>(slice.as_ref())?.values();
+                (values.offset().is_multiple_of(8) && values.len().is_multiple_of(8))
+                    .then_some(values.len() / 8)
+            }
+            DataType::Utf8 => {
+                let offsets = arrow::<StringArray>(slice.as_ref())?.value_offsets();
+                Some(size_of_val(offsets).saturating_add(byte_span(offsets)))
+            }
+            DataType::Binary => {
+                let offsets = arrow::<BinaryArray>(slice.as_ref())?.value_offsets();
+                Some(size_of_val(offsets).saturating_add(byte_span(offsets)))
+            }
+            DataType::FixedSizeBinary(width) => Some(slice.len().saturating_mul(*width as usize)),
+            data_type => data_type
+                .primitive_width()
+                .map(|width| slice.len().saturating_mul(width)),
+        };
+        // Bound retained capacity by the selected bytes and Arrow buffer rounding.
+        if slice.null_count() == 0
+            && compact_bytes.is_some_and(|bytes| {
+                slice.get_buffer_memory_size() <= bytes.saturating_mul(2).saturating_add(64)
+            })
+        {
+            return Ok(slice);
+        }
     }
-    let mask = chosen.iter().fold(0, |mask, (kind, _, _)| mask | kind.bit());
-    if mask == Kind::Null.bit() {
-        return Ok((Layout(mask), Arc::new(NullArray::new(chosen.len()))));
-    }
-    // Canonical posting bytes leave no source payload behind a null.
-    let null = arrow_array::new_null_array(&kind.data_type(), 1);
-    let mut arrays = arrays.to_vec();
-    let null_array = arrays.len();
-    arrays.push(null.as_ref());
-    let indices = chosen.iter().map(|&(kind, array, row)| {
-        if kind == Kind::Null { (null_array, 0) } else { (array, row) }
-    }).collect::<Vec<_>>();
-    Ok((Layout(mask), interleave_array(&arrays, &indices)?))
+    interleave_array(arrays, indices)
 }
 
 #[derive(Debug)]
@@ -424,11 +534,17 @@ impl Postings {
         .map(Self)
     }
 
-    pub fn interleave(rows: &[(&Self, usize)]) -> Result<Option<Self>> {
+    pub fn interleave(rows: &[(&Self, usize)]) -> Result<Self> {
         let selection: Vec<_> = rows.iter().map(|&(postings, row)| (&postings.0, row)).collect();
-        let Some((layouts, arrays)) = KeyBatch::interleave(&selection, true)? else { return Ok(None); };
-        let batch = RecordBatch::try_new(schema(BatchKind::Posting, &layouts)?, arrays).map_err(format_error)?;
-        Ok(Some(Self(KeyBatch::new(layouts, batch, BatchKind::Posting.prefix())?)))
+        let (layouts, arrays) = KeyBatch::interleave(&selection, true)?;
+        let batch = RecordBatch::try_new(schema(BatchKind::Posting, &layouts)?, arrays)
+            .map_err(format_error)?;
+        Ok(Self(KeyBatch::new(
+            layouts,
+            batch,
+            BatchKind::Posting.prefix(),
+            true,
+        )?))
     }
 
     pub fn len(&self) -> usize {
@@ -526,8 +642,11 @@ pub(super) enum KeyColumn<'a> {
 impl<'a> KeyColumn<'a> {
     pub fn new(column: Option<(&'a Field, &'a dyn Array)>) -> Self {
         let Some((field, array)) = column else { return Self::Missing; };
-        let kind = if field.extension_type_name().is_some() {
-            return Self::Cells(field, array);
+        let kind = if let Some(extension) = field.extension_type_name() {
+            match (extension, field.data_type()) {
+                ("uuid", DataType::FixedSizeBinary(16)) => Kind::Uuid,
+                _ => return Self::Cells(field, array),
+            }
         } else {
             match field.data_type() {
                 DataType::Union(..) | DataType::RunEndEncoded(..) =>
@@ -614,7 +733,34 @@ impl SelectedColumn<'_> {
                     };
                     return Ok((layout, values));
                 }
-                let selected = arrow_select::take::take(array, rows, None).map_err(format_error)?;
+                let start = rows.value(0) as usize;
+                let selected = if nulls != 0 {
+                    // A source null can hide arbitrary bytes in its physical value buffer.
+                    let null = arrow_array::new_null_array(array.data_type(), 1);
+                    let indices = rows
+                        .values()
+                        .iter()
+                        .map(|&row| {
+                            let row = row as usize;
+                            if array.is_null(row) { (1, 0) } else { (0, row) }
+                        })
+                        .collect::<Vec<_>>();
+                    interleave_array(&[array, null.as_ref()], &indices)?
+                } else if matches!(
+                    kind,
+                    Kind::Integer | Kind::Decimal128 | Kind::Day | Kind::FloatOrder
+                ) && array.nulls().is_none()
+                    && rows
+                        .values()
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, &row)| row as usize == start + offset)
+                {
+                    // The conversion allocates the execution values, so the source slice is temporary.
+                    array.slice(start, rows.len())
+                } else {
+                    arrow_select::take::take(array, rows, None).map_err(format_error)?
+                };
                 Ok((layout, kind.execution_array(selected)?))
             }
             Self::Typed(_, None, _) => unreachable!("a missing column has null type"),
@@ -632,9 +778,15 @@ impl Kind {
         use arrow_array::{types::*, Date32Array, Date64Array, Float32Array, Float64Array,
             Int8Array, Int16Array, Int32Array, TimestampMicrosecondArray, UInt16Array, UInt32Array};
         macro_rules! unary {
-            ($array:ty, $output:ty, $convert:expr) => {
-                Arc::new(arrow::<$array>(array.as_ref())?.unary::<_, $output>($convert))
-            };
+            ($array:ty, $output:ty, $convert:expr) => {{
+                let values = arrow::<$array>(array.as_ref())?;
+                let convert = $convert;
+                Arc::new(if values.null_count() == 0 {
+                    values.unary::<_, $output>(convert)
+                } else {
+                    values.unary_opt::<_, $output>(|value| Some(convert(value)))
+                })
+            }};
         }
         Ok(match self {
             Self::Integer => {
@@ -668,7 +820,7 @@ impl Kind {
                 Arc::new(builder.finish())
             }
             Self::Day if array.data_type() == &DataType::Date32 => unary!(Date32Array, Int64Type, i64::from),
-            Self::Day => unary!(Date64Array, Int64Type, |millis| millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
+            Self::Day => unary!(Date64Array, Int64Type, |millis: i64| millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
             Self::InstantMicros => Arc::new(arrow::<TimestampMicrosecondArray>(array.as_ref())?.reinterpret_cast::<Int64Type>()),
             Self::FloatOrder if array.data_type() == &DataType::Float32 => unary!(Float32Array, UInt64Type, |value| super::key::float_order(f64::from(value))),
             Self::FloatOrder => unary!(Float64Array, UInt64Type, super::key::float_order),
@@ -683,6 +835,7 @@ pub(super) struct KeyBatch {
     batch: RecordBatch,
     prefix: usize,
     bytes: usize,
+    share_slices: bool,
 }
 
 impl KeyBatch {
@@ -691,44 +844,60 @@ impl KeyBatch {
             Tuple::Arrow(keys, row) => Some((*keys, *row)),
             _ => None,
         }).collect::<Option<Vec<_>>>();
-        if let Some(selection) = selection
-            && let Some((layouts, keys)) = Self::interleave(&selection, false)?
-        {
+        if let Some(selection) = selection {
+            let (layouts, keys) = Self::interleave(&selection, false)?;
             prefix.extend(keys);
             let batch = RecordBatch::try_new(schema(kind, &layouts)?, prefix).map_err(format_error)?;
-            return Self::new(layouts, batch, kind.prefix());
+            return Self::new(layouts, batch, kind.prefix(), true);
         }
         Self::build(tuples, kind, prefix)
     }
 
-    fn interleave(selection: &[(&Self, usize)], prefix: bool) -> Result<Option<(Vec<Layout>, Vec<ArrayRef>)>> {
-        let Some(&(first, _)) = selection.first() else { return Ok(None); };
+    fn interleave(
+        selection: &[(&Self, usize)],
+        prefix: bool,
+    ) -> Result<(Vec<Layout>, Vec<ArrayRef>)> {
+        let &(first, _) = selection.first().ok_or_else(invalid)?;
+        if first.layouts.is_empty() {
+            return Err(invalid());
+        }
         let mut sources = Vec::new();
         let mut positions = HashMap::new();
         let mut indices = Vec::with_capacity(selection.len());
         for &(batch, row) in selection {
-            if batch.layouts != first.layouts { return Ok(None); }
+            if batch.layouts.len() != first.layouts.len() || row >= batch.batch.num_rows() {
+                return Err(invalid());
+            }
             let source = *positions.entry(std::ptr::from_ref(batch)).or_insert_with(|| {
                 sources.push(batch);
                 sources.len() - 1
             });
             indices.push((source, row));
         }
+        let share_slices = sources.iter().all(|source| source.share_slices);
         let mut output = Vec::new();
         if prefix {
             for column in 0..first.prefix {
                 let values = sources.iter().map(|source| source.batch.column(column).as_ref()).collect::<Vec<_>>();
-                output.push(interleave_array(&values, &indices)?);
+                output.push(select_array(&values, &indices, share_slices)?);
             }
         }
         let mut layouts = Vec::with_capacity(first.layouts.len());
-        for (slot, layout) in first.layouts.iter().enumerate() {
-            let values = sources.iter().map(|source| source.batch.column(slot + source.prefix).as_ref()).collect::<Vec<_>>();
-            let (layout, array) = layout.interleave(&values, &indices, slot)?;
+        for slot in 0..first.layouts.len() {
+            let values = sources
+                .iter()
+                .map(|source| {
+                    (
+                        source.layouts[slot],
+                        source.batch.column(slot + source.prefix).as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let (layout, array) = Layout::interleave(&values, &indices, slot, share_slices)?;
             layouts.push(layout);
             output.push(array);
         }
-        Ok(Some((layouts, output)))
+        Ok((layouts, output))
     }
 
     pub fn project(columns: Vec<SelectedColumn<'_>>, rows: Vec<u32>) -> Result<Self> {
@@ -737,7 +906,7 @@ impl KeyBatch {
         let (layouts, arrays) = columns.into_iter().enumerate().map(|(slot, column)| column.build(slot, &rows))
             .collect::<Result<Vec<_>>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
         let batch = RecordBatch::try_new(schema(BatchKind::Keys, &layouts)?, arrays).map_err(format_error)?;
-        Self::new(layouts, batch, 0)
+        Self::new(layouts, batch, 0, true)
     }
 
     pub fn build(tuples: &[Tuple<'_>], kind: BatchKind, mut arrays: Vec<ArrayRef>) -> Result<Self> {
@@ -770,7 +939,7 @@ impl KeyBatch {
             arrays.push(layout.build(schema.field(slot + kind.prefix()), cells, bytes)?);
         }
         let batch = RecordBatch::try_new(schema, arrays).map_err(format_error)?;
-        Self::new(layouts, batch, kind.prefix())
+        Self::new(layouts, batch, kind.prefix(), true)
     }
 
     pub fn build_with_prefix(
@@ -803,7 +972,7 @@ impl KeyBatch {
         }
         let batch =
             RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(format_error)?;
-        Self::new(layouts, batch, prefix)
+        Self::new(layouts, batch, prefix, false)
     }
 
     pub fn from_batch(batch: RecordBatch, prefix: &[Field]) -> Result<Self> {
@@ -838,10 +1007,15 @@ impl KeyBatch {
                 Ok(layout)
             })
             .collect::<Result<Vec<_>>>()?;
-        Self::new(layouts, batch, prefix.len())
+        Self::new(layouts, batch, prefix.len(), false)
     }
 
-    fn new(layouts: Vec<Layout>, batch: RecordBatch, prefix: usize) -> Result<Self> {
+    fn new(
+        layouts: Vec<Layout>,
+        batch: RecordBatch,
+        prefix: usize,
+        share_slices: bool,
+    ) -> Result<Self> {
         let bytes = rtdb_columnar::shared_allocation_size(&batch)?
             .saturating_add(layouts.len().saturating_mul(256));
         Ok(Self {
@@ -849,6 +1023,7 @@ impl KeyBatch {
             batch,
             prefix,
             bytes,
+            share_slices,
         })
     }
 
@@ -1009,7 +1184,8 @@ impl KeyBatch {
         {
             return Err(invalid());
         }
-        let mut keys = Self::new(layouts, batch, kind.prefix())?;
+        // The body can be a view into a complete stored page, including its suffix.
+        let mut keys = Self::new(layouts, batch, kind.prefix(), false)?;
         keys.bytes = keys.bytes.saturating_add(body_start);
         Ok((keys, bytes.slice(body_end..)))
     }
@@ -1197,6 +1373,45 @@ mod tests {
     }
 
     #[test]
+    fn projection_discards_bytes_under_nulls_before_retaining_selected_tuples() {
+        use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
+
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let text = StringArray::new(
+            OffsetBuffer::new(vec![0, 3, 9, 12].into()),
+            Buffer::from(b"onehiddentwo".to_vec()),
+            Some(nulls.clone()),
+        );
+        let bools = BooleanArray::new(BooleanBuffer::new_set(3), Some(nulls.clone()));
+        let floats = arrow_array::Float64Array::new(vec![-0.0, 8.0, 2.0].into(), Some(nulls));
+        let arrays: [&dyn Array; 3] = [&text, &bools, &floats];
+        let fields = arrays.map(|array| Field::new("key", array.data_type().clone(), true));
+        let rows = vec![0, 1];
+        let columns = fields
+            .iter()
+            .zip(arrays)
+            .map(|(field, array)| KeyColumn::new(Some((field, array))).select(&rows).unwrap())
+            .collect();
+        let projected = KeyBatch::project(columns, rows).unwrap();
+        let valid = [
+            AtomRef::Text("one"),
+            AtomRef::Bool(true),
+            AtomRef::FloatOrder(super::super::key::float_order(-0.0)),
+        ];
+        let null = [AtomRef::Null; 3];
+        let scalar = KeyBatch::build(
+            &[Tuple::Cells(&valid), Tuple::Cells(&null)],
+            BatchKind::Keys,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            projected.encode(b"", b"").unwrap(),
+            scalar.encode(b"", b"").unwrap()
+        );
+    }
+
+    #[test]
     fn interleaving_correction_keys_preserves_dense_tags_and_canonical_null_bytes() {
         let mixed = [
             [AtomRef::Text("one"), AtomRef::Integer(1)],
@@ -1217,20 +1432,129 @@ mod tests {
     }
 
     #[test]
+    fn correction_gather_reconciles_plain_and_union_legs_by_kind() {
+        let mixed = [
+            [
+                AtomRef::Binary(b"other"),
+                AtomRef::InstantMicros(5),
+                AtomRef::Unordered,
+            ],
+            [AtomRef::Text("one"), AtomRef::Day(5), AtomRef::Null],
+        ];
+        let plain = [
+            AtomRef::Text("two"),
+            AtomRef::InstantMicros(6),
+            AtomRef::Unordered,
+        ];
+        let mixed_keys = KeyBatch::build(
+            &[Tuple::Cells(&mixed[0]), Tuple::Cells(&mixed[1])],
+            BatchKind::Keys,
+            vec![],
+        )
+        .unwrap();
+        let plain_keys = KeyBatch::build(&[Tuple::Cells(&plain)], BatchKind::Keys, vec![]).unwrap();
+        let prefix: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ];
+        let typed = KeyBatch::gather(
+            &[
+                Tuple::Arrow(&mixed_keys, 1),
+                Tuple::Arrow(&plain_keys, 0),
+                Tuple::Arrow(&mixed_keys, 1),
+            ],
+            BatchKind::Correction,
+            prefix.clone(),
+        )
+        .unwrap();
+        let canonical = KeyBatch::build(
+            &[
+                Tuple::Cells(&mixed[1]),
+                Tuple::Cells(&plain),
+                Tuple::Cells(&mixed[1]),
+            ],
+            BatchKind::Correction,
+            prefix,
+        )
+        .unwrap();
+        assert_eq!(
+            typed.encode(b"", b"").unwrap(),
+            canonical.encode(b"", b"").unwrap()
+        );
+    }
+
+    #[test]
+    fn contiguous_posting_selection_retains_values_and_writes_canonical_bytes() {
+        let cells = [
+            [AtomRef::Text("before"), AtomRef::Bool(true)],
+            [AtomRef::Text("one"), AtomRef::Bool(true)],
+            [AtomRef::Text("two"), AtomRef::Bool(false)],
+            [AtomRef::Text("after"), AtomRef::Bool(true)],
+        ];
+        let keys = cells
+            .iter()
+            .enumerate()
+            .map(|(row, tuple)| {
+                (
+                    Bucket {
+                        level: 0,
+                        start: row as u64,
+                    },
+                    Tuple::Cells(tuple),
+                    AddressRef {
+                        iid: Iid::MIN,
+                        key: b"",
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let source = Postings::build(&keys).unwrap();
+        let selected = Postings::interleave(&[(&source, 1), (&source, 2)]).unwrap();
+        assert_eq!(selected.at(0).1.cell(0), AtomRef::Text("one"));
+        let AtomRef::Text(selected_text) = selected.at(0).1.cell(0) else {
+            unreachable!()
+        };
+        let AtomRef::Text(source_text) = source.at(1).1.cell(0) else {
+            unreachable!()
+        };
+        assert_eq!(selected_text.as_ptr(), source_text.as_ptr());
+        assert!(selected.bytes() >= source.plain_column(0).unwrap().get_buffer_memory_size());
+        drop(source);
+        let canonical = Postings::build(&keys[1..3]).unwrap();
+        assert_eq!(
+            selected.encode(b"", b"").unwrap(),
+            canonical.encode(b"", b"").unwrap()
+        );
+    }
+
+    #[test]
     fn interleaving_posting_edits_preserves_the_exact_leaf_bytes() {
         let first = [
             (Bucket { level: 0, start: 1 }, [AtomRef::Text("one"), AtomRef::Integer(1)], Iid([1; 16])),
             (Bucket { level: 0, start: 3 }, [AtomRef::Text("three"), AtomRef::Integer(3)], Iid([3; 16])),
         ];
-        let edit = [(Bucket { level: 0, start: 2 }, [AtomRef::Text("two"), AtomRef::Integer(2)], Iid([2; 16]))];
-        fn key<'a>((bucket, tuple, iid): &'a (Bucket, [AtomRef<'static>; 2], Iid)) -> (Bucket, Tuple<'a>, AddressRef<'a>) {
-            (*bucket, Tuple::Cells(tuple), AddressRef { iid: *iid, key: b"\0hello" })
+        let edit = [(
+            Bucket { level: 0, start: 2 },
+            [AtomRef::Binary(b"two"), AtomRef::Null],
+            Iid([2; 16]),
+        )];
+        fn key<'a>(
+            (bucket, tuple, iid): &'a (Bucket, [AtomRef<'static>; 2], Iid),
+        ) -> (Bucket, Tuple<'a>, AddressRef<'a>) {
+            (
+                *bucket,
+                Tuple::Cells(tuple),
+                AddressRef {
+                    iid: *iid,
+                    key: b"\0hello",
+                },
+            )
         }
         let first_keys = first.iter().map(key).collect::<Vec<_>>();
         let edit_keys = edit.iter().map(key).collect::<Vec<_>>();
         let existing = Postings::build(&first_keys).unwrap();
         let edits = Postings::build(&edit_keys).unwrap();
-        let result = Postings::interleave(&[(&existing, 0), (&edits, 0), (&existing, 1)]).unwrap().unwrap();
+        let result = Postings::interleave(&[(&existing, 0), (&edits, 0), (&existing, 1)]).unwrap();
         let scalar = Postings::build(&[first_keys[0], edit_keys[0], first_keys[1]]).unwrap();
         assert_eq!(result.encode(b"header", b"suffix").unwrap(), scalar.encode(b"header", b"suffix").unwrap());
     }

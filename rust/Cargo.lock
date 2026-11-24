@@ -3173,7 +3173,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0#f17bedb0e01ce58709dc05aa3189d028ff1620a0"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb#9c6ece1237441c9775923180ace158398812dfbb"
 dependencies = [
  "bytes",
 ]
@@ -3379,13 +3379,13 @@ dependencies = [
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0#f17bedb0e01ce58709dc05aa3189d028ff1620a0"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb#9c6ece1237441c9775923180ace158398812dfbb"
 dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0)",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb)",
  "libc",
  "parking_lot",
  "prost",
@@ -5183,7 +5183,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
- "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0)",
+ "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb)",
  "openssl",
  "parking_lot",
  "prost",

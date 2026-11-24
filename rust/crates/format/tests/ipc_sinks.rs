@@ -34,6 +34,68 @@ fn owned_ipc_reuses_aligned_message_values_and_retains_their_reservation() {
 }
 
 #[test]
+fn owned_stream_from_bytes_preserves_frame_bounds_and_charges() {
+    use arrow_buffer::Buffer;
+    use arrow_ipc::{MetadataVersion, writer::IpcWriteOptions};
+    use bytes::Bytes;
+    use rtdb_columnar::{MemoryBudget, MemoryReservation};
+    use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
+
+    struct ChargedFrame {
+        bytes: Buffer,
+        _charge: Arc<MemoryReservation>,
+    }
+
+    impl AsRef<[u8]> for ChargedFrame {
+        fn as_ref(&self) -> &[u8] { self.bytes.as_slice() }
+    }
+
+    let batch = page();
+    let options = IpcWriteOptions::try_new(64, false, MetadataVersion::V5).unwrap();
+    let ipc = write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), options).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let copied = OwnedStream::read(&ipc, &memory).unwrap();
+    let decode_charge = memory.used_bytes();
+    let expected = copied.pages()[0].batch();
+
+    let input_memory = MemoryBudget::new(1 << 20);
+    let decode_memory = MemoryBudget::new(decode_charge);
+    for offset in [16, 17] {
+        let mut frame = vec![0; offset];
+        frame.extend_from_slice(&ipc);
+        frame.push(1);
+        let frame_len = frame.len();
+        let frame = Bytes::from_owner(ChargedFrame {
+            bytes: Buffer::from_slice_ref(&frame),
+            _charge: input_memory.reserve(frame_len).unwrap(),
+        });
+        let input = frame.slice(offset..offset + ipc.len());
+        for malformed in [input.slice(..ipc.len() - 8), frame.slice(offset..)] {
+            let retained = OwnedStream::read_bytes(malformed.clone(), &decode_memory).err().unwrap();
+            let copied = OwnedStream::read(&malformed, &decode_memory).err().unwrap();
+            assert_eq!((retained.code, retained.message), (copied.code, copied.message));
+            assert_eq!(decode_memory.used_bytes(), 0);
+        }
+        let within = input.as_ptr() as usize..input.as_ptr() as usize + input.len();
+        drop(frame);
+        let stream = OwnedStream::read_bytes(input, &decode_memory).unwrap();
+        let decoded = stream.pages()[0].batch();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.get_array_memory_size(), expected.get_array_memory_size());
+        let column = Arc::clone(decoded.column(0));
+        drop(stream);
+
+        let values = column.as_any().downcast_ref::<Int64Array>().unwrap().values();
+        assert_eq!(within.contains(&(values.as_ptr() as usize)), offset == 16);
+        assert_eq!(input_memory.used_bytes(), if offset == 16 { frame_len } else { 0 });
+        assert_eq!(decode_memory.used_bytes(), decode_charge);
+        drop(column);
+        assert_eq!(input_memory.used_bytes(), 0);
+        assert_eq!(decode_memory.used_bytes(), 0);
+    }
+}
+
+#[test]
 fn owned_stream_admits_wide_arrow_batches_without_row_value_materialization() {
     use arrow_array::ArrayRef;
     use rtdb_columnar::MemoryBudget;

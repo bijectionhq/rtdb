@@ -1738,7 +1738,9 @@ rule ConsumeIntake {
 -- When the winning event carries an assertion ordinal, the point reply carries it with the winning line and event revision.
 -- For a positioned Held winner, the point certifies the clock published with that event.
 -- Point release validates the child's registration and the current Root purge frontier.
--- An installed live writer can read one exact opaque carrier from its earlier direct Root parent.
+-- An installed live writer can read one exact opaque carrier from its earlier Root parent.
+-- A nested hold certifies the frozen edge for the opaque carrier and its journal.
+-- An exact frozen overlay publication certifies its Held clock and the physical author of its positive winner.
 -- The held predecessor certifies the publication under the original pin and relation declarations, and point release checks current purge coverage.
 -- A landed Root carrier opens only against its exact protected journal assertion and current original family authority.
 -- A validation carrying an exclusive clock limit checks its exact world and pin at ordering.

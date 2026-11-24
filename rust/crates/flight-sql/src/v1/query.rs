@@ -301,7 +301,7 @@ impl Service {
         let parameters = request
             .params_ipc
             .map(|bytes| {
-                Parameters::read(Buffer::from(call.retain_request(bytes)), &context.memory)
+                Parameters::read(Buffer::from(call.retain_request_bytes(bytes)), &context.memory)
             })
             .transpose()?;
         let types = parameters

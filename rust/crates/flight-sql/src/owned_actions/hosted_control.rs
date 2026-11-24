@@ -116,11 +116,11 @@ impl Service {
     pub(crate) async fn read_held_hosted_control_action(
         &self,
         call: &Call,
-        body: &[u8],
+        envelope: &Bytes,
         positioned: bool,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
-        let (handle, body) = body
+        let (handle, body) = envelope
             .split_first_chunk::<16>()
             .ok_or_else(|| invalid("Hosted control point has no held handle"))?;
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
@@ -133,7 +133,7 @@ impl Service {
         };
         let (table, ipc) = split_relation(body)?;
         admit_control_targets(policy, [&table])?;
-        let batch = request_batch(call, ipc)?;
+        let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(ipc)))?;
         let batch = batch.batch();
         if batch.num_rows() != 1
             || batch.num_columns() != 1

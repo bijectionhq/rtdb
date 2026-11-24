@@ -46,7 +46,8 @@ entity ProbePlan {
 -- Rows sort by partition, IID and temporal coordinates before training, so their input order does not reach the bytes.
 -- Each partition trains its own clusters with spherical k-means: evenly spaced seeds, a fixed number of rounds, f64 sums in row order and ties to the lower cluster.
 -- A partition of at most 256 rows is one cluster.
--- Each cluster is an Arrow IPC stream aligned to 64 bytes; a directory names every cluster's partition, centroid, byte range, row count and digest.
+-- Each cluster starts at a 64-byte boundary and holds one Arrow IPC stream with 64-byte message and buffer alignment relative to that start.
+-- The directory names every cluster's partition, centroid, byte range, row count and SHA-256 digest covering the stream through its end marker.
 -- The artefact record carries the directory's location and digest, and a reader checks every directory and cluster byte it uses against them.
 -- The artefact lane builds generations for the tries `wants` admits and publishes them with ArtefactsAdded.
 -- Compaction output gets its own generation; an erased version is absent from compacted tries and so from their generations.

@@ -123,21 +123,24 @@ impl IndexedRows {
     pub(crate) fn rows(&self) -> &[IndexedRow] { &self.rows }
     pub(crate) fn unit(&self, row: &IndexedRow) -> &[f32] { &self.units[row.unit_offset..row.unit_offset + self.dimensions] }
 
+    pub(crate) fn contiguous_units(&self, selected: &[&IndexedRow]) -> Option<&[f32]> {
+        let start = selected.first()?.unit_offset;
+        let end = selected.last()?.unit_offset + self.dimensions;
+        if !selected.windows(2).all(|pair| pair[1].unit_offset == pair[0].unit_offset + self.dimensions) {
+            return None;
+        }
+        self.units.get(start..end)
+    }
+
     pub(crate) fn sort(&mut self) {
         self.rows.sort_by_key(|row| (row.partition, row.iid, row.system_from, row.valid_from, row.valid_to));
     }
 
     pub(crate) fn push_event(&mut self, event: &EventRef<'_>, definition: &VectorDefinition) -> Result<()> {
-        let header = event.header();
-        if header.op != EventOp::Put { return Ok(()); }
         let unit_offset = self.units.len();
-        if !append_event_unit(event, &definition.column, self.dimensions, &mut self.units)? { return Ok(()); }
-        let partition = match arrow_partition(event, &definition.partition) {
-            Some(partition) => partition,
-            None => definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
-                .and_then(Partition::of).inspect_err(|_| self.units.truncate(unit_offset))?,
-        };
-        self.push_row(header, partition, unit_offset);
+        if let Some(partition) = append_indexable_event_unit(event, definition, self.dimensions, &mut self.units)? {
+            self.push_row(event.header(), partition, unit_offset);
+        }
         Ok(())
     }
 
@@ -164,9 +167,18 @@ fn event_value<'a>(event: &'a EventRef<'_>, column: &str) -> Result<Option<Cow<'
     }
 }
 
-fn append_event_unit(event: &EventRef<'_>, column: &str, dimensions: usize, output: &mut Vec<f32>) -> Result<bool> {
-    let Some(PutColumn::Stored(field, array, row)) = event.put_column(column) else { return Ok(false) };
-    append_cell_unit(ArrowCell { field, array, row }, dimensions, output)
+pub(crate) fn append_indexable_event_unit(event: &EventRef<'_>, definition: &VectorDefinition, dimensions: usize,
+    output: &mut Vec<f32>) -> Result<Option<Partition>> {
+    if event.header().op != EventOp::Put { return Ok(None); }
+    let Some(PutColumn::Stored(field, array, row)) = event.put_column(&definition.column) else { return Ok(None) };
+    let unit_offset = output.len();
+    if !append_cell_unit(ArrowCell { field, array, row }, dimensions, output)? { return Ok(None); }
+    let partition = match arrow_partition(event, &definition.partition) {
+        Some(partition) => partition,
+        None => definition.partition.iter().map(|column| event_value(event, column)).collect::<Result<Vec<_>>>()
+            .and_then(Partition::of).inspect_err(|_| output.truncate(unit_offset))?,
+    };
+    Ok(Some(partition))
 }
 
 fn append_cell_unit(cell: ArrowCell<'_>, dimensions: usize, output: &mut Vec<f32>) -> Result<bool> {

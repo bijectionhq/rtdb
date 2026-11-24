@@ -131,8 +131,9 @@ config {
 --
 -- Writing the data file has two stages.
 -- Intermediate results use bounded disk spill or admitted Arrow batches between stages.
--- Native compaction can retain merged pages for a single task with one output or for two to four tasks that preserve recency and write a current trie.
--- Each retained batch fits the configured page size and the declared flat scalar output layout with plain IIDs and no `_recency` column.
+-- Native compaction can retain merged pages for a single task with one output or for up to sixteen tasks that preserve recency and write one trie.
+-- Each retained batch fits the configured page size and the declared output layout with supported flat scalar document fields, including fixed-width date, time, timestamp, duration, UUID and binary fields.
+-- A retained historical output can use run-end encoded IIDs and carry `_recency` as prescribed by its output layout.
 -- The retained Arrow reservations total at most 2 MiB per job and count against the shared memory budget.
 --
 -- == Stage 1: Merge pages ==
@@ -172,12 +173,13 @@ config {
 -- At the end of each merge task (i.e. for each IID path prefix), accumulated rows for a spilled output are flushed to a temporary file on disk.
 -- A retention candidate that exceeds the row or byte ceiling spills after writing the retained prefix in merge-task order.
 -- Multi-task retention that encounters memory admission pressure during assembly can retry from its held inputs with disk spill.
--- The spill path handles mixed or nested output fields, encoded IIDs, recency branching, and jobs outside the retention profile.
+-- The spill path handles mixed or nested output fields and jobs outside the retention profile, including merges that fan out into historical outputs.
 --
 -- == Stage 2: Normalise page sizes ==
 --
 -- The final writer reads the spill files or admitted retained batches and writes the resulting data and metadata files.
 -- Ordinary IID normalization uses the same tree of merge pages and row counts for both sources.
+-- Recency normalization uses the same time cells and streaming IID writer for both sources.
 -- The final writer computes page statistics over the normalized output.
 -- Retained normalization that encounters memory admission pressure discards partial final files and retries through the bounded spill writer.
 --

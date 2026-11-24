@@ -1,9 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{
-    Array, BinaryArray, Float64Array, RecordBatch, UInt32Array,
-    builder::{BinaryBuilder, FixedSizeBinaryBuilder, Float64Builder},
+    Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, Float64Array, RecordBatch, UInt32Array,
 };
+use arrow_buffer::{Buffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{
     EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, read_entity_id,
@@ -300,26 +300,28 @@ fn seek(
     ))
 }
 
+const RANKING_OVERHEAD: usize = 16 << 10;
+const IID_BYTES: usize = 16;
+const RANKING_ROW_BYTES: usize = size_of::<i32>() + size_of::<f64>() + IID_BYTES;
+
 struct RankingBuilder {
-    keys: BinaryBuilder,
-    distances: Float64Builder,
-    iids: FixedSizeBinaryBuilder,
-    scratch: Vec<u8>,
-    key_bytes: usize,
-    len: usize,
+    keys: Vec<u8>,
+    offsets: Vec<i32>,
+    distances: Vec<f64>,
+    iids: Vec<u8>,
+    work_key_bytes: usize,
     memory: Arc<MemoryReservation>,
 }
 
 impl RankingBuilder {
     fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let memory = memory.reserve(16 << 10)?;
+        let memory = memory.reserve(RANKING_OVERHEAD)?;
         Ok(Self {
-            keys: BinaryBuilder::with_capacity(0, 0),
-            distances: Float64Builder::with_capacity(0),
-            iids: FixedSizeBinaryBuilder::with_capacity(0, 16),
-            scratch: Vec::new(),
-            key_bytes: 0,
-            len: 0,
+            keys: Vec::new(),
+            offsets: vec![0],
+            distances: Vec::new(),
+            iids: Vec::new(),
+            work_key_bytes: 0,
             memory,
         })
     }
@@ -328,86 +330,143 @@ impl RankingBuilder {
         if !distance.is_finite() || distance < 0.0 {
             return Err(inconsistent_ranking());
         }
-        self.key_bytes = self
-            .key_bytes
-            .checked_add(id.owned_payload_bytes().max(16) + 1)
+        let work_key_bytes = self
+            .work_key_bytes
+            .checked_add(id.owned_payload_bytes().max(16))
+            .and_then(|bytes| bytes.checked_add(1))
             .filter(|&bytes| i32::try_from(bytes).is_ok())
             .ok_or_else(work_limit)?;
-        self.len += 1;
-        let required = self
-            .key_bytes
-            .checked_mul(4)
-            .and_then(|bytes| bytes.checked_add(self.len * 128 + (16 << 10)))
-            .ok_or_else(work_limit)?;
-        Arc::get_mut(&mut self.memory)
-            .expect("ranking owns its reservation")
-            .grow_to(required)?;
-        self.scratch.clear();
-        match id {
-            EntityIdRef::String(value) => {
-                self.scratch.push(0);
-                self.scratch.extend_from_slice(value.as_bytes());
-            }
-            EntityIdRef::Keyword(value) => {
-                self.scratch.push(1);
-                self.scratch.extend_from_slice(value.as_bytes());
-            }
+
+        let integer;
+        let (tag, payload): (u8, &[u8]) = match &id {
+            EntityIdRef::String(value) => (0, value.as_bytes()),
+            EntityIdRef::Keyword(value) => (1, value.as_bytes()),
             EntityIdRef::Integer(value) => {
-                self.scratch.push(2);
-                self.scratch
-                    .extend_from_slice(&((value as u64) ^ (1 << 63)).to_be_bytes());
+                integer = ((*value as u64) ^ (1 << 63)).to_be_bytes();
+                (2, &integer)
             }
-            EntityIdRef::Uuid(value) => {
-                self.scratch.push(3);
-                self.scratch.extend_from_slice(&value);
-            }
+            EntityIdRef::Uuid(value) => (3, value),
+        };
+        let end = self
+            .keys
+            .len()
+            .checked_add(1)
+            .and_then(|len| len.checked_add(payload.len()))
+            .ok_or_else(work_limit)?;
+        let offset = i32::try_from(end).map_err(|_| work_limit())?;
+        let next_count = self.offsets.len();
+        let rows_capacity = next_count
+            .checked_next_power_of_two()
+            .ok_or_else(work_limit)?;
+        let sort_and_output = next_count
+            .checked_mul(RANKING_ROW_BYTES + size_of::<u32>())
+            .and_then(|bytes| bytes.checked_add(end))
+            .ok_or_else(work_limit)?;
+        let fixed = rows_capacity
+            .checked_mul(RANKING_ROW_BYTES)
+            .and_then(|bytes| bytes.checked_add(sort_and_output))
+            .and_then(|bytes| bytes.checked_add(RANKING_OVERHEAD + 2 * size_of::<i32>()))
+            .ok_or_else(work_limit)?;
+        let current = self.keys.capacity();
+        let minimum = current.max(end);
+        let limit = (usize::MAX - fixed).min(i32::MAX as usize);
+        if minimum > limit {
+            return Err(work_limit());
         }
-        self.keys.append_value(&self.scratch);
-        self.distances.append_value(distance);
-        self.iids.append_value(iid.0).map_err(ranking_arrow_error)
+        let preferred = if end > current {
+            end.max(current.saturating_mul(2)).min(limit)
+        } else {
+            current
+        };
+        let memory = Arc::get_mut(&mut self.memory).expect("ranking owns its reservation");
+        let mut keys_capacity = preferred;
+        if fixed + preferred > memory.bytes()
+            && let Err(error) = memory.grow_to(fixed + preferred)
+        {
+            if preferred == minimum || error.code != "rtdb/memory-budget-exceeded" {
+                return Err(error);
+            }
+            memory.grow_to(fixed + minimum)?;
+            keys_capacity = minimum;
+        }
+
+        self.keys.reserve_exact(keys_capacity - self.keys.len());
+        self.offsets
+            .reserve_exact(rows_capacity + 1 - self.offsets.len());
+        self.distances
+            .reserve_exact(rows_capacity - self.distances.len());
+        self.iids
+            .reserve_exact(rows_capacity * IID_BYTES - self.iids.len());
+        self.keys.push(tag);
+        self.keys.extend_from_slice(payload);
+        self.offsets.push(offset);
+        self.distances.push(distance);
+        self.iids.extend_from_slice(iid.as_bytes());
+        self.work_key_bytes = work_key_bytes;
+        Ok(())
     }
 
-    fn finish(mut self, check: impl Fn() -> Result<()>) -> Result<OwnedBatch> {
+    fn finish(self, check: impl Fn() -> Result<()>) -> Result<OwnedBatch> {
         check()?;
-        let keys = self.keys.finish();
-        let distances = self.distances.finish();
-        let iids = self.iids.finish();
-        let count = u32::try_from(self.len).map_err(|_| work_limit())?;
+        let Self {
+            // Local bindings drop in reverse order, so the buffers release before their charge.
+            mut memory,
+            mut keys,
+            mut offsets,
+            mut distances,
+            mut iids,
+            ..
+        } = self;
+        let count = u32::try_from(distances.len()).map_err(|_| work_limit())?;
         let mut positions = (0..count).collect::<Vec<_>>();
+        let key_at = |row: usize| &keys[offsets[row] as usize..offsets[row + 1] as usize];
         // Complete key bytes sort in the same order as the typed identities.
         positions.sort_unstable_by(|&left, &right| {
             let (left, right) = (left as usize, right as usize);
-            distances
-                .value(left)
-                .total_cmp(&distances.value(right))
-                .then_with(|| keys.value(left).cmp(keys.value(right)))
+            distances[left]
+                .total_cmp(&distances[right])
+                .then_with(|| key_at(left).cmp(key_at(right)))
         });
         check()?;
-        let order = UInt32Array::from(positions);
+        let order = if positions.iter().copied().eq(0..count) {
+            drop(positions);
+            keys = keys.into_boxed_slice().into_vec();
+            offsets = offsets.into_boxed_slice().into_vec();
+            distances = distances.into_boxed_slice().into_vec();
+            iids = iids.into_boxed_slice().into_vec();
+            None
+        } else {
+            Some(UInt32Array::from(positions))
+        };
+        let keys = BinaryArray::try_new(
+            OffsetBuffer::new(offsets.into()),
+            Buffer::from_vec(keys),
+            None,
+        )
+        .map_err(ranking_arrow_error)?;
+        let distances = Float64Array::new(distances.into(), None);
+        let iids = FixedSizeBinaryArray::try_new(IID_BYTES as i32, Buffer::from_vec(iids), None)
+            .map_err(ranking_arrow_error)?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("_entity_key", DataType::Binary, false),
             Field::new("distance_m", DataType::Float64, false),
-            Field::new("_iid", DataType::FixedSizeBinary(16), false),
+            Field::new("_iid", DataType::FixedSizeBinary(IID_BYTES as i32), false),
         ]));
-        let ordered = |values: &dyn Array| {
-            arrow_select::take::take(values, &order, None).map_err(ranking_arrow_error)
+        let columns: Vec<ArrayRef> = if let Some(order) = order {
+            let ordered = |values: &dyn Array| {
+                arrow_select::take::take(values, &order, None).map_err(ranking_arrow_error)
+            };
+            let columns = vec![ordered(&keys)?, ordered(&distances)?, ordered(&iids)?];
+            drop((keys, distances, iids));
+            columns
+        } else {
+            vec![Arc::new(keys), Arc::new(distances), Arc::new(iids)]
         };
-        let columns = vec![ordered(&keys)?, ordered(&distances)?, ordered(&iids)?];
         let batch = RecordBatch::try_new(schema, columns).map_err(ranking_arrow_error)?;
-        drop((
-            keys,
-            distances,
-            iids,
-            order,
-            self.keys,
-            self.distances,
-            self.iids,
-            self.scratch,
-        ));
-        Arc::get_mut(&mut self.memory)
+        Arc::get_mut(&mut memory)
             .expect("ranking owns its reservation")
             .shrink_to(batch.get_array_memory_size())?;
-        OwnedBatch::with_reservation(batch, self.memory)
+        OwnedBatch::with_reservation(batch, memory)
     }
 }
 
@@ -427,14 +486,19 @@ fn inconsistent_ranking() -> Anomaly {
 fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
     let memory = MemoryBudget::new(1 << 20);
     let mut builder = RankingBuilder::new(&memory).unwrap();
-    for (id, distance) in [
+    let later = f64::from_bits(1.0_f64.to_bits() + 1);
+    for (row, (id, distance)) in [
         (EntityIdRef::Integer(1), 1.0),
         (EntityIdRef::String("same"), 1.0),
         (EntityIdRef::Integer(-3), 1.0),
         (EntityIdRef::Keyword("same"), 1.0),
-        (EntityIdRef::String("later"), 4.0),
-    ] {
-        builder.push(id, id.iid(), distance).unwrap();
+        (EntityIdRef::String("later"), later),
+        (EntityIdRef::Uuid([0; 16]), 1.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        builder.push(id, Iid([row as u8; 16]), distance).unwrap();
     }
     let ranking = builder.finish(|| Ok(())).unwrap();
     let keys = ranking
@@ -449,11 +513,13 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
         .as_any()
         .downcast_ref::<Float64Array>()
         .unwrap();
-    for (rank, id) in [
-        EntityIdRef::String("same"),
-        EntityIdRef::Keyword("same"),
-        EntityIdRef::Integer(-3),
-        EntityIdRef::Integer(1),
+    let iids = IidView::new(ranking.batch().column(2).as_ref()).unwrap();
+    for (rank, (id, source_row)) in [
+        (EntityIdRef::String("same"), 1),
+        (EntityIdRef::Keyword("same"), 3),
+        (EntityIdRef::Integer(-3), 2),
+        (EntityIdRef::Integer(1), 0),
+        (EntityIdRef::Uuid([0; 16]), 5),
     ]
     .into_iter()
     .enumerate()
@@ -462,6 +528,7 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
             EntityIdRef::from_handle_bytes(keys.value(rank)).unwrap(),
             id
         );
+        assert_eq!(iids.get(rank).unwrap(), Iid([source_row; 16]));
         assert_eq!(
             seek(
                 keys,
@@ -480,11 +547,113 @@ fn rank_continuation_uses_the_exact_typed_identity_among_equal_distances() {
                 distances,
                 Some(NearestPosition {
                     id,
-                    distance_m: 2.0
+                    distance_m: later
                 })
             )
             .is_err()
         );
     }
-    assert_eq!(distances.value(4), 4.0);
+    assert_eq!(distances.value(5).to_bits(), later.to_bits());
+}
+
+#[cfg(test)]
+#[test]
+fn already_ranked_rows_retain_compact_buffers_until_the_last_slice_drops() -> Result<()> {
+    let memory = MemoryBudget::new(1 << 20);
+    for count in [2, 3] {
+        let mut builder = RankingBuilder::new(&memory)?;
+        for row in 0..count {
+            builder.push(EntityIdRef::Integer(row as i64), Iid([row as u8; 16]), 1.0)?;
+        }
+        let source = builder.keys.as_ptr();
+        let ranking = builder.finish(|| Ok(()))?;
+        let batch = ranking.batch();
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let distances = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        let iids = IidView::new(batch.column(2).as_ref())?;
+        if count == 2 {
+            assert_eq!(keys.value_data().as_ptr(), source);
+        }
+        for row in 0..count {
+            assert_eq!(
+                EntityIdRef::from_handle_bytes(keys.value(row))?,
+                EntityIdRef::Integer(row as i64)
+            );
+            assert_eq!(iids.get(row)?, Iid([row as u8; 16]));
+        }
+        let retained = size_of::<BinaryArray>()
+            + size_of::<Float64Array>()
+            + size_of::<FixedSizeBinaryArray>()
+            + count * RANKING_ROW_BYTES
+            + size_of::<i32>()
+            + keys.value_data().len();
+        assert_eq!(memory.used_bytes(), retained);
+        let slice = distances.slice(1, 1);
+        drop(ranking);
+        assert_eq!(slice.value(0), 1.0);
+        assert_eq!(memory.used_bytes(), retained);
+        drop(slice);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn rank_key_growth_falls_back_to_exact_need_and_refuses_without_appending() -> Result<()> {
+    let limit = RANKING_OVERHEAD
+        + 2 * size_of::<i32>()
+        + 2 * (2 * RANKING_ROW_BYTES + size_of::<u32>())
+        + 2 * 8;
+    let memory = MemoryBudget::new(limit);
+    let mut builder = RankingBuilder::new(&memory)?;
+    builder.push(EntityIdRef::String("abcde"), Iid::MIN, 2.0)?;
+    builder.push(EntityIdRef::String("z"), Iid::MAX, 1.0)?;
+    assert_eq!(memory.used_bytes(), limit);
+    assert_eq!(
+        builder
+            .push(EntityIdRef::String("zz"), Iid::MIN, 3.0)
+            .unwrap_err()
+            .code,
+        "rtdb/memory-budget-exceeded",
+    );
+    let ranking = builder.finish(|| Ok(()))?;
+    assert_eq!(ranking.batch().num_rows(), 2);
+    assert_eq!(
+        IidView::new(ranking.batch().column(2).as_ref())?.get(0)?,
+        Iid::MAX
+    );
+    drop(ranking);
+    assert_eq!(memory.used_bytes(), 0);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn rank_cancelled_after_sort_releases_its_buffer_reservation() -> Result<()> {
+    let memory = MemoryBudget::new(1 << 20);
+    let mut builder = RankingBuilder::new(&memory)?;
+    builder.push(EntityIdRef::Integer(1), Iid::MIN, 1.0)?;
+    let checked = std::cell::Cell::new(false);
+    let error = builder
+        .finish(|| {
+            if checked.replace(true) {
+                assert!(memory.used_bytes() > 0);
+                Err(crate::postings::cancelled())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+    assert_eq!(error.code, crate::postings::cancelled().code);
+    assert_eq!(memory.used_bytes(), 0);
+    Ok(())
 }

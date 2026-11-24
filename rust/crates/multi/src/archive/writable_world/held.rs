@@ -706,6 +706,11 @@ impl HeldCheckpointWorld {
             let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
             if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         }
+        if let Some(ancestor) = self.open.record.ancestor()
+            && relations.iter().any(|relation| relation.name() == "fact_unit_column_payloads")
+        {
+            self.archived_accepted_clock(relations, ClockCut::Publication(ancestor.publication)).await?;
+        }
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::ParentAsOf {
             requested, schemas, guard: Arc::clone(&guard), reply,
@@ -726,12 +731,12 @@ impl HeldCheckpointWorld {
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let schema = if relation.name() == "fact_unit_column_payloads" {
-            if self.ancestor().is_some() || !original_scope.is_some_and(|scope| witness.matches_scope(scope)) {
-                return Err(OwnedWorld::unavailable());
+            self.require_original_carrier_scope(&witness, original_scope).await?;
+            if let Some(ancestor) = self.open.record.ancestor() {
+                self.archived_accepted_clock(std::slice::from_ref(relation), ClockCut::Publication(ancestor.publication)).await?;
             }
             let schema = self.world_point_schema(relation)?;
             if !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
-            self.projections.require_live_original().await?;
             schema
         } else {
             self.historical_parent_schema(relation)?
@@ -866,13 +871,30 @@ impl HeldCheckpointWorld {
 
     pub async fn accepted_point(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
-        system: Timestamp,
+        system: Timestamp, original_scope: Option<PlacedAttemptScope>,
     ) -> Result<(Option<WorldFact>, bool)> {
         if self.uses_frozen_overlay(Some(system)) {
+            let protected = relation.name() == "fact_unit_column_payloads";
+            if protected {
+                let schema = self.world_point_schema(relation)?;
+                if !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
+                let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
+                self.require_original_carrier_scope(&witness, original_scope).await?;
+                self.archived_accepted_clock(std::slice::from_ref(relation), ClockCut::System(system)).await?;
+            }
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::Point {
                 id: id.clone(), valid: Interval::at(valid)?,
             }, Some(system)).await?;
             let AncestorResult::Point(fact, shadowed) = result else { return Err(OwnedWorld::unavailable()); };
+            if protected && shadowed {
+                let fact = fact.as_ref().ok_or_else(OwnedWorld::unavailable)?;
+                let layer = self.open.record.ancestor_at_system(fact.revision).ok_or_else(OwnedWorld::unavailable)?;
+                if fact.assertion.is_none_or(|assertion|
+                    assertion.line != Some(Iid(layer.world)) || assertion.held_reading.is_none())
+                {
+                    return Err(OwnedWorld::unavailable());
+                }
+            }
             return Ok((fact, shadowed));
         }
         self.check_relation(relation)?;
@@ -882,6 +904,15 @@ impl HeldCheckpointWorld {
         self.require_archive_coverage(vec![(relation.clone(), 0)], guard).await?;
         self.open.snapshot.check_point_purge_floor(relation, id, self.parent_basis().system_time).await?;
         self.point_at_accepted_cut(relation, id, valid, &cut, schema).await
+    }
+
+    async fn require_original_carrier_scope(
+        &self, witness: &OwnedWorldWitness, scope: Option<PlacedAttemptScope>,
+    ) -> Result<()> {
+        if !scope.is_some_and(|scope| witness.matches_scope(scope)) {
+            return Err(OwnedWorld::unavailable());
+        }
+        self.projections.require_live_original().await
     }
 
     async fn point_at_accepted_cut(
@@ -1041,7 +1072,7 @@ impl HeldCheckpointWorld {
     }
     pub async fn ranked_search(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
-        valid: Timestamp, staged: Option<rtdb_node::TextShadows>,
+        valid: Timestamp, staged: Option<rtdb_node::TextShadows<'_>>,
     ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         if staged.is_some() && (self.clock_mode() != WorldClockMode::Proposal || valid != self.present().system_time) {
             return Err(OwnedWorld::unavailable());
@@ -1066,7 +1097,7 @@ impl HeldCheckpointWorld {
     async fn ranked_search_on_cut(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
-        staged: Option<rtdb_node::TextShadows>,
+        staged: Option<rtdb_node::TextShadows<'_>>,
     ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
@@ -1131,8 +1162,11 @@ impl HeldCheckpointWorld {
             (Vec::new(), rtdb_plan::Analyzer::Simple)
         };
         let overlay = if use_overlay {
-            let staged = staged.unwrap_or_default();
-            let corpus = staged.into_corpus(Arc::clone(&self.memory), analyzer, &query)?;
+            let memory = Arc::clone(&self.memory);
+            let corpus = match staged {
+                Some(staged) => staged.into_corpus(memory, analyzer, &query, || self.check())?,
+                None => rtdb_node::HeldTextCorpus::new(memory, analyzer, &query)?,
+            };
             Some(self.search_overlay(&partitions, &columns, valid, corpus, &guard,
                 earlier.map(|(system, _)| system)).await?)
         } else {

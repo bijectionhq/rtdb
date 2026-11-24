@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use arrow_array::{Array, StringArray, UInt64Array};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
@@ -64,26 +65,58 @@ struct Match {
     frequencies: Vec<u32>,
 }
 
-/// Staged text shadows admitted before the searched paths' analyzer is known.
-#[derive(Default)]
-pub struct TextShadows {
-    rows: Vec<(usize, EntityId, Option<String>)>,
+/// Staged text shadows borrow the request batch through analysis.
+pub struct TextShadows<'a> {
+    partitions: &'a UInt64Array,
+    ids: &'a StringArray,
+    text: &'a StringArray,
 }
 
-impl TextShadows {
-    pub fn push(&mut self, partition: usize, id: EntityId, text: Option<&str>) {
-        self.rows.push((partition, id, text.map(str::to_owned)));
+impl<'a> TextShadows<'a> {
+    pub fn try_new(
+        partitions: &'a UInt64Array,
+        ids: &'a StringArray,
+        text: &'a StringArray,
+        admit_identity: impl Fn(usize, &str) -> bool,
+    ) -> Option<Self> {
+        if partitions.len() != ids.len() || ids.len() != text.len() {
+            return None;
+        }
+        for row in 0..partitions.len() {
+            if partitions.is_null(row) || ids.is_null(row)
+                || !admit_identity(usize::try_from(partitions.value(row)).ok()?, ids.value(row))
+            {
+                return None;
+            }
+        }
+        Some(Self { partitions, ids, text })
     }
 
-    pub fn len(&self) -> usize { self.rows.len() }
-
-    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+    fn rows(&self) -> impl Iterator<Item = (usize, EntityIdRef<'a>, Option<&'a str>)> {
+        let Self { partitions, ids, text } = *self;
+        (0..partitions.len()).map(move |row| {
+            (
+                partitions.value(row) as usize,
+                EntityIdRef::String(ids.value(row)),
+                text.is_valid(row).then(|| text.value(row)),
+            )
+        })
+    }
 
     /// The corpus of `text` under the paths' analyzer, holding these shadows.
-    pub fn into_corpus(self, memory: Arc<MemoryBudget>, analyzer: rtdb_text::Analyzer, text: &str) -> Result<HeldTextCorpus> {
+    pub fn into_corpus(
+        self,
+        memory: Arc<MemoryBudget>,
+        analyzer: rtdb_text::Analyzer,
+        text: &str,
+        check: impl Fn() -> Result<()>,
+    ) -> Result<HeldTextCorpus> {
+        check()?;
         let mut corpus = HeldTextCorpus::new(memory, analyzer, text)?;
-        for (partition, id, text) in self.rows {
-            corpus.shadow(partition, id, text.as_deref())?;
+        for (partition, id, text) in self.rows() {
+            corpus.admit_shadow(partition, id, text)?;
+            corpus.insert_shadow(partition, id.into_owned())?;
+            check()?;
         }
         Ok(corpus)
     }
@@ -122,7 +155,7 @@ impl HeldTextCorpus {
         })
     }
 
-    fn observe(&mut self, partition: usize, id: &EntityId, text: Option<&str>) -> Result<()> {
+    fn observe(&mut self, partition: usize, id: EntityIdRef<'_>, text: Option<&str>) -> Result<()> {
         self.identities += 1;
         if self.identities > MAX_IDENTITIES {
             return Err(corpus_limit());
@@ -149,7 +182,7 @@ impl HeldTextCorpus {
             let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
             retained.grow_to(retained.bytes().saturating_add(charge))?;
             self.matches.push(Match {
-                id: id.clone(),
+                id: id.into_owned(),
                 partition,
                 length: rtdb_text::stored_length(tokens.len()),
                 frequencies,
@@ -160,10 +193,18 @@ impl HeldTextCorpus {
 
     /// Register an exact typed overlay shadow, even if it contributes no text.
     pub fn shadow(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
-        self.observe(partition, &id, text)?;
-        let charge = identity_charge(&id) + 192;
+        self.admit_shadow(partition, EntityIdRef::from(&id), text)?;
+        self.insert_shadow(partition, id)
+    }
+
+    fn admit_shadow(&mut self, partition: usize, id: EntityIdRef<'_>, text: Option<&str>) -> Result<()> {
+        self.observe(partition, id, text)?;
+        let charge = identity_charge(id) + 192;
         let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
-        retained.grow_to(retained.bytes().saturating_add(charge))?;
+        retained.grow_to(retained.bytes().saturating_add(charge))
+    }
+
+    fn insert_shadow(&mut self, partition: usize, id: EntityId) -> Result<()> {
         if !self.shadows.entry(partition).or_default().insert(id) {
             return Err(corpus_limit());
         }
@@ -275,9 +316,9 @@ impl HeldTextCorpus {
     }
 }
 
-fn identity_charge(id: &EntityId) -> usize {
+fn identity_charge(id: EntityIdRef<'_>) -> usize {
     // Keep the charge for a compact copy and the original Value-sized allowance.
-    std::mem::size_of::<Value>() + EntityIdRef::from(id).owned_payload_bytes()
+    std::mem::size_of::<Value>() + id.owned_payload_bytes()
 }
 
 fn corpus_limit() -> Anomaly {
@@ -337,20 +378,33 @@ mod tests {
     }
 
     #[test]
-    fn staged_shadows_replace_committed_text_before_statistics() {
-        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), rtdb_text::Analyzer::Simple, "apples").unwrap();
+    fn staged_arrow_shadows_borrow_text_and_replace_committed_documents() {
+        let partitions = UInt64Array::from(vec![0, 0, 1]);
+        let ids = StringArray::from(vec!["replaced", "deleted", "empty"]);
+        let text = StringArray::from(vec![Some("pears"), None, Some("")]);
+        let shadows = TextShadows::try_new(&partitions, &ids, &text, |_, _| true).unwrap();
+        {
+            let mut rows = shadows.rows();
+            assert!(std::ptr::eq(rows.next().unwrap().2.unwrap(), text.value(0)));
+            assert_eq!(rows.next().unwrap().2, None);
+            assert_eq!(rows.next().unwrap().2, Some(""));
+        }
+        let mut corpus = shadows.into_corpus(
+            MemoryBudget::new(1 << 20), rtdb_text::Analyzer::Simple, "apples", || Ok(()),
+        ).unwrap();
         let replaced = EntityId::String("replaced".into());
         let deleted = EntityId::String("deleted".into());
         let unchanged = EntityId::String("unchanged".into());
-        corpus.shadow(0, replaced.clone(), Some("pears")).unwrap();
-        corpus.shadow(0, deleted.clone(), None).unwrap();
+        assert!(corpus.contains_shadow(0, &replaced));
+        assert!(corpus.contains_shadow(0, &deleted));
+        assert!(corpus.contains_shadow(1, &EntityId::String("empty".into())));
         assert!(!corpus.contains_shadow(1, &replaced));
         for id in [replaced, deleted, unchanged.clone()] {
             if !corpus.contains_shadow(0, &id) {
                 corpus.shadow(0, id, Some("apples")).unwrap();
             }
         }
-        assert_eq!(corpus.statistics().documents, 2);
+        assert_eq!(corpus.statistics().documents, 3);
         let page = corpus.finish(0, 10).unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.hits[0].id, unchanged);

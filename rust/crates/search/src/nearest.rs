@@ -238,28 +238,41 @@ impl NearestWindow {
     }
 
     fn admit(&mut self, partition: usize, id: EntityIdRef<'_>, distance: f64) -> Result<()> {
+        if let Some(at) = self.admit_position(partition, id, distance)? {
+            self.insert_at(at, || NearestHit { partition, id: id.into_owned(), distance })?;
+        }
+        Ok(())
+    }
+
+    fn admit_position(&mut self, partition: usize, id: EntityIdRef<'_>, distance: f64) -> Result<Option<usize>> {
         self.total += 1;
         if self.total > MAX_NEAREST_CANDIDATES {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/nearest-scan-limit", "Owned nearest exceeded its candidate budget"));
         }
         let at = self.hits.partition_point(|hit| nearest_order(hit, partition, id, distance).is_lt());
-        if at >= self.k { return Ok(()); }
+        Ok((at < self.k).then_some(at))
+    }
+
+    fn insert_at(&mut self, at: usize, hit: impl FnOnce() -> NearestHit) -> Result<()> {
         if self.hits.len() == self.k {
             let evicted = self.hits.pop().expect("A full nearest window has a last hit");
             self.bytes -= identity_charge(&evicted.id).saturating_add(128);
         }
-        let id = id.into_owned();
-        self.bytes = self.bytes.saturating_add(identity_charge(&id).saturating_add(128));
-        self.hits.insert(at, NearestHit { partition, id, distance });
+        let hit = hit();
+        self.bytes = self.bytes.saturating_add(identity_charge(&hit.id).saturating_add(128));
+        self.hits.insert(at, hit);
         let reservation = Arc::get_mut(&mut self.memory).expect("nearest owns its reservation");
         reservation.grow_to(self.bytes.max(reservation.bytes()))
     }
 
     /// Admits another window's hits and counts its candidates.
     fn absorb(&mut self, other: NearestWindow) -> Result<()> {
-        self.total = self.total.saturating_add(other.total).saturating_sub(other.hits.len());
-        for hit in &other.hits {
-            self.admit(hit.partition, EntityIdRef::from(&hit.id), hit.distance)?;
+        let NearestWindow { hits, memory: _source_memory, total, .. } = other;
+        self.total = self.total.saturating_add(total).saturating_sub(hits.len());
+        for hit in hits {
+            if let Some(at) = self.admit_position(hit.partition, EntityIdRef::from(&hit.id), hit.distance)? {
+                self.insert_at(at, || hit)?;
+            }
         }
         Ok(())
     }
@@ -270,12 +283,12 @@ impl NearestWindow {
                 .ok_or_else(|| Anomaly::fault("rtdb.search/nearest-output", "Nearest output size overflow"))
         })?;
         let reservation = self.memory.budget().reserve(bound)?;
+        let ids = rtdb_columnar::entity_id_array(self.hits.iter().map(|hit| EntityIdRef::from(&hit.id)))?;
         let schema = Arc::new(Schema::new(vec![
-            rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type())?,
+            Field::new("_id", ids.data_type().clone(), false),
             Field::new("distance", DataType::Float64, false),
             Field::new("partition", DataType::UInt64, false),
         ]));
-        let ids = rtdb_columnar::entity_id_array(self.hits.iter().map(|hit| EntityIdRef::from(&hit.id)))?;
         let distance = Arc::new(Float64Array::from_iter_values(self.hits.iter().map(|hit| hit.distance)));
         let partition = Arc::new(UInt64Array::from_iter_values(self.hits.iter().map(|hit| hit.partition as u64)));
         let output = RecordBatch::try_new(schema, vec![ids, distance, partition])
@@ -579,6 +592,68 @@ mod tests {
         let order = window.hits.iter().map(|hit| (hit.partition, hit.id.clone())).collect::<Vec<_>>();
         assert_eq!(order, vec![(0, EntityId::Integer(1)), (1, EntityId::Integer(1)), (1, EntityId::Integer(2))]);
         assert_eq!(window.total, 4);
+    }
+
+    #[test]
+    fn nearest_window_moves_partition_ids_and_projects_the_mixed_ranking() {
+        let memory = MemoryBudget::new(1 << 20);
+        let mut window = NearestWindow::new(&memory, 5).unwrap();
+        let mut settled = NearestWindow::new(&memory, 5).unwrap();
+        let text = EntityIdRef::String("places/東京");
+        let keyword = EntityIdRef::Keyword("places/東京");
+        let integer = EntityIdRef::Integer(-3);
+        let uuid = EntityIdRef::Uuid([7; 16]);
+        let farther = 0.5_f64.next_up();
+        window.admit(0, text, 0.5).unwrap();
+        window.admit(0, EntityIdRef::String("evicted"), 2.0).unwrap();
+        for (id, distance) in [
+            (keyword, 0.5), (uuid, farther), (text, 0.5), (integer, 0.5),
+            (EntityIdRef::String("outside the merged window"), 1.0),
+            (EntityIdRef::String("outside the partition window"), 2.0),
+        ] {
+            settled.admit(1, id, distance).unwrap();
+        }
+        let payload = |hit: &NearestHit| match EntityIdRef::from(&hit.id) {
+            EntityIdRef::String(value) | EntityIdRef::Keyword(value) => value.as_ptr(),
+            _ => unreachable!(),
+        };
+        let source_payloads = [payload(&settled.hits[0]), payload(&settled.hits[1])];
+
+        window.absorb(settled).unwrap();
+        assert_eq!([payload(&window.hits[1]), payload(&window.hits[2])], source_payloads);
+
+        let page = window.finish().unwrap();
+        assert_eq!(page.total, 8);
+        let batch = page.hits.batch();
+        assert_eq!(batch.num_rows(), 5);
+        let field = batch.schema_ref().field(0);
+        assert_eq!(field, &rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type()).unwrap());
+        let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
+        let distances = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let partitions = batch.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+        for (row, (id, distance, partition, offset)) in [
+            (text, 0.5, 0, 0), (text, 0.5, 1, 1), (keyword, 0.5, 1, 0),
+            (integer, 0.5, 1, 0), (uuid, farther, 1, 0),
+        ].into_iter().enumerate() {
+            assert_eq!(rtdb_columnar::read_entity_id(field, ids, row).unwrap(), id);
+            assert_eq!(ids.value_offset(row), offset);
+            assert_eq!(distances.value(row).to_bits(), distance.to_bits());
+            assert_eq!(partitions.value(row), partition);
+        }
+    }
+
+    #[test]
+    fn nearest_window_merge_grows_before_releasing_the_source_reservation() {
+        let window_charge = 4096 + 2 * size_of::<NearestHit>();
+        let text = "id".repeat(1024);
+        let hit_charge = 4096 + size_of::<Value>() + text.len() + 128;
+        let memory = MemoryBudget::new(window_charge + hit_charge);
+        let mut window = NearestWindow::new(&memory, 1).unwrap();
+        let mut settled = NearestWindow::new(&memory, 1).unwrap();
+        settled.admit(0, EntityIdRef::String(&text), 0.5).unwrap();
+
+        assert_eq!(window.absorb(settled).unwrap_err().code, "rtdb/memory-budget-exceeded");
+        assert_eq!(memory.used_bytes(), window_charge);
     }
 
     #[test]
