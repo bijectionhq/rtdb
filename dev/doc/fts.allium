@@ -467,6 +467,8 @@ contract SearchFileLayout {
         -- A term directory records short rank summaries inline and refers to rank pages for larger postings.
         -- Each rank branch bounds the scores of its descendant windows and may prove the first identity at its exact maximum.
         -- Each directory edge authenticates its child byte range.
+        -- Decoded child fences, including inline routes, share the Arrow buffers that hold them and retain any backing reservation.
+        -- Ordinal traversal releases its references to a directory's fence buffers after selecting that directory's children.
         -- A negative discovery synopsis excludes term nominations; IID visibility can still read the same file.
         -- Per-storage cache entries hold authenticated immutable pages and share concurrent reads.
         -- Readers with prepaid cache allocations hold search range leases within those allocations.

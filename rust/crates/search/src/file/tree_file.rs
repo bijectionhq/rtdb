@@ -13,7 +13,7 @@ use crate::rank_windows::{document_range, window_of};
 use crate::term_directory::TermSummaries;
 
 use super::{LOGICAL_FORMAT_VERSION, PACKED_FORMAT_VERSION, TREE_FORMAT_VERSION, TextRevision, artefact_digest, corrupt, fault, layout::{FooterLocator, PageRef, Table, Writer, item_of, list, table},
-    page_tree::{Child, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
+    page_tree::{Child, DecodedChild, DirectoryRef, PageCache, PageKind, PageOwner, PageSource, TreeReader, inline_routes, read_inline_routes, read_root, root_table, write_directory}, paged::PostingPlan, rank_tree};
 
 pub(super) const POSTING: u8 = 0;
 pub(super) const TERM: u8 = 1;
@@ -439,7 +439,7 @@ pub(crate) struct TreeFile {
     reader: TreeReader,
     root: RecordBatch,
     directories: BTreeMap<u8, DirectoryRef>,
-    routes: BTreeMap<u8, Vec<Child>>,
+    routes: BTreeMap<u8, Vec<DecodedChild>>,
     format: i32,
 }
 
@@ -694,8 +694,8 @@ impl TreeFile {
         let ranges: Vec<_> = iids.iter().map(|iid| (event_key(&iid.0, 0), event_key(&iid.0, u32::MAX))).collect();
         let pages = match self.routes.get(&VISIBILITY) {
             Some(children) => children.iter().filter(|child| {
-                let index = ranges.partition_point(|(_, upper)| upper < &child.lower);
-                ranges.get(index).is_some_and(|(lower, _)| lower <= &child.upper)
+                let index = ranges.partition_point(|(_, upper)| upper.as_slice() < child.lower.as_slice());
+                ranges.get(index).is_some_and(|(lower, _)| lower.as_slice() <= child.upper.as_slice())
             }).map(|child| child.page).collect(),
             None => self.reader.covering(self.directories[&VISIBILITY], &ranges).await?,
         };
@@ -807,7 +807,7 @@ impl TreeFile {
     }
 }
 
-fn direct_reference(children: &[Child], key: &[u8]) -> Option<PageRef> {
+fn direct_reference(children: &[DecodedChild], key: &[u8]) -> Option<PageRef> {
     let index = children.partition_point(|child| child.upper.as_slice() < key);
     children.get(index).filter(|child| child.lower.as_slice() <= key).map(|child| child.page)
 }
