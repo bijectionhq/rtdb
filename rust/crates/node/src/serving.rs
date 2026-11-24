@@ -91,6 +91,14 @@ pub trait ServingDriver: Send + Sync {
     fn features(&self) -> &[&str];
     fn token_authority(&self) -> Option<TokenAuthority> { None }
 
+    async fn apply_token_key_rotation(&self, _generation: u64, _unreadable_by: i64) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/token-rotation", "This driver does not own token key rotation"))
+    }
+
+    async fn destroy_retired_token_key(&self, _generation: u64) -> Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/token-rotation", "This driver does not own token key rotation"))
+    }
+
     async fn query(
         &self,
         source: QuerySource,

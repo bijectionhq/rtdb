@@ -92,6 +92,8 @@ impl Service {
                                     features.push(feature.into());
                                 }
                             }
+                        } else {
+                            features.retain(|feature| feature != "query.track" && feature != "query.page");
                         }
                     }
                 }

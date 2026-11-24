@@ -1,19 +1,16 @@
 use std::{
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
 };
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_crypt::{
-    FileKms, Generation, Kms, LocalKms,
-    tokens::{TokenAuthority, TokenKey, TokenKeys},
+    FileKms, Kms, LocalKms,
+    tokens::{TokenAuthority, TokenKeys},
 };
 use rtdb_format::database::proto::{DatabaseConfig, database_config};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
+use rtdb_store::StoredTokenKeys;
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use sha2::{Digest, Sha256};
 use tokio::sync::OnceCell;
@@ -147,12 +144,7 @@ impl DatabaseTokens {
                     Custody::Missing => return Err(unavailable()),
                 };
                 let incarnation = self.incarnation().await?;
-                let keys = Arc::new(StoredTokenKeys {
-                    store: Arc::clone(&self.store),
-                    prefix: self.prefix.clone(),
-                    incarnation,
-                    hint: AtomicU64::new(0),
-                });
+                let keys = Arc::new(StoredTokenKeys::new(Arc::clone(&self.store), self.prefix.clone(), incarnation, 0));
                 if self.read_only {
                     keys.get(0).await?.ok_or_else(unavailable)?;
                 } else {
@@ -172,19 +164,8 @@ impl DatabaseTokens {
         if self.read_only {
             return Err(unavailable());
         }
-        let previous = next.checked_sub(1).ok_or_else(invalid_metadata)?;
         let authority = self.database_authority().await?;
-        let previous = authority
-            .keys
-            .get(previous)
-            .await?
-            .ok_or_else(invalid_metadata)?;
-        authority
-            .kms
-            .retire(previous.generation(), unreadable_by)
-            .await?;
-        authority.keys.install(authority.kms.as_ref(), next).await?;
-        Ok(())
+        authority.keys.rotate(authority.kms.as_ref(), next, unreadable_by).await
     }
 
     pub(super) async fn destroy_retired(&self, number: u64) -> Result<()> {
@@ -192,81 +173,7 @@ impl DatabaseTokens {
             return Err(unavailable());
         }
         let authority = self.database_authority().await?;
-        let key = authority
-            .keys
-            .get(number)
-            .await?
-            .ok_or_else(invalid_metadata)?;
-        authority.kms.destroy(key.generation()).await
-    }
-}
-
-struct StoredTokenKeys {
-    store: Arc<dyn ObjectStore>,
-    prefix: String,
-    incarnation: Uuid,
-    hint: AtomicU64,
-}
-
-impl StoredTokenKeys {
-    fn path(&self, number: u64) -> Result<ObjectKey> {
-        ObjectKey::new(format!("{}/keys/{number:016x}", self.prefix)).map_err(Into::into)
-    }
-
-    async fn install(&self, kms: &dyn Kms, number: u64) -> Result<TokenKey> {
-        if let Some(key) = self.get(number).await? {
-            return Ok(key);
-        }
-        let generation = Generation {
-            database: self.incarnation,
-            number,
-        };
-        let proposed = TokenKey::create(kms, generation).await?;
-        let written = self
-            .store
-            .put(&self.path(number)?, proposed.encode().into())
-            .await;
-        if let Some(installed) = self.get(number).await? {
-            return Ok(installed);
-        }
-        written?;
-        Err(unavailable())
-    }
-}
-
-#[async_trait]
-impl TokenKeys for StoredTokenKeys {
-    async fn current(&self) -> Result<TokenKey> {
-        let mut number = self.hint.load(Ordering::Relaxed);
-        let mut key = self.get(number).await?.ok_or_else(unavailable)?;
-        while let Some(next) = number.checked_add(1) {
-            let Some(found) = self.get(next).await? else {
-                break;
-            };
-            number = next;
-            key = found;
-        }
-        self.hint.fetch_max(number, Ordering::Relaxed);
-        Ok(key)
-    }
-
-    async fn get(&self, number: u64) -> Result<Option<TokenKey>> {
-        match self.store.get_fresh(&self.path(number)?).await {
-            Ok(bytes) => {
-                let key = TokenKey::decode(&bytes)?;
-                if key.generation()
-                    != (Generation {
-                        database: self.incarnation,
-                        number,
-                    })
-                {
-                    return Err(invalid_metadata());
-                }
-                Ok(Some(key))
-            }
-            Err(Error::MissingObject(_)) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+        authority.keys.destroy_retired(authority.kms.as_ref(), number).await
     }
 }
 

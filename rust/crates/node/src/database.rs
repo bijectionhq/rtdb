@@ -71,22 +71,30 @@ impl Database {
     pub async fn wire_incarnation(&self) -> Result<uuid::Uuid> { self.tokens.incarnation().await }
 
     pub async fn token_authority(&self) -> Result<rtdb_crypt::tokens::TokenAuthority> {
-        if let Some(authority) = self.serving_driver().and_then(|driver| driver.token_authority()) {
-            return Ok(authority);
+        if let Some(driver) = self.serving_driver() {
+            return driver.token_authority().ok_or_else(|| Anomaly::unsupported(
+                "rtdb/token-authority", "This serving driver has no shared token authority",
+            ));
         }
         self.tokens.authority().await
     }
 
     pub fn wire_tokens_supported(&self) -> bool {
-        self.serving_driver().and_then(|driver| driver.token_authority()).is_some() || self.tokens.supported()
+        self.serving_driver().map_or_else(|| self.tokens.supported(), |driver| driver.token_authority().is_some())
     }
 
     /// The writer calls this after committing the rotation and recovers using its original deadline.
     pub async fn apply_token_key_rotation(&self, next: u64, unreadable_by: i64) -> Result<()> {
+        if let Some(driver) = self.serving_driver() {
+            return driver.apply_token_key_rotation(next, unreadable_by).await;
+        }
         self.tokens.apply_rotation(next, unreadable_by).await
     }
 
     pub async fn destroy_retired_token_key(&self, generation: u64) -> Result<()> {
+        if let Some(driver) = self.serving_driver() {
+            return driver.destroy_retired_token_key(generation).await;
+        }
         self.tokens.destroy_retired(generation).await
     }
     pub fn wire_linearizable_reads(&self) -> bool {

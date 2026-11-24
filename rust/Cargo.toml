@@ -45,6 +45,7 @@ rtdb-sql = { path = "crates/sql" }
 rtdb-replication = { path = "crates/replication" }
 rtdb-tx = { path = "crates/tx" }
 rtdb-maintenance = { path = "crates/maintenance" }
+rtdb-db = { path = "crates/db" }
 rtdb-node = { path = "crates/node" }
 rtdb-kafka = { path = "crates/kafka" }
 rtdb-s3 = { path = "crates/s3" }

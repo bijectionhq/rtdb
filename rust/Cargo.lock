@@ -4651,6 +4651,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-db"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
+ "rtdb-crypt",
+ "rtdb-format",
+ "rtdb-index",
+ "rtdb-logkeeper",
+ "rtdb-store",
+ "rtdb-tx",
+ "rtdb-types",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rtdb-directory"
 version = "0.1.0"
 dependencies = [
@@ -5063,12 +5082,14 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "futures",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
  "parking_lot",
  "prost",
  "prost-types",
  "rtdb-azure",
  "rtdb-columnar",
  "rtdb-crypt",
+ "rtdb-db",
  "rtdb-expr",
  "rtdb-format",
  "rtdb-gcs",
@@ -5084,6 +5105,7 @@ dependencies = [
  "rtdb-spatial",
  "rtdb-sql",
  "rtdb-storage",
+ "rtdb-store",
  "rtdb-temporal",
  "rtdb-text",
  "rtdb-trie",
@@ -5479,6 +5501,7 @@ dependencies = [
 name = "rtdb-store"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "rtdb-crypt",
  "rtdb-format",
