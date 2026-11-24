@@ -147,12 +147,21 @@ impl AssertionFamilies<'_> {
     ) -> Result<Family> {
         self.require_position_open(binding.position).await?;
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
-        record.require_live()?;
-        let accepted = record.landings.iter().find(|entry| {
+        record.require_root_landing(stage, binding)?;
+        Ok(record)
+    }
+}
+
+impl Family {
+    pub(super) fn require_root_landing(&self, stage: AssertionStage, binding: RootLandingBinding) -> Result<()> {
+        self.require_live()?;
+        if binding.stage != *stage.identity().as_bytes() {
+            return Err(conflict());
+        }
+        let accepted = self.landings.iter().find(|entry| {
             entry.reservation.destination == binding.assertion && entry.reservation.capability == stage
         }).and_then(|entry| entry.accepted.as_ref()).ok_or_else(conflict)?;
-        require_binding(accepted, binding.position, root_binding_digest(binding))?;
-        Ok(record)
+        require_binding(accepted, binding.position, root_binding_digest(binding))
     }
 }
 
@@ -219,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_landing_opens_only_after_the_exact_link_is_activated() -> Result<()> {
+    async fn root_landing_open_and_release_require_the_exact_activation() -> Result<()> {
         let directory = tempfile::tempdir().unwrap();
         let vault = LocalKeyService::with_archive_broker(directory.path())?;
         let region = IoRegion::new();
@@ -256,6 +265,10 @@ mod tests {
             position: position(3), assertion: reservation.destination, stage: *reservation.capability.stage.as_bytes(), target,
             payload_digest: hash(&payload), link_digest: hash(&link),
         };
+        let member = FamilyOccurrence {
+            position: binding.position, assertion: binding.assertion, capability: reservation.capability,
+        };
+        let release = |binding| FamilyReleaseInput::RootLanding { member, binding };
         let open = |binding| families.open_root_landing_payload(family, reservation.capability, binding, payload.clone(), &vault);
         let derivative = DerivedRow {
             member: reservation.destination, world: None, capability: None,
@@ -267,9 +280,21 @@ mod tests {
         );
         assert!(rank(binding, &derivative.key).await.is_err());
         assert!(open(binding).await.is_err());
+        let (pending, _) = families.read(family).await?.unwrap();
+        assert!(release(binding).require_enrolled(&pending).is_err());
         let substituted = RootLandingBinding { payload_digest: [7; 32], ..binding };
         assert!(families.activate_root_landing(family, reservation, substituted, link.clone(), &vault).await.is_err());
         families.activate_root_landing(family, reservation, binding, link.clone(), &vault).await?;
+        let (activated, _) = families.read(family).await?.unwrap();
+        release(binding).require_enrolled(&activated)?;
+        let different_disclosure = RootLandingBinding {
+            target: RootLandingTarget { disclosure: [9; 32], ..binding.target }, ..binding
+        };
+        assert!(release(substituted).require_enrolled(&activated).is_err());
+        assert!(release(different_disclosure).require_enrolled(&activated).is_err());
+        assert_ne!(release(binding).commitment()?, release(substituted).commitment()?);
+        assert_ne!(release(binding).commitment()?, FamilyReleaseInput::Member(member).commitment()?);
+        assert!(release(RootLandingBinding { position: position(4), ..binding }).commitment().is_err());
         vault.retire_assertion_stage(reservation.link_capability, &region).await?;
         families.activate_root_landing(family, reservation, binding, link.clone(), &vault).await?;
         assert!(open(RootLandingBinding { position: position(4), ..binding }).await.is_err());
@@ -281,6 +306,8 @@ mod tests {
         assert_eq!(fence.positions, BTreeSet::from([original.position, binding.position]));
         assert!(open(binding).await.is_err());
         assert!(rank(binding, &derivative.key).await.is_err());
+        let (fenced, _) = families.read(family).await?.unwrap();
+        assert_eq!(release(binding).require_enrolled(&fenced).unwrap_err().code, "rtdb/erased-under-view");
         Ok(())
     }
 }

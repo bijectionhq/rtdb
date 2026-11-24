@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    CatalogReadCut, Database, NativeSession, Node, OwnedReadSession, QueryBasis, SessionIdentity, TimeBasis,
+    AppliedReadFloor, CatalogReadCut, Database, NativeSession, Node, OwnedReadSession, QueryBasis, SessionIdentity, TimeBasis,
     covers_transaction, hosted_source_unavailable, prepare_query,
 };
 
@@ -139,6 +139,10 @@ pub struct CurrentAssertionFamilyRead {
 }
 
 impl CurrentAssertionFamilyRead {
+    pub fn applied_source(&self) -> Option<TransactionKey> {
+        self.applied_source
+    }
+
     pub async fn carrier_journal_installation(&self) -> Result<HostedControlPoint> {
         let restored = self.carrier_point("bj_rtdb_restore_hold", "restore").await?;
         if restored.row.is_some() { return Err(hosted_source_unavailable()); }
@@ -204,6 +208,20 @@ impl OriginalAssertionFamilyReader {
     }
 
     pub async fn current(&self, deployment: Uuid, cancellation: &CancellationToken) -> Result<CurrentAssertionFamilyRead> {
+        self.current_read(deployment, None, cancellation).await
+    }
+
+    /// Opens a fresh Original control view containing every transaction in `floor`.
+    /// The caller supplies the floor from its authenticated Original history.
+    pub async fn current_covering(
+        &self, floor: &AppliedReadFloor, cancellation: &CancellationToken,
+    ) -> Result<CurrentAssertionFamilyRead> {
+        self.current_read(floor.history(), Some(floor), cancellation).await
+    }
+
+    async fn current_read(
+        &self, deployment: Uuid, floor: Option<&AppliedReadFloor>, cancellation: &CancellationToken,
+    ) -> Result<CurrentAssertionFamilyRead> {
         let unavailable = hosted_source_unavailable;
         let receipt = self.node.await_durable_source(
             &self.database, self.identity.as_ref(), true, Some(&self.attachment), cancellation,
@@ -221,8 +239,14 @@ impl OriginalAssertionFamilyReader {
         ).await?;
         let catalog = context.catalog.database(&self.database)?;
         let [partition] = catalog.partitions.as_slice() else { return Err(unavailable()); };
-        if receipt.applied.is_some_and(|floor| partition.tx_basis().is_none_or(|tip| !covers_transaction(tip, floor))) {
+        let head = partition.tx_basis();
+        if receipt.applied.is_some_and(|applied| head.is_none_or(|tip| !covers_transaction(tip, applied))) {
             return Err(unavailable());
+        }
+        if let Some(floor) = floor {
+            let applied = receipt.applied.filter(|applied| covers_transaction(*applied, floor.minimum()))
+                .ok_or_else(unavailable)?;
+            floor.require_transactions(&context, head.ok_or_else(unavailable)?, Some(applied)).await?;
         }
         context.check_cancelled()?;
         Ok(CurrentAssertionFamilyRead { context, owner: self.owner.clone(), applied_source: receipt.applied })
@@ -241,7 +265,7 @@ impl OriginalAssertionFamilyReader {
             if ordered != marker { return Err(unavailable()); }
             return Ok(AssertionFenceStatus::Ordered);
         }
-        if current.applied_source.is_some_and(|key| key.tx_id.0 >= attempt.position().0) {
+        if current.applied_source().is_some_and(|key| key.tx_id.0 >= attempt.position().0) {
             Ok(AssertionFenceStatus::Aborted)
         } else {
             Ok(AssertionFenceStatus::Pending)

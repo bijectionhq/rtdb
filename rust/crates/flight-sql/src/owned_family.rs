@@ -99,6 +99,7 @@ pub enum FamilyReleaseInputWire {
     World { member: FamilyOccurrenceWire, winner: Position, row: WorldRowAuthoring },
     WorldDerived { member: FamilyOccurrenceWire, stage: FamilyStage, world: Uuid, relation: String, key: Vec<u8> },
     RootDerived { member: FamilyOccurrenceWire, relation: String, key: Vec<u8> },
+    RootLanding { member: FamilyOccurrenceWire, binding: RootLandingBinding },
 }
 
 pub struct FamilyReleaseRegistrationWire {
@@ -290,6 +291,7 @@ impl<'a> Frame<'a> {
             3 => Ok(FamilyReleaseInputWire::RootDerived {
                 member, relation: self.text("derived relation")?, key: self.key()?,
             }),
+            4 => Ok(FamilyReleaseInputWire::RootLanding { member, binding: self.root_binding()? }),
             _ => Err(invalid("Invalid family release input kind")),
         }
     }
@@ -506,5 +508,45 @@ impl Service {
             }
         };
         Ok(ActionResult { body })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_prepare_decodes_an_exact_root_landing_binding() {
+        let member = FamilyOccurrenceWire {
+            position: Position { line_generation: [1; 16], publication: 2, ordinal: NonZeroU64::MIN },
+            assertion: AssertionId::from_bytes([3; 32]),
+            capability: FamilyStage {
+                deployment: Uuid::from_bytes([4; 16]), incarnation: NonZeroU64::MIN, stage: Uuid::from_bytes([5; 16]),
+            },
+        };
+        let binding = RootLandingBinding {
+            position: member.position, assertion: member.assertion, stage: *member.capability.stage.as_bytes(),
+            target: RootLandingTarget { receipt: [6; 32], review_slot: 0, address_extent: [7; 32], disclosure: [8; 32] },
+            payload_digest: [9; 32], link_digest: [10; 32],
+        };
+        let mut request = BytesMut::new();
+        request.extend_from_slice(&[0]);
+        request.extend_from_slice(&[11; 16]);
+        request.extend_from_slice(&[12; 72]);
+        request.extend_from_slice(&13_u64.to_be_bytes());
+        request.extend_from_slice(&[4]);
+        request.extend_from_slice(&member.position.to_bytes());
+        request.extend_from_slice(&member.assertion.to_bytes());
+        put_stage(&mut request, member.capability);
+        request.extend_from_slice(&binding.to_bytes());
+        let request = request.freeze();
+        let decoded = decode(FAMILY_RESPONSE_RELEASE_V2, &request).unwrap();
+        assert!(matches!(decoded, FamilyRequest::Release(FamilyReleaseRequest::Prepare {
+            input: FamilyReleaseInputWire::RootLanding { member: decoded_member, binding: decoded_binding }, ..
+        }) if decoded_member == member && decoded_binding == binding));
+        assert!(decode(FAMILY_RESPONSE_RELEASE_V2, &request.slice(..request.len() - 1)).is_err());
+        let mut extended = request.to_vec();
+        extended.push(0);
+        assert!(decode(FAMILY_RESPONSE_RELEASE_V2, &extended.into()).is_err());
     }
 }

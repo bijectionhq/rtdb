@@ -556,6 +556,8 @@ contract LogService {
         -- A pending vault claim freezes the enrolled inventory until the original source confirms its marker or a durable abort horizon.
         -- Ordinary and archive releases resolve pending claims against current original custody.
         -- A recoverable response hold is staged and promoted only under its original authenticated carrier registration and a live current marker check.
+        -- A carrier registration observation covers the exact original transaction sampled when its journal authority was opened.
+        -- An exact Root response hold binds the activated member, stage, receipt, address and extent, disclosure and envelope digests to its original response part and cutoff.
         -- The family compare-and-swap excludes delayed promotion before the original vault acknowledges a terminal response hold.
         -- An expired release holds custody until exact private cancellation or authenticated transport disposal.
         -- A landing enrolls its destination and separate private link stages in a live family before provisioning either capability.
