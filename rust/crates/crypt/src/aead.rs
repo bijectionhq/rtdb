@@ -35,6 +35,10 @@ pub(super) fn seal(key: &DataKey, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8
     Ok(bytes)
 }
 
+pub(super) fn has_envelope(bytes: &[u8]) -> bool {
+    bytes.len() >= SALT_LEN + AES_256_GCM.tag_len()
+}
+
 pub(super) fn open(key: &DataKey, aad: &[u8], envelope: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let (salt, ciphertext) = envelope
         .split_first_chunk::<SALT_LEN>()

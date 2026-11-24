@@ -151,7 +151,9 @@ impl NativeServingHandle {
             if error.category == AnomalyCategory::Interrupted { interrupted() } else { error }
         })?;
         let receipt = self.source_replies.get(position).ok_or_else(interrupted)??;
-        project_receipt(&self.view.borrow().index, receipt, scope.as_ref())
+        let Some(scope) = &scope else { return Ok(receipt); };
+        let index = self.view.borrow().index.clone();
+        project_receipt(&index, receipt, Some(scope))
     }
 
     pub async fn tx_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
