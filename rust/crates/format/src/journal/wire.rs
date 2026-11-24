@@ -90,6 +90,10 @@ struct KeyRetirement {
     rotation_lsn: u64,
     #[prost(sint64, tag = "3")]
     observed_at: i64,
+    #[prost(sint64, optional, tag = "4")]
+    unreadable_by: Option<i64>,
+    #[prost(bool, tag = "5")]
+    armed: bool,
 }
 
 #[derive(Message)]
@@ -135,11 +139,13 @@ impl TryFrom<&super::Record> for Record {
             }),
             Settle { tx_lsn } => Kind::Settle(TimedDecision { tx_lsn: *tx_lsn }),
             Refuse { tx_lsn } => Kind::Refuse(TimedDecision { tx_lsn: *tx_lsn }),
-            KeyRetirement { generation, rotation_lsn, observed_at } => {
+            KeyRetirement { generation, rotation_lsn, observed_at, unreadable_by, armed } => {
                 Kind::KeyRetirement(self::KeyRetirement {
                     generation: *generation,
                     rotation_lsn: *rotation_lsn,
                     observed_at: *observed_at,
+                    unreadable_by: *unreadable_by,
+                    armed: *armed,
                 })
             }
         };
@@ -189,6 +195,8 @@ impl TryFrom<Record> for super::Record {
                     generation: retirement.generation,
                     rotation_lsn: retirement.rotation_lsn,
                     observed_at: retirement.observed_at,
+                    unreadable_by: retirement.unreadable_by,
+                    armed: retirement.armed,
                 },
             },
         )

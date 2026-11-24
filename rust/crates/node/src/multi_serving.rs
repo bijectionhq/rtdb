@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact};
+use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact};
 use rtdb_types::{
     Anomaly, AnomalyCategory, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -62,7 +62,7 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
+        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
           "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
     }
 

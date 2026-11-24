@@ -9,7 +9,7 @@ use rtdb_crypt::LocalKms;
 use rtdb_logkeeper::simulation::{Fault, FaultJournal};
 use rtdb_store::{MemoryStore, read_file};
 use rtdb_tx::transact::{
-    Cell, Declaration, Guard, Outcome, REQUIREMENT_FAILED, Resolution, Row, Version, Visibility, Window,
+    Cell, Declaration, Guard, Op, Outcome, REQUIREMENT_FAILED, Resolution, Row, Version, Visibility, Window,
 };
 use rtdb_types::{
     EntityId, StructFields, TableRef, Value,
@@ -1027,6 +1027,43 @@ async fn multi_driver_routes_the_same_idempotency_key_in_two_receipt_namespaces(
         database.tx_status(&[2; 16]).await.unwrap_err().code,
         "rtdb/unknown-transaction"
     );
+}
+
+#[tokio::test]
+async fn interrupted_erase_recovers_the_retirement_proof_and_atomic_floor() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(Identity(1)))));
+    let mut writer = cluster.node(1, faults.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let original = writer.transact(&put(1, 1, "old row")).await.unwrap();
+
+    let mut erase = put(2, 2, "retained floor");
+    erase.ops.insert(0, Op::Erase { branch: None, table: table(), ids: vec![EntityId::Integer(1)] });
+    let pin = Uuid::from_u128(42);
+    writer.pin_checkpoint_at(pin, original.basis, None).await.unwrap();
+    assert_eq!(writer.transact(&erase).await.unwrap_err().code, "rtdb/key-rotation-pending");
+    writer.release_pin(pin).await.unwrap();
+
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(writer.transact(&erase).await.unwrap_err().category, AnomalyCategory::Interrupted);
+    assert_eq!(writer.tx_status(&erase.key).await.unwrap_err().code, "rtdb/erasure-pending");
+    writer.tick(&live(1)).await.unwrap();
+    let receipt = writer.tx_status(&erase.key).await.unwrap();
+    assert_eq!(receipt.erasure, Some(Erasure::Armed { unreadable_by: Timestamp(120) }));
+    assert_eq!(writer.transact(&erase).await.unwrap(), receipt);
+
+    cluster.at(120);
+    assert_eq!(writer.check_generation(1).await.unwrap_err().code, "rtdb/erased-under-view");
+    let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
+    successor.tick(&live(2)).await.unwrap();
+    assert_eq!(successor.tx_status(&erase.key).await.unwrap(), receipt);
+    assert_eq!(text_at(&mut successor, MAIN_BRANCH, 1).await, None);
+    assert_eq!(text_at(&mut successor, MAIN_BRANCH, 2).await, Some(Value::Utf8("retained floor".into())));
+    successor.checkpoint(Vec::new()).await.unwrap();
+    let mut follower = cluster.node(3, Arc::new(journal.handle(Identity(3))));
+    assert_eq!(follower.tx_status(&erase.key).await.unwrap(), receipt);
 }
 
 #[tokio::test]

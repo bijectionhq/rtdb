@@ -53,14 +53,18 @@ impl ErasurePlan {
         self.trim_through
     }
 
-    fn retirement(self, rotation_committed_at: i64) -> Result<Retirement> {
+    pub fn retirement(self, rotation_committed_at: i64) -> Result<Retirement> {
         let unreadable_by = rotation_committed_at
             .checked_add_unsigned(self.grant_micros)
             .ok_or_else(invalid_plan)?;
-        Ok(Retirement {
+        Ok(self.retirement_by(unreadable_by))
+    }
+
+    pub fn retirement_by(self, unreadable_by: i64) -> Retirement {
+        Retirement {
             generation: self.old,
             unreadable_by,
-        })
+        }
     }
 
     /// Stage a complete clean image from the database fold.
@@ -141,7 +145,7 @@ impl ErasurePlan {
         T: Future<Output = Result<()>> + Send,
     {
         let retirement = self.retirement(rotation_committed_at)?;
-        kms.retire(self.old, retirement.unreadable_by).await?;
+        retirement.arm(kms).await?;
         trim(self.trim_through).await?;
         Ok(retirement)
     }
@@ -196,6 +200,10 @@ pub struct Retirement {
 impl Retirement {
     pub fn unreadable_by(self) -> i64 {
         self.unreadable_by
+    }
+
+    pub async fn arm(self, kms: &dyn Kms) -> Result<()> {
+        kms.retire(self.generation, self.unreadable_by).await
     }
 
     pub async fn destroy(self, kms: &dyn Kms) -> Result<()> {

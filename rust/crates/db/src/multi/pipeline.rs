@@ -9,7 +9,7 @@ use journal_contract::{Epoch, JournalError, Lsn};
 use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
-    Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
+    Decision, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
     TransactPipeline, TransactState, TransactionRecord, TxKey,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{ClaimVerifier, LabelScope}};
@@ -21,12 +21,12 @@ use tokio::{
 use crate::replay::JournalCoordinates;
 
 use super::{
-    Entry, Lease, MultiDatabase, Role, Stream, missing_receipt, next, no_writer, reject_erasure,
+    Entry, Lease, MultiDatabase, Role, Stream, missing_receipt, next, no_writer,
 };
 
 const CAPACITY: usize = 64;
-const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, "row-visibility", "branches"];
-const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, "row-visibility"];
+const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, PHYSICAL_ERASURE, "row-visibility", "branches"];
+const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, "row-visibility"];
 type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
@@ -63,8 +63,8 @@ impl Work {
         }
     }
 
-    fn writes(&self) -> bool {
-        !self.request.ops.is_empty() || !self.request.otherwise.is_empty()
+    fn batchable(&self) -> bool {
+        !self.request.uses_erasure() && (!self.request.ops.is_empty() || !self.request.otherwise.is_empty())
     }
 
     fn timed(&self) -> bool {
@@ -228,7 +228,7 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             },
         };
         match command {
-            Command::Transact(work) if work.writes() => {
+            Command::Transact(work) if work.batchable() => {
                 burst(&database, &mut input, &mut barrier, work).await;
             }
             Command::Transact(work) => {
@@ -303,7 +303,7 @@ async fn burst(
                     result = &mut append => break result,
                     command = input.recv(), if input_open && barrier.is_none() && occupied < CAPACITY => {
                         match command {
-                            Some(Command::Transact(work)) if work.writes() => {
+                            Some(Command::Transact(work)) if work.batchable() => {
                                 let mut group = vec![work];
                                 fill(input, barrier, &mut group, CAPACITY - occupied);
                                 stage_batch(&mut *database.lock().await, &mut staged, group);
@@ -399,7 +399,7 @@ fn fill(
 ) {
     while barrier.is_none() && queued.len() < limit {
         match input.try_recv() {
-            Ok(Command::Transact(work)) if work.writes() => queued.push(work),
+            Ok(Command::Transact(work)) if work.batchable() => queued.push(work),
             Ok(command) => *barrier = Some(command),
             Err(_) => break,
         }
@@ -407,40 +407,28 @@ fn fill(
 }
 
 fn stage_batch(database: &mut MultiDatabase, staged: &mut VecDeque<Staged>, queued: Vec<Work>) {
-    let mut eligible = Vec::with_capacity(queued.len());
-    for work in queued {
-        match reject_erasure(&work.request) {
-            Ok(()) => eligible.push(work),
-            Err(error) => {
-                let _ = work.reply.send(Err(error));
-            }
-        }
-    }
-    if eligible.is_empty() {
-        return;
-    }
     if database.stream.batch.is_some()
-        && eligible.len() > 1
-        && eligible
+        && queued.len() > 1
+        && queued
             .iter()
             .all(|work| work.scope.is_none() && !work.timed())
     {
-        let requests: Vec<_> = eligible.iter().map(|work| work.request.clone()).collect();
-        let claims = VerifiedClaims::union(eligible.iter().map(|work| &work.claims));
+        let requests: Vec<_> = queued.iter().map(|work| work.request.clone()).collect();
+        let claims = VerifiedClaims::union(queued.iter().map(|work| &work.claims));
         match database.decide_group(&requests, &claims) {
             Ok(decisions) => {
-                for (work, decision) in eligible.into_iter().zip(decisions) {
+                for (work, decision) in queued.into_iter().zip(decisions) {
                     stage(database, staged, work, decision);
                 }
             }
             Err(error) => {
-                for work in eligible {
+                for work in queued {
                     let _ = work.reply.send(Err(error.clone()));
                 }
             }
         }
     } else {
-        for work in eligible {
+        for work in queued {
             let decision = database.decide_one(
                 &work.request,
                 work.scope.as_ref().map(Scope::authority),
@@ -619,7 +607,7 @@ impl MultiDatabase {
         writes: Vec<Append>,
     ) -> Result<Vec<Receipt>> {
         let through = writes.last().expect("nonempty append group").at;
-        let restored = writes.iter().any(|write| matches!(&write.entry.record, Record::Checkpoint(checkpoint) if checkpoint.restore));
+        let reload = writes.iter().any(|write| reload_writer_fold(&write.entry.record));
         if self.committed.is_none() {
             self.catch_up(through).await?;
         }
@@ -632,13 +620,13 @@ impl MultiDatabase {
         self.committed = Some(state);
         self.require_authority(lease)?;
         let coordinates = self.state().coordinates;
-        let restored = restored.then(|| self.new_pipeline()).transpose()?;
+        let reloaded = reload.then(|| self.new_pipeline()).transpose()?;
         let writer = self
             .writer
             .as_mut()
             .filter(|writer| !writer.recovering && writer.lease.epoch == lease.epoch)
             .ok_or_else(no_writer)?;
-        if let Some(pipeline) = restored {
+        if let Some(pipeline) = reloaded {
             writer.pipeline = pipeline;
             writer.acknowledged = through;
             return Ok(Vec::new());
@@ -695,11 +683,10 @@ impl MultiDatabase {
             return Err(no_writer());
         }
         let coordinates = state.coordinates;
-        let restored = state.records.iter().enumerate().any(|(offset, record)| {
-            state.floor.0 + offset as u64 > acknowledged.0
-                && matches!(record, Record::Checkpoint(checkpoint) if checkpoint.restore)
+        let reload = state.records.iter().enumerate().any(|(offset, record)| {
+            state.floor.0 + offset as u64 > acknowledged.0 && reload_writer_fold(record)
         });
-        if restored {
+        if reload {
             let pipeline = self.new_pipeline()?;
             let writer = self.writer.as_mut().ok_or_else(no_writer)?;
             writer.pipeline = pipeline;
@@ -784,6 +771,11 @@ fn plan(decision: Decision, lease: Lease, generation: u64, coordinates: JournalC
             },
         }),
     })
+}
+
+fn reload_writer_fold(record: &Record) -> bool {
+    matches!(record, Record::Checkpoint(checkpoint) if checkpoint.restore)
+        || matches!(record, Record::KeyRetirement { armed: true, .. })
 }
 
 fn journal_record(payload: Bytes, coordinates: JournalCoordinates) -> Result<Record> {

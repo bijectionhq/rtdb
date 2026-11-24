@@ -3,12 +3,12 @@ use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
 use journal_contract::{Epoch, Journal, JournalError, Lsn};
 use rtdb_crypt::{Generation, Kms, tokens::TokenAuthority};
 use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, ObjectKind, Pin, Record};
-use rtdb_index::branches::BranchIndex;
+use rtdb_index::branches::{BranchEffect, BranchIndex};
 use rtdb_store::{
     ObjectKey, ObjectStore, Reachability, StoredTokenKeys, VerifiedManifest, WriterObjects, read_manifest,
 };
 use rtdb_tx::transact::{
-    Op, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
+    Erasure, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
 use uuid::Uuid;
@@ -158,7 +158,7 @@ impl MultiDatabase {
         if let Some(writer) = &self.writer {
             let lease = writer.lease;
             self.refuse_pending(lease).await?;
-            self.finish_key_rotation().await?;
+            self.finish_pending_erasure().await?;
             if self.upper().saturating_add(self.options.lease_micros / 2) >= lease.until {
                 self.renew().await?;
             }
@@ -225,7 +225,7 @@ impl MultiDatabase {
                 objects: WriterObjects::new(self.options.database, attempt.epoch.0),
                 uploaded: BTreeSet::new(),
             });
-            if let Err(error) = self.finish_key_rotation().await {
+            if let Err(error) = self.finish_pending_erasure().await {
                 self.withdraw_writer();
                 return Err(error);
             }
@@ -306,7 +306,12 @@ impl MultiDatabase {
         scope: Option<ScopedTransact<'_>>,
     ) -> Result<Receipt> {
         self.refresh().await?;
-        reject_erasure(request)?;
+        if request.uses_erasure() {
+            self.finish_pending_erasure().await?;
+            if self.rotation_destroyed() && self.check_erase_storage(self.authority()?).await.is_ok() {
+                self.checkpoint(Vec::new()).await?;
+            }
+        }
         let claims = self
             .tokens
             .verify_claims_in(request.claims(), scope.map(|scope| scope.labels))
@@ -316,17 +321,26 @@ impl MultiDatabase {
             Planned::Append(write) => write,
         };
         let lease = self.authority()?;
+        if request.uses_erasure() && write_erases(&write)?
+            && let Err(error) = self.check_erase_storage(lease).await
+        {
+            let pipeline = self.new_pipeline()?;
+            self.writer.as_mut().ok_or_else(no_writer)?.pipeline = pipeline;
+            return Err(error);
+        }
         let original = write.at;
         let (upper, receipts) = self.commit_one(lease, write).await?;
         if request.window.before.is_none() {
-            return receipt_for(receipts, self.state().coordinates.position(original)?, &request.key);
+            let receipt = receipt_for(receipts, self.state().coordinates.position(original)?, &request.key)?;
+            return self.complete_erase_receipt(receipt, scope).await;
         }
         let (terminal, _) = self
             .decide_terminal(lease, original, upper)
             .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
         let position = terminal.at;
         let (_, receipts) = self.commit_one(lease, terminal).await?;
-        receipt_for(receipts, self.state().coordinates.position(position)?, &request.key)
+        let receipt = receipt_for(receipts, self.state().coordinates.position(position)?, &request.key)?;
+        self.complete_erase_receipt(receipt, scope).await
     }
 
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
@@ -354,6 +368,9 @@ impl MultiDatabase {
             (None, Some(scope)) => self.state().transactions.tx_status_scoped(key, scope),
             (None, None) => self.state().transactions.tx_status(key),
         }?;
+        if receipt.erasure == Some(Erasure::Pending) {
+            return Err(erasure_pending());
+        }
         self.project_receipt(receipt, scope)
     }
 
@@ -440,6 +457,9 @@ impl MultiDatabase {
     pub async fn checkpoint(&mut self, files: Vec<ObjectId>) -> Result<ObjectId> {
         self.refresh().await?;
         let lease = self.authority()?;
+        if self.state().transactions.pending_erasure().is_some() {
+            return Err(erasure_pending());
+        }
         self.require_destroyed_generation()?;
         let closure = self.reachability(lease).await?;
         self.validate_files(&closure, &files)?;
@@ -769,19 +789,18 @@ fn no_writer() -> Anomaly {
     )
 }
 
-fn reject_erasure(request: &Transact) -> Result<()> {
-    if request
-        .ops
-        .iter()
-        .chain(&request.otherwise)
-        .any(|op| matches!(op, Op::Erase { .. }))
-    {
-        return Err(Anomaly::unsupported(
-            "rtdb/erasure-required",
-            "Erasure requires a qualified key rotation path",
-        ));
-    }
-    Ok(())
+fn write_erases(write: &Append) -> Result<bool> {
+    let Record::Tx { payload, .. } = &write.entry.record else {
+        return Err(missing_receipt());
+    };
+    let TransactionRecord::Tx(tx) = TransactionRecord::decode(payload)? else {
+        return Err(missing_receipt());
+    };
+    Ok(tx.effects().iter().any(|effect| matches!(effect, BranchEffect::Erase { .. })))
+}
+
+fn erasure_pending() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement")
 }
 
 fn missing_receipt() -> Anomaly {

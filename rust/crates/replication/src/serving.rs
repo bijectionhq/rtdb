@@ -141,7 +141,7 @@ impl NativeServingHandle {
             self.replication.serving_barrier(cancellation).await?;
             return self.replication.serving_validate(request, cancellation).await;
         }
-        request.check_source_custody()?;
+        request.check_source_admission()?;
         let scope = request.scope.clone();
         let bytes = cancellation.run_until_cancelled(self.source_authority.seal(request)).await
             .ok_or_else(interrupted)??;
@@ -165,7 +165,10 @@ impl<C> NativeRequest<C> {
         self.transaction.ops.is_empty() && self.transaction.otherwise.is_empty()
     }
 
-    fn check_source_custody(&self) -> Result<()> {
+    fn check_source_admission(&self) -> Result<()> {
+        if self.transaction.uses_erasure() {
+            return Err(Anomaly::unsupported("rtdb/erasure-required", "Default erasure needs ordered retirement of the source and replica keys"));
+        }
         let features = if self.scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
         self.transaction.require_sealed_custody(features)
     }
@@ -314,7 +317,7 @@ impl NativeServing {
             Err(error) => return self.source_reply(source, Err(error)),
         };
         if request.is_validation() { return self.source_reply(source, Err(invalid_source_request())); }
-        if let Err(error) = request.check_source_custody() { return self.source_reply(source, Err(error)); }
+        if let Err(error) = request.check_source_admission() { return self.source_reply(source, Err(error)); }
         if self.request_pending(&request) { return Err(invalid()); }
         if self.pipeline.is_none() {
             let next = self.next_position()?;

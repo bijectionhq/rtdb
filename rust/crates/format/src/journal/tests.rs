@@ -42,6 +42,8 @@ fn record_kinds_round_trip_with_fixed_tags() {
             generation: 3,
             rotation_lsn: u64::MAX,
             observed_at: i64::MIN,
+            unreadable_by: Some(i64::MAX),
+            armed: true,
         },
     ];
     for (i, record) in records.into_iter().enumerate() {

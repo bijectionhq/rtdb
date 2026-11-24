@@ -53,7 +53,14 @@ pub(crate) struct Rotation {
     pub(crate) cut: Lsn,
     pub(crate) generation: u64,
     pub(crate) committed: bool,
-    pub(crate) retirement_observed_at: Option<i64>,
+    pub(crate) retirement: Option<RetirementObservation>,
+    pub(crate) retirement_armed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RetirementObservation {
+    pub(crate) observed_at: i64,
+    pub(crate) unreadable_by: Option<i64>,
 }
 
 pub(crate) struct Committed {
@@ -246,7 +253,8 @@ impl Committed {
                         cut: lsn,
                         generation: checkpoint.key_generation,
                         committed: false,
-                        retirement_observed_at: None,
+                        retirement: None,
+                        retirement_armed: false,
                     });
                 }
                 checkpoint.key_generation
@@ -270,14 +278,32 @@ impl Committed {
                 rotation.committed = true;
                 *generation
             }
-            Record::KeyRetirement { generation, rotation_lsn, observed_at } => {
+            Record::KeyRetirement { generation, rotation_lsn, observed_at, unreadable_by, armed } => {
                 let rotation = self.rotation.as_mut().filter(|rotation| {
                     rotation.committed
                         && rotation.generation == *generation
                         && rotation.cut.0.checked_add(1) == Some(*rotation_lsn)
-                        && rotation.retirement_observed_at.is_none()
                 }).ok_or_else(|| invalid("Key retirement does not match an unfenced rotation"))?;
-                rotation.retirement_observed_at = Some(*observed_at);
+                if unreadable_by.is_some_and(|deadline| deadline < *observed_at) {
+                    return Err(invalid("The key retirement deadline precedes the rotation observation"));
+                }
+                if *armed {
+                    let deadline = unreadable_by.ok_or_else(|| invalid("The armed retirement has no deadline"))?;
+                    if rotation.retirement_armed || !rotation.retirement.is_some_and(|prior| {
+                        prior.observed_at == *observed_at && prior.unreadable_by.is_none_or(|prior| prior == deadline)
+                    }) {
+                        return Err(invalid("The armed retirement changed the observed deadline"));
+                    }
+                    rotation.retirement_armed = true;
+                    if let Some(basis) = self.transactions.pending_erasure() {
+                        self.transactions.arm_erasure(basis, Timestamp(deadline))?;
+                    }
+                } else {
+                    if rotation.retirement.is_some() {
+                        return Err(invalid("The rotation already has a retirement observation"));
+                    }
+                    rotation.retirement = Some(RetirementObservation { observed_at: *observed_at, unreadable_by: *unreadable_by });
+                }
                 self.generation
             }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
@@ -352,7 +378,8 @@ impl Committed {
                 cut: lsn,
                 generation: checkpoint.key_generation,
                 committed: false,
-                retirement_observed_at: None,
+                retirement: None,
+                retirement_armed: false,
             });
         }
         if position > self.coordinates.position(Lsn(checkpoint.through))?

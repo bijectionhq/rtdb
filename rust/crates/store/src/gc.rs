@@ -92,6 +92,10 @@ impl Reachability {
         self.objects.contains(&id)
     }
 
+    pub fn has_files(&self) -> bool {
+        self.objects.iter().any(|id| id.kind == ObjectKind::File)
+    }
+
     /// Active pins reconstructed by `from_records`.
     pub fn pins(&self) -> impl Iterator<Item = &Pin> {
         self.pins.values()

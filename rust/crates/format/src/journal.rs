@@ -142,6 +142,8 @@ pub enum Record {
         generation: u64,
         rotation_lsn: u64,
         observed_at: i64,
+        unreadable_by: Option<i64>,
+        armed: bool,
     },
 }
 
