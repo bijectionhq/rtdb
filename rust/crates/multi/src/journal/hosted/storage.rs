@@ -286,9 +286,10 @@ impl StoreFactory {
         if route.writer.epoch != epoch {
             return Err(invalid("The ordered reader epoch changed during attachment"));
         }
-        let (lower, blocks) = tokio::time::timeout_at(deadline.into(),
-            self.open_checkpoint(placement, attachment, hold, Arc::clone(&io)),
-        ).await.map_err(|_| invalid("The checkpoint read exceeded its ordered lease"))??;
+        let (lower, blocks) = with_read_lease(deadline, |_| async {
+            self.open_checkpoint(placement, attachment, hold, Arc::clone(&io)).await
+                .map_err(|error| Error::Remote { key: "ordered checkpoint".into(), message: error.to_string() })
+        }).await?;
         let objects = ReplicaObjects {
             installed: placement.worker.placement(), storage_prefix: placement.record.storage_prefix(),
             root: root.clone(), bucket: self.storage.bucket(Arc::clone(&io)).await?,

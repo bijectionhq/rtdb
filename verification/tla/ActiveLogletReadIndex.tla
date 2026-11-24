@@ -11,6 +11,8 @@ Genesis == [position |-> 0, digest |-> "genesis"]
 Cut(digest) == [position |-> 1, digest |-> digest]
 EmptyReply == [nonce |-> 0, route |-> "none", cut |-> Genesis]
 Quorum(voters, roster) == voters \subseteq roster /\ Cardinality(voters) >= 2
+Handoff(cut, destination) == [cut |-> cut, source |-> Old, destination |-> destination,
+                                checkpoint |-> cut, epoch |-> 2]
 
 VARIABLE s
 
@@ -31,6 +33,7 @@ Initial ==
          writer |-> TRUE, certified |-> FALSE, acknowledged |-> FALSE,
          readerHelp |-> FALSE,
          outcome |-> "unknown", prepared |-> Genesis,
+         handoffVotes |-> [j \in Old |-> {}], handoff |-> Handoff(Genesis, New),
          installed |-> [j \in Journals |-> Genesis], stable |-> Genesis,
          applied |-> {Genesis}, holds |-> {}, output |-> Genesis,
          read |-> [step |-> "idle", nonce |-> 0, route |-> "none",
@@ -109,17 +112,35 @@ Exclude ==
        IN ~Quorum(Old \ negative, Old) \/ (Mutation = "silence_excludes" /\ s.expired)
     /\ s' = [s EXCEPT !.outcome = "excluded"]
 
-Prepare ==
+HandoffReady ==
     /\ s.phase = "sealed"
     /\ (Settled \/ Mutation = "activate_unknown")
     /\ (~s.certified \/ DurableOn(Cut(s.digest), Old))
     /\ (s.admission # "ordinary" \/ s.staged \cap s.sealed = {} \/ s.certified)
-    /\ s' = [s EXCEPT !.phase = "prepared", !.prepared = s.stable]
+
+SignHandoff(journal) ==
+    /\ HandoffReady
+    /\ journal \in s.sealed \cap s.online /\ s.handoffVotes[journal] = {}
+    /\ s' = [s EXCEPT !.handoffVotes[journal] = {Handoff(s.stable, New)}]
+
+SignedFor(handoff) == {j \in Old : handoff \in s.handoffVotes[j]}
+
+Prepare ==
+    /\ HandoffReady
+    /\ LET proposal == Handoff(s.stable, New)
+       IN /\ Quorum(SignedFor(proposal), Old) \/ Mutation = "one_handoff_vote" /\ SignedFor(proposal) # {}
+          /\ s' = [s EXCEPT !.phase = "prepared", !.prepared = s.stable,
+                         !.handoff = IF Mutation = "swap_activation_roster" THEN Handoff(s.stable, Old)
+                                      ELSE IF Mutation = "swap_handoff_checkpoint"
+                                           THEN [proposal EXCEPT !.checkpoint = Cut("y")]
+                                           ELSE proposal]
 
 Activate ==
     /\ s.phase = "prepared" /\ Quorum(s.online \cap New, New)
+    /\ (Quorum(SignedFor(s.handoff), Old) /\ s.handoff = Handoff(s.prepared, New))
+        \/ Mutation \in {"swap_activation_roster", "swap_handoff_checkpoint", "one_handoff_vote"}
     /\ s' = [s EXCEPT !.phase = "new",
-               !.installed = [j \in Journals |-> IF j \in New
+               !.installed = [j \in Journals |-> IF j \in New \cap s.online
                              THEN (IF Mutation = "lose_floor" THEN Genesis ELSE s.prepared)
                              ELSE s.installed[j]]]
 
@@ -180,7 +201,7 @@ LoseHold ==
 Next ==
     \/ \E admission \in {"ordinary", "guarded"}, d \in Digests : Offer(admission, d)
     \/ \E j \in Journals, eligible \in BOOLEAN, retain \in BOOLEAN : Stage(j, eligible, retain)
-    \/ \E j \in Journals : Copy(j) \/ Install(j) \/ Seal(j) \/ Probe(j) \/ Trim(j)
+    \/ \E j \in Journals : Copy(j) \/ Install(j) \/ Seal(j) \/ SignHandoff(j) \/ Probe(j) \/ Trim(j)
     \/ \E j \in Journals : (j \in s.online /\ s' = [s EXCEPT !.online = @ \ {j}])
     \/ \E j \in Journals : (j \notin s.online /\ s' = [s EXCEPT !.online = @ \cup {j}])
     \/ (s.writer /\ s' = [s EXCEPT !.writer = FALSE])
@@ -206,6 +227,10 @@ ActiveAuthority ==
     s.read.phaseAtSample = "new"
 ActivationContinuity ==
     s.phase = "new" => Quorum({j \in New : s.installed[j] = s.prepared}, New)
+PortableActivation ==
+    s.phase = "new" =>
+        /\ s.handoff = Handoff(s.prepared, New)
+        /\ Quorum(SignedFor(s.handoff), Old)
 StableWitnessRetained ==
     s.phase = "old" /\ s.stable.position = 1 => DurableOn(s.stable, Old)
 StrictOriginalAcceptance ==

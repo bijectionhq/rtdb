@@ -99,6 +99,13 @@ pub struct PlaintextView {
     memory: Arc<MemoryBudget>,
     units: Mutex<BTreeMap<(usize, ObjectKey), Arc<Unit>>>,
     certified_reads: Mutex<BTreeMap<[u8; 16], (Arc<CertifiedRead>, Arc<MemoryReservation>)>>,
+    protected_cuts: Mutex<Vec<ProtectedCut>>,
+}
+
+struct ProtectedCut {
+    view: Arc<HeldView>,
+    lease: Arc<ReadLease>,
+    _allocation: Arc<MemoryReservation>,
 }
 
 impl PlaintextView {
@@ -107,6 +114,7 @@ impl PlaintextView {
             memory,
             units: Mutex::new(BTreeMap::new()),
             certified_reads: Mutex::new(BTreeMap::new()),
+            protected_cuts: Mutex::new(Vec::new()),
         })
     }
 
@@ -139,6 +147,19 @@ impl PlaintextView {
                     let charge = view.memory.reserve(256)?;
                     entry.insert((read.clone(), charge));
                 }
+            }
+            Ok(())
+        }).unwrap_or(Ok(()))
+    }
+
+    /// Keep the exact selected catalog and its deadline with a bounded action reply.
+    pub fn track_protected_cut(view: Arc<HeldView>, lease: Arc<ReadLease>) -> rtdb_types::Result<()> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            for owner in views.iter() {
+                let allocation = owner.memory.reserve(std::mem::size_of::<ProtectedCut>())?;
+                owner.protected_cuts.lock().push(ProtectedCut {
+                    view: Arc::clone(&view), lease: Arc::clone(&lease), _allocation: allocation,
+                });
             }
             Ok(())
         }).unwrap_or(Ok(()))
@@ -235,14 +256,20 @@ impl PlaintextView {
         }
         let certified_reads = self.certified_reads.lock();
         let trace_bytes = self.memory.reserve(certified_reads.len().saturating_mul(std::mem::size_of::<Arc<CertifiedRead>>()))?;
-        let delivery = PlaintextDelivery {
+        let mut delivery = PlaintextDelivery {
             certified_reads: certified_reads.values().map(|(read, _)| read.clone()).collect(),
             _trace_bytes: trace_bytes,
             deadline,
-            view: None,
+            views: Vec::new(),
+            lease: None,
             _custody: custody,
             _allocation: allocation,
         };
+        for cut in self.protected_cuts.lock().iter() {
+            let charge = self.memory.reserve(std::mem::size_of::<Arc<HeldView>>())?;
+            delivery._custody.push(charge);
+            delivery = delivery.holding(Arc::clone(&cut.view), Some(Arc::clone(&cut.lease)));
+        }
         delivery.check()?;
         Ok(delivery)
     }
@@ -298,7 +325,8 @@ pub struct PlaintextDelivery {
     certified_reads: Vec<Arc<CertifiedRead>>,
     _trace_bytes: Arc<MemoryReservation>,
     deadline: Option<DeliveryDeadline>,
-    view: Option<(Arc<HeldView>, Option<Arc<ReadLease>>)>,
+    views: Vec<Arc<HeldView>>,
+    lease: Option<Arc<ReadLease>>,
     _custody: Vec<Arc<dyn Send + Sync>>,
     _allocation: Arc<MemoryReservation>,
 }
@@ -311,14 +339,15 @@ impl PlaintextDelivery {
     }
 
     pub fn holding(mut self, view: Arc<HeldView>, lease: Option<Arc<ReadLease>>) -> Self {
-        if let Some(lease) = &lease {
+        if let Some(lease) = lease {
             let sampled = Instant::now();
             let wall = SystemTime::now();
             let cutoff = sampled.checked_add(lease.remaining()).unwrap_or(sampled);
             let cutoff = DeliveryDeadline::sampled(sampled, wall, cutoff);
             self.deadline = Some(self.deadline.map_or(cutoff, |prior| prior.earlier(cutoff)));
+            self.lease = Some(self.lease.take().map_or_else(|| lease.clone(), |prior| prior.earlier(lease.clone())));
         }
-        self.view = Some((view, lease));
+        self.views.push(view);
         self
     }
 
@@ -327,7 +356,7 @@ impl PlaintextDelivery {
     pub fn transport_deadline(&self) -> Option<DeliveryDeadline> { self.deadline }
 
     pub fn check(&self) -> rtdb_types::Result<()> {
-        if let Some((_, Some(lease))) = &self.view { lease.check()?; }
+        if let Some(lease) = &self.lease { lease.check()?; }
         if self.deadline.is_some_and(|deadline| !deadline.is_live()) {
             return Err(expired());
         }
@@ -342,7 +371,7 @@ impl PlaintextDelivery {
     ) -> rtdb_types::Result<T> {
         self.check()?;
         let Some(deadline) = self.deadline else { return work.await; };
-        let handoff = Handoff { deadline, lease: self.view.as_ref().and_then(|(_, lease)| lease.clone()) };
+        let handoff = Handoff { deadline, lease: self.lease.clone() };
         let mut work = std::pin::pin!(work);
         let result = tokio::time::timeout_at(deadline.instant.into(), ANSWER_HANDOFF.scope(handoff, poll_fn(|cx| {
             if let Err(error) = self.check() { return Poll::Ready(Err(error)); }

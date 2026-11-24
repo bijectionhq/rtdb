@@ -2128,6 +2128,12 @@ TLA_CASES = (
      ('Mutation = "none"', 'Mutation = "replay_probe"'), "StableCutCovered"),
     ("ActiveLogletReadIndex", "read-index-activation-loses-floor",
      ('Mutation = "none"', 'Mutation = "lose_floor"'), "ActivationContinuity"),
+    ("ActiveLogletReadIndex", "read-index-activation-wrong-destination",
+     ('Mutation = "none"', 'Mutation = "swap_activation_roster"'), "PortableActivation"),
+    ("ActiveLogletReadIndex", "read-index-activation-wrong-checkpoint",
+     ('Mutation = "none"', 'Mutation = "swap_handoff_checkpoint"'), "PortableActivation"),
+    ("ActiveLogletReadIndex", "read-index-activation-one-predecessor",
+     ('Mutation = "none"', 'Mutation = "one_handoff_vote"'), "PortableActivation"),
     ("ActiveLogletReadIndex", "read-index-trim-loses-witness",
      ('Mutation = "none"', 'Mutation = "forget_witness"'), "StableWitnessRetained"),
     ("ActiveLogletReadIndex", "read-index-copy-votes",
@@ -2144,6 +2150,17 @@ TLA_CASES = (
      ("CHECK_DEADLOCK FALSE", "INVARIANT NoReaderStabilization\nCHECK_DEADLOCK FALSE"), "NoReaderStabilization"),
     ("ActiveLogletReadIndex", "read-index-expired-unknown-witness",
      ("CHECK_DEADLOCK FALSE", "INVARIANT NoExpiredUnknown\nCHECK_DEADLOCK FALSE"), "NoExpiredUnknown"),
+    ("OrderedReaderRelease", "ordered-reader-release", None, None),
+    ("OrderedReaderRelease", "ordered-reader-without-origin-session",
+     ("CHECK_DEADLOCK FALSE", "INVARIANT VacantReleaseUnsupported\nCHECK_DEADLOCK FALSE"), "VacantReleaseUnsupported"),
+    ("OrderedReaderRelease", "ordered-reader-route-only-enrollment",
+     ('Mutation = "none"', 'Mutation = "route_only"'), "EnrollmentOwnsLease"),
+    ("OrderedReaderRelease", "ordered-reader-substitutes-history",
+     ('Mutation = "none"', 'Mutation = "same_offset"'), "OriginalEvidence"),
+    ("OrderedReaderRelease", "ordered-reader-releases-after-hold",
+     ('Mutation = "none"', 'Mutation = "drop_delivery_hold"'), "ProtectedDelivery"),
+    ("OrderedReaderRelease", "ordered-reader-ignores-delivery-deadline",
+     ('Mutation = "none"', 'Mutation = "ignore_delivery_cutoff"'), "TimelyDelivery"),
     ("FrozenReceiptCut", "frozen-receipt-cut", None, None),
     ("FrozenReceiptCut", "frozen-receipt-trusts-matching-position",
      ('Mutation = "none"', 'Mutation = "trust_same_position"'), "ConfirmedAgainstSelectedRoot"),
@@ -3307,7 +3324,7 @@ def verify_tla(args, scratch):
         config = clone_file(Path(f"verification/tla/{config_name}.cfg"), directory)
         if mutation:
             replace_once(config, *mutation)
-            if module == "ActiveLogletReadIndex" and mutation[0] == 'Mutation = "none"':
+            if module in {"ActiveLogletReadIndex", "OrderedReaderRelease"} and mutation[0] == 'Mutation = "none"':
                 # Each fault is judged against its own law, even if it can
                 # also cause an earlier failure of a different invariant.
                 baseline = next(line for line in config.read_text().splitlines() if line.startswith("INVARIANTS "))

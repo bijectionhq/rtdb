@@ -332,6 +332,23 @@ impl QueryContext {
         rtdb_storage::IoRegion::reading(view, work).await
     }
 
+    /// Attach the exact catalog used by a read-only action to its answer transport.
+    pub async fn retain_delivery_cut(&self, cutoff: Arc<rtdb_storage::ReadLease>) -> Result<()> {
+        self.check_cancelled()?;
+        let catalog = self.catalog.read_lease().ok_or_else(|| Anomaly::new(
+            AnomalyCategory::Unavailable, "rtdb.query/no-delivery-lease", "The answer has no protected catalog lease",
+        ))?;
+        let lease = catalog.earlier(cutoff);
+        lease.check()?;
+        let view = self.catalog.held_view().await?;
+        for partition in self.catalog.databases.values().flat_map(|database| &database.partitions) {
+            if let Some(read) = partition.certified_read() {
+                PlaintextView::track_certified_read(read)?;
+            }
+        }
+        PlaintextView::track_protected_cut(view, lease)
+    }
+
     pub(crate) fn with_plaintext(mut self: Arc<Self>) -> Arc<Self> {
         if self.plaintext.is_none() {
             let view = PlaintextView::new(Arc::clone(&self.memory));

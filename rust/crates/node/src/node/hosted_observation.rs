@@ -320,7 +320,16 @@ impl NativeSession {
         }
         guard()?;
         read.check()?;
-        if read.node.receiver_time().await? >= until { return Err(unavailable()); }
+        let clock = Arc::clone(&read.node.factory.clock);
+        let sampled = clock.monotonic_micros();
+        let now = read.node.receiver_time().await?;
+        if now >= until {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "The hosted validation deadline has passed"));
+        }
+        let deadline = sampled.saturating_add(until.0.saturating_sub(now.0));
+        let cutoff = Arc::new(rtdb_storage::ReadLease::new(Some(deadline), Arc::new(move || clock.monotonic_micros())));
+        read.context.retain_delivery_cut(cutoff).await?;
+        guard()?;
         Ok(Some(AppliedReadConfirmation { covered: read.present, observed_at: observed }))
     }
 }

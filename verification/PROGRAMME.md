@@ -127,7 +127,7 @@ Enrolled Classic journals sign the exact candidate digest with retained Ed25519 
 
 **Open obligations:**
 
-1. Check `ActiveLogletReadIndex` and its controls for payload-only acknowledgement, single-copy exposure, digest binding, exact apply, trim and disjoint activation. The model includes write-back after loss of the publisher, a silent journal and ambiguous guarded settlement with an advancing clock. Refine probe and member authentication, checkpoint authority and successor installation to the implementation, including delayed durable replies, copied or cutoff-equal votes and exclusion inferred from silence.
+1. Check `ActiveLogletReadIndex` and its controls for payload-only acknowledgement, single-copy exposure, digest binding, exact apply, trim and disjoint activation. The models include write-back after loss of the publisher, a silent journal, ambiguous guarded settlement with an advancing clock, a quorum-signed exact successor activation, and protected ordered release after the issuing session closes. Refine probe and member authentication, checkpoint authority and successor installation to the implementation, including delayed durable replies, copied or cutoff-equal votes and exclusion inferred from silence.
 2. Replay injected crashes at each transition natively.
 3. Prove the partition publication transitions, scan coverage, and the composition from token to effect.
 4. Trace replica decoding, deferred delivery, oversized payload resolution, leader and follower apply, and recovery imports.

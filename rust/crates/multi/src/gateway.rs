@@ -476,13 +476,24 @@ where
 {
     let view = installed.journal.route().await?;
     let incumbent = view.writer.grant.map(|grant| grant.enrollment);
+    if !allow_takeover {
+        let grant = view.writer.grant.ok_or_else(writer_unreachable)?;
+        let worker = installed.endpoints.get(&grant.enrollment).ok_or_else(writer_unreachable)?;
+        let key = control::ControlKey(options.capabilities.clone());
+        let probe = control::ping(&worker.control, options.control_timeout.min(WRITER_DIAL_TIMEOUT), &key).await?;
+        let frontend = open(worker.clone(), probe).await?;
+        if installed.journal.route().await?.writer.grant != Some(grant) {
+            return Err(writer_unreachable());
+        }
+        return Ok((frontend, worker.clone(), grant.epoch));
+    }
     let predecessor = control::OrderedPredecessor { epoch: view.writer.epoch, enrollment: incumbent };
     let secret = options.capabilities.as_ref().ok_or_else(|| Anomaly::incorrect(
         "rtdb.multi/ordered-gateway", "The installed gateway needs a cell route credential"))?;
     let key = control::ControlKey(options.capabilities.clone());
     let installed_incumbent = incumbent.and_then(|owner| installed.endpoints.get(&owner));
     let candidates = installed_incumbent.into_iter()
-        .chain(installed.endpoints.values().filter(|worker| allow_takeover && Some(worker.enrollment) != incumbent));
+        .chain(installed.endpoints.values().filter(|worker| Some(worker.enrollment) != incumbent));
     let mut refused = None;
     for worker in candidates {
         let takeover = Some(worker.enrollment) != incumbent;
