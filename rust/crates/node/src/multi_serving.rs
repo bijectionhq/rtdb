@@ -191,6 +191,13 @@ impl ServingDriver for MultiServing {
         }).await.ok_or_else(interrupted)?
     }
 
+    async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {
+        cancellation.run_until_cancelled(async {
+            let (index, _) = self.database.lock().await.fresh_view().await?;
+            crate::serving::custody::reconcile_revocations(&index, &self.tokens.custody_vault(), crate::Clock::now(&crate::SystemClock)).await
+        }).await.ok_or_else(interrupted)?
+    }
+
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {
         cancellation
             .run_until_cancelled(async { self.database.lock().await.tx_status(key).await })

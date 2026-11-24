@@ -4,7 +4,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::CustodyVault;
 use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView}};
 use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, Op};
-use rtdb_types::{Anomaly, Result, StructFields, Value};
+use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
 use super::TransactSubmission;
@@ -87,6 +87,17 @@ pub(crate) async fn check_delivery(index: &BranchIndex, vault: &CustodyVault, gr
     Ok(())
 }
 
+pub(crate) async fn reconcile_revocations(index: &BranchIndex, vault: &CustodyVault, now: Timestamp) -> Result<()> {
+    for (group, basis) in index.custody_revocations() {
+        let deadline = index.exact(basis)?.system_time;
+        vault.retire(group, deadline.0).await?;
+        if now >= deadline {
+            vault.destroy(group).await?;
+        }
+    }
+    Ok(())
+}
+
 fn binding(fingerprint: [u8; 32], arm: usize, operation: usize, row: usize) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"rtdb/v1/custody-row\0");
@@ -109,7 +120,7 @@ fn payload_error(error: serde_json::Error) -> Anomaly {
 mod tests {
     use rtdb_crypt::LocalKms;
     use rtdb_tx::transact::{Outcome, ROW_CUSTODY, Resolution, Row, Transact, TransactState, TransactionRecord, Window};
-    use rtdb_types::{EntityId, TableRef, Timestamp, rtdb_v1::{At, ClaimSealer, Layer, MAIN_BRANCH}};
+    use rtdb_types::{EntityId, TableRef, rtdb_v1::{At, ClaimSealer, Layer, MAIN_BRANCH}};
     use uuid::Uuid;
 
     use super::*;
@@ -120,7 +131,7 @@ mod tests {
         let group = [5; 16];
         let table = TableRef::new("public", "documents");
         let claims = ClaimSealer::new(incarnation, [6; 32]);
-        let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 10)));
+        let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 11)));
         let request = |key, ops| TransactSubmission {
             transaction: Transact {
                 key: vec![key; 16], require: Vec::new(), window: Window::default(),
@@ -163,5 +174,9 @@ mod tests {
             else { panic!("a revocation must append"); };
         state.apply(2, append.into_record()).unwrap();
         assert_eq!(check_delivery(state.index(), &vault, &groups).await.unwrap_err(), rtdb_crypt::erased_under_view());
+        let checkpoint = state.encode_checkpoint().unwrap();
+        let reopened = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+        reconcile_revocations(reopened.index(), &vault, Timestamp(11)).await.unwrap();
+        assert_eq!(vault.check_readable(group).await.unwrap_err(), rtdb_crypt::erased_under_view());
     }
 }

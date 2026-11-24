@@ -706,6 +706,22 @@ impl DatabaseDriver {
         for driver in self.logs { logs.spawn(driver); }
         let mut tasks = JoinSet::new();
         tasks.spawn(self.replication.run());
+        if let Some(driver) = self.database.serving.as_ref().filter(|driver| {
+            driver.features().contains(&rtdb_tx::transact::ROW_CUSTODY)
+        }).cloned() {
+            let database = Arc::clone(&self.database);
+            tasks.spawn(async move {
+                let mut cadence = tokio::time::interval(Duration::from_secs(1));
+                cadence.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                while database.cancellation.run_until_cancelled(cadence.tick()).await.is_some() {
+                    if let Err(error) = driver.reconcile_custody(&database.cancellation).await
+                        && !database.cancellation.is_cancelled() {
+                        eprintln!("{} custody reconciliation: {error}", database.name);
+                    }
+                }
+                Ok(())
+            });
+        }
         if let Some(compactor) = self.compactor { tasks.spawn(compactor.run(self.database.cancellation.clone())); }
         for lane in self.artefacts { tasks.spawn(lane.run(self.database.cancellation.clone())); }
         if !self.live_artefacts.is_empty() {

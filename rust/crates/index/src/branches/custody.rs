@@ -35,6 +35,10 @@ impl BranchIndex {
         self.custody.get(&group)?.revoked
     }
 
+    pub fn custody_revocations(&self) -> impl Iterator<Item = (CustodyGroupId, Basis)> + '_ {
+        self.custody.iter().filter_map(|(id, group)| group.revoked.map(|basis| (*id, basis)))
+    }
+
     pub(super) fn create_custody_group(&mut self, id: CustodyGroupId) -> Result<()> {
         if id == [0; 16] || self.custody.contains_key(&id) {
             return Err(Anomaly::fault("rtdb/custody-fold", "Invalid resolved custody group creation"));

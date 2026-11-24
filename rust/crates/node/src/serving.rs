@@ -106,6 +106,8 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb/row-custody", "The query route has no protected delivery authority"))
     }
 
+    async fn reconcile_custody(&self, _cancellation: &CancellationToken) -> Result<()> { Ok(()) }
+
     async fn query_scoped(&self, _source: QuerySource, _track: bool, _now: Timestamp,
                           _scope: &ServingScope, _cancellation: &CancellationToken) -> Result<QueryView> {
         Err(visibility::unsupported())

@@ -77,6 +77,14 @@ impl ServingDriver for DefaultServing {
         super::custody::check_delivery(&view.index, &vault, groups).await
     }
 
+    async fn reconcile_custody(&self, cancellation: &CancellationToken) -> Result<()> {
+        if !self.writable { return Ok(()); }
+        let view = self.handle.view(At::Linearizable, cancellation).await?;
+        if !view.index.has_custody_groups() { return Ok(()); }
+        let vault = self.tokens.authority().await?.custody_vault();
+        super::custody::reconcile_revocations(&view.index, &vault, self.clock.now()).await
+    }
+
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {
         self.handle.tx_status(key.to_vec(), None, cancellation).await
     }
