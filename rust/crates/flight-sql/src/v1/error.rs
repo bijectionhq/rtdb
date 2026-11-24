@@ -111,7 +111,9 @@ pub(super) fn detail(native: Anomaly) -> Error {
     };
     let stable = match native.code.as_str() {
         "rtdb/erased-under-view" | "rtdb/cursor-expired" | "rtdb/unknown-branch"
-        | "rtdb/default-serving-classic-history" | REQUIREMENT_FAILED => {
+        | "rtdb/default-serving-classic-history" | "rtdb/idempotency-key"
+        | "rtdb/window-expired" | "rtdb/timed-transaction-refused"
+        | "rtdb/already-present" | REQUIREMENT_FAILED => {
             native.code.as_str()
         }
         _ => code(category),
