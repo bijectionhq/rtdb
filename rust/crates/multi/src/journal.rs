@@ -256,6 +256,19 @@ impl InstalledJournal {
         }
     }
 
+    pub async fn read_lease(&self, hold: Hold, epoch: u64) -> Result<u64> {
+        let view = self.route().await?;
+        if view.writer.epoch != epoch {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/reader-epoch", "The ordered reader attachment changed"));
+        }
+        let decision = self.execute(&self.request(&view, Command::LeaseRead { hold })?).await?;
+        match decision.receipt.outcome.map_err(refused)? {
+            Outcome::ReadLeased { hold: leased, issued_at, lease_end }
+                if leased == hold && lease_end > issued_at => Ok(lease_end - issued_at),
+            _ => Err(mismatch("The journal returned a different read lease")),
+        }
+    }
+
     pub async fn replay(&self, hold: Hold, from: Cut, maximum_bytes: u64) -> Result<ReplayPage> {
         let reply = self
             .call(Operation::Replay {

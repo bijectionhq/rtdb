@@ -75,6 +75,7 @@ pub(crate) struct Placement {
     journal_window_bytes: Option<u64>,
     nomination: tokio::sync::Mutex<Option<Request>>,
     worker_disposal: tokio::sync::Mutex<Option<Request>>,
+    reader_opening: parking_lot::Mutex<std::sync::Weak<Held>>,
     checkpoint_reservations: BTreeMap<u64, Reservation>,
     publication: tokio::sync::Mutex<Option<(Checkpoint, Cut)>>,
 }
@@ -151,17 +152,34 @@ struct Base {
 struct Attachment {
     name: String,
     deployment: Uuid,
-    admission: WriterAdmission,
+    admission: AttachmentAdmission,
     base: Base,
 }
 
-pub(crate) fn attachment_identity(value: &Any) -> Result<(String, u64)> {
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+enum AttachmentAdmission {
+    Writer { admission: WriterAdmission },
+    Reader { placement: ordered_logkeeper::ordered::Placement, epoch: u64, hold: Hold },
+}
+
+pub(crate) fn attachment_identity(value: &Any) -> Result<(String, Option<u64>)> {
     let attachment: Attachment =
         serde_json::from_slice(&value.value).map_err(|error| invalid(&error.to_string()))?;
-    Ok((
-        attachment.deployment.to_string(),
-        attachment.admission.grant.epoch,
-    ))
+    let epoch = match attachment.admission {
+        AttachmentAdmission::Writer { admission } => Some(admission.grant.epoch),
+        AttachmentAdmission::Reader { .. } => None,
+    };
+    Ok((attachment.deployment.to_string(), epoch))
+}
+
+pub(crate) fn reader_attachment(value: &Any) -> Result<Option<(ordered_logkeeper::ordered::Placement, u64, Enrollment)>> {
+    let attachment: Attachment =
+        serde_json::from_slice(&value.value).map_err(|error| invalid(&error.to_string()))?;
+    Ok(match attachment.admission {
+        AttachmentAdmission::Reader { placement, epoch, hold } => Some((placement, epoch, hold.owner)),
+        AttachmentAdmission::Writer { .. } => None,
+    })
 }
 
 impl Routes {
@@ -229,6 +247,7 @@ impl Routes {
                 journal_window_bytes: entry.journal_window_bytes,
                 nomination: Default::default(),
                 worker_disposal: Default::default(),
+                reader_opening: Default::default(),
                 checkpoint_reservations,
                 publication: Default::default(),
             });
@@ -263,9 +282,16 @@ impl Routes {
         let attachment: Attachment = serde_json::from_slice(&configuration.value)
             .map_err(|error| invalid(&error.to_string()))?;
         let placement = self.by_name(&attachment.name).filter(|placement| {
-            placement.worker.deployment() == attachment.deployment
-               && matches!(placement.worker.authority(), Authority::Worker { enrollment } if enrollment == attachment.admission.grant.enrollment)
-               && attachment.admission.recovery.owner == attachment.admission.grant.enrollment
+            if placement.worker.deployment() != attachment.deployment { return false; }
+            let Authority::Worker { enrollment } = placement.worker.authority() else { return false; };
+            match attachment.admission {
+                AttachmentAdmission::Writer { admission } => {
+                    admission.grant.enrollment == enrollment && admission.recovery.owner == enrollment
+                }
+                AttachmentAdmission::Reader { placement: expected, hold, .. } => {
+                    placement.worker.placement() == expected && hold.owner == enrollment
+                }
+            }
         }).ok_or_else(|| invalid("The database attachment addresses a different installed journal worker"))?;
         Ok((Arc::clone(placement), attachment))
     }
@@ -776,9 +802,45 @@ impl Placement {
         let attachment = Attachment {
             name: self.record.name.clone(),
             deployment: self.worker.deployment(),
-            admission,
+            admission: AttachmentAdmission::Writer { admission },
             base: Base { checkpoint },
         };
+        Self::database_configuration(attachment, false)
+    }
+
+    pub(crate) async fn reader_configuration(
+        &self, route: &Route, keys: &Arc<dyn KeyService>, tasks: &TaskTracker,
+    ) -> Result<(DatabaseConfig, Arc<Held>)> {
+        let request = self.worker.request(route, Command::ProtectRange {
+            from: route.checkpoint.cut.next_lsn,
+            through: route.head.next_lsn,
+        })?;
+        let recovery = Held::acquire(&self.worker, request, tasks).await?;
+        let hold = recovery.scope();
+        if hold.checkpoint != route.checkpoint || hold.start != route.checkpoint.cut || hold.through != route.head {
+            return Err(invalid("The requested cold reader basis changed"));
+        }
+        self.worker.read_lease(hold, route.writer.epoch).await?;
+        let checkpoint = if genesis(hold.checkpoint) { None } else {
+            let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+            Some(provider.open(hold.checkpoint).await?.checkpoint)
+        };
+        self.reader_opening.lock().clone_from(&Arc::downgrade(&recovery));
+        let config = Self::database_configuration(Attachment {
+            name: self.record.name.clone(),
+            deployment: self.worker.deployment(),
+            admission: AttachmentAdmission::Reader { placement: route.placement, epoch: route.writer.epoch, hold },
+            base: Base { checkpoint },
+        }, true)?;
+        Ok((config, recovery))
+    }
+
+    fn retained_reader(&self, hold: Hold) -> Result<Arc<Held>> {
+        self.reader_opening.lock().upgrade().filter(|active| active.scope() == hold)
+            .ok_or_else(|| invalid("The attachment lost its ordered recovery hold"))
+    }
+
+    fn database_configuration(attachment: Attachment, read_only: bool) -> Result<DatabaseConfig> {
         let encoded =
             serde_json::to_vec(&attachment).map_err(|error| invalid(&error.to_string()))?;
         Ok(DatabaseConfig {
@@ -793,6 +855,7 @@ impl Placement {
                 }),
                 epoch: Some(0),
             })),
+            mode: read_only.then_some(1),
             ..Default::default()
         })
     }
@@ -812,21 +875,26 @@ impl LogFactory for Logs {
         access: LogAccess,
         cancellation: CancellationToken,
     ) -> Result<OpenedLogs> {
-        if access != LogAccess::ReadWrite {
-            return Err(invalid(
-                "An installed writer attachment requires write log access",
-            ));
-        }
         let (placement, attachment) = self.routes.resolve(configuration)?;
         let material = material(self.keys.as_ref(), &placement.record).await?;
         let max_frame = crate::process::MAXIMUM_LOG_MESSAGE_BYTES;
+        let admission = match attachment.admission {
+            AttachmentAdmission::Writer { admission } if access == LogAccess::ReadWrite => admission,
+            AttachmentAdmission::Reader { epoch, hold, .. } if access == LogAccess::ReadOnly => {
+                let replica = JournalLog::open_reader(Arc::clone(&placement.worker), Arc::clone(&self.keys),
+                    epoch, placement.retained_reader(hold)?, max_frame, self.releases.clone()).await?;
+                return crate::logs::ordered_reader_opened(replica, &material, &placement.record, epoch,
+                    attachment.base.checkpoint, max_frame);
+            }
+            _ => return Err(invalid("The log access does not match its installed attachment")),
+        };
         let replica = JournalLog::open(
             Arc::clone(&placement.worker),
             Arc::clone(&self.keys),
-            attachment.admission,
+            admission,
             Held::pin(
                 Arc::clone(&placement.worker),
-                attachment.admission.recovery,
+                admission.recovery,
                 &self.releases,
             ),
             max_frame,
@@ -838,7 +906,7 @@ impl LogFactory for Logs {
             replica,
             &material,
             &placement.record,
-            attachment.admission,
+            admission,
             attachment.base.checkpoint,
             max_frame,
             cancellation,

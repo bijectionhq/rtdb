@@ -65,6 +65,13 @@ impl CellSecret {
         self.mint(&fresh_flight_peer_scope(deployment, epoch, log_epoch, stream, storage_prefix), &peer.to_string(), true, Duration::from_secs(60))
     }
 
+    pub(crate) fn ordered_reader_peer(
+        &self, placement: ordered_logkeeper::ordered::Placement, epoch: u64,
+        enrollment: ordered_logkeeper::ordered::Enrollment, peer: IpAddr,
+    ) -> String {
+        self.mint(&ordered_reader_scope(placement, epoch, enrollment), &peer.to_string(), true, Duration::from_secs(60))
+    }
+
     /// A capability for `principal` on `deployment`, valid for `ttl`.
     pub fn mint(&self, deployment: &str, principal: &str, read_only: bool, ttl: Duration) -> String {
         let claims = Claims { deployment: deployment.into(), principal: principal.into(), read_only, expires_at_ms: rtdb_directory::now_ms() + ttl.as_millis() as i64 };
@@ -98,6 +105,14 @@ impl std::fmt::Debug for CellSecret {
 
 impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
     fn verify(&self, proof: &str, attachment: &rtdb_node::Database) -> Result<(IpAddr, bool)> {
+        if let Some(value) = ordered_attachment(attachment)
+            && let Some((placement, epoch, enrollment)) = crate::journal::hosted::reader_attachment(value)?
+        {
+            let scope = ordered_reader_scope(placement, epoch, enrollment);
+            let peer = <Self as CapabilityVerifier>::verify(self, proof, &scope)?;
+            let address = peer.principal.parse().map_err(|_| refused("The Flight SQL peer address is invalid"))?;
+            return Ok((address, true));
+        }
         let (deployment, epoch) = attachment_identity(attachment)?;
         let scope = match epoch {
             Some(epoch) => flight_peer_scope(&deployment, epoch),
@@ -121,15 +136,18 @@ impl rtdb_flight_sql::FlightPeerVerifier for CellSecret {
 }
 
 fn attachment_identity(attachment: &rtdb_node::Database) -> Result<(String, Option<u64>)> {
-    if let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage
-        && let Some(value) = remote.object_store.as_ref().filter(|value|
-            value.type_url.rsplit('/').next() == Some(crate::journal::hosted::STORE_TYPE))
-    {
-        let (deployment, epoch) = crate::journal::hosted::attachment_identity(value)?;
-        return Ok((deployment, Some(epoch)));
+    if let Some(value) = ordered_attachment(attachment) {
+        return crate::journal::hosted::attachment_identity(value);
     }
     let config = attachment_storage(attachment)?;
     Ok((config.deployment, config.writer_epoch))
+}
+
+fn ordered_attachment(attachment: &rtdb_node::Database) -> Option<&prost_types::Any> {
+    let Some(database_config::Storage::RemoteStorage(remote)) = &attachment.configuration().storage else {
+        return None;
+    };
+    remote.object_store.as_ref().filter(|value| value.type_url.rsplit('/').next() == Some(crate::journal::hosted::STORE_TYPE))
 }
 
 pub(crate) fn attachment_storage(attachment: &rtdb_node::Database) -> Result<crate::store::CellStoreConfig> {
@@ -142,6 +160,13 @@ pub(crate) fn attachment_storage(attachment: &rtdb_node::Database) -> Result<cra
 }
 
 fn flight_peer_scope(deployment: &str, epoch: u64) -> String { format!("~flight/peer/{deployment}/{epoch}") }
+
+fn ordered_reader_scope(
+    placement: ordered_logkeeper::ordered::Placement, epoch: u64, enrollment: ordered_logkeeper::ordered::Enrollment,
+) -> String {
+    let scope = serde_json::to_string(&(placement, epoch, enrollment)).expect("ordered reader coordinates encode");
+    format!("~flight/ordered-fresh/{scope}")
+}
 
 fn fresh_flight_peer_scope(deployment: &str, epoch: u64, log_epoch: i32, stream: &str, prefix: &str) -> String {
     let route = serde_json::to_string(&(deployment, epoch, log_epoch, stream, prefix))

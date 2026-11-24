@@ -526,6 +526,64 @@ impl NodeAgent {
         }
     }
 
+    async fn subscribe_ordered_fresh(
+        &self, name: &str, scope: ordered_logkeeper::ordered::Placement,
+        enrollment: ordered_logkeeper::ordered::Enrollment, epoch: u64,
+    ) -> Result<Response> {
+        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/ordered-reader",
+            "The enrolled reader cannot open this ordered basis");
+        let secret = self.secret.as_ref().ok_or_else(unavailable)?;
+        let placement = self.ordered.by_name(name).filter(|placement| placement.worker.placement() == scope)
+            .ok_or_else(unavailable)?;
+        if !matches!(placement.worker.authority(), crate::journal::Authority::Worker { enrollment: own } if own == enrollment) {
+            return Err(unavailable());
+        }
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let route = placement.worker.route().await?;
+        if route.writer.epoch != epoch || route.writer.grant.is_some_and(|grant| grant.enrollment == enrollment) {
+            return Err(unavailable());
+        }
+        let response = || {
+            let flight = self.flight_endpoint.clone();
+            let proof = secret.sign_route(&control::ordered_read_binding(
+                name, scope, enrollment, epoch, &self.address, flight.as_deref(),
+            ));
+            Response::OrderedRead { address: self.address.clone(), flight, proof }
+        };
+        if let Some(current) = self.subscriptions.lock().get_mut(name).filter(|current| current.database.upgrade()
+            .and_then(|database| ordered_reader(&database)).is_some_and(|parts| parts == (scope, epoch, enrollment)))
+        {
+            current.last_touch = Instant::now();
+            return Ok(response());
+        }
+        if self.execution_memory_pressured() || !self.activations.lock().admit(Instant::now(), self.options.activations_per_second) {
+            return Err(unavailable());
+        }
+        self.stop_running(name).await;
+        let (configuration, recovery) = placement.reader_configuration(&route, &self.keys, &self.ordered_releases).await?;
+        let opened = async {
+            let database = self.node.database_or_attach(name.to_owned(), configuration).await?.ok_or_else(unavailable)?;
+            self.await_ordered_cut(&database, placement.worker.log_epoch(), recovery.scope().through).await?;
+            placement.worker.read_lease(recovery.scope(), epoch).await?;
+            Ok::<_, Anomaly>(database)
+        }.await;
+        match opened {
+            Ok(database) => {
+                let opened = Instant::now();
+                self.subscriptions.lock().insert(name.into(), LocalSubscription {
+                    id: placement.record.id.clone(), database: Arc::downgrade(&database), last_touch: opened,
+                    opened, role: Role::Subscriber, fragments: false,
+                });
+                Ok(response())
+            }
+            Err(error) => {
+                self.stop_running(name).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn await_ordered_cut(
         &self, database: &Database, epoch: StorageEpoch, cut: ordered_logkeeper::ordered::Cut,
     ) -> Result<()> {
@@ -1597,13 +1655,21 @@ impl NodeAgent {
             self.members().await.ok()
         } else { None };
         for (name, id, last_touch, opened, snapshot, fragments) in subscribed {
-            let wanted = match self.directory.deployment(&id).await {
-                Ok(Some(record)) if record.lifecycle == Lifecycle::Live => snapshot || fragments
-                    || (record.read_width > 1 && reader_members.as_ref().is_none_or(|members| {
-                        crate::deployment::read_replicas(&record, members, now_ms()).iter().any(|member| member.id == me)
-                    })),
-                Ok(_) => false,
-                Err(_) => true,
+            let wanted = if let Some(placement) = self.ordered.by_name(&name) {
+                let local = self.node.catalog().database(&name).ok().and_then(|database| ordered_reader(&database));
+                match placement.worker.route().await {
+                    Ok(route) => local.is_some_and(|(scope, epoch, _)| scope == route.placement && epoch == route.writer.epoch),
+                    Err(error) => error.category != AnomalyCategory::Forbidden,
+                }
+            } else {
+                match self.directory.deployment(&id).await {
+                    Ok(Some(record)) if record.lifecycle == Lifecycle::Live => snapshot || fragments
+                        || (record.read_width > 1 && reader_members.as_ref().is_none_or(|members| {
+                            crate::deployment::read_replicas(&record, members, now_ms()).iter().any(|member| member.id == me)
+                        })),
+                    Ok(_) => false,
+                    Err(_) => true,
+                }
             };
             // A snapshot closes before the reaper's grace could erase what it reads.
             let expired = snapshot && opened.elapsed() >= self.options.snapshot_lifetime;
@@ -1730,6 +1796,15 @@ fn stale_handoff(name: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/stale-handoff", format!("The requested holding of {name} has changed"))
 }
 
+fn ordered_reader(database: &Database) -> Option<(
+    ordered_logkeeper::ordered::Placement, u64, ordered_logkeeper::ordered::Enrollment,
+)> {
+    use rtdb_format::database::proto::database_config;
+    let Some(database_config::Log::OtherLog(config)) = &database.configuration().log else { return None; };
+    if config.type_url.rsplit('/').next() != Some(crate::journal::hosted::LOG_TYPE) { return None; }
+    crate::journal::hosted::reader_attachment(config).ok().flatten()
+}
+
 fn checkpoint_timeout(name: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-timeout", format!("The checkpoint for {name} was not published in time"))
 }
@@ -1763,6 +1838,8 @@ impl Handler for NodeAgent {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::SubscribeFresh { name } => self.subscribe_for(&name, SubscriptionUse::FreshQuery).await,
+            Request::SubscribeOrderedFresh { name, placement, enrollment, epoch } =>
+                self.subscribe_ordered_fresh(&name, placement, enrollment, epoch).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => match self.require_directory_route(&name) {
                 Ok(()) => self.flush(&name).await,

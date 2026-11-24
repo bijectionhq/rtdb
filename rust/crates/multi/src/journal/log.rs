@@ -38,7 +38,7 @@ const MAX_UNSETTLED_READS: usize = 8;
 pub(crate) struct JournalLog {
     reads: Arc<Reads>,
     maximum_data_message: usize,
-    writer: Mutex<Writer>,
+    writer: Option<Mutex<Writer>>,
     recovery: Mutex<Option<Arc<Held>>>,
 }
 
@@ -56,6 +56,7 @@ struct Reads {
     tasks: TaskTracker,
     maximum: usize,
     unsettled: Mutex<Vec<RequestId>>,
+    reader_epoch: Option<u64>,
 }
 
 pub(crate) struct Held {
@@ -154,6 +155,7 @@ impl JournalLog {
             tasks,
             maximum: maximum_message_bytes,
             unsettled: Mutex::new(Vec::new()),
+            reader_epoch: None,
         });
         let writer = Mutex::new(Writer {
             grant: admission.grant,
@@ -163,9 +165,30 @@ impl JournalLog {
         Ok(Arc::new(Self {
             reads,
             maximum_data_message,
-            writer,
+            writer: Some(writer),
             recovery: Mutex::new(Some(recovery)),
         }))
+    }
+
+    pub(super) async fn open_reader(
+        journal: Arc<InstalledJournal>,
+        keys: Arc<dyn KeyService>,
+        epoch: u64,
+        recovery: Arc<Held>,
+        maximum: usize,
+        tasks: TaskTracker,
+    ) -> Result<Arc<Self>> {
+        let reads = Arc::new(Reads {
+            journal, keys, io: IoRegion::new(), maximum, tasks,
+            tip: AtomicI64::new(latest(recovery.scope().through).map_err(storage)?.0),
+            unsettled: Mutex::new(Vec::new()), reader_epoch: Some(epoch),
+        });
+        reads.route().await?;
+        Ok(Arc::new(Self { reads, maximum_data_message: 0, writer: None, recovery: Mutex::new(Some(recovery)) }))
+    }
+
+    fn writer(&self) -> Result<&Mutex<Writer>> {
+        self.writer.as_ref().ok_or_else(|| Error::ReadOnlyLog(self.reads.journal.deployment().to_string().into()))
     }
 
     async fn enqueue_at(
@@ -174,6 +197,7 @@ impl JournalLog {
         payload: Bytes,
         sample: impl FnOnce() -> Result<Timestamp> + Send,
     ) -> Result<AppendReceipt> {
+        let writer = self.writer()?;
         let maximum = match class {
             AppendClass::Data => self.maximum_data_message,
             AppendClass::Maintenance => self.reads.maximum.saturating_sub(SEALED_OVERHEAD),
@@ -184,7 +208,7 @@ impl JournalLog {
                 maximum,
             });
         }
-        let mut writer = self.writer.lock().await;
+        let mut writer = writer.lock().await;
         if writer.pending.is_some() {
             self.finish_append(&mut writer).await?;
         }
@@ -309,7 +333,7 @@ impl ReplicaReadIndex for JournalLog {
             if reads.len() >= MAX_UNSETTLED_READS {
                 return Err(reads_unsettled());
             }
-            let current = self.reads.journal.route().await?;
+            let current = self.reads.route().await?;
             let invocation = self.reads.journal.request(&current, Command::Barrier)?;
             // Record the identity first so a cancelled read is still released later.
             reads.push(invocation.id);
@@ -318,6 +342,9 @@ impl ReplicaReadIndex for JournalLog {
                     reads.retain(|read| *read != invocation.id);
                     let hold = proof.claim.read();
                     let retention = self.reads.retain(hold);
+                    if self.reads.reader_epoch.is_some() {
+                        self.reads.route().await?;
+                    }
                     let offset = latest(hold.through)?;
                     crate::residence_trace::record("ordered-read-index", || serde_json::json!({
                         "deployment": current.placement.deployment, "incarnation": current.placement.incarnation,
@@ -348,6 +375,9 @@ impl ReplicaReadIndex for JournalLog {
 impl Reads {
     async fn route(&self) -> Result<Route> {
         let view = self.journal.route().await.map_err(storage)?;
+        if self.reader_epoch.is_some_and(|epoch| epoch != view.writer.epoch) {
+            return Err(Error::Closed("The ordered reader attachment changed".into()));
+        }
         self.tip
             .fetch_max(latest(view.head).map_err(storage)?.0, Ordering::Release);
         Ok(view)
@@ -584,7 +614,8 @@ impl Log for JournalLog {
     fn needs_published_recovery_checkpoint(&self) -> bool { true }
 
     async fn confirms_recovery_checkpoint(&self, block: i64, through: LogOffset, root: [u8; 32]) -> Result<bool> {
-        let grant = self.writer.lock().await.grant;
+        let Some(writer) = &self.writer else { return Ok(false); };
+        let grant = writer.lock().await.grant;
         let route = self.reads.route().await?;
         let checkpoint = route.checkpoint;
         if route.writer.grant != Some(grant) || checkpoint.root != root || latest(checkpoint.cut).map_err(storage)? != through {
@@ -608,7 +639,8 @@ impl Log for JournalLog {
     }
 
     async fn holds_writer_grant(&self) -> Result<bool> {
-        let grant = self.writer.lock().await.grant;
+        let Some(writer) = &self.writer else { return Ok(false); };
+        let grant = writer.lock().await.grant;
         Ok(self.reads.route().await?.writer.grant == Some(grant))
     }
 
@@ -650,7 +682,7 @@ impl Log for JournalLog {
 
     async fn available_append_capacity(&self) -> Result<Option<AppendCapacity>> {
         let current = self.reads.route().await?;
-        let grant = self.writer.lock().await.grant;
+        let grant = self.writer()?.lock().await.grant;
         if current.writer.grant != Some(grant) {
             return Err(deposed(grant, &current));
         }

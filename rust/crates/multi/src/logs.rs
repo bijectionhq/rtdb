@@ -260,6 +260,27 @@ pub(crate) async fn ordered_opened(
     })
 }
 
+pub(crate) fn ordered_reader_opened(
+    journal: Arc<crate::journal::JournalLog>, key: &[u8], record: &rtdb_directory::DeploymentRecord,
+    writer_epoch: u64, checkpoint: Option<rtdb_directory::Checkpoint>, maximum: usize,
+) -> Result<OpenedLogs> {
+    let epoch = StorageEpoch(record.log_epoch);
+    let deployment = uuid::Uuid::parse_str(&record.id).ok();
+    let index = || Box::new(OrderedReadIndex { journal: Arc::clone(&journal), deployment }) as Box<dyn ReplicaReadIndex>;
+    let await_authority = if writer_epoch == 0 { AwaitAuthority::Frozen } else {
+        let scope = PlacedAttemptScope::new(&record.stream("replica"), writer_epoch)?;
+        AwaitAuthority::Live {
+            codec: Box::new(DeploymentReceipts { scope, cipher: Cipher::new(key)? }),
+            recovery: ClosedEpochRecovery::ReadIndex(index()), placed_receipt_retirement: record.placed_receipt_retirement,
+        }
+    };
+    let next = checkpoint.map_or(0, |checkpoint| checkpoint.source.saturating_add(1));
+    let replica_read_index = Some(index());
+    let replica: Arc<dyn Log> = journal;
+    Ok(OpenedLogs { source: Arc::new(IntakeLog::new(maximum, next)), replica, source_epoch: epoch,
+        replica_epoch: epoch, placed_transfer: None, replica_read_index, await_authority, drivers: Vec::new() })
+}
+
 struct OrderedReadIndex { journal: Arc<crate::journal::JournalLog>, deployment: Option<uuid::Uuid> }
 
 #[async_trait]
