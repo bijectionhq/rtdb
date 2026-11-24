@@ -429,7 +429,7 @@ pub(crate) async fn activate_checkpoint_transfer_target(
         if crate::admin::cell_media(storage, keys)? != stage.media {
             return Err(inconsistent("The activated stage belongs to different storage or keys"));
         }
-        keys.destroy(&staged_key_id(&target)).await?;
+        keys.withdraw_archive_key(&staged_key_id(&target)).await?;
         return Ok(accepted.clone());
     }
     let replica = seed_checkpoint_transfer_target(
@@ -483,7 +483,7 @@ pub(crate) async fn activate_checkpoint_transfer_target(
         },
     ).await?;
     let accepted = directory.activate_checkpoint_transfer(&CheckpointTransferActivation { replica, recovery_manifest_sha256 }).await?;
-    keys.destroy(&staged_key_id(&target)).await?;
+    keys.withdraw_archive_key(&staged_key_id(&target)).await?;
     Ok(accepted)
 }
 

@@ -441,7 +441,9 @@ async fn copy_checkpoint(
             "The staged installation must have its own media key",
         ));
     }
-    let stage_key = keys.scoped_unit_key(&staged_key_id(target), Arc::clone(&target_io)).await?;
+    let stage_id = staged_key_id(target);
+    keys.archive_key(&stage_id, true, Arc::clone(&target_io)).await?;
+    let stage_key = keys.scoped_unit_key(&stage_id, Arc::clone(&target_io)).await?;
     let source = PrefixedStore::new(bucket, format!("{prefix}/objects"));
     let destination = PrefixedStore::new(
         storage.bucket(target_io).await?,
