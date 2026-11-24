@@ -80,20 +80,29 @@ fn custody_revocation_masks_prior_and_inherited_members_after_checkpoint() {
         Op::Put { branch, table, rows, if_absent }
     };
     let mut state = TransactState::new(INCARNATION);
+    let mut initial_inventory = None;
     for (position, ops) in [
         (1, vec![Op::CreateCustodyGroup { group }, protected(MAIN_BRANCH, 1), put(MAIN_BRANCH, 4, "ordinary")]),
         (2, vec![fork("child", 1), protected("child", 2), protected(MAIN_BRANCH, 3)]),
     ] {
         let prepared = plan(&state, &request(position as u8, ops), position, position as i64 * 10, &features);
         assert_eq!(apply(&mut state, position, prepared.record()).unwrap().outcome, Outcome::Then);
+        if position == 1 { initial_inventory = state.index().custody_inventory(group); }
     }
     assert_eq!(visible(&state, "child", Layer::Merged, 25), [1, 2, 4]);
-    let revoke = request(3, vec![Op::RevokeCustodyGroup { group }]);
-    let prepared = plan(&state, &revoke, 3, 30, &features);
-    let first = apply(&mut state, 3, prepared.record()).unwrap();
+    let stale = request(3, vec![Op::RevokeCustodyGroup { group, inventory_sha256: initial_inventory.unwrap().sha256 }]);
+    let prepared = plan(&state, &stale, 3, 30, &features);
+    let refusal = apply(&mut state, 3, prepared.record()).unwrap();
+    assert!(matches!(refusal.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-inventory-changed"));
+    assert!(state.index().custody_group_live(group).unwrap());
+    let inventory = state.index().custody_inventory(group).unwrap();
+    assert_eq!(inventory.placements, 3);
+    let revoke = request(4, vec![Op::RevokeCustodyGroup { group, inventory_sha256: inventory.sha256 }]);
+    let prepared = plan(&state, &revoke, 4, 40, &features);
+    let first = apply(&mut state, 4, prepared.record()).unwrap();
     let checkpoint = state.encode_checkpoint().unwrap();
     let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
-    assert_eq!(state.index().custody_revocation(group), Some(basis(3)));
+    assert_eq!(state.index().custody_revocation(group), Some(basis(4)));
     for (branch, cut) in [(MAIN_BRANCH, basis(1)), ("child", basis(2))] {
         let view = state.index().view(branch, At::Exactly(cut), Layer::Merged, Timestamp(25)).unwrap();
         for member in 1..=3 {
@@ -101,14 +110,14 @@ fn custody_revocation_masks_prior_and_inherited_members_after_checkpoint() {
         }
         assert!(view.row(&table(), &EntityId::Integer(4), Timestamp(25)).is_some());
     }
-    let Resolution::Answer(replay) = state.resolve(&revoke, 4, Timestamp(40), &features, &claims()).unwrap() else {
+    let Resolution::Answer(replay) = state.resolve(&revoke, 5, Timestamp(50), &features, &claims()).unwrap() else {
         panic!("revocation retry must return its original receipt");
     };
     assert_eq!(replay.basis, first.basis);
     assert!(replay.replayed);
-    let late = request(4, vec![protected("child", 5)]);
-    let prepared = plan(&state, &late, 4, 40, &features);
-    let refused = apply(&mut state, 4, prepared.record()).unwrap();
+    let late = request(5, vec![protected("child", 5)]);
+    let prepared = plan(&state, &late, 5, 50, &features);
+    let refused = apply(&mut state, 5, prepared.record()).unwrap();
     assert!(matches!(refused.outcome, Outcome::Refused { error } if error.code == "rtdb/erased-under-view"));
 }
 

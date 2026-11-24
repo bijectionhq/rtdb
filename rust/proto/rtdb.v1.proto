@@ -171,7 +171,12 @@ message Renew { string branch = 1; sint64 expires_at_micros = 2; }
 message Merge { string from = 1; string into = 2; }
 message DropBranch { string branch = 1; }
 message CreateCustodyGroup { bytes group = 1; }
-message RevokeCustodyGroup { bytes group = 1; }
+message RevokeCustodyGroup {
+  bytes group = 1;
+  // Exact inventory digest selected from xt.custody_groups. A new placement
+  // invalidates the plan and refuses the whole transaction.
+  bytes inventory_sha256 = 2;
+}
 message Op {
   oneof op {
     Put put = 1;

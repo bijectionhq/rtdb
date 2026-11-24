@@ -211,7 +211,8 @@ mod tests {
         assert_eq!(opened_changes.custody_groups, groups);
         let pending_changes = page();
 
-        let revoke = request(2, vec![Op::RevokeCustodyGroup { group }]);
+        let inventory_sha256 = state.index().custody_inventory(group).unwrap().sha256;
+        let revoke = request(2, vec![Op::RevokeCustodyGroup { group, inventory_sha256 }]);
         let Resolution::Append(append) = state.resolve(&revoke.transaction, 2, Timestamp(11), &[ROW_CUSTODY], &claims).unwrap()
             else { panic!("a revocation must append"); };
         state.apply(2, append.into_record()).unwrap();

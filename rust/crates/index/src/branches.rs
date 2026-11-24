@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 mod custody;
 mod visibility;
-pub use custody::{CustodyGroupId, CustodyPayload};
+pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +423,7 @@ impl BranchIndex {
                 if let Some(group) = event.image.as_ref().and_then(|image| image.custody_group) {
                     self.admit_custody_member(group, custody::CustodyMember {
                         branch: branch.clone(), table: table.clone(), id: event.id.clone(), written: basis,
+                        valid: event.valid, ordinal: self.writes.len() as u64,
                     })?;
                 }
                 let catalog = &mut self.catalog;
@@ -502,6 +503,9 @@ impl<'a> BranchView<'a> {
     pub fn layer(&self) -> Layer { self.layer }
     pub fn base(&self) -> Option<&(Branch, Basis)> { self.data.base.as_ref() }
     pub fn lineage(&self) -> Vec<BranchLineage> { self.index.lineage(self.cut.basis) }
+    pub fn custody_inventories(&self) -> impl Iterator<Item = CustodyInventory> + '_ {
+        self.index.custody_inventories(self.cut.basis)
+    }
 
     pub fn tables(&self) -> impl Iterator<Item = (&TableRef, &BranchTable)> {
         self.index.tables(self.cut.basis)

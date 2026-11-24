@@ -169,7 +169,7 @@ pub enum Op {
     Merge { from: Branch, into: Branch },
     DropBranch { branch: Branch },
     CreateCustodyGroup { group: CustodyGroupId },
-    RevokeCustodyGroup { group: CustodyGroupId },
+    RevokeCustodyGroup { group: CustodyGroupId, inventory_sha256: [u8; 32] },
 }
 
 impl Op {

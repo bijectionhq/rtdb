@@ -74,6 +74,7 @@ pub fn branch_snapshot_with(
             }
             append_lineage(view, &mut buffer)?;
             append_ordered_indexes(view, &mut buffer)?;
+            append_custody_inventory(view, &mut buffer)?;
         }
         live = Arc::new(live.apply(&buffer.stage()?)?);
     }
@@ -134,6 +135,29 @@ fn append_ordered_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer)
             ]);
             buffer.put(catalog.clone(), cells, Interval::ALL)?;
         }
+    }
+    Ok(())
+}
+
+fn append_custody_inventory(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+    let catalog = TableRef::new("xt", "custody_groups");
+    let binary = LogicalType::Scalar(ScalarType::Binary);
+    let columns = StructFields::from([
+        ("_id".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ("inventory_sha256".into(), binary.clone()),
+        ("placements".into(), LogicalType::Scalar(ScalarType::U64)),
+        ("revoked_at".into(), binary),
+    ]);
+    buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
+    buffer.declare_document_types(&catalog, &columns)?;
+    for entry in view.custody_inventories() {
+        let cells = StructFields::from([
+            ("_id".into(), Value::Utf8(format!("{:032x}", u128::from_be_bytes(entry.group)))),
+            ("inventory_sha256".into(), Value::Binary(entry.sha256.to_vec())),
+            ("placements".into(), Value::U64(entry.placements)),
+            ("revoked_at".into(), entry.revoked_at.map_or(Value::Null, basis_value)),
+        ]);
+        buffer.put(catalog.clone(), cells, Interval::ALL)?;
     }
     Ok(())
 }

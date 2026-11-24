@@ -174,6 +174,8 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
             },
             WireOp::RevokeCustodyGroup(revoke) => Op::RevokeCustodyGroup {
                 group: custody_group(&revoke.group)?,
+                inventory_sha256: revoke.inventory_sha256.as_slice().try_into()
+                    .map_err(|_| error::incorrect("Custody revocation needs a 32-byte inventory digest"))?,
             },
         },
     )

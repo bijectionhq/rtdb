@@ -5018,6 +5018,7 @@ dependencies = [
  "rtdb-trie",
  "rtdb-types",
  "serde",
+ "sha2",
 ]
 
 [[package]]

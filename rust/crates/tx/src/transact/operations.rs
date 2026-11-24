@@ -138,9 +138,13 @@ impl Candidate<'_> {
                         Err(error) => return Err(error),
                     }
                 }
-                Op::RevokeCustodyGroup { group } => {
+                Op::RevokeCustodyGroup { group, inventory_sha256 } => {
                     self.require_unrestricted()?;
                     if self.index.custody_group_live(*group)? {
+                        let inventory = self.index.custody_inventory(*group).expect("live group has an inventory");
+                        if inventory.sha256 != *inventory_sha256 {
+                            return Err(conflict("rtdb/custody-inventory-changed", "The custody inventory changed after erasure was planned"));
+                        }
                         self.push(BranchEffect::RevokeCustodyGroup { group: *group })?;
                     }
                 }

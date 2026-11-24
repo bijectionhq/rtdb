@@ -1,6 +1,15 @@
+use sha2::{Digest, Sha256};
+
 use super::*;
 
 pub type CustodyGroupId = [u8; 16];
+
+pub struct CustodyInventory {
+    pub group: CustodyGroupId,
+    pub placements: u64,
+    pub sha256: [u8; 32],
+    pub revoked_at: Option<Basis>,
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CustodyPayload {
@@ -14,12 +23,46 @@ pub(super) struct CustodyMember {
     pub table: TableRef,
     pub id: EntityId,
     pub written: Basis,
+    #[serde(default = "all_valid")]
+    pub valid: Interval,
+    #[serde(default)]
+    pub ordinal: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(super) struct CustodyGroup {
+    #[serde(default)]
+    created: Option<Basis>,
     revoked: Option<Basis>,
     members: imbl::OrdSet<CustodyMember>,
+}
+
+impl CustodyGroup {
+    fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
+        if self.created.is_some_and(|created| created > at) { return None; }
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/v1/custody-inventory\0");
+        hash.update(at.incarnation());
+        hash.update(group);
+        let mut placements = 0;
+        for member in self.members.iter().filter(|member| member.written <= at) {
+            for part in [member.branch.as_bytes(), member.table.schema.as_bytes(),
+                member.table.table.as_bytes(), &member.id.handle_bytes()]
+            {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part);
+            }
+            hash.update(member.written.to_bytes());
+            hash.update(member.valid.lower().0.to_be_bytes());
+            hash.update(member.valid.upper().0.to_be_bytes());
+            hash.update(member.ordinal.to_be_bytes());
+            placements += 1;
+        }
+        Some(CustodyInventory {
+            group, placements, sha256: hash.finalize().into(),
+            revoked_at: self.revoked.filter(|revocation| *revocation <= at),
+        })
+    }
 }
 
 impl BranchIndex {
@@ -39,11 +82,21 @@ impl BranchIndex {
         self.custody.iter().filter_map(|(id, group)| group.revoked.map(|basis| (*id, basis)))
     }
 
+    pub fn custody_inventory(&self, group: CustodyGroupId) -> Option<CustodyInventory> {
+        self.custody.get(&group)?.inventory(group, self.head.basis)
+    }
+
+    pub(super) fn custody_inventories(&self, at: Basis) -> impl Iterator<Item = CustodyInventory> + '_ {
+        self.custody.iter().filter_map(move |(&id, group)| group.inventory(id, at))
+    }
+
     pub(super) fn create_custody_group(&mut self, id: CustodyGroupId) -> Result<()> {
         if id == [0; 16] || self.custody.contains_key(&id) {
             return Err(Anomaly::fault("rtdb/custody-fold", "Invalid resolved custody group creation"));
         }
-        self.custody.insert(id, Arc::new(CustodyGroup::default()));
+        self.custody.insert(id, Arc::new(CustodyGroup {
+            created: Some(self.head.basis), ..CustodyGroup::default()
+        }));
         Ok(())
     }
 
@@ -88,3 +141,5 @@ impl BranchIndex {
         Ok(())
     }
 }
+
+fn all_valid() -> Interval { Interval::ALL }
