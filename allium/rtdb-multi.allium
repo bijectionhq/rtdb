@@ -573,6 +573,7 @@ contract LogService {
         -- Pre-fence carrier creator evidence uses the exact registry transaction and the original installation visible at that transaction.
         -- The current Original order binds a cell-endorsed custody grant and its exact held replay approval in one transaction after the retired frontier.
         -- The grant authenticates the exact Root activation and distinct reader and Original control credentials.
+        -- The enrolled reader makes custody requests through an authenticated session with read access to the current Original attachment.
         -- The reader can open the exact carrier only through a promoted response hold whose registration and disposition use the Original order.
         -- The Original controller can order a family fence on the retired history with the same live member and exact inventory predicates.
         -- A retired family release rechecks its current grant and marker through plaintext handoff.
