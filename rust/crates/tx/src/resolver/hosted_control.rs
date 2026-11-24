@@ -57,9 +57,9 @@ fn family_retirement(operation: &Operation) -> Result<Option<(Option<Iid>, Entit
             }
         };
         if let Some(digest) = digest {
-            if world.is_some() && (write.from, write.to) != (Some(Timestamp::MIN), Some(Timestamp::MAX))
-                || retirement.replace((world, row.id()?, digest)).is_some()
-            {
+            let all_time = write.from == Some(Timestamp::MIN)
+                && (write.to == Some(Timestamp::MAX) || world.is_none() && write.to.is_none());
+            if !all_time || retirement.replace((world, row.id()?, digest)).is_some() {
                 return Err(invalid_family_fence());
             }
         }
