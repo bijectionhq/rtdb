@@ -20,6 +20,8 @@ use crate::keys::{
     LandingReservation, WorldRowSlot, assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment,
 };
 
+mod release;
+
 struct Scope {
     deployment: Uuid,
     incarnation: NonZeroU64,
@@ -74,7 +76,7 @@ impl Scope {
             }
             FamilyRequest::EnrollOriginal(row) | FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, true)),
             FamilyRequest::Scope | FamilyRequest::RegisterDerived { .. } | FamilyRequest::SealWorldRow { .. }
-            | FamilyRequest::ResolveMember { .. } | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
+            | FamilyRequest::Release(_) | FamilyRequest::ResolveMember { .. } | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
         };
         let mut worlds = positions.into_iter().flatten()
             .filter(|position| position.line_generation != self.root_line)
@@ -222,9 +224,11 @@ pub(super) async fn serve(
             FamilyReply::Sealed(Bytes::from(envelope))
         }
         FamilyRequest::OpenRootLandingPayload { family, stage, binding, envelope } => {
-            FamilyReply::Opened(families.open_root_landing_payload(
+            let body = families.open_root_landing_payload(
                 scope.family(family), scope.stage(stage)?, binding, envelope, vault()?,
-            ).await?)
+            ).await?;
+            families.track_family_delivery(family)?;
+            FamilyReply::Opened(body)
         }
         FamilyRequest::ResolveMember { family, assertion } => {
             let member = families.resolve_member(scope.family(family), assertion).await?;
@@ -254,11 +258,15 @@ pub(super) async fn serve(
             let (stage, authoring) = admit_row(&scope, &families, &row).await?;
             let opened = vault()?.open_assertion_for_resolution(stage, authoring, &region, envelope).await?;
             admit_row(&scope, &families, &row).await?;
+            families.track_family_delivery(row.family)?;
             FamilyReply::Opened(opened)
         }
         FamilyRequest::PlanFence { family, selected, order } => {
             fence_reply(families.plan_fence(scope.family(family), selected, order).await?)
         }
+        FamilyRequest::Release(request) => return release::serve(
+            &scope, &original, session.state().cancellation(), families, request,
+        ).await,
         FamilyRequest::Settle { .. } => return Err(Anomaly::unsupported(
             "rtdb.owned/assertion-profile-uninstalled",
             "Family settlement requires the fixed assertion profile, which this cell does not install",

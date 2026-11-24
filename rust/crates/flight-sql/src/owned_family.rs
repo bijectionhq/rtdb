@@ -27,6 +27,7 @@ pub(crate) const REGISTER_FAMILY_DERIVED_V1: &str = "rtdb.owned.RegisterFamilyDe
 pub(crate) const SEAL_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.SealWorldOverlayRow.v1";
 pub(crate) const OPEN_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.OpenWorldOverlayRow.v1";
 pub(crate) const PLAN_ASSERTION_FAMILY_FENCE_V1: &str = "rtdb.owned.PlanAssertionFamilyFence.v1";
+pub(crate) const FAMILY_RESPONSE_RELEASE_V1: &str = "rtdb.owned.FamilyResponseRelease.v1";
 pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionFamily.v1";
 
 pub(crate) fn is_family_action(action: &str) -> bool {
@@ -35,7 +36,7 @@ pub(crate) fn is_family_action(action: &str) -> bool {
         | SEAL_FAMILY_LANDING_LINK_V2 | SEAL_FAMILY_LANDING_PAYLOAD_V1 | OPEN_FAMILY_LANDING_PAYLOAD_V1
         | RESOLVE_FAMILY_MEMBER_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
-        | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1)
+        | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1 | FAMILY_RESPONSE_RELEASE_V1)
 }
 
 const MAX_DERIVED_PER_REQUEST: usize = 256;
@@ -93,6 +94,27 @@ pub struct WorldRowAuthoring {
     pub key: Vec<u8>,
 }
 
+pub enum FamilyReleaseInputWire {
+    Member(FamilyOccurrenceWire),
+    World { member: FamilyOccurrenceWire, winner: Position, row: WorldRowAuthoring },
+}
+
+pub struct FamilyReleaseRegistrationWire {
+    pub origin: [u8; 32],
+    pub attempt: [u8; 32],
+    pub part: [u8; 72],
+    pub address: [u8; 188],
+}
+
+pub enum FamilyReleaseRequest {
+    Prepare { family: Uuid, part: [u8; 72], cutoff: u64, input: FamilyReleaseInputWire },
+    Stage { registration: FamilyReleaseRegistrationWire, input: FamilyReleaseInputWire },
+    Promote(FamilyReleaseRegistrationWire),
+    Check(FamilyReleaseRegistrationWire),
+    Cancel(FamilyReleaseRegistrationWire),
+    Dispose(FamilyReleaseRegistrationWire),
+}
+
 pub enum FamilyRequest {
     Scope,
     EnrollOriginal(WorldRowAuthoring),
@@ -125,6 +147,7 @@ pub enum FamilyRequest {
     OpenWorldRow { row: WorldRowAuthoring, envelope: Bytes },
     PlanFence { family: Uuid, selected: Position, order: Uuid },
     Settle { family: Uuid },
+    Release(FamilyReleaseRequest),
 }
 
 pub struct FamilyFenceReply {
@@ -143,6 +166,7 @@ pub enum FamilyReply {
     Sealed(Bytes),
     Opened(Bytes),
     Fence(FamilyFenceReply),
+    ReleaseRegistration(Bytes),
 }
 
 struct Frame<'a>(&'a [u8]);
@@ -251,6 +275,23 @@ impl<'a> Frame<'a> {
         })
     }
 
+    fn release_input(&mut self) -> Result<FamilyReleaseInputWire, Status> {
+        let tag = self.u8("release input kind")?;
+        let member = self.occurrence()?;
+        match tag {
+            0 => Ok(FamilyReleaseInputWire::Member(member)),
+            1 => Ok(FamilyReleaseInputWire::World { member, winner: self.position()?, row: self.world_row()? }),
+            _ => Err(invalid("Invalid family release input kind")),
+        }
+    }
+
+    fn release_registration(&mut self) -> Result<FamilyReleaseRegistrationWire, Status> {
+        Ok(FamilyReleaseRegistrationWire {
+            origin: self.take("release origin")?, attempt: self.take("release attempt")?,
+            part: self.take("response part")?, address: self.take("recovery address")?,
+        })
+    }
+
     fn root_target(&mut self) -> Result<RootLandingTarget, Status> {
         RootLandingTarget::from_bytes(self.take("Root landing target")?)
             .map_err(|_| invalid("Invalid Root landing target"))
@@ -348,6 +389,18 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
         PLAN_ASSERTION_FAMILY_FENCE_V1 => FamilyRequest::PlanFence {
             family: frame.uuid("family")?, selected: frame.position()?, order: frame.uuid("order")?,
         },
+        FAMILY_RESPONSE_RELEASE_V1 => FamilyRequest::Release(match frame.u8("release operation")? {
+            0 => FamilyReleaseRequest::Prepare {
+                family: frame.uuid("family")?, part: frame.take("response part")?,
+                cutoff: frame.u64("release cutoff")?, input: frame.release_input()?,
+            },
+            1 => FamilyReleaseRequest::Stage { registration: frame.release_registration()?, input: frame.release_input()? },
+            2 => FamilyReleaseRequest::Promote(frame.release_registration()?),
+            3 => FamilyReleaseRequest::Check(frame.release_registration()?),
+            4 => FamilyReleaseRequest::Cancel(frame.release_registration()?),
+            5 => FamilyReleaseRequest::Dispose(frame.release_registration()?),
+            _ => return Err(invalid("Invalid family release operation")),
+        }),
         SETTLE_ASSERTION_FAMILY_V1 => FamilyRequest::Settle { family: frame.uuid("family")? },
         _ => return Err(unsupported()),
     };
@@ -404,6 +457,9 @@ impl Service {
     pub(crate) async fn assertion_family_action(&self, call: &Call, action: &str, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || call.session.audience_source().is_some() { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
+        if action == FAMILY_RESPONSE_RELEASE_V1 && !self.supports_hosted_upload(call) {
+            return Err(unsupported());
+        }
         let request = decode(action, body)?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
@@ -430,7 +486,7 @@ impl Service {
                 put_stage(&mut out, member.capability);
                 out.freeze()
             },
-            FamilyReply::Sealed(bytes) | FamilyReply::Opened(bytes) => {
+            FamilyReply::Sealed(bytes) | FamilyReply::Opened(bytes) | FamilyReply::ReleaseRegistration(bytes) => {
                 let charge = call.reserve(bytes.len())?;
                 wire::retain(bytes, charge)
             }

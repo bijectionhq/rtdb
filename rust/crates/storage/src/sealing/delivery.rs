@@ -93,13 +93,25 @@ struct Unit {
     _allocation: Arc<MemoryReservation>,
 }
 
-/// A conservative inventory of the exact keys that could contribute to this
-/// execution's answer. Buffered operator state can outlive any single pull.
+/// An original authority for plaintext that is not tracked by an object key.
+#[async_trait::async_trait]
+pub trait PlaintextReleaseCheck: Send + Sync {
+    async fn require_current(&self) -> rtdb_types::Result<()>;
+}
+
+/// A conservative inventory of the exact keys and checks for an execution's answer.
 pub struct PlaintextView {
     memory: Arc<MemoryBudget>,
     units: Mutex<BTreeMap<(usize, ObjectKey), Arc<Unit>>>,
     certified_reads: Mutex<BTreeMap<[u8; 16], (Arc<CertifiedRead>, Arc<MemoryReservation>)>>,
     protected_cuts: Mutex<Vec<ProtectedCut>>,
+    release_checks: Mutex<BTreeMap<[u8; 32], Arc<CheckedRelease>>>,
+}
+
+struct CheckedRelease {
+    owner: Arc<dyn PlaintextReleaseCheck>,
+    cutoff: DeliveryDeadline,
+    _allocation: Arc<MemoryReservation>,
 }
 
 struct ProtectedCut {
@@ -115,6 +127,7 @@ impl PlaintextView {
             units: Mutex::new(BTreeMap::new()),
             certified_reads: Mutex::new(BTreeMap::new()),
             protected_cuts: Mutex::new(Vec::new()),
+            release_checks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -137,6 +150,22 @@ impl PlaintextView {
                 None => work.await,
             }
         }
+    }
+
+    /// Preserve the first cutoff for this subject through response handoff.
+    pub fn track_release_check(key: [u8; 32], owner: Arc<dyn PlaintextReleaseCheck>) -> rtdb_types::Result<()> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            for view in views.iter() {
+                let mut checks = view.release_checks.lock();
+                if let std::collections::btree_map::Entry::Vacant(entry) = checks.entry(key) {
+                    let allocation = view.memory.reserve(512)?;
+                    entry.insert(Arc::new(CheckedRelease {
+                        owner: Arc::clone(&owner), cutoff: DeliveryDeadline::answer_window(), _allocation: allocation,
+                    }));
+                }
+            }
+            Ok(())
+        }).unwrap_or(Ok(()))
     }
 
     pub fn track_certified_read(read: &Arc<CertifiedRead>) -> rtdb_types::Result<()> {
@@ -253,6 +282,17 @@ impl PlaintextView {
                 }
             };
             deadline = Some(deadline.map_or(expires, |prior: DeliveryDeadline| prior.earlier(expires)));
+        }
+        let (_check_charge, checks) = {
+            let checks = self.release_checks.lock();
+            let charge = self.memory.reserve(checks.len().saturating_mul(std::mem::size_of::<Arc<CheckedRelease>>()))?;
+            (charge, checks.values().cloned().collect::<Vec<_>>())
+        };
+        for check in checks {
+            if !check.cutoff.is_live() { return Err(expired()); }
+            tokio::time::timeout_at(check.cutoff.instant.into(), check.owner.require_current())
+                .await.map_err(|_| expired())??;
+            deadline = Some(deadline.map_or(check.cutoff, |prior| prior.earlier(check.cutoff)));
         }
         let certified_reads = self.certified_reads.lock();
         let trace_bytes = self.memory.reserve(certified_reads.len().saturating_mul(std::mem::size_of::<Arc<CertifiedRead>>()))?;

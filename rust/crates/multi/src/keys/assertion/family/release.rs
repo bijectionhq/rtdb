@@ -144,6 +144,7 @@ pub struct FamilyReleaseRegistration {
 
 impl FamilyReleaseRegistration {
     pub fn owner(self) -> CarrierJournalIdentity { self.owner }
+    pub fn client_family(self) -> Uuid { self.client_family }
     pub fn part(self) -> FamilyResponsePart { self.part }
     pub fn origin(self) -> [u8; 32] { self.origin }
     pub fn attempt(self) -> [u8; 32] { self.attempt }
@@ -186,7 +187,7 @@ impl FamilyReleaseRegistration {
         bytes
     }
 
-    fn recover(origin: [u8; 32], attempt: [u8; 32], part: FamilyResponsePart, address: &[u8]) -> Result<Self> {
+    pub fn from_address(origin: [u8; 32], attempt: [u8; 32], part: FamilyResponsePart, address: &[u8]) -> Result<Self> {
         let address: &[u8; 188] = address.try_into().map_err(|_| conflict())?;
         let owner = CarrierJournalIdentity {
             deployment: Uuid::from_bytes(address[4..20].try_into().expect("deployment width")),
@@ -252,9 +253,10 @@ pub(super) struct ReleaseHold {
 }
 
 impl<'a> AssertionFamilies<'a> {
-    pub fn with_release_authority(mut self, authority: &'a dyn FamilyReleaseAuthority) -> Self {
-        self.release_authority = Some(authority);
-        self
+    pub fn with_release_authority<'b>(self, authority: &'b dyn FamilyReleaseAuthority) -> AssertionFamilies<'b> where 'a: 'b {
+        AssertionFamilies {
+            journal: self.journal, region: self.region, original: self.original, release_authority: Some(authority),
+        }
     }
 
     /// Return coordinates to register before the first potentially durable hold.
@@ -351,7 +353,7 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn recover_family_release(
         &self, origin: [u8; 32], attempt: [u8; 32], part: FamilyResponsePart, address: &[u8],
     ) -> Result<()> {
-        let registration = FamilyReleaseRegistration::recover(origin, attempt, part, address)?;
+        let registration = FamilyReleaseRegistration::from_address(origin, attempt, part, address)?;
         self.settle_family_release(registration).await
     }
 
@@ -487,6 +489,40 @@ impl<'a> AssertionFamilies<'a> {
     }
 }
 
+struct OriginalFamilyDelivery {
+    original: OriginalAssertionFamilyReader,
+    deployment: Uuid,
+    family: Uuid,
+    cancellation: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl rtdb_storage::sealing::PlaintextReleaseCheck for OriginalFamilyDelivery {
+    async fn require_current(&self) -> Result<()> {
+        let current = self.original.current(self.deployment, &self.cancellation).await?;
+        if current.assertion_family_fence(self.family).await?.is_some() {
+            return Err(rtdb_storage::Error::ErasedUnderView.into());
+        }
+        Ok(())
+    }
+}
+
+impl AssertionFamilies<'_> {
+    /// The exact input was admitted at open. Attach its original marker and
+    /// original output cutoff to the existing plaintext delivery scope.
+    pub(crate) fn track_family_delivery(&self, family: Uuid) -> Result<()> {
+        let original = self.original.as_ref().ok_or_else(unavailable)?;
+        let mut key = Context::new(&SHA256);
+        key.update(b"rtdb.multi/family-plaintext-delivery/v1\0");
+        key.update(&original.reader.history_fingerprint());
+        key.update(family.as_bytes());
+        rtdb_storage::sealing::PlaintextView::track_release_check(finish(key), Arc::new(OriginalFamilyDelivery {
+            original: original.reader.clone(), deployment: original.deployment, family,
+            cancellation: original.cancellation.clone(),
+        }))
+    }
+}
+
 fn check_expiry(expires_at_ms: u64) -> Result<()> {
     let elapsed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_err(|_| unavailable())?;
     let now = u64::try_from(elapsed.as_millis()).map_err(|_| unavailable())?;
@@ -517,11 +553,11 @@ mod tests {
     fn recovery_binds_the_exact_part_and_address() {
         let offered = registration(Uuid::new_v4(), Uuid::new_v4());
         let address = offered.address();
-        let recovered = FamilyReleaseRegistration::recover(offered.origin(), offered.attempt(), offered.part(), &address).unwrap();
+        let recovered = FamilyReleaseRegistration::from_address(offered.origin(), offered.attempt(), offered.part(), &address).unwrap();
         assert_eq!(recovered.address(), address);
         assert_eq!(recovered.binding, offered.binding);
         let another_part = FamilyResponsePart { ordinal: NonZeroU64::new(2).unwrap(), ..offered.part() };
-        assert!(FamilyReleaseRegistration::recover(offered.origin(), offered.attempt(), another_part, &address).is_err());
+        assert!(FamilyReleaseRegistration::from_address(offered.origin(), offered.attempt(), another_part, &address).is_err());
 
         let later = FamilyReleaseRegistration::new(offered.owner(), offered.client_family, offered.part(), offered.input, 11);
         assert_eq!(later.attempt(), offered.attempt());

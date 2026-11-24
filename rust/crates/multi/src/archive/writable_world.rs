@@ -1254,6 +1254,7 @@ pub struct WorldFact {
     row: RecordBatch,
     revision: Timestamp,
     assertion: Option<OwnedWorldAssertion>,
+    authoring_world: Option<Iid>,
     lifetime: Option<Interval>,
     reservation: Arc<MemoryReservation>,
 }
@@ -1323,6 +1324,7 @@ impl WorldFact {
         }
         if deleted { return Ok(None); }
         self.row = self.row.project(&selected).map_err(|_| unavailable())?;
+        self.authoring_world = Some(line);
         if let Some(assertion) = &mut self.assertion {
             assertion.line = Some(line);
         }
@@ -1368,7 +1370,7 @@ fn decode_point(
                 rtdb_columnar::validate_readable_cell(field, batch.column(index).as_ref(), &logical, row, memory)?;
             }
             let row = batch.slice(row, 1).project(&columns).map_err(|_| OwnedWorld::unavailable())?;
-            found = Some(WorldFact { row, revision, assertion, lifetime, reservation });
+            found = Some(WorldFact { row, revision, assertion, authoring_world: None, lifetime, reservation });
         }
     }
     Ok(found)
@@ -1465,7 +1467,7 @@ mod tests {
         let row = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
         let ordinal = std::num::NonZeroU32::new(3).unwrap();
         let fact = WorldFact {
-            row, revision: Timestamp(20), assertion: Some(OwnedWorldAssertion { line: None, ordinal, held_reading: None }),
+            row, revision: Timestamp(20), assertion: Some(OwnedWorldAssertion { line: None, ordinal, held_reading: None }), authoring_world: None,
             lifetime: None, reservation: memory.reserve(4096)?,
         };
         let line = Iid([7; 16]);
@@ -1495,7 +1497,7 @@ mod world_point_tests {
                 Arc::new(StringArray::from(vec!["id"])),
                 rtdb_columnar::build_array(&logical, &[marker])?,
             ]).unwrap();
-            WorldFact { row, revision: Timestamp(2), assertion: None, lifetime: None, reservation: memory.reserve(4096)? }
+            WorldFact { row, revision: Timestamp(2), assertion: None, authoring_world: None, lifetime: None, reservation: memory.reserve(4096)? }
                 .into_shadow(line)
         };
         assert!(into_shadow(Value::Null)?.is_none());

@@ -139,6 +139,25 @@ pub struct CurrentAssertionFamilyRead {
 }
 
 impl CurrentAssertionFamilyRead {
+    pub async fn carrier_journal_installation(&self) -> Result<HostedControlPoint> {
+        let restored = self.carrier_point("bj_rtdb_restore_hold", "restore").await?;
+        if restored.row.is_some() { return Err(hosted_source_unavailable()); }
+        self.carrier_point("bj_installation", "authority").await
+    }
+
+    pub async fn carrier_journal_registration(&self, key: &str) -> Result<HostedControlPoint> {
+        self.carrier_point("bj_external_key_recovery", key).await
+    }
+
+    async fn carrier_point(&self, relation: &str, key: &str) -> Result<HostedControlPoint> {
+        let point = rtdb_query::read_hosted_control_point(
+            Arc::clone(&self.context), TableRef::new("public", relation),
+            &EntityId::String(key.to_owned()), true,
+        ).await?;
+        self.context.check_cancelled()?;
+        Ok(point)
+    }
+
     pub async fn assertion_family_fence(&self, family: Uuid) -> Result<Option<AssertionFamilyFenceMarker>> {
         let unavailable = hosted_source_unavailable;
         let selected = rtdb_query::read_hosted_control_point(

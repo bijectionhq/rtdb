@@ -234,7 +234,21 @@ A promoted hold closes only after positive durable disposal from the original ca
 The original vault retains a terminal record before acknowledging disposal or removing a hold from the family roster.
 A deadline refuses further release but supplies no disposal evidence.
 A drain checks the current original marker and the exact inventory before declaring all family holds terminal.
-The hosted action and delivery wiring remain uninstalled.
+Hosted protocol 221 advertises `rtdb.owned.FamilyResponseRelease.v1` to the installed writer.
+It reuses the current original placement, hosted `bj_installation` incarnation and writer, and the canonical `bj_external_key_recovery` table.
+Recovery requires the same linked original writer and leaves the registry row in place until the vault acknowledges terminal custody.
+The action refuses mounted, restored or cross-source placements.
+
+The request starts with one operation byte.
+Prepare (0) carries family UUID (16), response part (72), the original epoch-millisecond cutoff (u64 big-endian), and input.
+It returns provider origin (32), attempt (32), and the nonsecret recovery address (188).
+Stage (1) carries origin, attempt, response part, address, and the same input.
+Promote (2), check (3), cancel (4), and dispose (5) carry only origin, attempt, part, and address. Each returns byte 1.
+The part orders cell history, Usher, Conductor and response UUIDs followed by the positive u64 ordinal.
+Input kind 0 is the exact member occurrence. Kind 1 adds the world's ordered winning position and the complete world-row authoring prefix.
+The RTDB adapter derives the registry commitment from the original placed history, the installed incarnation, and the registry table name.
+It authenticates the exact row creator against the current original `bj_installation` writer and checks the original registry address at the same barrier.
+Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
 
 ### Fence plan reply
 

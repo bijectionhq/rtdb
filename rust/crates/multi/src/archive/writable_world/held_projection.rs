@@ -96,7 +96,7 @@ impl WorldProjectionCustody {
         {
             return Err(invalid());
         }
-        let world = fact.assertion.and_then(|assertion| assertion.line).ok_or_else(invalid)?;
+        let world = fact.authoring_world.ok_or_else(invalid)?;
         let EntityId::String(key) = id else { return Err(invalid()); };
         if key.is_empty() || key.len() > 512 {
             return Err(invalid());
@@ -121,6 +121,7 @@ impl WorldProjectionCustody {
         let charge = memory.reserve(bytes.len().saturating_mul(16))?;
         match opened.await {
             Ok(bytes) => {
+                families.track_family_delivery(carrier.family)?;
                 let projection = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
                 Ok(SearchRow::Sealed(projection, charge))
             }
