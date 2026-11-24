@@ -29,7 +29,6 @@ impl<J: Journal + ?Sized> FaultJournal<J> {
         }
     }
 
-    /// Queues a fault.
     /// A dropped reply applies to the next append attempt and leaves intervening non-append requests alone.
     pub fn inject(&self, fault: Fault) {
         self.faults.lock().push_back(fault);

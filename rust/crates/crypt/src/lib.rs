@@ -12,7 +12,6 @@ pub use local::LocalKms;
 
 pub type DataKey = Zeroizing<[u8; 32]>;
 
-/// A generation belongs to a single database incarnation.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Generation {
     pub database: Uuid,

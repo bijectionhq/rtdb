@@ -424,7 +424,6 @@ impl<'a> BranchView<'a> {
     }
 }
 
-/// Byte ordering for one binary or UTF-8 index column.
 pub fn index_key(value: &Value) -> Option<&[u8]> {
     match value {
         Value::Binary(key) | Value::FixedSizeBinary(key) => Some(key),

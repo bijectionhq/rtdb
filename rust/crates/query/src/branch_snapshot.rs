@@ -12,7 +12,6 @@ use rtdb_types::{
     rtdb_v1::{Basis, Claim, ClaimScope, ClaimSealer},
 };
 
-/// Projects the selected ancestry into the temporal scan used by SQL operators.
 pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Result<Snapshot> {
     let tables = Arc::new(TableCatalog::default());
     let tries = Arc::new(TrieCatalog::default());
