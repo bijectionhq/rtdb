@@ -22,7 +22,7 @@ impl Default for Tokens {
 }
 
 pub(super) struct Continuation {
-    pub cut: Timestamp,
+    pub cut: Basis,
     pub clock: Timestamp,
     pub offset: u64,
     pub request: [u8; 32],
@@ -50,14 +50,16 @@ impl Tokens {
     }
 
     fn claim_sealer(&self, incarnation: [u8; 16]) -> ClaimSealer {
-        let key = self.mac(Uuid::from_bytes(incarnation), b"claim-key", &[])
+        let key = self
+            .mac(Uuid::from_bytes(incarnation), b"claim-key", &[])
             .finalize()
             .into_bytes();
         ClaimSealer::new(incarnation, key.into())
     }
 
     pub fn claim(&self, basis: Basis) -> Result<proto::Claim, Status> {
-        let value = self.claim_sealer(basis.incarnation())
+        let value = self
+            .claim_sealer(basis.incarnation())
             .seal(&ClaimScope {
                 branch: MAIN_BRANCH.into(),
                 basis,
@@ -70,7 +72,7 @@ impl Tokens {
 
     pub fn continuation(&self, scope: Uuid, page: &Continuation) -> Vec<u8> {
         let mut body = Vec::with_capacity(88);
-        body.extend_from_slice(&page.cut.0.to_be_bytes());
+        body.extend_from_slice(&page.cut.position().to_be_bytes());
         body.extend_from_slice(&page.clock.0.to_be_bytes());
         body.extend_from_slice(&page.offset.to_be_bytes());
         body.extend_from_slice(&page.request);
@@ -86,7 +88,7 @@ impl Tokens {
         };
         let request = bytes[24..].try_into().expect("request fingerprint width");
         Ok(Continuation {
-            cut: Timestamp(i64::from_be_bytes(*cut)),
+            cut: Basis::new(*scope.as_bytes(), u64::from_be_bytes(*cut)),
             clock: Timestamp(i64::from_be_bytes(*clock)),
             offset: u64::from_be_bytes(*offset),
             request,
@@ -103,7 +105,9 @@ pub(super) fn basis(scope: Uuid, cut: Timestamp) -> Basis {
 
 impl From<Basis> for proto::Basis {
     fn from(basis: Basis) -> Self {
-        Self { value: basis.to_bytes().to_vec() }
+        Self {
+            value: basis.to_bytes().to_vec(),
+        }
     }
 }
 

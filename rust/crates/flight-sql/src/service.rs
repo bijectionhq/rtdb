@@ -617,7 +617,7 @@ impl FlightService for Service {
         let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
         if crate::v1::is_action(&request.get_ref().r#type) {
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await.map_err(crate::v1::error::map_status)?;
-            return self.v1_action(call, request.into_inner());
+            return self.v1_action(call, request.into_inner()).await;
         }
         let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)

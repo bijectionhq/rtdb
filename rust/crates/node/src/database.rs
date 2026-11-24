@@ -43,6 +43,7 @@ pub struct Database {
     pub(crate) audience_storage: Option<crate::AudienceReadStorage>,
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
+    serving: Option<Arc<dyn crate::serving::ServingDriver>>,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     pub(crate) await_authority: crate::AwaitAuthority,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
@@ -65,6 +66,7 @@ impl Database {
     /// Identifies the database attachment that issued a wire token.
     /// A new attachment receives a new identity.
     pub fn wire_incarnation(&self) -> uuid::Uuid { self.protected_equality_epoch }
+    pub fn serving_driver(&self) -> Option<&dyn crate::serving::ServingDriver> { self.serving.as_deref() }
     pub fn wire_linearizable_reads(&self) -> bool {
         self.has_replica_read_index() || (!self.read_only && !self.external_source()
             && !matches!(self.configuration.log, Some(database_config::Log::OtherLog(_))))
@@ -548,8 +550,9 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
+            let serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
-                audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
+                audience_storage: resources.audience_storage, logs, replication, serving, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });
