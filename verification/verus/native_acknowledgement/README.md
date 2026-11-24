@@ -35,3 +35,5 @@ In PX1's `AcknowledgedRecovery.lean` (commit `34a87874e2` on `codesign/p-x1`), t
 Binding the replica frame to the exact chosen Logkeeper `Protocol.Append`, establishing the logical event returned by `semantics.decodeTx`, and projecting a native read and query into `readCoversAcknowledgement`, `exactReadCut`, `usesSelectedCut` and `queryUsesRead` remain composition obligations.
 The proof treats returned fingerprints as byte values and relies on the journal delivery and hash binding contracts.
 The async queue, one-shot delivery, storage effects, semantic replay and query materialization are outside the verified functions.
+
+The Lean mutation runner rejects a completion decision that acknowledges enqueue, at `enqueued_does_not_acknowledge` and `enqueue_only_acknowledgement_is_invalid`.

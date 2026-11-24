@@ -1941,7 +1941,19 @@ def verify_installed_guards_lean(args, scratch):
     }, 22)
 
 
+def verify_native_acknowledgement_lean(args, scratch):
+    path = Path("verification/multi/compose/NativeAcknowledgement.lean")
+    verify_lean_model(args, scratch, path, "native-acknowledgement", {
+        "acknowledge-enqueue": (
+            "| .enqueued _ => none", "| .enqueued staged => some (.ok staged)",
+            ["enqueued_does_not_acknowledge", "enqueued_does_not_acknowledge",
+             "enqueue_only_acknowledgement_is_invalid"],
+        ),
+    }, 3)
+
+
 def verify_lean(args, scratch):
+    verify_native_acknowledgement_lean(args, scratch)
     verify_installed_guards_lean(args, scratch)
     verify_fenced_replica_lean(args, scratch)
     verify_gateway_replay_lean(args, scratch)
