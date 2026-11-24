@@ -85,6 +85,10 @@ The scan traces how many covered rows share at least one buffer and how many gat
 Ordered-index inputs bypass the persistent node cache, and replay reads its source bytes within the cycle's memory budget.
 An uncompressed source page borrows its aligned IPC body from the retained file bytes.
 Replay discovers erase cuts from the operation column and can reuse the decoded pages while their reservations fit.
+When retention is declined, the replay pass can read the adopted source's footer and each IPC record block at its exact byte position under the captured catalog hold.
+Each range matches the observed provider version when available, and framed sources authenticate the range through the storage owner.
+Replay releases each source page after projecting its events into index-owned keys.
+Sources without bounded observed ranges and files with dictionaries use the complete-file reader.
 Cold page reads carry the published size into a bounded provider fetch and validate the digest before opening Arrow buffers.
 The page admission and memory reservation stay with the provider operation through cancellation.
 A missing checkpoint, missing source coverage or memory admission failure while opening the seek uses the normal SQL executor.
