@@ -11,7 +11,7 @@ use std::{
 use journal_contract::{FileJournal, Identity, Journal, JournalError, Limits, StreamId};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Kms};
-use rtdb_db::{MultiDatabase, MultiOptions, discover_nodes};
+use rtdb_db::{JournalBatchAppender, MultiDatabase, MultiOptions, discover_nodes};
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
 use rtdb_node::{
     Clock, DatabaseStorage, LogAccess, MultiServing, NativeResources, OpenedLogs, ResourceFactory,
@@ -62,6 +62,7 @@ impl MultiRuntime {
         }));
         let backends = Backends {
             journal,
+            batch: None,
             store,
             io,
             vault,
@@ -135,8 +136,10 @@ impl MultiRuntime {
                 Arc::clone(&io),
             )
             .await?;
+        let journal = Arc::new(journal);
         let backends = Backends {
-            journal: Arc::new(journal),
+            batch: Some(Arc::new(StreamJournalBatch(Arc::clone(&journal)))),
+            journal,
             store,
             io,
             vault,
@@ -172,13 +175,16 @@ impl MultiRuntime {
                 lease_micros: 5_000_000,
                 drift_micros: 250_000,
             };
-            let driver = MultiDatabase::new(
+            let mut driver = MultiDatabase::new(
                 options,
                 Arc::clone(&backends.journal),
                 Arc::clone(&backends.store),
                 Arc::clone(&kms),
                 Arc::new(|| SystemClock.now()),
             )?;
+            if let Some(batch) = &backends.batch {
+                driver = driver.with_batch_appender(Arc::clone(batch));
+            }
             match backends.journal.head(StreamId(database.as_u128())).await {
                 Ok(_) => (),
                 Err(JournalError::NotFound) => driver.create().await?,
@@ -272,12 +278,28 @@ impl MultiRuntime {
 
 struct Backends {
     journal: Arc<dyn Journal>,
+    batch: Option<Arc<dyn JournalBatchAppender>>,
     store: Arc<dyn ObjectStore>,
     io: Arc<IoRegion>,
     vault: PathBuf,
     node: IpAddr,
     peers: Option<String>,
     credential_slot: Option<File>,
+}
+
+#[cfg(feature = "s3")]
+struct StreamJournalBatch(Arc<rtdb_journal_logkeeper::LogkeeperJournal>);
+
+#[cfg(feature = "s3")]
+impl JournalBatchAppender for StreamJournalBatch {
+    fn append_batch(
+        &self,
+        stream: StreamId,
+        epoch: journal_contract::Epoch,
+        records: Vec<(journal_contract::Lsn, bytes::Bytes)>,
+    ) -> journal_contract::BoxFuture<'_, journal_contract::Result<journal_contract::Lsn>> {
+        Box::pin(self.0.append_batch(stream, epoch, records))
+    }
 }
 
 struct ServingResources {

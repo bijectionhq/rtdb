@@ -3165,7 +3165,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb#896ed7818780d86e435ebf25c467ac179a1023fb"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=6e1e1d772bc7e2a2902d7b58f19b08e68d807db2#6e1e1d772bc7e2a2902d7b58f19b08e68d807db2"
 dependencies = [
  "bytes",
 ]
@@ -3355,13 +3355,13 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb#896ed7818780d86e435ebf25c467ac179a1023fb"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=6e1e1d772bc7e2a2902d7b58f19b08e68d807db2#6e1e1d772bc7e2a2902d7b58f19b08e68d807db2"
 dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb)",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=6e1e1d772bc7e2a2902d7b58f19b08e68d807db2)",
  "libc",
  "parking_lot",
  "prost",
@@ -5037,9 +5037,9 @@ name = "rtdb-journal-logkeeper"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb)",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=6e1e1d772bc7e2a2902d7b58f19b08e68d807db2)",
  "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
- "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb)",
+ "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=6e1e1d772bc7e2a2902d7b58f19b08e68d807db2)",
  "tempfile",
  "tokio",
 ]

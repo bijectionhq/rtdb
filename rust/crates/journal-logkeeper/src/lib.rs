@@ -1,4 +1,4 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{future::poll_fn, io, sync::Arc, task::Poll, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
@@ -19,6 +19,35 @@ impl LogkeeperJournal {
         let (transport, ensemble) = TcpTransport::discover(url, credentials, deadline).await?;
         let writer = Writer::new(Arc::new(transport), ensemble).map_err(io::Error::other)?;
         Ok(Self(writer))
+    }
+
+    /// Submit a contiguous group to the writer's shared stream queue.
+    pub async fn append_batch(
+        &self, stream: StreamId, epoch: Epoch, records: Vec<(Lsn, Bytes)>,
+    ) -> Result<Lsn> {
+        let (head, _) = records.last().ok_or(JournalError::Unavailable)?;
+        let head = *head;
+        if records.windows(2).any(|pair| pair[0].0.0.checked_add(1) != Some(pair[1].0.0)) {
+            return Err(JournalError::Unavailable);
+        }
+        let mut appends = records.into_iter().map(|(at, payload)| {
+            (at, Some(self.append(stream, epoch, at, payload)))
+        }).collect::<Vec<_>>();
+        // Writer::append joins the stream queue on its first poll. Stage in
+        // journal order so the writer can collect contiguous pending records.
+        poll_fn(|context| {
+            let mut waiting = false;
+            for (at, append) in &mut appends {
+                let Some(future) = append.as_mut() else { continue; };
+                match future.as_mut().poll(context) {
+                    Poll::Ready(Ok(committed)) if committed == *at => *append = None,
+                    Poll::Ready(Ok(_)) => return Poll::Ready(Err(JournalError::Unavailable)),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => waiting = true,
+                }
+            }
+            if waiting { Poll::Pending } else { Poll::Ready(Ok(head)) }
+        }).await
     }
 }
 
@@ -228,5 +257,12 @@ mod tests {
             .unwrap();
         assert_eq!(page.records, [(Lsn(1), data)]);
         assert_eq!(page.end, Lsn(1));
+        let next = Bytes::from_static(b"next");
+        let last = Bytes::from_static(b"last");
+        assert_eq!(second.append_batch(stream, Epoch(2), vec![
+            (Lsn(2), next.clone()), (Lsn(3), last.clone()),
+        ]).await.unwrap(), Lsn(3));
+        assert_eq!(second.read(stream, Lsn(2), 2, Duration::ZERO).await.unwrap().records,
+            [(Lsn(2), next), (Lsn(3), last)]);
     }
 }
