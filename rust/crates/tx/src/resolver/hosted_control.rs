@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use rtdb_types::{EntityId, OwnedRelation};
 
 use super::*;
+use super::control_order::{HostedStamp, hosted_stamps_current};
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +181,8 @@ impl OpenTransaction<'_> {
         let mut locators = BTreeSet::new();
         let mut selected_tables = BTreeSet::new();
         let mut charges = Vec::new();
+        // Each lookup uses the context captured from this one ordered base.
+        let mut stamps = Vec::new();
         let mut rows = 0usize;
         for control in controls.clone() {
             self.context.check_cancelled()?;
@@ -250,16 +253,17 @@ impl OpenTransaction<'_> {
                 }
                 funded_seat_seen = true;
             }
-            let revision = point.row.map(|(_, revision)| revision);
-            if !super::control_order::revision_matches(
-                revision.map(|time| time.0), control.expected().map(|time| time.0),
-            ) {
-                return Err(Anomaly::new(
-                    AnomalyCategory::Conflict,
-                    "rtdb.hosted/stale-control",
-                    "An observed hosted control changed before ordering",
-                ));
-            }
+            stamps.push(HostedStamp {
+                observed: point.row.map(|(_, revision)| revision.0),
+                expected: control.expected().map(|time| time.0),
+            });
+        }
+        if !hosted_stamps_current(&stamps) {
+            return Err(Anomaly::new(
+                AnomalyCategory::Conflict,
+                "rtdb.hosted/stale-control",
+                "An observed hosted control changed before ordering",
+            ));
         }
         if funded.is_some() && !funded_seat_seen {
             return Err(funded_booking_missing());

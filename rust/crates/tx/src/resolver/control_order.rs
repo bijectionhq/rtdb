@@ -14,6 +14,54 @@ pub(super) fn revision_matches(observed: Option<i64>, expected: Option<i64>) -> 
     }
 }
 
+pub(super) struct HostedStamp {
+    pub observed: Option<i64>,
+    pub expected: Option<i64>,
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(current =>
+    ensures current == (forall|i: int| 0 <= i < stamps@.len() ==>
+        (#[trigger] stamps@[i]).observed == stamps@[i].expected),
+))]
+pub(super) fn hosted_stamps_current(stamps: &[HostedStamp]) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            index <= stamps@.len(),
+            forall|i: int| 0 <= i < index ==> (#[trigger] stamps@[i]).observed == stamps@[i].expected,
+        decreases stamps@.len() - index,
+    ))]
+    while index < stamps.len() {
+        let stamp = &stamps[index];
+        if !revision_matches(stamp.observed, stamp.expected) {
+            #[cfg(verus_keep_ghost)]
+            proof! { assert(stamps@[index as int].observed != stamps@[index as int].expected); }
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+pub(super) struct LandingMarker<'a> {
+    pub context: &'a str,
+    pub fingerprint: &'a [u8],
+    pub source: Option<i64>,
+    pub revision: i64,
+}
+
+/// Check the event selected for publication against the original submission.
+#[cfg_attr(verus_keep_ghost, verus_spec(matches =>
+    ensures matches == (marker.context@ == context@ && marker.fingerprint@ == fingerprint@
+        && marker.source == Some(source) && marker.revision == revision),
+))]
+pub(super) fn landing_marker_matches(
+    marker: LandingMarker<'_>, context: &str, fingerprint: &[u8; 32], source: i64, revision: i64,
+) -> bool {
+    marker.context == context && fingerprint_matches(marker.fingerprint, fingerprint)
+        && marker.source == Some(source) && marker.revision == revision
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(selected =>
     ensures selected == if check_only { Some(original) } else { None },
 ))]

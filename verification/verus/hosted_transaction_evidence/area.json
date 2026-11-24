@@ -1,0 +1,25 @@
+{
+  "summary": "The shipped hosted source confirmation and decision observation compare both original coordinates in the same unique transaction row.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 2,
+  "controls": {
+    "substitute_transaction_revision": {
+      "defect": "A matching source offset authenticates a row with a different history revision.",
+      "mutate": [
+        {
+          "file": "rust/crates/node/src/node/transaction_evidence.rs",
+          "find": "        && revision == Some(requested_revision)\n}",
+          "replace": "\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/node/src/node/transaction_evidence.rs",
+          "function": "exact_transaction_row",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    }
+  }
+}

@@ -5,6 +5,42 @@
   ],
   "min_verified_functions": 21,
   "controls": {
+    "skip_a_hosted_stamp": {
+      "defect": "The hosted resolver repeats the first stamp check and skips later controls.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "        if !revision_matches(stamp.observed, stamp.expected) {",
+          "replace": "        if !revision_matches(stamp.observed, stamp.expected) && index == 0 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "hosted_stamps_current",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 20
+    },
+    "accept_marker_from_another_source_transaction": {
+      "defect": "Prepared publication accepts a marker carrying another original event position.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "        && marker.source == Some(source) && marker.revision == revision\n}",
+          "replace": "        && marker.revision == revision\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "function": "landing_marker_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 20
+    },
     "accept_a_different_writer_revision": {
       "defect": "Treat any live installation authority as the submitted revision.",
       "mutate": [
