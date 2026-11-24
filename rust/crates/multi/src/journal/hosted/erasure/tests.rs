@@ -241,10 +241,10 @@ impl ErasureJournal for CustodyFixture {
         let mut journal = self.journal.lock().unwrap();
         if std::mem::take(&mut journal.append_before_switch) {
             let incumbent = journal.preparing.unwrap().source;
-            assert!(matches!(
+            assert_eq!(
                 journal.append(incumbent, Bytes::from_static(b"old suffix")),
-                Ok(Outcome::Appended(_))
-            ));
+                Err(Refusal::Unavailable)
+            );
         }
         Ok(())
     }
@@ -453,7 +453,7 @@ async fn exact_head_rotation_survives_lost_rotation_and_commit_replies() -> Resu
 }
 
 #[tokio::test]
-async fn an_ordinary_boundary_cut_and_a_racing_append_prevent_the_switch() -> Result<()> {
+async fn an_ordinary_boundary_cut_is_refused_and_preparation_fences_appends() -> Result<()> {
     let mut boundary = Fixture::new().await?;
     boundary.custody.use_boundary = true;
     let failure = boundary.commit().await.unwrap_err();
@@ -477,16 +477,18 @@ async fn an_ordinary_boundary_cut_and_a_racing_append_prevent_the_switch() -> Re
         .get_mut()
         .unwrap()
         .append_before_switch = true;
-    assert_eq!(
-        racing.commit().await.unwrap_err().code,
-        "rtdb.multi/ordered-stale-grant"
-    );
+    let commit = racing.commit().await?;
     let journal = racing.custody.journal.get_mut().unwrap();
-    assert_eq!(journal.state.checkpoint().cut.next_lsn, 0);
-    assert_eq!(journal.state.head().next_lsn, 4);
+    assert_eq!(journal.state.checkpoint(), commit.prepared.checkpoint);
+    assert_eq!(journal.state.head(), commit.prepared.checkpoint.cut);
+    assert_eq!(journal.state.head().next_lsn, 3);
     assert_eq!(
         journal.state.writer_state().grant,
-        Some(racing.erasure.incumbent)
+        Some(Grant {
+            epoch: racing.erasure.incumbent.epoch + 1,
+            key_generation: racing.erasure.incumbent.key_generation + 1,
+            ..racing.erasure.incumbent
+        })
     );
     Ok(())
 }
