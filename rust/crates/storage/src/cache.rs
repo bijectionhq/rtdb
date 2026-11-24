@@ -339,6 +339,16 @@ impl BufferPool {
         Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, catalog_file_paths: paths }))
     }
 
+    /// Re-admit the same scope through the current owner. The old cohort retains
+    /// its original permit until its readers, provider tasks and deliveries drain.
+    pub async fn renew_catalog(&self, held: &HeldCatalogRead) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        if !Arc::ptr_eq(&self.residence, &held.residence) || !held.is_registered() {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
+                "The catalog hold does not belong to this storage residence"));
+        }
+        self.hold_catalog_with_paths(held.cut, held.catalog_file_paths.clone()).await
+    }
+
     pub fn holds_catalog(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>) -> bool {
         self.holds_catalog_with_paths(held, cut, None)
     }

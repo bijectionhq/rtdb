@@ -134,6 +134,9 @@ The current classic grant owner checks the stored receipt and uses the conservat
 A pending decision keeps the intent available for retry.
 Multi queues scoped releases and the provider consumes the existing exact lineage grant.
 A provider request retains its ticket through cancellation and releases it on drain.
+A hosted checkpoint subscription renews through a new admission of the same cut and file claim at the current floor.
+It only replaces its offer after successful admission.
+Existing executions keep their independent registrations through provider and delivery drain, including after refused renewal.
 An abandoned ticket without drain evidence remains in the ledger.
 Independent maintenance and complete recovery-root retention still require custody and settlement integration.
 

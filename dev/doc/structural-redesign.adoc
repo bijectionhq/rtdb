@@ -183,7 +183,8 @@ For hosted and versioned Classic S3 loose compacted primary files with an immuta
 Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
 Generic block and timestamp forks admit under the source lineage reservation and require the selected checkpoint's complete inventory. A same-organisation fork references its actual physical dependencies, including their enclosing packs. Fork admission no longer compares publication age.
 Hosted installed search runs with exact publication evidence use the same bounded catalog claim and can be submitted without the reader ageing timer.
-Abandoned remote hold recovery, renewal, full recovery-root integration, search staging and seal retirement, and uncoordinated timers remain open.
+A hosted checkpoint subscription renews the exact catalog scope through a fresh storage-ledger admission. Prior readers retain independent claims through provider and delivery drain.
+Abandoned Classic remote hold recovery, renewal across other entry points, full recovery-root integration, search staging and seal retirement, and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.

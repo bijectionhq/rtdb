@@ -2023,9 +2023,12 @@ mod tests {
         let tasks = TaskTracker::new();
         let readers = CatalogReaders::new(directory.clone(), tasks.clone(), &record, root, namespaces, owner, Some(record.epoch));
         Arc::get_mut(&mut store).unwrap().catalog_readers = Some(readers);
-        let store = EncryptingStore::new(store, &[7; 32]).unwrap();
+        let store = Arc::new(EncryptingStore::new(store, &[7; 32]).unwrap());
+        let buffer = rtdb_storage::cache::BufferPool::new(store.clone(), 1 << 20);
         let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
-        let hold = store.retain_catalog(Some(cut)).await.unwrap().unwrap();
+        let hold = buffer.hold_catalog(Some(cut)).await.unwrap();
+        let renewed = buffer.renew_catalog(&hold).await.unwrap();
+        assert_eq!(directory.deployment(&record.id).await.unwrap().unwrap().catalog_readers.len(), 2);
         let file = key("tables/orders/data/l01-rc-b00.arrow");
         let physical = key(&format!("{scope}/{file}"));
         store.put(&file, Bytes::from_static(b"admitted")).await.unwrap();
@@ -2055,10 +2058,13 @@ mod tests {
         assert!(!store.release_trie_files(&receipt, receipt_bytes.clone()).await.unwrap());
 
         let held = directory.deployment(&record.id).await.unwrap().unwrap();
-        assert_eq!(held.catalog_readers.len(), 1);
+        assert_eq!(held.catalog_readers.len(), 2);
         let refs = crate::reference::References::default();
         reap_as_of(bucket.as_ref(), &held, i64::MAX, Duration::ZERO, &refs).await.unwrap();
         assert_eq!(store.get(&file).await.unwrap(), Bytes::from_static(b"admitted"));
+        drop(renewed);
+        // The original cohort still prevents advancement after the renewal drains.
+        assert!(!store.advance_catalog_floor(floor).await.unwrap());
         drop(hold);
         tasks.close();
         tasks.wait().await;
