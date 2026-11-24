@@ -135,7 +135,7 @@ pub trait CandidateVerifier: Send + Sync {
     async fn gather_ranked(&self, _rows: Vec<ResolvedSearchRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
 
     /// The IIDs whose visible version at the scan's cut satisfies every predicate of the scan, or `None` where this verifier cannot say.
-    async fn retain_visible(&self, _iids: BTreeSet<Iid>) -> Result<Option<BTreeSet<Iid>>> { Ok(None) }
+    async fn retain_visible(&self, _iids: &CandidateIids) -> Result<Option<CandidateIids>> { Ok(None) }
 }
 
 #[derive(Clone)]
@@ -316,8 +316,21 @@ impl CandidateIids {
         row < self.len() && self.values.value(row) <= upper.0.as_slice()
     }
 
-    pub(crate) fn retain(self, mut keep: impl FnMut(Iid) -> bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(crate) fn position(&self, iid: Iid) -> Option<usize> {
+        let row = self.lower_bound(iid);
+        (row < self.len() && self.values.value(row) == iid.0.as_slice()).then_some(row)
+    }
+
+    pub(crate) fn retain(self, keep: impl Fn(Iid) -> bool, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if self.iter().all(&keep) { return Ok(self); }
         Self::build(self.len(), self.iter().filter(|&iid| keep(iid)), memory)
+    }
+
+    pub(crate) fn select_visible(&self, visible: &[bool], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if visible.len() != self.len() { return Err(crate::invalid("verifier-iid", "Visibility mask differs from its candidate selection")); }
+        let count = visible.iter().filter(|&&selected| selected).count();
+        if count == self.len() { return Ok(self.clone()); }
+        Self::build(count, self.iter().zip(visible).filter_map(|(iid, &selected)| selected.then_some(iid)), memory)
     }
 }
 
@@ -477,6 +490,21 @@ mod tests {
         assert!(!scope.intersects(Iid([2; 16]), Iid([8; 16])));
         assert_eq!(scope.iter().collect::<Vec<_>>(), [first, last]);
         assert_eq!(memory.used_bytes(), 256 + 2 * 16);
+    }
+
+    #[test]
+    fn visibility_keeps_the_grant_for_an_unchanged_arrow_scope() {
+        let memory = MemoryBudget::new(4096);
+        let first = Iid([1; 16]);
+        let last = Iid([9; 16]);
+        let scope = CandidateIids::from_sorted(&[first, last], &memory).unwrap();
+        let kept = scope.select_visible(&[true, true], &memory).unwrap();
+        assert!(Arc::ptr_eq(&scope._reservation, &kept._reservation));
+        let narrowed = scope.select_visible(&[false, true], &memory).unwrap();
+        assert_eq!(narrowed.position(last), Some(0));
+        assert_eq!(narrowed.position(first), None);
+        drop((scope, kept));
+        assert_eq!(memory.used_bytes(), 256 + 16);
     }
 
 }
