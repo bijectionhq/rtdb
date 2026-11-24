@@ -18,6 +18,9 @@ use uuid::Uuid;
 use super::{EncryptingStore, ObjectCipher, UnitOperation, UnitOutput, cipher::Cipher};
 use crate::{Error, IoRegion, ObjectKey, ObjectStore, sync_directory};
 
+mod kafka_retirement;
+pub use kafka_retirement::KafkaPrefixRetirement;
+
 const OWNER: &str = "~rtdb-classic-key-lineage";
 const KEY_BYTES: usize = 32;
 pub const KAFKA_LOG_SEAL_OVERHEAD: usize = LOG_SEAL_OVERHEAD;
@@ -187,7 +190,7 @@ impl ClassicKeyVault {
 
     /// Kafka's immutable topic ID selects a vault lineage. Only the caller
     /// that created the still-empty topic may enroll its vault namespace.
-    pub fn kafka_log_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>) -> Result<Arc<ClassicObjectKeys>> {
+    pub fn kafka_log_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>) -> Result<Arc<KafkaFrameKeys>> {
         let topic = Uuid::from_bytes(topic);
         if topic.is_nil() {
             return Err(invalid("A Classic Kafka log must have a broker topic identity"));
@@ -203,7 +206,7 @@ impl ClassicKeyVault {
         if !path.is_dir() {
             return Err(invalid("The Classic Kafka topic requires its original enrolled key vault"));
         }
-        Ok(Arc::new(ClassicObjectKeys { path: path.into(), region }))
+        Ok(Arc::new(KafkaFrameKeys(ClassicObjectKeys { path: path.into(), region })))
     }
 
     pub fn require_unsealed_log(path: &Path) -> Result<()> {
@@ -317,40 +320,47 @@ impl ObjectCipher for ClassicObjectKeys {
     }
 }
 
-impl ClassicObjectKeys {
+pub struct KafkaFrameKeys(ClassicObjectKeys);
+
+impl KafkaFrameKeys {
     pub async fn seal_kafka_record(&self, plaintext: Bytes) -> crate::Result<Bytes> {
         let publication = Uuid::new_v4();
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
-        let ciphertext = self.operate(&name, UnitOperation::SealValue(associated, plaintext)).await?.bytes()?;
+        let ciphertext = self.0.operate(&name, UnitOperation::SealValue(associated, plaintext)).await?.bytes()?;
         let mut frame = Vec::with_capacity(16 + ciphertext.len());
         frame.extend_from_slice(publication.as_bytes());
         frame.extend_from_slice(&ciphertext);
         Ok(frame.into())
     }
 
-    pub async fn open_kafka_record(&self, frame: Bytes) -> crate::Result<Bytes> {
-        let publication = frame.get(..16).and_then(|prefix| Uuid::from_slice(prefix).ok())
-            .filter(|publication| !publication.is_nil())
-            .ok_or_else(|| Error::Task("Kafka frame has no sealed publication identity".into()))?;
+    fn open_kafka_record(&self, frame: &[u8]) -> crate::Result<Bytes> {
+        let publication = kafka_publication(frame)?;
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.kafka-frame/v1/{publication}");
-        self.operate(&name, UnitOperation::OpenValue(associated, frame.slice(16..))).await?.bytes()
+        with_key(&self.0.name(&name), false, |cipher| cipher.open(&associated, &frame[16..]))
     }
 
     /// Persists the exact broker-acknowledged position before acknowledging it to RTDB.
     pub fn record_kafka_publication(&self, offset: i64, frame: &[u8]) -> crate::Result<()> {
-        if offset < 0 || frame.len() < KAFKA_LOG_SEAL_OVERHEAD {
+        if offset < 0 {
             return Err(Error::Task("Invalid Kafka frame publication".into()));
         }
-        let index = self.path.join("positions");
-        let floor = self.path.join("retired-before");
+        let publication = kafka_publication(frame)?;
+        let floor = self.0.path.join("retired-before");
         let _gate = lock(&floor)?;
         if offset < kafka_retired_before(&floor)? {
             return Err(Error::ErasedUnderView);
         }
+        let erasure_floor = self.kafka_erasure_floor()?;
+        if offset >= erasure_floor { self.check_retiring_slot(publication, erasure_floor)?; }
+        self.record_publication_locked(offset, frame, offset >= erasure_floor)
+    }
+
+    fn record_publication_locked(&self, offset: i64, frame: &[u8], retain_new: bool) -> crate::Result<()> {
+        let index = self.0.path.join("positions");
         match fs::create_dir(&index) {
-            Ok(()) => sync_directory(self.path.as_ref()).map_err(io(&index))?,
+            Ok(()) => sync_directory(self.0.path.as_ref()).map_err(io(&index))?,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => (),
             Err(error) => return Err(io(&index)(error)),
         }
@@ -361,17 +371,25 @@ impl ClassicObjectKeys {
         match fs::read(&marker) {
             Ok(bytes) if bytes == identity => Ok(()),
             Ok(_) => Err(Error::Task("The Kafka position changed its sealed publication".into())),
-            Err(error) if error.kind() == ErrorKind::NotFound => write_kafka_marker(&marker, &identity, false),
+            Err(error) if error.kind() == ErrorKind::NotFound && retain_new => write_kafka_marker(&marker, &identity, false),
+            Err(error) if error.kind() == ErrorKind::NotFound => Err(Error::ErasedUnderView),
             Err(error) => Err(io(&marker)(error)),
         }
     }
 
     /// Repairs the census after an ambiguous broker acknowledgement while the record is retained.
     pub async fn open_kafka_publication(self: &Arc<Self>, offset: i64, frame: Bytes) -> crate::Result<Bytes> {
-        let plaintext = self.open_kafka_record(frame.clone()).await?;
-        let keys = Arc::clone(self);
-        self.region.run_blocking(move || keys.record_kafka_publication(offset, &frame)).await?;
-        Ok(plaintext)
+        self.0.region.read(Arc::clone(self), offset, move |keys, &offset| {
+            let broker_floor = keys.0.path.join("retired-before");
+            let _gate = lock(&broker_floor)?;
+            let erasure_floor = keys.kafka_erasure_floor()?;
+            let first_retained = kafka_retired_before(&broker_floor)?.max(erasure_floor);
+            if offset < first_retained { return Err(Error::UnavailableLogRange { requested: offset, first_retained }); }
+            keys.check_retiring_slot(kafka_publication(&frame)?, erasure_floor)?;
+            let plaintext = keys.open_kafka_record(&frame)?;
+            keys.record_publication_locked(offset, &frame, true)?;
+            Ok(plaintext)
+        }).await
     }
 
     /// Consumes the broker's confirmed exclusive floor for this topic lineage.
@@ -379,8 +397,9 @@ impl ClassicObjectKeys {
         if before < 0 {
             return Err(Error::Task("The Kafka floor is negative".into()));
         }
-        let path = Arc::clone(&self.path);
-        self.region.run_blocking(move || {
+        let keys = Self(ClassicObjectKeys { path: Arc::clone(&self.0.path), region: Arc::clone(&self.0.region) });
+        self.0.region.run_blocking(move || {
+            let path = &keys.0.path;
             let floor = path.join("retired-before");
             let _gate = lock(&floor)?;
             let mut next = kafka_retired_before(&floor)?;
@@ -391,22 +410,9 @@ impl ClassicObjectKeys {
             let stop = before.min(next.saturating_add(128));
             while next < stop {
                 let marker = index.join(next.to_string());
-                let bytes = fs::read(&marker).map_err(|error| {
-                    if error.kind() == ErrorKind::NotFound {
-                        Error::Task(format!("The broker trimmed Kafka offset {next} before its slot was recorded"))
-                    } else {
-                        io(&marker)(error)
-                    }
-                })?;
-                let identity: [u8; 48] = bytes.try_into()
-                    .map_err(|_| Error::Task("Malformed Kafka retirement evidence".into()))?;
-                let publication = Uuid::from_slice(&identity[..16]).ok()
-                    .filter(|publication| !publication.is_nil())
-                    .ok_or_else(|| Error::Task("Malformed Kafka publication identity".into()))?;
-                use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+                let publication = kafka_retirement::publication_at(&index, next)?;
                 let name = ObjectKey::new(format!("frames/{publication}"))?;
-                let slot = path.join(URL_SAFE_NO_PAD.encode(digest(&SHA256, name.as_str().as_bytes()).as_ref()));
-                withdraw_slot(&slot)?;
+                withdraw_slot(&keys.0.name(&name))?;
                 let advanced = next + 1;
                 write_kafka_marker(&floor, &advanced.to_be_bytes(), true)?;
                 // The floor now carries the receipt and makes a failed unlink harmless.
@@ -420,7 +426,17 @@ impl ClassicObjectKeys {
             Ok(next == before)
         }).await
     }
+}
 
+fn kafka_publication(frame: &[u8]) -> crate::Result<Uuid> {
+    frame.first_chunk::<16>()
+        .filter(|_| frame.len() >= KAFKA_LOG_SEAL_OVERHEAD)
+        .map(|identity| Uuid::from_bytes(*identity))
+        .filter(|publication| !publication.is_nil())
+        .ok_or_else(|| Error::Task("Kafka frame has no sealed publication identity".into()))
+}
+
+impl ClassicObjectKeys {
     pub(crate) fn seal_record(
         &self,
         offset: i64,
@@ -608,8 +624,8 @@ mod tests {
         assert!(keys.record_kafka_publication(0, &later).is_err());
         assert!(keys.retire_kafka_before(1).await?);
         assert!(keys.retire_kafka_before(1).await?);
-        assert!(matches!(keys.open_kafka_record(earlier).await, Err(Error::ErasedUnderView)));
-        assert_eq!(keys.open_kafka_record(later).await?, Bytes::from_static(b"live"));
+        assert!(matches!(keys.open_kafka_record(&earlier), Err(Error::ErasedUnderView)));
+        assert_eq!(keys.open_kafka_record(&later)?, Bytes::from_static(b"live"));
         Ok(())
     }
 
@@ -627,8 +643,8 @@ mod tests {
         assert_ne!(frame, body);
         assert!(other.kafka_log_keys(topic, false, Arc::clone(&io)).is_err());
         let different = vault.kafka_log_keys(Uuid::new_v4().into_bytes(), true, Arc::clone(&io))?;
-        assert!(different.open_kafka_record(frame.clone()).await.is_err());
-        assert_eq!(vault.kafka_log_keys(topic, false, io)?.open_kafka_record(frame).await?, body);
+        assert!(different.open_kafka_record(&frame).is_err());
+        assert_eq!(vault.kafka_log_keys(topic, false, io)?.open_kafka_record(&frame)?, body);
         Ok(())
     }
 

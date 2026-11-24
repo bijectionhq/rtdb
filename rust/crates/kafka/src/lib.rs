@@ -1,6 +1,7 @@
 mod config;
 mod client;
 mod driver;
+mod erasure;
 mod log_configuration;
 mod tail;
 mod tls;
@@ -16,7 +17,7 @@ use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
 use rdkafka::{ClientConfig, Message, admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication}, client::DefaultClientContext,
     consumer::{BaseConsumer, Consumer}, error::{KafkaError, RDKafkaErrorCode}, message::BorrowedMessage};
-use rtdb_storage::{Error, IoRegion, Result as StorageResult, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}, sealing::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD}};
+use rtdb_storage::{Error, IoRegion, Result as StorageResult, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}, sealing::{ClassicKeyVault, KafkaFrameKeys, KAFKA_LOG_SEAL_OVERHEAD}};
 use rtdb_types::{Anomaly, Result, Timestamp};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use log_configuration::{ConfiguredLogClient, LogConfiguration, PreparedLogClient, Role};
@@ -44,7 +45,7 @@ enum Access {
     Writable { queue: mpsc::Sender<driver::Queued>, bytes: Arc<Semaphore>, records: Arc<Semaphore> },
 }
 
-pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access, keys: Option<Arc<ClassicObjectKeys>>, topic_id: Option<[u8; 16]> }
+pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access, keys: Option<Arc<KafkaFrameKeys>>, topic_id: Option<[u8; 16]> }
 pub struct OpenedKafkaLog { pub log: Arc<KafkaLog>, pub driver: Option<KafkaLogDriver> }
 
 impl KafkaLog {
@@ -100,6 +101,11 @@ impl KafkaLog {
 
     pub async fn settle_classic_prefix(&self) -> Result<bool> {
         let (Some(keys), Some(expected)) = (&self.keys, self.topic_id) else { return Ok(true); };
+        let (low, _) = self.verified_watermarks(expected).await?;
+        Ok(keys.retire_kafka_before(low).await?)
+    }
+
+    async fn verified_watermarks(&self, expected: [u8; 16]) -> Result<(i64, i64)> {
         let admin = self.configuration.prepare(Role::Admin)?.open(|configuration|
             configuration.create::<AdminClient<DefaultClientContext>>()
         ).map_err(|error| transport_error(&self.options.topic, error))?;
@@ -110,12 +116,12 @@ impl KafkaLog {
             return Err(Anomaly::incorrect("xtdb.kafka/topic-identity", "The opened Kafka topic ownership changed"));
         }
         let consumer = consumer(&self.configuration, &self.options)?;
-        let (low, _) = consumer.fetch_watermarks(topic, 0, self.options.request_timeout).map_err(|error| transport_error(topic, error))?;
+        let watermarks = consumer.fetch_watermarks(topic, 0, self.options.request_timeout).map_err(|error| transport_error(topic, error))?;
         let after = admin.topic_id(topic, &options).await.map_err(|error| transport_error(topic, error))?;
         if after != expected {
             return Err(Anomaly::incorrect("xtdb.kafka/topic-identity", "The Kafka floor belongs to another topic"));
         }
-        Ok(keys.retire_kafka_before(low).await?)
+        Ok(watermarks)
     }
 
     pub fn topic_id(&self) -> Option<[u8; 16]> {
@@ -300,7 +306,8 @@ impl Log for KafkaLog {
         let consumer = consumer(&self.configuration, &self.options)?;
         let (low, _) = consumer.fetch_watermarks(&self.options.topic, 0, self.options.request_timeout)
             .map_err(|error| transport_error(&self.options.topic, error))?;
-        Ok(Some(LogOffset(low)))
+        let key_floor = self.keys.as_ref().map_or(Ok(0), |keys| keys.kafka_erasure_floor())?;
+        Ok(Some(LogOffset(low.max(key_floor))))
     }
 
     async fn recovery_tail(&self, after: LogOffset) -> StorageResult<Option<Box<dyn LogTail>>> {

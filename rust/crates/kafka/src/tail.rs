@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rdkafka::{Message, Offset, TopicPartitionList, consumer::{BaseConsumer, Consumer}, error::KafkaError, message::RetainedConsumerMessage};
-use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead}, object_store::ReadReservation, sealing::{ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD}};
+use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead}, object_store::ReadReservation, sealing::{KafkaFrameKeys, KAFKA_LOG_SEAL_OVERHEAD}};
 use crate::{ConfiguredLogClient, KafkaLogOptions, Progress, metadata, transport_error};
 
 const DELIVERY_OVERHEAD_BYTES: usize = 256;
@@ -14,7 +14,7 @@ pub(crate) struct KafkaTail {
     options: KafkaLogOptions,
     progress: Arc<Progress>,
     next: i64,
-    keys: Option<Arc<ClassicObjectKeys>>,
+    keys: Option<Arc<KafkaFrameKeys>>,
 }
 
 pub(crate) struct KafkaRange { tail: KafkaTail, end: i64, maximum: usize, timeout: Duration }
@@ -33,10 +33,11 @@ impl rtdb_storage::log::LogRange for KafkaRange {
 }
 
 impl KafkaTail {
-    pub fn new(consumer: ConfiguredLogClient<Arc<BaseConsumer>>, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset, keys: Option<Arc<ClassicObjectKeys>>) -> Result<Self> {
+    pub fn new(consumer: ConfiguredLogClient<Arc<BaseConsumer>>, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset, keys: Option<Arc<KafkaFrameKeys>>) -> Result<Self> {
         progress.check()?;
         let next = after.0.checked_add(1).filter(|next| *next >= 0).ok_or_else(|| Error::UnavailableLogRange { requested: after.0, first_retained: 0 })?;
         let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
+        let low = low.max(keys.as_ref().map_or(Ok(0), |keys| keys.kafka_erasure_floor())?);
         if next < low || next > high { return Err(Error::UnavailableLogRange { requested: next, first_retained: low }); }
         let mut assignment = TopicPartitionList::new();
         assignment.add_partition_offset(&options.topic, 0, Offset::Offset(next)).map_err(|error| transport_error(&options.topic, error))?;
@@ -49,6 +50,7 @@ impl KafkaTail {
 
     pub fn end(&self) -> Result<i64> {
         let (low, high) = self.consumer.fetch_watermarks(&self.options.topic, 0, self.options.request_timeout).map_err(|error| transport_error(&self.options.topic, error))?;
+        let low = low.max(self.keys.as_ref().map_or(Ok(0), |keys| keys.kafka_erasure_floor())?);
         if self.next < low { return Err(Error::UnavailableLogRange { requested: self.next, first_retained: low }); }
         if high - 1 < self.progress.observed_tip.load(Ordering::Acquire) { return Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka withdrew an observed log position".into() }); }
         self.progress.advance(high - 1);
