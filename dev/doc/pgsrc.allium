@@ -1,14 +1,10 @@
 -- allium: 3
 -- pgsrc.allium
 --
--- Scope: what the Postgres external source may confirm to its upstream and the native batches it submits.
---   Confirming is an instruction to discard, not a progress report, so the only
---   question is which positions are safe to give.
--- Includes: the positions tracked and their ordering; the confirmation rule;
---   the re-delivery skip; the effect of a failed import; the reopening of a
---   lost stream.
--- Excludes: XTDB's processing model (see db.allium); other row and type mappings;
---   TOAST and replica-identity constraints; slot and publication creation.
+-- Scope: PostgreSQL source confirmation and native mirror ingestion.
+-- The confirmation rules track received and recoverable positions, redelivery, failed imports, and stream reopening.
+-- XTDB's processing model is specified in db.allium.
+-- Type mappings, TOAST and replica-identity constraints, and slot and publication creation are outside this scope.
 --
 -- db.allium describes when XTDB can recover an external-source token.
 -- This spec describes how a recoverable token bounds PostgreSQL confirmation.
@@ -358,6 +354,12 @@ surface TargetIngestion {
         -- The upstream type catalog supplies the effective dimension for pgvector domains in logical replication.
         -- Ordinary homogeneous floating-point arrays in JSON and JSONB build packed Float64 children.
         -- It stages Arrow document vectors with separately resolved event headers.
+        -- A complete WAL transaction carries Arrow batches grouped by relation, operation kind and compatible field layout.
+        -- The mirror stages rows in upstream event order using Arrow document vectors and typed ID and valid-time columns.
+        -- Snapshot fetch uses binary PostgreSQL fields wherever their binary readers preserve the source projection.
+        -- Fixed-layout range and opaque Transit columns use Arrow timestamp and binary children.
+        -- Array fields use typed Arrow children where the source projection has a list layout.
+        -- Document-shaped values retain their observed field and type order.
 
     @guarantee SubmissionIsOrdered
         -- Transactions are submitted in lsn order, so submitted_lsn is a

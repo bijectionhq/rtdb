@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use postgres_protocol::authentication::{md5_hash, sasl::{ChannelBinding, ScramSha256}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_pg_codec::{Format, source_snapshot_format};
 use rtdb_types::{Anomaly, Result};
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::TcpStream};
 use tokio_rustls::{TlsConnector, rustls::pki_types::ServerName};
@@ -14,16 +15,21 @@ struct Reading { header: [u8; 5], header_read: usize, bytes: Vec<u8>, bytes_read
 impl Reading { fn new() -> Self { Self { header: [0; 5], header_read: 0, bytes: Vec::new(), bytes_read: 0, charge: None } } }
 pub(crate) struct Connection { socket: Box<dyn Socket>, reading: Reading, memory: Arc<MemoryBudget>, max_message: usize }
 #[derive(Clone, Debug)]
-pub(crate) struct Column { pub name: String, pub oid: u32, pub typmod: i32 }
+pub(crate) struct Column { pub name: String, pub oid: u32, pub typmod: i32, pub format: Format }
 pub(crate) struct Row { frame: Frame, cells: Vec<Option<std::ops::Range<usize>>> }
 impl Row {
     pub fn cell(&self, index: usize) -> Result<Option<&str>> {
+        self.cell_bytes(index)?.map(|bytes| std::str::from_utf8(bytes).map_err(protocol)).transpose()
+    }
+    pub fn cell_bytes(&self, index: usize) -> Result<Option<&[u8]>> {
         let cell = self.cells.get(index).ok_or_else(|| protocol("DataRow column index is out of bounds"))?;
-        cell.as_ref().map(|range| std::str::from_utf8(&self.frame.bytes[range.clone()]).map_err(protocol)).transpose()
+        Ok(cell.as_ref().map(|range| &self.frame.bytes[range.clone()]))
     }
     pub fn encoded_size(&self) -> usize { self.frame.bytes.len() }
 }
 pub(crate) struct QueryResult { pub columns: Vec<Column>, pub rows: Vec<Row>, _description: Option<Frame>, _charge: Arc<MemoryReservation> }
+
+pub(crate) struct SnapshotFetch { bind: Vec<u8>, _charge: Arc<MemoryReservation> }
 
 impl Connection {
     pub async fn open(remote: &Remote, replication: bool, memory: Arc<MemoryBudget>) -> Result<Self> {
@@ -128,11 +134,48 @@ impl Connection {
         if query.contains('\0') { return Err(protocol("SQL query contains a zero byte")); }
         let charge = self.memory.reserve(query.len().checked_add(8192).ok_or_else(|| protocol("Query allocation overflow"))?)?;
         let mut body = query.as_bytes().to_vec(); body.push(0); self.send(b'Q', &body).await?;
+        self.read_query(charge, false).await
+    }
+    pub async fn prepare_snapshot_fetch(&mut self) -> Result<SnapshotFetch> {
+        let query = b"\0FETCH FORWARD 1000 FROM rtdb_rows\0\0\0";
+        let charge = self.memory.reserve(8192 + query.len())?;
+        self.send(b'P', query).await?;
+        self.send(b'D', b"S\0").await?;
+        self.send(b'S', b"").await?;
+        let statement = self.read_query(charge, true).await?;
+        let count = u16::try_from(statement.columns.len()).map_err(protocol)?;
+        let len = 8 + 2 * usize::from(count);
+        let charge = self.memory.reserve(1024 + len)?;
+        let mut bind = Vec::with_capacity(len);
+        bind.extend_from_slice(&[0; 6]);
+        bind.extend_from_slice(&count.to_be_bytes());
+        for column in &statement.columns {
+            bind.extend_from_slice(&source_snapshot_format(column.oid).code().to_be_bytes());
+        }
+        Ok(SnapshotFetch { bind, _charge: charge })
+    }
+
+    pub async fn snapshot_fetch(&mut self, statement: &SnapshotFetch) -> Result<QueryResult> {
+        let charge = self.memory.reserve(8192)?;
+        self.send(b'B', &statement.bind).await?;
+        self.send(b'D', b"P\0").await?;
+        self.send(b'E', b"\0\0\0\0\0").await?;
+        self.send(b'S', b"").await?;
+        self.read_query(charge, true).await
+    }
+
+    async fn read_query(&mut self, charge: Arc<MemoryReservation>, extended: bool) -> Result<QueryResult> {
         let mut columns = Vec::new(); let mut description = None; let mut rows = Vec::new(); let mut error = None;
         loop {
             let frame = self.read().await?;
             match frame.tag {
-                b'T' => { columns = row_description(&frame.bytes)?; description = Some(frame); },
+                b'T' => {
+                    columns = row_description(&frame.bytes)?;
+                    if !extended && columns.iter().any(|column| column.format != Format::Text) {
+                        return Err(protocol("Source query requires text result format"));
+                    }
+                    description = Some(frame);
+                }
                 b'D' => {
                     if rows.len() >= 1001 { return Err(protocol("Source query exceeded its bounded result-row limit")); }
                     let mut input = Input::new(&frame.bytes); let count = usize::from(input.u16()?);
@@ -143,6 +186,7 @@ impl Connection {
                 }
                 b'E' => error = Some(server_error(&frame.bytes)?),
                 b'C' | b'I' | b'N' | b'S' => {},
+                b'1' | b'2' | b't' | b'n' if extended => {},
                 b'Z' => return match error { Some(error) => Err(error), None => Ok(QueryResult { columns, rows, _description: description, _charge: charge }) },
                 _ => return Err(protocol("Unexpected message during a source SQL query")),
             }
@@ -156,7 +200,19 @@ impl Connection {
 
 fn row_description(bytes: &[u8]) -> Result<Vec<Column>> {
     let mut input = Input::new(bytes); let count = usize::from(input.u16()?); let mut fields = Vec::with_capacity(count);
-    for _ in 0..count { let name = input.string()?.to_owned(); input.take(6)?; let oid = input.u32()?; input.take(2)?; let typmod = input.i32()?; if input.u16()? != 0 { return Err(protocol("Source query requires text result format")); } fields.push(Column { name, oid, typmod }); }
+    for _ in 0..count {
+        let name = input.string()?.to_owned();
+        input.take(6)?;
+        let oid = input.u32()?;
+        input.take(2)?;
+        let typmod = input.i32()?;
+        let format = match input.u16()? {
+            0 => Format::Text,
+            1 => Format::Binary,
+            _ => return Err(protocol("Unknown source query result format")),
+        };
+        fields.push(Column { name, oid, typmod, format });
+    }
     input.end()?; Ok(fields)
 }
 

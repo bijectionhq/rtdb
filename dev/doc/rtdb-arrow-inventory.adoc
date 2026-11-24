@@ -20,9 +20,12 @@ Arrow file and stream imports open IPC buffers and validate document fields befo
 See link:../../rust/crates/tx/src/values.rs[document admission].
 
 |PostgreSQL CDC and non-Arrow ingress
-|The built-in PostgreSQL mirror builds snapshot and WAL batches and stages their document vectors into the live index.
-|The PostgreSQL wire decoder interprets the text of each reached field, including the old tuple for unchanged TOAST fields.
-The public PostgreSQL decoder and custom indexer interface expose row operations through compatibility adapters.
+|The built-in PostgreSQL mirror stages snapshot and WAL document vectors into the live index and resolves event headers from typed Arrow cells.
+WAL batches group changes with matching relation, operation kind and field layout, and staging follows the original order.
+Snapshot fetch requests binary fields where the wire binary reader preserves the source projection.
+|WAL text fields include values recovered from the old tuple for unchanged TOAST fields.
+JSON and polymorphic Transit documents infer layout from their contents.
+The public PostgreSQL decoder and custom indexer interface preserve the original batch and row ordering through compatibility adapters.
 Text COPY, Transit and document-map APIs provide their data in their documented input representation.
 See link:../../rust/crates/pg-source/src/decoder.rs[WAL], link:../../rust/crates/pg-source/src/snapshot.rs[snapshots], and link:../../rust/crates/pg-source/src/indexer.rs[mirror staging].
 

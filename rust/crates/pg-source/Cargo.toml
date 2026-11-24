@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-select.workspace = true
 rtdb-types.workspace = true
 rtdb-columnar.workspace = true
 rtdb-format.workspace = true

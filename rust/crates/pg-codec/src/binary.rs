@@ -7,6 +7,9 @@ use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::invalid;
 use crate::numeric::Numeric;
 
+mod column;
+pub use column::read_source_binary_column;
+
 pub(crate) const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 pub(crate) const PG_EPOCH_DAYS: i32 = 10_957;
 
@@ -16,7 +19,7 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
         PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword => Value::Utf8(std::str::from_utf8(bytes).map_err(invalid)?.to_owned()),
         PgType::Int2 => Value::I16(input.i16()?), PgType::Int4 => Value::I32(input.i32()?), PgType::Int8 => Value::I64(input.i64()?),
         PgType::Float4 => Value::F32(f32::from_bits(input.i32()? as u32)), PgType::Float8 => Value::F64(f64::from_bits(input.i64()? as u64)),
-        PgType::Bool => Value::Bool(match input.take(1)?[0] { 0 => false, 1 => true, _ => return Err(invalid("Invalid binary boolean value")) }),
+        PgType::Bool => Value::Bool(boolean(&mut input)?),
         PgType::Numeric => numeric_read(&mut input)?.into_value()?,
         PgType::Timestamp | PgType::TimestampTz => Value::Timestamp { value: input.i64()?.wrapping_add(PG_EPOCH_MICROS), unit: TimeUnit::Microsecond, timezone: (ty == PgType::TimestampTz).then(|| "UTC".into()) },
         PgType::Date => Value::DateDay(input.i32()?.checked_add(PG_EPOCH_DAYS).ok_or_else(|| invalid("Date exceeds Arrow Date32 range"))?),
@@ -32,6 +35,14 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
     };
     if !matches!(ty, PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword | PgType::Bytes | PgType::Numeric) && !input.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
     Ok(value)
+}
+
+fn boolean(input: &mut Input<'_>) -> Result<bool> {
+    match input.take(1)?[0] {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(invalid("Invalid binary boolean value")),
+    }
 }
 
 fn array_read(ty: PgType, input: &mut Input<'_>) -> Result<Value> {

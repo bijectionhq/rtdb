@@ -5,6 +5,7 @@ mod numeric;
 mod output;
 mod text;
 
+pub use binary::read_source_binary_column;
 pub use output::{Format, SessionEnvironment, encode, encode_arrow, encode_error, encode_timestamp, encode_value, to_transit};
 pub use text::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction, from_transit, read_source_text_column, read_text, read_text_column, read_vector_column};
 
@@ -39,6 +40,22 @@ pub fn decode(ty: PgType, format: Format, bytes: &[u8], memory: &Arc<MemoryBudge
 fn decode_bound(bytes: &[u8]) -> Result<usize> {
     let structural = bytes.iter().filter(|byte| matches!(byte, b'[' | b'{' | b',' | b':')).count();
     bytes.len().checked_mul(64).and_then(|n| n.checked_add(structural.checked_mul(4096)?)).and_then(|n| n.checked_add(8192)).ok_or_else(size_error)
+}
+
+/// PostgreSQL snapshot formats whose binary payloads preserve the source's text projection.
+pub fn source_snapshot_format(oid: u32) -> Format {
+    match oid {
+        16 | 20 | 21 | 23 | 25 | 1043 | 114 | 2950 | 3802 => Format::Binary,
+        _ => Format::Text,
+    }
+}
+
+/// The source owns the reservation for the input and decoded value.
+pub fn read_source_binary(oid: u32, bytes: &[u8]) -> Result<Value> {
+    let ty = PgType::from_oid(oid as i32)
+        .filter(|_| source_snapshot_format(oid) == Format::Binary)
+        .ok_or_else(|| invalid("PostgreSQL source type has no binary reader"))?;
+    binary::read(ty, bytes)
 }
 
 /// Decodes a single Bind argument and keeps its array covered until the portal adopts it.

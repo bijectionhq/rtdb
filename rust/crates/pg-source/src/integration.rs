@@ -44,7 +44,7 @@ async fn exported_snapshot_and_copyboth_preserve_concurrent_updates_and_full_toa
     control.query(&format!("DROP TABLE {table}")).await.unwrap();
 }
 
-fn change_cell(transaction: &crate::ArrowPgTransaction, field: &str) -> Value {
+fn change_cell(transaction: &crate::decoder::DecodedTransaction, field: &str) -> Value {
     let batch = transaction.batches[0].rows.batch();
     let column = batch.schema_ref().index_of(field).unwrap();
     rtdb_columnar::read_value(batch.schema_ref().field(column), batch.column(column).as_ref(), 0).unwrap()
@@ -212,6 +212,71 @@ async fn native_source_recovers_confirmed_local_journal_transactions_before_the_
     control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap();
     control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap();
     control.query(&format!("DROP TABLE {table}")).await.unwrap();
+}
+
+#[tokio::test]
+async fn pg_source_arrow_wal_keeps_replica_table_bytes_and_event_ordinals() {
+    use rtdb_format::envelope::ReplicaBody;
+    use rtdb_index::PartitionState;
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{SourcePosition, Timestamp};
+    use tokio_util::sync::CancellationToken;
+
+    let memory = MemoryBudget::new(1 << 26);
+    let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+    let context = rtdb_tx::ResolveContext {
+        database: "cdc".into(), storage, memory: Arc::clone(&memory), cancellation: CancellationToken::new(),
+        default_tz: "UTC".into(), authorization: Arc::new(Authority), query_options: Default::default(),
+        scan_accelerators: Default::default(), decision_clock: None, world_constraints: None,
+        execution_observer: None, tracer: None, write_event_origins: false, placed_receipt_retirement: false,
+        owned_witness_scope: None,
+    };
+    let partition = PartitionState::empty(Default::default()).unwrap();
+    let (actual, legacy) = crate::decoder::tests::transactions(&memory);
+    let mut replicas = Vec::new();
+    for transaction in [actual, legacy] {
+        let mut resolver = rtdb_tx::TxResolver::new(None, SourcePosition(-1), None, &memory).unwrap();
+        let mut writer = crate::indexer::ImportWriter { transaction, indexer: None, memory: Arc::clone(&memory) };
+        let resolved = resolver.resolve_external(partition.snapshot(), Timestamp(1_600_000_000_000_000), None, Some(vec![1, 2, 3]), &mut writer, &context).await.unwrap();
+        replicas.push(resolved.to_replica_body(&memory).unwrap());
+    }
+    let [actual, expected] = replicas.as_slice() else { unreachable!() };
+    let (ReplicaBody::ResolvedTx(actual), ReplicaBody::ResolvedTx(expected)) = (actual.body(), expected.body()) else { unreachable!() };
+    assert_eq!(actual.external_source_token, expected.external_source_token);
+    assert_eq!(actual.table_data.keys().collect::<Vec<_>>(), expected.table_data.keys().collect::<Vec<_>>());
+    for (table, page) in &actual.table_data {
+        assert!(page == &expected.table_data[table], "replica Arrow bytes differ for {table}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly configured PostgreSQL server"]
+async fn pg_source_arrow_snapshot_fetch_requests_binary_and_preserves_unknown_types_as_text() {
+    use rtdb_pg_codec::Format;
+    let mut remote = Remote::new(
+        std::env::var("RTDB_PG_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        std::env::var("RTDB_PG_DATABASE").expect("RTDB_PG_DATABASE"),
+        std::env::var("RTDB_PG_USER").expect("RTDB_PG_USER"),
+        std::env::var("RTDB_PG_PASSWORD").unwrap_or_default(),
+    );
+    remote.port = std::env::var("RTDB_PG_PORT").unwrap_or_else(|_| "5432".into()).parse().unwrap();
+    remote.ssl = SslMode::Disable;
+    let memory = MemoryBudget::new(128 << 20);
+    let mut query = Connection::open(&remote, false, memory).await.unwrap();
+    query.query("BEGIN").await.unwrap();
+    query.query("CREATE TYPE pg_temp.rtdb_test_enum AS ENUM ('active')").await.unwrap();
+    query.query("DECLARE rtdb_rows NO SCROLL CURSOR FOR SELECT n, 'active'::pg_temp.rtdb_test_enum FROM generate_series(1, 1001) n").await.unwrap();
+    let statement = query.prepare_snapshot_fetch().await.unwrap();
+    let first = query.snapshot_fetch(&statement).await.unwrap();
+    assert_eq!(first.columns.iter().map(|column| column.format).collect::<Vec<_>>(), [Format::Binary, Format::Text]);
+    assert_eq!(first.rows.len(), 1000);
+    assert_eq!(first.rows[0].cell_bytes(0).unwrap(), Some(1i32.to_be_bytes().as_slice()));
+    assert_eq!(first.rows[0].cell(1).unwrap(), Some("active"));
+    let second = query.snapshot_fetch(&statement).await.unwrap();
+    assert_eq!(second.rows.len(), 1);
+    assert_eq!(second.rows[0].cell_bytes(0).unwrap(), Some(1001i32.to_be_bytes().as_slice()));
+    assert!(query.snapshot_fetch(&statement).await.unwrap().rows.is_empty());
+    query.query("ROLLBACK").await.unwrap();
 }
 
 #[tokio::test]

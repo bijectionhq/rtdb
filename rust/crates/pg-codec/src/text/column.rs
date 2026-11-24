@@ -2,16 +2,17 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeListArray, ListArray, NullArray, PrimitiveArray, UnionArray,
-    builder::{ArrayBuilder, BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder},
+    builder::{ArrayBuilder, BinaryBuilder, TimestampMicrosecondBuilder, BooleanBuilder, FixedSizeBinaryBuilder, PrimitiveBuilder, StringBuilder},
     types::{ArrowPrimitiveType, Date32Type, Decimal128Type, Decimal256Type, DurationMicrosecondType,
         Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, IntervalMonthDayNanoType,
         IntervalYearMonthType, Time64NanosecondType, TimestampMicrosecondType}};
-use arrow_buffer::{IntervalMonthDayNano, NullBuffer, OffsetBuffer, i256};
+use arrow_buffer::{IntervalMonthDayNano, NullBuffer, NullBufferBuilder, OffsetBuffer, i256};
 use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_columnar::BatchBuilder;
+use rtdb_format::transit::{TransitValue, decode_json, encode_msgpack};
 use rtdb_types::{Anomaly, LogicalType, PgType, Result, ScalarType, TimeUnit};
 
-use super::{bytea, invalid, interval, interval_type, local_timestamp_micros, parse_boolean, parse_decimal, parse_uuid, float, float32, visit_array, zoned_timestamp_micros};
+use super::{bytea, invalid, interval, interval_type, local_timestamp_micros, parse_boolean, parse_decimal, parse_uuid, range, float, float32, visit_array, zoned_timestamp_micros};
 
 /// Decodes a PostgreSQL column using a fixed Arrow layout when supported.
 /// The caller admits input, output and scratch allocations.
@@ -167,6 +168,14 @@ pub fn read_source_text_column<'a>(
     output: &mut BatchBuilder,
 ) -> Result<Option<(Field, ArrayRef)>> {
     let result = match oid {
+        3910 => {
+            let (field, array) = ranges(name, count, cell)?;
+            account_field(field, array, output)?
+        }
+        16384 => {
+            let Some((field, array)) = transit_column(name, count, cell)? else { return Ok(None); };
+            account_field(field, array, output)?
+        }
         17 => scalar_column(name, count, cell, output, bytea, |_| ScalarType::Binary, |bytes| bytes.len(),
             |_, rows| Ok(Arc::new(rows.into_iter().collect::<BinaryArray>())))?,
         2950 => scalar_column(name, count, cell, output, parse_uuid, |_| ScalarType::Uuid, |_| 0,
@@ -229,6 +238,10 @@ pub fn read_source_text_column<'a>(
 fn account_column(name: &str, array: ArrayRef, output: &mut BatchBuilder) -> Result<(Field, ArrayRef)> {
     let field = Field::new(name, array.data_type().clone(), !array.is_empty()
         && (array.null_count() != 0 || array.data_type() == &DataType::Null));
+    account_field(field, array, output)
+}
+
+fn account_field(field: Field, array: ArrayRef, output: &mut BatchBuilder) -> Result<(Field, ArrayRef)> {
     let bound = array.get_array_memory_size().checked_add(512)
         .ok_or_else(|| Anomaly::fault("xtdb.postgres/protocol-error", "PostgreSQL Arrow batch allocation overflow"))?;
     Ok((field, output.column(bound, || Ok(array))?))
@@ -343,4 +356,114 @@ fn scalar_column<'a, P>(
         }
     })?;
     Ok((field, array))
+}
+
+fn ranges<'a>(
+    name: &str, count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
+) -> Result<(Field, ArrayRef)> {
+    let mut values = TimestampMicrosecondBuilder::new().with_timezone("UTC");
+    let mut valid = NullBufferBuilder::new(count);
+    let mut present = 0;
+    for row in 0..count {
+        let bounds = cell(row)?.map(range).transpose()?.flatten();
+        valid.append(bounds.is_some());
+        if let Some((lower, upper)) = bounds {
+            values.append_value(lower);
+            values.append_value(upper);
+            present += 1;
+        } else {
+            values.append_nulls(2);
+        }
+    }
+    if present == 0 { return null_column(name, count); }
+    let logical = PgType::TsTzRange.logical_type().expect("range type");
+    let field = rtdb_columnar::to_field(name, &nullable(logical, present != count))?;
+    let DataType::FixedSizeList(item, width) = field.data_type() else { unreachable!() };
+    let array = FixedSizeListArray::try_new(Arc::clone(item), *width, Arc::new(values.finish()), valid.finish())
+        .map_err(invalid)?;
+    Ok((field, Arc::new(array)))
+}
+
+fn transit_column<'a>(
+    name: &str, count: usize, mut cell: impl FnMut(usize) -> Result<Option<&'a str>>,
+) -> Result<Option<(Field, ArrayRef)>> {
+    let mut opaque = BinaryBuilder::new();
+    for row in 0..count {
+        let wire = cell(row)?.map(|text| decode_json(text.as_bytes())).transpose()?.unwrap_or(TransitValue::Null);
+        match &wire {
+            TransitValue::Null => opaque.append_null(),
+            TransitValue::Tagged { tag, .. } if super::is_opaque_transit(tag) => {
+                opaque.append_value(encode_msgpack(&wire)?);
+            }
+            _ => return Ok(None),
+        }
+    }
+    let array = opaque.finish();
+    if array.null_count() == count { return null_column(name, count).map(Some); }
+    let logical = nullable(LogicalType::Scalar(ScalarType::Transit), array.null_count() != 0);
+    Ok(Some((rtdb_columnar::to_field(name, &logical)?, Arc::new(array))))
+}
+
+fn nullable(logical: LogicalType, has_null: bool) -> LogicalType {
+    if has_null { logical.maybe() } else { logical }
+}
+
+fn null_column(name: &str, count: usize) -> Result<(Field, ArrayRef)> {
+    Ok((rtdb_columnar::to_field(name, &LogicalType::Null)?, Arc::new(NullArray::new(count))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read_text;
+    use rtdb_types::Value;
+
+    #[test]
+    fn source_column_matches_legacy_ipc_for_fixed_layouts() {
+        use arrow_array::RecordBatch;
+        use arrow_schema::Schema;
+        let memory = rtdb_columnar::MemoryBudget::new(16 << 20);
+        for (oid, rows) in [
+            (3910, vec![None, Some("empty"), Some("[2000-01-01 00:00:00+00,)"), Some("[,2000-01-01 00:00:00+00)")]),
+            (16384, vec![None, Some(r#"["~#xtdb/clj-form","a"]"#), Some(r#"["~#xtdb/clj-form",["^ ","foo",2]]"#)]),
+            (1007, vec![None, Some("{NULL,1,2}"), Some("{3,NULL}"), Some("{}"), Some("{NULL}")]),
+            (1016, vec![Some("{-9223372036854775808,NULL}"), Some("{NULL,7}"), None]),
+            (1009, vec![Some(r#"{"NULL",NULL,"a,b","q\"r"}"#), Some("{}"), None]),
+            (1021, vec![Some("{{1,2},{3,4}}"), None, Some("[0:1]={1,2}")]),
+            (1007, vec![Some("{}"), None, Some("{}")]),
+            (1007, vec![Some("{NULL}"), Some("{}"), None, Some("{NULL,NULL}")]),
+        ] {
+            let values = rows.iter().map(|text| text.map_or(Ok(Value::Null), |text| read_text(oid, text))).collect::<Result<Vec<_>>>().unwrap();
+            let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+            let legacy_field = rtdb_columnar::to_field("value", &logical).unwrap();
+            let legacy = rtdb_columnar::copy_array(&logical, &values).unwrap();
+            let mut output = BatchBuilder::new(4096, &memory).unwrap();
+            let (field, actual) = read_source_text_column("value", oid, rows.len(), |row| Ok(rows[row]), &mut output).unwrap().unwrap();
+            let ipc = |field: Field, array| {
+                let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+                rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
+            };
+            assert_eq!(field, legacy_field, "OID {oid}");
+            assert_eq!(actual.to_data(), legacy.to_data(), "OID {oid}");
+            assert!(ipc(field, actual) == ipc(legacy_field, legacy), "IPC differs for OID {oid}");
+        }
+    }
+
+    #[test]
+    fn source_column_preserves_array_failures_and_dynamic_transit() {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let mut output = BatchBuilder::new(4096, &memory).unwrap();
+        let first = read_text(1007, "{bad}").unwrap_err();
+        let error = read_source_text_column("value", 1007, 2, |row| {
+            Ok(Some(["{bad}", "{{1},{2}}"][row]))
+        }, &mut output).unwrap_err();
+        assert_eq!(error, first);
+        for text in ["{{1},{2}}", "[0:1]={1,2}"] {
+            assert_eq!(
+                read_source_text_column("value", 1007, 1, |_| Ok(Some(text)), &mut output).unwrap_err(),
+                read_text(1007, text).unwrap_err(),
+            );
+        }
+        assert!(read_source_text_column("value", 16384, 1, |_| Ok(Some(r#"["^ ","a",1]"#)), &mut output).unwrap().is_none());
+    }
 }

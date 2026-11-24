@@ -5033,6 +5033,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "arrow-select",
  "async-trait",
  "bigdecimal",
  "bytes",

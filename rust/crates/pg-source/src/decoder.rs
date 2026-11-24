@@ -1,13 +1,17 @@
 use rtdb_types::StructFields;
-use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use arrow_array::{RecordBatch, RecordBatchOptions};
+use std::{collections::{BTreeMap, BTreeSet}, ops::Range, sync::Arc};
+use arrow_array::{Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema;
 use rtdb_columnar::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, LogicalType, Result, TableRef, Timestamp, Value};
 use crate::{Lsn, read_text, vector_types::{VectorType, VectorTypes}, wire::{Column, Input, protocol}};
+use rtdb_pg_codec::{Format, read_source_binary, read_source_binary_column, read_source_text_column};
+
+mod pending;
+use pending::{DecodedCell, PendingTransaction, Run};
 
 pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RowKind { Put, Delete }
 #[derive(Debug)]
 pub struct RowOperation { pub kind: RowKind, pub table: TableRef, pub row: StructFields<Value>, _charge: Arc<MemoryReservation> }
@@ -29,54 +33,117 @@ pub struct ArrowPgTransaction {
 }
 
 impl ArrowPgTransaction {
-    pub(crate) fn empty(lsn: Lsn) -> Self {
-        Self { lsn, commit_time: None, batches: Vec::new() }
-    }
-
-    pub(crate) fn row_count(&self) -> usize {
-        self.batches.iter().map(|batch| batch.rows.batch().num_rows()).sum()
+    pub(crate) fn ordered_runs(&self) -> impl Iterator<Item = (&ArrowChanges, Range<usize>)> {
+        self.batches.iter().map(|batch| (batch, 0..batch.rows.batch().num_rows()))
     }
 
     pub(crate) fn to_rows(&self, memory: &Arc<MemoryBudget>) -> Result<PgTransaction> {
-        let mut operations = Vec::with_capacity(self.row_count());
-        for changes in &self.batches {
-            let batch = changes.rows.batch();
-            for row in 0..batch.num_rows() {
-                let fields = batch.schema_ref().fields().iter().zip(batch.columns());
-                let bound = fields.clone().try_fold(4096usize, |bytes, (field, column)| {
-                    let cell = rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), row)?;
-                    bytes.checked_add(cell).and_then(|bytes| bytes.checked_add(4096 + field.name().len()))
-                        .ok_or_else(|| protocol("Row allocation overflow"))
-                })?;
-                let charge = memory.reserve(bound)?;
-                let values = fields.map(|(field, column)| {
-                    Ok((field.name().clone(), rtdb_columnar::read_value(field, column.as_ref(), row)?))
-                }).collect::<Result<_>>()?;
-                operations.push(RowOperation { kind: changes.kind, table: changes.table.clone(), row: values, _charge: charge });
-            }
-        }
-        Ok(PgTransaction { lsn: self.lsn, commit_time: self.commit_time, operations })
+        decode_rows(self.lsn, self.commit_time, self.ordered_runs(), memory)
     }
 }
+
+#[derive(Debug)]
+pub(crate) struct DecodedTransaction {
+    pub lsn: Lsn,
+    pub commit_time: Option<Timestamp>,
+    pub batches: Vec<ArrowChanges>,
+    order: Option<Vec<Run>>,
+}
+
+impl DecodedTransaction {
+    pub fn new(lsn: Lsn, commit_time: Option<Timestamp>, batches: Vec<ArrowChanges>) -> Self {
+        Self { lsn, commit_time, batches, order: None }
+    }
+
+    pub fn ordered_runs(&self) -> impl Iterator<Item = (&ArrowChanges, Range<usize>)> {
+        let ordered = self.order.as_deref().unwrap_or_default().iter()
+            .map(|run| (&self.batches[run.batch], run.rows.clone()));
+        let natural = self.order.is_none().then_some(&self.batches).into_iter().flatten()
+            .map(|batch| (batch, 0..batch.rows.batch().num_rows()));
+        ordered.chain(natural)
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.batches.iter().map(|batch| batch.rows.batch().num_rows()).sum()
+    }
+
+    fn to_rows(&self, memory: &Arc<MemoryBudget>) -> Result<PgTransaction> {
+        decode_rows(self.lsn, self.commit_time, self.ordered_runs(), memory)
+    }
+
+    pub fn compatibility_batches(&self, memory: &Arc<MemoryBudget>) -> Result<(ArrowPgTransaction, Arc<MemoryReservation>)> {
+        let wal = self.order.is_some();
+        let count = if wal { self.row_count() } else { self.batches.len() };
+        let bound = self.ordered_runs().try_fold(4096usize, |size, (changes, range)| {
+            let metadata = changes.rows.batch().schema_ref().fields().iter().try_fold(4096usize, |size, field| {
+                size.checked_add(field.size().checked_mul(4).ok_or_else(overflow)?).ok_or_else(overflow)
+            })?;
+            size.checked_add(metadata.checked_mul(if wal { range.len() } else { 1 }).ok_or_else(overflow)?).ok_or_else(overflow)
+        })?;
+        let charge = memory.reserve(bound)?;
+        let mut batches = Vec::with_capacity(count);
+        for (changes, rows) in self.ordered_runs() {
+            if wal {
+                for row in rows {
+                    batches.push(ArrowChanges { kind: changes.kind, table: changes.table.clone(), rows: changes.rows.slice(row, 1)? });
+                }
+            } else {
+                batches.push(ArrowChanges { kind: changes.kind, table: changes.table.clone(), rows: changes.rows.clone() });
+            }
+        }
+        Ok((ArrowPgTransaction { lsn: self.lsn, commit_time: self.commit_time, batches }, charge))
+    }
+}
+
+fn decode_rows<'a>(
+    lsn: Lsn, commit_time: Option<Timestamp>, runs: impl Iterator<Item = (&'a ArrowChanges, Range<usize>)>,
+    memory: &Arc<MemoryBudget>,
+) -> Result<PgTransaction> {
+    let mut operations = Vec::new();
+    for (changes, rows) in runs {
+        let batch = changes.rows.batch();
+        for row in rows {
+            let fields = batch.schema_ref().fields().iter().zip(batch.columns());
+            let bound = fields.clone().try_fold(4096usize, |bytes, (field, column)| {
+                let cell = rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), row)?;
+                bytes.checked_add(cell).and_then(|bytes| bytes.checked_add(4096 + field.name().len()))
+                    .ok_or_else(|| protocol("Row allocation overflow"))
+            })?;
+            let charge = memory.reserve(bound)?;
+            let values = fields.map(|(field, column)| {
+                Ok((field.name().clone(), rtdb_columnar::read_value(field, column.as_ref(), row)?))
+            }).collect::<Result<_>>()?;
+            operations.push(RowOperation { kind: changes.kind, table: changes.table.clone(), row: values, _charge: charge });
+        }
+    }
+    Ok(PgTransaction { lsn, commit_time, operations })
+}
+
 struct Relation { table: TableRef, columns: Vec<Column>, _charge: Arc<MemoryReservation> }
 #[derive(Clone, Copy)]
 enum Cell<'a> { Null, Unchanged, Text(&'a str) }
 
 pub struct Decoder {
-    relations: BTreeMap<u32, Relation>, vector_types: Option<VectorTypes>, wal_vectors: BTreeSet<u32>, operations: Vec<ArrowChanges>, ignored: BTreeSet<TableRef>, memory: Arc<MemoryBudget>, in_transaction: bool,
+    relations: BTreeMap<u32, Relation>, vector_types: Option<VectorTypes>, wal_vectors: BTreeSet<u32>, pending: Option<PendingTransaction>, ignored: BTreeSet<TableRef>, memory: Arc<MemoryBudget>,
 }
 impl Decoder {
-    pub fn new(ignored: BTreeSet<TableRef>, memory: Arc<MemoryBudget>) -> Self { Self { relations: BTreeMap::new(), vector_types: None, wal_vectors: BTreeSet::new(), operations: Vec::new(), ignored, memory, in_transaction: false } }
+    pub fn new(ignored: BTreeSet<TableRef>, memory: Arc<MemoryBudget>) -> Self { Self { relations: BTreeMap::new(), vector_types: None, wal_vectors: BTreeSet::new(), pending: None, ignored, memory } }
     pub(crate) fn with_vector_types(mut self, types: VectorTypes) -> Self {
         self.vector_types = Some(types);
         self
     }
 
     pub fn receive(&mut self, bytes: &[u8]) -> Result<Option<PgTransaction>> {
-        self.receive_arrow(bytes)?.map(|transaction| transaction.to_rows(&self.memory)).transpose()
+        self.receive_decoded(bytes)?.map(|transaction| transaction.to_rows(&self.memory)).transpose()
     }
 
     pub fn receive_arrow(&mut self, bytes: &[u8]) -> Result<Option<ArrowPgTransaction>> {
+        self.receive_decoded(bytes)?.map(|transaction| {
+            transaction.compatibility_batches(&self.memory).map(|(batches, _charge)| batches)
+        }).transpose()
+    }
+
+    pub(crate) fn receive_decoded(&mut self, bytes: &[u8]) -> Result<Option<DecodedTransaction>> {
         let mut input = Input::new(bytes); let tag = input.u8()?;
         match tag {
             b'R' => {
@@ -84,7 +151,7 @@ impl Decoder {
                 let id = input.u32()?; let schema = input.string()?; let table = input.string()?;
                 if !matches!(input.u8()?, b'd' | b'n' | b'f' | b'i') { return Err(protocol("Unknown replica identity")); }
                 let count = input.u16()?; let mut columns = Vec::with_capacity(usize::from(count));
-                for _ in 0..count { input.u8()?; let name = input.string()?.to_owned(); let oid = input.u32()?; let typmod = input.i32()?; columns.push(Column { name, oid, typmod }); }
+                for _ in 0..count { input.u8()?; let name = input.string()?.to_owned(); let oid = input.u32()?; let typmod = input.i32()?; columns.push(Column { name, oid, typmod, format: Format::Text }); }
                 input.end()?; self.relations.insert(id, Relation { table: TableRef::new(schema, table), columns, _charge: charge });
             }
             b'Y' => {
@@ -95,15 +162,14 @@ impl Decoder {
                     self.wal_vectors.remove(&oid);
                 }
             }
-            b'B' => { input.u64()?; input.i64()?; input.u32()?; input.end()?; self.operations.clear(); self.in_transaction = true; }
+            b'B' => { input.u64()?; input.i64()?; input.u32()?; input.end()?; self.pending = Some(PendingTransaction::default()); }
             b'C' => {
                 input.u8()?; input.u64()?; let lsn = Lsn(input.u64()?); let timestamp = input.i64()?.checked_add(PG_EPOCH_MICROS).ok_or_else(|| protocol("PostgreSQL commit timestamp overflow"))?; input.end()?;
-                if !self.in_transaction { return Err(protocol("Commit arrived without Begin")); } self.in_transaction = false;
-                if self.operations.is_empty() { return Ok(None); }
-                return Ok(Some(ArrowPgTransaction { lsn, commit_time: Some(Timestamp(timestamp)), batches: std::mem::take(&mut self.operations) }));
+                let pending = self.pending.take().ok_or_else(|| protocol("Commit arrived without Begin"))?;
+                return pending.finish(lsn, Timestamp(timestamp));
             }
             b'I' | b'U' | b'D' => {
-                if !self.in_transaction { return Err(protocol("Row change arrived outside a transaction")); }
+                let pending = self.pending.as_mut().ok_or_else(|| protocol("Row change arrived outside a transaction"))?;
                 let id = input.u32()?; let relation = self.relations.get(&id).ok_or_else(|| protocol(format!("Relation {id} has no preceding Relation message")))?;
                 let marker = input.u8()?;
                 let mut old = None;
@@ -120,17 +186,40 @@ impl Decoder {
                 input.end()?;
                 if self.ignored.contains(&relation.table) { return Ok(None); }
                 let width = values.len().min(relation.columns.len());
-                let rows = decode_columns(&relation.columns[..width], 1, &self.memory, |oid| {
-                    self.vector_types.as_ref().filter(|_| self.wal_vectors.contains(&oid))?.get(oid, None)
-                }, |_, index| {
-                    let name = &relation.columns[index].name;
-                    recover(values[index], old.as_deref(), index, name, &relation.table)
-                })?;
-                self.operations.push(ArrowChanges {
-                    kind: if tag == b'D' { RowKind::Delete } else { RowKind::Put },
-                    table: relation.table.clone(),
-                    rows,
-                });
+                let columns = &relation.columns[..width];
+                let row_metadata = metadata(columns.iter().map(|column| column.name.as_str()))?;
+                let mut row_charge = self.memory.reserve(row_metadata)?;
+                let mut cells = Vec::with_capacity(width);
+                for (index, Column { name, oid, typmod, .. }) in columns.iter().enumerate() {
+                    let vector = self.vector_types.as_ref().filter(|_| self.wal_vectors.contains(oid)).and_then(|types| types.get(*oid, None));
+                    let oid = match vector { Some(VectorType::FloatArray(base)) => base, _ => *oid };
+                    let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
+                    let text = recover(values[index], old.as_deref(), index, name, &relation.table)?;
+                    let bound = text.map(|text| text_bound(bound_oid, text)).transpose()?.unwrap_or_default();
+                    let mut charge = self.memory.reserve(bound.checked_add(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+                    let mut column = BatchBuilder::new(0, &self.memory)?;
+                    let typed = if let Some(VectorType::Pgvector(domain_typmod)) = vector {
+                        Some(rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), 1, |_| Ok(text), &mut column)?)
+                    } else if matches!(oid, 1007 | 1009 | 1016 | 1021 | 1022 | 3910 | 16384) {
+                        read_source_text_column(name, oid, 1, |_| Ok(text), &mut column)?
+                    } else { None };
+                    let (field, cell) = match typed {
+                        Some((field, _)) if field.data_type() == &arrow_schema::DataType::Null => (field, DecodedCell::Scalar(Value::Null)),
+                        Some((field, array)) => (field, DecodedCell::Nested(array)),
+                        None => {
+                            let value = text.map_or(Ok(Value::Null), |text| read_text(oid, text))?;
+                            DecodedCell::from_value(name, value, &self.memory)?
+                        }
+                    };
+                    let retained = cell.retained()?;
+                    let reservation = Arc::get_mut(&mut charge).expect("decoded cell owns its reservation");
+                    if retained > reservation.bytes() { reservation.grow_to(retained)?; }
+                    else { reservation.shrink_to(retained)?; }
+                    Arc::get_mut(&mut row_charge).expect("decoded row owns its reservation").absorb(reservation)?;
+                    cells.push((field, cell));
+                }
+                let kind = if tag == b'D' { RowKind::Delete } else { RowKind::Put };
+                pending.push(id, &relation.table, kind, cells, row_charge, row_metadata)?;
             }
             _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-pgoutput-message", format!("Unsupported pgoutput message tag {tag}"))),
         }
@@ -146,54 +235,78 @@ fn recover<'a>(value: Cell<'a>, old: Option<&[Cell<'a>]>, index: usize, name: &s
     match value { Cell::Null => Ok(None), Cell::Text(value) => Ok(Some(value)), Cell::Unchanged => match old.and_then(|values| values.get(index)) { Some(Cell::Text(value)) => Ok(Some(value)), _ => Err(Anomaly::incorrect("xtdb.postgres/unchanged-toast", format!("Column {name} on {}.{} has an unrecoverable unchanged TOAST value; set REPLICA IDENTITY FULL and recreate the source", table.schema, table.table))) } }
 }
 pub(crate) fn text_bound(oid: u32, text: &str) -> Result<usize> {
+    wire_value_bound(oid, text.as_bytes())
+}
+
+fn wire_value_bound(oid: u32, value: &[u8]) -> Result<usize> {
     let nested = matches!(oid, 114 | 3802 | 16384 | 1007 | 1016 | 1009);
-    let nodes = if nested { text.bytes().filter(|byte| matches!(byte, b',' | b'{' | b'[' | b':')).count() } else { 0 };
-    text.len().checked_mul(8).and_then(|bytes| nodes.checked_mul(4096).and_then(|nodes| bytes.checked_add(nodes))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| protocol("Column allocation overflow"))
+    let nodes = if nested { value.iter().copied().filter(|byte| matches!(byte, b',' | b'{' | b'[' | b':')).count() } else { 0 };
+    value.len().checked_mul(8).and_then(|bytes| nodes.checked_mul(4096).and_then(|nodes| bytes.checked_add(nodes))).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| protocol("Column allocation overflow"))
 }
 pub(crate) fn snapshot_rows(
     table: &TableRef, columns: &[Column], rows: &[crate::wire::Row], memory: &Arc<MemoryBudget>, vectors: &VectorTypes,
 ) -> Result<ArrowChanges> {
-    let batch = decode_columns(columns, rows.len(), memory, |oid| vectors.get(oid, None), |row, column| rows[row].cell(column))?;
+    let batch = decode_columns(columns, rows.len(), memory, |oid| vectors.get(oid, None), |row, column| rows[row].cell_bytes(column))?;
     Ok(ArrowChanges { kind: RowKind::Put, table: table.clone(), rows: batch })
+}
+
+fn overflow() -> Anomaly { protocol("PostgreSQL Arrow batch allocation overflow") }
+
+fn metadata<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<usize> {
+    names.into_iter().try_fold(4096usize, |bytes, name| {
+        bytes.checked_add(4096 + 8 * name.len()).ok_or_else(overflow)
+    })
 }
 
 fn decode_columns<'a>(
     columns: &[Column], count: usize, memory: &Arc<MemoryBudget>, vector: impl Fn(u32) -> Option<VectorType>,
-    cell: impl Fn(usize, usize) -> Result<Option<&'a str>>,
+    cell: impl Fn(usize, usize) -> Result<Option<&'a [u8]>>,
 ) -> Result<OwnedBatch> {
-    let overflow = || protocol("PostgreSQL Arrow batch allocation overflow");
-    let metadata = columns.iter().try_fold(4096usize, |bytes, column| {
-        bytes.checked_add(4096 + 8 * column.name.len()).ok_or_else(overflow)
-    })?;
-    let mut output = BatchBuilder::new(metadata, memory)?;
+    let mut output = BatchBuilder::new(metadata(columns.iter().map(|column| column.name.as_str()))?, memory)?;
     let mut arrays = Vec::with_capacity(columns.len());
     let mut fields = Vec::with_capacity(columns.len());
     let base = count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
-    for (index, Column { name, oid, typmod }) in columns.iter().enumerate() {
+    for (index, Column { name, oid, typmod, format }) in columns.iter().enumerate() {
         let vector = vector(*oid);
-        let oid = match vector {
-            Some(VectorType::FloatArray(base)) => base,
-            _ => *oid,
-        };
+        let oid = match vector { Some(VectorType::FloatArray(base)) => base, _ => *oid };
         let bound_oid = if matches!(vector, Some(VectorType::Pgvector(_))) { 700 } else { oid };
+        let text = |row| cell(row, index)?.map(|bytes| std::str::from_utf8(bytes).map_err(protocol)).transpose();
         let temporary = (0..count).try_fold(base, |bytes, row| {
-            let size = cell(row, index)?.map(|text| text_bound(bound_oid, text)).transpose()?.unwrap_or_default();
+            let size = match format {
+                Format::Text => text(row)?.map(|text| text_bound(bound_oid, text)).transpose()?,
+                Format::Binary => cell(row, index)?.map(|bytes| wire_value_bound(oid, bytes)).transpose()?,
+            }.unwrap_or_default();
             bytes.checked_add(size).ok_or_else(overflow)
         })?;
         let _values = memory.reserve(temporary)?;
         if let Some(VectorType::Pgvector(domain_typmod)) = vector {
-            let (field, array) = rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), count, |row| cell(row, index), &mut output)?;
+            let (field, array) = rtdb_pg_codec::read_vector_column(name, domain_typmod.unwrap_or(*typmod), count, text, &mut output)?;
             arrays.push(array);
             fields.push(field);
             continue;
         }
-        if let Some((field, array)) = rtdb_pg_codec::read_source_text_column(name, oid, count, |row| cell(row, index), &mut output)? {
+        let typed = match format {
+            Format::Text => read_source_text_column(name, oid, count, text, &mut output)?,
+            Format::Binary => {
+                match read_source_binary_column(name, oid, count, |row| cell(row, index))? {
+                    Some((field, array)) => {
+                        let bound = array.get_array_memory_size().checked_add(512).ok_or_else(overflow)?;
+                        Some((field, output.column(bound, || Ok(array))?))
+                    }
+                    None => None,
+                }
+            }
+        };
+        if let Some((field, array)) = typed {
             arrays.push(array);
             fields.push(field);
             continue;
         }
         let values = (0..count).map(|row| {
-            cell(row, index)?.map_or(Ok(Value::Null), |text| read_text(oid, text))
+            match format {
+                Format::Text => text(row)?.map_or(Ok(Value::Null), |text| read_text(oid, text)),
+                Format::Binary => cell(row, index)?.map_or(Ok(Value::Null), |bytes| read_source_binary(oid, bytes)),
+            }
         }).collect::<Result<Vec<_>>>()?;
         let types = values.iter().map(Value::logical_type).collect::<Vec<_>>();
         let logical = LogicalType::join_all(&types);
@@ -211,9 +324,9 @@ fn decode_columns<'a>(
 #[test]
 fn snapshot_columns_keep_postgres_types_nulls_and_tuple_order() {
     let memory = MemoryBudget::new(1 << 20);
-    let columns = [column("_id", 20), column("note", 25)];
+    let columns = [Column { name: "_id".into(), oid: 20, typmod: -1, format: Format::Text }, Column { name: "note".into(), oid: 25, typmod: -1, format: Format::Text }];
     let tuples = [[Some("2"), None], [Some("1"), Some("a")]];
-    let batch = decode_columns(&columns, tuples.len(), &memory, |_| None, |row, column| Ok(tuples[row][column])).unwrap();
+    let batch = decode_columns(&columns, tuples.len(), &memory, |_| None, |row, column| Ok(tuples[row][column].map(str::as_bytes))).unwrap();
     let batch = batch.batch();
     assert_eq!(batch.num_rows(), 2);
     assert_eq!(batch.schema_ref().field(0).data_type(), &arrow_schema::DataType::Int64);
@@ -222,6 +335,128 @@ fn snapshot_columns_keep_postgres_types_nulls_and_tuple_order() {
     assert_eq!(rtdb_columnar::read_value(note, batch.column(1).as_ref(), 1).unwrap(), Value::Utf8("a".into()));
 }
 
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    fn relation(id: u32, table: &str, columns: &[(&str, u32)]) -> Vec<u8> {
+        let mut message = vec![b'R'];
+        message.extend(id.to_be_bytes());
+        message.extend(b"public\0");
+        message.extend(table.as_bytes());
+        message.extend(b"\0f");
+        message.extend((columns.len() as u16).to_be_bytes());
+        for (name, oid) in columns {
+            message.push(0);
+            message.extend(name.as_bytes());
+            message.push(0);
+            message.extend(oid.to_be_bytes());
+            message.extend((-1i32).to_be_bytes());
+        }
+        message
+    }
+
+    fn row(tag: u8, relation: u32, fields: &[Option<&str>]) -> Vec<u8> {
+        let mut message = vec![tag];
+        message.extend(relation.to_be_bytes());
+        message.push(if tag == b'D' { b'O' } else { b'N' });
+        message.extend((fields.len() as u16).to_be_bytes());
+        for field in fields {
+            if let Some(text) = field {
+                message.push(b't');
+                message.extend((text.len() as i32).to_be_bytes());
+                message.extend(text.as_bytes());
+            } else { message.push(b'n'); }
+        }
+        message
+    }
+
+    pub fn transactions(memory: &Arc<MemoryBudget>) -> (DecodedTransaction, DecodedTransaction) {
+        let mut decoder = Decoder::new(BTreeSet::new(), Arc::clone(memory));
+        let columns = [("_id", 23), ("data", 1007), ("_valid_from", 1184), ("_valid_to", 1184)];
+        decoder.receive_decoded(&relation(1, "a", &columns)).unwrap();
+        decoder.receive_decoded(&relation(2, "b", &columns)).unwrap();
+        decoder.receive_decoded(&[b'B'].into_iter().chain([0; 20]).collect::<Vec<_>>()).unwrap();
+
+        let changes = [
+            (b'I', 1, vec![Some("1"), Some("{2,NULL}"), Some("2020-01-01 00:00:00+00"), None]),
+            (b'I', 1, vec![Some("1"), Some("{5,NULL}"), Some("2020-01-01 00:00:00+00"), None]),
+            (b'I', 2, vec![Some("2"), Some("{3,7}"), None, None]),
+            (b'D', 1, vec![Some("1")]),
+            (b'I', 1, vec![Some("1"), Some("{9,NULL}"), Some("2020-01-01 00:00:00+00"), None]),
+            (b'I', 1, vec![Some("3"), None, None, None]),
+        ];
+        let mut legacy = Vec::new();
+        for (tag, relation_id, text) in changes {
+            assert!(decoder.receive_decoded(&row(tag, relation_id, &text)).unwrap().is_none());
+            let mut output = BatchBuilder::new(16_384, memory).unwrap();
+            let mut fields = Vec::new();
+            let mut arrays = Vec::new();
+            for ((name, oid), value) in columns.iter().zip(text) {
+                let value = value.map_or(Ok(Value::Null), |text| read_text(*oid, text)).unwrap();
+                let logical = LogicalType::join_all([&value.logical_type()]);
+                fields.push(rtdb_columnar::to_field(*name, &logical).unwrap());
+                let values = [value];
+                let bound = rtdb_columnar::estimate_builder_bytes(&logical, &values).unwrap();
+                arrays.push(output.column(bound, || rtdb_columnar::copy_array(&logical, &values)).unwrap());
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+            legacy.push(ArrowChanges {
+                kind: if tag == b'D' { RowKind::Delete } else { RowKind::Put },
+                table: TableRef::new("public", if relation_id == 1 { "a" } else { "b" }),
+                rows: output.finish(batch).unwrap(),
+            });
+        }
+        let actual = decoder.receive_decoded(&[b'C'].into_iter().chain([0; 25]).collect::<Vec<_>>()).unwrap().unwrap();
+        let legacy = DecodedTransaction::new(actual.lsn, actual.commit_time, legacy);
+        (actual, legacy)
+    }
+
+    #[test]
+    fn pg_source_arrow_wal_groups_rows_and_restores_order() {
+        let memory = MemoryBudget::new(1 << 22);
+        let (actual, legacy) = transactions(&memory);
+        assert_eq!(actual.batches.iter().map(|batch| batch.rows.batch().num_rows()).collect::<Vec<_>>(), [3, 1, 1, 1]);
+        let (compatible, compatibility_charge) = actual.compatibility_batches(&memory).unwrap();
+        assert!(compatible.batches.iter().all(|batch| batch.rows.batch().num_rows() == 1));
+        let rows = compatible.to_rows(&memory).unwrap();
+        let expected = legacy.to_rows(&memory).unwrap();
+        assert_eq!(rows.operations.len(), expected.operations.len());
+        for (actual, expected) in rows.operations.iter().zip(expected.operations.iter()) {
+            assert_eq!((&actual.table, actual.kind, &actual.row), (&expected.table, expected.kind, &expected.row));
+        }
+        let detached = Arc::clone(actual.batches[0].rows.batch().column(0));
+        drop((actual, legacy, compatible, compatibility_charge, rows, expected));
+        assert!(memory.used_bytes() > 0);
+        drop(detached);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn pg_source_arrow_snapshot_binary_and_text_layouts_are_identical() {
+        let memory = MemoryBudget::new(1 << 22);
+        let text = [Column { name: "_id".into(), oid: 20, typmod: -1, format: Format::Text },
+            Column { name: "doc".into(), oid: 3802, typmod: -1, format: Format::Text },
+            Column { name: "other".into(), oid: 90000, typmod: -1, format: Format::Text }];
+        let binary = [Column { format: Format::Binary, ..text[0].clone() },
+            Column { format: Format::Binary, ..text[1].clone() }, text[2].clone()];
+        let expected_data: [[Option<&[u8]>; 3]; 2] = [
+            [Some(b"-17"), Some(br#"{"a":1}"#), Some(b"enum-name")],
+            [Some(b"24"), Some(br#"{"b":null}"#), None],
+        ];
+        let first = (-17i64).to_be_bytes();
+        let second = 24i64.to_be_bytes();
+        let data: [[Option<&[u8]>; 3]; 2] = [
+            [Some(&first), Some(b"\x01{\"a\":1}"), Some(b"enum-name")],
+            [Some(&second), Some(b"\x01{\"b\":null}"), None],
+        ];
+        let expected = decode_columns(&text, 2, &memory, |_| None, |r, c| Ok(expected_data[r][c])).unwrap();
+        let actual = decode_columns(&binary, 2, &memory, |_| None, |r, c| Ok(data[r][c])).unwrap();
+        let ipc = |batch: &OwnedBatch| rtdb_format::ipc::write_stream(batch.batch().schema_ref(), std::slice::from_ref(batch.batch())).unwrap();
+        assert_eq!(actual.batch().schema(), expected.batch().schema());
+        assert!(ipc(&actual) == ipc(&expected));
+    }
+}
 
 #[test]
 fn snapshot_array_columns_match_the_text_reader_for_nulls_and_escaped_values() {
@@ -232,7 +467,7 @@ fn snapshot_array_columns_match_the_text_reader_for_nulls_and_escaped_values() {
         [Some("{}"), Some("{}"), None],
         [None, Some("{NULL}"), None],
     ];
-    let batch = decode_columns(&columns, tuples.len(), &memory, |_| None, |row, column| Ok(tuples[row][column])).unwrap();
+    let batch = decode_columns(&columns, tuples.len(), &memory, |_| None, |row, column| Ok(tuples[row][column].map(str::as_bytes))).unwrap();
     for (position, Column { oid, .. }) in columns.iter().enumerate() {
         for (row, tuple) in tuples.iter().enumerate() {
             let expected = tuple[position].map(|text| read_text(*oid, text).unwrap()).unwrap_or(Value::Null);
@@ -272,13 +507,13 @@ fn source_scalar_columns_match_legacy_arrays_metadata_and_errors() {
             assert_eq!(array.to_data(), expected_array.to_data(), "OID {oid}");
         }
         let expected = read_text(oid, invalid).unwrap_err();
-        let actual = decode_columns(&[column("scalar", oid)], 1, &memory, |_| None, |_, _| Ok(Some(invalid))).unwrap_err();
+        let actual = decode_columns(&[column("scalar", oid)], 1, &memory, |_| None, |_, _| Ok(Some(invalid.as_bytes()))).unwrap_err();
         assert_eq!((actual.category, actual.code, actual.message), (expected.category, expected.code, expected.message), "OID {oid}");
     }
 }
 
 #[cfg(test)]
-fn column(name: &str, oid: u32) -> Column { Column { name: name.into(), oid, typmod: -1 } }
+fn column(name: &str, oid: u32) -> Column { Column { name: name.into(), oid, typmod: -1, format: Format::Text } }
 
 #[test]
 fn floating_arrays_and_pgvector_build_typed_children_with_nulls() {
@@ -289,7 +524,7 @@ fn floating_arrays_and_pgvector_build_typed_children_with_nulls() {
     let types = VectorTypes::fixture();
     let columns = [column("reals", 1021), column("doubles", 1022), Column { typmod: 2, ..column("embedding", 20345) }];
     let tuples = [[Some("{-0,NaN,NULL}"), Some("{-0,Infinity,NULL}"), Some("[-0,1.5]")], [None; 3], [Some("{}"), Some("{NULL}"), Some("[1,2]")]];
-    let batch = decode_columns(&columns, tuples.len(), &memory, |oid| types.get(oid, None), |row, column| Ok(tuples[row][column])).unwrap();
+    let batch = decode_columns(&columns, tuples.len(), &memory, |oid| types.get(oid, None), |row, column| Ok(tuples[row][column].map(str::as_bytes))).unwrap();
     let batch = batch.batch();
     let reals = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
     let children = reals.values().as_any().downcast_ref::<Float32Array>().unwrap();
@@ -387,7 +622,7 @@ fn float_arrays_keep_multidimensional_and_explicitly_bounded_cells_as_text() {
 
     let memory = MemoryBudget::new(1 << 20);
     let texts = [Some("{-0,NULL}"), Some("[0:1]={2,3}"), Some("{{1,2},{3,4}}"), None];
-    let batch = decode_columns(&[column("array", 1021)], texts.len(), &memory, |_| None, |row, _| Ok(texts[row])).unwrap();
+    let batch = decode_columns(&[column("array", 1021)], texts.len(), &memory, |_| None, |row, _| Ok(texts[row].map(str::as_bytes))).unwrap();
     let column = batch.batch().column(0).as_any().downcast_ref::<UnionArray>().unwrap();
     let child = column.child(column.type_id(0)).as_any().downcast_ref::<ListArray>().unwrap();
     assert!(child.values().as_any().is::<Float32Array>());

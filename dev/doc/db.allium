@@ -119,6 +119,7 @@ external entity ExternalSource {
     -- On assignment it is handed an indexing callback and an opaque resume token to start after, and feeds transactions in directly.
     -- The native PostgreSQL direct mirror stages snapshots and logical changes from Arrow arrays.
     -- Primitive PostgreSQL text fields and supported text or integer arrays decode directly into Arrow builders.
+    -- The order of PostgreSQL WAL changes determines the order of their staged events within a transaction.
     -- An external-source database assigns its own monotonically increasing tx_id off the RESOLVED head rather than taking it from the source-log position.
     -- A client submit is rejected for such a database: transactions enter only through the source.
 }

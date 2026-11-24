@@ -34,11 +34,9 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
         1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; let mut list = rtdb_types::ListBuilder::with_capacity(0); visit_array(text, |value| { list.push(value.map_or(Ok(Value::Null), |text| read_text(element, &text))?); Ok(()) })?; Value::List(list.finish()) },
         114 | 3802 => read_json(text)?,
-        3910 => {
-            let Some(inner) = text.strip_prefix('[').and_then(|text| text.strip_suffix(')')) else { return Ok(Value::Null); };
-            let Some((lower, upper)) = inner.split_once(',') else { return Ok(Value::Null); };
-            let bound = |text: &str, absent| -> Result<i64> { if text.is_empty() { Ok(absent) } else { let value = timestamp(text)?; Ok(rtdb_expr::timestamp_micros(&value, "UTC")?.0) } };
-            Value::TimestampTzRange { lower: bound(lower, i64::MIN)?, upper: bound(upper, i64::MAX)? }
+        3910 => match range(text)? {
+            Some((lower, upper)) => Value::TimestampTzRange { lower, upper },
+            None => Value::Null,
         },
         26 | 2205 | 24 => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-text-type", format!("Pinned PgType has no text reader for OID {oid}"))),
         16384 => transit_input::decode_json(text.as_bytes())?,
@@ -177,10 +175,21 @@ pub(crate) fn visit_array_elements<'a>(text: &'a str, strict_quotes: bool, mut v
             '{' | '}' if !quoted => return Err(invalid("Nested PostgreSQL arrays are unsupported by the pinned type reader")),
             _ => {}
         }
+
     }
     if quoted || escaped { return Err(invalid("Unterminated PostgreSQL array element")); }
     visit(finish(start, inner.len(), copied, decoded))
 }
+fn range(text: &str) -> Result<Option<(i64, i64)>> {
+    let Some(inner) = text.strip_prefix('[').and_then(|text| text.strip_suffix(')')) else { return Ok(None); };
+    let Some((lower, upper)) = inner.split_once(',') else { return Ok(None); };
+    let bound = |text: &str, absent| -> Result<i64> {
+        if text.is_empty() { Ok(absent) } else { Ok(rtdb_expr::timestamp_micros(&timestamp(text)?, "UTC")?.0) }
+    };
+    Ok(Some((bound(lower, i64::MIN)?, bound(upper, i64::MAX)?)))
+}
+
+
 fn read_json(text: &str) -> Result<Value> {
     use serde_json::value::RawValue;
     let text = text.trim();
@@ -318,7 +327,7 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                     let [T::String(period), T::String(duration), ..] = parts.as_slice() else { return Err(invalid("Transit period-duration requires period and duration strings")); };
                     crate::interval::period_duration(period, duration)?
                 }
-                "xtdb/clj-form" | "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Value::Transit(encode_msgpack(&T::Tagged { tag, representation })?),
+                tag_name if is_opaque_transit(tag_name) => Value::Transit(encode_msgpack(&T::Tagged { tag, representation })?),
                 _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-transit-value", format!("Transit tag {tag} cannot be imported as a native document value"))),
             }
         }
@@ -347,6 +356,10 @@ fn cast_transit_number(tag: &str, value: Value) -> Result<Value> {
         _ => ScalarType::F64,
     };
     rtdb_expr::cast(&value, &rtdb_types::LogicalType::Scalar(scalar), "UTC")
+}
+
+fn is_opaque_transit(tag: &str) -> bool {
+    matches!(tag, "xtdb/clj-form" | "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info")
 }
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.postgres/invalid-column-value", error.to_string()) }
 
