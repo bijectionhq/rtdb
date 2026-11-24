@@ -14,6 +14,7 @@ mod repair;
 mod repair_decision;
 mod retirement_receipt;
 mod snapshot_replay;
+mod sql_survivor;
 mod state;
 mod table_replay;
 
@@ -23,6 +24,7 @@ pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint,
 pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
 pub use snapshot_replay::{ErasureTarget, SnapshotReplay, SqlErasureSource};
+pub use sql_survivor::SqlSurvivor;
 pub use replay_closure::{ReplayBase, ReplayDependencySources, checkpoint_dependencies, tail_dependencies};
 pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};

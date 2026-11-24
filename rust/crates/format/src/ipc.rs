@@ -664,6 +664,10 @@ fn schema_metrics(schema: &Schema) -> Result<(usize, usize)> {
 }
 
 pub fn write_file(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
+    write_file_pages(schema, pages)
+}
+
+pub fn write_file_pages<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>) -> Result<Vec<u8>> {
     let mut writer = JavaFile::new(Vec::new(), schema)?;
     for page in pages { writer.write(page)?; }
     writer.finish()

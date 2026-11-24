@@ -7,7 +7,7 @@ use ordered_logkeeper::ordered::{
     service::wire::{Decision, SignedRotationSlots},
 };
 use rtdb_replication::SqlErasureSource;
-use rtdb_storage::ObjectStore;
+use tokio_util::sync::CancellationToken;
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
 
@@ -202,17 +202,15 @@ impl<'a> ErasureCoordinator<'a> {
         Ok(self)
     }
 
-    /// Materializes an already rewritten SQL survivor closure in the protected
-    /// provider allocation. The protected replay supplies the original erase
-    /// effects and authenticates the exact predecessor and selected head.
+    /// Rewrites the SQL survivor closure from the protected selected source
+    /// and materializes it in the successor provider allocation.
     pub async fn stage_survivor(
         &self,
         erasure: Erasure,
         rotation: RequestId,
         reservation: Reservation,
-        checkpoint: rtdb_directory::Checkpoint,
         selection: &SqlErasureSource,
-        source: &dyn ObjectStore,
+        cancellation: &CancellationToken,
     ) -> Result<PreparedErasure> {
         self.require_incumbent(erasure)?;
         let route = self.custodian.route().await?;
@@ -227,21 +225,21 @@ impl<'a> ErasureCoordinator<'a> {
         if !base_matches
             || selection.authenticated_head() != crate::journal::head_identity(route.placement, route.head)
             || cut.replica_epoch != epoch
-            || cut.through.after_offset(epoch) != checkpoint.boundary
-            || selection.source_position().after_offset(epoch) != checkpoint.source
-            || selection.snapshot().block_index().0 != checkpoint.block
-            || selection.snapshot().tx_basis().map(|basis| basis.system_time.0) != Some(checkpoint.system_time)
             || route.writer.grant != Some(erasure.incumbent)
             || rotation.nonce.is_nil()
             || rotation.expires_at <= route.position.saturating_add(1)
             || route.head.next_lsn <= route.checkpoint.cut.next_lsn
             || reservation.custody.allocation == route.checkpoint.custody.allocation
-            || checkpoint.root_sha256 == Some(route.checkpoint.root)
         {
             return Err(invalid(
                 "Erasure staging needs a new root and custody at the exact incumbent head",
             ));
         }
+        let survivors = selection.build_survivor(CheckpointCustody::copy_budget(&reservation)?, cancellation).await?;
+        let checkpoint = super::checkpoint_for_block(&survivors.catalog, epoch)
+            .filter(|candidate| candidate.root_sha256 != Some(route.checkpoint.root))
+            .ok_or_else(|| invalid("The survivor rewrite has no new exact catalog"))?;
+        let source = survivors.store();
         let origin = Preparation {
             authority: CheckpointAuthority::Erasure(binding(erasure, rotation)),
             writer: erasure.incumbent,

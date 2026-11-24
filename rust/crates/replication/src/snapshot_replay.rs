@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_format::{catalog::legacy_table_ref, envelope::{ReplicaBody, decode_replica_outcome_attempt}};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_index::{Snapshot, StagedWrite};
-use rtdb_storage::object_store::ReadReservation;
+use rtdb_storage::{ObjectStore, object_store::ReadReservation};
 use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, EventOp, EventPosition, Iid, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp, TransactionKey};
 use tokio_util::sync::CancellationToken;
 
@@ -65,8 +65,12 @@ pub struct SqlErasureSource {
     source_position: SourcePosition,
     transaction: TransactionKey,
     targets: Vec<ErasureTarget>,
-    _custody: Arc<dyn Send + Sync>,
+    pub(crate) custody: Arc<dyn Send + Sync>,
     snapshot: Snapshot,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) memory: Arc<MemoryBudget>,
+    pub(crate) fence: crate::TermFence,
+    pub(crate) external_token: Option<Arc<[u8]>>,
 }
 
 impl SqlErasureSource {
@@ -117,7 +121,9 @@ impl RecoveredPartition {
         let targets = selected.filter(|targets| !targets.is_empty()).ok_or_else(missing_erasure)?;
         Ok(SqlErasureSource {
             authenticated_head, cut, checkpoint, source_position: self.progress.source_position, transaction,
-            targets, _custody: custody, snapshot: self.partition.snapshot(),
+            targets, custody, snapshot: self.partition.snapshot(),
+            store: Arc::clone(logs.storage()), memory: Arc::clone(memory),
+            fence: self.fence.clone(), external_token: self.progress.external_token.clone(),
         })
     }
 

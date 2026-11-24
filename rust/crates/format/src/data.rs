@@ -184,6 +184,15 @@ impl<'a> EventRef<'a> {
         rtdb_columnar::text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
     }
 
+    pub fn document_allocation_bound(&self) -> Result<usize> {
+        let Some(put) = self.put else { return Ok(0); };
+        put.array.fields().iter().enumerate().try_fold(4096usize, |bytes, (index, field)| {
+            let cell = rtdb_columnar::estimate_read_cell_bytes(field, put.array.column(index).as_ref(), put.offset)?;
+            cell.checked_mul(4).and_then(|cell| cell.checked_add(field.name().len()))
+                .and_then(|cell| cell.checked_add(512)).and_then(|cell| bytes.checked_add(cell)).ok_or_else(event_size)
+        })
+    }
+
     pub fn physical_entity_key(&self) -> Option<&'a [u8]> { self.entity_key }
 
     pub fn put_identity(&self) -> Result<Option<rtdb_columnar::EntityIdRef<'a>>> {
