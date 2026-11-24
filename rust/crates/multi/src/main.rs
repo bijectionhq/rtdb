@@ -344,16 +344,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             standalone_protocol: u32,
             hosted_protocol: u32,
             held_root_catalog: bool,
+            installed_authority_fence: bool,
             pgwire_arrow_copy_out: bool,
             placed_receipt_retirement: bool,
         }
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 206 } else { 56 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 207 } else { 56 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,
+            installed_authority_fence: true,
         };
         let mut output = std::io::stdout().lock();
         serde_json::to_writer(&mut output, &report).map_err(|error| io(std::io::Error::other(error)))?;
