@@ -1029,6 +1029,39 @@ pub fn write_file_pages<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a
     writer.finish()
 }
 
+/// Incremental JVM-compatible IPC. The sink owns its byte admission, while
+/// the encoder funds schema, per-page scratch, and the final footer.
+pub struct ArrowFileEncoder<W: Write> {
+    file: JavaFile<W>,
+    schema: Arc<MemoryReservation>,
+    blocks: Arc<MemoryReservation>,
+    per_page: usize,
+}
+
+impl<W: Write> ArrowFileEncoder<W> {
+    pub fn new(sink: W, schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let grant = memory.reserve(schema_translation_bound(schema)?)?;
+        let per_page = allocation_mul(allocation_add(dictionary_count(schema)?, 1)?, 512)?;
+        let blocks = memory.reserve(0)?;
+        let file = JavaFile::new(sink, schema)?;
+        Ok(Self { file, schema: grant, blocks, per_page })
+    }
+
+    pub fn write(&mut self, page: &RecordBatch) -> Result<()> {
+        let scratch = allocation_add(self.schema.bytes(), allocation_mul(page.get_array_memory_size(), 4)?)?;
+        let _scratch = self.schema.budget().reserve(scratch)?;
+        let retained = allocation_add(self.blocks.bytes(), self.per_page)?;
+        Arc::get_mut(&mut self.blocks).expect("Encoder owns its footer blocks").grow_to(retained)?;
+        self.file.write(page)
+    }
+
+    pub fn finish(self) -> Result<W> {
+        let footer = allocation_add(self.schema.bytes(), self.blocks.bytes())?;
+        let _footer = self.schema.budget().reserve(footer)?;
+        self.file.finish()
+    }
+}
+
 /// `ArrowUnloader`'s file mode, `xtdb.arrow.ArrowUnloader.Mode.FILE`: the magic padded to eight bytes, the stream's messages in the
 /// reference's Java layout, its single zero end marker, then the Java-layout footer, its length and the magic.
 struct JavaFile<W: Write> {
