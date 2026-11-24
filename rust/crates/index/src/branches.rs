@@ -173,6 +173,8 @@ pub struct BranchIndex {
     catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
     #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
     custody: Map<CustodyGroupId, Arc<custody::CustodyGroup>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latest_custody_revocation: Option<Basis>,
     changed_catalog: Option<Basis>,
     erased: Option<Basis>,
     #[serde(skip)]
@@ -194,7 +196,8 @@ impl BranchIndex {
         Self {
             head, times: Map::unit(0, head.system_time),
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
-            catalog: Map::new(), custody: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
+            catalog: Map::new(), custody: Map::new(), latest_custody_revocation: None,
+            changed_catalog: None, erased: None, writes: Arc::default(),
         }
     }
 
@@ -297,6 +300,7 @@ impl BranchIndex {
             || data.changed.is_some_and(|last| last > basis)
             || self.changed_catalog.is_some_and(|changed| changed > basis)
             || self.erased.is_some_and(|erased| erased > basis)
+            || self.latest_custody_revocation.is_some_and(|revocation| revocation > basis)
         {
             return Ok(false);
         }
@@ -327,6 +331,7 @@ impl BranchIndex {
         if !data.active(self.head, now)
             || data.expiries.last().is_some_and(|(at, _)| *at > basis)
             || self.erased.is_some_and(|at| at > basis)
+            || self.latest_custody_revocation.is_some_and(|revocation| revocation > basis)
         {
             return Ok(false);
         }

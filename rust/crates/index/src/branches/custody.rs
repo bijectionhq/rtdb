@@ -84,7 +84,7 @@ impl BranchIndex {
                 valid: None,
             });
         }
-        self.erased = Some(basis);
+        self.latest_custody_revocation = Some(basis);
         Ok(())
     }
 }
