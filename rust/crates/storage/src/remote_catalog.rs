@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path as VaultPath, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::{Error as ProviderError, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
@@ -6,10 +6,18 @@ use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, Result};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::{IoRegion, ObjectKey, io_region::IoAdmission, local_catalog::{CatalogHold, covers, same_storage, well_formed}};
+use crate::{IoRegion, ObjectKey, classic_catalog_drain::{CatalogReadWitness, ClassicCatalogDrain, selected_vault},
+    io_region::IoAdmission, local_catalog::{CatalogHold, covers, same_storage, well_formed}};
 
 const MAX_LEDGER_BYTES: usize = 1024 * 1024;
-type CatalogHolds = BTreeMap<Uuid, CatalogHold>;
+type CatalogHolds = BTreeMap<Uuid, HeldCatalog>;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HeldCatalog {
+    catalog: CatalogHold,
+    owner: Option<ClassicCatalogDrain>,
+}
 
 #[derive(Default)]
 struct Ledger {
@@ -32,13 +40,22 @@ impl CatalogLedger {
 
     pub async fn retain(self: &Arc<Self>, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>, io: &IoRegion)
         -> Result<Arc<dyn Send + Sync>> {
-        let claim = CatalogHold::new(cut, paths.as_deref());
+        let catalog = CatalogHold::new(cut, paths.as_deref());
         let admission: IoAdmission = io.admit_read(self.clone(), self.key.clone())?;
+        let vault = selected_vault();
         let ledger = Arc::clone(self);
         let (answer, result) = oneshot::channel();
         let (permit, drained) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let ticket = Uuid::new_v4();
+            let witness = match vault {
+                Some(vault) => match ledger.reads.run(move || CatalogReadWitness::reserve(&vault, ticket)).await {
+                    Ok(witness) => witness.map(Arc::new),
+                    Err(error) => { let _ = answer.send(Err(error.into())); return; }
+                },
+                None => None,
+            };
+            let claim = HeldCatalog { catalog, owner: witness.as_ref().map(|witness| witness.identity) };
             let mut uncertain = false;
             let registered = ledger.update(|state| {
                 if cut.is_some_and(|cut| !well_formed(cut))
@@ -52,7 +69,9 @@ impl CatalogLedger {
                 Ok((true, ()))
             }).await;
             let opened = registered.is_ok();
-            let delivered = answer.send(registered.map(|()| Arc::new(permit) as Arc<dyn Send + Sync>)).is_ok();
+            let delivered = answer.send(registered.map(|()| {
+                Arc::new((permit, witness.clone())) as Arc<dyn Send + Sync>
+            })).is_ok();
             drop(admission);
             if opened && delivered { let _ = drained.await; }
             if opened || uncertain {
@@ -61,19 +80,24 @@ impl CatalogLedger {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
+            if let Some(witness) = witness {
+                let _ = ledger.reads.run(move || witness.forget()).await;
+            }
         });
         result.await.map_err(|_| unavailable("Remote catalog admission ended"))?
     }
 
-    pub async fn advance(self: &Arc<Self>, cut: CatalogCut) -> Result<bool> {
-        Ok(self.close_admission(cut, &[None]).await?[0])
+    pub async fn advance(self: &Arc<Self>, cut: CatalogCut, vault: Option<Arc<VaultPath>>) -> Result<bool> {
+        Ok(self.close_admission(cut, &[None], vault).await?[0])
     }
 
-    pub async fn close_admission(self: &Arc<Self>, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
+    pub async fn close_admission(self: &Arc<Self>, cut: CatalogCut, paths: &[Option<&str>], vault: Option<Arc<VaultPath>>) -> Result<Vec<bool>> {
         if !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0 {
             return Err(unavailable("Invalid remote catalog floor"));
         }
+        let drained = self.drained_holds(vault).await?;
         self.update(|state| {
+            let removed = clear_drained(&mut state.holds, &drained);
             let closed = state.floor.is_some_and(|prior| covers(prior, cut));
             if !closed && state.floor.is_some_and(|prior| {
                 !covers(cut, prior) && !(same_storage(cut, prior) && cut.replica_epoch > prior.replica_epoch)
@@ -81,15 +105,28 @@ impl CatalogLedger {
                 return Err(unavailable("The remote catalog floor belongs to another storage root or a newer journal"));
             }
             let advance = !closed && (paths.iter().any(Option::is_some)
-                || state.holds.values().all(|held| !held.retains(cut, None)));
+                || state.holds.values().all(|held| !held.catalog.retains(cut, None)));
             if advance {
                 state.floor = Some(cut);
             }
             let allowed = paths.iter().map(|path| {
-                (closed || advance) && state.holds.values().all(|held| !held.retains(cut, *path))
+                (closed || advance) && state.holds.values().all(|held| !held.catalog.retains(cut, *path))
             }).collect();
-            Ok((advance, allowed))
+            Ok((advance || removed, allowed))
         }).await
+    }
+
+    async fn drained_holds(self: &Arc<Self>, vault: Option<Arc<VaultPath>>) -> Result<Vec<(Uuid, ClassicCatalogDrain)>> {
+        let Some(vault) = vault else { return Ok(Vec::new()); };
+        let (state, _) = self.read().await?;
+        let owners = state.holds.into_iter().filter_map(|(ticket, held)| held.owner.map(|witness| (ticket, witness)));
+        Ok(self.reads.run(move || {
+            let mut drained = Vec::new();
+            for (ticket, witness) in owners {
+                if CatalogReadWitness::drained(&vault, ticket, witness)? { drained.push((ticket, witness)); }
+            }
+            Ok(drained)
+        }).await?)
     }
 
     async fn read(self: &Arc<Self>) -> Result<(Ledger, PutMode)> {
@@ -114,7 +151,7 @@ impl CatalogLedger {
         let (sequence, floor, holds): (u64, Option<CatalogCut>, CatalogHolds) =
             serde_json::from_slice(&bytes).map_err(unavailable)?;
         if sequence == 0 || floor.is_some_and(|floor| !well_formed(floor))
-            || holds.values().any(|held| held.cut.is_some_and(|cut| !well_formed(cut)))
+            || holds.values().any(|held| held.catalog.cut.is_some_and(|cut| !well_formed(cut)))
         {
             return Err(unavailable("Malformed remote catalog ledger"));
         }
@@ -138,6 +175,16 @@ impl CatalogLedger {
         }
         Err(unavailable("The remote catalog ledger kept changing"))
     }
+}
+
+fn clear_drained(holds: &mut CatalogHolds, drained: &[(Uuid, ClassicCatalogDrain)]) -> bool {
+    let before = holds.len();
+    for &(ticket, witness) in drained {
+        if holds.get(&ticket).is_some_and(|hold| hold.owner == Some(witness)) {
+            holds.remove(&ticket);
+        }
+    }
+    holds.len() != before
 }
 
 fn unavailable(message: impl std::fmt::Display) -> Anomaly {

@@ -204,3 +204,14 @@ upload, after the original epoch and region have drained. It does not infer
 abandonment from the first time it observed an intent. Classic local
 allocated search runs use the same catalog claim, recovery gate and terminal
 name as primary-file retirement.
+
+## Classic remote reader drain
+
+A sealed Classic remote reader reserves a durable exclusive attachment
+witness in the original key vault before registering the remote catalog
+hold. Cancellation and provider work retain the registration as usual.
+A successor with the same vault can discard an abandoned hold by opening
+the exact witness inode and acquiring its lock. The catalog update compares
+the ticket and witness identity before removing it. A missing or different
+witness confers no authority. Unsealed providers continue to require normal
+release until they have a shared drain authority.

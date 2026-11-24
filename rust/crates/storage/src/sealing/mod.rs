@@ -130,6 +130,7 @@ pub struct EncryptingStore {
     keys: ObjectKeys,
     published: Option<PublicationSealing>,
     classic_control: Option<ObjectKey>,
+    classic_catalog_vault: Option<Arc<std::path::Path>>,
 }
 
 enum ObjectKeys {
@@ -144,6 +145,7 @@ impl EncryptingStore {
             keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: None },
             published: None,
             classic_control: None,
+            classic_catalog_vault: None,
         })
     }
 
@@ -156,6 +158,7 @@ impl EncryptingStore {
             keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: Some(authority) },
             published: None,
             classic_control: None,
+            classic_catalog_vault: None,
         })
     }
 
@@ -165,6 +168,7 @@ impl EncryptingStore {
             keys: ObjectKeys::Units(ledger),
             published: None,
             classic_control: None,
+            classic_catalog_vault: None,
         }
     }
 
@@ -191,8 +195,9 @@ impl EncryptingStore {
         let body = stored.size.checked_sub(overhead).ok_or_else(|| Error::ConflictingObject(stored.key.to_string()))?;
         Ok(StoredObject { size: object::plaintext_size(&stored.key, body)?, ..stored })
     }
-    fn with_classic_control(mut self, marker: ObjectKey) -> Self {
+    fn with_classic_control(mut self, marker: ObjectKey, vault: Arc<std::path::Path>) -> Self {
         self.classic_control = Some(marker);
+        self.classic_catalog_vault = Some(vault);
         self
     }
 
@@ -329,14 +334,14 @@ impl ObjectStore for EncryptingStore {
         &self,
         cut: Option<rtdb_types::CatalogCut>,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
-        self.inner.retain_catalog(cut).await
+        crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(), self.inner.retain_catalog(cut)).await
     }
     async fn retain_catalog_with_paths(
         &self,
         cut: Option<rtdb_types::CatalogCut>,
         paths: Arc<[String]>,
     ) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
-        self.inner.retain_catalog_with_paths(cut, paths).await
+        crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(), self.inner.retain_catalog_with_paths(cut, paths)).await
     }
     fn defers_trie_releases(&self) -> bool {
         self.inner.defers_trie_releases()
@@ -345,7 +350,7 @@ impl ObjectStore for EncryptingStore {
         self.inner.releases_receipt_l0()
     }
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> Result<bool> {
-        self.inner.advance_catalog_floor(installed).await
+        crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(), self.inner.advance_catalog_floor(installed)).await
     }
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
         if contents.len() > MAXIMUM_RECEIPT_BYTES
@@ -371,7 +376,7 @@ impl ObjectStore for EncryptingStore {
     }
 
     async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
-        self.inner.close_classic_trie_admission(cut, paths).await
+        crate::classic_catalog_drain::within_vault(self.classic_catalog_vault.clone(), self.inner.close_classic_trie_admission(cut, paths)).await
     }
 
     async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>) -> Result<bool> {

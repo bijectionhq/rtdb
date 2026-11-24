@@ -329,6 +329,21 @@ impl ObjectStore for DiskCachedStore {
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
         self.remote.release_trie_files(receipt, contents).await
     }
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
+        self.remote.close_classic_trie_admission(cut, paths).await
+    }
+    async fn classic_trie_retirement_ready(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>)
+        -> rtdb_types::Result<bool> {
+        self.remote.classic_trie_retirement_ready(key, version).await
+    }
+    async fn settle_classic_trie(&self, key: &ObjectKey, version: Option<&rtdb_types::PhysicalObjectVersion>)
+        -> rtdb_types::Result<()> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.remote.settle_classic_trie(key, version).await?;
+        self.cache.invalidate(&self.key(key)?)?;
+        Ok(())
+    }
     async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
         self.remote.search_staging_owner().await
     }

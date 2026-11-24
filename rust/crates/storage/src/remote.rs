@@ -195,7 +195,8 @@ impl ObjectStore for RemoteStore {
 
     async fn advance_catalog_floor(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let Some(ledger) = self.catalog.clone() else { return Ok(true); };
-        self.io.run_async(async move { Ok(ledger.advance(cut).await) }).await?
+        let vault = crate::classic_catalog_drain::selected_vault();
+        self.io.run_async(async move { Ok(ledger.advance(cut, vault).await) }).await?
     }
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
@@ -207,9 +208,10 @@ impl ObjectStore for RemoteStore {
             return Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()]);
         };
         let paths = paths.iter().map(|path| path.map(str::to_owned)).collect::<Vec<_>>();
+        let vault = crate::classic_catalog_drain::selected_vault();
         self.io.run_async(async move {
             let paths = paths.iter().map(Option::as_deref).collect::<Vec<_>>();
-            Ok(ledger.close_admission(cut, &paths).await)
+            Ok(ledger.close_admission(cut, &paths, vault).await)
         }).await?
     }
 
