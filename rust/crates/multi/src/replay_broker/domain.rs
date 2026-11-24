@@ -23,6 +23,7 @@ const MAX_ATTEMPTS: usize = 8;
 pub struct Root {
     pub history: [u8; 32],
     pub verification_key: [u8; 32],
+    pub admission_key: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +250,8 @@ impl State {
                 if root.is_nil()
                     || enrollment.history == [0; 32]
                     || enrollment.verification_key == [0; 32]
+                    || enrollment.admission_key == [0; 32]
+                    || enrollment.admission_key == enrollment.verification_key
                 {
                     return Err(conflict("A root needs an exact history and custody signer"));
                 }
@@ -312,11 +315,35 @@ impl State {
                     },
                 );
             }
+            Action::AdmitWorker {
+                generation,
+                id,
+                duty,
+                signature,
+            } => {
+                let enrollment = self
+                    .roots
+                    .get(&duty.root)
+                    .ok_or_else(|| conflict("The worker is outside the custody membership"))?;
+                verify(
+                    enrollment.admission_key,
+                    &admission_bytes(self.domain, *generation, *id, *duty)?,
+                    signature,
+                )?;
+                self.apply(&Action::Admit {
+                    generation: *generation,
+                    id: *id,
+                    duty: *duty,
+                })?;
+            }
             Action::Join {
                 generation,
                 id,
                 join,
             } => {
+                if *generation < self.generation {
+                    return Ok(());
+                }
                 if self.generation != *generation || join.observation == [0; 32] {
                     return Err(conflict("The drain observation belongs to different work"));
                 }
@@ -479,6 +506,12 @@ pub enum Action {
         id: Uuid,
         duty: Duty,
     },
+    AdmitWorker {
+        generation: u64,
+        id: Uuid,
+        duty: Duty,
+        signature: Vec<u8>,
+    },
     Join {
         generation: u64,
         id: Uuid,
@@ -554,6 +587,18 @@ pub fn sql_target(
     fingerprint(
         b"rtdb.custody/sql-erasure-target/v1\0",
         &(placement, transaction, position),
+    )
+}
+
+pub(crate) fn admission_bytes(
+    domain: Uuid,
+    generation: u64,
+    id: Uuid,
+    duty: Duty,
+) -> Result<Vec<u8>> {
+    statement(
+        b"rtdb.custody/work-admission/v1\0",
+        &(domain, generation, id, duty),
     )
 }
 
@@ -683,11 +728,14 @@ mod tests {
         let mut state = State::new(Uuid::new_v4());
         let signer = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
         let verification_key = signer.public_key().as_ref().try_into().unwrap();
+        let admission = Ed25519KeyPair::from_seed_unchecked(&[16; 32]).unwrap();
+        let admission_key = admission.public_key().as_ref().try_into().unwrap();
         let first = Uuid::new_v4();
         let dependent = Uuid::new_v4();
         let enrollment = Root {
             history: [18; 32],
             verification_key,
+            admission_key,
         };
         for root in [first, dependent] {
             state
@@ -705,11 +753,13 @@ mod tests {
             verification_key,
         };
         let id = Uuid::new_v4();
+        let statement = admission_bytes(state.domain, 1, id, duty).unwrap();
         state
-            .apply(&Action::Admit {
+            .apply(&Action::AdmitWorker {
                 generation: 1,
                 id,
                 duty,
+                signature: admission.sign(&statement).as_ref().to_vec(),
             })
             .unwrap();
         state

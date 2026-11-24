@@ -117,6 +117,10 @@ It builds the successor from the protected snapshot store.
 The ordered erasure preparation keeps that head stable across normal appends and grants.
 The placement coordinator submits its joined root witness to the broker and requires the completed domain drain before it arms key retirement.
 It binds the verified provider disposition to the same drain when reporting root completion.
+The broker checks installed query and copy registration signatures against each root's admission key.
+The originating process uses a separate signer for each work owner's terminal evidence.
+Query and transport custody follows the held catalog, and checkpoint copy custody follows the retained provider owner.
+A missing join remains pending, including after loss of its process.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
 The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring key inventory, custody work roster and latest destruction time.
 The fixed commitment binds both inventories and the deadline to the authenticated switch.

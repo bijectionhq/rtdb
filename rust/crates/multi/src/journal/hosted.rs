@@ -1,5 +1,6 @@
 //! Attachment of an installed journal to RTDB's database factories.
 
+mod custody_work;
 mod discovery;
 pub mod erasure;
 pub(crate) mod prefix_retirement;
@@ -47,6 +48,7 @@ struct Definition {
     deployment: DeploymentRecord,
     worker: InstalledRoute,
     custody: Option<InstalledRoute>,
+    custody_work: Option<custody_work::Installation>,
     archive: crate::deployment::CellStorage,
     archive_prefix: String,
     journal_window_bytes: Option<u64>,
@@ -70,6 +72,7 @@ pub(crate) struct Placement {
     pub record: DeploymentRecord,
     pub worker: Arc<InstalledJournal>,
     pub custodian: Option<Arc<InstalledJournal>>,
+    custody_work: Option<custody_work::WorkOwner>,
     archive: crate::deployment::CellStorage,
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
@@ -183,7 +186,7 @@ pub(crate) fn reader_attachment(value: &Any) -> Result<Option<(ordered_logkeeper
 }
 
 impl Routes {
-    pub(crate) fn read(path: &Path, serving: &crate::deployment::CellStorage) -> Result<Self> {
+    pub(crate) fn read(path: &Path, serving: &crate::deployment::CellStorage, broker: Option<&crate::replay_broker::Client>) -> Result<Self> {
         let entries: Vec<Definition> = read_manifest(path)?;
         let mut routes = BTreeMap::new();
         for entry in entries {
@@ -238,6 +241,10 @@ impl Routes {
                     "The installed journal window size must be positive",
                 ));
             }
+            let custody_work = entry.custody_work.map(|installation| {
+                let broker = broker.cloned().ok_or_else(|| invalid("The installed custody domain needs its broker route"))?;
+                custody_work::WorkOwner::open(installation, broker, worker.placement())
+            }).transpose()?;
             let placement = Arc::new(Placement {
                 record: entry.deployment,
                 worker,
@@ -245,6 +252,7 @@ impl Routes {
                 archive: entry.archive,
                 archive_prefix: ObjectKey::new(entry.archive_prefix)?,
                 journal_window_bytes: entry.journal_window_bytes,
+                custody_work,
                 nomination: Default::default(),
                 worker_disposal: Default::default(),
                 reader_opening: Default::default(),
@@ -376,6 +384,9 @@ impl Placement {
         let custodian = self.custodian.as_ref().ok_or_else(|| invalid("This placement has no erasure custodian"))?;
         let placement = custodian.placement();
         let operation = request.operation;
+        if self.custody_work.as_ref().map(custody_work::WorkOwner::domain) != Some(operation.domain) {
+            return Err(invalid("The selected SQL writer is outside the installed custody domain"));
+        }
         if domain::sql_target(placement, request.transaction, request.position)? != operation.target {
             return Err(invalid("The SQL erasure marker differs from the broker's target"));
         }
@@ -425,6 +436,13 @@ impl Placement {
             incumbent: admission.grant, timing: erasure::ErasureTiming::OperationalTarget,
         }, request.rotation, reservation, &selection, cancellation).await?;
         Ok(staged.checkpoint)
+    }
+
+    async fn hold_query_custody(&self, tasks: &TaskTracker) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(owner) = &self.custody_work else { return Ok(None); };
+        let plaintext = owner.hold(erasure::CustodyWork::Plaintext, tasks).await?;
+        let egress = owner.hold(erasure::CustodyWork::Egress, tasks).await?;
+        Ok(Some(Arc::new((plaintext, egress))))
     }
 
     /// Replenish only bytes the installed voters have already paid for. The
@@ -630,7 +648,11 @@ impl Placement {
         if held.scope().checkpoint != checkpoint {
             return Err(invalid("The ordered copy hold selected a different checkpoint"));
         }
-        let mut work = std::pin::pin!(IoRegion::retaining(Arc::clone(&held), work));
+        let custody = match &self.custody_work {
+            Some(custody) => Some(custody.hold(erasure::CustodyWork::Copy, releases).await?),
+            None => None,
+        };
+        let mut work = std::pin::pin!(IoRegion::retaining(Arc::new((Arc::clone(&held), custody)), work));
         loop {
             let sent = std::time::Instant::now();
             let length = self.worker.read_lease(held.scope(), route.writer.epoch).await?;

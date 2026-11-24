@@ -601,7 +601,7 @@ impl ObjectStore for ServingStore {
         _paths: Option<Arc<[String]>>,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
         let source = self.snapshot.as_ref().ok_or_else(|| invalid("This serving store has no snapshot owner"))?;
-        source.retain(cut, base).await.map(|hold| Some(hold as Arc<dyn Send + Sync>))
+        source.retain(cut, base).await.map(Some)
     }
 
     async fn replica_publication_address(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<(rtdb_types::S3ObjectNamespace, String)>> {

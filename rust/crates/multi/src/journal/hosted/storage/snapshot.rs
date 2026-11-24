@@ -10,7 +10,8 @@ pub(super) struct Source {
 impl Source {
     pub(super) async fn retain(
         &self, cut: rtdb_types::CatalogCut, base: rtdb_types::CatalogCheckpoint,
-    ) -> Result<Arc<crate::journal::Held>> {
+    ) -> Result<Arc<dyn Send + Sync>> {
+        let custody = self.placement.hold_query_custody(&self.tasks).await?;
         let journal = &self.placement.worker;
         let epoch = journal.log_epoch();
         let genesis = ReplicaPosition::from_epoch_offset(epoch, -1)?;
@@ -36,7 +37,7 @@ impl Source {
         {
             return Err(invalid("The protected catalog has a different checkpoint or suffix"));
         }
-        Ok(held)
+        Ok(Arc::new((held, custody)))
     }
 
     pub(super) async fn open(
@@ -63,7 +64,10 @@ impl Source {
             })).await?;
             Some(opened.store)
         };
-        Ok(Arc::new(SnapshotStore { checkpoint, objects, files, scope, allocation }))
+        Ok(Arc::new(SnapshotStore {
+            checkpoint, objects, files, scope, allocation,
+            placement: Arc::clone(&self.placement), tasks: self.tasks.clone(),
+        }))
     }
 }
 
@@ -74,6 +78,8 @@ struct SnapshotStore {
     files: Arc<crate::journal::log::SnapshotFiles>,
     scope: ReaderScope,
     allocation: Arc<dyn ObjectStore>,
+    placement: Arc<super::super::Placement>,
+    tasks: tokio_util::task::TaskTracker,
 }
 
 impl SnapshotStore {
@@ -117,8 +123,9 @@ impl ObjectStore for SnapshotStore {
     }
 
     async fn retain_catalog(&self, _cut: Option<rtdb_types::CatalogCut>) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let custody = self.placement.hold_query_custody(&self.tasks).await?;
         self.scope.serving().await?;
-        Ok(Some(Arc::clone(&self.files) as Arc<dyn Send + Sync>))
+        Ok(Some(Arc::new((Arc::clone(&self.files), custody))))
     }
 
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {

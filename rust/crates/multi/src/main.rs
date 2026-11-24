@@ -349,7 +349,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         let report = MultiBuildInfo {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
-            hosted_protocol: if cfg!(feature = "s3-key-vault") { 179 } else { 40 },
+            hosted_protocol: if cfg!(feature = "s3-key-vault") { 180 } else { 41 },
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,

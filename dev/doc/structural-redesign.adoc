@@ -272,7 +272,9 @@ SQL declarations persist separately from inferred row types in replica transacti
 Protected replay extracts the committed erase effects and authenticates their exact selected head. SQL staging rebuilds the selected placement’s primary survivor closure from live and persisted events and keeps derivatives out of the staged checkpoint until they rebuild. The installed SQL writer can initiate exact-head staging from a broker-selected committed erase marker.
 Logkeeper fences appends and normal grants while that erasure preparation owns the head.
 The coordinator requires the broker's signed domain drain before enabling provider retirement.
-Production processing still needs dependent-root survivor staging, live SQL and egress participation in the signed roster, and an installed adapter that signs the domain and provider evidence.
+An enrolled installed worker registers signed plaintext and egress duties with its catalog hold and registers checkpoint copies before reading.
+The process signs the join after the last retained view, delivery, or provider operation releases the duty.
+Production processing still needs dependent-root survivor staging, complete runtime enrollment, and an installed adapter that signs and submits root and provider evidence.
 
 |8
 |Transaction metadata retention.

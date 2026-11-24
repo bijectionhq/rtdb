@@ -70,7 +70,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         return Err(Anomaly::incorrect("rtdb.multi/ordered-worker", "Installed journal workers require a cell route credential"));
     }
     let ordered = Arc::new(match &settings.agent.installed_journal_manifest {
-        Some(path) => crate::journal::hosted::Routes::read(path, &settings.agent.storage)?,
+        Some(path) => crate::journal::hosted::Routes::read(path, &settings.agent.storage, settings.agent.replay_broker.as_ref())?,
         None => crate::journal::hosted::Routes::default(),
     });
     ordered.reserve_deployments(directory.as_ref()).await?;
