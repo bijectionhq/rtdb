@@ -68,7 +68,11 @@ Its scope includes every recoverable capability and affected recoverable derivat
 Only an installed original authority with bounded scheduling, drain, provider work and recovery can offer the profile.
 
 [AssertionBackup](../../rust/crates/multi/src/keys/assertion.rs) defines the passive Option 2 backup entry.
-RTAB version 1 carries the original stage identity and sealed assertion envelope. Restore matches the stage from authenticated placement, then uses the original current authority for an open.
+RTAB version 1 carries the original stage identity and sealed assertion envelope.
+RTAS version 2 authenticates the original realm and incarnation, receiver assertion ID, one-use stage, admitted scope commitment and codec.
+The local and S3 brokers persist the exact first frame with the current capability and return it on an exact staging retry.
+Restore takes the stage from authenticated placement.
+Accepted-history opening requires current custody and an independently certified placement.
 The vault and its tombstones are outside the backup. A file-system snapshot of the local broker is outside the admitted fixed profile.
 Raw deployment-key transfer cannot install an assertion stage. Restoring a passive record cannot create or rewrite a capability.
 

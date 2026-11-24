@@ -9,10 +9,12 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use uuid::Uuid;
 
 use super::{
-    ArchiveKey, ArchiveKeyWithdrawal, AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
+    ArchiveKey, ArchiveKeyWithdrawal, AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DELETION_SIGNING_KEY_ID, KEY_BYTES,
     KeyService, NAMESPACE_KEY_ID, UnitOperation, UnitOutput, UnitScope, UnitSlot, malformed, new_key,
     require_matching_key, journal::key_error, unit::{self, OPERATION_LIMIT},
 };
+
+use super::assertion::{MAX_CAPABILITY_BYTES, StagedCapability, stage_used};
 
 mod assertion_deadline;
 mod captures;
@@ -153,6 +155,22 @@ impl S3KeyService {
         }
     }
 
+    async fn withdraw_current_object(&self, path: &str, maximum: usize) -> Result<()> {
+        for _ in 0..4 {
+            let current = self.read_vault_object(path, maximum).await?;
+            let condition = match &current {
+                None => Precondition::Absent,
+                Some((record, _)) if record.is_empty() => return self.require_never_versioned().await,
+                Some((_, etag)) => Precondition::Matches(etag),
+            };
+            self.put(path, &[], condition).await?;
+        }
+        match self.read_vault_object(path, maximum).await? {
+            Some((record, _)) if record.is_empty() => self.require_never_versioned().await,
+            _ => Err(unavailable("confirm assertion withdrawal")),
+        }
+    }
+
     async fn withdraw_current(&self, path: &str) -> Result<()> {
         for _ in 0..4 {
             let current = self.current(path).await?;
@@ -265,42 +283,52 @@ impl KeyService for S3KeyService {
 #[async_trait::async_trait]
 impl AssertionKeyService for S3KeyService {
     async fn seal_assertion_stage(
-        &self, stage: AssertionStage, _region: &Arc<IoRegion>, plaintext: Bytes,
+        &self, stage: AssertionStage, authoring: AssertionAuthoring, _region: &Arc<IoRegion>,
+        plaintext: Bytes,
     ) -> Result<AssertionEnvelope> {
         self.require_never_versioned().await?;
-        let key = new_key()?;
-        let envelope = AssertionEnvelope::seal(stage, &key, &plaintext)?;
-        drop(plaintext);
         let path = assertion_path(stage);
-        if self.put(&path, &key, Precondition::Absent).await? {
-            return Ok(envelope);
+        if let Some((record, _)) = self.read_vault_object(&path, MAX_CAPABILITY_BYTES).await? {
+            return retry_assertion_stage(record, stage, authoring, &plaintext);
         }
-        match self.current(&path).await? {
-            Current::Live { .. } | Current::Withdrawn => Err(Anomaly::new(
-                AnomalyCategory::Conflict, "rtdb.multi/assertion-stage-used",
-                "This assertion stage already has a custody entry",
-            )),
-            Current::Absent => Err(unavailable("confirm assertion staging")),
+
+        let capability = StagedCapability::create(stage, authoring, &plaintext)?;
+        if self.put(&path, capability.bytes(), Precondition::Absent).await? {
+            return Ok(capability.envelope());
         }
+        let (record, _) = self.read_vault_object(&path, MAX_CAPABILITY_BYTES).await?
+            .ok_or_else(|| unavailable("confirm assertion staging"))?;
+        retry_assertion_stage(record, stage, authoring, &plaintext)
     }
 
-    async fn open_assertion_stage(
-        &self, stage: AssertionStage, _region: &Arc<IoRegion>, envelope: AssertionEnvelope,
+    async fn open_assertion_for_resolution(
+        &self, stage: AssertionStage, authoring: AssertionAuthoring, _region: &Arc<IoRegion>,
+        envelope: AssertionEnvelope,
     ) -> Result<Bytes> {
         self.require_never_versioned().await?;
-        match self.current(&assertion_path(stage)).await? {
-            Current::Live { key, .. } => envelope.open(stage, &key),
-            Current::Withdrawn => Err(Error::ErasedUnderView.into()),
-            Current::Absent => Err(unavailable("read assertion wrapping capability")),
+        let (record, _) = self.read_vault_object(&assertion_path(stage), MAX_CAPABILITY_BYTES).await?
+            .ok_or_else(|| unavailable("read assertion wrapping capability"))?;
+        if record.is_empty() {
+            return Err(Error::ErasedUnderView.into());
         }
+        StagedCapability::read(record)?.open(stage, authoring, envelope)
     }
 
     async fn retire_assertion_stage(
         &self, stage: AssertionStage, _region: &Arc<IoRegion>,
     ) -> Result<()> {
         self.require_never_versioned().await?;
-        self.withdraw_current(&assertion_path(stage)).await
+        self.withdraw_current_object(&assertion_path(stage), MAX_CAPABILITY_BYTES).await
     }
+}
+
+fn retry_assertion_stage(
+    record: Bytes, stage: AssertionStage, authoring: AssertionAuthoring, plaintext: &[u8],
+) -> Result<AssertionEnvelope> {
+    if record.is_empty() {
+        return Err(stage_used());
+    }
+    StagedCapability::read(record)?.retry(stage, authoring, plaintext)
 }
 
 fn assertion_path(stage: AssertionStage) -> String {
@@ -483,13 +511,14 @@ mod transport_tests {
     const ENCRYPTED: &str = "x-amz-server-side-encryption: AES256\r\nETag: \"tag\"\r\n";
     const ASSERTION_PATH: &str = "/assertion-capabilities/assertion-stage-00000000-0000-0000-0000-00000000abcd-17-00000000-0000-0000-0000-000000001234";
 
+    #[derive(Clone)]
     struct Exchange {
         method: &'static str,
         request_header: &'static str,
         path: Option<&'static str>,
         status: &'static str,
         response_headers: &'static str,
-        body: &'static [u8],
+        body: std::borrow::Cow<'static, [u8]>,
     }
 
     async fn mock_s3(exchanges: Vec<Exchange>) -> (S3KeyService, JoinHandle<()>) {
@@ -546,7 +575,7 @@ mod transport_tests {
                     exchange.response_headers,
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
-                stream.write_all(exchange.body).await.unwrap();
+                stream.write_all(&exchange.body).await.unwrap();
             }
         });
         let config = aws_sdk_s3::Config::builder()
@@ -575,7 +604,7 @@ mod transport_tests {
             path: None,
             status,
             response_headers: "",
-            body,
+            body: body.into(),
         }
     }
 
@@ -648,13 +677,25 @@ mod transport_tests {
 
     #[tokio::test]
     async fn assertion_capabilities_have_a_separate_conditional_withdrawal_route() {
+        let stage = AssertionStage::new(
+            "00000000-0000-0000-0000-00000000abcd".parse().unwrap(),
+            std::num::NonZeroU64::new(17).unwrap(),
+            "00000000-0000-0000-0000-000000001234".parse().unwrap(),
+        ).unwrap();
+        let authoring = AssertionAuthoring { assertion_id: rtdb_types::AssertionId::from_bytes([4; 32]), scope_commitment: [5; 32], codec: 6 };
+        let plaintext = Bytes::from_static(b"retained assertion");
+        let capability = StagedCapability::create(stage, authoring, &plaintext).unwrap();
+        let live = Exchange { body: capability.bytes().to_vec().into(), ..get(b"") };
+        let envelope = capability.envelope();
         let version = || exchange("VERSION", "200 OK", NEVER_VERSIONED);
         let assertion = |exchange| Exchange { path: Some(ASSERTION_PATH), ..exchange };
         let (vault, service) = mock_s3(vec![
             version(),
-            assertion(get(LIVE)),
+            assertion(live.clone()),
             version(),
-            assertion(get(LIVE)),
+            assertion(live.clone()),
+            version(),
+            assertion(live),
             assertion(Exchange {
                 request_header: "if-match: \"tag\"",
                 ..exchange("PUT", "200 OK", b"")
@@ -664,33 +705,26 @@ mod transport_tests {
             version(),
             assertion(get(b"")),
             version(),
-            assertion(Exchange {
-                request_header: "if-none-match: *",
-                ..exchange(
-                    "PUT", "412 Precondition Failed",
-                    b"<Error><Code>PreconditionFailed</Code></Error>",
-                )
-            }),
             assertion(get(b"")),
         ]).await;
-        let stage = AssertionStage::new(
-            "00000000-0000-0000-0000-00000000abcd".parse().unwrap(),
-            std::num::NonZeroU64::new(17).unwrap(),
-            "00000000-0000-0000-0000-000000001234".parse().unwrap(),
-        ).unwrap();
         assert!(vault.existing_key(&stage.key_id()).await.is_err());
         let authority = vault.assertion_keys().unwrap();
         let region = IoRegion::new();
-        let plaintext = Bytes::from_static(b"retained assertion");
-        let envelope = AssertionEnvelope::seal(stage, LIVE, &plaintext).unwrap();
-        assert_eq!(authority.open_assertion_stage(stage, &region, envelope.clone()).await.unwrap(), plaintext);
+        assert_eq!(
+            authority.seal_assertion_stage(stage, authoring, &region, plaintext.clone()).await.unwrap(),
+            envelope,
+        );
+        assert_eq!(
+            authority.open_assertion_for_resolution(stage, authoring, &region, envelope.clone()).await.unwrap(),
+            plaintext,
+        );
         authority.retire_assertion_stage(stage, &region).await.unwrap();
         assert_eq!(
-            authority.open_assertion_stage(stage, &region, envelope).await.unwrap_err().code,
+            authority.open_assertion_for_resolution(stage, authoring, &region, envelope).await.unwrap_err().code,
             "rtdb/erased-under-view",
         );
         assert_eq!(
-            authority.seal_assertion_stage(stage, &region, plaintext).await.unwrap_err().code,
+            authority.seal_assertion_stage(stage, authoring, &region, plaintext).await.unwrap_err().code,
             "rtdb.multi/assertion-stage-used",
         );
         service.await.unwrap();
