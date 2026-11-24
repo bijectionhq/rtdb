@@ -1,7 +1,7 @@
-use rtdb_node::OwnedChangeEdge;
 use std::{future::Future, pin::Pin, time::Duration};
 
-use rtdb_node::{NodeOptions, OwnedCountRequest, OwnedKeyBound, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
+use rtdb_flight_sql::FrozenWorldWinner;
+use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
 use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
 use tokio::sync::{mpsc, oneshot};
@@ -359,7 +359,7 @@ impl ClockCut {
 }
 
 enum AncestorRead {
-    Point { id: EntityId, valid: Interval },
+    Point { id: EntityId, valid: Interval, prove_winner: bool },
     Changes { after: OwnedChangeEdge, through: OwnedChangeEdge, limit: usize, reverse: bool },
     Clock(ClockCut),
     SelectClock(Timestamp),
@@ -380,7 +380,7 @@ enum AncestorRead {
 }
 
 enum AncestorResult {
-    Point(Option<WorldFact>, bool),
+    Point(Option<WorldFact>, bool, Option<FrozenWorldWinner>),
     Changes(rtdb_node::OwnedMergedChanges),
     Clock(rtdb_query::ArchivedHeldClock),
     SelectedClock(Option<(TransactionKey, Timestamp)>),
@@ -872,30 +872,34 @@ impl HeldCheckpointWorld {
     pub async fn accepted_point(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp,
         system: Timestamp, original_scope: Option<PlacedAttemptScope>,
-    ) -> Result<(Option<WorldFact>, bool)> {
+    ) -> Result<(Option<WorldFact>, bool, Option<FrozenWorldWinner>)> {
         if self.uses_frozen_overlay(Some(system)) {
             let protected = relation.name() == "fact_unit_column_payloads";
-            if protected {
-                let schema = self.world_point_schema(relation)?;
-                if !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
+            let schema = self.world_point_schema(relation)?;
+            if protected && !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
+            let prove_winner = protected || (original_scope.is_some() && schema.has_world_assertion_journal()
+                && matches!(id, EntityId::String(key) if key.starts_with("row-position/row/")));
+            if prove_winner {
                 let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
                 self.require_original_carrier_scope(&witness, original_scope).await?;
                 self.archived_accepted_clock(std::slice::from_ref(relation), ClockCut::System(system)).await?;
             }
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::Point {
-                id: id.clone(), valid: Interval::at(valid)?,
+                id: id.clone(), valid: Interval::at(valid)?, prove_winner,
             }, Some(system)).await?;
-            let AncestorResult::Point(fact, shadowed) = result else { return Err(OwnedWorld::unavailable()); };
-            if protected && shadowed {
-                let fact = fact.as_ref().ok_or_else(OwnedWorld::unavailable)?;
-                let layer = self.open.record.ancestor_at_system(fact.revision).ok_or_else(OwnedWorld::unavailable)?;
-                if fact.assertion.is_none_or(|assertion|
-                    assertion.line != Some(Iid(layer.world)) || assertion.held_reading.is_none())
+            let AncestorResult::Point(fact, shadowed, winner) = result else { return Err(OwnedWorld::unavailable()); };
+            if prove_winner && shadowed {
+                let winner = winner.ok_or_else(OwnedWorld::unavailable)?;
+                let layer = self.open.record.ancestor_at_system(winner.publication.system_time)
+                    .ok_or_else(OwnedWorld::unavailable)?;
+                if winner.author.0 != layer.world || (protected && fact.as_ref().is_some_and(|fact|
+                    fact.assertion.is_none_or(|assertion| assertion.line != Some(winner.author)
+                        || assertion.held_reading != Some(winner.reading))))
                 {
                     return Err(OwnedWorld::unavailable());
                 }
             }
-            return Ok((fact, shadowed));
+            return Ok((fact, shadowed, winner));
         }
         self.check_relation(relation)?;
         let schema = self.world_point_schema(relation)?;
@@ -903,7 +907,8 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         self.require_archive_coverage(vec![(relation.clone(), 0)], guard).await?;
         self.open.snapshot.check_point_purge_floor(relation, id, self.parent_basis().system_time).await?;
-        self.point_at_accepted_cut(relation, id, valid, &cut, schema).await
+        let (fact, shadowed) = self.point_at_accepted_cut(relation, id, valid, &cut, schema).await?;
+        Ok((fact, shadowed, None))
     }
 
     async fn require_original_carrier_scope(
@@ -980,9 +985,9 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, observed: bool,
     ) -> Result<WorldPoint> {
         let (result, witness) = self.read_ancestor(relation, AncestorRead::Point {
-            id: id.clone(), valid: Interval::at(valid)?,
+            id: id.clone(), valid: Interval::at(valid)?, prove_winner: false,
         }).await?;
-        let AncestorResult::Point(fact, shadowed) = result else { return Err(OwnedWorld::unavailable()); };
+        let AncestorResult::Point(fact, shadowed, _) = result else { return Err(OwnedWorld::unavailable()); };
         Ok(WorldPoint { present: self.present(), fact, until: None, shadowed, witness: observed.then_some(witness) })
     }
 
@@ -2077,6 +2082,12 @@ impl<'a> InheritedRelation<'a> {
     }
 
     async fn shadow(&self, id: &EntityId, valid: Interval) -> Result<Option<Option<WorldFact>>> {
+        Ok(self.shadow_with_winner(id, valid, false).await?.map(|(fact, _)| fact))
+    }
+
+    async fn shadow_with_winner(
+        &self, id: &EntityId, valid: Interval, prove_winner: bool,
+    ) -> Result<Option<(Option<WorldFact>, Option<FrozenWorldWinner>)>> {
         let unavailable = OwnedWorld::unavailable;
         let mut shadow = None;
         if let Some(mut rows) = rtdb_query::open_owned_assertion_point(
@@ -2085,23 +2096,30 @@ impl<'a> InheritedRelation<'a> {
             while let Some(batch) = rows.next_batch().await? {
                 if batch.batch().num_rows() == 0 { continue; }
                 if shadow.is_some() { return Err(unavailable()); }
-                shadow = decode_point(vec![batch], id, self.memory, None)?;
+                let position = prove_winner.then(|| rtdb_query::owned_row_event_position(batch.batch(), 0)).transpose()?;
+                shadow = decode_point(vec![batch], id, self.memory, None)?.map(|fact| (fact, position));
             }
         }
         self.overlay.check_cancelled()?;
-        if let Some(shadow) = shadow {
-            if shadow.revision > self.overlay_basis { return Err(unavailable()); }
-            let mut fact = shadow.into_shadow(self.world)?;
-            if let Some(fact) = &mut fact {
-                fact.validate(self.schema)?;
-                if let Some(assertion) = &mut fact.assertion {
-                    let (_, reading) = self.accepted_group(fact.revision).await?;
-                    assertion.held_reading = Some(reading);
-                }
+        let Some((shadow, position)) = shadow else { return Ok(None); };
+        let revision = shadow.revision;
+        if revision > self.overlay_basis { return Err(unavailable()); }
+        // Validate the physical shadow marker even when it projects to a negative.
+        let mut fact = shadow.into_shadow(self.world)?;
+        if let Some(fact) = &fact { fact.validate(self.schema)?; }
+        let assertion = fact.as_mut().and_then(|fact| fact.assertion.as_mut());
+        let mut winner = None;
+        if position.is_some() || assertion.is_some() {
+            let (_, publication, reading) = self.accepted_group(revision).await?;
+            if let Some(assertion) = assertion { assertion.held_reading = Some(reading); }
+            if let Some(position) = position {
+                if position.transaction != publication.tx_id { return Err(unavailable()); }
+                winner = Some(FrozenWorldWinner {
+                    author: self.world, publication, event_ordinal: position.ordinal, reading,
+                });
             }
-            return Ok(Some(fact));
         }
-        Ok(None)
+        Ok(Some((fact, winner)))
     }
 
     async fn point(&self, id: &EntityId, valid: Interval) -> Result<Option<WorldFact>> {
@@ -2109,8 +2127,15 @@ impl<'a> InheritedRelation<'a> {
     }
 
     async fn resolve(&self, id: &EntityId, valid: Interval) -> Result<(Option<WorldFact>, bool)> {
-        if let Some(shadow) = self.resolve_shadow(id, valid).await? {
-            return Ok((shadow, true));
+        let (fact, shadowed, _) = self.resolve_with_winner(id, valid, false).await?;
+        Ok((fact, shadowed))
+    }
+
+    async fn resolve_with_winner(
+        &self, id: &EntityId, valid: Interval, prove_winner: bool,
+    ) -> Result<(Option<WorldFact>, bool, Option<FrozenWorldWinner>)> {
+        if let Some((fact, winner)) = self.resolve_shadow_with_winner(id, valid, prove_winner).await? {
+            return Ok((fact, true, winner));
         }
         let unavailable = OwnedWorld::unavailable;
         let batches = read_checkpoint_point_in_context(Arc::clone(&self.root), CheckpointPoint {
@@ -2122,12 +2147,18 @@ impl<'a> InheritedRelation<'a> {
             fact.validate(self.schema)?;
         }
         self.root.check_cancelled()?;
-        Ok((fact, false))
+        Ok((fact, false, None))
     }
 
     async fn resolve_shadow(&self, id: &EntityId, valid: Interval) -> Result<Option<Option<WorldFact>>> {
+        Ok(self.resolve_shadow_with_winner(id, valid, false).await?.map(|(fact, _)| fact))
+    }
+
+    async fn resolve_shadow_with_winner(
+        &self, id: &EntityId, valid: Interval, prove_winner: bool,
+    ) -> Result<Option<(Option<WorldFact>, Option<FrozenWorldWinner>)>> {
         for writer in self.writers() {
-            if let Some(shadow) = writer.shadow(id, valid).await? { return Ok(Some(shadow)); }
+            if let Some(shadow) = writer.shadow_with_winner(id, valid, prove_winner).await? { return Ok(Some(shadow)); }
         }
         Ok(None)
     }
@@ -2215,7 +2246,7 @@ impl<'a> InheritedRelation<'a> {
         {
             return Err(unavailable());
         }
-        let (at, clock) = self.accepted_group(group).await?;
+        let (at, _, clock) = self.accepted_group(group).await?;
         self.overlay = at;
         self.overlay_basis = group;
         let boundaries = self.boundaries(id, Interval::ALL).await?;
@@ -2244,7 +2275,7 @@ impl<'a> InheritedRelation<'a> {
         Ok(None)
     }
 
-    async fn accepted_group(&self, group: Timestamp) -> Result<(Arc<rtdb_query::QueryContext>, Timestamp)> {
+    async fn accepted_group(&self, group: Timestamp) -> Result<(Arc<rtdb_query::QueryContext>, TransactionKey, Timestamp)> {
         let unavailable = OwnedWorld::unavailable;
         if group <= self.floor || group > self.overlay_basis {
             return Err(unavailable());
@@ -2253,7 +2284,7 @@ impl<'a> InheritedRelation<'a> {
         let (clock, publication) = rtdb_query::read_owned_world_clock_publication(Arc::clone(&at), self.owner, self.world)
             .await?.filter(|(clock, revision)| revision.system_time == group && *clock > self.initial_clock)
             .ok_or_else(unavailable)?;
-        Ok((at.with_owned_transaction_cut(publication, &at.cancellation)?, clock))
+        Ok((at.with_owned_transaction_cut(publication, &at.cancellation)?, publication, clock))
     }
 
     async fn at(mut self, selected: Option<Timestamp>) -> Result<Self> {
@@ -2271,7 +2302,7 @@ impl<'a> InheritedRelation<'a> {
     ) -> Result<[(Option<WorldFact>, bool); 2]> {
         let unavailable = OwnedWorld::unavailable;
         self = self.cut_at(group)?;
-        let (accepted, clock) = self.accepted_group(group).await?;
+        let (accepted, _, clock) = self.accepted_group(group).await?;
         if clock != valid { return Err(unavailable()); }
         let before = Timestamp(group.0.checked_sub(1).ok_or_else(unavailable)?);
         let columns = rtdb_node::archived_path_touch_at_cut(
@@ -2758,9 +2789,9 @@ pub(crate) async fn open_held_checkpoint_world(
                                                     let inherited = InheritedRelation::open(root, overlays, owner, relation, ancestors, schema, memory)
                                                         .await?.at(selected).await?;
                                                     match read {
-                                                        AncestorRead::Point { id, valid } => {
-                                                            let (fact, shadowed) = inherited.resolve(&id, valid).await?;
-                                                            Ok(AncestorResult::Point(fact, shadowed))
+                                                        AncestorRead::Point { id, valid, prove_winner } => {
+                                                            let (fact, shadowed, winner) = inherited.resolve_with_winner(&id, valid, prove_winner).await?;
+                                                            Ok(AncestorResult::Point(fact, shadowed, winner))
                                                         },
                                                         AncestorRead::Changes { after, through, limit, reverse } =>
                                                             Ok(AncestorResult::Changes(inherited.changes(after, through, limit, reverse).await?)),

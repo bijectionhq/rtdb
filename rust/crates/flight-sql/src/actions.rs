@@ -421,7 +421,7 @@ impl Service {
                     return self.held_world_point_at(&call, &action.body, true, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal).await?)]),
                 crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal).await?)]),
-                crate::owned_actions::HELD_WORLD_POINT_AT_V1 =>
+                crate::owned_actions::HELD_WORLD_POINT_AT_V2 =>
                     return self.held_world_point_at(&call, &action.body, false, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_POINT_V2 =>
                     return self.held_world_point(&call, &action.body, reply_format).await.map(ActionReplies::Owned),

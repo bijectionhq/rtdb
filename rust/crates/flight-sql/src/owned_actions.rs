@@ -332,7 +332,7 @@ pub(crate) enum WorldCutSelection { ExactLocal, AsOfLocal, AsOfParent }
 
 pub(crate) const SELECT_HELD_WORLD_AS_OF_V2: &str = "rtdb.owned.SelectHeldWorldAsOf.v2";
 pub(crate) const HELD_WORLD_AT_PREFLIGHT_V2: &str = "rtdb.owned.PreflightHeldWorldAt.v2";
-pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
+pub(crate) const HELD_WORLD_POINT_AT_V2: &str = "rtdb.owned.ReadHeldWorldPointAt.v2";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
 pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V5: &str = "rtdb.owned.PublishHeldWorldRetention.v5";
@@ -4806,6 +4806,10 @@ impl Service {
         let original_scope = if (parent || frozen) && relation.name() == "fact_unit_column_payloads" {
             if !self.supports_hosted_upload(call) { return Err(unsupported()); }
             Some(self.hosted_control_scope(call).await?)
+        } else if !parent && frozen && self.supports_hosted_upload(call)
+            && matches!(&id, EntityId::String(key) if key.starts_with("row-position/row/"))
+        {
+            Some(self.hosted_control_scope(call).await?)
         } else {
             None
         };
@@ -5038,6 +5042,15 @@ impl Service {
         }
         if let Some(nonce) = nonce {
             metadata.insert(WORLD_POINT_WITNESS.into(), nonce.simple().to_string());
+        }
+        if let Some(winner) = result.frozen_winner {
+            let author = Uuid::from_bytes(winner.author.0).simple();
+            let system = winner.publication.system_time.0;
+            let transaction = winner.publication.tx_id.0;
+            let ordinal = winner.event_ordinal;
+            let reading = winner.reading.0;
+            metadata.insert("rtdb.owned.frozen_world_winner".into(),
+                format!("{author}{system:016x}{transaction:016x}{ordinal:016x}{reading:016x}"));
         }
         if let Some(row) = result.row {
             let crate::WorldPointRow { batch: row, revision, assertion, reservation: _retained } = row;

@@ -4,7 +4,7 @@ use arrow_array::{RecordBatch, cast::AsArray};
 use futures::future::BoxFuture;
 use rtdb_columnar::{ArrowCell, MemoryReservation};
 use rtdb_node::{OwnedChangeEdge, Database, NativeSession, Node, OwnedCountRequest, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, OwnedWorldWitness};
-use rtdb_types::{EntityId, Interval, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
+use rtdb_types::{EntityId, Iid, Interval, LogicalType, OwnedRelation, OwnedWorldAssertion, Result, ScalarType, StructFields, Timestamp, TransactionKey, Value, WorldClockMode};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -93,6 +93,16 @@ pub struct WorldPointResult {
     pub until: Option<Timestamp>,
     pub shadowed: bool,
     pub witness: Option<OwnedWorldWitness>,
+    pub frozen_winner: Option<FrozenWorldWinner>,
+}
+
+/// The original event and accepted Held reading of a frozen overlay winner.
+#[derive(Clone, Copy)]
+pub struct FrozenWorldWinner {
+    pub author: Iid,
+    pub publication: TransactionKey,
+    pub event_ordinal: u64,
+    pub reading: Timestamp,
 }
 
 pub struct WorldPointRow {
