@@ -63,6 +63,9 @@ pub(crate) async fn open(
     };
     let (mut serving, _) =
         NativeServing::open(authority, Arc::clone(store), checkpoint.as_ref(), false)?;
+    if serving.pending_erasure().is_some() {
+        return Err(erasure_recovery_required());
+    }
     if let Some(block) = block {
         serving.verify_checkpoint_prefix(block)?;
     }
@@ -108,10 +111,7 @@ pub(crate) fn apply(
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<AppliedDecision>> {
     if ErasureRetirement::decode(message)?.is_some() {
-        return Err(Anomaly::unsupported(
-            "rtdb/default-erasure-retained-replay",
-            "Retained replay requires the Default erasure recovery fence",
-        ));
+        return Err(erasure_recovery_required());
     }
     let Some(serving) = serving else {
         require_physical_replay_support(message)?;
@@ -140,5 +140,15 @@ pub(crate) fn apply(
             Ok(())
         },
     )?;
+    if serving.pending_erasure().is_some() {
+        return Err(erasure_recovery_required());
+    }
     Ok(completion.map(|(source, _)| AppliedDecision { source, write }))
+}
+
+fn erasure_recovery_required() -> Anomaly {
+    Anomaly::unsupported(
+        "rtdb/default-erasure-retained-replay",
+        "Retained replay requires the Default erasure recovery fence",
+    )
 }

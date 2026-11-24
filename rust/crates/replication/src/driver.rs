@@ -1005,7 +1005,9 @@ impl ReplicationDriver {
         let cancellation = self.cancellation.child_token();
         // Reopen from the installed source position after adopting an inherited block
         // or settling a recovered timed original.
-        let source_tail = if self.pending_block.is_some() || self.waiting_for_checkpoint() || self.serving_holds_checkpoint() {
+        let source_tail = if self.pending_block.is_some() || self.waiting_for_checkpoint() || self.serving_holds_checkpoint()
+            || self.default_erasure.is_some()
+        {
             None
         } else {
             Some(self.logs.source_replay(progress.source_position).await?)
@@ -1346,7 +1348,9 @@ impl ReplicationDriver {
                 let tries = additions(&message.tries)?;
                 let selected = self.verify_default_erasure_upload(&catalog, &pending.boundary, &record).await?;
                 if let Some(selected) = selected {
+                    let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
                     self.partition.adopt_rewritten_block(pending.prepared.clone(), catalog, &table_blocks, record.metadata.timestamp)?;
+                    serving.adopt_erasure_generation(selected.generation);
                     self.default_erasure = Some(DefaultErasure::Selected(selected));
                 } else {
                     self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
@@ -2129,7 +2133,13 @@ impl ReplicationDriver {
     }
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        if !self.waiting_for_checkpoint() && self.leader.as_ref().is_some_and(LeaderState::accepting_commands) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
+        if self.default_erasure.is_none()
+            && !self.waiting_for_checkpoint()
+            && self.leader.as_ref().is_some_and(LeaderState::accepting_commands)
+            && self.flush_timer.should_flush((self.clock)(), persisted)
+        {
+            self.cut().await?;
+        }
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {

@@ -436,6 +436,14 @@ impl NativeServing {
         self.durable().pending_erasure_installation()
     }
 
+    pub(crate) fn adopt_erasure_generation(&self, generation: u64) {
+        self.view.send_modify(|view| {
+            view.key_generation = Some(generation);
+            view.floor = view.index.head().basis;
+            view.changes = Arc::default();
+        });
+    }
+
     pub(crate) fn source_ready(&self) -> bool {
         !self.holds_checkpoint() && self.pending.len() + self.pending_replies < MAX_IN_FLIGHT
     }

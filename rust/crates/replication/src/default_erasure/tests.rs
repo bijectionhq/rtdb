@@ -39,6 +39,7 @@ fn an_ordered_retirement_keeps_the_deadline_when_reopened() -> Result<()> {
             boundary: ReplicaPosition(42),
             root_sha256: Some([5; 32]),
         },
+        generation: 2,
         uploaded: Some(ReplicaPosition(43)),
     };
     let initial = ErasureRetirement::observe(selected, Timestamp(1000), 200)?;

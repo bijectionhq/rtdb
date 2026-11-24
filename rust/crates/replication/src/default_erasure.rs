@@ -63,6 +63,7 @@ pub(crate) struct RewriteEvidence {
 pub(crate) struct SelectedRewrite {
     pub evidence: RewriteEvidence,
     pub checkpoint: PublishedCheckpoint,
+    pub generation: u64,
     pub uploaded: Option<ReplicaPosition>,
 }
 
@@ -271,7 +272,8 @@ pub(crate) async fn recover_rewrite(
     {
         return Err(invalid());
     }
-    let selected = SelectedRewrite::from_catalog(evidence, catalog, logs)?;
+    let selected =
+        SelectedRewrite::from_catalog(evidence, opened.generation.number, catalog, logs)?;
     let (fold, position, shared) =
         serving::decode_checkpoint_image(image.bytes(), authority.incarnation)?;
     if !shared
@@ -299,6 +301,7 @@ pub(crate) async fn recover_rewrite(
 impl SelectedRewrite {
     pub fn from_catalog(
         evidence: RewriteEvidence,
+        generation: u64,
         catalog: &BlockCatalog,
         logs: &PartitionLogs,
     ) -> Result<Self> {
@@ -322,6 +325,7 @@ impl SelectedRewrite {
         Ok(Self {
             evidence,
             checkpoint,
+            generation,
             uploaded: None,
         })
     }
