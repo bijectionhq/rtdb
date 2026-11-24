@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, Lifecycle, ReplayCustody, StorageRegion};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::{CURRENT_STORAGE_VERSION, oversized_block_index, oversized_key}};
-use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, log::{ReplicaPayload, ReplicaPayloadReference}};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, log::{ReplicaPayload, ReplicaPayloadReference}};
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, PhysicalObjectVersion, Result, StorageEpoch};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
@@ -302,16 +302,20 @@ impl Service {
         };
         let mut attempted = false;
         let result = async {
-            let record = self.admit_read(history, ticket, position, region, &mut attempted).await?;
+            let record = Arc::new(self.admit_read(history, ticket, position, region, &mut attempted).await?);
             let io = IoRegion::new();
-            let read = async {
-                let payload = self.read_body(&record, position, frame, &reference, Arc::clone(&io), memory).await?;
+            let held = HeldView::recovery(Arc::new((record.clone(), region, position)));
+            let read = IoRegion::reading(held, async {
+                let (payload, sealed_frame) = self.read_body(&record, position, frame, &reference, Arc::clone(&io), memory).await?;
                 crate::residence_trace::record("read-retained-payload", || serde_json::json!({
                     "lineage": record.lineage, "installation": record.id, "incarnation": record.incarnation,
                     "revision": record.version, "stream": record.stream("replica"), "epoch": record.log_epoch,
                     "hold": region, "residence": residence(&record), "position": position,
                     "key": format!("{}/{}", residence(&record), reference.object()),
-                    "publication": reference.publication(),
+                    "publication": reference.publication(), "frame": sealed_frame,
+                    "source_hold": record.storage_regions.get(&ticket)
+                        .filter(|source| matches!(source, StorageRegion::ReplicaReplay { .. }))
+                        .map(|_| serde_json::json!({ "hold": ticket, "residence": record.storage_prefix() })),
                 }));
                 if let Some(socket) = socket {
                     socket_work(async {
@@ -321,7 +325,7 @@ impl Service {
                     }).await?;
                 }
                 Ok(payload)
-            }.await;
+            }).await;
             io.close_and_wait().await;
             read
         }.await;
@@ -412,7 +416,7 @@ impl Service {
     async fn read_body(
         &self, record: &DeploymentRecord, position: i64, frame: &[u8],
         reference: &ReplicaPayloadReference, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
-    ) -> Result<ReplicaPayload> {
+    ) -> Result<(ReplicaPayload, [u8; 32])> {
         let stream = crate::admin::administration_stream(self.directory.as_ref(), record, crate::process::MAXIMUM_LOG_MESSAGE_BYTES).await?;
         let proof = rtdb_logkeeper::certify_committed_range(&stream, position, position).await?;
         let mut reader = rtdb_logkeeper::CertifiedRangeReader::new(&stream, &proof)?;
@@ -428,7 +432,9 @@ impl Service {
         }
         let files = self.open(record, io).await?;
         check_length(usize::try_from(files.head_fresh(reference.object()).await?.size).map_err(transport)?)?;
-        Ok(reference.read_at(&files, memory).await?)
+        let sealed_frame = ring::digest::digest(&ring::digest::SHA256, &page[0].payload)
+            .as_ref().try_into().expect("SHA-256 width");
+        Ok((reference.read_at(&files, memory).await?, sealed_frame))
     }
 
     async fn open(&self, record: &DeploymentRecord, io: Arc<IoRegion>) -> Result<EncryptingStore> {

@@ -240,6 +240,71 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn a_payload_read_spends_its_directory_replay_hold() {
+        use crate::{deployment::CellStorage, keys::LocalKeyService, lease::LeaseOptions,
+            logs::JournalUnits, process, replay_broker::Client};
+        use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, keys::oversized_key, log::proto::NoOp};
+        use rtdb_storage::{IoRegion, MemoryStore, log::Log};
+        use rtdb_types::{BlockIndex, Term, TermSequence, Timestamp};
+        use tokio_util::sync::CancellationToken;
+
+        let data = tempfile::tempdir().unwrap();
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let journal = process::start_logkeeper(directory.clone(), process::LogkeeperSettings {
+            authority: None, advertise_host: None, listen: "127.0.0.1:0".parse().unwrap(),
+            data_dir: data.path().join("journal"), fsync: true, cache_bytes: 1 << 20,
+            availability_zone: "local".into(), lease: LeaseOptions::default(),
+        }).await.unwrap();
+        let mut record = crate::admin::create_deployment(directory.as_ref(), "shop", "acme", 1).await.unwrap();
+        record.holder = Some(rtdb_directory::MemberId("writer".into()));
+        record.epoch = 1;
+        let version = record.version;
+        let Cas::Applied(record) = directory.replace_deployment(record, version).await.unwrap() else {
+            panic!("the writer should be admitted");
+        };
+        let stream = crate::admin::administration_stream(directory.as_ref(), &record, process::MAXIMUM_LOG_MESSAGE_BYTES).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let writer = rtdb_logkeeper::open_writer(stream, record.epoch, shutdown.clone()).await.unwrap();
+        let tasks = TaskTracker::new();
+        let serving = CellStorage::Local { root: data.path().join("serving") };
+        let detached = CellStorage::Local { root: data.path().join("detached") };
+        let keys = Arc::new(LocalKeyService::new(data.path().join("journal-keys")).unwrap());
+        let broker = Client::standalone(directory.clone(), detached, &serving,
+            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), tasks.clone()).unwrap();
+        let holds = Arc::new(RecoveryHolds {
+            directory: directory.clone(), keys: keys.clone(), custody: ReplayCustody::Local, broker: Some(broker), tasks: tasks.clone(),
+        });
+        let admission = RecoveryAdmission {
+            holds, deployment: record.id.clone(), stream: record.stream("replica"),
+            log_epoch: record.log_epoch, writer_epoch: record.epoch,
+        };
+        let body = ReplicaEnvelope {
+            term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(NoOp::default()),
+        };
+        let payload = Bytes::from(body.encode());
+        let allocation = Uuid::new_v4().to_string();
+        let key = ObjectKey::new(oversized_key(BlockIndex(0), &allocation).unwrap()).unwrap();
+        assert!(admission.publish(&key, payload.clone()).await.unwrap().is_none());
+        let reference = Bytes::from(body.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(record.log_epoch),
+            BlockIndex(0), allocation, &payload).encode());
+        let io = IoRegion::new();
+        let journal_keys = JournalUnits::open(keys.as_ref(), &record.key_id(), "replica", io.clone()).await.unwrap();
+        let sealed = journal_keys.seed(0, reference.clone()).await.unwrap();
+        let committed = writer.enqueue(sealed, Timestamp(0)).await.unwrap().durable().await.unwrap();
+        let hold = Arc::new(admission.hold(LogOffset(-1), committed.offset).await.unwrap().unwrap());
+        let mut delivery = LogRecord::new(committed, reference);
+        hold.retain_record(&mut delivery).unwrap();
+        let returned = delivery.replica_objects.as_ref().unwrap().redeem(&MemoryStore::default(), &MemoryBudget::new(1 << 20)).await.unwrap();
+        assert_eq!(returned.as_ref(), payload.as_ref());
+        drop((delivery, hold));
+        tasks.close();
+        tasks.wait().await;
+        io.close_and_wait().await;
+        shutdown.cancel();
+        journal.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_directory_payload_cannot_fall_back_to_ordinary_serving_storage() {
         use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto::NoOp};
         use rtdb_storage::{MemoryStore, ObjectStore, log::LogMetadata};

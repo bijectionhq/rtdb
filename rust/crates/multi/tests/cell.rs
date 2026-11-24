@@ -3431,6 +3431,7 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
         .map(|path| (path, directory.deployment_changes().unwrap()));
     let mut cell = Cell::start_with_directory(directory.clone()).await;
     let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    admin::set_linearizable_reads(directory.as_ref(), "shop", true).await.unwrap();
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     cell.node(0).agent.flush("shop").await.unwrap();

@@ -146,8 +146,10 @@ A successor loglet retains the installed decision floor.
 Trimming and exact deletion require an installed recovery fence after replacement publication and older replay drain.
 The native checker joins observed checkpoint, trim and offloaded-object retirement decisions by scope, revision, root, manifest and journal anchor.
 It also checks that each logged receipt follows the observed covering quorum publication for the same stream, epoch and ensemble.
-This join covers the recorded recovery and retirement owners.
-The full native capture still needs the production T1 certificate-to-query handoff, T2's exact reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
+Directory-managed fresh answers carry the portable T1 decision fingerprint through the probe nonce, the applied catalog capture and frontend delivery.
+The native checker also joins the checkpoint publisher to its covering certified decision and from the checkpoint to the installed recovery closure.
+Inherited loglet prefixes without a portable decision carry no certified-answer observation.
+The full native capture still needs the general T2 reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
 The new model, controls and native joins have source review only.
 
 
@@ -158,7 +160,9 @@ Compaction and stored artefact builders register the captured catalog and, where
 A cursor tracks the exact slots consulted by the immutable-unit cipher across opening, pulls and local buffering.
 Local, remote and disk-cache object discovery admits the exact key or prefix under the opened provider.
 S3 inventory admits version checks, listings, terminal metadata and conditional publication ranges under the provider's scope.
-These observations expire with their individual operation.
+Local journals admit file discovery, range pulls and replay probes with the file path and selected offset or interval.
+S3 and DynamoDB key-vault discovery carry the opened vault and exact point or scan prefix and cursor.
+The admission retains these scopes through the individual operation.
 Selecting a catalog, checkpoint or recovery dependency retains the corresponding authority across requests.
 
 The grant follows PostgreSQL rows and COPY chunks through flushing and Flight statements and encoded action replies to stream handoff.
@@ -173,10 +177,10 @@ Their 30-second grant and 60-second drain assume that the reader's monotonic clo
 T4 publishes a directory-backed receiver frontier for ordered observations.
 The current observation interface lacks an enforced expiry bound through transport pauses, so it cannot yet replace the remote drain premise.
 
-Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. Full replay still requires the production T1 certificate-to-answer and T2 reachability and recovery-exclusion handoffs. These changes have source review only.
+Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. The new detached broker admits its own exact position hold before reading and retains it through provider drain. The checker joins that admission to the origin replay ticket and records the certified sealed frame. These changes have source review only.
 
 
 Installed receipt reclamation emits the ordered journal's withdrawal position and exact provider path and publication fingerprints.
 The provider trace joins those fingerprints with the placement and withdrawal position before validating physical removal.
 This covers installed receipt publications for which the runtime can obtain an exact object fence.
-The portable T1 certificate-to-answer handoff and the general T2 recovery and reachability closure remain prerequisites for complete native replay.
+The complete T2 replay requires the full reachable-publication census and a recovery exclusion that can settle the detached version independently of physical trim. The broker serves normal tails and ranges. Administrative and transfer access and hosted credential provisioning remain relevant to closing the full recovery inventory.

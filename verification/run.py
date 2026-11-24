@@ -5108,6 +5108,16 @@ def verify_native_payload_replay(args, source):
         else:
             raise ValueError(f"{label}: accepted a substituted {field}")
 
+    orphan = copy.deepcopy(read)
+    orphan["source_hold"]["hold"] = "another-source-ticket"
+    try:
+        verify_joined([directory, [orphan]])
+    except ValueError as error:
+        if "broker read lacks its originating replay hold" not in str(error):
+            raise
+    else:
+        raise ValueError(f"{label}: accepted a substituted originating hold")
+
 
 def capture_native_recovery(args, source, label, trace, observations):
     env = os.environ | {

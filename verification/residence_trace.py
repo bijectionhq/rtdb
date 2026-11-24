@@ -331,6 +331,14 @@ def verify_joined(captures):
             first, through, revision = replay_holds[hold]
             require(first <= event["position"] <= through and revision <= event["revision"],
                     "payload read is outside its admitted replay interval")
+            source = event.get("source_hold")
+            if source is not None:
+                require(digest(event["frame"]), "broker read lacks its certified sealed frame")
+                source_hold = (*replica_scope(event), source["residence"], source["hold"])
+                require(source_hold != hold and source_hold in replay_holds, "broker read lacks its originating replay hold")
+                source_first, source_through, source_revision = replay_holds[source_hold]
+                require(source_first <= event["position"] <= source_through and source_revision < revision,
+                        "broker read exceeds its originating replay hold")
             if event["publication"] is not None:
                 publication = (*replica_scope(event), event["key"], json.dumps(event["publication"], sort_keys=True))
                 require(publication not in exclusions or event["revision"] < exclusions[publication],
