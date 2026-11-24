@@ -259,12 +259,15 @@ Checkpoint discovery at startup and coordinated Classic checkpoint loads carry t
 Local and remote object stores, the disk cache, S3 inventory, local journals and remote vault discovery bind their opened owner and exact target at I/O admission.
 PostgreSQL rows and COPY, Flight statements and materialized Flight actions carry delivery grants for the originating unit, deployment or archive keys.
 Local vault locks retain exact custody through delivery, and remote key providers drain bounded grants after fencing.
+PostgreSQL and Flight enforce the original answer cutoff on socket writes and flushes, including on gateway egress.
+A multiplexed Flight connection retains its earliest protected cutoff and closes at that deadline.
 Held-world replies carry the original replay dependencies across the archive worker.
 Hosted PostgreSQL feedback follows the exact published recovery root.
-The bounded replay includes quorum publication before acknowledgement and recovery exclusion before deletion.
+The bounded replay includes quorum publication before acknowledgement, recovery exclusion before deletion, and refusal of a paused answer at its transport deadline.
 Native replay joins portable T1 decisions to the applied catalog and frontend answer, and checks the covering decision for directory checkpoint publication.
 It correlates broker reads with both replay holds, checkpoint publication and trim with dependent version removal, and installed receipt removal with the exact journal fence.
-An enforceable transport-time bound for remote grants, general T2 reachability and recovery exclusion, and execution evidence remain open.
+General T2 reachability and recovery exclusion and execution evidence remain open.
+Cross-host cutoff checks rely on a consistent wall-clock domain, and remote vault settlement retains its clock-rate margin.
 |===
 
 == Placed serving and search

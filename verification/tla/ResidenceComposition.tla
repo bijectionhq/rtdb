@@ -34,7 +34,7 @@ VARIABLES
     fork,
     \* @type: Bool;
     stalePublication,
-    \* @type: {systemTime: Int, rawTime: Int, receiptClock: Int, clockRegressed: Bool, mode: Str, requestedTime: Int, decision: Str, retained: Bool, redemption: Str, redemptionBody: Str, redemptionExpired: Bool, namingEpoch: Int, loglet: Int, indexFor: Int, indexThrough: Int, captured: Int, captureLoglet: Int, confirmed: Int, erasure: Str, cacheResult: Str, certified: Int, publications: Set(Int), acknowledged: Int, activationFloor: Int, recoveryFence: Int, deletion: Str};
+    \* @type: {systemTime: Int, rawTime: Int, receiptClock: Int, clockRegressed: Bool, mode: Str, requestedTime: Int, decision: Str, retained: Bool, redemption: Str, redemptionBody: Str, redemptionExpired: Bool, namingEpoch: Int, loglet: Int, indexFor: Int, indexThrough: Int, captured: Int, captureLoglet: Int, confirmed: Int, erasure: Str, cacheResult: Str, certified: Int, publications: Set(Int), acknowledged: Int, activationFloor: Int, recoveryFence: Int, deletion: Str, delivery: {state: Str, time: Int, deadline: Int, lastWrite: Int}};
     authority
 
 vars == <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
@@ -57,7 +57,8 @@ AuthorityInit ==
      namingEpoch |-> 0, loglet |-> 0, indexFor |-> None, indexThrough |-> None,
      captured |-> None, captureLoglet |-> None, confirmed |-> None, erasure |-> "open", cacheResult |-> "",
      certified |-> None, publications |-> {}, acknowledged |-> None, activationFloor |-> 0,
-     recoveryFence |-> 0, deletion |-> ""]
+     recoveryFence |-> 0, deletion |-> "",
+     delivery |-> [state |-> "", time |-> 0, deadline |-> None, lastWrite |-> None]]
 
 Init ==
     /\ authority = AuthorityInit
@@ -311,8 +312,34 @@ ArmErasure ==
     /\ authority' = [authority EXCEPT !.erasure = "armed"]
     /\ UNCHANGED vars
 
+AdmitTransportAnswer ==
+    /\ Open /\ query = 0 /\ authority.delivery.state = ""
+    /\ authority.erasure \in {"open", "prepared"}
+    /\ authority' = [authority EXCEPT !.delivery.state = "admitted", !.delivery.deadline = 1]
+    /\ UNCHANGED vars
+
+AdvanceTransportTime ==
+    /\ authority.delivery.state \in {"admitted", "writing"} /\ authority.delivery.time = 0
+    /\ authority' = [authority EXCEPT !.delivery.time = 1]
+    /\ UNCHANGED vars
+
+HandoffTransportAnswer(finished) ==
+    /\ authority.delivery.state \in {"admitted", "writing"}
+    /\ (authority.delivery.time < authority.delivery.deadline \/ Mutation = "skip_transport_deadline")
+    /\ authority' = [authority EXCEPT !.delivery.state = IF finished THEN "delivered" ELSE "writing",
+                     !.delivery.lastWrite = authority.delivery.time]
+    /\ UNCHANGED vars
+
+RefuseTransportAnswer ==
+    /\ authority.delivery.state \in {"admitted", "writing"}
+    /\ authority.delivery.time >= authority.delivery.deadline
+    /\ authority' = [authority EXCEPT !.delivery.state = "refused"]
+    /\ UNCHANGED vars
+
 RevokeKey ==
     /\ Open /\ authority.erasure = "armed"
+    /\ (authority.delivery.state \notin {"admitted", "writing"}
+        \/ authority.delivery.time >= authority.delivery.deadline)
     /\ authority' = [authority EXCEPT !.erasure = "revoked"]
     /\ UNCHANGED vars
 
@@ -334,6 +361,8 @@ AuthorityNext ==
     \/ \E epoch \in 0..1, through \in 0..1 : ConfirmReadIndex(epoch, through)
     \/ \E cut \in 0..1 : CaptureFresh(cut) \/ Acknowledge(cut)
     \/ PrepareErasure \/ ArmErasure \/ RevokeKey
+    \/ AdmitTransportAnswer \/ AdvanceTransportTime \/ RefuseTransportAnswer
+    \/ \E finished \in BOOLEAN : HandoffTransportAnswer(finished)
     \/ \E answer \in {"page", "erased-under-view"} : ReadOldCachedPage(answer)
 
 Next == Install \/ AuthorizeVersion \/ (StorageNext /\ UNCHANGED authority) \/ (ExtendAuthorities /\ AuthorityNext)
@@ -359,6 +388,8 @@ AcknowledgedClosure == Open /\ authority.confirmed # None =>
 ErasureHasSuccessor == Open /\ authority.erasure \in {"armed", "revoked"} =>
     checkpoint = 1 /\ Needs(checkpoint) \subseteq source
 RevokedCacheClosed == authority.cacheResult # "page"
+OnlyLiveTransportWrites == authority.delivery.lastWrite # None =>
+    authority.delivery.lastWrite < authority.delivery.deadline
 
 FloorKeepsHeldCatalogs == ExtendAuthorities => \A cut \in {query, providerRead} \ {None} : cut >= floor
 RetainedCutsReadable == \A cut \in ServingDependencies : Needs(cut) \subseteq source
@@ -373,7 +404,7 @@ Safe == FloorKeepsHeldCatalogs /\ RetainedCutsReadable /\ ReplaySurvivesTrim /\ 
         /\ BoundedAppend /\ ExternalClamp /\ DistinctNamingEpoch /\ ReceiptExpiry /\ ReceiptReplay
         /\ FreshCapture /\ AcknowledgedClosure /\ ErasureHasSuccessor /\ RevokedCacheClosed
         /\ AcknowledgedDecision /\ FreshIndexHasPublication /\ DecisionSurvivesActivation
-        /\ RecoveryFenceProtectsDeletion
+        /\ RecoveryFenceProtectsDeletion /\ OnlyLiveTransportWrites
 
 NeverDisposesAfterTrimAndForkCopy ==
     ~(phase = "disposed" /\ head = 1 /\ firstRecord = 2 /\ fork = 1 /\ forkCopy = Needs(1))

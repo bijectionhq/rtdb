@@ -3298,6 +3298,8 @@ rule CleanUpMovedSource {
 rule ChargeQuery {
     -- Query CPU is scheduled by weighted deficit round robin across deployments, on a runtime separate from the write path.
     -- Memory is granted per query from the deployment's quota within the node's budget, and a query over its grant spills or is refused.
+    -- A protected answer keeps its original delivery cutoff through the frontend and gateway buffers.
+    -- Each socket handoff checks the cutoff and expiry closes a partly delivered reply.
     when: QueryArrived(member, query, session)
 
     ensures:

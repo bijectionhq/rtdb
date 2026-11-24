@@ -12,6 +12,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::config::accepts_seat_header;
+use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
 use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, SeatState, admit_audience_seat, occupied_seat_action};
 
@@ -77,6 +78,8 @@ pub(crate) struct Call {
     _lease: Option<AcquiredSession>,
     _active_call: Option<Arc<dyn Send + Sync>>,
     _reservation: Arc<MemoryReservation>,
+    egress: Option<Arc<crate::server::FlightEgress>>,
+    routed_delivery: bool,
 }
 struct Admission { service: Service, permit: Option<OwnedSemaphorePermit> }
 impl Admission {
@@ -91,6 +94,28 @@ impl Drop for Call {
 impl Call {
     pub(crate) fn audience_io_owner(&self) -> Option<Arc<dyn Send + Sync>> {
         capture_audience_io_owner!(self)
+    }
+
+    pub(crate) fn handoff(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
+        if let Some(egress) = &self.egress { return egress.admit(grant, relay).map_err(status); }
+        grant.check().map_err(status)?;
+        if grant.is_bounded() || relay.is_some() { return Err(Status::unavailable("Flight answer transport has no delivery fence")); }
+        grant.observe_answer();
+        Ok(())
+    }
+
+    pub(crate) fn delivery_headers(
+        &self, grant: &PlaintextDelivery, streaming: bool,
+    ) -> Result<(tonic::metadata::MetadataMap, Option<DeliveryDeadline>), Status> {
+        let mut headers = self.response(())?.metadata().clone();
+        let cutoff = if self.routed_delivery {
+            grant.transport_deadline().or_else(|| streaming.then(DeliveryDeadline::answer_window))
+        } else { None };
+        if let Some(cutoff) = cutoff {
+            let wire = cutoff.wire_nanos().ok_or_else(|| Status::unavailable("Flight answer deadline cannot be routed"))?;
+            headers.insert(crate::GATEWAY_ANSWER_DEADLINE_HEADER, wire.to_string().parse().map_err(arrow)?);
+        }
+        Ok((headers, cutoff))
     }
 
     pub fn response<T>(&self, value: T) -> Result<Response<T>, Status> {
@@ -181,6 +206,7 @@ impl Service {
     }
     async fn call_with_kind<T>(&self, request: &Request<T>, body_bytes: usize, kind: CallKind) -> Result<Call, Status> {
         if self.0.cancellation.is_cancelled() { return Err(cancelled()); }
+        let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
         let source_headers = request.metadata().get_all(AUDIENCE_FLIGHT_HEADER);
         let mut sources = source_headers.iter();
         let audience_source = sources.next().map(|source| {
@@ -274,7 +300,7 @@ impl Service {
                 }
                 (Some(peer.to_string()), Some(attachment), fresh_replica)
             } else {
-                (request.remote_addr().map(|address| address.ip().to_string()), None, false)
+                (transport.and_then(|transport| transport.peer.remote_addr()).or_else(|| request.remote_addr()).map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
             let placement = if catalog.is_placed() {
@@ -394,7 +420,9 @@ impl Service {
         };
         let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
         let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(),
-            admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation };
+            admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
+            egress: transport.map(|transport| transport.egress.clone()),
+            routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward") };
         self.publish(); Ok(call)
     }
     async fn reserve_audience_seat(&self, database: Weak<rtdb_node::Database>, index: usize,
@@ -444,25 +472,26 @@ pub(crate) fn result_stream<T: Send + 'static>(call: Call, values: Vec<Result<T,
     let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
 }
 
-pub(crate) fn action_result_stream(
+pub(crate) async fn action_result_stream(
     call: Call, values: Vec<Result<flight::Result, Status>>,
     plaintext: Arc<rtdb_storage::sealing::PlaintextView>,
 ) -> Result<Response<Output<flight::Result>>, Status> {
-    let headers = call.response(())?.metadata().clone();
+    if !values.iter().any(Result::is_ok) { return result_stream(call, values); }
+    let first = call.cancellation.run_until_cancelled(plaintext.grant()).await.ok_or_else(cancelled)?.map_err(status)?;
+    let (headers, cutoff) = call.delivery_headers(&first, false)?;
     let stream: Output<flight::Result> = Box::pin(futures::stream::unfold(
-        (call, values.into_iter(), plaintext, false),
-        |(call, mut values, plaintext, stopped)| async move {
+        (call, values.into_iter(), plaintext, Some(first), false),
+        move |(call, mut values, plaintext, mut first, stopped)| async move {
             if stopped { return None; }
             let value = values.next()?;
             let result = call.cancellation.run_until_cancelled(async {
                 let value = value?;
-                let grant = plaintext.grant().await.map_err(status)?;
-                grant.check().map_err(status)?;
-                grant.observe_answer();
+                let grant = match first.take() { Some(grant) => grant, None => plaintext.grant().await.map_err(status)? };
+                call.handoff(grant, cutoff)?;
                 Ok(value)
             }).await.unwrap_or_else(|| Err(cancelled()));
             let stop = result.is_err();
-            Some((result, (call, values, plaintext, stop)))
+            Some((result, (call, values, plaintext, first, stop)))
         },
     ));
     let mut response = Response::new(stream);

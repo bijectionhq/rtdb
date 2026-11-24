@@ -175,7 +175,16 @@ Withdrawal and scheduling serialize on the corresponding exclusive locks.
 Remote S3 and DynamoDB providers still drain after fencing.
 Their 30-second grant and 60-second drain assume that the reader's monotonic clock advances at least half as fast as the settling owner's clock.
 T4 publishes a directory-backed receiver frontier for ordered observations.
-The current observation interface lacks an enforced expiry bound through transport pauses, so it cannot yet replace the remote drain premise.
+Answer delivery freezes each grant's earliest monotonic and wall-clock cutoff.
+Every PostgreSQL socket write and flush checks that cutoff after protocol encoding, including when it resumes inside a buffered write.
+Private PostgreSQL frames carry the original exclusive wall cutoff through each gateway, and the outer gateway consumes that stamp before releasing the corresponding frame.
+Flight carries one cutoff for a protected routed response and refuses any frame whose live grant ends sooner.
+HTTP/2 and TLS can retain accepted Flight data beyond a body poll, so the connection writer enforces its earliest protected cutoff through closure.
+A gateway imports the sender's absolute cutoff and fixes a local monotonic ceiling on receipt.
+Cross-host enforcement assumes a consistent wall-clock domain with a bound on skew.
+Remote provider settlement still requires the existing clock-rate margin.
+The composed model distinguishes admission, partial handoff, time advancing while transport is paused, and refusal at expiry.
+Its negative control permits a socket write at the cutoff and violates the live-write invariant.
 
 Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. The new detached broker admits its own exact position hold before reading and retains it through provider drain. The checker joins that admission to the origin replay ticket and records the certified sealed frame. These changes have source review only.
 

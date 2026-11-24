@@ -3251,6 +3251,7 @@ RESIDENCE_AUTHORITY_CONTROLS = (
     ("ack_before_closure", "AcknowledgedClosure"),
     ("arm_before_successor", "ErasureHasSuccessor"),
     ("use_revoked_cache", "RevokedCacheClosed"),
+    ("skip_transport_deadline", "OnlyLiveTransportWrites"),
     ("ack_payload_quorum", "AcknowledgedDecision"),
     ("read_unpublished_decision", "FreshIndexHasPublication"),
     ("lose_decision_on_activation", "DecisionSurvivesActivation"),
@@ -3433,6 +3434,12 @@ def verify_composed_residence_trace(args, scratch):
         index = positions[kind]
         altered[index][field] = value
         check_residence_trace(args, scratch, f"tlc-residence-authorities-{name}", altered, index, extended=True)
+
+    late_write = [event.copy() for event in events]
+    index = positions["refuse-transport-answer"]
+    late_write[index] = events[positions["handoff-transport-answer"]].copy()
+    late_write[index][1] = events[positions["advance-transport-time"]][1]
+    check_residence_trace(args, scratch, "tlc-residence-authorities-write-after-deadline", late_write, index, extended=True)
 
     external = [event.copy() for event in events]
     index = positions["attempt-outcome"]

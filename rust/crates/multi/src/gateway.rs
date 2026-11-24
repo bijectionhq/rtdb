@@ -134,6 +134,8 @@ pub async fn serve(listener: TcpListener, directory: Arc<dyn Directory>, options
     }
 }
 
+const RELAY_ANSWER_DEADLINE_PARAMETER: &str = "rtdb.relay_answer_deadline";
+
 struct Startup { bytes: Vec<u8>, parameters: BTreeMap<String, String> }
 
 impl Startup {
@@ -162,9 +164,10 @@ type Client = Box<dyn Transport>;
 async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: GatewayOptions, cancellation: CancellationToken,
                     heartbeats: Arc<Heartbeats>, deployments: Arc<DeploymentConnections>, frame_memory: Arc<MemoryBudget>, connection_index: usize) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + options.startup_timeout;
-    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(client), options.tls.clone()));
+    let startup = tokio::time::timeout_at(startup_deadline, read_startup(Box::new(rtdb_storage::sealing::DeliveryIo::new(client)), options.tls.clone()));
     let Some(result) = cancellation.run_until_cancelled(startup).await else { return Ok(()); };
     let Some((mut client, mut startup)) = result.map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/startup-timeout", "PostgreSQL startup did not finish"))?? else { return Ok(()); };
+    let forward_stamp = startup.parameters.remove(RELAY_ANSWER_DEADLINE_PARAMETER).as_deref() == Some("on");
     let selector = startup.parameters.get("database");
     let selection = match selector {
         Some(selector) => database_selector(selector),
@@ -185,17 +188,19 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
         return refuse(&mut client, "57P03", "Timed out looking up the deployment's cell").await;
     };
     if let Some(gateway) = remote_gateway {
+        startup.parameters.insert(RELAY_ANSWER_DEADLINE_PARAMETER.into(), "on".into());
+        startup.bytes = encode_startup(&startup.parameters);
         let forward = tokio::time::timeout_at(startup_deadline, async {
             let mut forward = connect(&gateway).await?;
             forward.write_all(&startup.bytes).await.map_err(io)?;
             Ok::<_, Anomaly>(forward)
         }).await;
-        let mut forward = match forward {
+        let forward = match forward {
             Ok(Ok(forward)) => forward,
             Ok(Err(error)) => return refuse(&mut client, "08006", error.message.as_deref().unwrap_or_default()).await,
             Err(_) => return refuse(&mut client, "57P03", "Timed out forwarding startup to the deployment's cell").await,
         };
-        return tokio::io::copy_bidirectional(&mut client, &mut forward).await.map(|_| ()).map_err(io);
+        return crate::session::relay_cell(client, forward, &frame_memory, forward_stamp).await;
     }
     if let Some(installation) = expected {
         startup.parameters.insert("database".into(), name.clone());
@@ -232,7 +237,7 @@ async fn connection(client: TcpStream, directory: Arc<dyn Directory>, options: G
     }.with_frame_memory(frame_memory).with_installation(expected);
     tokio::select! {
         _ = cancellation.cancelled() => Ok(()),
-        outcome = session.run_before(client, server, control, epoch, startup_deadline) => outcome,
+        outcome = session.run_before(client, server, control, epoch, startup_deadline, forward_stamp) => outcome,
     }
 }
 

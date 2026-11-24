@@ -56,6 +56,7 @@ pub use entity_history::{HistoryObject, table_point_rows, uncovered_history_iids
 pub use context::{CatalogSnapshot, DatabaseSnapshot, OrderedIndexInventory, OrderedIndexStorage, QueryContext, QueryOptions, retain_catalog_snapshot};
 pub use fragment::{FragmentBytes, FragmentDepth, FragmentReply, FragmentResidence, ScanFragment, ScanFragmenter, TriePrefix, evaluate_fragment, evaluate_fragment_retained};
 pub use cursor::{PreparedQuery, QueryCursor, encoding_ordered_batch};
+pub use rtdb_storage::sealing::{DeliveryIo, current_delivery_deadline};
 pub use query_cpu::QueryCpu;
 pub use settings::unindexed_tx;
 pub use runtime_schema::RuntimeSchema;
