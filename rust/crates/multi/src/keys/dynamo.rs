@@ -156,6 +156,7 @@ impl DynamoKeyService {
     async fn close_units(&self, scope: UnitScope) -> Result<()> {
         let namespace = scope.namespace();
         self.withdraw_item(&namespace).await?;
+        rtdb_storage::sealing::drain_unit_delivery().await;
         let prefix = format!("{namespace}-");
         let mut start = None;
         loop {
@@ -236,9 +237,7 @@ impl KeyService for DynamoKeyService {
     async fn destroy(&self, id: &str) -> Result<()> {
         super::require_general_key_namespace(id)?;
         self.withdraw_item(id).await?;
-        self.close_units(UnitScope::archive(id)).await?;
-        rtdb_storage::sealing::drain_unit_delivery().await;
-        Ok(())
+        self.close_units(UnitScope::archive(id)).await
     }
 
     async fn use_unit_key(
@@ -267,9 +266,7 @@ impl KeyService for DynamoKeyService {
     }
 
     async fn withdraw_unit_scope(&self, scope: UnitScope, _region: &Arc<IoRegion>) -> Result<()> {
-        self.close_units(scope).await?;
-        rtdb_storage::sealing::drain_unit_delivery().await;
-        Ok(())
+        self.close_units(scope).await
     }
 
     async fn archive_key(

@@ -82,6 +82,7 @@ The native tests exercise the coordinator with Logkeeper application decisions a
 Installed serving reads carry the journal-issued lease through provider access and check it again before returning a body.
 Detached replica objects inherit the servicing lease for cryptography and open in the original writer's key namespace.
 The detached replay broker registers uploads before accepting a body and retains that region until provider operations join.
+S3 and DynamoDB namespace withdrawal fences new unit grants, waits out the provider and delivery window, then settles the registered unit material. The wait covers existing bounded grants from these vaults.
 Installed log and object key operations have a local monotonic time limit.
 These bounds cover the key operations and affected storage responses; decoded pages, query results, and other working copies require their own drain evidence.
 Independent checkpoint member slots allow a staged successor to open with no dependency on the prior writer or checkpoint allocation's object keys.

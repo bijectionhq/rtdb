@@ -122,7 +122,13 @@ impl S3KeyService {
             current = self.current(&path).await.map_err(key_error)?;
         }
         match current {
-            Current::Live { key, .. } => Ok(key),
+            Current::Live { mut key, .. } => {
+                if let Err(error) = self.require_open_unit_scope(slot.scope).await {
+                    key.fill(0);
+                    return Err(key_error(error));
+                }
+                Ok(key)
+            }
             Current::Withdrawn => Err(rtdb_storage::Error::ErasedUnderView),
             Current::Absent => Err(key_error(unavailable("confirm immutable-unit custody"))),
         }
@@ -161,13 +167,14 @@ impl S3KeyService {
     pub(super) async fn withdraw_registered_scope(&self, scope: UnitScope) -> Result<()> {
         self.require_never_versioned().await?;
         self.withdraw_current(&marker(scope)).await?;
-        let drain = rtdb_storage::sealing::drain_unit_delivery();
-        let settle = stream::iter(0..=u8::MAX)
+        // The scope marker closes admission before the grant window starts.
+        // The individual materials remain intact during that window.
+        rtdb_storage::sealing::drain_unit_delivery().await;
+        stream::iter(0..=u8::MAX)
             .map(|shard| self.withdraw_shard(scope, shard))
             .buffer_unordered(RETIREMENT_PARALLELISM)
-            .try_for_each(|()| async { Ok(()) });
-        let ((), result) = tokio::join!(drain, settle);
-        result?;
+            .try_for_each(|()| async { Ok(()) })
+            .await?;
         self.require_never_versioned().await
     }
 
