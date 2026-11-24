@@ -1101,6 +1101,64 @@ async fn exercise_pipeline(outcome: PipelineOutcome) {
 }
 
 #[tokio::test]
+async fn managed_workload_expired_while_waiting_for_the_original_acknowledgement() {
+    use rtdb_tx::transact::workload::{Applied, Authority, Family, Fence, Holder, Operation, Placement, Point, Previous, Reply, Request};
+
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let gate = Arc::new(GateJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, gate.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let database = Arc::new(Mutex::new(writer));
+    let writes = WritePipeline::start(database.clone());
+
+    let point = Point::new("public.bj_installation", "authority".into(), Timestamp(0)).unwrap();
+    let command = |namespace, expires_at, operation| Request { point: point.clone(), namespace, expires_at, operation };
+    let submit = |key, authority, transaction| Operation::Submit {
+        key: vec![key; 16], authority, transaction, digest: [key; 32],
+    };
+    let applied = |reply: Reply, namespace| {
+        let Reply::Receipt(receipt) = reply else { panic!("expected receipt") };
+        assert_eq!(receipt.outcome, Outcome::Then);
+        Applied { namespace, key: receipt.key, basis: receipt.basis.to_bytes(), system_time_micros: receipt.system_time.0 }
+    };
+    let placement = Placement {
+        epoch: 1, assignment: Some(Holder { assignment_id: [7; 16], holder: "conductor".into() }),
+    };
+    let advance = Authority::AdvancePlacement {
+        installation_intent: [6; 16], previous: Previous::Empty, next: placement.clone(),
+    };
+    let fence = Fence { placement, applied: applied(
+        writes.workload(command([1; 32], Timestamp(80), submit(1, advance, None))).await.unwrap(), [1; 32],
+    ) };
+    let claim = Authority::ClaimWriter { fence: fence.clone() };
+    let writer = applied(
+        writes.workload(command([2; 32], Timestamp(80), submit(2, claim, None))).await.unwrap(), [2; 32],
+    );
+
+    let write = Authority::Write { fence, writer };
+    gate.arm.store(true, Ordering::SeqCst);
+    let pending = writes.workload(command([3; 32], Timestamp(25), submit(3, write, Some(put(3, 1, "expired")))));
+    tokio::pin!(pending);
+    tokio::select! {
+        _ = &mut pending => panic!("the workload returned before the original acknowledgement"),
+        reached = tokio::time::timeout(Duration::from_secs(2), gate.entered.notified()) => reached.unwrap(),
+    }
+    cluster.at(30);
+    gate.release.notify_one();
+    let Reply::Receipt(refused) = pending.await.unwrap() else { panic!("expected refusal") };
+    assert!(matches!(refused.outcome, Outcome::Refused { .. }));
+    let key = vec![3; 16];
+    let status = command([3; 32], Timestamp(80), Operation::Status { key: key.clone(), family: Family::Write });
+    let Reply::Receipt(recovered) = writes.workload(status).await.unwrap() else { panic!("expected retained refusal") };
+    assert_eq!(recovered, Receipt { replayed: true, ..refused });
+    let mut database = database.lock().await;
+    assert_eq!(database.tx_status(&key).await.unwrap_err().code, "rtdb/unknown-transaction");
+    assert_eq!(text_at(&mut database, MAIN_BRANCH, 1).await, None);
+}
+
+#[tokio::test]
 async fn multi_driver_admits_a_dependent_write_behind_a_timed_terminal_slot() {
     exercise_timed_suffix(false).await;
 }
