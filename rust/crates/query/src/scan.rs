@@ -839,7 +839,12 @@ impl ScanCursor {
                     let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
                         verifier, partitions: database_partitions };
-                    let selection = accelerator.select_candidates(&request).await?;
+                    let selection = {
+                        let mut selection = accelerator.select_candidates(&request);
+                        std::future::poll_fn(|context| {
+                            stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || selection.as_mut().poll(context))
+                        }).await?
+                    };
                     if let Some(crate::ScanSelection { iids: mut candidates, scores }) = selection {
                         if pushdowns.is_some() || narrowed.iids.is_some() {
                             candidates = match candidates.retain(|iid| {

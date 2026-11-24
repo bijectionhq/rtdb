@@ -307,7 +307,7 @@ impl SearchBuilder {
         self.store.put(&intent, staged.encode()?.into()).await?;
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
         let key = ObjectKey::new(run.object_key(slug)?)?;
-        // A provider can commit a failed request; leave its intent for the collector to settle after the writer drains.
+        // A provider can commit a failed request, so the collector needs its intent after the writer drains.
         run.publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);
         if self.store.releases_exact_search_runs() && run.publication.is_none() {
             run.publication = self.store.retirement_publication(&key).await?.map(Into::into);

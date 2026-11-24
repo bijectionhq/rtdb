@@ -1879,7 +1879,7 @@ async fn native_search_rebuilds_from_the_retained_journal_after_loss_of_postings
         node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
     }
     let table = TableRef::new("public", "docs");
-    assert!(database.trie_catalog().search_runs(&table).next().is_none());
+    assert_eq!(database.trie_catalog().search_runs(&table).flat_map(|run| run.blocks()).count(), 2);
     database.build_artefacts().await.unwrap();
     database.compaction().unwrap().compact_all().await.unwrap();
     node.sync_all(Duration::from_secs(10), &stop).await.unwrap();
@@ -1943,6 +1943,7 @@ async fn a_same_commit_reinsert_keeps_only_the_post_erase_search_revision() {
     let database = node.catalog().database("xtdb").unwrap();
     database.flush().await.unwrap();
     node.sync_all(Duration::from_secs(10), &tokio_util::sync::CancellationToken::new()).await.unwrap();
+    database.build_artefacts().await.unwrap();
     let table = TableRef::new("public", "docs");
     let catalog = database.trie_catalog();
     let run = catalog.search_runs(&table).next().unwrap();
