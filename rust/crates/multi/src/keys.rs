@@ -20,6 +20,8 @@ mod delivery;
 pub(crate) use delivery::DeploymentDelivery;
 mod assertion;
 pub mod assertion_deadline;
+mod occurrence;
+pub use occurrence::{AssertionMintKey, AssertionRoute, AssertionRouteKey};
 mod journal;
 mod unit;
 pub use rtdb_storage::sealing::{UnitOperation, UnitOutput};
