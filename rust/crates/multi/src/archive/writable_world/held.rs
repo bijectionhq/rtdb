@@ -1220,7 +1220,7 @@ impl HeldCheckpointWorld {
                 Some(staged) => staged,
                 None => rtdb_node::nearest::HeldVectorOverlay::new(&self.memory)?,
             };
-            Some(self.nearest_overlay(&partitions, valid, shadows, &guard, earlier.map(|(system, _)| system)).await?)
+            Some(self.nearest_overlay(&partitions, &query, valid, shadows, &guard, earlier.map(|(system, _)| system)).await?)
         } else {
             None
         };
@@ -1239,7 +1239,7 @@ impl HeldCheckpointWorld {
     /// Shadow every local world identity with its local row, mirroring
     /// `search_overlay`: typed tombstones mask the archived row.
     async fn nearest_overlay(
-        &self, partitions: &[rtdb_node::nearest::NearestPartition], valid: Timestamp,
+        &self, partitions: &[rtdb_node::nearest::NearestPartition], query: &rtdb_node::nearest::NearestQuery, valid: Timestamp,
         mut shadows: rtdb_node::nearest::HeldVectorOverlay,
         guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>, system: Option<Timestamp>,
     ) -> Result<rtdb_node::nearest::HeldVectorOverlay> {
@@ -1272,11 +1272,11 @@ impl HeldCheckpointWorld {
                         let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?
                             .ok_or_else(OwnedWorld::unavailable)?;
                         let row = fact.into_shadow(self.open.record.id)?;
-                        shadows.shadow_row(partition, selected, id, row.as_ref().map(|fact| &fact.row))?;
+                        shadows.shadow_row(partition, selected, id, row.as_ref().map(|fact| &fact.row), query)?;
                     } else {
                         let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
                         let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
-                        shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row))?;
+                        shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row), query)?;
                     }
                 }
                 if candidates.keys.len() < 128 { break; }
@@ -2285,7 +2285,7 @@ impl<'a> InheritedRelation<'a> {
     }
 
     async fn nearest_shadows(
-        &self, selected: &rtdb_node::nearest::NearestPartition, partition: usize, valid: Timestamp,
+        &self, selected: &rtdb_node::nearest::NearestPartition, query: &rtdb_node::nearest::NearestQuery, partition: usize, valid: Timestamp,
         shadows: &mut rtdb_node::nearest::HeldVectorOverlay, remaining: &mut usize,
     ) -> Result<()> {
         let unavailable = OwnedWorld::unavailable;
@@ -2299,7 +2299,7 @@ impl<'a> InheritedRelation<'a> {
                 let id = EntityId::String(key.clone());
                 if shadows.contains_shadow(partition, &id) { continue; }
                 let shadow = self.resolve_shadow(&id, instant).await?.ok_or_else(unavailable)?;
-                shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row))?;
+                shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row), query)?;
             }
             if !page.more { return Ok(()); }
             let key = page.keys.last().ok_or_else(unavailable)?;
@@ -3043,7 +3043,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                 |archived| {
                                                     let archived = archived.into_iter().map(|layer|
                                                         layer.with_owned_read_guard(Arc::clone(&guard))).collect::<Vec<_>>();
-                                                    let (root, owner, partitions) = (&scoped, &owner, &partitions);
+                                                    let (root, owner, partitions, query) = (&scoped, &owner, &partitions, &query);
                                                     async move {
                                                         let mut shadows = match overlay {
                                                             Some(shadows) => shadows,
@@ -3054,7 +3054,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             let inherited = InheritedRelation::open(
                                                                 Arc::clone(root), archived.clone(), owner, &selected.relation, ancestors, &schema, memory,
                                                             ).await?.at(ancestor_system).await?;
-                                                            inherited.nearest_shadows(selected, index, valid, &mut shadows, &mut remaining).await?;
+                                                            inherited.nearest_shadows(selected, query, index, valid, &mut shadows, &mut remaining).await?;
                                                         }
                                                         Ok(shadows)
                                                     }

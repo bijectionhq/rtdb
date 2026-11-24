@@ -3948,12 +3948,16 @@ impl Service {
                 if range.len() != nearest.query.dimensions() || range.clone().any(|index| components.is_null(index)) {
                     return Err(invalid("A staged nearest vector does not have the probe's dimensions"));
                 }
-                Some(range.map(|index| components.value(index)).collect::<Vec<f32>>())
+                Some(components.values().slice(range.start, range.len()))
             };
             let cells = filter_columns.iter()
-                .map(|column| (!column.is_null(row)).then(|| column.value(row).to_vec()))
+                .map(|column| (!column.is_null(row)).then(|| {
+                    let offsets = column.value_offsets();
+                    let start = offsets[row] as usize;
+                    column.values().slice_with_length(start, offsets[row + 1] as usize - start)
+                }))
                 .collect();
-            overlay.shadow(
+            overlay.shadow_staged(
                 partitions.value(row) as usize,
                 rtdb_types::EntityId::String(ids.value(row).to_owned()),
                 vector,
