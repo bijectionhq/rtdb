@@ -223,7 +223,7 @@ mod tests {
         let encoded = read_block(file.reader.as_mut(), block, true).unwrap();
         let (header, body) = super::super::block_message(block, &encoded).unwrap();
         let message = arrow_ipc::root_as_message(&encoded[header]).unwrap();
-        let page = file.event_projection.as_ref().unwrap().decode(&file.pages.source_schema, message, &encoded.slice(body))
+        let page = file.pages.event_projection.as_ref().unwrap().decode(&file.pages.source_schema, message, &encoded.slice(body))
             .expect("projection must decode before falling back to full-page reads");
         assert_eq!(page.schema(), file.schema());
         drop(file);
