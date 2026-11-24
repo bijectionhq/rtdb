@@ -188,6 +188,7 @@ impl DmlBuffer {
             TxOp::OwnedDeclareRelation { relation, schema } => relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(allocation_overflow)?,
             TxOp::OwnedDropSpatialPath { relation, name } => relation.name().len() + name.name().len(),
             TxOp::OwnedRetireRelation { relation, .. } => relation.name().len(),
+            TxOp::OwnedAdoptRelation { source, destination, .. } => source.name().len() + destination.name().len(),
             TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. } => columns.iter().try_fold(
                 relation.name().len() + name.name().len(), |bytes, column| bytes.checked_add(column.capacity() + 64).ok_or_else(allocation_overflow),
             )?,

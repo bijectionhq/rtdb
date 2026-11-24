@@ -1639,6 +1639,11 @@ pub enum TxOp {
     /// Fence a Root relation against later writes and declarations at this transaction.
     /// Collection reclaims its storage once `retain_micros` has passed and no live world names it.
     OwnedRetireRelation { relation: rtdb_types::OwnedRelation, retain_micros: i64 },
+    #[doc(hidden)]
+    OwnedAdoptRelation {
+        source: rtdb_types::OwnedRelation, destination: rtdb_types::OwnedRelation,
+        retain_micros: i64,
+    },
     OwnedDeclareSpatialPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String> },
     OwnedDeclareEncodedSpatialPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String>, encoding: rtdb_types::SpatialGeometryEncoding },
     OwnedRequireSpatialPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, columns: Vec<String>, encoding: rtdb_types::SpatialGeometryEncoding },
@@ -1710,7 +1715,7 @@ impl TxOp {
     }
 
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedRetireRelation { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeclareVectorPath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedReplayResidue { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
+        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedRetireRelation { .. } | Self::OwnedAdoptRelation { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeclareVectorPath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedReplayResidue { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
     }
 }
 

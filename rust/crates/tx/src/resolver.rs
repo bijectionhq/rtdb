@@ -22,6 +22,7 @@ use crate::values::{BoundArgumentRow, IngestMode, LegacyOwnedPresence, plain_sca
 use crate::{ArrowDocumentWrite, ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, SourceGuard, decode_arguments, is_reserved_write_schema, table_name}};
 
 mod hosted_control;
+mod relation_adoption;
 mod prepared_landing;
 mod prepared_landing_basis;
 pub(crate) use prepared_landing::{PreparedLanding, is_landing as is_prepared_landing};
@@ -200,6 +201,14 @@ impl ResolvedTx {
                     .map_err(|error| Anomaly::incorrect("rtdb.tx/declaration-schema", error.to_string()))?;
                 &declaration_page
             };
+            let history_page;
+            let page = if write.is_adopted_history() {
+                let mut metadata = page.schema_ref().metadata().clone();
+                metadata.insert(crate::replica::ADOPTED_HISTORY_METADATA.into(), "1".into());
+                history_page = page.clone().with_schema(Arc::new(page.schema_ref().as_ref().clone().with_metadata(metadata)))
+                    .map_err(|error| relation_adoption::uncovered(error.to_string()))?;
+                &history_page
+            } else { page };
             let bytes = crate::ipc::encode(page.schema_ref(), [page], memory)?;
             let name = format!("{}/{}", table.schema, table.table);
             bound = bound.checked_add(name.capacity()).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
@@ -1224,6 +1233,8 @@ impl<'a> OpenTransaction<'a> {
                 self.declare_owned_path(relation, name, columns, OwnedPathKind::Ordered).await,
             Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                 self.drop_owned_spatial_path(relation, name).await,
+            Operation::Public(TxOp::OwnedAdoptRelation { source, destination, retain_micros }) =>
+                self.adopt_owned_relation(source, destination, *retain_micros).await,
             Operation::Public(TxOp::OwnedRetireRelation { relation, retain_micros }) =>
                 self.retire_owned_relation(relation, *retain_micros).await,
             Operation::Public(TxOp::OwnedDeclareSpatialPath { relation, name, columns }) =>
@@ -2468,6 +2479,7 @@ impl<'a> OpenTransaction<'a> {
         }
         let archive_replay = replay.is_some();
         self.check_hosted_controls(operations, source_scope, replay).await?;
+        self.check_relation_adoption(operations, source_scope, owner, has_clock_slot).await?;
         let signed_root_count = has_clock_slot && proposal_land.is_some_and(|landing| {
             landing.effect != crate::hosted_control::ProposalLandingEffect::Close
         });
@@ -2825,7 +2837,23 @@ impl<'a> OpenTransaction<'a> {
         }
         let table = relation.table(owner);
         let ordered = self.tx_key();
-        let context = self.context.query_context(snapshot, ordered.system_time, &self.options.default_tz, self.trace_parent)?;
+        let context = self.context.query_context(snapshot.clone(), ordered.system_time, &self.options.default_tz, self.trace_parent)?;
+        if let Some((predecessor, _)) = rtdb_query::read_owned_adoption(Arc::clone(&context), owner, relation).await? {
+            if self.hosted_replay.is_some() {
+                return Err(relation_adoption::uncovered("Original archive erasure needs the adopted relation and its predecessor"));
+            }
+            if snapshot.trie_catalog().retired_as_of(&predecessor.table(owner)).is_some() {
+                // A held reader can still own the old files after catalog retirement.
+                let markers = predecessor.purge_table(owner);
+                if !self.buffer.has_pending_table(&markers) {
+                    self.buffer.put(markers, StructFields::from([
+                        ("_id".into(), Value::I64(ordered.tx_id.0)),
+                    ]), Interval::ALL)?;
+                }
+            } else {
+                Box::pin(self.erase_owned(&predecessor, id, kind)).await?;
+            }
+        }
         let kind = if let Some((duration, original)) = replay_lifetime {
             if self.observed_owned_lifetime(Arc::clone(&context), owner, relation, id, duration)
                 .await?.is_some_and(|(created, expires)| created != original.lower() || expires != original.upper())

@@ -1931,6 +1931,20 @@ impl Service {
             });
             return Ok(true);
         }
+        if operation == "adopt-relation" && matches!(effects, CommitEffects::HostedRoot) {
+            if source.num_columns() != 4 || !matches!(id, EntityIdRef::String(name) if name == relation.name()) {
+                return Err(invalid("An adoption row must name its source, destination and retention"));
+            }
+            let destination = cell("destination").and_then(ArrowCell::utf8)
+                .ok_or_else(|| invalid("An adoption must name its staged destination"))?;
+            let retain_micros = cell("retain_micros").and_then(ArrowCell::int64)
+                .ok_or_else(|| invalid("An adoption must carry its signed microsecond retention"))?;
+            charge.grow_to(wire::add(charge.bytes(), relation.name().len() + destination.len())?).map_err(status)?;
+            writes.push(TxOp::OwnedAdoptRelation {
+                source: relation.clone(), destination: OwnedRelation::new(destination).map_err(status)?, retain_micros,
+            });
+            return Ok(true);
+        }
         if operation == "retire-relation" && matches!(effects, CommitEffects::HostedRoot) {
             let EntityIdRef::String(name) = id else { return Err(invalid("A relation retirement names its relation")); };
             if source.num_columns() != 3 || name != relation.name() {

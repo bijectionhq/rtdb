@@ -25,6 +25,7 @@ arrow-buffer.workspace = true
 arrow-ipc.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
+base64.workspace = true
 bytes.workspace = true
 sha2.workspace = true
 stacker.workspace = true

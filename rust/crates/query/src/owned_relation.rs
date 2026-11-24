@@ -753,6 +753,33 @@ pub async fn read_owned_lifetime_floor_table(
     floor.ok_or_else(malformed)
 }
 
+/// Reads the adoption edge at the supplied physical prefix.
+#[doc(hidden)]
+pub async fn read_owned_adoption(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+) -> Result<Option<(OwnedRelation, rtdb_types::TransactionKey)>> {
+    let id = EntityId::String(relation.name().into());
+    let columns = ["predecessor", "activation_tx", "activation_micros"];
+    let Some(mut cursor) = open_owned_table_point(
+        context, OwnedRelation::adopted_catalog(owner), id.iid(), Some(&id), None, Some(&columns), false,
+    ).await? else { return Ok(None); };
+    let malformed = || Anomaly::fault("rtdb.owned/adoption-catalog", "Invalid stored relation adoption");
+    let mut result = None;
+    while let Some(rows) = cursor.next_batch().await? {
+        let batch = rows.batch();
+        for row in 0..batch.num_rows() {
+            let cell = |name| rtdb_columnar::ArrowCell::named(batch, name, row).ok_or_else(malformed);
+            let source = cell("predecessor")?.utf8().ok_or_else(malformed)?;
+            if result.is_some() || source == relation.name() { return Err(malformed()); }
+            result = Some((OwnedRelation::new(source)?, rtdb_types::TransactionKey {
+                tx_id: rtdb_types::TxId(cell("activation_tx")?.int64().ok_or_else(malformed)?),
+                system_time: Timestamp(cell("activation_micros")?.int64().ok_or_else(malformed)?),
+            }));
+        }
+    }
+    Ok(result)
+}
+
 /// Reads the exact declared schema at the caller's admitted cut.
 pub async fn read_owned_relation_schema(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,

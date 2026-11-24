@@ -531,6 +531,8 @@ entity TablesRetiredMessage {
 
 rule RetireDueTables {
     -- A hosted Root commit retires an owned relation at a transaction, with a retention (tx.allium).
+    -- An adopted successor retains its original relation identity for ordered erasure until the predecessor's physical history can be reclaimed.
+    -- A successor erase advances both release frontiers, including the predecessor's while an admitted hold can still reference retired files.
     -- At the start of each cycle, before selecting garbage, the collector reads every principal's retired catalog at the applied present.
     -- A relation is due once its retirement time plus retention is at or before that present, and no selectable world with an earlier basis in the same principal's catalog names it in its schemas.
     -- A world remains selectable strictly before its expiry and while it has not been dropped. The catalog hold keeps already admitted dependencies through drain.

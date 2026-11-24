@@ -5199,6 +5199,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "chrono-tz",

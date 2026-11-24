@@ -929,11 +929,12 @@ async fn exercise_installed_owned_reads() {
     local.confirm_audience_route(&db, deployment).await.unwrap();
     let tx = local.latest_completed_transactions().unwrap()["shop"][0].unwrap();
     let floor = rtdb_node::AppliedReadFloor::new(deployment, vec![tx]).unwrap();
-    let session = local.session("shop", Arc::new(Reader)).unwrap();
+    let mut session = local.session("shop", Arc::new(Reader)).unwrap();
     let original = session.assertion_family_reader().unwrap();
     let cancellation = session.state().cancellation();
     let read = original.current_covering(&floor, cancellation).await.unwrap();
     assert!(tx.at_or_before(read.applied_source().unwrap()));
+    read.require_unretired_family_source().await.unwrap();
     let other_revision = rtdb_types::TransactionKey {
         system_time: rtdb_types::Timestamp(tx.system_time.0 - 1), ..tx
     };
@@ -942,6 +943,20 @@ async fn exercise_installed_owned_reads() {
     let wrong_history = rtdb_node::AppliedReadFloor::new(Uuid::new_v4(), vec![tx]).unwrap();
     assert!(original.current_covering(&wrong_history, cancellation).await.is_err());
     drop(read);
+    let sql = |sql: &str| rtdb_tx::TxOp::Sql { sql: sql.into(), args: None };
+    let declaration = session.state_mut().execute_tx(vec![
+        sql("CREATE TABLE bj_rtdb_restore_hold (_id TEXT)"),
+    ], Default::default()).await.unwrap();
+    assert!(declaration.committed(), "{:?}", declaration.error());
+    original.current(deployment, session.state().cancellation()).await.unwrap()
+        .require_unretired_family_source().await.unwrap();
+    let fence = session.state_mut().execute_tx(vec![sql(
+        "INSERT INTO bj_rtdb_restore_hold (_id, _valid_from) VALUES \
+         ('archive-source-fence.v1', TIMESTAMP WITH TIME ZONE '1970-01-01 00:00:00+00:00')",
+    )], Default::default()).await.unwrap();
+    assert!(fence.committed(), "{:?}", fence.error());
+    assert!(original.current(deployment, session.state().cancellation()).await.unwrap()
+        .require_unretired_family_source().await.is_err());
     drop(session);
     let prepaid = local.memory().prepay(32 << 20).unwrap();
     let cache = rtdb_storage::cache::CacheBudget::with_memory(local.memory().prepay(32 << 20).unwrap());

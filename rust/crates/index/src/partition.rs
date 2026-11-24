@@ -333,6 +333,9 @@ impl PartitionState {
 
     pub fn apply(&self, write: &StagedWrite) -> Result<()> {
         let mut value = self.value.write();
+        if write.tables().values().any(crate::TableWrite::is_adopted_history) {
+            value.snapshot().require_virgin_adoption(write)?;
+        }
         let mut live = value.live.apply(write)?;
         live.search = None;
         let table_catalog = value.table_catalog.with_entries_for(write.tables().keys().cloned())?;
@@ -345,6 +348,9 @@ impl PartitionState {
 
     pub fn prepare_write(&self, write: &StagedWrite) -> Result<PreparedWrite> {
         let captured = self.value();
+        if write.tables().values().any(crate::TableWrite::is_adopted_history) {
+            captured.snapshot().require_virgin_adoption(write)?;
+        }
         let written: Vec<_> = write.tables().keys().cloned().collect();
         let mut next = captured.as_ref().clone();
         next.live = Arc::new(captured.live.apply(write)?);

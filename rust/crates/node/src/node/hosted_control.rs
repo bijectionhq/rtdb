@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rtdb_plan::Catalog;
 use rtdb_query::{HostedControlPoint, QueryCursor};
 use rtdb_tx::HostedControlWrite;
 use rtdb_types::{
@@ -13,6 +14,12 @@ use super::{
     AppliedReadFloor, CatalogReadCut, Database, NativeSession, Node, OwnedReadSession, QueryBasis, SessionIdentity, TimeBasis,
     covers_transaction, hosted_source_unavailable, prepare_query,
 };
+
+mod retired_original;
+pub use retired_original::{RetiredOriginalFamilyRead, RetiredOriginalFamilySource};
+
+const RESTORE: &str = "bj_rtdb_restore_hold";
+const ARCHIVE_FENCE: &str = "archive-source-fence.v1";
 
 #[derive(Clone, Copy)]
 pub enum RootCatalogRead {
@@ -139,6 +146,17 @@ pub struct CurrentAssertionFamilyRead {
 }
 
 impl CurrentAssertionFamilyRead {
+    pub async fn require_unretired_family_source(&self) -> Result<()> {
+        let catalog = self.context.catalog.database(self.context.catalog.default_database())?;
+        let [partition] = catalog.partitions.as_slice() else { return Err(hosted_source_unavailable()); };
+        if partition.contains_table(&TableRef::new("public", RESTORE))
+            && self.carrier_point(RESTORE, ARCHIVE_FENCE).await?.row.is_some()
+        {
+            return Err(hosted_source_unavailable());
+        }
+        Ok(())
+    }
+
     pub fn applied_source(&self) -> Option<TransactionKey> {
         self.applied_source
     }
@@ -154,12 +172,7 @@ impl CurrentAssertionFamilyRead {
     }
 
     async fn carrier_point(&self, relation: &str, key: &str) -> Result<HostedControlPoint> {
-        let point = rtdb_query::read_hosted_control_point(
-            Arc::clone(&self.context), TableRef::new("public", relation),
-            &EntityId::String(key.to_owned()), true,
-        ).await?;
-        self.context.check_cancelled()?;
-        Ok(point)
+        read_carrier_point(&self.context, relation, key).await
     }
 
     pub async fn assertion_family_fence(&self, family: Uuid) -> Result<Option<AssertionFamilyFenceMarker>> {
@@ -183,6 +196,14 @@ impl CurrentAssertionFamilyRead {
         self.context.check_cancelled()?;
         Ok(registration.map(|(world, _)| world))
     }
+}
+
+async fn read_carrier_point(
+    context: &Arc<rtdb_query::QueryContext>, relation: &str, key: &str,
+) -> Result<HostedControlPoint> {
+    rtdb_query::read_hosted_control_point(
+        Arc::clone(context), TableRef::new("public", relation), &EntityId::String(key.to_owned()), true,
+    ).await
 }
 
 #[derive(Clone)]

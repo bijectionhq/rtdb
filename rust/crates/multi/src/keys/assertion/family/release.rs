@@ -549,6 +549,7 @@ struct OriginalFamilyDelivery {
 impl rtdb_storage::sealing::PlaintextReleaseCheck for OriginalFamilyDelivery {
     async fn require_current(&self) -> Result<()> {
         let current = self.original.current(self.deployment, &self.cancellation).await?;
+        current.require_unretired_family_source().await?;
         if current.assertion_family_fence(self.family).await?.is_some() {
             return Err(rtdb_storage::Error::ErasedUnderView.into());
         }

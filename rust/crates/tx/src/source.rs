@@ -149,7 +149,8 @@ impl SourceTransaction {
     pub fn requires_durable_predecessor(&self) -> bool {
         crate::resolver::is_prepared_landing(&self.operations) || self.uses_staging_deadline()
             || self.operations.iter().any(|operation| matches!(operation,
-                Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()))
+                Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker())
+                || matches!(operation, Operation::Public(TxOp::OwnedAdoptRelation { .. })))
     }
 
     pub fn uses_staging_deadline(&self) -> bool {
@@ -175,6 +176,8 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                     (relation.name().len() + name.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedRetireRelation { relation, .. }) => (relation.name().len(), None, 0),
+                Operation::Public(TxOp::OwnedAdoptRelation { source, destination, .. }) =>
+                    (source.name().len() + destination.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     (relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. }) =>
@@ -496,6 +499,8 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDropSpatialPath { relation, name }) =>
                     relation.name().len() + name.name().len(),
                 Operation::Public(TxOp::OwnedRetireRelation { relation, .. }) => relation.name().len(),
+                Operation::Public(TxOp::OwnedAdoptRelation { source, destination, .. }) =>
+                    source.name().len() + destination.name().len(),
                 Operation::Public(TxOp::OwnedDeclareRelation { relation, schema }) =>
                     relation.name().len().checked_add(schema.retained_bytes()).ok_or_else(overflow)?,
                 Operation::Public(TxOp::OwnedDeclarePath { relation, name, columns } | TxOp::OwnedDeclareSpatialPath { relation, name, columns } | TxOp::OwnedDeclareEncodedSpatialPath { relation, name, columns, .. } | TxOp::OwnedRequireSpatialPath { relation, name, columns, .. }) =>
@@ -805,6 +810,12 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
             body.insert("schema".into(), Value::Binary(schema.to_json()?));
             "rtdb-owned-relation-v1"
+        }
+        Operation::Public(TxOp::OwnedAdoptRelation { source, destination, retain_micros }) => {
+            body.insert("source".into(), Value::Utf8(source.name().into()));
+            body.insert("destination".into(), Value::Utf8(destination.name().into()));
+            body.insert("retain_micros".into(), Value::I64(*retain_micros));
+            "rtdb-owned-adopt-relation-v1"
         }
         Operation::Public(TxOp::OwnedRetireRelation { relation, retain_micros }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -2615,6 +2626,16 @@ impl SourceOperationReader<'_> {
                     schema: rtdb_types::OwnedSchema::from_json(&schema)?,
                 }
             }
+            "rtdb-owned-adopt-relation-v1" => {
+                let (Value::Utf8(source), Value::Utf8(destination), Value::I64(retain_micros)) =
+                    (value("source")?, value("destination")?, value("retain_micros")?)
+                else { return Err(invalid("Owned relation adoption has invalid fields")); };
+                TxOp::OwnedAdoptRelation {
+                    source: rtdb_types::OwnedRelation::new(source)?,
+                    destination: rtdb_types::OwnedRelation::new(destination)?,
+                    retain_micros,
+                }
+            }
             "rtdb-owned-retire-relation-v1" => {
                 let (Value::Utf8(relation), Value::I64(retain_micros)) = (value("relation")?, value("retain_micros")?)
                     else { return Err(invalid("Owned relation retirement has invalid fields")); };
@@ -3519,6 +3540,22 @@ mod tests {
         assert!(matches!(replayed.operations.as_slice(), [Operation::Public(TxOp::OwnedRetireRelation {
             relation: actual, retain_micros: 86_400_000_000,
         })] if actual == &relation));
+    }
+
+    #[test]
+    fn a_relation_adoption_replays_with_its_exact_endpoints_and_retention() {
+        let memory = budget();
+        let original = rtdb_types::OwnedRelation::new("fact_original").unwrap();
+        let successor = rtdb_types::OwnedRelation::new("fact_successor").unwrap();
+        let source = SourceTransaction::new(vec![TxOp::OwnedAdoptRelation {
+            source: original.clone(), destination: successor.clone(), retain_micros: 5000,
+        }], SubmitOptions::default(), &memory).unwrap();
+        let replayed = roundtrip(&source);
+        assert!(replayed.requires_durable_predecessor());
+        assert!(matches!(replayed.operations.as_slice(), [Operation::Public(TxOp::OwnedAdoptRelation {
+            source, destination, retain_micros: 5000,
+        })] if source == &original && destination == &successor));
+        assert_eq!(source.body_digest().unwrap(), replayed.body_digest().unwrap());
     }
 
     #[test]

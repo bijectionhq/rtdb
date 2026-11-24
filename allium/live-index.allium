@@ -26,6 +26,8 @@
 --   A world omission consumes its original ordinal and is retained beside the archive receipt.
 --   A resolved archive replay accounts for every original ordinal exactly once, as a stored effect or a retained omission.
 --   The owned relation's routing inventory reads the applied data, change-journal and purge event frontiers under the same snapshot.
+--   An adopted Root baseline stages one virgin data and journal pair under the accepting transaction while preserving the copied rows' original positions and times.
+--   The admitting transaction controls when the populated successor becomes visible and the baseline contributes to its ordinary cumulative table and journal counts.
 --   A relation is exhausted when its data and purge frontiers are zero and its serving trie inventory is empty.
 --   A feed is exhausted when the relation is exhausted and its change journal also has a zero frontier and no serving tries.
 --   A nested retained world stores an ordered, bounded prefix of original parent registrations and selected cuts in its own world record.
