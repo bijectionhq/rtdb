@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_schema::DataType;
 use rtdb_columnar::{ArrowCell, MemoryBudget};
+use rtdb_format::keys::spatial_posting_id;
 use rtdb_index::Snapshot;
 use rtdb_maintenance::ArtefactDefinition;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryCursor, QueryOptions};
@@ -9,8 +10,7 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, OwnedRelation, Result, SpatialGeometryEncoding, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const KIND: &str = "spatial";
-const FILE_VERSION: u32 = 2;
+pub(crate) use rtdb_format::keys::SPATIAL_ARTEFACT_KIND as KIND;
 
 pub(crate) struct Definition {
     pub(crate) name: String,
@@ -23,7 +23,7 @@ pub(crate) struct Definition {
 
 impl Definition {
     pub(crate) fn artefact_id(&self) -> String {
-        format!("{}~f{}", self.name, FILE_VERSION)
+        spatial_posting_id(&self.name)
     }
 
     pub(crate) fn artefact(&self) -> ArtefactDefinition {

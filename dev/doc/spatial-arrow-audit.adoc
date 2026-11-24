@@ -69,8 +69,12 @@ A probe whose matches exceed the ceilings, have duplicate identities, or cannot 
 | It reads the path name, table, columns, and generation from typed Arrow cells.
 
 | RTDB spatial posting read
-| The file reader copied individual page bodies from the cached IPC allocation.
-| Validated page ranges become Arrow buffer slices of the existing cache lease.
+| A narrow scan authenticated the entire posting object before applying the partition and cell fences.
+| The held catalog authenticates the directory and Arrow footer.
+Partition and cell fences select the page ranges, and the reader authenticates each selected page before visiting its Arrow rows.
+Range-capable stores fetch the directory and selected pages, including sealed stores for the new posting format.
+Stores with whole-object reads lend slices of one funded allocation.
+An invalid directory or page uses the held trie's bounded IID fallback.
 
 | RTDB held document projection
 | The scan selected a separate one-row document batch for each provisional hit and copied those rows again into the result.

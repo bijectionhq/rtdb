@@ -131,6 +131,21 @@ pub fn is_compacted_catalog_file(key: &str) -> bool {
         .is_some_and(|(owner, _, _, _)| matches!(owner, ArtefactOwner::Trie(trie) if trie.level() > 0))
 }
 
+pub const SPATIAL_ARTEFACT_KIND: &str = "spatial";
+const SPATIAL_POSTING_SUFFIX: &str = "~f3";
+
+pub fn spatial_posting_id(name: &str) -> String {
+    format!("{name}{SPATIAL_POSTING_SUFFIX}")
+}
+
+pub fn is_ranged_spatial_artefact(key: &str) -> bool {
+    let Some((prefix, _)) = key.strip_prefix("tables/").and_then(|tail| tail.split_once("/spatial/")) else { return false; };
+    let Some((slug, _)) = prefix.split_once("/artefacts/") else { return false; };
+    TableSlug::recorded(slug).ok().and_then(|slug| slug.parse_artefact_key(key))
+        .is_some_and(|(owner, kind, id, _)| matches!(owner, ArtefactOwner::Trie(_))
+            && kind == SPATIAL_ARTEFACT_KIND && id.ends_with(SPATIAL_POSTING_SUFFIX))
+}
+
 /// Serving catalog paths covered by the bounded exact reader inventory.
 pub fn is_catalog_retirement_file(key: &str) -> bool {
     is_compacted_catalog_file(key) || crate::search_manifest::is_run_key(key)
