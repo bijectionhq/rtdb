@@ -528,6 +528,7 @@ impl Session {
         self.parameters.retain(|name, _| name == "application_name");
         self.timezone = self.initial_timezone.clone();
         self.replace_await_token(None);
+        self.last_submitted = None;
         self.default_access_mode = None;
         self.settings_revision = self.settings_revision.wrapping_add(1);
         Ok(())

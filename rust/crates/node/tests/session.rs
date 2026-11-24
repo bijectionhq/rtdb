@@ -252,6 +252,16 @@ async fn awaited_writes_merge_tokens_across_database_changes_and_capture_identit
 }
 
 #[tokio::test]
+async fn discard_all_clears_the_last_submitted_transaction_with_the_await_token() {
+    let service = Service::new(); let mut session = service.session();
+    session.execute_operation(operation()).await.unwrap();
+    assert!(session.last_submitted().is_some() && session.effective_await_token().is_some());
+    session.reset().unwrap();
+    assert!(session.last_submitted().is_none());
+    assert!(session.effective_await_token().is_none());
+}
+
+#[tokio::test]
 async fn read_only_await_override_shadows_connection_token_only_within_transaction() {
     let service = Service::new(); let mut session = service.session();
     let token = encode_tx_basis(&TxBasis { databases: BTreeMap::from([("xtdb".into(), vec![TxId(8)])]) });
