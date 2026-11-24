@@ -73,7 +73,16 @@ The worker reads that object from the exact writer epoch recorded by Logkeeper a
 The custodian obtains an ordered checkpoint preparation before copying data. The preparation keeps the exact source cut and its base alive. A replacement can use the completed provider manifest or continue the copy from the original immutable serving prefix.
 With no prior preparation, the custodian can discover a chosen native boundary and upload, verify the original catalog, and prepare its provider copy independently of the writer grant.
 The scan is tied to the exact selected base and the newest chosen maintenance cut at the start of inspection.
-A changed base invalidates the scan, and staging still requires the new ordered preparation. An accepted block upload carries the digest of its exact encoded catalog. Installed recovery requires that digest before adopting or confirming the catalog. Before staging a new copy, the custodian reads and decodes the chosen native block boundary under the exact preparation. Publication and trim use the custodian identity independently of the writer grant. Trim names the exact currently selected reconstructable root and retains every suffix still held by an overlapping read or attachment. Its receipt names the old floor and the resulting floor and totals the encoded bytes released by append class. Ordinary windows replenish from the reusable voter space reported by the installed journal. On ordinary capacity pressure, the driver pauses ordinary intake, preserves the previously accepted source prefix, and uses the maintenance lane for block boundaries and uploads. The custodian queries the exact candidate cut and orders preparation without borrowing an ordinary read hold.
+A changed base invalidates the scan, and staging still requires the new ordered preparation.
+An accepted block upload carries the digest of its exact encoded catalog.
+Installed recovery requires that digest before adopting or confirming the catalog.
+Before staging a new copy, the custodian reads and decodes the chosen native block boundary under the exact preparation.
+Publication and trim use the custodian identity independently of the writer grant.
+Trim names the exact currently selected reconstructable root and retains every suffix still held by an overlapping read or attachment.
+Its receipt names the old floor and the resulting floor and totals the encoded bytes released by append class.
+Ordinary windows replenish from the reusable voter space reported by the installed journal.
+On ordinary capacity pressure, the driver pauses ordinary intake, preserves the previously accepted source prefix, and uses the maintenance lane for block boundaries and uploads.
+The custodian queries the exact candidate cut and orders preparation without borrowing an ordinary read hold.
 
 An installed driver promotes after an empty replica read and a positive check of the current grant.
 It starts the successor of the highest observed replica term at sequence zero.
