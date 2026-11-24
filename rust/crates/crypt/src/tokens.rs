@@ -97,6 +97,11 @@ pub struct TokenAuthority {
     keys: Arc<dyn TokenKeys>,
 }
 
+pub struct TokenIssuer {
+    authority: TokenAuthority,
+    key: TokenKey,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PageToken {
     pub basis: Basis,
@@ -147,18 +152,11 @@ impl TokenAuthority {
     }
 
     pub async fn seal_claim(&self, evidence: &ClaimEvidence) -> Result<Claim> {
-        if evidence.scope.basis.incarnation() != *self.incarnation.as_bytes()
-            || !valid_branch_name(&evidence.scope.branch)
-        {
-            return Err(Purpose::Claim.invalid());
-        }
-        let bytes =
-            Zeroizing::new(serde_json::to_vec(evidence).map_err(|_| Purpose::Claim.invalid())?);
-        Ok(Claim::from_bytes(self.seal(Purpose::Claim, &bytes).await?))
+        self.issuer().await?.seal_claim(evidence).await
     }
 
     pub async fn open_claim(&self, claim: &Claim) -> Result<ClaimEvidence> {
-        let bytes = self.open(Purpose::Claim, claim.as_bytes()).await?;
+        let (bytes, _) = self.open(Purpose::Claim, claim.as_bytes()).await?;
         let evidence: ClaimEvidence =
             serde_json::from_slice(&bytes).map_err(|_| Purpose::Claim.invalid())?;
         if evidence.scope.basis.incarnation() != *self.incarnation.as_bytes()
@@ -183,18 +181,23 @@ impl TokenAuthority {
     }
 
     pub async fn seal_page(&self, page: &PageToken) -> Result<Vec<u8>> {
-        if page.basis.incarnation() != *self.incarnation.as_bytes() {
-            return Err(Purpose::Page.invalid());
-        }
-        let mut bytes = page.basis.to_bytes().to_vec();
-        bytes.extend_from_slice(&page.clock.0.to_be_bytes());
-        bytes.extend_from_slice(&page.offset.to_be_bytes());
-        bytes.extend_from_slice(&page.request);
-        self.seal(Purpose::Page, &bytes).await
+        self.issuer().await?.seal_page(page).await
     }
 
     pub async fn open_page(&self, token: &[u8]) -> Result<PageToken> {
-        let bytes = self.open(Purpose::Page, token).await?;
+        self.resume_page(token).await.map(|(page, _)| page)
+    }
+
+    pub async fn issuer(&self) -> Result<TokenIssuer> {
+        let key = self.keys.current().await?;
+        if key.generation.database != self.incarnation {
+            return Err(invalid_metadata());
+        }
+        Ok(TokenIssuer { authority: self.clone(), key })
+    }
+
+    pub async fn resume_page(&self, token: &[u8]) -> Result<(PageToken, TokenIssuer)> {
+        let (bytes, key) = self.open(Purpose::Page, token).await?;
         let invalid = || Purpose::Page.invalid();
         let (basis, bytes) = bytes
             .split_first_chunk::<{ Basis::WIDTH }>()
@@ -205,12 +208,13 @@ impl TokenAuthority {
         if basis.incarnation() != *self.incarnation.as_bytes() {
             return Err(invalid());
         }
-        Ok(PageToken {
+        let page = PageToken {
             basis,
             clock: Timestamp(i64::from_be_bytes(*clock)),
             offset: u64::from_be_bytes(*offset),
             request: request.try_into().map_err(|_| invalid())?,
-        })
+        };
+        Ok((page, TokenIssuer { authority: self.clone(), key }))
     }
 
     pub async fn check_claim_readable(&self, claim: &Claim) -> Result<()> {
@@ -231,16 +235,12 @@ impl TokenAuthority {
             .await
     }
 
-    async fn seal(&self, purpose: Purpose, plaintext: &[u8]) -> Result<Vec<u8>> {
+    async fn seal(&self, key: &TokenKey, purpose: Purpose, plaintext: &[u8]) -> Result<Vec<u8>> {
         if plaintext.len() > purpose.max_payload() {
             return Err(purpose.invalid());
         }
-        let key = self.keys.current().await?;
         let generation = key.generation;
-        if generation.database != self.incarnation {
-            return Err(invalid_metadata());
-        }
-        let material = self.material(&key).await?;
+        let material = self.material(key).await?;
         let mut header = FORMAT.to_vec();
         header.extend_from_slice(generation.database.as_bytes());
         header.extend_from_slice(&generation.number.to_be_bytes());
@@ -253,7 +253,7 @@ impl TokenAuthority {
         Ok(header)
     }
 
-    async fn open(&self, purpose: Purpose, token: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    async fn open(&self, purpose: Purpose, token: &[u8]) -> Result<(Zeroizing<Vec<u8>>, TokenKey)> {
         let (header, number, ciphertext) = self.split(purpose, token)?;
         let key = self
             .keys
@@ -274,7 +274,7 @@ impl TokenAuthority {
                 .map_err(|_| purpose.invalid())?,
         );
         self.kms.check_readable(generation).await?;
-        Ok(bytes)
+        Ok((bytes, key))
     }
 
     fn split<'a>(&self, purpose: Purpose, token: &'a [u8]) -> Result<(&'a [u8], u64, &'a [u8])> {
@@ -300,6 +300,34 @@ impl TokenAuthority {
                 &wrapping_context(key.generation),
             )
             .await
+    }
+}
+
+impl TokenIssuer {
+    pub async fn seal_claim(&self, evidence: &ClaimEvidence) -> Result<Claim> {
+        if evidence.scope.basis.incarnation() != *self.authority.incarnation.as_bytes()
+            || !valid_branch_name(&evidence.scope.branch)
+        {
+            return Err(Purpose::Claim.invalid());
+        }
+        let bytes =
+            Zeroizing::new(serde_json::to_vec(evidence).map_err(|_| Purpose::Claim.invalid())?);
+        Ok(Claim::from_bytes(self.authority.seal(&self.key, Purpose::Claim, &bytes).await?))
+    }
+
+    pub async fn seal_page(&self, page: &PageToken) -> Result<Vec<u8>> {
+        if page.basis.incarnation() != *self.authority.incarnation.as_bytes() {
+            return Err(Purpose::Page.invalid());
+        }
+        let mut bytes = page.basis.to_bytes().to_vec();
+        bytes.extend_from_slice(&page.clock.0.to_be_bytes());
+        bytes.extend_from_slice(&page.offset.to_be_bytes());
+        bytes.extend_from_slice(&page.request);
+        self.authority.seal(&self.key, Purpose::Page, &bytes).await
+    }
+
+    pub async fn check_readable(&self) -> Result<()> {
+        self.authority.kms.check_readable(self.key.generation).await
     }
 }
 
@@ -465,12 +493,17 @@ mod tests {
         assert_ne!(claim, replacement);
         assert_eq!(rotated.open_claim(&claim).await.unwrap(), evidence);
         assert_eq!(rotated.open_page(&resume).await.unwrap(), page);
+        let (resumed, issuer) = rotated.resume_page(&resume).await.unwrap();
+        assert_eq!(issuer.seal_claim(&evidence).await.unwrap(), claim);
+        let next_page = issuer.seal_page(&PageToken { offset: 4, ..resumed }).await.unwrap();
         let verified = rotated
             .verify_claims([&claim, &replacement, &replacement])
             .await;
         assert_eq!(verified.verify(&claim).unwrap(), evidence);
 
         now.store(20, Ordering::Relaxed);
+        assert_eq!(issuer.check_readable().await.unwrap_err().code, "rtdb/erased-under-view");
+        assert_eq!(rotated.open_page(&next_page).await.unwrap_err().code, "rtdb/erased-under-view");
         assert_eq!(
             rotated.open_claim(&claim).await.unwrap_err().code,
             "rtdb/erased-under-view"

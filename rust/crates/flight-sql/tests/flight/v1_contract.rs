@@ -233,8 +233,8 @@ async fn rtdb_v1_tokens_survive_database_and_flight_restart() {
     let authority = database.token_authority().await.unwrap();
     let before = Claim::from_bytes(first.claim.unwrap().value);
     let after = Claim::from_bytes(second.claim.unwrap().value);
-    assert_ne!(before, after);
-    assert_eq!(authority.open_claim(&before).await.unwrap(), authority.open_claim(&after).await.unwrap());
+    assert_eq!(before, after);
+    assert_eq!(authority.open_claim(&before).await.unwrap().scope.branch, "main");
     rerouted.stop().await;
 
     let foreign = Running::start(None, FlightConfig::default()).await;

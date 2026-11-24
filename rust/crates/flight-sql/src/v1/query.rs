@@ -5,10 +5,10 @@ use std::{
 
 use arrow_flight::FlightData;
 use prost::Message;
-use rtdb_crypt::tokens::{PageToken, TokenAuthority};
+use rtdb_crypt::tokens::{PageToken, TokenIssuer};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
 use rtdb_query::{QueryContext, QueryCursor};
-use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{Claim, ClaimEvidence, ClaimFootprint, ClaimScope, Layer}};
+use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimScope, Layer}};
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -82,9 +82,8 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
 struct OpenedQuery {
     cursor: QueryCursor,
     database: Arc<Database>,
-    authority: Option<TokenAuthority>,
+    issuer: Option<TokenIssuer>,
     page: PageToken,
-    after: Vec<u8>,
     limit: u64,
     trailer: proto::QueryTrailer,
 }
@@ -95,7 +94,7 @@ impl Service {
         call: Call,
         request: proto::QueryRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
-        let OpenedQuery { mut cursor, database, authority, page, after, limit, trailer: mut trailer_msg } = self
+        let OpenedQuery { mut cursor, database, issuer, page, limit, trailer: mut trailer_msg } = self
             .open_v1_query(&call, request)
             .await
             .map_err(|status| call.error(status))?;
@@ -134,24 +133,19 @@ impl Service {
                 let Some((data, more)) = encoded else { break; };
                 for item in data {
                     service.check_attachment(&call, &database)?;
+                    if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
                     call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
                     yield item;
                 }
                 if more {
                     let next = PageToken { offset: page.offset.checked_add(sent).ok_or_else(|| error::incorrect("Page offset overflow"))?, ..page };
-                    let authority = authority.as_ref().ok_or_else(|| error::unsupported("query.page"))?;
-                    trailer_msg.next = Some(authority.seal_page(&next).await.map_err(error::anomaly)?);
+                    let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("query.page"))?;
+                    trailer_msg.next = Some(issuer.seal_page(&next).await.map_err(error::anomaly)?);
                     break;
                 }
             }
             if skip != 0 { Err(cursor_expired())?; }
-            if let Some(authority) = &authority {
-                if !after.is_empty() { authority.check_page_readable(&after).await.map_err(error::anomaly)?; }
-                if let Some(next) = &trailer_msg.next { authority.check_page_readable(next).await.map_err(error::anomaly)?; }
-                if let Some(claim) = &trailer_msg.claim {
-                    authority.check_claim_readable(&Claim::from_bytes(claim.value.clone())).await.map_err(error::anomaly)?;
-                }
-            }
+            if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
             service.check_attachment(&call, &database)?;
             call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
@@ -196,17 +190,16 @@ impl Service {
             }
             None => (u64::MAX, &[][..]),
         };
-        let continuation = if after.is_empty() {
-            None
-        } else {
-            let authority = authority.as_ref().ok_or_else(|| error::unsupported("query.page"))?;
-            let page = authority.open_page(after).await.map_err(error::anomaly)?;
-            if page.request != request_hash {
-                return Err(error::incorrect(
-                    "Continuation belongs to a different query",
-                ));
+        let (continuation, issuer) = match authority {
+            Some(authority) if !after.is_empty() => {
+                let (page, issuer) = authority.resume_page(after).await.map_err(error::anomaly)?;
+                if page.request != request_hash {
+                    return Err(error::incorrect("Continuation belongs to a different query"));
+                }
+                (Some(page), Some(issuer))
             }
-            Some(page)
+            Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
+            None => (None, None),
         };
         let minimum = match (continuation, selection) {
             (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
@@ -272,12 +265,12 @@ impl Service {
             .prepare(scope, &request.sql, &context, types)?;
         let (cursor, footprint) = open_query(prepared, context, parameters.as_ref(), request.track).await?;
         let claim = if request.track {
-            let authority = authority.as_ref().ok_or_else(|| error::unsupported("query.track"))?;
+            let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("query.track"))?;
             let evidence = ClaimEvidence {
                 scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: Layer::Merged },
                 footprint,
             };
-            let value = authority.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
+            let value = issuer.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
             Some(proto::Claim { value })
         } else { None };
         let trailer = proto::QueryTrailer {
@@ -286,7 +279,7 @@ impl Service {
             claim,
             next: None,
         };
-        Ok(OpenedQuery { cursor, database, authority, page, after: after.to_vec(), limit, trailer })
+        Ok(OpenedQuery { cursor, database, issuer, page, limit, trailer })
     }
 }
 

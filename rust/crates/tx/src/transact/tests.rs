@@ -76,6 +76,7 @@ fn claim_guards_detect_writes_to_rows_and_both_sides_of_index_moves() {
     }]));
     let mut validation = request(5, Vec::new());
     validation.guards.push(Guard::Unchanged(Claim::from_bytes(Vec::new())));
+    assert_eq!(validation.claims().count(), 1);
     let outcome = |state: &TransactState, claim: &Verified| {
         let Resolution::Answer(receipt) = state.resolve(&validation, 7, Timestamp(70), DEFAULT, claim).unwrap() else {
             panic!("claim validation must answer at the applied cut");

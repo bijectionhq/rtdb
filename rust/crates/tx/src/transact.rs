@@ -31,6 +31,15 @@ pub struct Transact {
     pub otherwise: Vec<Op>,
 }
 
+impl Transact {
+    pub fn claims(&self) -> impl Iterator<Item = &Claim> {
+        self.guards.iter().filter_map(|guard| match guard {
+            Guard::Unchanged(claim) => Some(claim),
+            _ => None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub enum Guard {
     Unchanged(Claim),

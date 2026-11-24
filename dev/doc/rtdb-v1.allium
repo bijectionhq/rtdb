@@ -38,6 +38,7 @@ surface StatelessDatabase {
         -- A successful final page has no continuation.
         -- Any authorized route to the same database incarnation can redeem a continuation while its cut and key generation are readable.
         -- A continuation binds its query, execution clock and next offset to the captured basis.
+        -- Successive pages preserve the original token generation and share its retirement deadline.
 
     @guarantee RankedReads
         -- Text search returns matching rows ordered by descending relevance score.
