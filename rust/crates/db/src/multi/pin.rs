@@ -145,7 +145,7 @@ impl MultiDatabase {
             return state.transactions.index().exact(Basis::new(destination, origin.through));
         }
         if state.transactions.index().head().basis.position() != 0
-            || state.records.iter().any(|record| !matches!(record, Record::Lease { .. }))
+            || state.records.iter().any(|record| !matches!(record, Record::Lease { .. } | Record::WriterRelease { .. }))
         {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/restore-not-empty", "Restore needs a fresh deployment"));
         }

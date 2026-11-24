@@ -849,7 +849,9 @@ contract ObjectStorage {
 
 contract FencedStreamWriter {
     @invariant OrderedAuthority
-        -- A node may attempt takeover if rendezvous ranking selects it and the last observed lease has lapsed beyond the clock drift allowance.
+        -- A node may attempt takeover if rendezvous ranking selects it and the previous writer released its lease or the lease has lapsed beyond the clock drift allowance.
+        -- A writer that observes a new preferred node settles pending work and orders release against its current lease.
+        -- No later record in the released epoch can change the applied state.
         -- A new stream with an empty committed prefix is eligible for its first seal.
         -- A candidate replays through the end returned by its seal before it publishes its lease.
         -- A journal record authenticates its writer epoch and position.

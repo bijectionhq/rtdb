@@ -675,6 +675,10 @@ impl MultiDatabase {
         self.catch_up(head).await?;
         self.require_authority(lease)?;
         let state = self.committed.as_ref().ok_or_else(no_writer)?;
+        if state.released == Some(lease.epoch) {
+            self.withdraw_writer();
+            return Ok(());
+        }
         if state.epoch > lease.epoch
             || acknowledged.0.saturating_add(1) < state.floor.0
             || head < acknowledged

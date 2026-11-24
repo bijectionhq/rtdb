@@ -395,6 +395,25 @@ async fn multi_driver_dueling_dns_views_keep_one_epoch_until_the_winner_lapses()
 }
 
 #[tokio::test]
+async fn multi_driver_hands_off_a_settled_writer_after_a_lost_release_reply() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(Identity(1)))));
+    let mut first = cluster.node(1, faults.clone());
+    let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
+    first.create().await.unwrap();
+    first.tick(&live(1)).await.unwrap();
+    let prior = first.transact(&put(1, 1, "released writer")).await.unwrap();
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Follower);
+
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(first.tick(&live(2)).await.unwrap_err().category, AnomalyCategory::Interrupted);
+    assert_eq!(successor.tick(&live(2)).await.unwrap(), Role::Writer(Epoch(2)));
+    assert_eq!(successor.tx_status(&prior.key).await.unwrap().basis, prior.basis);
+    assert_eq!(first.transact(&put(2, 2, "no prior authority")).await.unwrap_err().code, "rtdb/no-writer");
+}
+
+#[tokio::test]
 async fn multi_driver_abandoned_seal_allows_one_replacement_after_its_grace_period() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();

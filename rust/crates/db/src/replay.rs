@@ -70,6 +70,7 @@ pub(crate) struct Committed {
     pub(crate) epoch: Epoch,
     pub(crate) generation: u64,
     pub(crate) lease: Option<(Epoch, i64)>,
+    pub(crate) released: Option<Epoch>,
     pub(crate) records: Vec<Record>,
     pub(crate) effects: Vec<AppliedEffects>,
     pub(crate) rotation: Option<Rotation>,
@@ -85,6 +86,7 @@ impl Committed {
             epoch: Epoch(0),
             generation: 1,
             lease: None,
+            released: None,
             records: Vec::new(),
             effects: Vec::new(),
             rotation: None,
@@ -162,7 +164,7 @@ impl Committed {
                 if checkpoint.restore && (self.transactions.index().head().basis.position() != 0
                     || self.coordinates.origin.is_some() || self.rotation.is_some()
                     || checkpoint.key_generation != self.generation
-                    || self.records.iter().any(|record| !matches!(record, Record::Lease { .. })))
+                    || self.records.iter().any(|record| !matches!(record, Record::Lease { .. } | Record::WriterRelease { .. })))
                 {
                     return Err(invalid("Restore requires a fresh deployment"));
                 }
@@ -178,6 +180,9 @@ impl Committed {
     pub(crate) fn apply(&mut self, lsn: Lsn, entry: Entry) -> Result<Option<Receipt>> {
         if lsn != next(self.head)? || entry.epoch < self.epoch {
             return Err(invalid("The journal records are out of order"));
+        }
+        if self.released == Some(entry.epoch) {
+            return Err(invalid("A released writer epoch cannot append again"));
         }
         if let Some(rotation) = self.rotation
             && !rotation.committed
@@ -235,6 +240,18 @@ impl Committed {
                     return Err(invalid("The writer lease did not advance"));
                 }
                 self.lease = Some((entry.epoch, *until));
+                self.generation
+            }
+            Record::WriterRelease { lease_until } => {
+                if self.lease != Some((entry.epoch, *lease_until))
+                    || self.transactions.recover_pending().is_some()
+                    || self.transactions.pending_erasure().is_some()
+                    || self.rotation.is_some_and(|rotation| !rotation.retirement_armed)
+                {
+                    return Err(invalid("Writer release does not close a settled current lease"));
+                }
+                self.lease = None;
+                self.released = Some(entry.epoch);
                 self.generation
             }
             Record::Checkpoint(checkpoint) => {

@@ -145,6 +145,9 @@ pub enum Record {
         unreadable_by: Option<i64>,
         armed: bool,
     },
+    WriterRelease {
+        lease_until: i64,
+    },
 }
 
 impl Record {

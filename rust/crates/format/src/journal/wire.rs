@@ -6,7 +6,7 @@ use super::{ObjectKind, invalid, require_kind};
 
 #[derive(Message)]
 pub(super) struct Record {
-    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "Kind", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     kind: Option<Kind>,
 }
 
@@ -30,6 +30,8 @@ enum Kind {
     Refuse(TimedDecision),
     #[prost(message, tag = "9")]
     KeyRetirement(KeyRetirement),
+    #[prost(message, tag = "10")]
+    WriterRelease(Lease),
 }
 
 #[derive(Message)]
@@ -148,6 +150,7 @@ impl TryFrom<&super::Record> for Record {
                     armed: *armed,
                 })
             }
+            WriterRelease { lease_until } => Kind::WriterRelease(self::Lease { until: *lease_until }),
         };
         Ok(Self { kind: Some(kind) })
     }
@@ -198,6 +201,7 @@ impl TryFrom<Record> for super::Record {
                     unreadable_by: retirement.unreadable_by,
                     armed: retirement.armed,
                 },
+                Kind::WriterRelease(release) => Self::WriterRelease { lease_until: release.until },
             },
         )
     }

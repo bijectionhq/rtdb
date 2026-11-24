@@ -159,6 +159,11 @@ impl MultiDatabase {
             let lease = writer.lease;
             self.refuse_pending(lease).await?;
             self.finish_pending_erasure().await?;
+            if !selected && !live_nodes.is_empty() {
+                self.append_control(lease, Record::WriterRelease { lease_until: lease.until }).await?;
+                self.withdraw_writer();
+                return Ok(Role::Follower);
+            }
             if self.upper().saturating_add(self.options.lease_micros / 2) >= lease.until {
                 self.renew().await?;
             }
@@ -702,7 +707,8 @@ impl MultiDatabase {
         let end = self.stream.head().await?;
         self.catch_up(end).await?;
         if self.writer.as_ref().is_some_and(|writer| {
-            self.state().epoch > writer.lease.epoch || !self.before(writer.lease.until)
+            self.state().epoch > writer.lease.epoch || self.state().released == Some(writer.lease.epoch)
+                || !self.before(writer.lease.until)
         }) {
             self.withdraw_writer();
         }
