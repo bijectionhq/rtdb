@@ -110,6 +110,10 @@ pub trait ArtefactPublisher: Send + Sync {
     async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition>;
     /// Completes after the removal is durably appended and admitted processing has applied it.
     async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition>;
+    /// Holds the recovery gate through durable source append and releases it before waiting for application.
+    async fn remove_with_recovery_gate(&self, _message: ArtefactsRemoved, _gate: Arc<dyn Send + Sync>) -> Result<SourcePosition> {
+        Err(Anomaly::unsupported("rtdb.maintenance/search-prune", "The artefact publisher cannot submit a prune under the recovery gate"))
+    }
 }
 
 /// Whether a definition wants an artefact on a trie: above level 0, other than a level-1 current trie below the file size target, which is rewritten within a block or two, and historical only for a historical definition.

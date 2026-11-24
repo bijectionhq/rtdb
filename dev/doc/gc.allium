@@ -453,6 +453,9 @@ rule DeleteAndCommitChunkRule {
     -- A checkpoint preserves the released abandonment until collection orders its removal.
     -- Collection requires the oldest recoverable checkpoint boundary to follow settlement, and a fresh observation that the drained writer's staging intent is absent.
     -- Open catalog captures and local recovery admissions can retain an older view.
+    -- Classic local collection holds the recovery gate exclusively through durable publication of the prune to the source log.
+    -- The collector releases the gate before waiting for ordered application.
+    -- Directory-page collection precedes search tombstone pruning within a table's sweep.
     -- Hosted collection checks the catalog admission floor, authenticated recovery coverage, and fork and archive holds before pruning.
     -- A released abandonment from an older checkpoint format gains a settlement position through a repeated ordered release once its staging intent is absent.
     -- Replay checkpoint copies and archives include every authenticated page reached by the recorded term directory roots.

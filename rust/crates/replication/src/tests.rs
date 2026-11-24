@@ -2825,6 +2825,23 @@ async fn search_intent_admission_keeps_a_republication_of_an_active_identity_wit
     assert_eq!(admitted, republish);
 }
 
+#[tokio::test]
+async fn an_ordered_search_prune_releases_the_recovery_gate_after_source_append() {
+    let fixture = fixture(ReplicationConfig::default(), 1 << 20).await;
+    let files = tempfile::tempdir().unwrap();
+    let store = rtdb_storage::LocalStore::open(files.path()).unwrap().with_catalog_ledger(StorageEpoch(0));
+    let gate = store.try_lock_recovery_deletion().await.unwrap().unwrap();
+    let cancellation = CancellationToken::new();
+    let removal = proto::ArtefactsRemoved { storage_version: Some(CURRENT_STORAGE_VERSION.0), ..Default::default() };
+    let mut publish = Box::pin(fixture.handle.remove_artefacts_retaining(removal, &cancellation, Some(gate)));
+
+    assert!(futures::poll!(&mut publish).is_pending());
+    assert_eq!(fixture.source.latest().unwrap(), LogOffset(0));
+    assert!(store.try_lock_recovery_deletion().await.unwrap().is_some());
+    cancellation.cancel();
+    assert_eq!(publish.await.unwrap_err().category, rtdb_types::AnomalyCategory::Interrupted);
+}
+
 #[test]
 fn a_group_objects_file_is_deleted_or_dropped_from_caches_only_with_the_groups_last_member() {
     use rtdb_format::keys::{ArtefactOwner, TrieKey};

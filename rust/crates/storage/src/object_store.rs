@@ -270,12 +270,12 @@ pub trait ObjectStore: Send + Sync {
     /// Checks storage-side dependencies before attempting to release a retired search run.
     async fn permits_search_release(&self, _key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> { Ok(true) }
+    /// Checks catalog retention.
+    /// On Classic local storage the caller holds the exclusive recovery gate during this check and durable publication.
     async fn permits_search_tombstone_prune(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         _checkpoint: rtdb_types::BlockIndex, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() {
-            let Some(local) = self.local_maintenance_store() else { return Ok(false); };
-            let Some(_recovery) = local.try_lock_recovery_deletion().await? else { return Ok(false); };
-            if !self.advance_catalog_floor(cut).await? { return Ok(false); }
+            if self.local_maintenance_store().is_none() || !self.advance_catalog_floor(cut).await? { return Ok(false); }
         }
         self.permits_search_release(key, publication, Some(cut)).await
     }
@@ -567,7 +567,9 @@ impl LocalStore {
         Ok(Arc::new(self.io.read(ledger, "recovery-open", |ledger, _| Ok(ledger.hold_recovery_open())).await??))
     }
 
-    pub(crate) async fn try_lock_recovery_deletion(&self) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+    /// Acquires exclusive recovery custody, or returns `None` while the gate is held.
+    /// The last guard clone releases custody on drop.
+    pub async fn try_lock_recovery_deletion(&self) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
         let gate = self.io.read(ledger, "recovery-open", |ledger, _| Ok(ledger.try_lock_recovery_deletion())).await??;

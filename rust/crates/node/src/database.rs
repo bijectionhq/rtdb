@@ -713,6 +713,9 @@ struct PublishArtefacts { replication: ReplicationHandle, cancellation: Cancella
 impl ArtefactPublisher for PublishArtefacts {
     async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> { self.replication.publish_artefacts(message, &self.cancellation).await }
     async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> { self.replication.remove_artefacts(message, &self.cancellation).await }
+    async fn remove_with_recovery_gate(&self, message: ArtefactsRemoved, gate: Arc<dyn Send + Sync>) -> Result<SourcePosition> {
+        self.replication.remove_artefacts_retaining(message, &self.cancellation, Some(gate)).await
+    }
 }
 pub(crate) struct PublishDeletions(pub(crate) TermHandle);
 #[async_trait]

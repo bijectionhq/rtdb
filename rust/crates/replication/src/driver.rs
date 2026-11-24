@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, PreparedSearchDelta, SearchDelta, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
-use rtdb_storage::{Error as StorageError, ObjectKey, ObjectStore, log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -163,7 +163,18 @@ impl ReplicationHandle {
     }
     /// Returns once this node has applied the removal.
     pub async fn remove_artefacts(&self, message: proto::ArtefactsRemoved, cancellation: &CancellationToken) -> Result<SourcePosition> {
-        let position = self.submit_source(&SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(message)), (self.clock)()).await?;
+        self.remove_artefacts_retaining(message, cancellation, None).await
+    }
+    /// Retains the supplied recovery gate through source append.
+    pub async fn remove_artefacts_retaining(&self, message: proto::ArtefactsRemoved, cancellation: &CancellationToken,
+        recovery_gate: Option<Arc<dyn Send + Sync>>) -> Result<SourcePosition> {
+        let source = SourceMessage::Protobuf(SourceBody::ArtefactsRemoved(message));
+        let append = self.submit_source(&source, (self.clock)());
+        // Block adoption can share the recovery gate before this source position can apply.
+        let position = match recovery_gate {
+            Some(gate) => IoRegion::retaining(gate, append).await?,
+            None => append.await?,
+        };
         self.await_source(position, cancellation).await?;
         Ok(position)
     }

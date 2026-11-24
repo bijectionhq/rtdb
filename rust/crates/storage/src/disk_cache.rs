@@ -314,6 +314,7 @@ impl ObjectStore for DiskCachedStore {
         self.remote.s3_publication_address(key)
     }
     fn permits_shared_read_cache(&self) -> bool { self.remote.permits_shared_read_cache() }
+    fn local_maintenance_store(&self) -> Option<&crate::LocalStore> { self.remote.local_maintenance_store() }
     fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
         self.remote.index_page_lifecycle()
     }

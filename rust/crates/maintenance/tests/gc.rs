@@ -879,7 +879,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     use rtdb_maintenance::ArtefactPublisher;
     use rtdb_types::SourcePosition;
 
-    struct SearchPublisher { table: TableRef, state: Arc<PartitionState>, abandoned: AtomicBool }
+    struct SearchPublisher { table: TableRef, state: Arc<PartitionState>, store: Arc<LocalStore>, abandoned: AtomicBool }
     #[async_trait]
     impl ArtefactPublisher for SearchPublisher {
         async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> {
@@ -900,6 +900,15 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
             }).collect();
             self.state.remove_artefacts_at(&self.table, entries, Some(ReplicaPosition(2)));
             Ok(SourcePosition(2))
+        }
+
+        async fn remove_with_recovery_gate(&self, message: ArtefactsRemoved, gate: Arc<dyn Send + Sync>) -> Result<SourcePosition> {
+            assert!(message.entries.iter().all(|entry| SearchRunChange::from_artefact(entry.record.as_ref().unwrap())
+                .unwrap().prune_settled_at.is_some()));
+            assert!(self.store.try_lock_recovery_deletion().await?.is_none());
+            drop(gate);
+            let _application = self.store.hold_recovery_open().await?;
+            self.remove(message).await
         }
     }
 
@@ -928,7 +937,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     writer.put(&absent_marker, absent.encode().unwrap().into()).await.unwrap();
     let staged = rtdb_format::search_manifest::StagedSearchRun { run: pending, owner: Some(owner) };
     writer.put(&marker, staged.encode().unwrap().into()).await.unwrap();
-    let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), abandoned: AtomicBool::new(false) });
+    let retirement = Arc::new(SearchPublisher { table: table.clone(), state: Arc::clone(&state), store: Arc::clone(&store), abandoned: AtomicBool::new(false) });
     let trie_deletion = Arc::new(DeletedPublisher { table: entry, store: Arc::new(MemoryStore::default()), commits: Mutex::default() });
     let observer = Arc::new(Observer::default());
     let collector = TrieCollector::new(store.clone(), state.clone(), trie_deletion, observer.clone(), unleased(), fixed_clock()).unwrap()
@@ -988,6 +997,7 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
 
     collector.collect_as_of(at, &stop).await.unwrap();
     assert_eq!(settlement(), None);
+    assert!(store.try_lock_recovery_deletion().await.unwrap().is_some());
     assert!(state.prepare_block().unwrap().table_blocks(&BTreeMap::new(), at).unwrap()[&table]
         .as_proto().retired_search_runs.is_empty());
     assert!(observer.0.lock().unwrap().is_empty());
@@ -1153,8 +1163,8 @@ async fn directory_sealing_requires_page_releases_and_preserves_per_trie_history
 }
 
 #[tokio::test]
-async fn term_directory_pages_no_held_root_reaches_are_swept() {
-    use rtdb_format::{cow_tree::{PageDigest, page_key}, log::proto::{ArtefactsAdded, ArtefactsRemoved}, term_directory};
+async fn unreachable_term_directory_pages_are_swept_when_tombstone_pruning_fails() {
+    use rtdb_format::{cow_tree::{PageDigest, page_key}, log::proto::{SearchRun, SearchRunChange}, term_directory};
     use rtdb_maintenance::ArtefactPublisher;
     use rtdb_types::SourcePosition;
 
@@ -1168,15 +1178,32 @@ async fn term_directory_pages_no_held_root_reaches_are_swept() {
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::load(Some(block(0)), &BTreeMap::new()).unwrap().with_seeded_table(table.clone(), Vec::new()).unwrap();
     let entry = tables.entry(&table).unwrap().clone();
-    let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(TrieKey::l0(BlockIndex(0)).unwrap(), 1, None).unwrap()], Timestamp(10)).unwrap();
+    let anchor = TrieKey::l0(BlockIndex(0)).unwrap();
+    let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(anchor.clone(), 1, None).unwrap()], Timestamp(10)).unwrap();
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
+    let run = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
+        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1), allocation: Some(vec![16; 16]),
+        ..Default::default() };
+    let release = SearchRunChange { run: Some(run), retire_only: Some(true), ..Default::default() };
+    let abandon = SearchRunChange { abandon: Some(true), ..release.clone() }.to_artefact().unwrap();
+    state.add_artefacts_at(&table, vec![(anchor.clone(), abandon)], Timestamp(10));
+    state.remove_artefacts_at(&table, vec![(anchor, release.to_artefact().unwrap())], Some(ReplicaPosition(1)));
+    state.publish_catalog_cut(CatalogCut { storage_version: StorageVersion(0), storage_epoch: StorageEpoch(0),
+        replica_epoch: StorageEpoch(0), through: ReplicaPosition(2) }).unwrap();
+
     let store = Arc::new(MemoryStore::default());
+    let checkpoint = ObjectKey::new(block_key(BlockIndex(0)).unwrap()).unwrap();
+    store.put(&checkpoint, Bytes::from_static(b"\xff")).await.unwrap();
     let prefix = term_directory::page_prefix(&entry.slug);
     let orphans: Vec<_> = [1u8, 2].into_iter().map(|byte| ObjectKey::new(page_key(&prefix, PageDigest([byte; 32]))).unwrap()).collect();
     for key in &orphans { store.put(key, Bytes::from_static(b"page")).await.unwrap(); }
     let deletions = Arc::new(DeletedPublisher { table: entry.clone(), store: store.clone(), commits: Mutex::default() });
-    let collector = TrieCollector::new(store.clone(), state.clone(), deletions, Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap()
+    let observer = Arc::new(Observer::default());
+    let collector = TrieCollector::new(store.clone(), state.clone(), deletions, observer.clone(), unleased(), fixed_clock()).unwrap()
         .with_search(Arc::new(Unused), StorageVersion(0), StorageEpoch(0));
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
-    for key in &orphans { assert!(store.head(key).await.is_err(), "{key:?}"); }
+    for key in &orphans { assert!(matches!(store.head(key).await, Err(rtdb_storage::Error::MissingObject(_))), "{key:?}"); }
+    assert_eq!(state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().settled_at_replica_msg_id, Some(1));
+    let errors = observer.0.lock().unwrap();
+    assert_eq!(errors.iter().map(|error| error.code.as_str()).collect::<Vec<_>>(), ["rtdb.format/invalid-catalog"]);
 }

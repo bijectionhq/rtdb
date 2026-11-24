@@ -201,9 +201,9 @@ impl TrieCollector {
                     self.collect_search_seals(&entry, &seals, cut, collection.current().trie_catalog(), cancellation).await?;
                     self.collect_pending_search(&entry, collection.current().trie_catalog(), collection.current().table_catalog().block_index(), cancellation).await?;
                     self.collect_search_runs(&entry, &collection, as_of, cut, cancellation).await?;
-                    self.prune_search_tombstones(&entry, &collection, cut, oldest_checkpoint, cancellation).await?;
                     self.collect_entity_directory_pages(&entry, &collection, cut, cancellation).await?;
-                    self.collect_term_directory_pages(&entry, &collection, cut, cancellation).await
+                    self.collect_term_directory_pages(&entry, &collection, cut, cancellation).await?;
+                    self.prune_search_tombstones(&entry, &collection, cut, oldest_checkpoint, cancellation).await
                 }).await;
                 if let Err(error) = &result { if !cancellation.is_cancelled() { self.observer.table_failed(Some(&entry.table), error); } }
             }
@@ -478,6 +478,8 @@ impl TrieCollector {
         oldest_checkpoint: &OnceCell<Option<(BlockIndex, CatalogCut)>>, cancellation: &CancellationToken) -> Result<()> {
         let Some((publisher, version, epoch)) = &self.search else { return Ok(()); };
         let Some((cut, latest)) = cut.zip(collection.current().table_catalog().block_index()) else { return Ok(()); };
+        let local = self.store.local_maintenance_store().filter(|local| local.defers_trie_releases());
+        let mut recovery_gate = None;
         let mut entries = Vec::new();
         for retired in collection.eligible_search_tombstones(&entry.table) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
@@ -486,6 +488,10 @@ impl TrieCollector {
                 let Some((block, checkpoint)) = *oldest_checkpoint.get_or_try_init(|| self.oldest_search_checkpoint(latest, cut)).await?
                     else { continue; };
                 if checkpoint.through.0 <= settled_at { continue; }
+                if let Some(local) = local && recovery_gate.is_none() {
+                    let Some(gate) = local.try_lock_recovery_deletion().await? else { break; };
+                    recovery_gate = Some(gate);
+                }
                 let first_in_journal = ReplicaPosition::from_epoch_offset(checkpoint.replica_epoch, 0)?;
                 let floor = CatalogCut { through: ReplicaPosition(settled_at + 1).max(first_in_journal), ..checkpoint };
                 let key = ObjectKey::new(run.object_key(&entry.slug)?)?;
@@ -504,8 +510,12 @@ impl TrieCollector {
             if entries.len() >= self.config.chunk_size { break; }
         }
         if !entries.is_empty() {
-            publisher.remove(ArtefactsRemoved { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
-                table_name: Some(entry.table.schema_and_table()), entries, source_msg_id: None }).await?;
+            let removal = ArtefactsRemoved { storage_version: Some(version.0), storage_epoch: Some(epoch.0),
+                table_name: Some(entry.table.schema_and_table()), entries, source_msg_id: None };
+            match recovery_gate {
+                Some(gate) => publisher.remove_with_recovery_gate(removal, gate).await?,
+                None => publisher.remove(removal).await?,
+            };
         }
         Ok(())
     }
