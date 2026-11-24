@@ -6,7 +6,7 @@
 //! - A fork releasing an object it only references drops the reference; the object itself is its owner's.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
+use std::ops::{AsyncFn, Range};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -558,7 +558,10 @@ async fn stage_object(bucket: &dyn ObjectStore, key: &ObjectKey, bytes: Bytes) -
 
 /// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving retained references into objects of its own.
 /// The destination builds its ordered index and retirement journal from its authoritative catalog.
-pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str) -> Result<()> {
+pub(crate) async fn materialize(
+    from_bucket: &dyn ObjectStore, from: &str, to_bucket: &dyn ObjectStore, to: &str,
+    reseal: impl AsyncFn(&ObjectKey, Bytes) -> rtdb_storage::Result<Bytes>,
+) -> Result<()> {
     for store in stores(from_bucket, from).await? {
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
         let target = format!("{to}/{version}");
@@ -567,7 +570,8 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
             if crate::store::stays_in_source_residence(&name) { continue; }
             let source = key(&format!("{store}/{name}"))?;
             let destination = key(&format!("{target}/{name}"))?;
-            stage_object(to_bucket, &destination, from_bucket.get(&source).await?).await?;
+            let bytes = reseal(&key(&name)?, from_bucket.get(&source).await?).await?;
+            stage_object(to_bucket, &destination, bytes).await?;
         }
         for (name, owner) in base.objects {
             if crate::store::stays_in_source_residence(&name) { continue; }
@@ -585,6 +589,7 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
                 },
                 value => value?,
             };
+            let bytes = reseal(&key(&name)?, bytes).await?;
             stage_object(to_bucket, &destination, bytes).await?;
         }
     }
@@ -594,6 +599,8 @@ pub async fn materialize(from_bucket: &dyn ObjectStore, from: &str, to_bucket: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn unchanged(_: &ObjectKey, body: Bytes) -> rtdb_storage::Result<Bytes> { Ok(body) }
 
     fn bucket() -> Bucket { Arc::new(rtdb_storage::MemoryStore::default()) }
     async fn put(bucket: &Bucket, name: &str, bytes: &[u8]) { bucket.put(&key(name).unwrap(), Bytes::copy_from_slice(bytes)).await.unwrap(); }
@@ -704,7 +711,7 @@ mod tests {
             copy: key("child/v06/row").unwrap(),
             transferred: Default::default(),
         };
-        materialize(&transferring, "child", there.as_ref(), "arrived").await.unwrap();
+        materialize(&transferring, "child", there.as_ref(), "arrived", unchanged).await.unwrap();
         assert_eq!(there.get(&key("arrived/v06/row").unwrap()).await.unwrap().as_ref(), b"parent");
         assert!(!holds(here.as_ref(), "parent/v06", "row").await.unwrap());
     }
@@ -715,7 +722,7 @@ mod tests {
         put(&here, "parent/v06/row", b"parent").await;
         simulate_fork(here.as_ref(), "parent", "child", None).await.unwrap();
         here.delete(&key("parent/v06/row").unwrap()).await.unwrap();
-        assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived").await.is_err());
+        assert!(materialize(here.as_ref(), "child", there.as_ref(), "arrived", unchanged).await.is_err());
     }
 
     #[tokio::test]
@@ -723,10 +730,10 @@ mod tests {
         let (here, there) = (bucket(), bucket());
         put(&here, "source/v06/blocks/b00", b"accepted").await;
         put(&there, "target/v06/blocks/b00", b"substitute").await;
-        assert!(materialize(here.as_ref(), "source", there.as_ref(), "target").await.is_err());
+        assert!(materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.is_err());
         there.delete(&key("target/v06/blocks/b00").unwrap()).await.unwrap();
-        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
-        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.unwrap();
     }
 
     #[tokio::test]
@@ -749,7 +756,7 @@ mod tests {
         simulate_fork(here.as_ref(), "source", "child", None).await.unwrap();
         let base = Base::load(here.as_ref(), "child/v06").await.unwrap();
         assert_eq!(base.objects.into_keys().collect::<Vec<_>>(), ["blocks/b00"]);
-        materialize(here.as_ref(), "source", there.as_ref(), "target").await.unwrap();
+        materialize(here.as_ref(), "source", there.as_ref(), "target", unchanged).await.unwrap();
         assert_eq!(physical_objects(there.as_ref(), "target/v06").await.unwrap(), ["blocks/b00"]);
     }
 
@@ -760,7 +767,7 @@ mod tests {
         put(&here, &format!("p/v06/{}", crate::store::ROOT_MARKER), b"p").await;
         simulate_fork(here.as_ref(), "p", "c", None).await.unwrap();
         put(&here, "c/v06/blocks/b01", b"child").await;
-        materialize(here.as_ref(), "c", there.as_ref(), "c").await.unwrap();
+        materialize(here.as_ref(), "c", there.as_ref(), "c", unchanged).await.unwrap();
         let mut moved = physical_objects(there.as_ref(), "c/v06").await.unwrap();
         moved.sort();
         assert_eq!(moved, ["blocks/b00", "blocks/b01"]);

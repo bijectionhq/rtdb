@@ -415,6 +415,7 @@ impl ArchivedCheckpoint {
         &self,
         record: &DeploymentRecord,
         destination: Arc<dyn ObjectStore>,
+        destination_cipher: &Cipher,
     ) -> Result<()> {
         let checkpoint = record
             .checkpoint
@@ -433,12 +434,12 @@ impl ArchivedCheckpoint {
         for (name, object) in &self.objects {
             let plaintext = self.read_plaintext(name, object).await?;
             match serving.get(name).await {
-                Ok(bytes) if self.serving_cipher.open_object(name, &bytes)? == plaintext => continue,
+                Ok(bytes) if destination_cipher.open_object(name, &bytes)? == plaintext => continue,
                 Ok(_) => return Err(Error::ConflictingObject(name.to_string()).into()),
                 Err(Error::MissingObject(_)) => {},
                 Err(error) => return Err(error.into()),
             }
-            let ciphertext = self.serving_cipher.seal_object(name, &plaintext)?;
+            let ciphertext = destination_cipher.seal_object(name, &plaintext)?;
             if name.as_str().starts_with("blocks/") && rtdb_format::keys::block_index_from_key(name.as_str()).is_ok() {
                 roots.push((name, ciphertext));
             } else {
@@ -539,9 +540,11 @@ pub(crate) async fn materialize_serving_archive(
     source: &DeploymentRecord,
     target: &DeploymentRecord,
     destination: Arc<dyn ObjectStore>,
+    destination_cipher: Option<&Cipher>,
     hosted_task: Option<&rtdb_directory::HostedTask>,
 ) -> Result<()> {
     let Some(selected) = serving_archive(source)? else { return Ok(()); };
+    let destination_cipher = destination_cipher.ok_or_else(|| inconsistent("The move has no destination serving key"))?;
     let archive: CellStorage = serde_json::from_str(selected.archive)
         .map_err(|_| inconsistent("Invalid retained archive binding"))?;
     Box::pin(stage::with_region(
@@ -562,7 +565,7 @@ pub(crate) async fn materialize_serving_archive(
             let repair = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io, false)).await?
                 .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
             repair.require_transferable()?;
-            Box::pin(repair.materialize(target, destination)).await
+            Box::pin(repair.materialize(target, destination, destination_cipher)).await
         }),
     )).await
 }

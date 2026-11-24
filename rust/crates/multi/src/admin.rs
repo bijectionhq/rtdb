@@ -1274,9 +1274,7 @@ async fn prepare_cell_move(
     let mut bound_source = current.clone();
     bind_admin_storage(&mut bound_source, source_binding)?;
     let material = from.keys.existing_key(&current.key_id()).await?;
-    if let Some(material) = material.as_ref() {
-        to.keys.validate_install(&arrival.key_id(), material).await?;
-    } else if current.checkpoint.is_some() {
+    if material.is_none() && current.checkpoint.is_some() {
         return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
     }
     if let Some(target) = to.directory.deployment(&current.id).await? {
@@ -1530,27 +1528,54 @@ async fn stage_cell_storage(
     let uncertain = admitted.as_ref().is_err_and(|error| error.code != "rtdb.multi/cell-transfer");
     let result = async {
         admitted?;
+        use crate::cipher::Cipher;
+        use rtdb_storage::{Error, ObjectKey};
+
         let material = from.keys.existing_key(&source.key_id()).await?;
         if source.checkpoint.is_some() && material.is_none() {
             return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
         }
+        let destination_material = match material {
+            Some(material) => {
+                let destination = to.keys.key(&staged.key_id()).await?;
+                if material == destination {
+                    return Err(Anomaly::incorrect("rtdb.multi/transfer-key", "The destination serving key must be independent"));
+                }
+                Some(destination)
+            }
+            None => None,
+        };
+        let source_cipher = material.as_ref().map(|key| Cipher::new(key)).transpose()?;
+        let destination_cipher = destination_material.as_ref().map(|key| Cipher::new(key)).transpose()?;
+        let reseal_member = async |name: &ObjectKey, body: bytes::Bytes| {
+            let (Some(source), Some(destination)) = (&source_cipher, &destination_cipher) else {
+                return Err(Error::Closed("The serving copy has no source or destination key".into()));
+            };
+            let plaintext = source.open_object(name, &body)?;
+            destination.seal_object(name, &plaintext)
+        };
+        let reseal = async |name: &ObjectKey, body: bytes::Bytes| {
+            if name.as_str().strip_prefix(crate::store::GARBAGE_DIRECTORY).is_some_and(|path| path.starts_with('/')) {
+                return Ok(body);
+            }
+            if crate::packing::is_pack_key(name.as_str()) {
+                crate::packing::reseal_pack(name, body, &reseal_member).await
+            } else {
+                reseal_member(name, body).await
+            }
+        };
         let source_bucket = from.storage.bucket(io.clone()).await?;
         let target_bucket = to.storage.bucket(io.clone()).await?;
         crate::reference::materialize(
-            source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(),
+            source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(), reseal,
         ).await?;
         Box::pin(crate::archive::materialize_serving_archive(
-            from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), hosted_task.as_ref(),
+            from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), destination_cipher.as_ref(), hosted_task.as_ref(),
         )).await?;
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }
-        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, material.as_ref())).await?;
-        // A never-opened source need not provision a key merely to move.
-        // The source vault is read-only for the transfer operator.
-        if let Some(material) = material {
-            to.keys.install(&staged.key_id(), material).await?;
-        }
+        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, destination_material.as_ref())).await?;
         Ok(())
     }.await;
     io.close_and_wait().await;

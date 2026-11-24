@@ -3254,6 +3254,8 @@ rule BeginCellMove {
 
 rule MoveCutover {
     -- The destination accepts placements only after the cell map switches to it.
+    -- The destination authenticates each inherited or loose serving unit and reseals it under its own residence key.
+    -- Pack resealing preserves the predecessor links and publication time.
     -- The destination verifies the certified retained interval and reseals each frame into its own slots before it can serve.
     -- A retry after the switch finishes publication and leaves the source tombstone.
     -- Forks in the source cell retain access to every object they share.

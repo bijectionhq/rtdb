@@ -65,12 +65,6 @@ pub trait KeyService: Send + Sync {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb.multi/key-missing", "The deployment has no installed key")
         })
     }
-    async fn validate_install(&self, deployment: &str, key: &[u8; KEY_BYTES]) -> Result<()> {
-        if let Some(existing) = self.existing_key(deployment).await? {
-            require_matching_key(deployment, key, &existing)?;
-        }
-        Ok(())
-    }
     async fn sign_deletion(&self, facts: DeletionFacts) -> Result<DeletionRecord> {
         sign_deletion(self.key(DELETION_SIGNING_KEY_ID).await?, facts)
     }
@@ -700,7 +694,6 @@ mod tests {
         let restarted = LocalKeyService::new(directory.path()).unwrap();
         assert_eq!(restarted.key("a").await.unwrap_err().code, "rtdb.multi/key-destroyed");
         assert_eq!(restarted.install("a", key).await.unwrap_err().code, "rtdb.multi/key-destroyed");
-        assert_eq!(restarted.validate_install("a", &key).await.unwrap_err().code, "rtdb.multi/key-destroyed");
         assert_eq!(restarted.key("b").await.unwrap(), key);
     }
 

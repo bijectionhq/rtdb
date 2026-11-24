@@ -8,7 +8,7 @@
 //! An audience writer loads locations before attachment and publishes new locations with the blocks its readers may capture.
 
 use std::collections::BTreeMap;
-use std::ops::Range;
+use std::ops::{AsyncFn, Range};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -89,6 +89,44 @@ pub fn encode_pack(objects: &BTreeMap<String, Bytes>, previous: Vec<String>, wri
     bytes.extend_from_slice(&encoded);
     bytes.put_u64(encoded.len() as u64);
     (bytes.freeze(), index)
+}
+
+pub(crate) async fn reseal_pack(
+    name: &ObjectKey,
+    source: Bytes,
+    reseal: &impl AsyncFn(&ObjectKey, Bytes) -> rtdb_storage::Result<Bytes>,
+) -> rtdb_storage::Result<Bytes> {
+    let mut index = read_pack_index_with(name, source.len() as u64, usize::MAX, |range| {
+        let bytes = source.slice(range.start as usize..range.end as usize);
+        std::future::ready(Ok::<_, Error>(bytes))
+    }).await?;
+    let trailer = source.len() - 8;
+    let index_size = u64::from_be_bytes(source[trailer..].try_into().expect("validated pack trailer"));
+    let input_end = trailer - index_size as usize;
+    let mut members = std::mem::take(&mut index.entries).into_iter().collect::<Vec<_>>();
+    members.sort_by_key(|(_, entry)| entry.offset);
+    let mut body = BytesMut::with_capacity(source.len());
+    let mut next = 0;
+    for (logical, entry) in members {
+        if entry.offset != next || entry.length == 0 {
+            return Err(Error::ConflictingObject(name.to_string()));
+        }
+        let end = entry.offset + entry.length;
+        let ciphertext = source.slice(entry.offset as usize..end as usize);
+        let member = ObjectKey::new(logical)?;
+        let resealed = reseal(&member, ciphertext).await?;
+        let extent = PackEntry { offset: body.len() as u64, length: resealed.len() as u64 };
+        body.extend_from_slice(&resealed);
+        index.entries.insert(member.to_string(), extent);
+        next = end;
+    }
+    if next != input_end as u64 {
+        return Err(Error::ConflictingObject(name.to_string()));
+    }
+    let manifest = serde_json::to_vec(&index).map_err(|error| Error::Task(error.to_string()))?;
+    body.extend_from_slice(&manifest);
+    body.put_u64(manifest.len() as u64);
+    Ok(body.freeze())
 }
 
 pub async fn read_index(store: &dyn ObjectStore, pack: &ObjectKey) -> rtdb_storage::Result<PackIndex> {
@@ -576,6 +614,37 @@ pub(crate) mod tests {
     use rtdb_storage::MemoryStore;
 
     fn object(name: &str) -> ObjectKey { ObjectKey::new(name).unwrap() }
+
+    #[tokio::test]
+    async fn a_transferred_pack_authenticates_and_reseals_every_member() -> rtdb_storage::Result<()> {
+        let from = crate::cipher::Cipher::new(&[3; 32]).unwrap();
+        let to = crate::cipher::Cipher::new(&[5; 32]).unwrap();
+        let catalog = object("blocks/b00.binpb");
+        let page = object("tables/items/data/l00-rc-b00.arrow");
+        let source = BTreeMap::from([
+            (catalog.to_string(), from.seal_object(&catalog, b"catalog")?),
+            (page.to_string(), from.seal_object(&page, b"rows")?),
+        ]);
+        let pack = object("~packs/b00.pack");
+        let (body, index) = encode_pack(&source, vec!["~packs/older.pack".into()], 17);
+        let reseal = async |name: &ObjectKey, bytes: Bytes| {
+            let plaintext = from.open_object(name, &bytes)?;
+            to.seal_object(name, &plaintext)
+        };
+        let copied = reseal_pack(&pack, body, &reseal).await?;
+        let store = rtdb_storage::MemoryStore::default();
+        store.put(&pack, copied.clone()).await?;
+        let rebuilt = read_index(&store, &pack).await?;
+        assert_eq!(rebuilt.previous, index.previous);
+        assert_eq!(rebuilt.written_at_ms, index.written_at_ms);
+        for (name, plaintext) in [(catalog, b"catalog".as_slice()), (page, b"rows".as_slice())] {
+            let extent = &rebuilt.entries[name.as_str()];
+            let sealed = &copied[extent.offset as usize..(extent.offset + extent.length) as usize];
+            assert_eq!(to.open_object(&name, sealed)?.as_ref(), plaintext);
+            assert!(from.open_object(&name, sealed).is_err());
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn audience_reads_use_the_installed_pack_locations() {
