@@ -2998,6 +2998,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "journal-contract"
+version = "0.1.0"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86#f2b964da847ce2487c35fa1dc31fae05a32d6d86"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3172,7 +3180,7 @@ dependencies = [
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0)",
  "libc",
  "parking_lot",
  "prost",
@@ -4827,6 +4835,7 @@ dependencies = [
  "crc32fast",
  "fs2",
  "futures",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
  "parking_lot",
  "prost",
  "rtdb-storage",

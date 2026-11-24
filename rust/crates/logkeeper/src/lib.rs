@@ -19,11 +19,14 @@ pub use local::LocalListener;
 pub use rtdb_types::JournalEndpoint;
 pub use server::{AuthorityListener, JournalDigest, PreparedJournal, ServerOptions, inspect_retained, inspect_retained_with_prefix, serve};
 
-/// The pure pieces `rtdb-simulation` drives directly: one stream's server state machine, the recovery planning rules, and the messages they exchange.
-/// Not API: they change with the protocol.
+/// Protocol fixtures and scripted stream journal faults for simulation.
 #[cfg(feature = "simulation")]
 pub mod simulation {
     pub use crate::client::recovery::{Holding, RepairPlan, plan_repair, winner};
+    pub use crate::journal_faults::{Fault, FaultJournal};
     pub use crate::protocol::{Accepted, Entries, Entry, EpochRun, Failed, Refused, ResponseBody, Sealed};
     pub use crate::server::state::{Decision, Event, Held, StreamState};
 }
+
+#[cfg(feature = "simulation")]
+mod journal_faults;
