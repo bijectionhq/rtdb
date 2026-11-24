@@ -140,6 +140,8 @@ impl Service {
                 Ok(request) => self.v1_tx_status(&call, request).await,
                 Err(status) => Err(status),
             },
+            #[cfg(feature = "multi")]
+            name if crate::admin::ACTIONS.contains(&name) => self.admin_action(&call, name, action.body).await,
             _ => Err(error::unsupported("admin")),
         };
         let result = outcome.map_err(|status| call.error(status))?;

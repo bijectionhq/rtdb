@@ -1,0 +1,180 @@
+use bytes::Bytes;
+use prost::Message;
+use rtdb_auth::Principal;
+use rtdb_types::{Timestamp, rtdb_v1::Basis};
+use tonic::Status;
+use uuid::Uuid;
+
+use crate::{
+    rtdb::{admin::v1 as proto, v1 as data},
+    service::{Call, Service},
+    v1::error,
+};
+
+const EXPORT: &str = "rtdb.admin.v1.ExportCheckpoint";
+const RESTORE: &str = "rtdb.admin.v1.RestoreDeployment";
+const FORK: &str = "rtdb.admin.v1.ForkDeployment";
+pub(crate) const ACTIONS: [&str; 3] = [EXPORT, RESTORE, FORK];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeploymentAdminAction<'a> {
+    Export {
+        deployment: &'a str,
+    },
+    Restore {
+        source: &'a str,
+        destination: &'a str,
+    },
+    Fork {
+        source: &'a str,
+        destination: &'a str,
+    },
+}
+
+/// Deployment authorization supplied by the host that binds the Flight listener.
+pub trait DeploymentAdminAuthority: std::fmt::Debug + Send + Sync {
+    fn authorize(
+        &self,
+        principal: &Principal,
+        action: DeploymentAdminAction<'_>,
+    ) -> rtdb_types::Result<()>;
+}
+
+impl Service {
+    pub(crate) fn has_admin_route(&self, call: &Call) -> bool {
+        let principal = &call.session.caller.principal;
+        self.0.config.deployment_admin.is_some()
+            && call.session.caller.credential_verified
+            && principal.user_id().is_some()
+            && principal.label_scope().is_none()
+            && call.session.audience_source().is_none()
+            && !call.session.fresh_replica
+    }
+
+    pub(crate) async fn admin_action(
+        &self,
+        call: &Call,
+        name: &str,
+        body: Bytes,
+    ) -> Result<Vec<u8>, Status> {
+        let authority = self
+            .0
+            .config
+            .deployment_admin
+            .as_ref()
+            .ok_or_else(|| error::unsupported("admin"))?;
+        if !self.has_admin_route(call) {
+            return Err(Status::permission_denied(
+                "The session cannot administer deployments",
+            ));
+        }
+        let principal = &call.session.caller.principal;
+        let catalog = self.0.node.catalog();
+        match name {
+            EXPORT => {
+                let request: proto::ExportCheckpointRequest = decode(body)?;
+                authority
+                    .authorize(
+                        principal,
+                        DeploymentAdminAction::Export {
+                            deployment: &request.deployment,
+                        },
+                    )
+                    .map_err(error::anomaly)?;
+                let basis = basis(request.basis)?;
+                let checkpoint = catalog
+                    .export_deployment_checkpoint(
+                        &request.deployment,
+                        pin(&request.pin)?,
+                        basis,
+                        request.retain_until_micros.map(Timestamp),
+                        &call.cancellation,
+                    )
+                    .await
+                    .map_err(error::anomaly)?;
+                Ok(proto::CheckpointExport {
+                    checkpoint,
+                    basis: Some(basis_wire(basis)),
+                }
+                .encode_to_vec())
+            }
+            RESTORE => {
+                let request: proto::RestoreDeploymentRequest = decode(body)?;
+                authority
+                    .authorize(
+                        principal,
+                        DeploymentAdminAction::Restore {
+                            source: &request.from,
+                            destination: &request.deployment,
+                        },
+                    )
+                    .map_err(error::anomaly)?;
+                let basis = catalog
+                    .restore_deployment_checkpoint(
+                        &request.from,
+                        &request.deployment,
+                        request.checkpoint,
+                        &call.cancellation,
+                    )
+                    .await
+                    .map_err(error::anomaly)?;
+                Ok(proto::Deployment {
+                    deployment: request.deployment,
+                    basis: Some(basis_wire(basis)),
+                }
+                .encode_to_vec())
+            }
+            FORK => {
+                let request: proto::ForkDeploymentRequest = decode(body)?;
+                authority
+                    .authorize(
+                        principal,
+                        DeploymentAdminAction::Fork {
+                            source: &request.from,
+                            destination: &request.deployment,
+                        },
+                    )
+                    .map_err(error::anomaly)?;
+                let basis = catalog
+                    .fork_deployment_checkpoint(
+                        &request.from,
+                        &request.deployment,
+                        pin(&request.pin)?,
+                        basis(request.basis)?,
+                        request.retain_until_micros.map(Timestamp),
+                        &call.cancellation,
+                    )
+                    .await
+                    .map_err(error::anomaly)?;
+                Ok(proto::Deployment {
+                    deployment: request.deployment,
+                    basis: Some(basis_wire(basis)),
+                }
+                .encode_to_vec())
+            }
+            _ => Err(error::unsupported("admin")),
+        }
+    }
+}
+
+fn decode<M: Message + Default>(bytes: Bytes) -> Result<M, Status> {
+    M::decode(bytes).map_err(|_| error::incorrect("Invalid deployment administration request"))
+}
+
+fn basis(basis: Option<data::Basis>) -> Result<Basis, Status> {
+    let basis = basis.ok_or_else(|| error::incorrect("An exact source basis is required"))?;
+    Basis::from_bytes(&basis.value).map_err(error::anomaly)
+}
+
+fn basis_wire(basis: Basis) -> data::Basis {
+    data::Basis {
+        value: basis.to_bytes().to_vec(),
+    }
+}
+
+fn pin(bytes: &[u8]) -> Result<Uuid, Status> {
+    Uuid::from_slice(bytes)
+        .ok()
+        .filter(|pin| !pin.is_nil())
+        .ok_or_else(|| error::incorrect("A nonzero checkpoint pin ID is required"))
+}

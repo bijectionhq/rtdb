@@ -598,6 +598,9 @@ impl FlightService for Service {
             crate::owned_actions::HELD_WORLD_POINT_AT_V2,
         ];
         let root_rank = self.0.config.owned_native_actions && call.session.audience_source().is_none();
+        #[cfg(feature = "multi")]
+        let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|_| self.has_admin_route(&call)))
+            .collect::<Vec<_>>();
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS)
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(crate::owned_actions::ROOT_RANK_ACTIONS.into_iter().filter(|_| root_rank))

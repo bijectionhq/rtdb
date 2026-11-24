@@ -24,7 +24,13 @@ impl ResourceOwner {
         }
     }
 }
-pub(crate) struct Caller { pub owner: Owner, pub principal: Arc<Principal>, pub mac: Option<[u8; 32]> }
+pub(crate) struct Caller {
+    pub owner: Owner,
+    pub principal: Arc<Principal>,
+    pub mac: Option<[u8; 32]>,
+    #[cfg(feature = "multi")]
+    pub credential_verified: bool,
+}
 pub(crate) struct ConnectionResource { pub native: tokio::sync::Mutex<NativeSession>, pub cancellation: CancellationToken, closed: AtomicBool }
 impl ConnectionResource {
     pub fn new(native: NativeSession) -> Arc<Self> { let cancellation = native.state().cancellation().clone(); Arc::new(Self { native: tokio::sync::Mutex::new(native), cancellation, closed: AtomicBool::new(false) }) }
@@ -271,6 +277,8 @@ mod tests {
         let caller = Arc::new(Caller {
             owner: Owner::Anonymous,
             principal: auth.unauthenticated().unwrap(),
+            #[cfg(feature = "multi")]
+            credential_verified: false,
             mac: None,
         });
         let session = Session::new("session".into(), caller, None, false, None, memory.reserve(256).unwrap());

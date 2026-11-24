@@ -40,23 +40,26 @@ impl Authentication {
     pub fn new(authenticator: Arc<Authenticator>) -> Self { let mut key = [0; 32]; key[..16].copy_from_slice(Uuid::new_v4().as_bytes()); key[16..].copy_from_slice(Uuid::new_v4().as_bytes()); Self { authenticator, key: Zeroizing::new(key) } }
     pub fn mac(&self, raw: &str) -> [u8; 32] { let mut mac = Hmac::<Sha256>::new_from_slice(self.key.as_ref()).expect("HMAC key"); mac.update(raw.as_bytes()); mac.finalize().into_bytes().into() }
     pub async fn authenticate(&self, credentials: &Credentials<'_>, peer: Option<&str>) -> Result<Arc<Caller>, Status> {
-        let principal = match credentials {
-            Credentials::None => { if self.authenticator.method_for(None, peer) != Some(Method::Trust) { return Err(unauthenticated("credentials required")); } self.authenticator.unauthenticated().map_err(auth_error)? }
+        let (principal, _method) = match credentials {
+            Credentials::None => { if self.authenticator.method_for(None, peer) != Some(Method::Trust) { return Err(unauthenticated("credentials required")); } (self.authenticator.unauthenticated().map_err(auth_error)?, Method::Trust) }
             Credentials::Bearer(_) => return Err(unauthenticated("unknown session")),
             Credentials::Basic { user, secret, .. } => match self.authenticator.method_for(Some(user), peer) {
-                Some(Method::Trust) => self.authenticator.authenticate_trusted(user).map_err(auth_error)?,
-                Some(Method::Password) => self.authenticator.verify_password(user, secret).await.map_err(auth_error)?,
+                Some(Method::Trust) => (self.authenticator.authenticate_trusted(user).map_err(auth_error)?, Method::Trust),
+                Some(Method::Password) => (self.authenticator.verify_password(user, secret).await.map_err(auth_error)?, Method::Password),
                 Some(Method::ClientCredentials) => return Err(unauthenticated("client credentials require Client authorization")),
                 Some(Method::DeviceAuth) => return Err(Status::unimplemented("device authorization is not supported over Flight SQL")),
                 None => return Err(unauthenticated("no matching authentication rule")),
             },
             Credentials::Client { id, secret, .. } => {
                 let principal = self.authenticator.verify_client_credentials(id, secret).await.map_err(auth_error)?;
-                if self.authenticator.method_for(principal.user(), peer) != Some(Method::ClientCredentials) { return Err(unauthenticated("client credentials authentication failed")); } principal
+                if self.authenticator.method_for(principal.user(), peer) != Some(Method::ClientCredentials) { return Err(unauthenticated("client credentials authentication failed")); } (principal, Method::ClientCredentials)
             }
         };
         let owner = if matches!(credentials, Credentials::None) { Owner::Anonymous } else { Owner::Authenticated(Uuid::new_v4()) };
-        Ok(Arc::new(Caller { owner, principal, mac: credentials.raw().map(|raw| self.mac(raw)) }))
+        Ok(Arc::new(Caller { owner, principal, mac: credentials.raw().map(|raw| self.mac(raw)),
+            #[cfg(feature = "multi")]
+            credential_verified: _method != Method::Trust,
+        }))
     }
 }
 pub(crate) fn auth_error(error: Anomaly) -> Status { match error.category { AnomalyCategory::Fault => Status::internal("authentication failed"), AnomalyCategory::Unsupported => Status::unimplemented(error.message.unwrap_or_default()), _ => unauthenticated(error.message.unwrap_or_else(|| "authentication failed".into())) } }

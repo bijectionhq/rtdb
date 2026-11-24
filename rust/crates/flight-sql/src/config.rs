@@ -129,10 +129,16 @@ pub struct FlightConfig {
     pub playground: bool,
     pub forwarded_peer: Option<Arc<dyn FlightPeerVerifier>>,
     pub owned_world_host: Option<Arc<dyn crate::OwnedWorldHost>>,
+    /// Installed by the trusted deployment host for checkpoint administration.
+    #[cfg(feature = "multi")]
+    pub deployment_admin: Option<Arc<dyn crate::DeploymentAdminAuthority>>,
 }
 impl Default for FlightConfig {
     fn default() -> Self {
-        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None }
+        Self { address: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9839), transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60), sweep_interval: Duration::from_secs(10), maximum_message_bytes: 64 * 1024 * 1024, owned_native_actions: false, hosted_controls: None, audience: None, reserved_applied_source: None, maximum_concurrent_calls: 256, playground: false, forwarded_peer: None, owned_world_host: None,
+            #[cfg(feature = "multi")]
+            deployment_admin: None,
+        }
     }
 }
 impl FlightConfig {

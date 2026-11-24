@@ -12,10 +12,29 @@ service Admin {
   rpc RestoreDeployment(RestoreDeploymentRequest) returns (Deployment);
 }
 message CreateDeploymentRequest { string deployment = 1; }
-message Deployment { string deployment = 1; }
+message Deployment {
+  string deployment = 1;
+  rtdb.v1.Basis basis = 2;
+}
 message DeleteDeploymentRequest { string deployment = 1; }
 message ErasureProof { string deployment = 1; bytes proof = 2; sint64 unreadable_by_micros = 3; }
-message ForkDeploymentRequest { string deployment = 1; string from = 2; rtdb.v1.Basis basis = 3; }
-message ExportCheckpointRequest { string deployment = 1; rtdb.v1.Basis basis = 2; }
+message ForkDeploymentRequest {
+  string deployment = 1;
+  string from = 2;
+  rtdb.v1.Basis basis = 3;
+  bytes pin = 4;
+  optional sint64 retain_until_micros = 5;
+}
+message ExportCheckpointRequest {
+  string deployment = 1;
+  rtdb.v1.Basis basis = 2;
+  // Stable nonzero UUID bytes supplied by the caller for exact retries.
+  bytes pin = 3;
+  optional sint64 retain_until_micros = 4;
+}
 message CheckpointExport { bytes checkpoint = 1; rtdb.v1.Basis basis = 2; }
-message RestoreDeploymentRequest { string deployment = 1; bytes checkpoint = 2; }
+message RestoreDeploymentRequest {
+  string deployment = 1;
+  bytes checkpoint = 2;
+  string from = 3;
+}

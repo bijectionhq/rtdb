@@ -31,6 +31,10 @@ pub use owned_world::{FrozenWorldWinner, OwnedWorldHost, OwnedWorldRead, Prepare
 pub const GATEWAY_ANSWER_DEADLINE_HEADER: &str = "x-rtdb-answer-deadline";
 
 mod v1;
+#[cfg(feature = "multi")]
+mod admin;
+#[cfg(feature = "multi")]
+pub use admin::{DeploymentAdminAction, DeploymentAdminAuthority};
 
 pub mod rtdb {
     pub mod v1 {

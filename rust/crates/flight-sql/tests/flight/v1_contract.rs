@@ -5,6 +5,45 @@ use rtdb_flight_sql::rtdb::v1::{self as v1, at::Selection};
 
 const CHANGE_IMAGE_HEADER: &str = "x-rtdb-changes-images";
 
+#[cfg(feature = "multi")]
+#[tokio::test]
+async fn checkpoint_administration_requires_a_verified_unscoped_credential() {
+    use rtdb_flight_sql::{
+        DeploymentAdminAction, DeploymentAdminAuthority, rtdb::admin::v1::ExportCheckpointRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Authority(AtomicUsize);
+
+    impl DeploymentAdminAuthority for Authority {
+        fn authorize(&self, principal: &rtdb_auth::Principal, action: DeploymentAdminAction<'_>) -> rtdb_types::Result<()> {
+            assert_eq!(principal.user_id(), Some("xtdb"));
+            assert_eq!(action, DeploymentAdminAction::Export { deployment: "xtdb" });
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    let authority = Arc::new(Authority::default());
+    let config = FlightConfig { deployment_admin: Some(authority.clone()), ..Default::default() };
+    let body: Bytes = ExportCheckpointRequest { deployment: "xtdb".into(), ..Default::default() }
+        .encode_to_vec().into();
+    let action = "rtdb.admin.v1.ExportCheckpoint";
+
+    let running = Running::start(None, config.clone()).await;
+    let mut trust = Client::connect(&running.server, Some("xtdb:unverified")).await;
+    assert_eq!(trust.action(action, body.clone()).await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    assert_eq!(authority.0.load(Ordering::Relaxed), 0);
+    running.stop().await;
+
+    let running = Running::start(Some("secret"), config).await;
+    let mut verified = Client::connect(&running.server, Some("xtdb:secret")).await;
+    error(verified.action(action, body).await.unwrap_err(), v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+    assert_eq!(authority.0.load(Ordering::Relaxed), 1);
+    running.stop().await;
+}
+
 fn input(sql: &str) -> v1::QueryRequest {
     v1::QueryRequest {
         source: Some(v1::Source {
