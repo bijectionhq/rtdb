@@ -401,9 +401,9 @@ impl Service {
                 crate::owned_actions::HELD_WORLD_PATH_TOUCH_V1 => self.held_world_path_touch_action(&call, &action.body, false).await,
                 crate::owned_actions::HELD_OWNED_PATH_TOUCH_V2 => self.held_owned_path_touch_action(&call, &action.body).await,
                 crate::owned_actions::HELD_OWNED_HISTORICAL_POINT_V1 =>
-                    return self.held_owned_historical_point(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_owned_historical_point(&call, &action.body, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POSITION_POINT_V1 =>
-                    return self.held_owned_position_point(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_owned_position_point(&call, &action.body, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_ROOT_CUT_POINT_V1 =>
                     return self.held_root_cut_point_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_VALID_DURING_V2 =>
@@ -423,13 +423,13 @@ impl Service {
                 crate::owned_actions::READ_HELD_WORLD_HEAD_V1 => Ok(vec![Ok(self.read_held_world_head_action(&call, &action.body)?)]),
                 crate::owned_actions::SELECT_HELD_WORLD_PARENT_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfParent).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_POINT_AT_V1 =>
-                    return self.held_world_point_at(&call, &action.body, true, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_world_point_at(&call, &action.body, true, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal).await?)]),
                 crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal).await?)]),
                 crate::owned_actions::HELD_WORLD_POINT_AT_V2 =>
-                    return self.held_world_point_at(&call, &action.body, false, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_world_point_at(&call, &action.body, false, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_POINT_V2 =>
-                    return self.held_world_point(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_world_point(&call, &action.body, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::CLOSE_WORLD_READ_V1 => {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::{data::StoredOperation, envelope::decode_replica_outcome_attempt, generated::xtdb::log::proto::ResolvedTx};
+use rtdb_format::{data::{EncodedEvent, StoredOperation}, envelope::decode_replica_outcome_attempt, generated::xtdb::log::proto::ResolvedTx};
 use rtdb_index::{IndexBatch, StagedWrite, TableWrite};
 use rtdb_types::{Anomaly, BlockIndex, EventOp, Interval, PLACED_ATTEMPT_OUTCOME_TABLE, PlacedAttempt, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 

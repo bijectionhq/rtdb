@@ -3387,11 +3387,11 @@ mod ancestor_boundaries_tests {
 
     #[test]
     fn merged_identities_stop_at_the_first_unseen_source() {
-        let parent = ["a".to_owned(), "c".to_owned()];
-        let overlay = ["b".to_owned(), "e".to_owned()];
+        let parent = ["a", "c"].map(|value| EntityId::String(value.to_owned()));
+        let overlay = ["b", "e"].map(|value| EntityId::String(value.to_owned()));
         let (candidates, through) = identity_candidates(&parent, &overlay, 2);
-        assert_eq!(through.map(String::as_str), Some("c"));
-        assert_eq!(candidates.map(String::as_str).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(through, Some(&EntityId::String("c".to_owned())));
+        assert_eq!(candidates.cloned().collect::<Vec<_>>(), ["a", "b", "c"].map(|value| EntityId::String(value.to_owned())));
     }
 
     #[test]
