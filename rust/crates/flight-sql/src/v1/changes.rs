@@ -1,11 +1,13 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    mem::size_of,
     sync::Arc,
     time::Duration,
 };
 
 use arrow_array::{
-    BinaryArray, BooleanArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_flight::FlightData;
@@ -38,6 +40,10 @@ const IMAGE_HEADER: &str = "x-rtdb-changes-images";
 const IMAGE_STREAM: &str = "stream-v1";
 const IMAGE_END: [u8; 4] = [0; 4];
 const MAX_PACKED_BYTES: usize = 1 << 20;
+const MAX_FIXED_IMAGE_FIELDS: usize = 4;
+const MAX_FIXED_IMAGE_BYTES: usize = 1024;
+const MAX_FIXED_IMAGE_SCRATCH: usize = 24 << 10;
+const MIN_FIXED_IMAGE_ROW_BOUND: usize = MAX_FIXED_IMAGE_SCRATCH + 8 * MAX_FIXED_IMAGE_BYTES;
 
 struct Request {
     tables: BTreeSet<TableRef>,
@@ -68,6 +74,15 @@ struct ReservedRow {
 }
 
 impl ReservedRow {
+    fn finish_images(&mut self) -> Result<(), Status> {
+        for image in &mut self.images {
+            if let Some(Image::Deferred(deferred)) = image {
+                *image = Some(deferred.encode()?);
+            }
+        }
+        Ok(())
+    }
+
     fn encode(
         self,
         schema: &SchemaRef,
@@ -99,15 +114,29 @@ enum Image {
         stream: Arc<RowStreamEncoder>,
         row: PreparedStreamRow,
     },
+    Deferred(DeferredImage),
 }
 
 impl Image {
+    fn encode(batch: &RecordBatch, stream: Option<&Arc<RowStreamEncoder>>) -> Result<Self, Status> {
+        match stream {
+            Some(stream) => Ok(Self::Shared {
+                stream: Arc::clone(stream),
+                row: stream.prepare(batch).map_err(error::anomaly)?,
+            }),
+            None => rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(batch))
+                .map(Self::Binary)
+                .map_err(error::anomaly),
+        }
+    }
+
     fn legacy_len(&self) -> usize {
         match self {
             Self::Binary(bytes) => bytes.len(),
             Self::Shared { stream, row } => {
                 stream.schema_frame().len() + row.framed_len() + IMAGE_END.len()
             }
+            Self::Deferred(image) => image.legacy_len,
         }
     }
 
@@ -121,6 +150,66 @@ impl Image {
     }
 }
 
+struct DeferredImage {
+    schema: SchemaRef,
+    values: [i64; MAX_FIXED_IMAGE_FIELDS],
+    stream: Option<Arc<RowStreamEncoder>>,
+    legacy_len: usize,
+}
+
+impl DeferredImage {
+    fn fixed_values(
+        batch: &RecordBatch,
+        schema_bound: usize,
+    ) -> Option<[i64; MAX_FIXED_IMAGE_FIELDS]> {
+        const CELL_SCRATCH: usize = 4 * (size_of::<Int64Array>() + size_of::<i64>());
+        let fields = batch.num_columns();
+        let schema = batch.schema_ref();
+        if !(1..=MAX_FIXED_IMAGE_FIELDS).contains(&fields)
+            || schema_bound > MAX_FIXED_IMAGE_SCRATCH - CELL_SCRATCH * fields
+            || !schema.metadata().is_empty()
+        {
+            return None;
+        }
+        let mut values = [0; MAX_FIXED_IMAGE_FIELDS];
+        for ((value, field), array) in values.iter_mut().zip(schema.fields()).zip(batch.columns()) {
+            if array.null_count() != 0 || !field.metadata().is_empty() {
+                return None;
+            }
+            *value = match field.data_type() {
+                DataType::Int64 => array.as_any().downcast_ref::<Int64Array>()?.value(0),
+                DataType::Timestamp(ArrowTime::Microsecond, _) => array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()?
+                    .value(0),
+                _ => return None,
+            };
+        }
+        Some(values)
+    }
+
+    fn encode(&self) -> Result<Image, Status> {
+        let columns = self
+            .schema
+            .fields()
+            .iter()
+            .zip(self.values)
+            .map(|(field, value)| -> ArrayRef {
+                match field.data_type() {
+                    DataType::Int64 => Arc::new(Int64Array::from(vec![value])),
+                    DataType::Timestamp(ArrowTime::Microsecond, timezone) => Arc::new(
+                        TimestampMicrosecondArray::from(vec![value])
+                            .with_timezone_opt(timezone.clone()),
+                    ),
+                    _ => unreachable!("deferred images have a fixed-width layout"),
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(batch_error)?;
+        Image::encode(&batch, self.stream.as_ref())
+    }
+}
+
 enum ImageEncoding {
     Binary,
     Stream(Option<Arc<RowStreamEncoder>>),
@@ -131,6 +220,7 @@ struct ImageProjection<'a> {
     columns: &'a [usize],
     projected: Option<RecordBatch>,
     schema_bound: Option<usize>,
+    fixed_len: Option<usize>,
     encoding: ImageEncoding,
 }
 
@@ -141,6 +231,7 @@ impl<'a> ImageProjection<'a> {
             columns,
             projected: None,
             schema_bound: None,
+            fixed_len: None,
             encoding: if shared_images {
                 ImageEncoding::Stream(None)
             } else {
@@ -149,7 +240,7 @@ impl<'a> ImageProjection<'a> {
         }
     }
 
-    fn write(
+    fn prepare(
         &mut self,
         row: usize,
         memory: &Arc<MemoryBudget>,
@@ -172,11 +263,8 @@ impl<'a> ImageProjection<'a> {
         };
         let size = wire::add(arrays, schema_bound).map_err(error::map_status)?;
         let charge = memory.reserve(size).map_err(error::anomaly)?;
-        let image = match &mut self.encoding {
-            ImageEncoding::Binary => Image::Binary(
-                rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
-                    .map_err(error::anomaly)?,
-            ),
+        let stream = match &mut self.encoding {
+            ImageEncoding::Binary => None,
             ImageEncoding::Stream(encoder) => {
                 let encoder = match encoder {
                     Some(encoder) => encoder,
@@ -184,12 +272,28 @@ impl<'a> ImageProjection<'a> {
                         RowStreamEncoder::new(batch.schema_ref()).map_err(error::anomaly)?,
                     )),
                 };
-                Image::Shared {
-                    stream: Arc::clone(encoder),
-                    row: encoder.prepare(&batch).map_err(error::anomaly)?,
-                }
+                Some(&*encoder)
             }
         };
+        let values = DeferredImage::fixed_values(&batch, schema_bound);
+        if let (Some(values), Some(legacy_len)) = (values, self.fixed_len) {
+            return Ok((
+                Image::Deferred(DeferredImage {
+                    schema: batch.schema(),
+                    values,
+                    stream: stream.cloned(),
+                    legacy_len,
+                }),
+                charge,
+            ));
+        }
+        let image = Image::encode(&batch, stream)?;
+        // For present fixed-width cells, uncompressed framing depends only on the projection.
+        // Use a successful encode to establish its exact length under the original scratch charge.
+        if values.is_some() {
+            let length = image.legacy_len();
+            self.fixed_len = (length <= MAX_FIXED_IMAGE_BYTES).then_some(length);
+        }
         Ok((image, charge))
     }
 }
@@ -508,12 +612,12 @@ async fn change_page(
                             };
                             let (key, _key_scratch) = key_writer
                                 .as_mut()
-                                .map(|writer| writer.write(row, memory))
+                                .map(|writer| writer.prepare(row, memory))
                                 .transpose()?
                                 .unzip();
                             let (image, _image_scratch) = image_writer
                                 .as_mut()
-                                .map(|writer| writer.write(row, memory))
+                                .map(|writer| writer.prepare(row, memory))
                                 .transpose()?
                                 .unzip();
                             let opened = matches!(boundary, Boundary::Opened);
@@ -528,13 +632,24 @@ async fn change_page(
                                 .reserve(bound)
                                 .map_err(crate::error::status)
                                 .map_err(error::map_status)?;
-                            let row = ReservedRow {
+                            let mut row = ReservedRow {
                                 table: Arc::clone(&table_name),
                                 time,
                                 opened,
                                 images,
                                 charge,
                             };
+                            // Only defer small images together so their scratch fits in the
+                            // singleton charge before allocating the outer batch.
+                            if !(MIN_FIXED_IMAGE_ROW_BOUND..=pack_limit).contains(&bound)
+                                || row
+                                    .images
+                                    .iter()
+                                    .flatten()
+                                    .any(|image| !matches!(image, Image::Deferred(_)))
+                            {
+                                row.finish_images()?;
+                            }
                             let row = if bound <= pack_limit {
                                 ChangeRow::Reserved(row)
                             } else {
@@ -649,7 +764,7 @@ fn outer_row(
 }
 
 fn encode_page(
-    groups: BTreeMap<Timestamp, Vec<(usize, ChangeRow)>>,
+    mut groups: BTreeMap<Timestamp, Vec<(usize, ChangeRow)>>,
     descending: bool,
     shared_images: bool,
     schema: &SchemaRef,
@@ -657,6 +772,11 @@ fn encode_page(
     memory: &Arc<MemoryBudget>,
     pack_limit: usize,
 ) -> Result<Vec<(usize, Vec<FlightData>)>, Status> {
+    for (_, row) in groups.values_mut().flatten() {
+        if let ChangeRow::Reserved(row) = row {
+            row.finish_images()?;
+        }
+    }
     let mut groups = groups.into_values();
     let mut rows = std::iter::from_fn(|| {
         if descending {
@@ -746,13 +866,13 @@ fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, Arrow
             .map(|image| match image {
                 Some(Image::Binary(bytes)) => Some(bytes.as_slice()),
                 None => None,
-                Some(Image::Shared { .. }) => unreachable!("packed rows use the same image carrier"),
+                Some(_) => unreachable!("packed rows use the same encoded image carrier"),
             })
             .collect());
     };
     let messages = images.flatten().map(|image| match image {
         Image::Shared { row, .. } => row,
-        Image::Binary(_) => unreachable!("packed rows use the same image carrier"),
+        _ => unreachable!("packed rows use the same encoded image carrier"),
     });
     let len = stream.schema_frame().len()
         + messages.clone().map(PreparedStreamRow::framed_len).sum::<usize>()
@@ -777,7 +897,74 @@ fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, Arrow
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, ArrayRef, builder::StringDictionaryBuilder, types::Int32Type};
+    use arrow_array::{Array, builder::StringDictionaryBuilder, types::Int32Type};
+
+    #[test]
+    fn fixed_images_preserve_scratch_admission_and_singleton_bytes_when_deferred() {
+        let batch = RecordBatch::try_from_iter([
+            (
+                "_id",
+                Arc::new(Int64Array::from(vec![Some(1), Some(-42), None])) as ArrayRef,
+            ),
+            (
+                "_valid_from",
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![2, 170, 191])
+                        .with_timezone("America/New_York"),
+                ) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Arc::new(schema());
+        let table: Arc<str> = Arc::from("public.rows");
+        let base = singleton_base(&schema, &table).unwrap();
+        assert!(base >= MIN_FIXED_IMAGE_ROW_BOUND);
+        let candidate = batch.slice(1, 1);
+        let scratch_bound = wire::batch_bound(&candidate).unwrap();
+        let expected =
+            rtdb_format::ipc::write_stream(candidate.schema_ref(), std::slice::from_ref(&candidate))
+                .unwrap();
+
+        for shared in [false, true] {
+            let mut projection = ImageProjection::new(&batch, &[0, 1], shared);
+            let (first, first_scratch) = projection.prepare(0, &memory).unwrap();
+            assert!(!matches!(&first, Image::Deferred(_)));
+            drop(first_scratch);
+
+            let restricted = MemoryBudget::new(scratch_bound - 1);
+            let expected_error = error::anomaly(restricted.reserve(scratch_bound).err().unwrap());
+            let error = projection.prepare(1, &restricted).err().unwrap();
+            assert_eq!(error.code(), expected_error.code());
+            assert_eq!(error.details(), expected_error.details());
+
+            let (image, scratch) = projection.prepare(1, &memory).unwrap();
+            assert!(matches!(&image, Image::Deferred(_)));
+            assert_eq!(scratch.bytes(), scratch_bound);
+            assert_eq!(image.legacy_len(), expected.len());
+            let charge = memory
+                .reserve(singleton_bound(base, [Some(expected.len()), None, None]).unwrap())
+                .unwrap();
+            let mut row = ReservedRow {
+                table: Arc::clone(&table),
+                time: Timestamp(1),
+                opened: true,
+                images: [Some(image), None, None],
+                charge,
+            };
+            drop(scratch);
+            row.finish_images().unwrap();
+            let materialized = row.images[0].as_ref().unwrap();
+            assert_eq!(materialized.legacy_len(), expected.len());
+            assert_eq!(first.shares_schema_with(materialized), shared);
+            let singleton = image_array(std::slice::from_ref(&row), 0).unwrap();
+            assert_eq!(singleton.value(0), expected.as_slice());
+
+            let (null, _) = projection.prepare(2, &memory).unwrap();
+            assert!(!matches!(null, Image::Deferred(_)));
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn shared_images_keep_the_released_bytes_across_input_batches() {
@@ -812,8 +999,8 @@ mod tests {
                     std::slice::from_ref(&candidate),
                 )
                 .unwrap();
-                let (image, scratch) = shared.write(index, &memory).unwrap();
-                let (binary, binary_scratch) = ordinary.write(index, &memory).unwrap();
+                let (image, scratch) = shared.prepare(index, &memory).unwrap();
+                let (binary, binary_scratch) = ordinary.prepare(index, &memory).unwrap();
                 let image_bound = wire::batch_bound(&candidate).unwrap();
                 assert_eq!(scratch.bytes(), image_bound);
                 assert_eq!(binary_scratch.bytes(), image_bound);
@@ -862,7 +1049,7 @@ mod tests {
             let mut images = ImageProjection::new(&batch, &[0], shared);
             let memory = MemoryBudget::new(bound - 1);
             let expected = error::anomaly(memory.reserve(bound).err().unwrap());
-            let rejection = images.write(0, &memory).err().unwrap();
+            let rejection = images.prepare(0, &memory).err().unwrap();
             assert_eq!(rejection.code(), expected.code());
             assert_eq!(rejection.details(), expected.details());
             assert_eq!(memory.used_bytes(), 0);
@@ -872,7 +1059,7 @@ mod tests {
                 rtdb_format::ipc::write_stream(candidate.schema_ref(), std::slice::from_ref(&candidate))
                     .unwrap_err(),
             );
-            let rejection = images.write(0, &memory).err().unwrap();
+            let rejection = images.prepare(0, &memory).err().unwrap();
             assert_eq!(rejection.code(), expected.code());
             assert_eq!(rejection.details(), expected.details());
             assert_eq!(memory.used_bytes(), 0);
@@ -951,8 +1138,8 @@ mod tests {
         let mut shared = ImageProjection::new(&batch, &[0], true);
         let mut legacy = ImageProjection::new(&batch, &[0], false);
         let mut make_row = |row| {
-            let (image, charge) = shared.write(row, &memory).unwrap();
-            let (legacy, _) = legacy.write(row, &memory).unwrap();
+            let (image, charge) = shared.prepare(row, &memory).unwrap();
+            let (legacy, _) = legacy.prepare(row, &memory).unwrap();
             let Image::Binary(legacy) = legacy else {
                 panic!("expected an ordinary image");
             };
