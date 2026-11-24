@@ -308,6 +308,11 @@ impl MultiServing {
         self.writes.transact(request).await
     }
 
+    pub async fn replay_follower(&self) -> Result<()> {
+        self.database.lock().await.fresh_index().await?;
+        Ok(())
+    }
+
     pub async fn tick(&self, live_nodes: &BTreeSet<IpAddr>) -> Result<Role> {
         self.writes.tick(live_nodes.clone()).await
     }
@@ -836,6 +841,13 @@ mod tests {
         let unretained = Basis::new(*id.as_bytes(), evidence.applied_position + 1);
         assert_eq!(select(At::Exactly(unretained), false).await.err().unwrap().code, "rtdb/cursor-expired");
         assert_eq!(select(At::Exactly(Basis::new([5; 16], 0)), false).await.err().unwrap().code, "rtdb/foreign-basis");
+
+        drop(reader);
+        let live = BTreeSet::from([follower_node]);
+        assert_eq!(writer.tick(&live).await.unwrap(), Role::Follower);
+        follower.replay_follower().await.unwrap();
+        assert_eq!(follower.database.lock().await.role(), Role::Follower);
+        assert!(matches!(follower.tick(&live).await.unwrap(), Role::Writer(_)));
     }
 
     #[tokio::test]

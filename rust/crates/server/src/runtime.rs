@@ -140,6 +140,33 @@ impl ServerDriver {
         Self::open_mode(config, limit, memory, false, None, None, Backend::Configured(Some(multi.resource_override()))).await
     }
 
+    #[cfg(all(feature = "multi", feature = "s3"))]
+    pub async fn open_with_multi_follower(
+        config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>,
+        multi: &crate::multi::MultiRuntime, address: SocketAddr,
+        tls: tokio_rustls::rustls::ServerConfig,
+    ) -> Result<(ServerHandle, Self)> {
+        let invalid = || Anomaly::incorrect("rtdb/follower-assignment", "The assigned follower requires a dedicated Multi node");
+        let assignment = multi.follower_assignment().ok_or_else(invalid)?;
+        if config.server.is_some() || config.flight_sql.is_some() || config.health.is_some() || !config.read_only_databases {
+            return Err(invalid());
+        }
+        let (mut handle, mut driver) = Self::open_with_multi(config, limit, memory, multi).await?;
+        let listener = multi.bind_native_follower(handle.node(), assignment.clone(), address, handle.authenticator().clone(), tls).await;
+        match listener {
+            Ok((listener, listener_driver)) => {
+                handle.addresses.flight_sql = Some(listener.address());
+                driver.handle.addresses.flight_sql = handle.addresses.flight_sql;
+                driver.flight.push((listener, listener_driver));
+                Ok((handle, driver))
+            }
+            Err(error) => match driver.close_without_run().await {
+                Ok(()) => Err(error),
+                Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())),
+            },
+        }
+    }
+
     pub(crate) async fn open_installed(config: NodeConfiguration, limit: usize, resources: NativeResources, tls: Option<Tls>) -> Result<(ServerHandle, Self)> {
         if tls.is_none() && (config.server.is_some() || config.flight_sql.is_some()) {
             return Err(Anomaly::incorrect("rtdb.server/standalone", "Installed listeners require TLS"));

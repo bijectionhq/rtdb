@@ -102,6 +102,16 @@ impl ParsedConfiguration {
     pub fn warnings(&self) -> &[String] { &self.warnings }
     pub(crate) fn configuration_mut(&mut self) -> &mut NodeConfiguration { &mut self.configuration }
 
+    #[cfg(all(feature = "multi", feature = "s3"))]
+    pub fn into_follower_execution(mut self, allocation_limit_bytes: usize) -> Result<(NodeConfiguration, Arc<MemoryBudget>, Arc<MemoryReservation>)> {
+        self.configuration.server = None;
+        self.configuration.flight_sql = None;
+        self.configuration.health = None;
+        self.configuration.read_only_databases = true;
+        self.configuration.default_v1_serving = false;
+        self.into_execution(allocation_limit_bytes)
+    }
+
     /// Transfers startup charges before the node allocates from its execution/cache split.
     /// Retain the returned lease until the configuration and all allocations derived from it have been dropped.
     pub fn into_execution(self, allocation_limit_bytes: usize) -> Result<(NodeConfiguration, Arc<MemoryBudget>, Arc<MemoryReservation>)> {

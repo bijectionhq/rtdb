@@ -2,6 +2,9 @@ use std::{io::Write, process::ExitCode, time::Duration};
 use rtdb_server::{ServerDriver, ServerHandle, cli::{self, Command}};
 use rtdb_types::{Anomaly, Result};
 
+#[cfg(all(feature = "multi", feature = "s3"))]
+mod follower_process;
+
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread().thread_stack_size(rtdb_node::WORKER_STACK_BYTES).enable_all().build() {
         Ok(runtime) => runtime,
@@ -81,19 +84,21 @@ async fn run() -> Result<()> {
             } else { ServerDriver::open_with_memory(config, options.allocation_limit_bytes, memory).await? };
             run_started(&handle, driver).await
         }
-        Command::StartMulti { options, config_env } => {
+        Command::StartMulti { options, config_env, native_follower } => {
             #[cfg(all(feature = "multi", feature = "s3"))]
             {
                 let limit = options.allocation_limit_bytes;
-                let (mut config, memory, _configuration) = options
-                    .load_multi_reserved(config_env.as_deref())?
-                    .into_execution(limit)?;
+                let parsed = options.load_multi_reserved(config_env.as_deref())?;
+                if let Some(path) = native_follower {
+                    return follower_process::serve(parsed, limit, &path).await;
+                }
+                let (mut config, memory, _configuration) = parsed.into_execution(limit)?;
                 let multi = rtdb_server::multi::MultiRuntime::production(&mut config, memory.clone()).await?;
                 serve_multi(config, limit, memory, multi).await
             }
             #[cfg(not(all(feature = "multi", feature = "s3")))]
             {
-                let _ = (options, config_env);
+                let _ = (options, config_env, native_follower);
                 Err(Anomaly::unsupported("rtdb.multi/backend", "Installed Multi nodes require the multi and s3 features"))
             }
         }

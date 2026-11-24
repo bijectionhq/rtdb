@@ -2,7 +2,7 @@ use std::{fs::File, io::Read, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tls::{KeyStore, StoreFormat, StoreUse};
 use rtdb_types::{Anomaly, Result};
-use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}, server::{ClientHello, ResolvesServerCert}, sign::CertifiedKey};
+use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject}, server::{ClientHello, ResolvesServerCert}, sign::CertifiedKey};
 use zeroize::Zeroizing;
 use crate::config::KeyStoreSettings;
 const MAX_KEYSTORE_BYTES: u64 = 16 * 1024 * 1024;
@@ -28,6 +28,21 @@ pub fn load(settings: &KeyStoreSettings, memory: &Arc<MemoryBudget>) -> Result<A
         .with_no_client_auth().with_cert_resolver(Arc::new(KeyResolver { keys, _reservation: store.reservation() }));
     Ok(Arc::new(configuration))
 }
+pub fn from_pem_identity(certificate: &[u8], private_key: &[u8]) -> Result<rustls::ServerConfig> {
+    let invalid = |message| Anomaly::incorrect("rtdb.server/invalid-tls-identity", message);
+    let chain = CertificateDer::pem_slice_iter(certificate)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| invalid("Invalid TLS certificate PEM".to_owned()))?;
+    let key = PrivateKeyDer::from_pem_slice(private_key)
+        .map_err(|_| invalid("Invalid TLS private key PEM".to_owned()))?;
+    rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|error| invalid(error.to_string()))?
+        .with_no_client_auth()
+        .with_single_cert(chain, key)
+        .map_err(|error| invalid(error.to_string()))
+}
+
 struct KeyResolver { keys: Vec<Arc<CertifiedKey>>, _reservation: Arc<MemoryReservation> }
 impl std::fmt::Debug for KeyResolver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.debug_struct("KeyResolver").field("identities", &self.keys.len()).finish() }

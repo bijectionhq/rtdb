@@ -60,6 +60,7 @@ pub struct MultiRuntime {
     managed_sources: Arc<BTreeMap<Uuid, Arc<dyn ManagedCheckpointSource>>>,
     native_checkpoint_source: Option<native_checkpoint::NativeCheckpointSource>,
     managed_operations: TaskTracker,
+    follower: Option<NativeFollowerAssignment>,
 }
 
 impl MultiRuntime {
@@ -70,16 +71,12 @@ impl MultiRuntime {
         authenticator: Arc<Authenticator>, tls: tokio_rustls::rustls::ServerConfig,
     ) -> Result<(rtdb_flight_sql::ServerHandle, rtdb_flight_sql::ServerDriver)> {
         validate_deployment_name(&assignment.database)?;
-        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-unavailable", "The assigned deployment has no local Multi replica");
-        if !node.catalog().is_managed() || !self.catalog.read().await?.get(&assignment.database)
-            .is_some_and(|entry| entry.status.ready() && entry.database == assignment.incarnation)
-        {
-            return Err(unavailable());
+        if !node.catalog().is_managed() || self.follower.as_ref().is_some_and(|installed| installed != &assignment) {
+            return Err(follower_unavailable());
         }
-        let attachment = node.catalog().database(&assignment.database).map_err(|_| unavailable())?;
-        let driver = self.databases.read().expect("Multi serving catalog").get(&assignment.database)
-            .filter(|driver| driver.incarnation() == *assignment.incarnation.as_bytes())
-            .cloned().ok_or_else(unavailable)?;
+        require_ready_follower(&self.catalog.read().await?, &assignment)?;
+        let attachment = node.catalog().database(&assignment.database).map_err(|_| follower_unavailable())?;
+        let driver = self.follower_driver(&assignment)?;
         let reader = driver.assign_follower().await?;
         rtdb_flight_sql::ServerDriver::bind_follower(address, node.clone(), authenticator, tls, assignment, &attachment, reader).await
     }
@@ -125,6 +122,7 @@ impl MultiRuntime {
             memory,
             BTreeMap::from([("xtdb".into(), database)]),
             backends,
+            None,
         )
         .await
     }
@@ -134,10 +132,28 @@ impl MultiRuntime {
         config: &mut NodeConfiguration,
         memory: Arc<MemoryBudget>,
     ) -> Result<Self> {
+        Self::production_mode(config, memory, None).await
+    }
+
+    #[cfg(feature = "s3")]
+    pub async fn production_follower(
+        config: &mut NodeConfiguration,
+        memory: Arc<MemoryBudget>,
+        assignment: NativeFollowerAssignment,
+    ) -> Result<Self> {
+        Self::production_mode(config, memory, Some(assignment)).await
+    }
+
+    #[cfg(feature = "s3")]
+    async fn production_mode(
+        config: &mut NodeConfiguration,
+        memory: Arc<MemoryBudget>,
+        follower: Option<NativeFollowerAssignment>,
+    ) -> Result<Self> {
         use rtdb_stream_journal::{Credentials, StreamJournal};
 
         let node = installed_node_ip().await?;
-        let peers = Some(required("RTDB_PEERS")?);
+        let peers = if follower.is_none() { Some(required("RTDB_PEERS")?) } else { None };
         let databases = serde_json::from_str(&required("RTDB_DATABASES")?)
             .map_err(|_| invalid("RTDB_DATABASES must map database names to UUIDs"))?;
         let vault = PathBuf::from(required("RTDB_KEY_DIRECTORY")?);
@@ -188,7 +204,9 @@ impl MultiRuntime {
             .await?;
         let journal = Arc::new(journal);
         let backends = Backends {
-            batch: Some(Arc::new(StreamJournalBatch(Arc::clone(&journal)))),
+            batch: follower.is_none().then(|| {
+                Arc::new(StreamJournalBatch(Arc::clone(&journal))) as Arc<dyn JournalBatchAppender>
+            }),
             journal,
             store,
             io,
@@ -197,8 +215,10 @@ impl MultiRuntime {
             peers,
             _credential_slot: Some(Arc::new(lock)),
         };
-        let mut runtime = Self::open(config, memory, databases, backends).await?;
-        runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
+        let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
+        if runtime.follower.is_none() {
+            runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
+        }
         Ok(runtime)
     }
 
@@ -207,6 +227,7 @@ impl MultiRuntime {
         memory: Arc<MemoryBudget>,
         databases: BTreeMap<String, Uuid>,
         backends: Backends,
+        follower: Option<NativeFollowerAssignment>,
     ) -> Result<Self> {
         if !databases.contains_key("xtdb")
             || databases.values().any(Uuid::is_nil)
@@ -217,7 +238,9 @@ impl MultiRuntime {
                 "Multi requires xtdb and distinct nonzero database IDs",
             ));
         }
-        FileKms::create_directory(&backends.vault)?;
+        if follower.is_none() {
+            FileKms::create_directory(&backends.vault)?;
+        }
         let kms: Arc<dyn Kms> = Arc::new(FileKms::open(&backends.vault, || SystemClock.now().0)?);
         let control = catalog::identity(b"catalog", databases["xtdb"], "");
         if databases.values().any(|id| *id == control) {
@@ -225,7 +248,8 @@ impl MultiRuntime {
                 "A bootstrap database cannot use the deployment catalog identity",
             ));
         }
-        let control = open_database(&backends, &kms, control, false).await?;
+        let control_open = if follower.is_some() { DatabaseOpen::Prepared } else { DatabaseOpen::Required };
+        let control = open_database(&backends, &kms, control, control_open).await?;
         let peer = backends.peers.as_ref().map(|_| {
             peer::Peer::new(
                 backends.node,
@@ -249,23 +273,29 @@ impl MultiRuntime {
                 ));
             }
         }
-        let initial = databases
-            .iter()
-            .filter(|(name, _)| {
-                observed
-                    .get(*name)
-                    .is_none_or(|entry| matches!(entry.status, Status::Reserved | Status::Ready))
-            })
-            .map(|(name, id)| (name.clone(), *id))
-            .chain(
-                observed
-                    .iter()
-                    .filter(|(_, entry)| entry.status.ready())
-                    .map(|(name, entry)| (name.clone(), entry.database)),
-            )
-            .collect::<BTreeMap<_, _>>();
+        let initial = if let Some(assignment) = &follower {
+            require_ready_follower(&observed, assignment)?;
+            BTreeMap::from([(assignment.database.clone(), assignment.incarnation)])
+        } else {
+            databases
+                .iter()
+                .filter(|(name, _)| {
+                    observed
+                        .get(*name)
+                        .is_none_or(|entry| matches!(entry.status, Status::Reserved | Status::Ready))
+                })
+                .map(|(name, id)| (name.clone(), *id))
+                .chain(
+                    observed
+                        .iter()
+                        .filter(|(_, entry)| entry.status.ready())
+                        .map(|(name, entry)| (name.clone(), entry.database)),
+                )
+                .collect()
+        };
+        let database_open = if follower.is_some() { DatabaseOpen::Prepared } else { DatabaseOpen::Startup };
         for (name, id) in initial {
-            let database = open_database(&backends, &kms, id, true).await?;
+            let database = open_database(&backends, &kms, id, database_open).await?;
             serving.insert(
                 name.clone(),
                 serving_driver(database, &name, &memory, peer.as_ref()),
@@ -293,6 +323,7 @@ impl MultiRuntime {
             managed_sources: Arc::default(),
             native_checkpoint_source: None,
             managed_operations: TaskTracker::new(),
+            follower,
         })
     }
 
@@ -741,7 +772,25 @@ impl MultiRuntime {
         self.catalog.mark_erased(name, retirement, confirmed).await
     }
 
+    #[cfg(feature = "s3")]
+    pub(crate) fn follower_assignment(&self) -> Option<&NativeFollowerAssignment> {
+        self.follower.as_ref()
+    }
+
+    fn follower_driver(&self, assignment: &NativeFollowerAssignment) -> Result<Arc<MultiServing>> {
+        self.databases.read().expect("Multi serving catalog").get(&assignment.database)
+            .filter(|driver| driver.incarnation() == *assignment.incarnation.as_bytes())
+            .cloned().ok_or_else(follower_unavailable)
+    }
+
     pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
+        if let Some(assignment) = &self.follower {
+            let replica = self.follower_driver(assignment)?;
+            return drive_multi(stop, async || match replica.replay_follower().await {
+                Err(error) if retryable(&error) => Ok(()),
+                result => result,
+            }).await;
+        }
         tokio::select! {
             result = self.drive_databases(node, stop) => result,
             result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
@@ -751,16 +800,7 @@ impl MultiRuntime {
     }
 
     async fn drive_databases(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
-        let mut interval = tokio::time::interval(Duration::from_millis(250));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        stop.run_until_cancelled(async {
-            loop {
-                interval.tick().await;
-                self.tick(node).await?;
-            }
-        })
-        .await
-        .unwrap_or(Ok(()))
+        drive_multi(stop, async || self.tick(node).await).await
     }
 
     async fn tick(&self, node: &Node) -> Result<()> {
@@ -890,7 +930,7 @@ impl MultiRuntime {
             check_incarnation(driver, id)?;
             return Ok(Arc::clone(driver));
         }
-        let mut database = open_database(&self.backends, &self.kms, id, false).await?;
+        let mut database = open_database(&self.backends, &self.kms, id, DatabaseOpen::Required).await?;
         if database.deployment_retirement().await?.is_none() {
             database.token_authority().issuer().await?;
         }
@@ -944,11 +984,18 @@ fn serving_driver(
     })
 }
 
+#[derive(Clone, Copy)]
+enum DatabaseOpen {
+    Startup,
+    Required,
+    Prepared,
+}
+
 async fn open_database(
     backends: &Backends,
     kms: &Arc<dyn Kms>,
     id: Uuid,
-    allow_unavailable: bool,
+    mode: DatabaseOpen,
 ) -> Result<MultiDatabase> {
     let mut database = MultiDatabase::new(
         MultiOptions {
@@ -967,6 +1014,9 @@ async fn open_database(
     }
     match backends.journal.head(StreamId(id.as_u128())).await {
         Ok(head) if head.0 > 0 => (),
+        Ok(_) | Err(JournalError::NotFound) if matches!(mode, DatabaseOpen::Prepared) => {
+            return Err(follower_unavailable());
+        }
         Ok(_) | Err(JournalError::NotFound) => {
             // Concurrent catalog followers must open the same initial token key.
             let path = backends.vault.join(format!("bootstrap-{id}.lock"));
@@ -985,7 +1035,7 @@ async fn open_database(
             .map_err(io_error)?;
             database.create().await?;
         }
-        Err(JournalError::Unavailable) if allow_unavailable => (),
+        Err(JournalError::Unavailable) if matches!(mode, DatabaseOpen::Startup) => (),
         Err(JournalError::Unavailable) => {
             return Err(Anomaly::new(
                 AnomalyCategory::Unavailable,
@@ -996,6 +1046,38 @@ async fn open_database(
         Err(error) => return Err(Anomaly::fault("rtdb/multi-open", error.to_string())),
     }
     Ok(database)
+}
+
+async fn drive_multi(
+    stop: &CancellationToken,
+    mut tick: impl AsyncFnMut() -> Result<()>,
+) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    stop.run_until_cancelled(async {
+        loop {
+            interval.tick().await;
+            tick().await?;
+        }
+    })
+    .await
+    .unwrap_or(Ok(()))
+}
+
+fn require_ready_follower(
+    observed: &BTreeMap<String, catalog::Deployment>,
+    assignment: &NativeFollowerAssignment,
+) -> Result<()> {
+    if !observed.get(&assignment.database)
+        .is_some_and(|entry| entry.status.ready() && entry.database == assignment.incarnation)
+    {
+        return Err(follower_unavailable());
+    }
+    Ok(())
+}
+
+fn follower_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-unavailable", "The assigned deployment has no prepared local Multi replica")
 }
 
 fn check_incarnation(driver: &MultiServing, id: Uuid) -> Result<()> {
@@ -1140,6 +1222,12 @@ impl ResourceFactory for ServingResources {
         _: &DatabaseConfig,
         _: &CancellationToken,
     ) -> Result<Option<Arc<dyn ServingDriver>>> {
+        if let Some(assignment) = &self.runtime.follower {
+            if assignment.database != name {
+                return Err(follower_unavailable());
+            }
+            return Ok(Some(self.runtime.follower_driver(assignment)?));
+        }
         Ok(self
             .runtime
             .databases
@@ -1184,6 +1272,9 @@ impl ResourceFactory for ServingResources {
                 .await
             {
                 Ok(observed) => observed,
+                Err(rtdb_storage::Error::MissingObject(_)) if self.runtime.follower.is_some() => {
+                    return Err(follower_unavailable());
+                }
                 Err(rtdb_storage::Error::MissingObject(_)) => {
                     let write = storage
                         .store
@@ -1385,6 +1476,34 @@ mod tests {
     };
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
+
+    #[tokio::test]
+    async fn prepared_follower_open_does_not_bootstrap_a_missing_journal() {
+        let data = tempfile::tempdir().unwrap();
+        let vault = data.path().join("keys");
+        FileKms::create_directory(&vault).unwrap();
+        let kms: Arc<dyn Kms> = Arc::new(FileKms::open(&vault, || 0).unwrap());
+        let journal = FileJournal::open(data.path().join("journal"), Limits::default()).unwrap();
+        let io = IoRegion::new();
+        let backends = Backends {
+            journal: Arc::new(journal.handle(Identity::from_static("urn:rtdb:test:follower"))),
+            batch: None,
+            store: Arc::new(LocalStore::open_in(data.path().join("objects"), io.clone()).unwrap()),
+            io,
+            vault,
+            node: Ipv4Addr::LOCALHOST.into(),
+            peers: None,
+            _credential_slot: None,
+        };
+        let incarnation = Uuid::from_u128(1);
+        let stream = StreamId(incarnation.as_u128());
+        let missing = backends.journal.head(stream).await;
+        assert!(matches!(&missing, Err(JournalError::NotFound)));
+        let result = open_database(&backends, &kms, incarnation, DatabaseOpen::Prepared).await;
+        assert_eq!(result.err().unwrap().code, "rtdb/follower-unavailable");
+        assert!(matches!(backends.journal.head(stream).await, Err(JournalError::NotFound)));
+        assert!(!backends.vault.join(format!("bootstrap-{incarnation}.lock")).exists());
+    }
 
     #[test]
     fn multi_dev_reopens_an_applied_receipt_and_reads_it_over_native_sql() {

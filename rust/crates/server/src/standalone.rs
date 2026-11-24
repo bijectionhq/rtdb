@@ -29,10 +29,7 @@ use rtdb_types::{
     rtdb_v1::{Basis, Claim, ClaimEvidence, ClaimScope, Layer, MAIN_BRANCH},
 };
 use serde::{Deserialize, Serialize};
-use tokio_rustls::rustls::{
-    self,
-    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
-};
+use tokio_rustls::rustls;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -504,21 +501,10 @@ fn checkpoint_context(target: &Target) -> String {
 
 fn tls(certificate: &Path, key: &Path) -> Result<Arc<rustls::ServerConfig>> {
     let certificate = read_bounded(private_input(certificate)?, 64 * 1024)?;
-    let chain = CertificateDer::pem_slice_iter(&certificate)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| invalid("Invalid standalone TLS certificate"))?;
     let key = Zeroizing::new(read_bounded(private_input(key)?, 64 * 1024)?);
-    let key = PrivateKeyDer::from_pem_slice(&key)
-        .map_err(|_| invalid("Invalid standalone TLS private key"))?;
-    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::aws_lc_rs::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .map_err(tls_error)?
-    .with_no_client_auth()
-    .with_single_cert(chain, key)
-    .map_err(tls_error)?;
-    Ok(Arc::new(config))
+    crate::tls::from_pem_identity(&certificate, &key).map(Arc::new).map_err(|error| {
+        invalid(format!("Invalid standalone TLS identity: {error}"))
+    })
 }
 
 fn read_bounded(file: File, maximum: usize) -> Result<Vec<u8>> {
@@ -594,10 +580,6 @@ fn after_close<T>(result: Result<T>, closed: Result<()>) -> Result<T> {
 
 fn invalid(message: impl Into<String>) -> Anomaly {
     Anomaly::incorrect("rtdb.server/standalone", message)
-}
-
-fn tls_error(error: rustls::Error) -> Anomaly {
-    invalid(format!("Invalid standalone TLS identity: {error}"))
 }
 
 fn io_error(error: io::Error) -> Anomaly {

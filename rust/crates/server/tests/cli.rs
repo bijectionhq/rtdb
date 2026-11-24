@@ -74,7 +74,7 @@ fn multi_is_explicit_in_development_and_cluster_startup() {
 
 #[test]
 fn configuration_environment_is_an_explicit_multi_only_source() {
-    let Command::StartMulti { options, config_env } =
+    let Command::StartMulti { options, config_env, .. } =
         parse(&["node", "--config-env", "MULTI_NODE_YAML", "--multi"])
     else {
         panic!("expected Multi startup");
@@ -87,6 +87,26 @@ fn configuration_environment_is_an_explicit_multi_only_source() {
         &["node", "--multi", "--config-env", "MULTI_NODE_YAML", "-f", "cluster.yaml"],
         &["node", "--multi", "--config-env", "--file"],
         &["node", "--multi", "--config-env", "ONE", "--config-env", "TWO"],
+    ];
+    for arguments in invalid {
+        assert!(cli::parse(arguments.iter().copied().map(str::to_owned), &|_| None).is_err());
+    }
+}
+
+#[test]
+fn native_follower_is_an_explicit_installed_multi_startup() {
+    let Command::StartMulti { native_follower, .. } =
+        parse(&["node", "--native-follower", "follower.json", "--multi"])
+    else {
+        panic!("expected Multi startup");
+    };
+    assert_eq!(native_follower.as_deref(), Some(std::path::Path::new("follower.json")));
+
+    let invalid: &[&[&str]] = &[
+        &["node", "--native-follower", "follower.json"],
+        &["dev", "--multi", "--native-follower", "follower.json"],
+        &["node", "--multi", "--native-follower", "--memory-limit", "123"],
+        &["node", "--multi", "--native-follower", "one", "--native-follower", "two"],
     ];
     for arguments in invalid {
         assert!(cli::parse(arguments.iter().copied().map(str::to_owned), &|_| None).is_err());

@@ -3,7 +3,56 @@
 The opt-in listener serves one existing local replica of a ready plain Multi deployment.
 The cell is responsible for selecting that replica, owning the current assignment lease, and delivering the per-assignment credentials and TLS trust to the worker.
 
-## Startup and drain
+## Installed process
+
+Start the official Multi binary with `rtdb node --multi --config-env CELL_RTDB_YAML --native-follower /run/private/rtdb/follower.json`.
+The ordinary `-f FILE` configuration source also works.
+The follower reuses the installed Multi journal, storage and key-vault settings and reads the ordered catalog to find the exact ready incarnation.
+Prepare the catalog and data journals, the deployment's incarnation marker, and the keys before launch.
+Run this process separately from the writer and omit its node address from the writers' `RTDB_PEERS` discovery records.
+The process attaches only the assigned replica, replays its journal and binds only the private follower Flight listener.
+A missing or incompatible prepared replica fails startup.
+The process never enters Multi election, recovery, peer forwarding, or automatic attachment, including during shutdown.
+
+Use an owner-only launch file and input files under a cell-private directory.
+The certificate chain and private key are PEM files.
+The password file contains exactly 64 random hexadecimal digits without a newline.
+Use a dedicated Basic user and a certificate valid for the server name the cell gives the worker.
+
+```json
+{
+  "slot": "pool-a",
+  "assignment": {
+    "database": "app",
+    "incarnation": "10000000-0000-0000-0000-000000000002",
+    "placement_epoch": 3,
+    "assignment": "10000000-0000-0000-0000-000000000003",
+    "endpoint": "127.0.0.1:0"
+  },
+  "certificate": "/run/private/rtdb/tls.pem",
+  "private_key": "/run/private/rtdb/key.pem",
+  "user": "pool-reader",
+  "password_file": "/run/private/rtdb/password"
+}
+```
+
+The cell holds the child's stdin and stdout pipes open.
+The first stdout line is JSON containing `slot` and the full `assignment`, with the actual bound loopback endpoint replacing port zero.
+The cell uses that exact assignment for `LocalPlacement` resolve and attach on its private socket.
+Its attach reply supplies the same assignment, `tls_server_name`, `ca_pem`, `user`, and `password`.
+Use an authenticated progress probe before admitting work to that route.
+
+On retirement, the cell stops renewing the assignment and drains the Bijection attachment.
+For `POST /v1/follower/detach`, the cell verifies the current full assignment and sends the same `{"slot":...,"assignment":...}` body as one newline-terminated JSON frame on stdin.
+A mismatched assignment frame returns `{"error":"rtdb/follower-assignment"}` and leaves the listener running.
+The cell maps that refusal to HTTP 409.
+An exact frame shuts down and joins Flight, the local node and its resources before writing `{"assignment":...}` to stdout and exiting successfully.
+The cell waits for that exact receipt and successful child exit before acknowledging detach or removing the local copy.
+It retains the exact retired assignment for idempotent detach retries after a lost response.
+A signal, lost control pipe or process failure yields no detach receipt.
+The cell owns the private HTTP adapter, credentials delivered to the worker, and receipt retention.
+
+## Embedded host API
 
 The cell host calls the following API after the existing Multi runtime has attached the assigned database locally.
 Use an existing replica on a separate member from the writer.
