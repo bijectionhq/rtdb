@@ -717,6 +717,8 @@ variant OversizedMessage : ReplicaMessage {
     -- block_index is the block the standing-in record lands in — the open one, not the last completed — because block-gc.allium collects on it.
     -- New references authenticate the exact encoded body with SHA-256; older references still verify the decoded term and sequence.
     -- Leader read-back compares the authenticated body digest to the pending append's digest.
+    -- Owned offload reads retain the fetched allocation and its charge while decoded fields share its bytes.
+    -- Protected snapshot replay copies the fields it decodes so its applied state can outlive the delivery.
     storage_version: Integer
     storage_epoch: Integer
     block_index: Integer

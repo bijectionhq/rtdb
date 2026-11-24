@@ -15,6 +15,10 @@ impl AdmittedReplica {
         Ok(Self(logs.resolve_oversized_fresh(self.0).await?))
     }
 
+    pub(crate) async fn resolve_payload_fresh_detached(self, logs: &PartitionLogs) -> Result<Self> {
+        Ok(Self(logs.resolve_oversized_fresh_detached(self.0).await?))
+    }
+
     pub(crate) async fn resolve_payload_for_readback(self, logs: &PartitionLogs, expected: Option<crate::readback_identity::ReplicaFingerprint>) -> Result<Self> {
         Ok(Self(logs.resolve_oversized_for_readback(self.0, expected).await?))
     }
