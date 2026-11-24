@@ -11,7 +11,8 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Result, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
-/// Reads the principals' retired catalogs for relations past their retention that no undropped world forked before the retirement still names (gc.allium: RetireDueTables).
+/// Publishes retirement of expired owned relations after their last selectable
+/// pre-retirement fork closes (gc.allium: RetireDueTables).
 pub(crate) struct RetiredRelations {
     pub(crate) database: String,
     pub(crate) partition: Arc<PartitionState>,
@@ -23,7 +24,6 @@ pub(crate) struct RetiredRelations {
 #[async_trait]
 impl TableRetirements for RetiredRelations {
     async fn due(&self, cancellation: &CancellationToken) -> Result<Option<(Vec<TableRef>, Timestamp)>> {
-        let value = self.partition.value();
         let snapshot = self.partition.snapshot();
         let Some(present) = snapshot.tx_basis().map(|basis| basis.system_time) else { return Ok(None); };
         let catalogs: Vec<_> = snapshot.tables().into_iter().filter(TableRef::is_owned_retired_catalog).collect();
@@ -42,12 +42,14 @@ impl TableRetirements for RetiredRelations {
                 _ => Vec::new(),
             };
             for (relation, retirement) in ready {
-                if worlds.iter().any(|world| !world.dropped && world.basis.system_time < retirement.retired_at
-                    && world.schemas.relation(&relation).is_some())
+                if worlds.iter().any(|world| {
+                    world.schemas.relation(&relation).is_some()
+                        && fork_retains_relation(world.dropped, world.until, world.basis.system_time, present, retirement.retired_at)
+                })
                 { continue; }
                 let Some(tables) = relation.physical_tables(&retired) else { continue; };
                 due.extend(tables.into_iter().filter(|table| {
-                    value.table_catalog().entry(table).is_some() && value.trie_catalog().retired_as_of(table).is_none()
+                    snapshot.table_catalog().entry(table).is_some() && snapshot.trie_catalog().retired_as_of(table).is_none()
                 }));
             }
         }
@@ -56,5 +58,22 @@ impl TableRetirements for RetiredRelations {
 
     async fn retire(&self, tables: Vec<TableRef>, as_of: Timestamp) -> Result<()> {
         self.term.publish_retirements(tables, as_of).await
+    }
+}
+
+fn fork_retains_relation(dropped: bool, until: Timestamp, basis: Timestamp, present: Timestamp, retired: Timestamp) -> bool {
+    !dropped && present < until && basis < retired
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_selectable_earlier_fork_defers_owned_relation_retirement() {
+        assert!(fork_retains_relation(false, Timestamp(20), Timestamp(8), Timestamp(19), Timestamp(9)));
+        assert!(!fork_retains_relation(false, Timestamp(20), Timestamp(8), Timestamp(20), Timestamp(9)));
+        assert!(!fork_retains_relation(true, Timestamp(20), Timestamp(8), Timestamp(19), Timestamp(9)));
+        assert!(!fork_retains_relation(false, Timestamp(20), Timestamp(9), Timestamp(19), Timestamp(9)));
     }
 }

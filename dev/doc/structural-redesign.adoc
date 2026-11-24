@@ -185,6 +185,7 @@ Generic block and timestamp forks admit under the source lineage reservation and
 Inherited reads and source disposal recheck the original publication. The versioned reaper compares the fork's claim to its exact candidate.
 Hosted installed search runs with exact publication evidence use the same bounded catalog claim and can be submitted without the reader ageing timer.
 A hosted checkpoint subscription renews the exact catalog scope through a fresh storage-ledger admission. Prior readers retain independent claims through provider and delivery drain.
+Owned relations past their declared retention can enter installed retirement once no selectable older world names them. Expired worlds close new admission. Already admitted scopes retain their dependencies through drain.
 Directory-managed search staging binds the upload to its writer epoch and storage region. A successor waits for both writer turnover and provider drain before ordering abandonment.
 Abandoned Classic remote hold recovery, renewal across other entry points, full recovery-root integration, other search staging and seal retirement, and uncoordinated timers remain open.
 
