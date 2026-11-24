@@ -8,7 +8,7 @@ use ordered_logkeeper::ordered::{
 };
 use rtdb_storage::IoRegion;
 
-use super::*;
+use super::{decision::OPERATIONAL_TARGET_MS, *};
 use crate::keys::LocalKeyService;
 
 const RETRY_POSITIONS: u64 = 64;
@@ -537,6 +537,39 @@ async fn either_old_selectable_slot_blocks_commit_and_leaves_the_view_readable()
 }
 
 #[tokio::test]
+async fn clean_slot_gate_rejects_a_short_quorum_and_stale_generation() -> Result<()> {
+    let fixture = Fixture::new().await?;
+    let ErasureProgress::Prepared(prepared) = fixture.custody.prepare(fixture.erasure).await? else {
+        panic!("expected a new erasure attempt");
+    };
+    let request = Request {
+        id: prepared.rotation,
+        placement: prepared.erasure.placement,
+        principal: Principal::Custodian,
+        command: Command::PublishAndRotate {
+            grant: prepared.erasure.incumbent,
+            checkpoint: prepared.checkpoint,
+        },
+    };
+    let decision = fixture.custody.execute(&request).await?;
+    let receipt = decision.receipt;
+    let evidence = decision.rotation.unwrap().evidence;
+    assert!(evidence.covers(receipt));
+    assert!(covers_clean_rotation(&evidence, receipt));
+
+    let mut short_quorum = evidence.clone();
+    short_quorum.voters.pop();
+    assert!(!short_quorum.covers(receipt));
+    assert!(!covers_clean_rotation(&short_quorum, receipt));
+
+    let mut stale_generation = evidence;
+    stale_generation.key_generation -= 1;
+    assert!(!stale_generation.covers(receipt));
+    assert!(!covers_clean_rotation(&stale_generation, receipt));
+    Ok(())
+}
+
+#[tokio::test]
 async fn one_slot_attested_twice_cannot_authorize_commit() -> Result<()> {
     let mut fixture = Fixture::new().await?;
     fixture.custody.duplicate_slot = true;
@@ -630,7 +663,8 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
     let signer = Ed25519KeyPair::from_seed_unchecked(&[4; 32]).unwrap();
     let authority = CustodyEvidence::new(signer.public_key().as_ref().try_into().unwrap())?;
     let sign = |bytes: &[u8]| signer.sign(bytes).as_ref().try_into().unwrap();
-    let mut commit = fixture.commit().await?;
+    let operational = fixture.commit().await?;
+    let mut commit = operational;
     let committed = commit.committed_at_ms;
     let by_ms = committed + 10;
     commit.prepared.erasure.timing = ErasureTiming::Fixed { before_ms: by_ms };
@@ -702,6 +736,12 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
     sign_drain(&mut destruction);
     authority.verify_destruction(commit, &destruction)?;
     assert_eq!(destruction.fixed_deadline_met(&commit), Some(false));
+    assert_eq!(destruction.fixed_deadline_met(&operational), None);
+    let mut on_deadline = destruction.clone();
+    on_deadline.destroyed_at_ms = by_ms;
+    sign_drain(&mut on_deadline);
+    authority.verify_destruction(commit, &on_deadline)?;
+    assert_eq!(on_deadline.fixed_deadline_met(&commit), Some(true));
     assert!(
         authority
             .verify_destruction(other_switch, &destruction)

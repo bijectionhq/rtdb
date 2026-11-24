@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CleanRecoverySlots, CustodyDrain, DestructionEvidence, Erasure, ErasureCommit, ErasureCustody,
-    ErasureDeadline, ErasureProgress, ErasureTiming, JoinedCustody, OPERATIONAL_TARGET_MS,
-    PreparedErasure, domain, drain, drain_inventory, invalid,
+    ErasureDeadline, ErasureProgress, ErasureTiming, JoinedCustody, PreparedErasure, decision,
+    domain, drain, drain_inventory, invalid,
 };
 use crate::journal::custody::CheckpointCustody;
 
@@ -56,7 +56,7 @@ struct CommitRecord {
 
 impl CommitRecord {
     fn read(self, prepared: PreparedErasure) -> Result<ErasureCommit> {
-        let at_ms = self.at_ms.checked_add(OPERATIONAL_TARGET_MS)
+        let at_ms = decision::operational_target_at(self.at_ms)
             .ok_or_else(|| invalid("The operational erasure clock overflowed"))?;
         Ok(ErasureCommit {
             prepared, committed_at_ms: self.at_ms, deadline: ErasureDeadline::Target { at_ms },
@@ -129,8 +129,11 @@ impl ErasureCustody for Installed<'_> {
 
     async fn commit_and_arm(&self, ready: CleanRecoverySlots) -> Result<ErasureCommit> {
         let prepared = ready.prepared();
-        if prepared != self.staged.prepared || prepared.erasure.timing != ErasureTiming::OperationalTarget
-            || ready.deadline().is_some()
+        if prepared != self.staged.prepared
+            || !decision::installed_admits(
+                prepared.erasure.timing == ErasureTiming::OperationalTarget,
+                ready.deadline().is_some(),
+            )
         {
             return Err(invalid("This installed provider uses the operational erasure target"));
         }

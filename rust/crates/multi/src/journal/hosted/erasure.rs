@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use ordered_logkeeper::ordered::{
     Checkpoint, CheckpointPreparation, Command, Cut, Grant, Outcome, Placement, Principal, Receipt,
     Request, RequestId,
+    replication::RotationSlots,
     service::wire::{Decision, SignedRotationSlots},
 };
 use rtdb_replication::SqlErasureSource;
@@ -19,6 +20,7 @@ use crate::journal::{
 use crate::keys::{JournalKey, KeyService};
 use crate::replay_broker::{Client as CustodyBroker, domain};
 
+mod decision;
 mod drain;
 mod evidence;
 pub(super) mod installed;
@@ -452,7 +454,9 @@ impl<'a> ErasureCoordinator<'a> {
         let Some(retiring) = route.erasure_retirement else {
             return Err(invalid("The custodian cannot read the ordered erasure drain"));
         };
-        if retiring.outstanding_holds != 0 { return Ok(None); }
+        if !decision::ordered_holds_drained(retiring.outstanding_holds) {
+            return Ok(None);
+        }
         let joined_custody = journal.joined_fingerprint(&joined)?;
         let root_drain = domain::RootDrain {
             original_head: crate::journal::head_identity(placement, checkpoint.cut),
@@ -625,7 +629,7 @@ async fn coordinate(
         ErasureTiming::OperationalTarget => None,
         ErasureTiming::Fixed { before_ms } => {
             let reservation = custody.reserve_deadline(prepared).await?;
-            if reservation.by_ms == 0 || reservation.by_ms > before_ms {
+            if !decision::fixed_deadline_admits(before_ms, reservation.by_ms) {
                 return Err(invalid(
                     "The custody reservation exceeds the requested deadline",
                 ));
@@ -710,7 +714,7 @@ fn require_clean_slots(
 ) -> Result<CleanRecoverySlots> {
     let slots = decision
         .rotation
-        .filter(|proof| proof.evidence.covers(decision.receipt))
+        .filter(|proof| covers_clean_rotation(&proof.evidence, decision.receipt))
         .ok_or_else(|| invalid("Both recovery slots require authenticated quorum readback"))?;
     // The installed Logkeeper client authenticates the decision and exact
     // readback in this signature before returning it to custody.
@@ -734,10 +738,48 @@ fn require_clean_slots(
     })
 }
 
+fn covers_clean_rotation(slots: &RotationSlots, receipt: Receipt) -> bool {
+    let Ok(Outcome::Granted { grant, recovery }) = receipt.outcome else {
+        return false;
+    };
+    slots.group != [0; 32]
+        && slots.ballot.round != 0
+        && !slots.ballot.nonce.is_nil()
+        && slots.prefix != [0; 32]
+        && receipt.position != 0
+        && slots.position >= receipt.position
+        && recovery.admitted_at == receipt.position
+        && recovery.start == slots.checkpoint.cut
+        && recovery.through == slots.checkpoint.cut
+        && decision::at_clean_checkpoint(
+            slots.checkpoint == recovery.checkpoint,
+            slots.key_generation,
+            grant.key_generation,
+        )
+        && decision::strict_majority(slots.cohort_size, slots.voters.len())
+        && slots.voters.iter().all(|voter| {
+            let [a, b] = voter.slots.images;
+            !voter.voter.is_nil()
+                && decision::mirrors_fence(
+                    voter.slots.selected,
+                    [a.generation, b.generation],
+                    [a.digest != [0; 32], b.digest != [0; 32]],
+                    a.digest != b.digest,
+                )
+        })
+        && slots
+            .voters
+            .windows(2)
+            .all(|pair| pair[0].voter < pair[1].voter)
+}
+
 fn matches_reservation(reserved: DeadlineReservation, commit: ErasureCommit) -> bool {
-    reserved.by_ms == commit.deadline.at_ms()
-        && reserved.retiring_inventory == commit.retiring_inventory
-        && reserved.draining_inventory == commit.draining_inventory
+    decision::same_reservation(
+        reserved.by_ms,
+        commit.deadline.at_ms(),
+        reserved.retiring_inventory == commit.retiring_inventory,
+        reserved.draining_inventory == commit.draining_inventory,
+    )
 }
 
 fn validate_commit(
@@ -746,12 +788,13 @@ fn validate_commit(
     switch: Option<[u8; 32]>,
     authority: Option<&CustodyEvidence>,
 ) -> Result<ErasureCommit> {
-    if commit.prepared != prepared
-        || commit.committed_at_ms == 0
+    if !decision::same_attempt(
+        commit.prepared == prepared,
+        switch.is_none_or(|binding| binding == commit.switch_evidence),
+    ) || commit.committed_at_ms == 0
         || commit.retiring_inventory == [0; 32]
         || commit.draining_inventory == [0; 32]
         || commit.switch_evidence == [0; 32]
-        || switch.is_some_and(|binding| binding != commit.switch_evidence)
     {
         return Err(invalid(
             "The erasure commit has a different switch or retiring inventory",
@@ -759,9 +802,9 @@ fn validate_commit(
     }
     match (prepared.erasure.timing, commit.deadline) {
         (ErasureTiming::OperationalTarget, ErasureDeadline::Target { at_ms })
-            if commit.committed_at_ms.checked_add(OPERATIONAL_TARGET_MS) == Some(at_ms) => {}
+            if decision::operational_target_at(commit.committed_at_ms) == Some(at_ms) => {}
         (ErasureTiming::Fixed { before_ms }, ErasureDeadline::Enforced { by_ms, signature })
-            if by_ms > commit.committed_at_ms && by_ms <= before_ms =>
+            if decision::fixed_commit_admits(before_ms, by_ms, commit.committed_at_ms) =>
         {
             authority
                 .ok_or_else(evidence::authority_unavailable)?

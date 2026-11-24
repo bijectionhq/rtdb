@@ -7,7 +7,7 @@ use ring::{
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
-use super::{ErasureCommit, PreparedErasure, invalid};
+use super::{ErasureCommit, PreparedErasure, decision, invalid};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ErasureTiming {
@@ -205,10 +205,11 @@ impl DestructionEvidence {
 
     /// An operational target supplies no deadline obligation.
     pub fn fixed_deadline_met(&self, commit: &ErasureCommit) -> Option<bool> {
-        match commit.deadline {
+        let enforced_deadline = match commit.deadline {
             ErasureDeadline::Target { .. } => None,
-            ErasureDeadline::Enforced { by_ms, .. } => Some(self.destroyed_at_ms <= by_ms),
-        }
+            ErasureDeadline::Enforced { by_ms, .. } => Some(by_ms),
+        };
+        decision::completion_status(enforced_deadline, self.destroyed_at_ms)
     }
 }
 
@@ -245,15 +246,21 @@ impl CustodyEvidence {
         receipt: &DestructionEvidence,
     ) -> Result<()> {
         let drain = &receipt.drain;
-        if drain.closed_at_ms < commit.committed_at_ms
-            || receipt.destroyed_at_ms < drain.closed_at_ms
+        if !decision::destruction_follows_drain(
+            commit.committed_at_ms,
+            drain.closed_at_ms,
+            receipt.destroyed_at_ms,
+        )
             || receipt.disposition == [0; 32]
             || receipt.journal_key_disposition == [0; 32]
             || receipt.checkpoint_disposition == [0; 32]
             || receipt.serving_disposition == [0; 32]
             || drain.joined.iter().any(|work| {
-                work.observed_at_ms < drain.closed_at_ms
-                    || work.observed_at_ms > receipt.destroyed_at_ms
+                !decision::observed_during_drain(
+                    drain.closed_at_ms,
+                    work.observed_at_ms,
+                    receipt.destroyed_at_ms,
+                )
                     || work.observation == [0; 32]
             })
             || drain_inventory(drain.joined.iter().map(|work| work.participant))?

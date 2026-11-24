@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::journal::custody::{CheckpointCustody, ErasureRecords};
 
 use super::{
-    CleanRecoverySlots, CustodyWork, DrainParticipant, DrainedWork, ErasureCommit, drain_inventory,
-    invalid,
+    CleanRecoverySlots, CustodyWork, DrainParticipant, DrainedWork, ErasureCommit, decision,
+    drain_inventory, invalid,
 };
 use ordered_logkeeper::ordered::{Checkpoint, Placement};
 
@@ -456,7 +456,7 @@ impl<'a> ErasureDrainJournal<'a> {
             None => {
                 let before = u64::try_from(rtdb_directory::now_ms())
                     .map_err(|_| invalid("The custody clock is invalid"))?;
-                if before < latest_join {
+                if !decision::withdrawal_follows_join(before, latest_join) {
                     return Err(invalid(
                         "The custody clock has not reached the joined observation",
                     ));
