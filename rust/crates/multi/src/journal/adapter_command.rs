@@ -213,3 +213,15 @@ mod tests {
         ));
     }
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (expected_lo == observed_lo && expected_hi == observed_hi
+        && prepared > 0 && prepared < fence && fence < opening),
+))]
+pub(crate) fn exact_writer_settlement(
+    expected_lo: u128, expected_hi: u128, observed_lo: u128, observed_hi: u128,
+    prepared: u64, fence: u64, opening: u64,
+) -> bool {
+    expected_lo == observed_lo && expected_hi == observed_hi
+        && prepared > 0 && prepared < fence && fence < opening
+}

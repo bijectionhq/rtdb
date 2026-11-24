@@ -290,6 +290,59 @@ pub async fn move_observed_holder(
     Ok(successor)
 }
 
+/// Fetch an exact writer handoff witness from its authenticated successor node.
+pub async fn audience_writer_handoff(
+    directory: &dyn Directory,
+    plan: rtdb_directory::WriterHandoffPlan,
+    action: control::WriterHandoffAction,
+    control: &ControlKey,
+) -> Result<Vec<u8>> {
+    let unavailable = || Anomaly::new(
+        AnomalyCategory::Unavailable, "rtdb.multi/writer-handoff", "The exact writer handoff witness is unavailable",
+    );
+    let secret = control.0.as_ref().ok_or_else(unavailable)?;
+    let record = directory.deployment(&plan.identity.source().to_string()).await?
+        .filter(|record| plan.matches(record)).ok_or_else(unavailable)?;
+    let target = directory.member(&plan.successor).await?
+        .filter(|member| record.may_hold_on(member, now_ms())).ok_or_else(unavailable)?;
+    let address = target.control_address.as_deref().ok_or_else(unavailable)?;
+    let command = control::WriterHandoffCommand::issue(secret, &record.name, plan, action);
+    let response = expect(address, Request::WriterHandoff { name: record.name.clone(), command: command.clone() }, control).await?;
+    let Response::WriterHandoff { witness, proof } = response else { return Err(unavailable()); };
+    if !secret.verify_route(&command.binding(&record.name, Some(&witness)), &proof) {
+        return Err(unavailable());
+    }
+    let expected = match action {
+        control::WriterHandoffAction::Prepare => rtdb_directory::WRITER_HANDOFF_BYTES + 16,
+        control::WriterHandoffAction::Read | control::WriterHandoffAction::Switch => rtdb_directory::WRITER_HANDOFF_BYTES + 32,
+        control::WriterHandoffAction::Abandon => 0,
+    };
+    if witness.len() != expected
+        || (action == control::WriterHandoffAction::Prepare && !witness.starts_with(&command.plan.identity.encode()))
+    {
+        return Err(unavailable());
+    }
+    if matches!(action, control::WriterHandoffAction::Read | control::WriterHandoffAction::Switch) {
+        let width = rtdb_directory::WRITER_HANDOFF_BYTES;
+        let coordinate = |offset| u64::from_be_bytes(witness[offset..offset + 8].try_into().expect("checked writer witness length"));
+        let digest_halves = |data: &[u8]| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, data);
+            let bytes = digest.as_ref();
+            (u128::from_be_bytes(bytes[..16].try_into().expect("SHA-256 half")),
+             u128::from_be_bytes(bytes[16..].try_into().expect("SHA-256 half")))
+        };
+        let (expected_lo, expected_hi) = digest_halves(&command.plan.identity.encode());
+        let (observed_lo, observed_hi) = digest_halves(&witness[..width]);
+        if !crate::journal::adapter_command::exact_writer_settlement(
+            expected_lo, expected_hi, observed_lo, observed_hi,
+            coordinate(width), coordinate(width + 16), coordinate(width + 24),
+        ) {
+            return Err(unavailable());
+        }
+    }
+    Ok(witness)
+}
+
 async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId,
                         source: Option<(&MemberId, u64)>, observed: Option<&HolderObservation>,
                         control: &ControlKey) -> Result<u64> {

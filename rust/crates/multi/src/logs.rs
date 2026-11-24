@@ -674,7 +674,11 @@ impl Log for SealedLog {
     async fn enqueue_guarded(&self, payload: Bytes, guard: GuardedAppend<'_>) -> rtdb_storage::Result<AppendReceipt> {
         let staged = self.admit_detached_append(&payload).await?;
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
-        let receipt = self.inner.enqueue_guarded(self.units.seal(payload).await?, guard).await?;
+        let payload = self.units.seal(payload).await?;
+        if let Some((admission, cutoff)) = self.recovery.as_ref().zip(guard.journal_before()) {
+            admission.check_handoff_dispatch(cutoff).await?;
+        }
+        let receipt = self.inner.enqueue_guarded(payload, guard).await?;
         Ok(observe_detached_commit(observe_attempt(receipt, outcome), staged))
     }
     fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.inner.latest() }

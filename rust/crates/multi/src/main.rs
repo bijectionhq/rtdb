@@ -63,6 +63,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi status --directory DIR [--target-per-node N] [--placements-only]\n\
        rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
        rtdb-multi move-observed-holder --directory DIR --observation FILE --to MEMBER [--cell-secret FILE]\n\
+       rtdb-multi audience-writer-handoff --directory DIR --cell-secret FILE --action ACTION --handoff FILE --from MEMBER --to MEMBER --incarnation N --maximum-clock-error-ns N --switch-deadline-ns N --incumbent-drain-until-ns N\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
        rtdb-multi audit-acceptance --directory DIR --keys PATH --id UUID --incarnation N --log-epoch N --replica-offset N\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
@@ -856,6 +857,39 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
             let successor = admin::move_observed_holder(directory.as_ref(), &original, &target, &control).await?;
             println!("{}", serde_json::to_string(&successor).expect("a holder observation serializes"));
+            Ok(())
+        }
+        "audience-writer-handoff" => {
+            use rtdb_directory::{MemberId, WriterHandoff, WriterHandoffPlan, WRITER_HANDOFF_BYTES};
+            use rtdb_multi::control::WriterHandoffAction;
+            let action = match arguments.required("action")? {
+                "prepare" => WriterHandoffAction::Prepare,
+                "switch" => WriterHandoffAction::Switch,
+                "read" => WriterHandoffAction::Read,
+                "abandon" => WriterHandoffAction::Abandon,
+                _ => return Err(usage("Expected prepare, switch, read or abandon".into())),
+            };
+            let mut bytes = Vec::with_capacity(WRITER_HANDOFF_BYTES);
+            std::fs::File::open(arguments.required("handoff")?).map_err(io)?
+                .take(WRITER_HANDOFF_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(io)?;
+            let identity = WriterHandoff::decode(&bytes).ok_or_else(|| usage("Invalid canonical writer handoff".into()))?;
+            let number = |name| -> Result<u64> {
+                arguments.required(name)?.parse().map_err(|_| usage(format!("Invalid --{name}")))
+            };
+            let plan = WriterHandoffPlan {
+                identity,
+                incumbent: MemberId(arguments.required("from")?.into()),
+                successor: MemberId(arguments.required("to")?.into()),
+                incarnation: number("incarnation")?,
+                maximum_clock_error_ns: number("maximum-clock-error-ns")?,
+                switch_deadline_ns: number("switch-deadline-ns")?,
+                incumbent_drain_until_ns: number("incumbent-drain-until-ns")?,
+            };
+            let directory = directory(arguments.required("directory")?).await?;
+            let control = rtdb_multi::control::ControlKey(cell_secret(&arguments)?);
+            let witness = admin::audience_writer_handoff(directory.as_ref(), plan, action, &control).await?;
+            use std::io::Write as _;
+            std::io::stdout().lock().write_all(&witness).map_err(io)?;
             Ok(())
         }
         "pin-engine" => {

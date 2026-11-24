@@ -1,0 +1,119 @@
+{
+  "summary": "The hosted writer handoff bounds fence time, preserves the original cutoff and opens only the immediate successor epoch.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "fence-before-switch": {
+      "defect": "An uncertain clock permits fencing the incumbent too early.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "find": "switch_at <= lower && lower <= upper && upper < deadline\n}",
+          "replace": "switch_at <= upper && lower <= upper && upper < deadline\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "function": "fence_at_switch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "fence-at-deadline": {
+      "defect": "Fencing can start after the funded window is exhausted.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "find": "switch_at <= lower && lower <= upper && upper < deadline\n}",
+          "replace": "switch_at <= lower && lower <= upper && upper <= deadline\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "function": "fence_at_switch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "dispatch-beyond-fence": {
+      "defect": "An original journal cutoff with clock uncertainty can run beyond the switch.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "find": "upper <= switch_at\n}",
+          "replace": "upper.saturating_sub(clock_error) <= switch_at\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "function": "original_cutoff_before_fence",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "reuse-epoch": {
+      "defect": "The successor may reuse an incumbent writer epoch.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "find": "incumbent.checked_add(1)",
+          "replace": "incumbent.checked_add(0)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "function": "next_writer_epoch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "skip-epoch": {
+      "defect": "The successor may skip an epoch.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "find": "incumbent.checked_add(1)",
+          "replace": "incumbent.checked_add(2)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "function": "next_writer_epoch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 2
+    },
+    "retain-old-at-drain-cutoff": {
+      "defect": "Held incumbent reads continue at the exclusive drain cutoff.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "find": "    clock_upper < original_drain_until\n}",
+          "replace": "    clock_upper <= original_drain_until\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/agent/writer_handoff_decision.rs",
+          "function": "retained_read_live",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

@@ -160,6 +160,33 @@ Physical release also requires retained I/O to drain and the directory to accept
 The correspondence assumes DynamoDB conditional-write atomicity and consistent reads within the cell, unique claim revisions, authenticated bearer routes, exact ECS stop records, and the session ownership and clock wiring inspected in Rust.
 Cross-cell transfers and provider I/O drain time require separate evidence.
 
+#### Prepared audience writer handoff
+
+The active and prepared fleets must join the same placement authority, source incarnation, storage namespaces and original replica quorum.
+The target node warms a protected committed cut while the incumbent holds the writer epoch.
+It retains the preparation in the deployment record and issues its witness only after reading the durable reservation before the switch.
+A signed control request binds the handoff, target, action and nonce.
+The signed response binds the exact request and ordered witness.
+At the switch the directory assigns the immediate successor epoch directly to the target.
+The target confirms leadership on the original quorum before ordering its opening.
+An ordinary park, restart claim, later holding or changed target supplies no settlement.
+The authenticated settlement read rechecks the exact local attachment and quorum.
+
+The scheduled move uses the commissioned clock error bound for the nodes and original journals.
+The supplied switch deadline bounds the funded slot in which quorum recovery and route publication must finish.
+The separately supplied incumbent drain cutoff is the greatest retained release bound.
+Only actions on already-held snapshots can use the exact incumbent attachment after the fence, and they remain subject to their original per-action deadlines.
+Timed appends keep the original journal cutoff and certificate.
+An incumbent append whose cutoff could run past the fence is refused before journal dispatch.
+The opening leaves a physical recovery interval within the switch slot.
+Continuity at the public schedule depends on finishing that recovery and making the successor route usable at ingress before its first affected turn.
+
+The control command is `rtdb-multi audience-writer-handoff`.
+Its `prepare`, `switch` and `read` operations return canonical binary witnesses.
+They require the exact handoff file, both member IDs, incarnation, installed cell secret, shared directory, clock error, switch deadline, and incumbent drain bound.
+An abandoned unexecuted handoff retains its identity.
+After a fence, retries open the same successor epoch even if its original slot has expired, and a late opening supplies no timely settlement.
+
 #### Resource-enforced seat generations
 
 The proposed durable seat fence gives the accepting resource one current generation for each deployment and turn.

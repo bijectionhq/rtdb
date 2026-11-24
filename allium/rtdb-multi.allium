@@ -2245,6 +2245,13 @@ rule CountActivationCrash {
 -- Rebalancing, scale-in and engine rollout are all planned handoffs.
 ------------------------------------------------------------
 
+-- A prepared audience handoff retains both full generations, one source and tablet, consecutive writer epochs and the planned slot.
+-- Durable preparation leaves the incumbent grant selected.
+-- At the switch the directory directly assigns the successor epoch and records the fence coordinate.
+-- Recovery on the original quorum precedes the opening coordinate and authenticates the settlement for that exact handoff.
+-- Already held reads may continue at the original attachment until its exclusive drain cutoff.
+-- Fresh timed dispatch retains its original certificate and journal cutoff and refuses an incumbent cutoff beyond the fence.
+
 rule IntendMove {
     -- A reservation expires, and a refused activation releases its reservation.
     -- Temporary memory pressure or directory contention can be retried while the reservation remains active.

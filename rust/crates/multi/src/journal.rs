@@ -14,7 +14,7 @@ use ordered_logkeeper::ordered::{
     },
 };
 
-mod adapter_command;
+pub(crate) mod adapter_command;
 mod append_selection;
 pub mod cell;
 pub mod custody;

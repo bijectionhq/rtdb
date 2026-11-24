@@ -1,5 +1,5 @@
 {
-  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment. A writer nomination accepts only the immediate successor epoch and preserves the active predecessor key generation. Directory handoff readback retains the exact epoch from the authenticated activation response.",
+  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment. A writer nomination accepts only the immediate successor epoch and preserves the active predecessor key generation. Directory handoff readback retains the exact epoch from the authenticated activation response. Prepared writer settlement checks the exact handoff digest and the strict preparation, fence and opening order.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -11,7 +11,7 @@
     "--verify-module",
     "uuid_model"
   ],
-  "min_verified_functions": 25,
+  "min_verified_functions": 26,
   "controls": {
     "expose-later-holding": {
       "defect": "An unrelated later holding on the same member confirms the original move.",
@@ -360,6 +360,60 @@
         }
       ],
       "min_verified_functions": 22
+    },
+    "settle-foreign-handoff": {
+      "defect": "A foreign handoff digest can confirm readiness.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    expected_lo == observed_lo && expected_hi == observed_hi\n        && prepared > 0 && prepared < fence && fence < opening",
+          "replace": "    expected_hi == observed_hi\n        && prepared > 0 && prepared < fence && fence < opening"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "function": "exact_writer_settlement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "settle-opening-at-fence": {
+      "defect": "The successor opening can use the predecessor fence coordinate.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    expected_lo == observed_lo && expected_hi == observed_hi\n        && prepared > 0 && prepared < fence && fence < opening",
+          "replace": "    expected_lo == observed_lo && expected_hi == observed_hi\n        && prepared > 0 && prepared < fence && fence <= opening"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "function": "exact_writer_settlement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "settle-unprepared-fence": {
+      "defect": "A fence can occupy the preparation coordinate.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "    expected_lo == observed_lo && expected_hi == observed_hi\n        && prepared > 0 && prepared < fence && fence < opening",
+          "replace": "    expected_lo == observed_lo && expected_hi == observed_hi\n        && prepared > 0 && prepared <= fence && fence < opening"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "function": "exact_writer_settlement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
     }
   }
 }

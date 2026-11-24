@@ -80,6 +80,9 @@ pub trait ReadFence: Send + Sync {
     async fn confirm_audience(&self, _database: &Database, _require_quorum: bool) -> Result<String> {
         Err(hosted_source_unavailable())
     }
+    async fn confirm_held_audience(&self, database: &Database) -> Result<String> {
+        self.confirm_audience(database, false).await
+    }
     /// Reserves one deployment seat until the final session owner drops its release guard.
     async fn hold_audience_seat(&self, _database: Weak<Database>, _index: usize, ready: oneshot::Sender<Result<()>>,
         _release: CancellationToken) {
@@ -291,9 +294,21 @@ impl Node {
     }
     /// Rechecks the serving placement before reading an already-held audience snapshot.
     pub async fn confirm_audience_route(&self, database: &Arc<Database>, source: uuid::Uuid) -> Result<()> {
+        self.confirm_audience_attachment(database, source, false).await
+    }
+
+    pub async fn confirm_held_audience_route(&self, database: &Arc<Database>, source: uuid::Uuid) -> Result<()> {
+        self.confirm_audience_attachment(database, source, true).await
+    }
+
+    async fn confirm_audience_attachment(&self, database: &Arc<Database>, source: uuid::Uuid, held: bool) -> Result<()> {
         self.ensure_open()?;
         let fence = self.read_fence.as_ref().ok_or_else(hosted_source_unavailable)?;
-        let history = fence.confirm_audience(database, false).await?;
+        let history = if held {
+            fence.confirm_held_audience(database).await?
+        } else {
+            fence.confirm_audience(database, false).await?
+        };
         let attached = self.attached_database(database.name(), None)?;
         if uuid::Uuid::parse_str(&history).ok() != Some(source) || !Arc::ptr_eq(&attached, database) {
             return Err(hosted_source_unavailable());

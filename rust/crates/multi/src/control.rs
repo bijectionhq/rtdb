@@ -52,6 +52,7 @@ pub enum Request {
     Activate { name: String },
     ActivateOrdered { name: String, activation: OrderedActivation },
     ActivateForMove { name: String, ticket: MoveTicket },
+    WriterHandoff { name: String, command: WriterHandoffCommand },
     /// Flush, release the placement, and stop running the deployment.
     Park { name: String },
     ParkForMove { name: String, epoch: u64, ticket: MoveTicket },
@@ -141,6 +142,38 @@ impl OrderedActivation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterHandoffAction { Prepare, Switch, Read, Abandon }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriterHandoffCommand {
+    pub(crate) plan: rtdb_directory::WriterHandoffPlan,
+    pub(crate) action: WriterHandoffAction,
+    nonce: uuid::Uuid,
+    proof: [u8; 32],
+}
+
+impl WriterHandoffCommand {
+    pub(crate) fn issue(
+        secret: &crate::capability::CellSecret, name: &str,
+        plan: rtdb_directory::WriterHandoffPlan, action: WriterHandoffAction,
+    ) -> Self {
+        let mut command = Self { plan, action, nonce: uuid::Uuid::new_v4(), proof: [0; 32] };
+        command.proof = secret.sign_route(&command.binding(name, None));
+        command
+    }
+
+    pub(crate) fn authentic(&self, secret: &crate::capability::CellSecret, name: &str) -> bool {
+        !self.nonce.is_nil() && secret.verify_route(&self.binding(name, None), &self.proof)
+    }
+
+    pub(crate) fn binding(&self, name: &str, witness: Option<&[u8]>) -> Vec<u8> {
+        serde_json::to_vec(&("rtdb.multi/writer-handoff/v1", name, &self.plan, self.action, self.nonce, witness))
+            .expect("writer handoff binding serializes")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveTicket {
     pub deployment: String,
@@ -153,6 +186,7 @@ pub enum Response {
     /// This member holds the deployment under `epoch`; clients reach it at `address`.
     Held { epoch: u64, address: String },
     OrderedHeld { epoch: u64, address: String, proof: [u8; 32] },
+    WriterHandoff { witness: Vec<u8>, proof: [u8; 32] },
     /// Another live member holds it; clients reach that one at `address`.
     Redirect { holder: String, address: String },
     /// This member serves the deployment's reads from a replica; clients reach it at `address`.

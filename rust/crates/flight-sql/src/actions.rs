@@ -80,7 +80,7 @@ impl Service {
         let source = call.session.audience_source().ok_or_else(unsupported)?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
-        self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
+        self.0.node.confirm_held_audience_route(&attachment, source).await.map_err(status)?;
         Ok(())
     }
 

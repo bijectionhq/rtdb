@@ -77,6 +77,20 @@ impl RecoveryAdmission {
         Self { holds, deployment: config.deployment.clone(), stream: config.replica_stream.clone(), log_epoch: config.log_epoch, writer_epoch: config.epoch }
     }
 
+    pub(crate) async fn check_handoff_dispatch(&self, cutoff: rtdb_types::TimedJournalCutoff) -> Result<()> {
+        let record = self.holds.directory.deployment(&self.deployment).await.map_err(broker_error)?
+            .filter(|record| record.epoch == self.writer_epoch && record.stream("replica") == self.stream)
+            .ok_or(Error::GuardedAppendCutoff)?;
+        if let Some(handoff) = record.writer_handoffs.last().filter(|entry| entry.pending()
+            && entry.plan.identity.predecessor_epoch() == self.writer_epoch)
+            && !crate::agent::writer_handoff_decision::original_cutoff_before_fence(
+                cutoff.before().0, handoff.plan.maximum_clock_error_ns, handoff.plan.identity.switch_at_ns())
+        {
+            return Err(Error::GuardedAppendCutoff);
+        }
+        Ok(())
+    }
+
     pub async fn hold(&self, after: LogOffset, through: LogOffset) -> Result<Option<ReplayHold>> {
         if after >= through {
             self.check_start(after).await?;

@@ -25,6 +25,9 @@ use crate::hosted_recovery::{ReplicaTrimPlan, ReplicaTrimWitness, advance_body_f
 use crate::directory_bypass::{directory_move_park_allowed, directory_route_allowed, pressure_candidate};
 use crate::journal::hosted::{checkpoint_for_block, custodian};
 
+mod writer_handoff;
+pub(crate) mod writer_handoff_decision;
+
 enum SuffixCut<'a> {
     Tip(TransactionKey),
     HeldPublication(
@@ -145,6 +148,7 @@ fn require_recovered_checkpoint(record: &DeploymentRecord, database: &Database) 
 enum HostedReadCheck {
     Ordinary,
     AudienceRoute,
+    AudienceHeld,
     AudienceCapture,
 }
 
@@ -408,6 +412,9 @@ impl NodeAgent {
                     return Ok(Response::Redirect { holder: holder.to_string(), address });
                 }
             }
+            if record.writer_handoffs.last().is_some_and(rtdb_directory::RetainedWriterHandoff::pending) {
+                return Err(stale_handoff(name));
+            }
             let Some(mut next) = claim(&record, &me, &members, now) else {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, NOT_CLAIMABLE, format!("{name} cannot be claimed by this member now")));
             };
@@ -622,9 +629,18 @@ impl NodeAgent {
     }
 
     async fn open(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>) -> Result<Response> {
+        self.open_with_handoff(record, members, false).await
+    }
+
+    async fn open_with_handoff(&self, record: DeploymentRecord, members: &BTreeMap<MemberId, MemberRecord>,
+                               handoff: bool) -> Result<Response> {
         self.stop_running(&record.name).await;
         let opened = async {
-            let configuration = self.holder_config(&record, members)?;
+            let configuration = if handoff {
+                database_config(&record, ensemble_servers(&record, members)?, &self.options.storage, Role::Holder)
+            } else {
+                self.holder_config(&record, members)?
+            };
             let database = self.node.database_or_attach(record.name.clone(), configuration).await?
                 .ok_or_else(|| Anomaly::fault("rtdb.multi/not-opened", "The node declined to open the deployment"))?;
             self.await_leadership(&record.name, &database).await?;
@@ -647,7 +663,9 @@ impl NodeAgent {
             Err(error) => {
                 self.stop_running(&record.name).await;
                 let crashed = !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Busy | AnomalyCategory::Interrupted | AnomalyCategory::Conflict);
-                self.release_failed_holding(&record.id, record.epoch, crashed).await;
+                if !handoff {
+                    self.release_failed_holding(&record.id, record.epoch, crashed).await;
+                }
                 Err(error)
             }
         }
@@ -683,6 +701,10 @@ impl NodeAgent {
     pub(crate) async fn confirm_audience_read(&self, database: &Database, require_quorum: bool) -> Result<String> {
         let check = if require_quorum { HostedReadCheck::AudienceCapture } else { HostedReadCheck::AudienceRoute };
         self.confirm_placed_read(database, check).await
+    }
+
+    pub(crate) async fn confirm_held_audience_read(&self, database: &Database) -> Result<String> {
+        self.confirm_placed_read(database, HostedReadCheck::AudienceHeld).await
     }
 
     pub(crate) async fn prepare_audience_seat(&self, database: Weak<Database>, index: usize,
@@ -733,17 +755,19 @@ impl NodeAgent {
         let member_id = self.member();
         let record = match check {
             HostedReadCheck::Ordinary => self.directory.deployment(&id).await?,
-            HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceCapture => {
+            HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceHeld | HostedReadCheck::AudienceCapture => {
                 self.directory.audience_authority(&id, &member_id).await?.and_then(|(record, member)| {
                     (member.id == member_id && record.may_hold_on(&member, now_ms())).then_some(record)
                 })
             }
-        }.filter(|record| record.id == id && record.name == name && record.linearizable_reads && record.epoch == epoch
-            && record.holder.as_ref() == Some(&member_id)
-            && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined))
+        }.filter(|record| record.id == id && record.name == name && record.linearizable_reads
+            && matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
+            && (record.epoch == epoch && record.holder.as_ref() == Some(&member_id)
+                || matches!(check, HostedReadCheck::AudienceHeld)
+                    && writer_handoff::retains_incumbent_read(record, &member_id, epoch)))
             .ok_or_else(unavailable)?;
         if !matches!(check, HostedReadCheck::Ordinary) {
-            let scope = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?;
+            let scope = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), epoch)?;
             if database.placed_writer_scope() != Some(scope) {
                 return Err(unavailable());
             }
@@ -753,7 +777,7 @@ impl NodeAgent {
                 require_recovered_checkpoint(&record, database)?;
                 self.confirm_holder(name, &id, None).await?;
             },
-            HostedReadCheck::AudienceRoute => {}
+            HostedReadCheck::AudienceRoute | HostedReadCheck::AudienceHeld => {}
             HostedReadCheck::AudienceCapture => {
                 let port = self.options.audience_journal_port.ok_or_else(unavailable)?;
                 self.confirm_holder(name, &id, Some(port)).await?;
@@ -1152,6 +1176,11 @@ impl NodeAgent {
             self.stop_running(name).await;
             if let Some(admission) = admission { placement.worker.vacate(admission.grant).await?; }
             return Ok(Response::Done);
+        }
+        if self.directory.deployment_by_name(name).await?.is_some_and(|record|
+            record.writer_handoffs.last().is_some_and(rtdb_directory::RetainedWriterHandoff::pending))
+        {
+            return Err(stale_handoff(name));
         }
         let local = self.holdings.lock().get(name).map(|holding| (holding.id.clone(), holding.epoch));
         let Some((id, epoch)) = local else { return self.park_resident(name, moving, None).await; };
@@ -1703,6 +1732,11 @@ impl NodeAgent {
             let placed_here = |record: &DeploymentRecord| record.epoch == epoch && record.holder.as_ref() == Some(&me);
             let deposed = current.as_ref().is_some_and(|record| !placed_here(record));
             let stopped = self.node.catalog().database(&name).map_or(true, |database| matches!(database.status().role, DriverRole::Stopped));
+            if deposed && !stopped && current.as_ref().is_some_and(|record|
+                writer_handoff::retains_incumbent_read(record, &me, epoch))
+            {
+                continue;
+            }
             if deposed || stopped {
                 let turn = self.turn(&name);
                 let _turn = turn.lock().await;
@@ -1941,6 +1975,7 @@ impl Handler for NodeAgent {
         let result = match request {
             Request::Activate { name } => self.activate(&name).await,
             Request::ActivateOrdered { name, activation } => self.authenticated_ordered_activation(&name, activation).await,
+            Request::WriterHandoff { name, command } => self.writer_handoff(&name, command).await,
             Request::ActivateForMove { name, ticket } => self.activate_holding(&name, Some(&ticket)).await,
             Request::Park { name } => match self.require_directory_route(&name) {
                 Ok(()) => self.park(&name).await,

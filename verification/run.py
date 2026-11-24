@@ -2249,6 +2249,21 @@ def write_generated_temporal_trace(path):
 
 
 TLA_CASES = (
+    ("AudienceWriterHandoff", "audience-writer-handoff", None, None),
+    ("AudienceWriterHandoff", "audience-writer-handoff-two-turns", ("Turns = 1", "Turns = 2"), None),
+    ("AudienceWriterHandoff", "audience-writer-parked", ('Mutation = "none"', 'Mutation = "park"'), "Continuity"),
+    ("AudienceWriterHandoff", "audience-writer-early-fence", ('Mutation = "none"', 'Mutation = "early-fence"'), "Continuity"),
+    ("AudienceWriterHandoff", "audience-writer-open-late", ('Mutation = "none"', 'Mutation = "tick-fenced"'), "Continuity"),
+    ("AudienceWriterHandoff", "audience-writer-foreign-settlement", ('Mutation = "none"', 'Mutation = "foreign-settlement"'), "ExactSettlement"),
+    ("AudienceWriterHandoff", "audience-writer-equal-coordinates", ('Mutation = "none"', 'Mutation = "equal-coordinates"'), "SettlementOrder"),
+    ("AudienceWriterHandoff", "audience-writer-reuse-epoch", ('Mutation = "none"', 'Mutation = "reuse-epoch"'), "EpochOrder"),
+    ("AudienceWriterHandoff", "audience-writer-skip-epoch", ('Mutation = "none"', 'Mutation = "skip-epoch"'), "EpochOrder"),
+    ("AudienceWriterHandoff", "audience-writer-late-dispatch", ('Mutation = "none"', 'Mutation = "late-dispatch"'), "OriginalDispatch"),
+    ("AudienceWriterHandoff", "audience-writer-replace-certificate", ('Mutation = "none"', 'Mutation = "replace-certificate"'), "OriginalRelease"),
+    ("AudienceWriterHandoff", "audience-writer-extend-cutoff", ('Mutation = "none"', 'Mutation = "inclusive-release"'), "action:CutoffsUnchanged"),
+    ("AudienceWriterHandoff", "audience-writer-stalled", ('Mutation = "none"', 'Mutation = "stalled-opening"'), "temporal:EventuallyOpens"),
+    ("AudienceWriterHandoff", "audience-writer-straddler", ("PROPERTIES CutoffsUnchanged EventuallyOpens", "INVARIANT NeverStraddles"), "NeverStraddles"),
+    ("AudienceWriterHandoff", "audience-writer-refusal", ("PROPERTIES CutoffsUnchanged EventuallyOpens", "INVARIANT NeverRefuses"), "NeverRefuses"),
     ("AudienceSeatResourceFence", "audience-resource-fence", None, None),
     ("AudienceSeatResourceFence", "audience-resource-fence-two-replacements",
      ("Generations = 2", "Generations = 3"), None),

@@ -315,6 +315,11 @@ impl rtdb_node::ReadFence for FenceSlot {
         agent.confirm_audience_read(database, require_quorum).await
     }
 
+    async fn confirm_held_audience(&self, database: &rtdb_node::Database) -> Result<String> {
+        let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
+        agent.confirm_held_audience_read(database).await
+    }
+
     async fn hold_audience_seat(&self, database: std::sync::Weak<rtdb_node::Database>, index: usize,
         ready: tokio::sync::oneshot::Sender<Result<()>>, release: CancellationToken) {
         let Some(agent) = self.agent.get().and_then(std::sync::Weak::upgrade) else {
