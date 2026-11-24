@@ -35,7 +35,7 @@ pub use evidence::{
 
 const OPERATIONAL_TARGET_MS: u64 = 120_000;
 
-#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SqlErasureRequest {
     pub operation: crate::replay_broker::domain::Operation,

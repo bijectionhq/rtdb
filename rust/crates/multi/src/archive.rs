@@ -468,7 +468,7 @@ pub(crate) async fn verify_cell_move_checkpoint(
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&key(&block_key(BlockIndex(checkpoint.block))?)?).await?)?;
     verify_cut(&catalog, checkpoint, StorageEpoch(record.log_epoch))?;
     let closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
-    let tries = closure.iter().filter_map(|(name, digest)| digest.is_none().then_some(name));
+    let tries = closure.iter().filter_map(|(name, member)| member.digest.is_none().then_some(name));
     futures::stream::iter(tries.map(Ok)).try_for_each_concurrent(16, |name| {
         let raw = raw.as_ref();
         async move {
@@ -3044,7 +3044,8 @@ mod tests {
         store.put(&table, Bytes::from_static(b"table")).await?;
         store.put(&root, Bytes::from_static(b"root")).await?;
         let before = raw.head_observations();
-        let plan = plan_checkpoint_copy(store.as_ref(), BTreeMap::from([(root, None), (table, None)]), None).await?;
+        let closure = BTreeMap::from([(root, CheckpointMember::default()), (table, CheckpointMember::default())]);
+        let plan = plan_checkpoint_copy(store.as_ref(), closure, None).await?;
         assert_eq!(raw.head_observations() - before, 1);
         assert!(plan[0].version.is_some());
         assert_eq!(plan[0].version, plan[1].version);
@@ -3061,7 +3062,7 @@ mod tests {
         let name = key("tables/t/data/example.arrow")?;
         let bytes = Bytes::from_static(b"observed bytes");
         store.put(&name, bytes.clone()).await?;
-        let closure = BTreeMap::from([(name.clone(), Some(publication_digest(&bytes)))]);
+        let closure = BTreeMap::from([(name.clone(), CheckpointMember::metadata(publication_digest(&bytes)))]);
         let budget = crate::cipher::object::sealed_size(&name, bytes.len())? as u64;
         let plan = plan_checkpoint_copy(&store, closure, Some(budget)).await?;
         assert_eq!(plan[0].version.as_ref().map(|identity| identity.key.as_str()),

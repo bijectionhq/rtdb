@@ -112,7 +112,7 @@ mod tests {
 
     use crate::deployment::{CellStorage, storage_namespaces};
     use crate::keys::LocalKeyService;
-    use crate::reference::{Base, PrefixedStore, ReferencingStore, fork, key};
+    use crate::reference::{Base, PrefixedStore, ReferencingStore, key, simulate_fork};
 
     #[tokio::test]
     async fn inherited_io_holds_its_physical_residence_through_cancellation_and_disposal() {
@@ -138,7 +138,7 @@ mod tests {
         let object = key("payload").unwrap();
         let bytes = Bytes::from_static(b"payload");
         bucket.put(&parent_object, bytes.clone()).await.unwrap();
-        fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+        simulate_fork(bucket.as_ref(), &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         let base = Base::load(bucket.as_ref(), &child_store).await.unwrap();
 
         let tasks = TaskTracker::new();

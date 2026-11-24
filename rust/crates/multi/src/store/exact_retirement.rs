@@ -1731,7 +1731,7 @@ mod tests {
             }
         });
         let bucket = MemoryStore::default();
-        let first = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &erasing, &retirement, None, 0).await.unwrap_err();
+        let first = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &erasing, &retirement, None).await.unwrap_err();
         assert_eq!(first.message.as_deref(), Some("The retired object version is still present"),
             "a deletion reply without absence cannot settle the retirement");
         assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), fenced);
@@ -1740,13 +1740,13 @@ mod tests {
 
         let directory = MemoryDirectory::open(data.path()).unwrap();
         let state = directory.lineage_state(&owner.lineage).await.unwrap();
-        let absent = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None, 0).await
+        let absent = finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None).await
             .expect_err("the release marker needs its own absence evidence");
         assert_eq!(absent.message.as_deref(), Some("The retired object version is still present"));
         assert_eq!(directory.deployment(&owner.id).await.unwrap().unwrap(), fenced);
         assert_eq!(directory.lineage_state(&owner.lineage).await.unwrap().open_generation(), None);
 
-        finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None, 0).await.unwrap();
+        finish(directory.as_ref(), &bucket, &inventory, &owner.lineage, &state, &retirement, None).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
         assert!(!directory.deployment(&owner.id).await.unwrap().unwrap().storage_regions.contains_key(&retirement.token),
             "settlement removes the physical owner's fence");

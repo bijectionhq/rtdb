@@ -1964,7 +1964,7 @@ impl Handler for NodeAgent {
                 Ok(()) => self.flush(&name).await,
                 Err(error) => Err(error),
             },
-            Request::EnrollInstalledFork { parent, child } => {
+            Request::EnrollInstalledFork { parent, child } => async {
                 let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/installed-fork",
                     "The custody node needs both installed fork routes");
                 let source = self.ordered.by_name(&parent).ok_or_else(unavailable)?;
@@ -1973,7 +1973,7 @@ impl Handler for NodeAgent {
                 source.enroll_installed_fork(destination, broker, &self.keys, self.node.memory(),
                     &self.ordered_releases).await?;
                 Ok(Response::InstalledForkEnrolled)
-            }
+            }.await,
             Request::StageSqlErasure { name, request } => self.stage_sql_erasure(&name, request).await,
             Request::PinCheckpointSuffix { name, deployment, lease, capture, basis, expires_at_ms } =>
                 self.pin_checkpoint_suffix(&name, deployment, lease, capture, basis, expires_at_ms).await,

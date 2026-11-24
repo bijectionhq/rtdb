@@ -148,8 +148,8 @@ impl Service {
             self.replace_stage(record, id, region, None).await?;
             return Ok(());
         }
-        let audit = match stage.route {
-            PublishRoute::Writer { epoch } => self.audit_staged_append(record, stage, epoch).await?,
+        let audit = match (stage.route, stage.reference) {
+            (PublishRoute::Writer { epoch }, _) => self.audit_staged_append(record, stage, epoch).await?,
             _ if transfer_excluded(record, stage.route) => {
                 let position = stage.route.transfer_position().ok_or_else(refused)?;
                 if record.requires_replica_offset(position, rtdb_directory::now_ms()) {
@@ -158,7 +158,7 @@ impl Service {
                     Audit::Excluded
                 }
             }
-            _ if let Some(digest) = stage.reference => {
+            (_, Some(digest)) => {
                 let position = stage.route.transfer_position().ok_or_else(refused)?;
                 if self.transfer_committed(record, stage.route, position, digest).await? {
                     Audit::Committed

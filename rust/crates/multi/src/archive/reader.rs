@@ -626,7 +626,8 @@ async fn monitor(authority: &StageReadAuthority, stop: &CancellationToken) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{ArchivedObject, Cipher};
+    use super::super::ArchivedObject;
+    use crate::cipher::Cipher;
     use bytes::Bytes;
     use rtdb_storage::Error;
 

@@ -227,7 +227,8 @@ async fn authorize(
     let terminal = terminal.as_ref();
     let target = &target;
     let store = &store;
-    archive::with_replay_archive(directory, storage, keys, &record, Some(task), |admitted, owner, archive| async move {
+    let record = &record;
+    archive::with_replay_archive(directory, storage, keys, record, Some(task), |admitted, owner, archive| async move {
         let Some(observed) = observe_pack(bucket, terminal, target).await? else { return Ok(()); };
         let same = match (&publication, &observed.storage) {
             (Publication::Version { version: expected, .. }, PackStorage::Raw { version, .. }) => version.as_ref() == Some(*expected),
@@ -251,7 +252,7 @@ async fn authorize(
         }
         let io = IoRegion::new();
         let census = crate::store::publication_retirement::PublicationCensus::new(keys, &deployments, &io);
-        let plan = census.pack_plan(bucket, &record, &observed, provider).await?;
+        let plan = census.pack_plan(bucket, record, &observed, provider).await?;
         if crate::store::exact_retirement::plan_digest(&plan) != packed_slots { return Ok(()); }
         bucket.put(&crate::store::exact_retirement::pack_plan_key(retirement.token)?, plan).await?;
         let fenced = crate::admin::update_installation(directory, deployment, |latest| {

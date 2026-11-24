@@ -2779,9 +2779,9 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(data.path().join("keys")).unwrap();
         let storage = CellStorage::Local { root: data.path().join("objects") };
-        let broker = fork_broker(&directory, &storage, data.path());
         let bucket = storage.bucket(rtdb_storage::IoRegion::new()).await.unwrap();
         let directory: std::sync::Arc<dyn Directory> = MemoryDirectory::new();
+        let broker = fork_broker(&directory, &storage, data.path());
         let mut source = DeploymentRecord::new("source", "acme", Vec::new(), 0);
         let namespaces = super::storage_namespaces(bucket.as_ref(), &keys).await.unwrap();
         source.storage_namespaces = Some(namespaces);
@@ -2881,7 +2881,7 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_disposal_materializes_inherited_objects_before_provider_erasure() {
-        use crate::reference::{fork, preserve_residence};
+        use crate::reference::{preserve_residence, simulate_fork};
 
         let bucket = MemoryStore::default();
         let directory = MemoryDirectory::new();
@@ -2895,7 +2895,7 @@ mod tests {
         bucket.put(&source, Bytes::from_static(b"parent")).await.unwrap();
         bucket.put(&released, Bytes::from_static(b"collected release marker")).await.unwrap();
         for child in [&inherited, &shadowed] {
-            fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
+            simulate_fork(&bucket, &parent.storage_prefix(), &child.storage_prefix(), None).await.unwrap();
         }
         bucket.put(&shadow, Bytes::from_static(b"shadow")).await.unwrap();
         bucket.delete(&released).await.unwrap();
