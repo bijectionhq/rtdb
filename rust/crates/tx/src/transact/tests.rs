@@ -138,6 +138,50 @@ fn declare_visibility() -> Op {
 }
 
 #[test]
+fn projected_custody_keeps_issued_bases_and_masks_the_revoked_versions() {
+    let public = [21; 16];
+    let hidden = [22; 16];
+    let scoped = LabelScope { read: BTreeSet::from([vec![1]]), write: Default::default() };
+    let features = [LINEARIZABLE, ROW_CUSTODY];
+    let mut state = TransactState::new(INCARNATION);
+    let protected = |id, label, group| {
+        let Op::Put { branch, table, mut rows, if_absent } =
+            labelled_put(MAIN_BRANCH, id, label, Interval::ALL) else { unreachable!() };
+        rows[0].custody_group = Some(group);
+        Op::Put { branch, table, rows, if_absent }
+    };
+    let write = |state: &mut TransactState, position, ops| {
+        let request = request(position as u8, ops);
+        let prepared = plan(state, &request, position, position as i64 * 10, &features);
+        assert_eq!(apply(state, position, prepared.record()).unwrap().outcome, Outcome::Then);
+    };
+    write(&mut state, 1, vec![
+        declare_visibility(), Op::CreateCustodyGroup { group: public },
+        Op::CreateCustodyGroup { group: hidden },
+        protected(1, 1, public), protected(2, 2, hidden),
+        labelled_put(MAIN_BRANCH, 3, 1, Interval::ALL),
+    ]);
+    let projected = state.index().project_main_visibility(&scoped).unwrap();
+    let first = projected.index().head();
+    assert_eq!(projected.source_basis(first.basis).unwrap(), basis(1));
+    let hidden_inventory = state.index().custody_inventory(hidden).unwrap().sha256;
+    write(&mut state, 2, vec![Op::RevokeCustodyGroup { group: hidden, inventory_sha256: hidden_inventory }]);
+    let projected = state.index().project_main_visibility(&scoped).unwrap();
+    assert_eq!(projected.index().head(), first);
+
+    let public_inventory = state.index().custody_inventory(public).unwrap().sha256;
+    write(&mut state, 3, vec![Op::RevokeCustodyGroup { group: public, inventory_sha256: public_inventory }]);
+    let projected = state.index().project_main_visibility(&scoped).unwrap();
+    assert_eq!(projected.source_basis(first.basis).unwrap(), basis(1));
+    let old = projected.index().view(MAIN_BRANCH, At::Exactly(first.basis), Layer::Merged, Timestamp(0)).unwrap();
+    assert!(old.row(&table(), &EntityId::Integer(1), Timestamp(0)).is_none());
+    assert!(old.row(&table(), &EntityId::Integer(2), Timestamp(0)).is_none());
+    assert!(old.row(&table(), &EntityId::Integer(3), Timestamp(0)).is_some());
+    assert!(old.custody_inventories().next().is_none());
+    assert_eq!(projected.changes().last().unwrap().rows[0].id, EntityId::Integer(1));
+}
+
+#[test]
 fn row_visibility_masks_inherited_and_older_versions_only_where_the_hidden_version_wins() {
     let mut state = TransactState::new(INCARNATION);
     commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL)]));

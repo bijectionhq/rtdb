@@ -37,6 +37,13 @@ pub(super) struct CustodyGroup {
     members: imbl::OrdSet<CustodyMember>,
 }
 
+/// The classification and lifetime needed to reconstruct visible cut numbers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct RetiredLabel {
+    pub revoked: Basis,
+    pub image: Arc<RowImage>,
+}
+
 impl CustodyGroup {
     fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
         if self.created.is_some_and(|created| created > at) { return None; }
@@ -150,13 +157,27 @@ impl BranchIndex {
         }
         let basis = self.head.basis;
         group.revoked = Some(basis);
-        for member in group.members.iter() {
+        let members = group.members.clone();
+        for member in members.iter() {
+            let visibility = self.definition(&member.table, member.written)
+                .and_then(|table| table.visibility.clone());
             let Some(branch) = self.branches.get_mut(&member.branch).map(Arc::make_mut) else { continue };
             let Some(rows) = branch.tables.get_mut(&member.table).map(Arc::make_mut) else { continue };
             let Some(events) = rows.events.get_mut(&member.id).map(Arc::make_mut) else { continue };
-            for (_, event) in events.iter_mut().filter(|(_, event)| event.cut.basis == member.written) {
-                if event.image.as_ref().is_some_and(|image| image.custody_group == Some(id)) {
-                    event.image = None;
+            for (ordinal, (_, event)) in events.iter_mut().enumerate().filter(|(_, (_, event))| event.cut.basis == member.written) {
+                let Some(image) = event.image.take_if(|image| image.custody_group == Some(id)) else { continue };
+                if let Some(visibility) = &visibility
+                    && let Some(label) = visibility.label(&image.cells)
+                {
+                    let marker = RowImage {
+                        cells: StructFields::from([
+                            ("_id".into(), event.id.as_value()),
+                            (visibility.column.clone(), Value::Binary(label.to_vec())),
+                        ]),
+                        expires_at: image.expires_at, custody_group: Some(id), custody_payload: None,
+                    };
+                    Arc::make_mut(rows.retired_labels.entry(member.id.clone()).or_default())
+                        .insert(ordinal, RetiredLabel { revoked: basis, image: Arc::new(marker) });
                 }
             }
             branch.changed = Some(basis);

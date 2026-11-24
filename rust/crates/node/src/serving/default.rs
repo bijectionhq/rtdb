@@ -107,7 +107,12 @@ impl ServingDriver for DefaultServing {
         let at = if source.at == At::Linearizable { At::Linearizable } else { At::Latest };
         let mut snapshot = self.handle.view(at, cancellation).await?;
         loop {
-            match scope.query(&snapshot.index, source.clone(), now, &self.memory) {
+            let vault = if snapshot.index.has_custody_groups() {
+                Some(self.tokens.authority().await?.custody_vault())
+            } else {
+                None
+            };
+            match scope.query(&snapshot.index, source.clone(), now, &self.memory, vault.as_ref()).await {
                 Ok((mut view, raw)) => {
                     if track {
                         view.claim = Some(self.tokens.authority().await?.issuer().await?

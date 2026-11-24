@@ -74,7 +74,8 @@ impl ServingDriver for MultiServing {
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
-                match scope.query(&index, source.clone(), now, &self.memory) {
+                let vault = index.has_custody_groups().then(|| self.tokens.custody_vault());
+                match scope.query(&index, source.clone(), now, &self.memory, vault.as_ref()).await {
                     Ok((mut view, raw)) => {
                         if track {
                             view.claim = Some(self.tokens.issuer().await?.seal_scoped_claim(raw, &scope.labels).await?);
@@ -115,6 +116,9 @@ impl ServingDriver for MultiServing {
                 let remaining = request.wait.saturating_sub(start.elapsed());
                 if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
                     self.database.lock().await.check_generation(generation).await?;
+                    if index.has_custody_groups() {
+                        return crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await;
+                    }
                     return Ok(page);
                 }
                 tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;

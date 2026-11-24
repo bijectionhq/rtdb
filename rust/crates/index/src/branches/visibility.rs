@@ -26,6 +26,7 @@ pub struct VisibleChange {
 struct Touched<'a> {
     rows: BTreeSet<(&'a TableRef, &'a EntityId)>,
     declarations: BTreeSet<&'a TableRef>,
+    revocations: BTreeSet<CustodyGroupId>,
 }
 
 impl VisibleHistory {
@@ -67,6 +68,7 @@ impl BranchIndex {
         let main = &self.branches[MAIN_BRANCH];
         let touched = self.visibility_touches(main)?;
         let mut index = BranchIndex::with_initial_time(incarnation, Timestamp(0));
+        index.visibility_projection = true;
         let mut source_bases = BTreeMap::from([(
             index.head.basis,
             Basis::new(self.head.basis.incarnation(), 0),
@@ -98,8 +100,11 @@ impl BranchIndex {
                     (old != Some(new)).then_some((table, old, new))
                 })
                 .collect::<Vec<_>>();
+            let revocations = touched.revocations.into_iter().filter(|group| {
+                index.custody_group_live(*group).unwrap_or(false)
+            }).collect::<Vec<_>>();
             previous = current;
-            if rows.is_empty() && declarations.is_empty() {
+            if rows.is_empty() && declarations.is_empty() && revocations.is_empty() {
                 continue;
             }
 
@@ -134,6 +139,11 @@ impl BranchIndex {
                 {
                     continue;
                 }
+                if let Some(group) = row.after.as_ref().and_then(|image| image.custody_group)
+                    && index.custody_group_live(group).is_err()
+                {
+                    index.create_custody_group(group)?;
+                }
                 index.apply(BranchEffect::Write {
                     branch: MAIN_BRANCH.into(),
                     table: row.table.clone(),
@@ -144,6 +154,9 @@ impl BranchIndex {
                         image: row.after.clone(),
                     },
                 })?;
+            }
+            for group in revocations {
+                index.revoke_custody_group(group)?;
             }
             source_bases.insert(cut.basis, basis);
             changes.push(VisibleChangeGroup { cut, rows });
@@ -207,6 +220,13 @@ impl BranchIndex {
                         .insert((table, id));
                 }
             }
+            for (id, labels) in rows.into_iter().flat_map(|rows| &rows.retired_labels) {
+                for label in labels.values() {
+                    let change = touched.entry(label.revoked).or_default();
+                    change.rows.insert((table, id));
+                    change.revocations.extend(label.image.custody_group);
+                }
+            }
         }
         Ok(touched)
     }
@@ -219,14 +239,11 @@ fn visible_changes(
     id: &EntityId,
     labels: &BTreeSet<Vec<u8>>,
 ) -> Result<Vec<VisibleChange>> {
-    let boundaries = before
-        .history(table, id)
-        .into_iter()
-        .chain(after.history(table, id))
-        .flat_map(|event| {
-            let expires = event
-                .image
-                .as_ref()
+    let prior_images = visibility_images(before, table, id);
+    let next_images = visibility_images(after, table, id);
+    let boundaries = prior_images.iter().chain(&next_images)
+        .flat_map(|(event, image)| {
+            let expires = image
                 .and_then(|image| image.expires_at)
                 .filter(|at| event.valid.contains(*at));
             [
@@ -242,23 +259,23 @@ fn visible_changes(
         .collect::<Vec<_>>();
     let mut changes: Vec<VisibleChange> = Vec::new();
     let mut last_pair = (None, None);
+    let prior_label = before.table(table).and_then(|definition| definition.visibility.as_ref());
+    let next_label = after.table(table).and_then(|definition| definition.visibility.as_ref());
     for bounds in boundaries.windows(2) {
-        let prior = before.visible_row(table, id, bounds[0], labels);
-        let next = after.visible_row(table, id, bounds[0], labels);
+        let prior = visible_version(&prior_images, bounds[0], prior_label, labels);
+        let next = visible_version(&next_images, bounds[0], next_label, labels);
         if same_version(prior, next) {
             continue;
         }
-        let project = |event: &BranchEvent| {
-            event.image.as_ref().map(|image| {
-                if image.expires_at.is_none() {
-                    return Arc::clone(image);
-                }
-                Arc::new(RowImage {
-                    cells: image.cells.clone(),
-                    expires_at: None,
-                    custody_group: image.custody_group,
-                    custody_payload: image.custody_payload.clone(),
-                })
+        let project = |(_, image): VisibleVersion<'_>| {
+            if image.expires_at.is_none() {
+                return Arc::clone(image);
+            }
+            Arc::new(RowImage {
+                cells: image.cells.clone(),
+                expires_at: None,
+                custody_group: image.custody_group,
+                custody_payload: image.custody_payload.clone(),
             })
         };
         if let Some(last) = changes.last_mut()
@@ -272,8 +289,8 @@ fn visible_changes(
                 table: table.clone(),
                 id: id.clone(),
                 valid: Interval::new(bounds[0], bounds[1])?,
-                before: prior.and_then(project),
-                after: next.and_then(project),
+                before: prior.map(project),
+                after: next.map(project),
             });
         }
         last_pair = (prior, next);
@@ -281,9 +298,39 @@ fn visible_changes(
     Ok(changes)
 }
 
-fn same_version(left: Option<&BranchEvent>, right: Option<&BranchEvent>) -> bool {
+type VisibleVersion<'a> = (&'a BranchEvent, &'a Arc<RowImage>);
+
+fn visibility_images<'a>(
+    view: &BranchView<'a>, table: &TableRef, id: &EntityId,
+) -> Vec<(&'a BranchEvent, Option<&'a Arc<RowImage>>)> {
+    let Some(definition) = view.table(table) else { return Vec::new(); };
+    let Some(rows) = view.data.tables.get(table) else { return Vec::new(); };
+    let retired_labels = rows.retired_labels.get(id);
+    rows.events.get(id).into_iter().flat_map(|events| events.iter().enumerate())
+        .filter(|(_, (generation, event))| *generation == definition.generation && event.cut.basis <= view.cut.basis)
+        .map(|(ordinal, (_, event))| {
+            let image = event.image.as_ref().or_else(|| {
+                let retired = retired_labels?.get(&ordinal)?;
+                (view.cut.basis < retired.revoked).then_some(&retired.image)
+            });
+            (event, image)
+        }).collect()
+}
+
+fn visible_version<'a>(
+    images: &[(&'a BranchEvent, Option<&'a Arc<RowImage>>)>,
+    at: Timestamp, visibility: Option<&Visibility>, labels: &BTreeSet<Vec<u8>>,
+) -> Option<VisibleVersion<'a>> {
+    let (event, image) = images.iter().rev().find(|(event, _)| event.valid.contains(at))?;
+    let image = (*image)?;
+    if image.expires_at.is_some_and(|until| at >= until) { return None; }
+    let label = visibility?.label(&image.cells)?;
+    labels.contains(label).then_some((*event, image))
+}
+
+fn same_version(left: Option<VisibleVersion<'_>>, right: Option<VisibleVersion<'_>>) -> bool {
     match (left, right) {
-        (Some(left), Some(right)) => std::ptr::eq(left, right),
+        (Some((left, _)), Some((right, _))) => std::ptr::eq(left, right),
         (None, None) => true,
         _ => false,
     }

@@ -150,6 +150,8 @@ struct BranchRows {
     events: Map<EntityId, Arc<Vec<(u64, BranchEvent)>>>,
     #[serde(with = "entries")]
     erased: Map<EntityId, Basis>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    retired_labels: Map<EntityId, Arc<BTreeMap<usize, custody::RetiredLabel>>>,
 }
 
 impl BranchData {
@@ -180,6 +182,8 @@ pub struct BranchIndex {
     erased: Option<Basis>,
     #[serde(skip)]
     writes: Arc<Vec<BranchWrite>>,
+    #[serde(skip)]
+    visibility_projection: bool,
 }
 
 impl BranchIndex {
@@ -199,6 +203,7 @@ impl BranchIndex {
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
             catalog: Map::new(), custody: Map::new(), latest_custody_revocation: None,
             changed_catalog: None, erased: None, writes: Arc::default(),
+            visibility_projection: false,
         }
     }
 
@@ -473,6 +478,7 @@ impl BranchIndex {
                     let data = Arc::make_mut(self.branches.get_mut(&name).expect("listed branch"));
                     let rows = Arc::make_mut(data.tables.entry(table.clone()).or_default());
                     rows.events.remove(&id);
+                    rows.retired_labels.remove(&id);
                     rows.erased.insert(id.clone(), basis);
                     Arc::make_mut(&mut self.writes).push(BranchWrite {
                         branch: name.clone(), table: table.clone(), id: id.clone(),
@@ -511,7 +517,7 @@ impl<'a> BranchView<'a> {
     pub fn base(&self) -> Option<&(Branch, Basis)> { self.data.base.as_ref() }
     pub fn lineage(&self) -> Vec<BranchLineage> { self.index.lineage(self.cut.basis) }
     pub fn custody_inventories(&self) -> impl Iterator<Item = CustodyInventory> + '_ {
-        self.index.custody_inventories(self.cut.basis)
+        self.index.custody_inventories(self.cut.basis).filter(move |_| !self.index.visibility_projection)
     }
 
     pub fn tables(&self) -> impl Iterator<Item = (&TableRef, &BranchTable)> {

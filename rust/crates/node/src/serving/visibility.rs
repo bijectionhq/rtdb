@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rtdb_crypt::CustodyVault;
 use rtdb_index::branches::BranchIndex;
 use rtdb_tx::transact::ScopedTransact;
 use rtdb_types::{
@@ -24,8 +25,9 @@ impl ServingScope {
         ScopedTransact { labels: &self.labels, receipt_namespace: self.receipt_namespace }
     }
 
-    pub fn query(
+    pub async fn query(
         &self, index: &BranchIndex, source: QuerySource, now: Timestamp, memory: &Arc<MemoryBudget>,
+        vault: Option<&CustodyVault>,
     ) -> Result<(QueryView, Basis)> {
         check_source(&source.branch, source.layer)?;
         let projected = index.project_main_visibility(&self.labels)?;
@@ -37,7 +39,13 @@ impl ServingScope {
         } else {
             projected.source_basis(cut.basis)?
         };
-        Ok((QueryView { snapshot: rtdb_query::branch_snapshot(&view, memory)?, cut, claim: None, custody_groups: BTreeSet::new() }, raw_cut))
+        let (snapshot, custody_groups) = if projected.index().has_custody_groups() {
+            let vault = vault.ok_or_else(|| Anomaly::unsupported("rtdb/row-custody", "The scoped query has no custody vault"))?;
+            super::custody::snapshot(&view, memory, vault).await?
+        } else {
+            (rtdb_query::branch_snapshot(&view, memory)?, BTreeSet::new())
+        };
+        Ok((QueryView { snapshot, cut, claim: None, custody_groups }, raw_cut))
     }
 
     pub fn changes(&self, index: &BranchIndex, request: &Changes) -> Result<ChangePage> {
