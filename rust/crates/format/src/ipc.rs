@@ -8,10 +8,10 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::writer::{
-    CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter,
-    write_message,
+    CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions,
+    StreamWriter, write_message,
 };
-use arrow_schema::{DataType, Schema, SchemaRef, UnionMode};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef, UnionMode};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
@@ -1123,6 +1123,32 @@ pub struct RowStreamEncoder {
     options: IpcWriteOptions,
 }
 
+/// Detached dictionary and record messages for one row of a V5 stream with 8-byte alignment.
+pub struct PreparedStreamRow {
+    dictionaries: Box<[EncodedData]>,
+    record: EncodedData,
+    framed_len: usize,
+}
+
+impl PreparedStreamRow {
+    pub fn framed_len(&self) -> usize {
+        self.framed_len
+    }
+
+    /// Appends the messages without allocating an intermediate framed copy of their bodies.
+    pub fn append_to(&self, bytes: &mut Vec<u8>) {
+        for message in self.dictionaries.iter().chain(std::iter::once(&self.record)) {
+            let metadata_len = message.ipc_message.len().next_multiple_of(STREAM_ALIGNMENT);
+            bytes.extend_from_slice(&[0xff; 4]);
+            bytes.extend_from_slice(&(metadata_len as i32).to_le_bytes());
+            bytes.extend_from_slice(&message.ipc_message);
+            let padding = metadata_len - message.ipc_message.len();
+            bytes.extend_from_slice(&[0; STREAM_ALIGNMENT][..padding]);
+            bytes.extend_from_slice(&message.arrow_data);
+        }
+    }
+}
+
 impl RowStreamEncoder {
     pub fn new(schema: &SchemaRef) -> Result<Self> {
         let options = write_options()?;
@@ -1154,6 +1180,36 @@ impl RowStreamEncoder {
 
     /// Encodes a row's dictionary and record frames. A complete stream also needs its schema and end marker.
     pub fn encode(&self, row: &RecordBatch) -> Result<Vec<u8>> {
+        let (dictionaries, record) = self.messages(row)?;
+        let mut bytes = Vec::new();
+        for message in dictionaries.into_iter().chain(std::iter::once(record)) {
+            write_message(&mut bytes, message, &self.options).map_err(invalid)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Validates framing and measures the exact wire length while encoding the candidate row.
+    pub fn prepare(&self, row: &RecordBatch) -> Result<PreparedStreamRow> {
+        let (dictionaries, record) = self.messages(row)?;
+        let framed_len = dictionaries
+            .iter()
+            .chain(std::iter::once(&record))
+            .try_fold(0, |len, message| {
+                if !message.arrow_data.len().is_multiple_of(STREAM_ALIGNMENT) {
+                    return Err(invalid(ArrowError::MemoryError("Arrow data not aligned".into())));
+                }
+                let metadata_len = message.ipc_message.len().next_multiple_of(STREAM_ALIGNMENT);
+                let framed_metadata = allocation_add(8, metadata_len)?;
+                allocation_add(len, allocation_add(framed_metadata, message.arrow_data.len())?)
+            })?;
+        Ok(PreparedStreamRow {
+            dictionaries: dictionaries.into_boxed_slice(),
+            record,
+            framed_len,
+        })
+    }
+
+    fn messages(&self, row: &RecordBatch) -> Result<(Vec<EncodedData>, EncodedData)> {
         if row.num_rows() != 1 || row.schema_ref() != &self.schema {
             return Err(invalid("Arrow row differs from its declared stream schema or row count"));
         }
@@ -1161,14 +1217,9 @@ impl RowStreamEncoder {
         for _ in 0..self.dictionaries {
             tracker.next_dict_id();
         }
-        let (dictionaries, record) = IpcDataGenerator::default()
+        IpcDataGenerator::default()
             .encode(row, &mut tracker, &self.options, &mut CompressionContext::default())
-            .map_err(invalid)?;
-        let mut bytes = Vec::new();
-        for message in dictionaries.into_iter().chain(std::iter::once(record)) {
-            write_message(&mut bytes, message, &self.options).map_err(invalid)?;
-        }
-        Ok(bytes)
+            .map_err(invalid)
     }
 }
 
@@ -1306,8 +1357,10 @@ impl<W: Write> Write for FirstSchemaWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
+const STREAM_ALIGNMENT: usize = 8;
+
 fn write_options() -> Result<IpcWriteOptions> {
-    IpcWriteOptions::try_new(8, false, arrow_ipc::MetadataVersion::V5).map_err(invalid)
+    IpcWriteOptions::try_new(STREAM_ALIGNMENT, false, arrow_ipc::MetadataVersion::V5).map_err(invalid)
 }
 
 fn jvm_end_marker(bytes: &mut Vec<u8>, end: usize) -> Result<()> {

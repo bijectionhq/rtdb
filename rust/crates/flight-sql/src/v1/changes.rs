@@ -12,7 +12,7 @@ use arrow_flight::FlightData;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit as ArrowTime};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::ipc::RowStreamEncoder;
+use rtdb_format::ipc::{PreparedStreamRow, RowStreamEncoder};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_types::{TableRef, TimeUnit, Timestamp, Value};
@@ -93,21 +93,27 @@ impl ReservedRow {
     }
 }
 
-struct Image {
-    bytes: Vec<u8>,
-    stream: Option<Arc<RowStreamEncoder>>,
+enum Image {
+    Binary(Vec<u8>),
+    Shared {
+        stream: Arc<RowStreamEncoder>,
+        row: PreparedStreamRow,
+    },
 }
 
 impl Image {
     fn legacy_len(&self) -> usize {
-        let framing = self.stream.as_ref().map_or(0, |stream| {
-            stream.schema_frame().len() + IMAGE_END.len()
-        });
-        self.bytes.len() + framing
+        match self {
+            Self::Binary(bytes) => bytes.len(),
+            Self::Shared { stream, row } => {
+                stream.schema_frame().len() + row.framed_len() + IMAGE_END.len()
+            }
+        }
     }
 
     fn shares_schema_with(&self, other: &Self) -> bool {
-        let (Some(left), Some(right)) = (&self.stream, &other.stream) else {
+        let (Self::Shared { stream: left, .. }, Self::Shared { stream: right, .. }) = (self, other)
+        else {
             return false;
         };
         !left.has_dictionaries() && !right.has_dictionaries()
@@ -115,18 +121,76 @@ impl Image {
     }
 }
 
-enum ImageWriter {
+enum ImageEncoding {
     Binary,
     Stream(Option<Arc<RowStreamEncoder>>),
 }
 
-impl ImageWriter {
-    fn new(shared_images: bool) -> Self {
-        if shared_images {
-            Self::Stream(None)
-        } else {
-            Self::Binary
+struct ImageProjection<'a> {
+    source: &'a RecordBatch,
+    columns: &'a [usize],
+    projected: Option<RecordBatch>,
+    schema_bound: Option<usize>,
+    encoding: ImageEncoding,
+}
+
+impl<'a> ImageProjection<'a> {
+    fn new(source: &'a RecordBatch, columns: &'a [usize], shared_images: bool) -> Self {
+        Self {
+            source,
+            columns,
+            projected: None,
+            schema_bound: None,
+            encoding: if shared_images {
+                ImageEncoding::Stream(None)
+            } else {
+                ImageEncoding::Binary
+            },
         }
+    }
+
+    fn write(
+        &mut self,
+        row: usize,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<(Image, Arc<MemoryReservation>), Status> {
+        let projected = match &mut self.projected {
+            Some(projected) => projected,
+            None => self
+                .projected
+                .insert(self.source.project(self.columns).map_err(batch_error)?),
+        };
+        let batch = projected.slice(row, 1);
+        let arrays = wire::mul(batch.get_array_memory_size(), 4).map_err(error::map_status)?;
+        let schema_bound = match self.schema_bound {
+            Some(bound) => bound,
+            None => {
+                let bound = wire::schema_bound(batch.schema_ref()).map_err(error::map_status)?;
+                self.schema_bound = Some(bound);
+                bound
+            }
+        };
+        let size = wire::add(arrays, schema_bound).map_err(error::map_status)?;
+        let charge = memory.reserve(size).map_err(error::anomaly)?;
+        let image = match &mut self.encoding {
+            ImageEncoding::Binary => Image::Binary(
+                rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+                    .map_err(error::anomaly)?,
+            ),
+            ImageEncoding::Stream(encoder) => {
+                let encoder = match encoder {
+                    Some(encoder) => encoder,
+                    None => encoder.insert(Arc::new(
+                        RowStreamEncoder::new(batch.schema_ref()).map_err(error::anomaly)?,
+                    )),
+                };
+                Image::Shared {
+                    stream: Arc::clone(encoder),
+                    row: encoder.prepare(&batch).map_err(error::anomaly)?,
+                }
+            }
+        };
+        Ok((image, charge))
     }
 }
 
@@ -406,7 +470,8 @@ async fn change_page(
                                     "Changes projection omitted system time",
                                 ))
                             })?;
-                        let key_index = projection.column_with_name("_id").map(|(index, _)| index);
+                        let key_projection =
+                            projection.column_with_name("_id").map(|(index, _)| [index]);
                         let image_projection = if image {
                             (0..batch.num_columns())
                                 .filter(|index| *index != time_index)
@@ -414,8 +479,12 @@ async fn change_page(
                         } else {
                             Vec::new()
                         };
-                        let mut key_writer = ImageWriter::new(request.shared_images);
-                        let mut image_writer = ImageWriter::new(request.shared_images);
+                        let mut key_writer = key_projection.as_ref().map(|columns| {
+                            ImageProjection::new(batch, columns, request.shared_images)
+                        });
+                        let mut image_writer = image.then(|| {
+                            ImageProjection::new(batch, &image_projection, request.shared_images)
+                        });
                         for row in 0..batch.num_rows() {
                             let value = rtdb_columnar::read_value(
                                 time_field,
@@ -437,16 +506,14 @@ async fn change_page(
                             let (Some(encoder), Some(row_base)) = (encoder.as_mut(), row_base) else {
                                 continue;
                             };
-                            let (key, _key_scratch) = key_index
-                                .map(|index| {
-                                    write_image(&mut key_writer, batch, row, &[index], memory)
-                                })
+                            let (key, _key_scratch) = key_writer
+                                .as_mut()
+                                .map(|writer| writer.write(row, memory))
                                 .transpose()?
                                 .unzip();
-                            let (image, _image_scratch) = image
-                                .then(|| {
-                                    write_image(&mut image_writer, batch, row, &image_projection, memory)
-                                })
+                            let (image, _image_scratch) = image_writer
+                                .as_mut()
+                                .map(|writer| writer.write(row, memory))
                                 .transpose()?
                                 .unzip();
                             let opened = matches!(boundary, Boundary::Opened);
@@ -674,21 +741,27 @@ fn pack_batch(schema: SchemaRef, rows: &[ReservedRow]) -> Result<RecordBatch, Ar
 
 fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, ArrowError> {
     let images = rows.iter().map(|row| row.images[column].as_ref());
-    let stream = rows[0].images[column]
-        .as_ref()
-        .and_then(|image| image.stream.as_ref());
-    let Some(stream) = stream else {
-        return Ok(images.map(|image| image.map(|image| image.bytes.as_slice())).collect());
+    let Some(Image::Shared { stream, .. }) = &rows[0].images[column] else {
+        return Ok(images
+            .map(|image| match image {
+                Some(Image::Binary(bytes)) => Some(bytes.as_slice()),
+                None => None,
+                Some(Image::Shared { .. }) => unreachable!("packed rows use the same image carrier"),
+            })
+            .collect());
     };
-    let messages = images.flatten().map(|image| image.bytes.as_slice());
+    let messages = images.flatten().map(|image| match image {
+        Image::Shared { row, .. } => row,
+        Image::Binary(_) => unreachable!("packed rows use the same image carrier"),
+    });
     let len = stream.schema_frame().len()
-        + messages.clone().map(<[u8]>::len).sum::<usize>()
+        + messages.clone().map(PreparedStreamRow::framed_len).sum::<usize>()
         + IMAGE_END.len();
     let end = i32::try_from(len).map_err(|_| ArrowError::OffsetOverflowError(len))?;
     let mut bytes = Vec::with_capacity(len);
     bytes.extend_from_slice(stream.schema_frame());
     for message in messages {
-        bytes.extend_from_slice(message);
+        message.append_to(&mut bytes);
     }
     bytes.extend_from_slice(&IMAGE_END);
     let mut offsets = vec![end; rows.len() + 1];
@@ -701,49 +774,110 @@ fn image_array(rows: &[ReservedRow], column: usize) -> Result<BinaryArray, Arrow
     BinaryArray::try_new(OffsetBuffer::new(offsets.into()), bytes.into(), nulls)
 }
 
-fn write_image(
-    writer: &mut ImageWriter,
-    batch: &RecordBatch,
-    row: usize,
-    projection: &[usize],
-    memory: &Arc<MemoryBudget>,
-) -> Result<(Image, Arc<MemoryReservation>), Status> {
-    let batch = batch
-        .slice(row, 1)
-        .project(projection)
-        .map_err(batch_error)?;
-    let size = wire::add(
-        wire::mul(batch.get_array_memory_size(), 4).map_err(error::map_status)?,
-        wire::schema_bound(batch.schema().as_ref()).map_err(error::map_status)?,
-    )
-    .map_err(error::map_status)?;
-    let charge = memory.reserve(size).map_err(error::anomaly)?;
-    let image = match writer {
-        ImageWriter::Binary => Image {
-            bytes: rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
-                .map_err(error::anomaly)?,
-            stream: None,
-        },
-        ImageWriter::Stream(encoder) => {
-            let encoder = match encoder {
-                Some(encoder) => encoder,
-                None => encoder.insert(Arc::new(
-                    RowStreamEncoder::new(batch.schema_ref()).map_err(error::anomaly)?,
-                )),
-            };
-            Image {
-                bytes: encoder.encode(&batch).map_err(error::anomaly)?,
-                stream: Some(Arc::clone(encoder)),
-            }
-        }
-    };
-    Ok((image, charge))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, builder::StringDictionaryBuilder, types::Int32Type};
+    use arrow_array::{Array, ArrayRef, builder::StringDictionaryBuilder, types::Int32Type};
+
+    #[test]
+    fn shared_images_keep_the_released_bytes_across_input_batches() {
+        let long = "value".repeat(500);
+        let batch = RecordBatch::try_from_iter([
+            (
+                "_id",
+                Arc::new(StringArray::from(vec!["one", "two", "three"])) as ArrayRef,
+            ),
+            (
+                "value",
+                Arc::new(StringArray::from(vec![Some("short"), None, Some(long.as_str())]))
+                    as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let inputs = [batch.slice(0, 2), batch.slice(2, 1)];
+        let memory = MemoryBudget::new(1 << 20);
+        let outer_schema = Arc::new(schema());
+        let table: Arc<str> = Arc::from("public.rows");
+        let base = singleton_base(&outer_schema, &table).unwrap();
+        let released = RowStreamEncoder::new(batch.schema_ref()).unwrap();
+        let mut expected = released.schema_frame().to_vec();
+        let mut rows = Vec::new();
+        for input in &inputs {
+            let mut shared = ImageProjection::new(input, &[0, 1], true);
+            let mut ordinary = ImageProjection::new(input, &[0, 1], false);
+            for index in 0..input.num_rows() {
+                let candidate = input.slice(index, 1);
+                let legacy = rtdb_format::ipc::write_stream(
+                    candidate.schema_ref(),
+                    std::slice::from_ref(&candidate),
+                )
+                .unwrap();
+                let (image, scratch) = shared.write(index, &memory).unwrap();
+                let (binary, binary_scratch) = ordinary.write(index, &memory).unwrap();
+                let image_bound = wire::batch_bound(&candidate).unwrap();
+                assert_eq!(scratch.bytes(), image_bound);
+                assert_eq!(binary_scratch.bytes(), image_bound);
+                let Image::Binary(bytes) = binary else {
+                    panic!("expected an ordinary image");
+                };
+                assert_eq!(bytes, legacy);
+                assert_eq!(image.legacy_len(), legacy.len());
+                expected.extend_from_slice(&released.encode(&candidate).unwrap());
+                let charge = memory
+                    .reserve(singleton_bound(base, [Some(legacy.len()), None, None]).unwrap())
+                    .unwrap();
+                let row = ReservedRow {
+                    table: Arc::clone(&table),
+                    time: Timestamp(1),
+                    opened: true,
+                    images: [Some(image), None, None],
+                    charge,
+                };
+                let singleton = image_array(std::slice::from_ref(&row), 0).unwrap();
+                assert_eq!(singleton.value(0), legacy.as_slice());
+                rows.push(row);
+            }
+        }
+        expected.extend_from_slice(&IMAGE_END);
+        assert!(rows[0].shares_streams_with(&rows[2]));
+        let packed = image_array(&rows, 0).unwrap();
+        assert_eq!(packed.value(0), expected.as_slice());
+        assert!(packed.is_null(1));
+        assert!(packed.is_null(2));
+        drop(rows);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn image_scratch_admission_precedes_a_schema_encoding_error() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["one"]));
+        let mut batch = RecordBatch::try_from_iter([("_id", values)]).unwrap();
+        batch.schema_metadata_mut().insert(
+            rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY.into(),
+            "0".into(),
+        );
+        let candidate = batch.slice(0, 1).project(&[0]).unwrap();
+        let bound = wire::batch_bound(&candidate).unwrap();
+        for shared in [false, true] {
+            let mut images = ImageProjection::new(&batch, &[0], shared);
+            let memory = MemoryBudget::new(bound - 1);
+            let expected = error::anomaly(memory.reserve(bound).err().unwrap());
+            let rejection = images.write(0, &memory).err().unwrap();
+            assert_eq!(rejection.code(), expected.code());
+            assert_eq!(rejection.details(), expected.details());
+            assert_eq!(memory.used_bytes(), 0);
+
+            let memory = MemoryBudget::new(bound);
+            let expected = error::anomaly(
+                rtdb_format::ipc::write_stream(candidate.schema_ref(), std::slice::from_ref(&candidate))
+                    .unwrap_err(),
+            );
+            let rejection = images.write(0, &memory).err().unwrap();
+            assert_eq!(rejection.code(), expected.code());
+            assert_eq!(rejection.details(), expected.details());
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
 
     #[test]
     fn descriptor_reservation_equals_the_legacy_singleton_charge() {
@@ -814,12 +948,15 @@ mod tests {
         let values: ArrayRef = Arc::new(dictionary.finish());
         let batch = RecordBatch::try_from_iter([("_id", values)]).unwrap();
         let memory = MemoryBudget::new(1 << 20);
-        let mut shared = ImageWriter::new(true);
-        let mut legacy = ImageWriter::new(false);
+        let mut shared = ImageProjection::new(&batch, &[0], true);
+        let mut legacy = ImageProjection::new(&batch, &[0], false);
         let mut make_row = |row| {
-            let (image, charge) = write_image(&mut shared, &batch, row, &[0], &memory).unwrap();
-            let (legacy, _) = write_image(&mut legacy, &batch, row, &[0], &memory).unwrap();
-            assert_eq!(image.legacy_len(), legacy.bytes.len());
+            let (image, charge) = shared.write(row, &memory).unwrap();
+            let (legacy, _) = legacy.write(row, &memory).unwrap();
+            let Image::Binary(legacy) = legacy else {
+                panic!("expected an ordinary image");
+            };
+            assert_eq!(image.legacy_len(), legacy.len());
             let row = ReservedRow {
                 table: Arc::from("public.rows"),
                 time: Timestamp(1),
@@ -828,7 +965,7 @@ mod tests {
                 charge,
             };
             let encoded = image_array(std::slice::from_ref(&row), 0).unwrap();
-            assert_eq!(encoded.value(0), legacy.bytes.as_slice());
+            assert_eq!(encoded.value(0), legacy.as_slice());
             row
         };
         let first = make_row(0);
