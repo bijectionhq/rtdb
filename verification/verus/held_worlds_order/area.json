@@ -1,10 +1,33 @@
 {
-  "summary": "Checks the shipped prepared landing action selection, hosted revision comparison, exact selection of original refusal checks, marker payload and event revision decisions, and placement of a publication after its recovered predecessor.",
+  "summary": "Checks the shipped prepared landing action selection, hosted revision comparison, exact selection of original refusal checks, marker payload and event revision decisions, and placement of a publication after its recovered predecessor. An original hosted validation refuses a replaced revision and selects no control write.",
   "flags": [
     "--no-external-by-default"
   ],
-  "min_verified_functions": 21,
+  "min_verified_functions": 24,
   "controls": {
+    "check_only_selects_a_write_mirror": {
+      "defect": "The resolver's write eligibility and local contract ignore check-only admission.",
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "ensures writes == (!check_only && !transient_replay),",
+          "replace": "ensures writes == !transient_replay,"
+        },
+        {
+          "file": "rust/crates/tx/src/resolver/control_order.rs",
+          "find": "    !check_only && !transient_replay\n",
+          "replace": "    let _ = check_only;\n    !transient_replay\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/held_worlds_order/laws.rs",
+          "function": "hosted_validation_selects_no_control_write",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
     "skip_a_hosted_stamp": {
       "defect": "The hosted resolver repeats the first stamp check and skips later controls.",
       "mutate": [

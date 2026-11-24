@@ -1,5 +1,5 @@
 use crate::control_order::{SourceOrder, fingerprint_bytes, fingerprint_matches, hosted_check_for_refusal, revision_matches, source_order, staging_clock_upper};
-use crate::control_order::{HostedStamp, LandingMarker, hosted_stamps_current, landing_marker_matches};
+use crate::control_order::{HostedStamp, LandingMarker, hosted_stamps_current, landing_marker_matches, writes_hosted_control};
 use crate::event_revision::matches_transaction;
 use crate::prepared_landing;
 use crate::system_time::{advances, owned_deadline_is_live};
@@ -23,6 +23,31 @@ pub(crate) fn ordered_hosted_inventory_is_current(stamps: &[HostedStamp], ordere
         (#[trigger] stamps@[i]).observed == stamps@[i].expected),
 {
     owned_deadline_is_live(ordered_at, until) && hosted_stamps_current(stamps)
+}
+
+pub(crate) fn a_replaced_hosted_revision_refuses_original_validation(
+    stamps: &[HostedStamp], grant: usize, original: i64, replacement: i64,
+) -> (admitted: bool)
+    requires
+        grant < stamps@.len(),
+        stamps@[grant as int].expected == Some(original),
+        stamps@[grant as int].observed == Some(replacement),
+        replacement != original,
+    ensures !admitted,
+{
+    let admitted = hosted_stamps_current(stamps);
+    proof! {
+        if admitted {
+            assert(stamps@[grant as int].observed == stamps@[grant as int].expected);
+        }
+    }
+    admitted
+}
+
+pub(crate) fn hosted_validation_selects_no_control_write(transient_replay: bool) -> (writes: bool)
+    ensures !writes,
+{
+    writes_hosted_control(true, transient_replay)
 }
 
 pub(crate) fn chosen_landing_marker_has_original_identity(

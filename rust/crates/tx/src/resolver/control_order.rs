@@ -62,6 +62,13 @@ pub(super) fn landing_marker_matches(
         && marker.source == Some(source) && marker.revision == revision
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(writes =>
+    ensures writes == (!check_only && !transient_replay),
+))]
+pub(super) fn writes_hosted_control(check_only: bool, transient_replay: bool) -> bool {
+    !check_only && !transient_replay
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(selected =>
     ensures selected == if check_only { Some(original) } else { None },
 ))]
