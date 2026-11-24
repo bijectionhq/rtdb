@@ -1,4 +1,6 @@
-use ring::{aead, rand::{SecureRandom, SystemRandom}};
+use std::collections::BTreeSet;
+
+use ring::{aead, digest, rand::{SecureRandom, SystemRandom}};
 use serde::{Deserialize, Serialize};
 
 use crate::{Anomaly, Result, Timestamp};
@@ -6,6 +8,25 @@ use crate::{Anomaly, Result, Timestamp};
 pub type Branch = String;
 pub const MAIN_BRANCH: &str = "main";
 pub const MAX_BRANCH_BYTES: usize = 255;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LabelScope {
+    pub read: BTreeSet<Vec<u8>>,
+    pub write: BTreeSet<Vec<u8>>,
+}
+
+impl LabelScope {
+    pub fn main_read_incarnation(&self, database_incarnation: [u8; 16]) -> [u8; 16] {
+        let mut hash = digest::Context::new(&digest::SHA256);
+        hash.update(b"rtdb.v1/main-merged-visibility");
+        hash.update(&database_incarnation);
+        for label in &self.read {
+            hash.update(&(label.len() as u64).to_be_bytes());
+            hash.update(label);
+        }
+        hash.finish().as_ref()[..16].try_into().expect("SHA-256 contains 16 bytes")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Basis {

@@ -3,9 +3,12 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, Basis, Branch, LabelScope, Layer, MAIN_BRANCH},
 };
 use serde::{Deserialize, Serialize};
+
+mod visibility;
+pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchCut {
@@ -37,6 +40,24 @@ pub struct BranchTable {
     pub constraints: BTreeMap<String, CountRange>,
     pub generation: u64,
     pub dropped: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Visibility>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub single_label_per_tx: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Visibility {
+    pub column: String,
+}
+
+impl Visibility {
+    pub fn label<'a>(&self, cells: &'a StructFields<Value>) -> Option<&'a [u8]> {
+        match cells.get(&self.column)? {
+            Value::Binary(label) | Value::FixedSizeBinary(label) if !label.is_empty() => Some(label),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -125,8 +146,12 @@ pub struct BranchIndex {
 
 impl BranchIndex {
     pub fn new(incarnation: [u8; 16]) -> Self {
+        Self::with_initial_time(incarnation, Timestamp::MIN)
+    }
+
+    fn with_initial_time(incarnation: [u8; 16], system_time: Timestamp) -> Self {
         let basis = Basis::new(incarnation, 0);
-        let head = BranchCut { basis, system_time: Timestamp::MIN };
+        let head = BranchCut { basis, system_time };
         let main = BranchData {
             base: None, created: basis, writable: true, dropped: None,
             expiries: vec![(basis, None)], changed: None, tables: BTreeMap::new(),
@@ -255,6 +280,20 @@ impl BranchIndex {
         })
     }
 
+    pub fn has_row_history(&self, table: &TableRef) -> bool {
+        self.branches.values().any(|branch| branch.tables.contains_key(table))
+    }
+
+    pub fn stored_labels(&self, table: &TableRef, branch: Option<&str>, id: &EntityId, visibility: &Visibility) -> BTreeSet<Vec<u8>> {
+        self.branches.iter()
+            .filter(|(name, _)| branch.is_none_or(|branch| name.as_str() == branch))
+            .filter_map(|(_, branch)| branch.tables.get(table)?.events.get(id))
+            .flat_map(|events| events.iter())
+            .filter_map(|(_, event)| visibility.label(&event.image.as_ref()?.cells))
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
     pub fn advance(&mut self, cut: BranchCut) -> Result<()> {
         self.require_incarnation(cut.basis)?;
         if cut.basis <= self.head.basis || cut.system_time <= self.head.system_time {
@@ -379,6 +418,13 @@ impl<'a> BranchView<'a> {
             if rows.erased.contains_key(id) { return None; }
         }
         None
+    }
+
+    pub fn visible_row(&self, table: &TableRef, id: &EntityId, valid_at: Timestamp, labels: &BTreeSet<Vec<u8>>) -> Option<&'a BranchEvent> {
+        let visibility = self.table(table)?.visibility.as_ref()?;
+        let event = self.row(table, id, valid_at)?;
+        let label = visibility.label(&event.image.as_ref()?.cells)?;
+        labels.contains(label).then_some(event)
     }
 
     pub fn erased_after(&self, table: &TableRef, id: &EntityId, basis: Basis) -> bool {

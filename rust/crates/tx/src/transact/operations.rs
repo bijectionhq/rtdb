@@ -2,18 +2,20 @@ use rtdb_index::branches::BranchEvent;
 
 use super::*;
 
-impl Candidate {
+impl Candidate<'_> {
     pub(super) fn execute(&mut self, ops: &[Op]) -> Result<()> {
         let cut = self.index.head();
         for op in ops {
             match op {
                 Op::Put { branch, table, rows, if_absent } => {
                     self.index.writable(branch)?;
-                    let definition = self.definition(table)?;
+                    let definition = self.write_definition(table)?;
                     for row in rows {
                         let valid = effective_valid(row.valid, cut.system_time)?;
-                        if *if_absent && self.present(branch, table, &row.id, valid)? {
-                            return Err(conflict("rtdb/already-present", "The put overlaps an existing row"));
+                        if let Some(visibility) = &definition.visibility
+                            && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
+                        {
+                            return Err(invalid_label());
                         }
                         let mut cells = row.cells.iter().map(|(name, value)| (name.clone(), value.resolve(cut)))
                             .collect::<StructFields<_>>();
@@ -23,24 +25,44 @@ impl Candidate {
                         validate_cells(&definition, &cells)?;
                         cells.insert("_id".into(), row.id.as_value());
                         let expires_at = definition.ttl_micros.map(|ttl| expiry(cut.system_time, ttl)).transpose()?;
+                        self.authorize_write(branch, table, &row.id, valid, &definition, Some(&cells))?;
+                        if *if_absent && self.present(branch, table, &row.id, valid)? {
+                            return Err(conflict("rtdb/already-present", "The put overlaps an existing row"));
+                        }
                         self.write(branch, table, row.id.clone(), valid, Some(Arc::new(RowImage { cells, expires_at })))?;
                     }
                 }
                 Op::Delete { branch, table, ids, valid } => {
                     self.index.writable(branch)?;
-                    self.definition(table)?;
+                    let definition = self.write_definition(table)?;
                     let valid = effective_valid(*valid, cut.system_time)?;
-                    for id in ids { self.write(branch, table, id.clone(), valid, None)?; }
+                    for id in ids {
+                        self.authorize_write(branch, table, id, valid, &definition, None)?;
+                        self.write(branch, table, id.clone(), valid, None)?;
+                    }
                 }
                 Op::Erase { branch, table, ids } => {
-                    self.definition(table)?;
+                    let definition = self.write_definition(table)?;
                     if let Some(branch) = branch { self.view(branch, Layer::Local)?; }
                     for id in ids {
+                        if let Some(visibility) = &definition.visibility {
+                            let mut labels = self.index.stored_labels(table, branch.as_deref(), id, visibility);
+                            if let Some(branch) = branch {
+                                labels.extend(self.view(branch, Layer::Merged)?.history(table, id).iter()
+                                    .filter_map(|event| visibility.label(&event.image.as_ref()?.cells))
+                                    .map(<[u8]>::to_vec));
+                            }
+                            self.authorize_labels(&definition, labels)?;
+                        }
                         self.push(BranchEffect::Erase { branch: branch.clone(), table: table.clone(), id: id.clone() })?;
                     }
                 }
-                Op::Declare { table, change } => self.declare(table, change)?,
+                Op::Declare { table, change } => {
+                    self.require_unrestricted()?;
+                    self.declare(table, change)?;
+                }
                 Op::Fork { child, from, writable, expires_at } => {
+                    self.require_unrestricted()?;
                     if !valid_branch_name(child) {
                         return Err(Anomaly::incorrect("rtdb/invalid-branch", "Invalid child branch name"));
                     }
@@ -56,12 +78,17 @@ impl Candidate {
                     self.touched.insert(child.clone());
                 }
                 Op::Renew { branch, expires_at } => {
+                    self.require_unrestricted()?;
                     self.require_child(branch)?;
                     validate_expiry(*expires_at, cut.system_time)?;
                     self.push(BranchEffect::Renew { branch: branch.clone(), expires_at: *expires_at })?;
                 }
-                Op::Merge { from, into } => self.merge(from, into)?,
+                Op::Merge { from, into } => {
+                    self.require_unrestricted()?;
+                    self.merge(from, into)?;
+                }
                 Op::DropBranch { branch } => {
+                    self.require_unrestricted()?;
                     self.require_child(branch)?;
                     self.push(BranchEffect::Drop { branch: branch.clone() })?;
                 }
@@ -98,6 +125,38 @@ impl Candidate {
         }))
     }
 
+    fn require_unrestricted(&self) -> Result<()> {
+        if self.scope.is_some() { return Err(write_scope_error()); }
+        Ok(())
+    }
+
+    fn authorize_write(&mut self, branch: &str, table: &TableRef, id: &EntityId, valid: Interval,
+                       definition: &BranchTable, cells: Option<&StructFields<Value>>) -> Result<()> {
+        let Some(visibility) = &definition.visibility else { return Ok(()); };
+        let view = self.view(branch, Layer::Merged)?;
+        let history = view.history(table, id);
+        let mut labels = endpoints(&history, valid).into_iter().filter(|at| *at < valid.upper())
+            .filter_map(|at| view.row(table, id, at))
+            .filter_map(|event| visibility.label(&event.image.as_ref()?.cells))
+            .map(<[u8]>::to_vec).collect::<BTreeSet<_>>();
+        if let Some(cells) = cells {
+            labels.insert(visibility.label(cells).ok_or_else(invalid_label)?.to_vec());
+        }
+        self.authorize_labels(definition, labels)
+    }
+
+    fn authorize_labels(&mut self, definition: &BranchTable, labels: BTreeSet<Vec<u8>>) -> Result<()> {
+        if self.scope.is_some_and(|scope| labels.is_empty() || !labels.is_subset(&scope.write)) {
+            return Err(write_scope_error());
+        }
+        self.affected_labels.extend(labels);
+        self.single_label |= definition.single_label_per_tx;
+        if self.single_label && self.affected_labels.len() > 1 {
+            return Err(Anomaly::incorrect("rtdb/mixed-visibility-labels", "The transaction must use a single visibility label"));
+        }
+        Ok(())
+    }
+
     fn merge(&mut self, from: &str, into: &str) -> Result<()> {
         if from == into || from == MAIN_BRANCH {
             return Err(Anomaly::incorrect("rtdb/invalid-merge", "Merge requires a child source and a different target"));
@@ -129,6 +188,8 @@ impl Candidate {
             }
         }
         for (table, id, valid, image) in effects {
+            let definition = self.definition(&table)?;
+            self.authorize_write(into, &table, &id, valid, &definition, image.as_ref().map(|row| &row.cells))?;
             self.write(into, &table, id, valid, image)?;
         }
         Ok(())
@@ -141,6 +202,14 @@ impl Candidate {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-table", "The table has been dropped"));
         }
         Ok(definition)
+    }
+
+    fn write_definition(&self, table: &TableRef) -> Result<BranchTable> {
+        let definition = self.definition(table);
+        if self.scope.is_some() && !definition.as_ref().is_ok_and(|def| def.visibility.is_some()) {
+            return Err(write_scope_error());
+        }
+        definition
     }
 
     fn declare(&mut self, table: &TableRef, change: &Declaration) -> Result<()> {
@@ -197,8 +266,29 @@ impl Candidate {
                 }
             }
             Declaration::Drop => definition = BranchTable {
-                generation: cut.basis.position(), dropped: true, ..BranchTable::default()
+                generation: cut.basis.position(), dropped: true,
+                visibility: definition.visibility, single_label_per_tx: definition.single_label_per_tx,
+                ..BranchTable::default()
             },
+            Declaration::Visibility(visibility) => {
+                validate_column(&visibility.column)?;
+                if definition.visibility.as_ref() != Some(visibility) {
+                    if definition.visibility.is_some() || self.index.has_row_history(table) {
+                        return Err(conflict("rtdb/visibility-declaration", "Declare a stable visibility column before writing the table"));
+                    }
+                    definition.visibility = Some(visibility.clone());
+                }
+            }
+            Declaration::SingleLabelPerTx => {
+                if definition.visibility.is_none() {
+                    return Err(Anomaly::incorrect("rtdb/visibility-declaration", "The table requires a visibility column"));
+                }
+                definition.single_label_per_tx = true;
+                if self.affected_labels.len() > 1 {
+                    return Err(Anomaly::incorrect("rtdb/mixed-visibility-labels", "The transaction must use a single visibility label"));
+                }
+                self.single_label = true;
+            }
         }
         self.push(BranchEffect::Declare { table: table.clone(), definition })?;
         self.declared.insert(table.clone());
@@ -300,4 +390,12 @@ fn validate_expiry(until: Timestamp, time: Timestamp) -> Result<()> {
 
 fn conflict(code: &str, message: impl Into<String>) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, code, message)
+}
+
+fn invalid_label() -> Anomaly {
+    Anomaly::incorrect("rtdb/visibility-label", "The declared visibility column requires a nonempty binary label")
+}
+
+fn write_scope_error() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Forbidden, "rtdb/write-scope", "The row operation is outside the write scope")
 }

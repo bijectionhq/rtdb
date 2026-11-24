@@ -46,6 +46,71 @@ fn visible(state: &TransactState, branch: &str, layer: Layer, at: i64) -> Vec<i6
     }).collect()
 }
 
+fn labelled_put(branch: &str, id: i64, label: u8, valid: Interval) -> Op {
+    let Op::Put { branch, table, mut rows, if_absent } = put(branch, id, "value") else { unreachable!() };
+    rows[0].valid = Some(valid);
+    rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![label])));
+    Op::Put { branch, table, rows, if_absent }
+}
+
+fn declare_visibility() -> Op {
+    Op::Declare { table: table(), change: Declaration::Visibility(Visibility { column: "label".into() }) }
+}
+
+#[test]
+fn row_visibility_masks_inherited_and_older_versions_only_where_the_hidden_version_wins() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL)]));
+    commit(&mut state, 2, &request(2, vec![fork("child", 1)]));
+    let private_period = Interval::new(Timestamp(30), Timestamp(40)).unwrap();
+    commit(&mut state, 3, &request(3, vec![labelled_put("child", 1, 2, private_period)]));
+    let labels = BTreeSet::from([vec![1]]);
+    let id = EntityId::Integer(1);
+    let view = state.index().view("child", At::Latest, Layer::Merged, Timestamp(50)).unwrap();
+    assert!(view.visible_row(&table(), &id, Timestamp(29), &labels).is_some());
+    assert!(view.visible_row(&table(), &id, Timestamp(30), &labels).is_none());
+    assert!(view.visible_row(&table(), &id, Timestamp(40), &labels).is_some());
+    let historical = state.index().view("child", At::Exactly(basis(2)), Layer::Merged, Timestamp(50)).unwrap();
+    assert!(historical.visible_row(&table(), &id, Timestamp(30), &labels).is_some());
+}
+
+#[test]
+fn row_visibility_checks_incoming_and_affected_labels() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 2, Interval::ALL)]));
+    let write = LabelScope { read: BTreeSet::from([vec![2]]), write: BTreeSet::from([vec![1]]) };
+    let delete = |id| Op::Delete { branch: MAIN_BRANCH.into(), table: table(), ids: vec![EntityId::Integer(id)], valid: Some(Interval::ALL) };
+    let erase = Op::Erase { branch: None, table: table(), ids: vec![EntityId::Integer(1)] };
+    for op in [labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL), labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL),
+        delete(1), delete(2), erase] {
+        let mut candidate = Candidate::new(state.index().clone(), Some(&write));
+        let error = candidate.execute(&[op]).unwrap_err();
+        assert_eq!(error.code, "rtdb/write-scope");
+        assert_eq!(error.category, AnomalyCategory::Forbidden);
+        assert!(candidate.effects.is_empty());
+    }
+    let mut candidate = Candidate::new(state.index().clone(), Some(&write));
+    candidate.execute(&[labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL), delete(2)]).unwrap();
+    assert_eq!(candidate.effects.len(), 2);
+}
+
+#[test]
+fn row_visibility_declarations_and_single_label_are_ordered_and_recoverable() {
+    let mut state = TransactState::new(INCARNATION);
+    let single = Op::Declare { table: table(), change: Declaration::SingleLabelPerTx };
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), single]));
+    let receipt = commit(&mut state, 2, &request(2, vec![put(MAIN_BRANCH, 1, "unlabelled")]));
+    assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/visibility-label"));
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    let mixed = request(3, vec![labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL), labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL)]);
+    let receipt = commit(&mut state, 3, &mixed);
+    assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/mixed-visibility-labels"));
+    assert!(visible(&state, MAIN_BRANCH, Layer::Merged, 30).is_empty());
+    let same = request(4, vec![labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL), labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL)]);
+    assert_eq!(commit(&mut state, 4, &same).outcome, Outcome::Then);
+}
+
 #[test]
 fn timed_writes_publish_only_at_the_terminal_position() {
     let mut state = TransactState::new(INCARNATION);
@@ -258,4 +323,157 @@ async fn sql_aggregate_and_lineage_share_the_selected_branch_snapshot() {
             assert_eq!(count.values().as_ref(), [expected]);
         }
     }
+}
+
+#[test]
+fn row_visibility_projection_ignores_generated_hidden_histories() {
+    fn assert_same(public: &TransactState, mixed: &TransactState, scope: &LabelScope) {
+        let a = public.index().project_main_visibility(scope).unwrap();
+        let b = mixed.index().project_main_visibility(scope).unwrap();
+        assert_eq!(a.index().head(), b.index().head());
+        assert_eq!(a.changes(), b.changes());
+        for group in a.changes() {
+            let basis = group.cut.basis;
+            let view = |index: &BranchIndex| -> Vec<_> {
+                let view = index.view(MAIN_BRANCH, At::Exactly(basis), Layer::Merged, Timestamp(0)).unwrap();
+                view.ids(&table()).into_iter().filter_map(|id| {
+                    let event = view.row(&table(), id, Timestamp(0))?;
+                    Some((id.clone(), event.cut, event.image_at(Timestamp(0))?.clone()))
+                }).collect()
+            };
+            assert_eq!(view(a.index()), view(b.index()));
+        }
+    }
+
+    let scope = LabelScope { read: BTreeSet::from([vec![1]]), ..LabelScope::default() };
+    for seed in 0u64..32 {
+        let mut pseudorandom = seed;
+        let mut public = TransactState::new(INCARNATION);
+        let mut mixed = TransactState::new(INCARNATION);
+        let declare = request(0, vec![declare_visibility()]);
+        commit(&mut public, 1, &declare);
+        commit(&mut mixed, 1, &declare);
+        let mut public_position = 1;
+        let mut mixed_position = 1;
+        for step in 1u8..=12 {
+            pseudorandom = pseudorandom.wrapping_mul(6364136223846793005).wrapping_add(1);
+            for offset in 0..(pseudorandom >> 63) + 1 {
+                mixed_position += 1;
+                let private = if offset == 0 {
+                    let at = Timestamp(40 + (pseudorandom % 13) as i64);
+                    let valid = Interval::new(at, at.next().unwrap()).unwrap();
+                    labelled_put(MAIN_BRANCH, (pseudorandom % 3) as i64, 2, valid)
+                } else {
+                    labelled_put(MAIN_BRANCH, 100 + step as i64, 2, Interval::ALL)
+                };
+                commit(&mut mixed, mixed_position, &request(100 + mixed_position as u8, vec![private]));
+            }
+            assert_same(&public, &mixed, &scope);
+
+            let valid = Interval::new(Timestamp(-20), Timestamp(20)).unwrap();
+            let authorized = request(step, vec![labelled_put(MAIN_BRANCH, (pseudorandom % 3) as i64, 1, valid)]);
+            public_position += 1;
+            mixed_position += 1;
+            commit(&mut public, public_position, &authorized);
+            commit(&mut mixed, mixed_position, &authorized);
+            assert_same(&public, &mixed, &scope);
+        }
+        let checkpoint = mixed.encode_checkpoint().unwrap();
+        let recovered = TransactState::decode_checkpoint(&checkpoint, mixed.index().head()).unwrap();
+        assert_same(&public, &recovered, &scope);
+    }
+}
+
+#[test]
+fn row_visibility_projection_reports_a_hidden_winner_as_only_a_visible_removal() {
+    let mut state = TransactState::new(INCARNATION);
+    let scope = LabelScope { read: BTreeSet::from([vec![1]]), ..LabelScope::default() };
+    let valid = Interval::new(Timestamp(10), Timestamp(20)).unwrap();
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, valid)]));
+    commit(&mut state, 2, &request(2, vec![labelled_put(MAIN_BRANCH, 1, 2, Interval::ALL)]));
+    let projected = state.index().project_main_visibility(&scope).unwrap();
+    let [opened, masked] = projected.changes() else { panic!("expected a visible put and removal"); };
+    assert_eq!(opened.cut.system_time, Timestamp(1));
+    assert_eq!(masked.cut.system_time, Timestamp(2));
+    let [row] = masked.rows.as_slice() else { panic!("expected one masked interval"); };
+    assert_eq!(row.valid, valid);
+    assert!(row.before.is_some());
+    assert!(row.after.is_none());
+    let view = projected.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(15)).unwrap();
+    assert!(view.row(&table(), &EntityId::Integer(1), Timestamp(15)).is_none());
+    assert!(projected.index().exact(state.index().head().basis).is_err());
+    let other = LabelScope { read: BTreeSet::from([vec![2]]), ..LabelScope::default() };
+    let other = state.index().project_main_visibility(&other).unwrap();
+    assert!(other.index().exact(masked.cut.basis).is_err());
+}
+
+#[tokio::test]
+async fn row_visibility_supplies_only_projected_versions_to_sql_aggregates() {
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
+    use rtdb_sql::PrepareOptions;
+    use rtdb_storage::{cache::BufferPool, object_store::MemoryStore};
+    use tokio_util::sync::CancellationToken;
+
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL),
+        labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL)]));
+    let masked = Interval::new(Timestamp(10), Timestamp(20)).unwrap();
+    commit(&mut state, 2, &request(2, vec![labelled_put(MAIN_BRANCH, 1, 2, masked)]));
+    let scope = LabelScope { read: BTreeSet::from([vec![1]]), ..LabelScope::default() };
+    let projected = state.index().project_main_visibility(&scope).unwrap();
+    let memory = MemoryBudget::new(1 << 24);
+    let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+    let cancel = CancellationToken::new();
+    for (group, expected) in projected.changes().iter().zip([1, 0]) {
+        let now = Timestamp(15);
+        let view = projected.index().view(MAIN_BRANCH, At::Exactly(group.cut.basis), Layer::Merged, now).unwrap();
+        let snapshot = rtdb_query::branch_snapshot(&view, &memory).unwrap();
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&storage) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let prepared = rtdb_sql::prepare_in("SELECT count(*) FROM docs", &catalog, &PrepareOptions::default(), &memory).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), now, "UTC", QueryOptions::default(), &cancel).unwrap();
+        let mut cursor = PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, Vec::new()).await.unwrap();
+        let result = cursor.next_batch().await.unwrap().unwrap();
+        let count = result.batch().column(0).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap();
+        assert_eq!(count.values().as_ref(), [expected]);
+    }
+}
+
+#[test]
+fn row_visibility_scopes_otherwise_effects_and_receipts() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(2, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 2, Interval::ALL)]));
+    let scope = LabelScope { read: BTreeSet::from([vec![1]]), write: BTreeSet::from([vec![1]]) };
+    let authority = ScopedTransact { labels: &scope, receipt_namespace: [3; 32] };
+    let other = ScopedTransact { receipt_namespace: [4; 32], ..authority };
+
+    let mut guarded = request(2, vec![labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL)]);
+    guarded.guards.push(Guard::Version {
+        branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Integer(1), valid_at: None, expect: Version::Absent,
+    });
+    let resolve = |state: &TransactState, request: &Transact, position, authority| {
+        let Resolution::Append(prepared) = state.resolve_scoped(
+            request, position, Timestamp(40), MULTI, &claims(), authority,
+        ).unwrap() else { panic!("expected append"); };
+        prepared
+    };
+    let prepared = resolve(&state, &guarded, 2, authority);
+    let receipt = apply(&mut state, 2, prepared.record()).unwrap();
+    assert_eq!(receipt.outcome, Outcome::Otherwise { failed: vec![0] });
+    assert_eq!(state.tx_status(&guarded.key).unwrap().basis, basis(1));
+    assert_eq!(state.tx_status_scoped(&guarded.key, authority).unwrap().basis, basis(2));
+    assert_eq!(state.tx_status_scoped(&guarded.key, other).unwrap_err().code, "rtdb/unknown-transaction");
+
+    guarded.otherwise.push(labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL));
+    let prepared = resolve(&state, &guarded, 3, other);
+    let receipt = apply(&mut state, 3, prepared.record()).unwrap();
+    assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == "rtdb/write-scope"));
+
+    let before = state.index().head();
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let recovered = TransactState::decode_checkpoint(&checkpoint, before).unwrap();
+    assert_eq!(recovered.tx_status(&guarded.key).unwrap().basis, basis(1));
+    assert_eq!(recovered.tx_status_scoped(&guarded.key, authority).unwrap().basis, basis(2));
+    assert_eq!(recovered.tx_status_scoped(&guarded.key, other).unwrap().basis, basis(3));
 }

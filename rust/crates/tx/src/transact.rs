@@ -4,11 +4,11 @@ use bytes::Bytes;
 use rtdb_index::branches::{
     BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage,
 };
-pub use rtdb_index::branches::{CountRange, IndexDefinition};
+pub use rtdb_index::branches::{CountRange, IndexDefinition, Visibility};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Claim, ClaimScope, ClaimSealer, Layer, MAIN_BRANCH, valid_branch_name},
+    rtdb_v1::{At, Basis, Branch, Claim, ClaimScope, ClaimSealer, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -91,6 +91,8 @@ pub enum Declaration {
     Ttl(Option<u64>),
     Constraint { name: String, range: Option<CountRange> },
     Drop,
+    Visibility(Visibility),
+    SingleLabelPerTx,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +113,12 @@ pub struct Receipt {
 
 pub const TIMED_TRANSACT: &str = "timed-transact";
 pub const LINEARIZABLE: &str = "linearizable";
+
+#[derive(Clone, Copy)]
+pub struct ScopedTransact<'a> {
+    pub receipt_namespace: [u8; 32],
+    pub labels: &'a LabelScope,
+}
 
 pub enum Resolution {
     Answer(Receipt),
@@ -172,6 +180,8 @@ pub struct ResolvedTransact {
     receipt: Receipt,
     effects: Vec<BranchEffect>,
     before: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt_namespace: Option<[u8; 32]>,
 }
 
 struct Pending {
@@ -183,12 +193,14 @@ struct Pending {
 struct StoredReceipt {
     receipt: Receipt,
     fingerprint: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    receipt_namespace: Option<[u8; 32]>,
 }
 
 /// State folded from a single stream. A caller resolves at its fresh committed prefix.
 pub struct TransactState {
     index: BranchIndex,
-    receipts: BTreeMap<Vec<u8>, StoredReceipt>,
+    receipts: BTreeMap<Option<[u8; 32]>, BTreeMap<Vec<u8>, StoredReceipt>>,
     pending: Option<Pending>,
 }
 
@@ -202,7 +214,7 @@ impl TransactState {
     /// A checkpoint can replace the settled prefix once the mode installs its manifest.
     pub fn encode_checkpoint(&self) -> Result<Bytes> {
         if self.pending.is_some() { return Err(pending_error()); }
-        let receipts = self.receipts.values().collect::<Vec<_>>();
+        let receipts = self.receipts.values().flat_map(|namespace| namespace.values()).collect::<Vec<_>>();
         serde_json::to_vec(&(RECORD_VERSION, &self.index, receipts)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
     }
@@ -219,7 +231,7 @@ impl TransactState {
             let receipt = &stored.receipt;
             validate_key(&receipt.key).map_err(|_| invalid())?;
             if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time
-                || state.receipts.insert(receipt.key.clone(), stored).is_some()
+                || state.receipts.entry(stored.receipt_namespace).or_default().insert(receipt.key.clone(), stored).is_some()
             {
                 return Err(invalid());
             }
@@ -228,11 +240,22 @@ impl TransactState {
     }
 
     pub fn tx_status(&self, key: &[u8]) -> Result<Receipt> {
+        self.tx_status_with_namespace(key, None)
+    }
+
+    pub fn tx_status_scoped(&self, key: &[u8], authority: ScopedTransact<'_>) -> Result<Receipt> {
+        self.tx_status_with_namespace(key, Some(authority.receipt_namespace))
+    }
+
+    fn tx_status_with_namespace(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<Receipt> {
         validate_key(key)?;
-        if self.pending.as_ref().is_some_and(|pending| pending.tx.receipt.key == key) {
+        if self.pending.as_ref().is_some_and(|pending| {
+            pending.tx.receipt_namespace == namespace && pending.tx.receipt.key == key
+        }) {
             return Err(pending_error());
         }
-        self.receipts.get(key).map(|stored| replay(&stored.receipt)).ok_or_else(|| {
+        self.receipts.get(&namespace).and_then(|receipts| receipts.get(key))
+            .map(|stored| replay(&stored.receipt)).ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-transaction", "No transaction has committed with this key")
         })
     }
@@ -240,11 +263,27 @@ impl TransactState {
     pub fn resolve(
         &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
     ) -> Result<Resolution> {
+        self.resolve_with_scope(request, position, now, features, claims, None)
+    }
+
+    /// The driver binds claims, written-version selectors, and receipt coordinates to the admitted scope.
+    pub fn resolve_scoped(
+        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
+        authority: ScopedTransact<'_>,
+    ) -> Result<Resolution> {
+        self.resolve_with_scope(request, position, now, features, claims, Some(authority))
+    }
+
+    fn resolve_with_scope(
+        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
+        authority: Option<ScopedTransact<'_>>,
+    ) -> Result<Resolution> {
         validate_key(&request.key)?;
+        let receipt_namespace = authority.map(|authority| authority.receipt_namespace);
         let fingerprint = serde_json::to_vec(request)
             .map(|bytes| Sha256::digest(bytes).into())
             .map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))?;
-        if let Some(stored) = self.receipts.get(&request.key) {
+        if let Some(stored) = self.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
             if stored.fingerprint != fingerprint {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction"));
             }
@@ -284,7 +323,7 @@ impl TransactState {
         let mut base = self.index.clone();
         if !validation { base.advance(cut)?; }
         let decision_time = now.max(cut.system_time);
-        let result = self.decide(request, base, now, decision_time, features, claims);
+        let result = self.decide(request, base, now, decision_time, features, claims, authority.map(|authority| authority.labels));
         let (outcome, effects) = match result {
             Ok(decision) => decision,
             Err(error) if error.is_caller_error() => (Outcome::Refused { error }, Vec::new()),
@@ -296,14 +335,14 @@ impl TransactState {
         if validation {
             Ok(Resolution::Answer(receipt))
         } else {
-            let record = TransactionRecord::Tx(ResolvedTransact { fingerprint, receipt, effects, before });
+            let record = TransactionRecord::Tx(ResolvedTransact { fingerprint, receipt, effects, before, receipt_namespace });
             Ok(Resolution::Append(PreparedAppend { position, record }))
         }
     }
 
     fn decide(
         &self, request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
-        features: &[&str], claims: &ClaimSealer,
+        features: &[&str], claims: &ClaimSealer, scope: Option<&LabelScope>,
     ) -> Result<(Outcome, Vec<BranchEffect>)> {
         if let Some(feature) = request.require.iter().find(|feature| !features.contains(&feature.as_str())) {
             return Err(feature_required(feature));
@@ -325,7 +364,7 @@ impl TransactState {
             if !guard.evaluate(&base, time, claims)? { failed.push(i); }
         }
         if failed.is_empty() {
-            let mut then = Candidate::new(base.clone());
+            let mut then = Candidate::new(base.clone(), scope);
             then.execute(&request.ops)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
                 if !guard.evaluate(&then.index, time, claims)? { failed.push(i); }
@@ -335,7 +374,7 @@ impl TransactState {
                 return Ok((Outcome::Then, then.effects));
             }
         }
-        let mut otherwise = Candidate::new(base);
+        let mut otherwise = Candidate::new(base, scope);
         otherwise.execute(&request.otherwise)?;
         if !request.otherwise.is_empty() { otherwise.check_constraints()?; }
         Ok((Outcome::Otherwise { failed }, otherwise.effects))
@@ -356,7 +395,7 @@ impl TransactState {
                     || Some(receipt.basis.position()) != expected
                     || receipt.basis.incarnation() != head.basis.incarnation() || receipt.system_time <= head.system_time
                     || receipt.replayed || validate_key(&receipt.key).is_err()
-                    || self.receipts.contains_key(&receipt.key)
+                    || self.receipts.get(&tx.receipt_namespace).is_some_and(|namespace| namespace.contains_key(&receipt.key))
                     || (matches!(&receipt.outcome, Outcome::Refused { .. }) && !tx.effects.is_empty())
                 {
                     return Err(invalid_record());
@@ -365,7 +404,7 @@ impl TransactState {
                     self.pending = Some(Pending { position, tx });
                     Ok(None)
                 } else {
-                    self.publish(tx.receipt, tx.fingerprint, tx.effects).map(Some)
+                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.effects).map(Some)
                 }
             }
             TransactionRecord::Settle { tx_lsn } => {
@@ -376,7 +415,9 @@ impl TransactState {
                 {
                     return Err(invalid_record());
                 }
-                let receipt = self.publish(pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.effects.clone())?;
+                let receipt = self.publish(
+                    pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.effects.clone(),
+                )?;
                 self.pending = None;
                 Ok(Some(receipt))
             }
@@ -391,19 +432,22 @@ impl TransactState {
                             "The original transaction lacks timely durable acknowledgement"),
                     };
                 }
-                let receipt = self.publish(receipt, pending.tx.fingerprint, Vec::new())?;
+                let receipt = self.publish(receipt, pending.tx.fingerprint, pending.tx.receipt_namespace, Vec::new())?;
                 self.pending = None;
                 Ok(Some(receipt))
             }
         }
     }
 
-    fn publish(&mut self, receipt: Receipt, fingerprint: [u8; 32], effects: Vec<BranchEffect>) -> Result<Receipt> {
+    fn publish(&mut self, receipt: Receipt, fingerprint: [u8; 32], receipt_namespace: Option<[u8; 32]>,
+               effects: Vec<BranchEffect>) -> Result<Receipt> {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects { candidate.apply(effect)?; }
         self.index = candidate;
-        self.receipts.insert(receipt.key.clone(), StoredReceipt { fingerprint, receipt: receipt.clone() });
+        self.receipts.entry(receipt_namespace).or_default().insert(
+            receipt.key.clone(), StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace },
+        );
         Ok(receipt)
     }
 }
@@ -458,16 +502,22 @@ impl Guard {
     }
 }
 
-struct Candidate {
+struct Candidate<'a> {
     index: BranchIndex,
     effects: Vec<BranchEffect>,
     touched: BTreeSet<Branch>,
     declared: BTreeSet<TableRef>,
+    scope: Option<&'a LabelScope>,
+    affected_labels: BTreeSet<Vec<u8>>,
+    single_label: bool,
 }
 
-impl Candidate {
-    fn new(index: BranchIndex) -> Self {
-        Self { index, effects: Vec::new(), touched: BTreeSet::new(), declared: BTreeSet::new() }
+impl<'a> Candidate<'a> {
+    fn new(index: BranchIndex, scope: Option<&'a LabelScope>) -> Self {
+        Self {
+            index, effects: Vec::new(), touched: BTreeSet::new(), declared: BTreeSet::new(),
+            scope, affected_labels: BTreeSet::new(), single_label: false,
+        }
     }
 
     fn push(&mut self, effect: BranchEffect) -> Result<()> {

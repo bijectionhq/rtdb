@@ -137,6 +137,7 @@ enum IndexKind {
 message Index { string name = 1; IndexKind kind = 2; repeated string columns = 3; }
 message Ttl { optional uint64 duration_micros = 1; }
 message Constraint { string name = 1; string expression = 2; }
+message Visibility { string column = 1; }
 message Declare {
   string table = 1;
   oneof change {
@@ -145,6 +146,8 @@ message Declare {
     Ttl ttl = 4;
     Constraint constraint = 5;
     google.protobuf.Empty drop = 6;
+    Visibility visibility = 7;
+    google.protobuf.Empty single_label_per_tx = 8;
   }
 }
 message BranchBasis { string branch = 1; Basis basis = 2; }
