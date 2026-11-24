@@ -156,6 +156,26 @@ The node compares the exact ordered grant with its current leading attachment an
 The durable reader-seat claim still requires the DynamoDB seat store and the installed deployment reservation.
 The installed audience path can omit `--audience-journal-port`; classic audiences use that port and their dedicated directory read transport.
 
+## Run custody in a separate process
+
+Run one `rtdb-multi custodian --installed-cell FILE --storage-root SERVING` process per configured cell.
+The cell JSON contains `cell`, `ca`, `voters`, `limits`, `archive_root` and `keys`.
+Each of the three `voters` entries supplies a distinct `voter` UUID, `zone`, `endpoint` in host:port form and a hex `receipt_key`.
+The `limits` object uses the Logkeeper group limit fields.
+A relative `custody_manifest` path resolves against the cell file.
+The optional `--archive-root` and `--keys` flags override the cell values.
+
+For manifest-based installations, set `custody_manifest` in the cell file or pass `--installed-journals FILE` to the custodian.
+Each entry supplies the deployment, its custody route, the exact enrolled worker route that protects checkpoint copies, archive prefix and checkpoint allocations.
+The process opens the entries at startup and checks that each uses the cell archive.
+The standalone process can discover a chosen native upload without a worker offering it and can maintain the journal while the writer grant is vacant.
+It uses the installed broker to advance a staged operational erasure.
+An incumbent still records committed SQL erasure intents and provides the clean staging material.
+Existing co-located manifest installations can keep their custody route while transitioning to the dedicated process.
+
+Installed S3 serving uses the read-drain census from the first installation.
+The custodian reports blocking registrations while it waits for conclusive provider completion.
+
 ## Observe recovery and maintenance
 
 A worker obtains a grant against the last observed writer state. It opens the exact checkpoint and protected suffix named by that decision, waits until replay has applied through the granted cut, and confirms the grant before reporting readiness. Old file writes remain scoped to their grant-specific serving prefix.
@@ -357,6 +377,10 @@ The Lean models in `verification/multi/lean/OrderedCapacity.lean`, `OrderedJourn
 The capacity model compares the saturated ordinary window with and without a funded maintenance sequence.
 The journal model composes exact handoff, receipt retention, fresh read admission and release, checkpoint protection, provider disposition, and trim.
 The quorum lemmas state the assumptions on durable promises and agreement of higher ballots.
+The worker roster model in `verification/multi/lean/WorkerRoster.lean` distinguishes withdrawal, which frees an enrollment slot, from expiry disposal, which releases the withdrawn enrollment's holds.
+The cell installer requires its configured worker slots to leave at least one enrollment slot open.
+The spare-slot theorem requires every subsequent ordered admission to preserve that capacity.
+The pinned reducer permits the last slot to be filled, and the model reaches that state after two crashes without withdrawal.
 The Lake package in `verification/multi` and the Rust workspace use the same Logkeeper revision.
 Run `lake build` from `verification/multi` to check the composition against that pinned revision and the directory's Lean toolchain.
 `RecoveryComposition.lean` relates the exact decoded append selected by the voter model to the receipt retained by the RTDB trace, including across a modeled transfer of the exact predecessor image to a repaired cohort.

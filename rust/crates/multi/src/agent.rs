@@ -23,7 +23,7 @@ use crate::deployment::{CellStorage, Role, database_config, ensemble_servers, jo
 use crate::lease::MemberLease;
 use crate::hosted_recovery::{ReplicaTrimPlan, advance_body_fence, capture_replay_start};
 use crate::directory_bypass::{directory_move_park_allowed, directory_route_allowed, pressure_candidate};
-use crate::journal::{hosted::checkpoint_for_block, retention_decision::{RetentionAction, retention_actions}};
+use crate::journal::hosted::{checkpoint_for_block, custodian};
 
 enum SuffixCut<'a> {
     Tip(TransactionKey),
@@ -1846,33 +1846,9 @@ impl NodeAgent {
             }
         }
 
-        // The custodian can maintain retention even with no grant or running database.
         for (name, placement) in self.ordered.custody_placements() {
-            if let Some(broker) = self.replay_broker()
-                && let Ok(Err(error)) = tokio::time::timeout(self.options.activation_timeout,
-                    placement.advance_installed_erasure(broker, &self.keys)).await
-            {
-                tracing::warn!(code = %error.code, "Installed erasure awaits custody evidence");
-            }
-            for action in retention_actions() {
-                match action {
-                    RetentionAction::DisposeExpired => { let _ = placement.dispose_withdrawn_workers().await; }
-                    RetentionAction::RetainSelected => { let _ = placement.retain_selected().await; }
-                    RetentionAction::Publish => {
-                        let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),
-                            &self.options.storage, self.node.memory(), &self.ordered_releases);
-                        if matches!(tokio::time::timeout(self.options.activation_timeout, publish).await, Ok(Ok(Some(_)))) {
-                            let _ = placement.retain_selected().await;
-                        }
-                    }
-                }
-            }
-            let retirement = placement.retire_unheld_checkpoint(&self.keys);
-            let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
-            let receipts = placement.settle_serving_receipts(&self.options.storage, &self.keys);
-            let _ = tokio::time::timeout(self.options.activation_timeout, receipts).await;
-            let serving = placement.retire_serving_prefixes(&self.options.storage, &self.keys);
-            let _ = tokio::time::timeout(self.options.activation_timeout, serving).await;
+            custodian::maintain(placement, offered.remove(name), self.replay_broker(), &self.keys,
+                &self.options.storage, self.node.memory(), &self.ordered_releases, self.options.activation_timeout).await;
         }
     }
 

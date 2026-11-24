@@ -38,6 +38,7 @@ pub struct InstalledCell {
     limits: Limits,
     pub archive_root: String,
     pub keys: String,
+    pub custody_manifest: Option<PathBuf>,
     maximum_prefix_bytes: usize,
     maximum_application_frame: usize,
     #[serde(default = "exchange_ms")]
@@ -100,7 +101,7 @@ fn exchange_ms() -> u64 {
 
 impl InstalledCell {
     pub fn read(path: &Path) -> Result<Arc<Self>> {
-        let cell: Self = super::hosted::read_manifest(path)?;
+        let mut cell: Self = super::hosted::read_manifest(path)?;
         let mut identities = BTreeSet::new();
         let mut sites = BTreeSet::new();
         let mut voter_ids = BTreeSet::new();
@@ -112,7 +113,6 @@ impl InstalledCell {
             || cell.voters.len() < 3
             || cell.voters.len() % 2 == 0
             || cell.workers.is_empty()
-            || cell.workers.len() > cell.limits.enrolled_workers
             || !identities.insert(cell.route_reader_pin)
             || cell
                 .custodian_pin
@@ -137,7 +137,14 @@ impl InstalledCell {
                 "The installed cell needs distinct voter and client identities and worker endpoints",
             ));
         }
+        if cell.workers.len() >= cell.limits.enrolled_workers {
+            return Err(invalid(
+                "The installed worker slots must leave room for one more enrollment",
+            ));
+        }
         cell.voter_routes()?;
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        cell.custody_manifest = cell.custody_manifest.map(|path| parent.join(path));
         Ok(Arc::new(cell))
     }
 

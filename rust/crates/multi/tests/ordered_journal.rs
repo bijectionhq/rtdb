@@ -511,7 +511,7 @@ async fn reconcile(client: &Client, grant: Grant, original: Request) -> AppendRe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn expired_withdrawn_worker_disposal_releases_the_read_that_blocks_trim() {
+async fn custodian_disposes_expired_withdrawn_worker_before_trim() {
     withdrawn_worker_disposal_and_trim(true).await;
 }
 
@@ -610,7 +610,11 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
     let withdrawn = route(&custodian).await;
     assert!(withdrawn.writer.grant.is_none());
     assert!(withdrawn.time < lease_end);
-    let node = start_disposal_node(&authority, &cohort, deployment, automatic_disposal).await;
+    let service = if automatic_disposal {
+        Some(start_disposal_custodian(&authority, &cohort, deployment).await)
+    } else {
+        None
+    };
     let pending = async || {
         let Reply::WithdrawnWorkers(workers) = custodian
             .call(Operation::WithdrawnWorkers { after: None })
@@ -681,7 +685,54 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
         assert_eq!(blocked.floor, initial.floor);
         assert_eq!(pending().await, [expected_worker]);
     }
-    node.shutdown().await.unwrap();
+    if let Some((cancel, service)) = service {
+        cancel.cancel();
+        tokio::time::timeout(DEADLINE, service).await.unwrap().unwrap().unwrap();
+    }
+}
+
+async fn start_disposal_custodian(
+    authority: &Authority,
+    cohort: &Cohort,
+    deployment: DeploymentRecord,
+) -> (CancellationToken, JoinHandle<rtdb_types::Result<()>>) {
+    use rtdb_multi::journal::hosted::custodian;
+
+    let root = authority.data.path();
+    let keys = Arc::new(LocalKeyService::new(root.join("keys")).unwrap());
+    let storage = CellStorage::Local { root: root.join("serving") };
+    let archive = CellStorage::Local { root: root.join("archive") };
+    admin::initialize_storage(&storage, keys.as_ref()).await.unwrap();
+    admin::initialize_storage(&archive, keys.as_ref()).await.unwrap();
+    let installed = |identity: &Identity, role: Value| {
+        json!({
+            "incarnation": deployment.incarnation,
+            "log_epoch": deployment.log_epoch,
+            "authority": role,
+            "route": cohort.route,
+            "credentials": identity.credentials,
+        })
+    };
+    let standby = authority.enrollments[1];
+    let manifest = root.join("custodian.json");
+    write_json(&manifest, &json!([{
+        "deployment": deployment,
+        "worker": installed(&authority.workers[1], json!({"kind": "worker", "enrollment": standby})),
+        "custody": installed(&authority.custodian, json!({"kind": "custody"})),
+        "endpoints": [{ "enrollment": standby, "control": "127.0.0.1:1", "pgwire": "127.0.0.1:2" }],
+        "archive": archive,
+        "archive_prefix": "checkpoints",
+    }]));
+    let cancel = CancellationToken::new();
+    let service = tokio::spawn(custodian::run(custodian::Settings {
+        placements: manifest,
+        serving: storage,
+        archive,
+        keys,
+        broker: None,
+        memory: rtdb_columnar::MemoryBudget::new(1 << 30),
+    }, cancel.clone()));
+    (cancel, service)
 }
 
 async fn start_disposal_node(
@@ -2008,6 +2059,46 @@ async fn recover_after_writer_loss(prepare_before_loss: bool) {
     for voter in &mut cohort.voters {
         voter.stop().await;
     }
+}
+
+#[test]
+fn installed_cell_leaves_a_worker_slot_and_resolves_the_custody_manifest() {
+    use rtdb_multi::journal::cell::InstalledCell;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("cell.json");
+    let voters: Vec<_> = (1_u8..=3).map(|index| json!({
+        "voter": Uuid::from_u128(u128::from(index)),
+        "zone": format!("zone-{index}"),
+        "endpoint": format!("voter-{index}:5448"),
+        "server_name": format!("voter-{index}"),
+        "certificate": vec![index; 32],
+        "receipt_key": format!("{index:064x}"),
+    })).collect();
+    let mut definition = json!({
+        "cell": "custody-test", "ca": "ca.pem", "archive_root": "archive", "keys": "keys",
+        "custody_manifest": "custody.json", "voters": voters,
+        "limits": {
+            "enrolled_workers": 1, "replay_holds": 8, "retry_positions": 128,
+            "retained_data_bytes": 1_048_576, "maintenance_bytes": 262_144,
+            "serving_lease": 60_000, "clock_drift": 500,
+        },
+        "maximum_prefix_bytes": 2_097_152, "maximum_application_frame": FRAME,
+        "administrator_pin": vec![4; 32], "route_reader_pin": vec![5; 32],
+        "workers": [{
+            "worker": Uuid::from_u128(7), "certificate": vec![6; 32],
+            "control": "127.0.0.1:5444", "pgwire": "127.0.0.1:5432",
+        }],
+    });
+
+    write_json(&path, &definition);
+    assert!(matches!(InstalledCell::read(&path), Err(error) if error.message.as_deref()
+        .is_some_and(|message| message.contains("leave room for one more enrollment"))));
+
+    definition["limits"]["enrolled_workers"] = json!(2);
+    write_json(&path, &definition);
+    let cell = InstalledCell::read(&path).unwrap();
+    assert_eq!(cell.custody_manifest, Some(root.path().join("custody.json")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

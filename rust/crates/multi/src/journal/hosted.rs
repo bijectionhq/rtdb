@@ -1,6 +1,7 @@
 //! Attachment of an installed journal to RTDB's database factories.
 
 mod custody_work;
+pub mod custodian;
 mod discovery;
 pub mod erasure;
 pub(crate) mod prefix_retirement;

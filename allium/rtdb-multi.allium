@@ -626,6 +626,12 @@ contract LogService {
         -- A withdrawn enrollment that never held a lease is immediately eligible for expiry disposal.
         -- The disposal decision releases the holds of that exact enrollment.
 
+    @invariant CellCustodyRunsIndependently
+        -- The dedicated cell custodian maintains the configured deployments using their installed custody authority.
+        -- It can discover and publish a chosen native checkpoint and advance retention when the writer grant is vacant.
+        -- Its checkpoint copies carry the same ordered holds as before.
+        -- The installed S3 serving participants share a durable read census before reclaiming an exact publication.
+
     @invariant CustodianDisposesExpiredWorkerHoldsBeforeTrim
         -- The journal exposes a custodian-only bounded page of exact withdrawn enrollments that own holds in the selected state and their expiry disposal eligibility.
         -- The custodian checks those enrollments before attempting trim on its maintenance pass.

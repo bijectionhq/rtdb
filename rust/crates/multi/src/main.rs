@@ -29,6 +29,7 @@ Usage: rtdb-multi --build-info\n\
 \
        rtdb-multi custody-enroll-installed-fork --parent NAME --child NAME --at CUSTODIAN --cell-secret FILE\n\
        rtdb-multi replay-broker --directory DIR --listen ADDR --payload-storage-root PATH --payload-keys PATH --serving-storage-root PATH --token-file FILE [--transfer-token-file FILE] [--custody-token-file FILE] --config FILE [--ecs-cluster ARN]\n\
+       rtdb-multi custodian --installed-cell FILE --storage-root PATH [--archive-root PATH] [--keys PATH] [--installed-journals FILE]\n\
        rtdb-multi ordered-journal --manifest FILE\n\
        rtdb-multi initialize-ordered-journal --manifest FILE\n\
        rtdb-multi ordered-route --manifest FILE --deployment UUID\n\
@@ -461,6 +462,22 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                     Err(Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, code, message)),
                 _ => Err(usage("The custodian returned a different fork enrollment response".into())),
             }
+        }
+        "custodian" => {
+            use rtdb_multi::journal::{cell::InstalledCell, hosted::custodian};
+
+            let cell = InstalledCell::read(std::path::Path::new(arguments.required("installed-cell")?))?;
+            let placements = arguments.optional("installed-journals").map(PathBuf::from)
+                .or_else(|| cell.custody_manifest.clone())
+                .ok_or_else(|| usage("The installed cell needs custody_manifest or --installed-journals".into()))?;
+            custodian::run(custodian::Settings {
+                placements,
+                serving: CellStorage::parse(arguments.required("storage-root")?)?,
+                archive: CellStorage::parse(arguments.optional("archive-root").unwrap_or(&cell.archive_root))?,
+                keys: key_service(arguments.optional("keys").unwrap_or(&cell.keys)).await?,
+                broker: replay_broker_client(&arguments, "")?,
+                memory: rtdb_columnar::MemoryBudget::new(arguments.number("memory-limit", 1usize << 30)?),
+            }, cancellation).await
         }
         "ordered-journal" | "initialize-ordered-journal" => {
             let failure = |error: Box<dyn std::error::Error + Send + Sync>| {
