@@ -925,6 +925,7 @@ pub struct DisposalReceipt {
 pub struct RetiredResidence {
     pub transfer: CellTransfer,
     pub serving: DisposalReceipt,
+    pub deletion: DeletionRecord,
     pub archives: Option<ArchiveRetirement>,
 }
 

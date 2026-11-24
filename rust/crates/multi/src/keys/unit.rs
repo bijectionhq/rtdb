@@ -21,7 +21,10 @@ const NAMESPACE_CLOSED: &[u8] = b"RTDB-unit-namespace-closed-v1";
 pub(super) const OPERATION_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy)]
-pub struct UnitScope([u8; 32]);
+pub struct UnitScope([u8; 32], UnitRouting);
+
+#[derive(Clone, Copy)]
+enum UnitRouting { Exact, Publication }
 
 impl UnitScope {
     pub(crate) fn new(
@@ -38,7 +41,7 @@ impl UnitScope {
         digest.update(purpose);
         digest.update(b"\0");
         digest.update(residence);
-        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"), UnitRouting::Exact)
     }
 
     pub(super) fn namespace(self) -> String {
@@ -49,7 +52,7 @@ impl UnitScope {
         let mut digest = Context::new(&SHA256);
         digest.update(b"rtdb.multi/archive-unit-scope/v1\0");
         digest.update(id.as_bytes());
-        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"), UnitRouting::Exact)
     }
 
     pub(crate) fn replay_objects(provider: [u8; 32], residence: &str, log_epoch: i32) -> Self {
@@ -58,7 +61,7 @@ impl UnitScope {
         digest.update(&provider);
         digest.update(&log_epoch.to_be_bytes());
         digest.update(residence.as_bytes());
-        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"), UnitRouting::Exact)
     }
 
     pub(crate) fn ordered_index(residence: &str, index: &str, generation: u64) -> Self {
@@ -69,7 +72,7 @@ impl UnitScope {
         digest.update(index.as_bytes());
         digest.update(b"\0");
         digest.update(&generation.to_be_bytes());
-        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"), UnitRouting::Exact)
     }
 
     pub(crate) fn directory_serving(org: &str, lineage: &str) -> Self {
@@ -78,7 +81,34 @@ impl UnitScope {
         digest.update(org.as_bytes());
         digest.update(b"\0");
         digest.update(lineage.as_bytes());
-        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"), UnitRouting::Publication)
+    }
+
+    pub(crate) fn publication_origin(prefix: &str) -> [u8; 32] {
+        let mut origin = Context::new(&SHA256);
+        origin.update(b"rtdb.multi/serving-publication-residence/v1\0");
+        origin.update(prefix.as_bytes());
+        origin.finish().as_ref().try_into().expect("SHA-256 width")
+    }
+
+    pub(crate) fn publication_scope(self, origin: [u8; 32]) -> Self {
+        let mut scope = Context::new(&SHA256);
+        scope.update(b"rtdb.multi/directory-publication-scope/v1\0");
+        scope.update(&self.0);
+        scope.update(&origin);
+        Self(scope.finish().as_ref().try_into().expect("SHA-256 width"), UnitRouting::Exact)
+    }
+
+    fn selected_slot(self, name: &ObjectKey) -> rtdb_storage::Result<UnitSlot> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        if matches!(self.1, UnitRouting::Exact) { return Ok(self.slot(name)); }
+        let (origin, logical) = name.as_str().strip_prefix("publications/")
+            .and_then(|relative| relative.split_once('/'))
+            .ok_or_else(|| Error::InvalidKey(name.to_string()))?;
+        let tag: [u8; 32] = URL_SAFE_NO_PAD.decode(origin).ok().and_then(|tag| tag.try_into().ok())
+            .filter(|tag| *tag != [0; 32]).ok_or_else(|| Error::InvalidKey(name.to_string()))?;
+        Ok(self.publication_scope(tag).slot(&ObjectKey::new(logical)?))
     }
 
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
@@ -142,7 +172,7 @@ impl UnitLedger {
     ) -> rtdb_storage::Result<UnitOutput> {
         let work = self
             .keys
-            .use_unit_key(self.scope.slot(name), name.clone(), operation, &self.io);
+            .use_unit_key(self.scope.selected_slot(name)?, name.clone(), operation, &self.io);
         let Some(deadline) = self.deadline else {
             return work.await;
         };
@@ -166,7 +196,7 @@ impl UnitLedger {
 
     pub(crate) async fn withdraw(&self, name: &ObjectKey) -> Result<()> {
         self.keys
-            .withdraw_unit_key(self.scope.slot(name), &self.io)
+            .withdraw_unit_key(self.scope.selected_slot(name)?, &self.io)
             .await
     }
 }
@@ -428,6 +458,36 @@ mod tests {
             Err(Error::ErasedUnderView)
         ));
         assert_eq!(successor.get(&erased).await?, body);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn closing_one_original_residence_withdraws_its_orphan_without_retiring_another() -> Result<()> {
+        let volume = tempfile::tempdir().unwrap();
+        let keys = LocalKeyService::new(volume.path())?;
+        let io = IoRegion::new();
+        let domain = UnitScope::directory_serving("tenant", "lineage");
+        let first = UnitScope::publication_origin("first");
+        let second = UnitScope::publication_origin("second");
+        let name = ObjectKey::new("blocks/b00.binpb")?;
+        let original = rtdb_storage::sealing::PublicationSealing::new(
+            keys.retained_unit_ledger(domain, Arc::clone(&io))?, first, |_| true,
+        );
+        let fork = rtdb_storage::sealing::PublicationSealing::new(
+            keys.retained_unit_ledger(domain, Arc::clone(&io))?, second, |_| true,
+        );
+        let orphan = original.seal(&name, Bytes::from_static(b"unpublished")).await?;
+        let live = fork.seal(&name, Bytes::from_static(b"survivor")).await?;
+        assert_eq!(fork.open(&name, orphan.clone()).await?.as_ref(), b"unpublished");
+        keys.withdraw_unit_scope(domain.publication_scope(first), &io).await?;
+        assert!(matches!(fork.open(&name, orphan).await, Err(Error::ErasedUnderView)));
+        assert_eq!(fork.open(&name, live).await?.as_ref(), b"survivor");
         Ok(())
     }
 }

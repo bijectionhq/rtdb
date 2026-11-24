@@ -237,7 +237,7 @@ Classic Kafka database logs seal frames before enqueueing and use the original v
 Classic offline repair-anchor reclamation withdraws the exact sealed local-log frame slots before overwriting their ciphertext and preserves the replica boundary.
 Directory-managed ordered-index pages use per-page slots in their admitted generation. The index custodian withdraws the entire generation, including unplaced slots, before ciphertext collection.
 Directory-managed serving objects carry their original publication slot through packing and same-domain forks. Independent forks, cell moves and stage activation open authenticated source publications and reseal every serving member into a destination slot. Archive overlays use the admitted archive slots.
-Exact withdrawal of directory serving slots after the last reference, including abandoned publications, remains open.
+The retirement owner withdraws the original publication scopes after disposing the last co-custodied residence and after fencing an unpublished transfer generation or a rejected fork. The scope census includes interrupted key registration. Exact withdrawal of obsolete serving slots while other parts of the same lineage remain live still needs a publication reachability census.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

@@ -3162,6 +3162,11 @@ struct InterruptedInstall {
 
 #[async_trait::async_trait]
 impl KeyService for InterruptedInstall {
+    async fn withdraw_unit_scope(&self, scope: rtdb_multi::keys::UnitScope, io: &Arc<rtdb_storage::IoRegion>)
+        -> rtdb_types::Result<()>
+    {
+        self.keys.withdraw_unit_scope(scope, io).await
+    }
     fn retained_unit_ledger(&self, scope: rtdb_multi::keys::UnitScope, io: Arc<rtdb_storage::IoRegion>)
         -> rtdb_types::Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
     {

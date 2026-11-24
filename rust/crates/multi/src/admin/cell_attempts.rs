@@ -192,6 +192,9 @@ pub(crate) async fn dispose_generations(directory: &dyn Directory, storage: &Cel
             (CellStorage::S3 { .. }, Some(first)) => observed_at_ms >= s3_write_lease_horizon(first),
             (CellStorage::S3 { .. }, None) => false,
         };
+        if settled {
+            super::withdraw_unreferenced_publication_origin(keys, &record, &entry.prefix).await?;
+        }
         record = update_installation(directory, id, |current| {
             let stored = current.abandoned_generations.get_mut(&generation)
                 .filter(|stored| stored.prefix == entry.prefix && stored.namespaces == entry.namespaces)

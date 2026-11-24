@@ -1,6 +1,6 @@
 //! Cell administration: creating, moving, rebalancing, forking and deleting deployments, and confirming dead members (`CreateDeployment`, `IntendMove`, `Rebalance`, `Fork`, `BeginDeletion`, `EraseAndProve`, `ExpireLease`).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -806,7 +806,7 @@ async fn discard_local_fork(bucket: &dyn rtdb_storage::ObjectStore, keys: &dyn K
         if !crate::reference::erase_deployment(bucket, &erasure, &[]).await? {
             return Err(Anomaly::fault("rtdb.multi/fork-cleanup", format!("Storage still contains staged objects for {}", child.id)));
         }
-        Ok(())
+        withdraw_unreferenced_publication_origin(keys, child, &prefix).await
     };
     let erase_tail = async {
         if let Some(stream) = stream {
@@ -1392,6 +1392,7 @@ async fn prepare_cell_move(
             staged.retired_residences.insert(prior.incarnation, RetiredResidence {
                 transfer: prior.cell_transfer.as_deref().cloned().ok_or_else(&conflict)?,
                 serving: prior.disposal.as_deref().cloned().ok_or_else(&conflict)?,
+                deletion: prior.deletion_record.as_deref().cloned().ok_or_else(&conflict)?,
                 archives: prior.archive_retirement.clone(),
             });
             if prior.archive_retirement.is_none() {
@@ -1850,6 +1851,7 @@ async fn finish_disposal_with_lock(
         ).await?,
         CellStorage::S3 { config } => {
             let (first, last) = observe_s3_inventory(directory, config, bucket.as_ref(), &fenced, &erasure, &others).await?;
+            withdraw_terminal_lineage_slots(keys, &fenced, &erasure, &others, namespaces).await?;
             let signed = sign_disposal(&fenced, keys, namespaces, DeletionInventory::AllVersionsAndMultipartUploads, Some(first), last).await?;
             (signed, ServingInventory::S3VersionsAndUploads)
         }
@@ -1930,8 +1932,56 @@ async fn erase_and_sign_local_disposal(
         return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/disposal-prefix", format!("Installation {} still has serving objects", fenced.id)));
     }
     let objects_erased_at_ms = now_ms().max(journals_retired_at_ms);
+    withdraw_terminal_lineage_slots(keys, fenced, erasure, others, namespaces).await?;
     let signed = sign_disposal(fenced, keys, namespaces, DeletionInventory::CurrentObjects, None, objects_erased_at_ms).await?;
     Ok((signed, ServingInventory::LocalDirectory))
+}
+
+/// The current reference-disposal permit closes the lineage to new forks.
+/// Older origins can remain live in relocated copies until the last residence
+/// is gone, including origins whose own ciphertext prefix is already empty.
+async fn withdraw_terminal_lineage_slots(
+    keys: &dyn KeyService,
+    record: &DeploymentRecord,
+    erasure: &ResidenceErasure<'_>,
+    others: &[DeploymentRecord],
+    namespaces: StorageNamespaces,
+) -> Result<()> {
+    if !matches!(erasure.0, ErasureAuthority::Disposing(_)) { return Ok(()); }
+    if record.hosted_fork_stage.is_some() {
+        return withdraw_unreferenced_publication_origin(keys, record, &record.storage_prefix()).await;
+    }
+    let peers = others.iter().filter(|peer| peer.org == record.org && peer.lineage == record.lineage);
+    if peers.clone().any(|peer| peer.lifecycle != Lifecycle::Deleted
+        || peer.disposal.is_none() || !peer.storage_regions.is_empty())
+    {
+        return Ok(());
+    }
+    let mut origins = BTreeSet::from([record.storage_prefix()]);
+    for residence in std::iter::once(record).chain(peers) {
+        for deletion in residence.deletion_record.iter().map(Box::as_ref)
+            .chain(residence.retired_residences.values().map(|retired| &retired.deletion))
+        {
+            let facts = &deletion.facts;
+            let mut path = facts.storage_prefix.split('/');
+            let _shard = path.next();
+            if path.next() == Some(record.org.as_str()) && path.next() == Some(record.lineage.as_str())
+                && facts.namespaces.keys == namespaces.keys
+            {
+                origins.insert(facts.storage_prefix.clone());
+            }
+        }
+    }
+    for origin in origins {
+        withdraw_unreferenced_publication_origin(keys, record, &origin).await?;
+    }
+    Ok(())
+}
+
+async fn withdraw_unreferenced_publication_origin(keys: &dyn KeyService, record: &DeploymentRecord, prefix: &str) -> Result<()> {
+    let scope = crate::keys::UnitScope::directory_serving(&record.org, &record.lineage)
+        .publication_scope(crate::keys::UnitScope::publication_origin(prefix));
+    keys.withdraw_unit_scope(scope, &rtdb_storage::IoRegion::new()).await
 }
 
 async fn sign_disposal(

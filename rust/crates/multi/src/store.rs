@@ -60,13 +60,8 @@ pub(crate) fn stays_in_source_residence(name: &str) -> bool {
 }
 
 pub(crate) fn directory_publications(keys: &dyn KeyService, record: &DeploymentRecord, region: Arc<IoRegion>) -> Result<PublicationSealing> {
-    use ring::digest::{Context, SHA256};
-
     let ledger = keys.retained_unit_ledger(UnitScope::directory_serving(&record.org, &record.lineage), region)?;
-    let mut origin = Context::new(&SHA256);
-    origin.update(b"rtdb.multi/serving-publication-residence/v1\0");
-    origin.update(record.storage_prefix().as_bytes());
-    let origin = origin.finish().as_ref().try_into().expect("SHA-256 width");
+    let origin = UnitScope::publication_origin(&record.storage_prefix());
     Ok(PublicationSealing::new(ledger, origin, |name| {
         (!name.as_str().starts_with('~') || rtdb_format::keys::is_trie_retirement_object(name.as_str()))
             && ordered_index_storage::page_generation(name.as_str()).is_none()
