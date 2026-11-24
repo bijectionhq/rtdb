@@ -19,7 +19,8 @@ pub(super) use hosted::reap_hosted;
 const MAXIMUM_MEMBER_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn eligible(record: &DeploymentRecord) -> bool {
-    record.storage_regions.is_empty() && record.catalog_readers.is_empty() && eligible_checkpoint(record)
+    record.holder.is_none() && record.storage_regions.is_empty() && record.catalog_readers.is_empty()
+        && eligible_checkpoint(record)
 }
 
 fn eligible_checkpoint(record: &DeploymentRecord) -> bool {
@@ -27,7 +28,7 @@ fn eligible_checkpoint(record: &DeploymentRecord) -> bool {
     let Some(capture) = record.serving_replay_capture.and_then(|id| record.checkpoint_captures.get(&id))
         else { return false; };
     record.lifecycle == Lifecycle::Live
-        && record.holder.is_none() && record.parent.is_none() && record.move_from.is_none()
+        && record.parent.is_none() && record.move_from.is_none()
         && capture.checkpoint == checkpoint && capture.media_bound && record.recovery_manifest_sha256.is_some()
         && record.replica_anchor.as_ref().is_some_and(|anchor| {
             anchor.root_incarnation == record.incarnation && anchor.interval[0] >= 0

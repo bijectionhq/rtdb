@@ -172,6 +172,7 @@ Age is no longer a condition of this replay-pack grant or of the checkpoint-meta
 The local reaper holds the maintenance lock, lineage reservation and archive region while verifying and unlinking the pack. Hosted retirement uses the same lineage authority with exact version settlement or enrolled terminal tombstone evidence.
 Hosted readers can remain admitted when their region uses the same selected archive and the archive covers every payload member, including receipt L0.
 Raw readers still require drain.
+In enrolled terminal S3, active writers can stay attached through the same archive. The directory fence excludes new uploads to the pack and checks for admitted uploads to that key. The conditional tombstone preserves exclusion after the directory releases its grant.
 The grant also requires no declared descendant references and a certified replica prefix that passes the old boundary while retaining the published boundary.
 Only the physical original pack is erased, so the archive continues to serve the logical L0 descriptors.
 An in-place restore of an archive-backed installation must adopt a complete replay capture.

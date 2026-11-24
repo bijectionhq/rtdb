@@ -685,6 +685,11 @@ impl PublicationJournal for DirectoryPublications {
                 crate::archive::require_capture_open(record, *capture)?;
             }
             require_publication_key(record, *archive, key)?;
+            if record.storage_regions.values().any(|region| {
+                matches!(region, StorageRegion::ReplayPackRetirement { object, .. } if object == key.as_str())
+            }) {
+                return Err(storage_region_error("The original pack publication is fenced for retirement"));
+            }
             if matches!(self.owner, PublicationOwner::Serving) && archive.is_none() {
                 ordered_index_storage::require_page_publication(record, self.region, key)?;
             }

@@ -62,6 +62,21 @@ impl LineageRetirement {
     }
 }
 
+fn replay_pack_writes_are_fenced(owner: &DeploymentRecord, work: &RetirementWork, target: &str) -> bool {
+    match work {
+        RetirementWork::ReplayPack { .. } => owner.holder.is_none() && owner.active_s3_write_lease(crate::now_ms()).is_none(),
+        RetirementWork::ReplayPackTombstone { allocation, tombstone, .. } => {
+            owner.storage_namespaces.is_some_and(|namespaces| namespaces.objects == *allocation)
+                && matches!(&tombstone.condition, rtdb_types::S3TombstoneCondition::Matches(_))
+                && !owner.storage_regions.values().any(|region| {
+                    matches!(region, StorageRegion::Remote { publications, .. }
+                        if publications.values().any(|upload| upload.key == target))
+                })
+        }
+        _ => false,
+    }
+}
+
 fn replay_pack_regions_are_covered(owner: &DeploymentRecord, fence: Uuid, capture: Uuid, checkpoint: Checkpoint) -> bool {
     let mut sweep = None;
     for (&id, region) in &owner.storage_regions {
@@ -299,10 +314,10 @@ impl LineageState {
         }
         let mut next = self.clone();
         if !self.exact_erasure_authorized() {
-            if let RetirementWork::ReplayPack { capture, checkpoint, .. }
-                | RetirementWork::ReplayPackTombstone { capture, checkpoint, .. } = &retirement.work
-                && (owner.lifecycle != Lifecycle::Live || owner.holder.is_some()
-                    || owner.active_s3_write_lease(crate::now_ms()).is_some()
+            if let RetirementWork::ReplayPack { capture, checkpoint, target, .. }
+                | RetirementWork::ReplayPackTombstone { capture, checkpoint, target, .. } = &retirement.work
+                && (owner.lifecycle != Lifecycle::Live
+                    || !replay_pack_writes_are_fenced(owner, &retirement.work, target)
                     || owner.serving_replay_capture != Some(*capture) || owner.checkpoint != Some(*checkpoint)
                     || owner.checkpoint_capture_retirements.contains_key(capture)
                     || owner.checkpoint_captures.get(capture).is_none_or(|archive| !archive.media_bound || archive.checkpoint != *checkpoint)
@@ -569,10 +584,37 @@ mod tests {
             },
         };
         owner.storage_regions.insert(retirement.token, StorageRegion::ReplayPackRetirement { object: target.clone(), capture });
-        let state = LineageState {
-            admission: Admission::ErasingTombstones { retirement: retirement.clone(), uploads: BTreeMap::new() },
-            ..LineageState::default()
-        };
+        let RetirementWork::ReplayPackTombstone { allocation, checkpoint, .. } = &retirement.work else { unreachable!(); };
+        let checkpoint = *checkpoint;
+        owner.holder = Some(crate::MemberId("writer".into()));
+        owner.s3_write_lease_until_ms = Some(i64::MAX);
+        owner.serving_replay_capture = Some(capture);
+        owner.checkpoint = Some(checkpoint);
+        owner.checkpoint_captures.insert(capture, CheckpointCapture {
+            archive: "independent archive".into(), key_namespace: None, incarnation: owner.incarnation,
+            log_epoch: owner.log_epoch, checkpoint, automatic_fork: false, world_replay: None,
+            media_bound: true, manifest_sha256: Some("accepted".into()), remote_disposal: None,
+        });
+        owner.storage_regions.insert(Uuid::new_v4(), StorageRegion::Local {
+            archive: Some(capture), checkpoint_suffix: None, repair_archive: None,
+            tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+        });
+        let writer = Uuid::new_v4();
+        owner.storage_regions.insert(writer, StorageRegion::Remote {
+            archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: Some(capture),
+            tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            owner: None, closed: false, publications: BTreeMap::from([(Uuid::new_v4(), crate::StoragePublication {
+                key: target.clone(), upload_id: "admitted".into(),
+            })]),
+        });
+        let state = LineageState::default().changed(LineageChange::ReserveRetirement {
+            retirement: retirement.clone(), observed_references: 0, generation: 0,
+        }).unwrap();
+        owner.storage_namespaces = Some(crate::StorageNamespaces { objects: *allocation, keys: [0; 32] });
+        assert!(state.authorize_exact_owned(&owner, &retirement).is_err());
+        let StorageRegion::Remote { publications, .. } = owner.storage_regions.get_mut(&writer).unwrap() else { unreachable!(); };
+        publications.clear();
+        let state = state.authorize_exact_owned(&owner, &retirement).unwrap();
         let upload = |key: &str| LineageChange::AdmitTombstoneUpload {
             retirement: retirement.token, key: key.to_owned(), upload: "upload".into(),
         };

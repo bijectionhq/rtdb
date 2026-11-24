@@ -1965,7 +1965,8 @@ rule ReapUnreachable {
 -- Other storage admissions, journal dependencies, and declared descendant references retain the original pack.
 -- New serving admissions start at the published checkpoint and acquire the selected replay archive.
 -- The hosted reaper binds the pack index and every member observation to the same physical publication.
--- It verifies the published successor root and waits for outstanding write leases to expire.
+-- It verifies the published successor root. A versioned grant waits for write authority to drain.
+-- A terminal grant instead fences new pack uploads in the directory and waits for earlier uploads of that key to drain.
 -- Durable provider authority fences the exact pack and retains the capture through a reaper restart.
 -- In a versioned bucket, the reaper reopens the lineage after confirming absence of the exact version.
 -- An enrolled never-versioned bucket binds each read to the accepted strong entity tag.

@@ -53,6 +53,10 @@ fn eligible(record: &DeploymentRecord) -> bool {
         })
 }
 
+fn parked_writer_drained(record: &DeploymentRecord) -> bool {
+    record.holder.is_none() && record.active_s3_write_lease(now_ms()).is_none()
+}
+
 pub(in crate::store) async fn reap_hosted(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
     bucket: &dyn ObjectStore, provider: &VersionedInventory, candidate: &DeploymentRecord,
@@ -65,7 +69,7 @@ pub(in crate::store) async fn reap_hosted(
         }
         return Ok(());
     }
-    if !eligible(candidate) || candidate.active_s3_write_lease(now_ms()).is_some()
+    if !eligible(candidate)
         || state.open_generation().is_none() || state.preparations().next().is_some()
     {
         return Ok(());
@@ -76,6 +80,7 @@ pub(in crate::store) async fn reap_hosted(
     let prefix = format!("{store}/");
     if !Base::load(bucket, &store).await?.objects.is_empty() { return Ok(()); }
     let terminal = provider.enrolled_terminal_retirement().await?;
+    if terminal.is_none() && !parked_writer_drained(candidate) { return Ok(()); }
     let deployments = directory.deployments().await?;
     let references = References::scan(bucket, &deployments).await?;
     for pack in bucket.list(Some(&key(&format!("{prefix}{PACK_DIRECTORY}"))?)).await? {
@@ -181,7 +186,7 @@ async fn authorize(
     let Some(block) = target.as_str().strip_prefix(&format!("{store}/")).and_then(pack_block)
         else { return Err(changed()); };
     let Some(record) = directory.deployment(deployment).await? else { return Ok(()); };
-    if !eligible(&record) || record.active_s3_write_lease(now_ms()).is_some()
+    if !eligible(&record) || matches!(publication, Publication::Version(_)) && !parked_writer_drained(&record)
         || record.lineage != lineage || record.storage_prefix() != retirement.source
         || record.checkpoint != Some(checkpoint) || record.serving_replay_capture != Some(capture)
         || block >= checkpoint.block || !Base::load(bucket, &store).await?.objects.is_empty()
@@ -209,7 +214,7 @@ async fn authorize(
             Some(terminal)
         }
     };
-    let allow_compacted_receipt = record.storage_regions.is_empty();
+    let allow_compacted_receipt = parked_writer_drained(&record) && record.storage_regions.is_empty();
     let terminal = terminal.as_ref();
     let target = &target;
     let store = &store;
