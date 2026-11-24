@@ -606,3 +606,5 @@ impl<'a> Candidate<'a> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod perf;
