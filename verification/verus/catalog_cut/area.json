@@ -1,5 +1,5 @@
 {
-  "summary": "An installed replica cut can be published only after the supported history has no held effects.",
+  "summary": "An installed replica cut requires a drained history. Re-admission matches its original checkpoint and exact end under the original replica suffix hold.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 5,
+  "min_verified_functions": 9,
   "controls": {
     "cross_pending_block": {
       "mutate": [
@@ -125,6 +125,57 @@
         }
       ],
       "min_verified_functions": 4
+    },
+    "allow_a_later_prefix_during_resume": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "&& replayed_end == captured_end && (captured_base == captured_end || held_suffix)",
+          "replace": "&& replayed_end >= captured_end && (captured_base == captured_end || held_suffix)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "function": "completes_snapshot_replay",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "resume_without_the_original_suffix_hold": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": " && (captured_base == captured_end || held_suffix)\n}",
+          "replace": "\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "function": "completes_snapshot_replay",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "resume_from_another_checkpoint": {
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "find": "    loaded_base == captured_base && captured_base <= captured_end\n",
+          "replace": "    captured_base <= captured_end\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/replication/src/catalog_cut.rs",
+          "function": "completes_snapshot_replay",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
     }
   }
 }

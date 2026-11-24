@@ -107,6 +107,7 @@ impl SqlSnapshots {
             .and_then(|bytes| bytes.checked_add(token.len())).ok_or_else(unretained)?;
         let charge = memory.reserve(bytes)?;
         let expires = tokio::time::Instant::now() + HOLD_FOR;
+        let view = with_expiry(view, expires.into_std());
         let entry = Arc::new(SqlSnapshot { owner, view, expires, _charge: charge });
         let evicted = {
             let mut entries = self.entries.lock();
@@ -167,6 +168,13 @@ impl SqlSnapshots {
 
 }
 
+fn with_expiry(mut view: rtdb_query::SqlSnapshotView, deadline: std::time::Instant) -> rtdb_query::SqlSnapshotView {
+    let lease = Arc::new(rtdb_storage::ReadLease::until(deadline));
+    let lease = view.catalog.read_lease().map_or_else(|| Arc::clone(&lease), |original| original.earlier(Arc::clone(&lease)));
+    view.catalog = view.catalog.with_read_lease(lease);
+    view
+}
+
 pub(crate) fn unretained() -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb/snapshot-unretained", "The exact SQL snapshot cannot be readmitted")
 }
@@ -207,6 +215,10 @@ impl SqlSnapshotAdmission {
         {
             return Err(unretained());
         }
+        let expiry = exact.issued.0.checked_add(HOLD_FOR.as_micros() as i64).ok_or_else(unretained)?;
+        let remaining = expiry.checked_sub(self.node.now().0).and_then(|micros| u64::try_from(micros).ok())
+            .filter(|micros| *micros > 0 && *micros <= HOLD_FOR.as_micros() as u64).ok_or_else(unretained)?;
+        let deadline = std::time::Instant::now().checked_add(Duration::from_micros(remaining)).ok_or_else(unretained)?;
         let [partition] = current_database.partitions.as_slice() else { return Err(unretained()); };
         let (snapshot, suffix) = if exact.matches(partition) {
             (partition.clone(), None)
@@ -214,7 +226,11 @@ impl SqlSnapshotAdmission {
             let cut = partition.catalog_cut().filter(|cut| cut.storage_version == exact.cut.storage_version
                 && cut.storage_epoch == exact.cut.storage_epoch && cut.replica_epoch == exact.cut.replica_epoch)
                 .ok_or_else(unretained)?;
-            if cut.through < exact.cut.through { return Err(unretained()); }
+            if cut.through < exact.cut.through {
+                tokio::time::timeout_at(deadline.into(), database.await_installed(
+                    |prefix| prefix.replica >= exact.cut.through, cancellation,
+                )).await.map_err(|_| unretained())??;
+            }
             let checkpoint = match exact.replay.as_ref().ok_or_else(unretained)? {
                 SnapshotReplayBase::Genesis if exact.block == BlockIndex(0) => None,
                 SnapshotReplayBase::Genesis => return Err(unretained()),
@@ -222,21 +238,17 @@ impl SqlSnapshotAdmission {
                     block: *block, boundary: *boundary, root_sha256: Some(*root),
                 }),
             };
-            self.node.recover_sql_snapshot(&database, exact.cut, checkpoint, cancellation)
-                .await.map_err(|error| {
-                    if error.code == "rtdb/erased-under-view" { error } else { unretained() }
+            let recovery = self.node.recover_sql_snapshot(&database, exact.cut, checkpoint, cancellation);
+            tokio::time::timeout_at(deadline.into(), recovery).await.map_err(|_| unretained())?
+                .map_err(|error| {
+                    if matches!(error.code.as_str(), "rtdb/erased-under-view" | "xtdb/operation-cancelled") { error }
+                    else { unretained() }
                 })?
         };
         if !exact.matches(&snapshot) || !exact.is_live(self.node.now()) { return Err(unretained()); }
         let snapshot = snapshot.with_system_time_cap(exact.cap).map_err(|_| unretained())?;
-        let mut view = rtdb_query::SqlSnapshotView::from_exact_partition(current, snapshot, exact.clock, suffix)?;
-        let expiry = exact.issued.0.checked_add(HOLD_FOR.as_micros() as i64).ok_or_else(unretained)?;
-        let remaining = expiry.checked_sub(self.node.now().0).and_then(|micros| u64::try_from(micros).ok())
-            .filter(|micros| *micros > 0 && *micros <= HOLD_FOR.as_micros() as u64).ok_or_else(unretained)?;
-        let deadline = std::time::Instant::now().checked_add(Duration::from_micros(remaining)).ok_or_else(unretained)?;
-        let lease = Arc::new(rtdb_storage::ReadLease::until(deadline));
-        let lease = view.catalog.read_lease().map_or_else(|| Arc::clone(&lease), |original| original.earlier(Arc::clone(&lease)));
-        view.catalog = view.catalog.with_read_lease(lease);
+        let view = rtdb_query::SqlSnapshotView::from_exact_partition(current, snapshot, exact.clock, suffix)?;
+        let view = with_expiry(view, deadline);
         self.node.admit_retained_catalog(&view.catalog, self.identity.as_ref(), cancellation).await?;
         Ok(view)
     }

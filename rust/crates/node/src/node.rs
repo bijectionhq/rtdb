@@ -629,18 +629,24 @@ impl Node {
         let storage = &database.storage;
         let hold = storage.hold_catalog(Some(cut)).await?;
         if !hold.is_registered() { return Err(crate::sql_snapshots::unretained()); }
-        let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
-            Arc::clone(storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
-        let mut recovered = match checkpoint {
-            Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
-                database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
-                .await.ok_or_else(cancelled)??,
-            None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
-        };
-        let suffix = recovered.replay_snapshot_suffix(&database.logs, cut, cancellation).await?;
-        recovered.partition.publish_catalog_cut(cut)?;
-        let snapshot = recovered.partition.snapshot().with_catalog_read(hold);
-        Ok((rtdb_query::retain_catalog_snapshot(snapshot, storage).await?, suffix))
+        let replay = cancellation.run_until_cancelled(
+            rtdb_replication::SnapshotReplay::protect(&database.logs, cut, checkpoint),
+        ).await.ok_or_else(cancelled)??;
+        let dependencies = Arc::new((Arc::clone(&hold), replay.custody()));
+        rtdb_storage::IoRegion::retaining(dependencies, async {
+            let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
+                Arc::clone(storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
+            let mut recovered = match checkpoint {
+                Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
+                    database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
+                    .await.ok_or_else(cancelled)??,
+                None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
+            };
+            let suffix = recovered.replay_snapshot_suffix(&database.logs, replay, cancellation).await?;
+            recovered.partition.publish_catalog_cut(cut)?;
+            let snapshot = recovered.partition.snapshot().with_catalog_read(hold);
+            Ok((rtdb_query::retain_catalog_snapshot(snapshot, storage).await?, suffix))
+        }).await
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {

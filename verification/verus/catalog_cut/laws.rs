@@ -1,4 +1,4 @@
-use crate::production::completed_prefix;
+use crate::production::{completed_prefix, completes_snapshot_replay};
 use vstd::prelude::*;
 
 verus! {
@@ -25,6 +25,28 @@ pub fn an_untracked_history_cannot_publish(received: i64) {
 pub fn a_drained_supported_history_can_publish_its_prefix(received: i64) {
     let published = completed_prefix(received, true, false, false);
     assert(published == Some(received));
+}
+
+// A later installed prefix cannot answer for the original selected end.
+pub fn replay_cannot_advance_past_the_selected_cut(base: i64, observed: i64, through: i64)
+    requires base <= through, through < observed,
+{
+    assert(!completes_snapshot_replay(base, base, observed, through, true));
+}
+
+// Replaying the selected suffix requires the provider owner throughout.
+pub fn suffix_replay_requires_custody(base: i64, through: i64)
+    requires base < through,
+{
+    assert(!completes_snapshot_replay(base, base, through, through, false));
+    assert(completes_snapshot_replay(base, base, through, through, true));
+}
+
+pub fn another_checkpoint_cannot_anchor_the_original_suffix(base: i64, loaded: i64, through: i64)
+    requires base <= through, loaded != base,
+{
+    assert(!completes_snapshot_replay(loaded, base, through, through, true));
+    assert(completes_snapshot_replay(base, base, base, base, false));
 }
 
 }

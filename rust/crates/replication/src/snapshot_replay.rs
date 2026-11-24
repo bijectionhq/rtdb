@@ -7,25 +7,59 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, validate_uploaded_root}, driver::{additions, artefact_entries}};
 
-impl RecoveredPartition {
-    /// Rebuild an installed SQL cut in a private partition using its protected replica interval.
-    /// The caller retains the interval owner through result delivery.
-    pub async fn replay_snapshot_suffix(
-        &mut self, logs: &PartitionLogs, cut: CatalogCut, cancellation: &CancellationToken,
-    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+/// Owns the original checkpoint boundary and protected replica interval.
+pub struct SnapshotReplay {
+    cut: CatalogCut,
+    after: ReplicaPosition,
+    protected: Option<rtdb_storage::log::ProtectedLogRange>,
+}
+
+impl SnapshotReplay {
+    pub fn custody(&self) -> Option<Arc<dyn Send + Sync>> {
+        self.protected.as_ref().map(|range| Arc::clone(&range.hold))
+    }
+
+    pub async fn protect(
+        logs: &PartitionLogs, cut: CatalogCut, checkpoint: Option<crate::PublishedCheckpoint>,
+    ) -> Result<Self> {
         if cut.storage_version != logs.storage_version || cut.storage_epoch != logs.storage_epoch
             || cut.replica_epoch != logs.replica_epoch
         {
             return Err(unretained());
         }
-        let after = self.block.as_ref().and_then(|block| block.boundary_replica_position())
-            .unwrap_or(logs.replica_floor()?);
-        if after > cut.through { return Err(unretained()); }
-        if after == cut.through { return Ok(None); }
-        let next = |position: ReplicaPosition| position.0.checked_add(1).map(ReplicaPosition).ok_or_else(unretained);
-        let protected = cancellation
-            .run_until_cancelled(logs.protected_snapshot_range(next(after)?, next(cut.through)?))
-            .await.ok_or_else(crate::progress::cancelled)??;
+        let after = match checkpoint {
+            Some(checkpoint) if checkpoint.boundary.epoch() == cut.replica_epoch && checkpoint.root_sha256.is_some() => checkpoint.boundary,
+            Some(_) => return Err(unretained()),
+            None => logs.replica_floor()?,
+        };
+        let protected = if after < cut.through {
+            let next = |position: ReplicaPosition| position.0.checked_add(1).map(ReplicaPosition).ok_or_else(unretained);
+            Some(logs.protected_snapshot_range(next(after)?, next(cut.through)?).await?)
+        } else if after == cut.through {
+            None
+        } else {
+            return Err(unretained());
+        };
+        Ok(Self { cut, after, protected })
+    }
+}
+
+impl RecoveredPartition {
+    /// Rebuild an installed SQL cut in a private partition using its protected replica interval.
+    /// The caller retains the interval owner through result delivery.
+    pub async fn replay_snapshot_suffix(
+        &mut self, logs: &PartitionLogs, replay: SnapshotReplay, cancellation: &CancellationToken,
+    ) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let SnapshotReplay { cut, after, protected } = replay;
+        let base = self.replica_start(logs)?;
+        if base != after { return Err(unretained()); }
+        let Some(protected) = protected else {
+            return if crate::catalog_cut::completes_snapshot_replay(base.0, after.0, base.0, cut.through.0, false) {
+                Ok(None)
+            } else {
+                Err(unretained())
+            };
+        };
         let mut range = protected.range;
         let bound = range.allocation_bound();
         let memory = logs.memory();
@@ -121,7 +155,9 @@ impl RecoveredPartition {
                     return Err(unretained()),
             }
         }
-        if reached != cut.through { return Err(unretained()); }
+        if !crate::catalog_cut::completes_snapshot_replay(base.0, after.0, reached.0, cut.through.0, true) {
+            return Err(unretained());
+        }
         Ok(Some(protected.hold))
     }
 

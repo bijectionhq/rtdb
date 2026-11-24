@@ -102,7 +102,8 @@ impl CatalogSnapshot {
                     registrations.push(hold_snapshot(snapshot, &database.storage).await?);
                 }
             }
-            Ok(Arc::new(rtdb_storage::HeldView::new(self.databases.clone(), registrations)))
+            let owners = Arc::new((Arc::clone(&self.databases), self.snapshot_suffix.clone()));
+            Ok(Arc::new(rtdb_storage::HeldView::new(owners, registrations)))
         }).await.map(Arc::clone)
     }
     pub(crate) fn check_view_lease(&self) -> Result<()> {
