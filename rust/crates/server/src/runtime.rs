@@ -63,6 +63,12 @@ pub struct ServerHandle {
 }
 impl ServerHandle {
     pub fn node(&self) -> &Node { &self.node }
+    pub async fn mount_original_custody_provider(
+        &self, database: &str, installation: rtdb_node::serving::custody_release::CustodyProviderInstallation,
+    ) -> Result<rtdb_node::serving::custody_release::CustodyProviderMount> {
+        self.node.catalog().mount_original_custody_provider(database, installation, &self.cancellation).await
+    }
+
     pub fn authenticator(&self) -> &Arc<Authenticator> { &self.auth }
     pub fn metrics(&self) -> &Arc<Registry> { &self.metrics }
     pub fn addresses(&self) -> &ListenerAddresses { &self.addresses }

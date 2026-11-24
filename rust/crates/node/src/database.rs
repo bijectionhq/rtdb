@@ -47,6 +47,7 @@ pub struct Database {
     pub(crate) logs: Arc<PartitionLogs>,
     pub(crate) replication: ReplicationHandle,
     serving: Option<Arc<dyn crate::serving::ServingDriver>>,
+    pub(crate) custody_provider: crate::serving::custody_release::CustodyProviderSlot,
     replica_read_index: Option<Box<dyn ReplicaReadIndex>>,
     pub(crate) await_authority: crate::AwaitAuthority,
     transaction_admission: RwLock<parking_lot::Mutex<Option<SourcePosition>>>,
@@ -68,7 +69,7 @@ impl Database {
     }
     pub fn serving_driver(&self) -> Option<&dyn crate::serving::ServingDriver> { self.serving.as_deref() }
 
-    pub fn original_custody_carrier_journal<'a>(
+    pub(crate) fn original_custody_carrier_journal<'a>(
         &'a self,
         authority: crate::serving::custody_release::CustodyCarrierAuthority,
         writer: crate::serving::custody_release::OriginalWriterPoint,
@@ -78,7 +79,7 @@ impl Database {
         if self.read_only || self.audience_storage.is_some() || self.cancellation.is_cancelled() {
             return Err(release_unavailable());
         }
-        let driver = self.serving_driver().ok_or_else(release_unavailable)?;
+        let driver = self.serving_driver().filter(|driver| driver.features().contains(&"transact")).ok_or_else(release_unavailable)?;
         AttachedCustodyCarrierJournal::new(driver, authority, writer, original)
     }
 
@@ -385,7 +386,11 @@ impl Database {
         self.require_writable()?;
         self.replication.flush().await
     }
-    pub(crate) fn cancel(&self) { self.cancellation.cancel(); }
+    pub(crate) fn cancel(&self) {
+        self.custody_provider.close(&self.cancellation);
+    }
+
+    pub(crate) fn custody_provider_lifetime(&self) -> CancellationToken { self.cancellation.child_token() }
     pub(crate) async fn close_io(&self) { self.io.close_and_wait().await; }
     pub(crate) fn require_writable(&self) -> Result<()> {
         if self.cancellation.is_cancelled() { return Err(closed()); }
@@ -625,7 +630,7 @@ impl DatabaseFactory {
                 }));
             }
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
-                audience_storage: resources.audience_storage, logs, replication, serving, replica_read_index: opened_logs.replica_read_index,
+                audience_storage: resources.audience_storage, logs, replication, serving, custody_provider: Default::default(), replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),
                 query_cpu, fragment_residence, compaction, artefacts, ordered_cycle, cancellation: cancellation.clone(), io: Arc::clone(&io), currency });

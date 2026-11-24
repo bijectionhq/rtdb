@@ -117,7 +117,11 @@ surface StatelessDatabase {
         -- The original writer and carrier receipt are observed independently and verified by exact request key, basis and system time on the original attachment.
         -- The carrier receipt selects the admitted occurrence and its commitment is retained in the release registration.
         -- The response release command checks the observed writer version in the same order as the hold or terminal.
+        -- An authenticated host mount pins the original writer and provider to the live writable database attachment.
+        -- Removing the mount or detaching its database closes new handoffs and preserves already ordered release evidence.
         -- The response owner holds every group and occurrence in its authenticated contributor inventory through delivery.
+        -- A native ranked capture retains protected inputs before ranking or slicing, including inherited and shadowing versions.
+        -- Before enqueue the mounted owner rechecks the exact frame commitment, complete promoted inventory, attachment, selected key generation and immutable deadline.
         -- The ordered release fold serializes private registration, promotion, cancellation and disposal with revocation.
         -- Final delivery requires a promoted release, current authority, a live group and an unexpired cutoff.
         -- Only private cancellation or authenticated durable transport disposal terminates an admitted release.

@@ -96,6 +96,16 @@ impl DatabaseCatalog {
             _ => Err(no_database(name)),
         }
     }
+    pub(crate) fn with_current_attachment<T>(&self, attachment: &Arc<Database>, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let current = self.value.read();
+        if !matches!(current.entries.get(attachment.name()), Some(Entry::Open { database, driver: DriverLifetime::Running })
+            if Arc::ptr_eq(database, attachment))
+        {
+            return Err(no_database(attachment.name()));
+        }
+        operation()
+    }
+
     fn require_mutable(&self) -> Result<()> {
         if matches!(self.membership, Membership::Fixed(_) | Membership::Placed) { return Err(Anomaly::unsupported("xtdb/fixed-database-catalog", "A fixed database catalog does not accept membership instructions")); }
         Ok(())

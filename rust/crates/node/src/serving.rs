@@ -32,6 +32,7 @@ pub struct QueryView {
     pub cut: BranchCut,
     pub claim: Option<Claim>,
     pub custody_groups: BTreeSet<CustodyGroupId>,
+    pub custody_contributors: Option<custody_release::CustodyContributors>,
     pub key_generation: Option<u64>,
 }
 
@@ -181,7 +182,7 @@ pub trait ServingDriver: Send + Sync {
     }
 
     async fn check_custody_release_delivery(&self, _groups: &BTreeSet<CustodyGroupId>, _writer: &CustodyWriterFence,
-                                            _cancellation: &CancellationToken) -> Result<()> {
+                                            _generation: Option<u64>, _cancellation: &CancellationToken) -> Result<()> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no original release delivery authority"))
     }
 

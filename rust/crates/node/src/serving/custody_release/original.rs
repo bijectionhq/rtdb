@@ -44,6 +44,14 @@ pub trait OriginalCarrierObservations: Send + Sync {
         authority: CustodyCarrierAuthority,
         cancellation: &CancellationToken,
     ) -> Result<OriginalReceipt>;
+    /// Reads the live original response part after the exact frame and complete contributors are registered.
+    async fn registered_response(
+        &self,
+        authority: CustodyCarrierAuthority,
+        part: CustodyResponsePart,
+        cancellation: &CancellationToken,
+    ) -> Result<RegisteredCustodyResponse>;
+
     async fn registered_carrier(
         &self,
         registration: CustodyReleaseRegistration,
@@ -56,6 +64,7 @@ pub struct AttachedCustodyCarrierJournal<'a> {
     authority: CustodyCarrierAuthority,
     writer: OriginalWriterPoint,
     original: &'a dyn OriginalCarrierObservations,
+    lifetime: Option<&'a CancellationToken>,
 }
 
 impl<'a> AttachedCustodyCarrierJournal<'a> {
@@ -78,7 +87,20 @@ impl<'a> AttachedCustodyCarrierJournal<'a> {
             authority,
             writer,
             original,
+            lifetime: None,
         })
+    }
+
+    pub(super) fn with_lifetime(mut self, lifetime: &'a CancellationToken) -> Result<Self> {
+        if lifetime.is_cancelled() {
+            return Err(release_unavailable());
+        }
+        self.lifetime = Some(lifetime);
+        Ok(self)
+    }
+
+    pub(super) fn attachment(&self) -> &dyn ServingDriver {
+        self.attachment
     }
 
     async fn confirm_receipt(
@@ -115,7 +137,9 @@ pub fn original_writer_commitment(installation: [u8; 16], request_key: &[u8]) ->
 #[async_trait]
 impl CustodyCarrierJournal for AttachedCustodyCarrierJournal<'_> {
     fn authority(&self, attachment: &dyn ServingDriver) -> Result<CustodyCarrierAuthority> {
-        if !std::ptr::addr_eq(attachment, self.attachment) {
+        if self.lifetime.is_some_and(CancellationToken::is_cancelled)
+            || !std::ptr::addr_eq(attachment, self.attachment)
+        {
             return Err(release_unavailable());
         }
         Ok(self.authority)

@@ -54,7 +54,7 @@ impl ServingDriver for DefaultServing {
             }
             let (snapshot, cut) = self.handle.classic_read(source.at, cancellation).await?;
             let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage).await?;
-            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new() });
+            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(), custody_contributors: None, key_generation: None });
         }
         let snapshot = self.handle.view(source.at, cancellation).await?;
         let at = if source.at == At::Linearizable { At::Latest } else { source.at };
@@ -68,11 +68,11 @@ impl ServingDriver for DefaultServing {
             None
         };
         let cut = branch.cut();
-        let (snapshot, custody_groups) = if snapshot.index.has_custody_groups() {
+        let (snapshot, custody_groups, custody_contributors) = if snapshot.index.has_custody_groups() {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::snapshot(&branch, &self.memory, &vault).await?
-        } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new()) };
-        Ok(QueryView { snapshot, cut, claim, custody_groups, key_generation: None })
+        } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
+        Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, key_generation: None })
     }
 
     async fn transact(&self, mut request: Transact, cancellation: &CancellationToken) -> Result<Receipt> {
@@ -108,7 +108,8 @@ impl ServingDriver for DefaultServing {
     }
 
     async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
-                                            cancellation: &CancellationToken) -> Result<()> {
+                                            generation: Option<u64>, cancellation: &CancellationToken) -> Result<()> {
+        if generation.is_some() { return Err(super::custody_release::release_unavailable()); }
         let vault = self.tokens.authority().await?.custody_vault();
         for &group in groups { vault.check_readable(group).await?; }
         let index = self.current_custody(cancellation).await?;

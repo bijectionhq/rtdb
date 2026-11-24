@@ -262,6 +262,24 @@ impl BranchIndex {
     }
 }
 
+impl BranchView<'_> {
+    pub fn custody_event_contributor(&self, table: &TableRef, event: &BranchEvent) -> Option<(CustodyGroupId, [u8; 32])> {
+        if self.index.visibility_projection { return None; }
+        let image = event.image.as_ref()?;
+        let group = image.custody_group?;
+        let payload = image.custody_payload.as_ref()?;
+        let envelope_sha256: [u8; 32] = Sha256::digest(&payload.envelope).into();
+        let mut matches = self.index.custody.get(&group)?.occurrences().filter(|occurrence| {
+            occurrence.written == event.cut.basis && occurrence.target.table == *table
+                && occurrence.target.id == event.id && occurrence.target.valid == event.valid
+                && occurrence.envelope_sha256 == envelope_sha256
+        });
+        let occurrence = matches.next()?;
+        if matches.next().is_some() { return None; }
+        Some((group, occurrence.commitment(group)))
+    }
+}
+
 fn placement_conflict() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Conflict,
