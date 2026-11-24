@@ -1,0 +1,268 @@
+{
+  "summary": "Check the installed erasure coordinator's rotation, attempt, deadline, and destruction decisions.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "prefix_retirement"
+  ],
+  "min_verified_functions": 32,
+  "controls": {
+    "drop_a_slot": {
+      "defect": "The selected read is allowed to stand in for the alternate slot.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "        && populated[alternate]\n",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "        && populated@[1 - selected as int]\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "rotation_evidence_requires_both_slots",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "short_quorum": {
+      "defect": "A rotation can use half the cohort rounded down.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    cohort >= 3 && cohort % 2 == 1 && evidence == cohort / 2 + 1\n",
+          "replace": "    cohort >= 3 && cohort % 2 == 1 && evidence == cohort / 2\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (cohort >= 3 && cohort % 2 == 1 && evidence == cohort / 2 + 1),",
+          "replace": "ensures out == (cohort >= 3 && cohort % 2 == 1 && evidence == cohort / 2),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "rotation_evidence_names_a_strict_majority",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "stale_generation": {
+      "defect": "Evidence can name a generation older than the clean successor.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    exact_checkpoint && generation == successor_generation && generation > 1\n",
+          "replace": "    exact_checkpoint && generation <= successor_generation && generation > 1\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (exact_checkpoint && generation == successor_generation && generation > 1),",
+          "replace": "ensures out == (exact_checkpoint && generation <= successor_generation && generation > 1),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "rotation_evidence_names_the_clean_successor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "skip_admission_deadline": {
+      "defect": "A signed reservation may exceed the requested bound.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    reserved != 0 && reserved <= requested\n",
+          "replace": "    reserved != 0\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (reserved != 0 && reserved <= requested),",
+          "replace": "ensures out == (reserved != 0),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "a_fixed_reservation_fits_the_requested_deadline",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "change_reserved_inventory": {
+      "defect": "The result independently changes the closed drain roster.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    reserved == committed && same_retiring_inventory && same_draining_inventory\n",
+          "replace": "    reserved == committed && same_retiring_inventory\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (reserved == committed && same_retiring_inventory && same_draining_inventory),",
+          "replace": "ensures out == (reserved == committed && same_retiring_inventory),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "a_fixed_commit_keeps_the_reserved_deadline_and_inventories",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "mix_attempts": {
+      "defect": "A matching switch can be combined with another signed preparation.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    exact_preparation && exact_switch\n",
+          "replace": "    exact_switch\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (exact_preparation && exact_switch),",
+          "replace": "ensures out == (exact_switch),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "a_commit_cannot_mix_attempts",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "skip_completion_deadline": {
+      "defect": "Fixed destruction evidence always reports on-time completion.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "Some(by) => Some(destroyed_at <= by),\n        None => None,\n    }\n",
+          "replace": "Some(_) => Some(true),\n        None => None,\n    }\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "Some(by) => Some(destroyed_at <= by),\n        None => None,\n    },\n",
+          "replace": "Some(_) => Some(true),\n        None => None,\n    },\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "fixed_completion_distinguishes_on_time_and_late",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "destroy_with_live_holds": {
+      "defect": "The coordinator can begin retirement with a live ordered hold.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    outstanding == 0\n",
+          "replace": "    true\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (outstanding == 0),",
+          "replace": "ensures out == (true),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "outstanding_ordered_holds_block_destruction",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "destroy_before_drain": {
+      "defect": "The original key withdrawal may start before the last join was observed.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "    now >= latest_join\n",
+          "replace": "    true\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "ensures out == (now >= latest_join),",
+          "replace": "ensures out == (true),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "withdrawal_waits_for_the_latest_join",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "target_claims_fixed_completion": {
+      "defect": "An operational target can report a fixed deadline as met.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "        None => None,\n    }\n}\n",
+          "replace": "        None => Some(true),\n    }\n}\n"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/hosted/erasure/decision.rs",
+          "find": "        None => None,\n    },\n",
+          "replace": "        None => Some(true),\n    },\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "the_installed_profile_claims_no_fixed_deadline",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    },
+    "expire_scoped_grants_at_fence": {
+      "defect": "The prefix may be retired immediately after the fence while a scoped namespace grant is live.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "&& now_ms >= observed_at_ms + horizon_ms\n}",
+          "replace": "&& now_ms >= observed_at_ms\n}"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/prefix_retirement.rs",
+          "find": "&& now_ms >= observed_at_ms + horizon_ms),",
+          "replace": "&& now_ms >= observed_at_ms),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/erasure_commit/laws.rs",
+          "function": "all_scoped_namespace_grants_expire_before_prefix_retirement",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 31
+    }
+  }
+}

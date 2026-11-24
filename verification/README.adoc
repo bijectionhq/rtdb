@@ -335,6 +335,8 @@ It also exercises the Azure adapter against a loopback provider and separately m
   Its reachability check collects and reuses a physical key.
 * `tla/S3KeyCustody.tla` checks conditional provisioning, withdrawal, and confirmation for one S3 vault key.
   It distinguishes a successful withdrawal from a conditional conflict and separately checks the provider's no-historical-version premise.
+* link:verus/erasure_commit/README.md[Installed erasure commit] checks the shipped slot quorum, exact successor, fixed reservation and completion, and drain decisions.
+  Its Lean composition links the checks to Logkeeper's mirrored selection fence and Study 112's recovery theorem.
 * `verus/key_enrollment` checks the production decision to enroll a missing key under current writer authority in a pristine original residence.
   Its single and joint controls cover authority, residence identity, and durable history.
 * `verus/guarded_append_sample` checks the production function called by `GuardedAppend::sample` over all signed 64-bit inputs, with or without a journal cutoff.
