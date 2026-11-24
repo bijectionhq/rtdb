@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_execution_value};
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
+use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_owned_entity_id};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedIdentityScan, OwnedRelation, Result, Timestamp};
 
 use super::{OwnedRangeWitness, OwnedReadSession};
 
@@ -13,7 +13,7 @@ const CARRIER_IMAGE_BYTES: usize = 4096;
 
 /// A bounded key page with progress through its last returned identity.
 pub struct OwnedIdentityPage {
-    pub keys: Vec<String>,
+    pub keys: Vec<EntityId>,
     pub more: bool,
     _charges: Vec<Arc<MemoryReservation>>,
 }
@@ -66,9 +66,9 @@ impl OwnedReadSession {
         }
         let at = self.present.system_time;
         let page = self
-            .identity_page_in_prefix(relation, at, at, after, limit, Some(prefix))
+            .identity_page_in_prefix(relation, at, at, &OwnedIdentityScan::text(after), limit, Some(prefix))
             .await?;
-        if page.keys.iter().any(|id| !valid_carrier(id, prefix)) {
+        if page.keys.iter().any(|id| !matches!(id, EntityId::String(key) if valid_carrier(key, prefix))) {
             return Err(protected_page_unavailable());
         }
         let witness = if page.more {
@@ -114,7 +114,7 @@ impl OwnedReadSession {
     /// Reads live local shadow keys, including tombstones, for one admitted world.
     pub async fn world_identity_candidates(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
-        after: Option<&str>, fetch: usize,
+        after: &OwnedIdentityScan<'_>, fetch: usize,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         self.world_identity_candidates_at(world, relation, self.present.system_time, valid, after, fetch).await
     }
@@ -123,19 +123,19 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, valid: Timestamp,
         after: Option<&str>, fetch: usize, prefix: &str,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
-        self.world_identity_candidates_on(world, relation, self.present.system_time, valid, after, fetch, Some(prefix)).await
+        self.world_identity_candidates_on(world, relation, self.present.system_time, valid, &OwnedIdentityScan::text(after), fetch, Some(prefix)).await
     }
 
     pub(super) async fn world_identity_candidates_at(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
-        after: Option<&str>, fetch: usize,
+        after: &OwnedIdentityScan<'_>, fetch: usize,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         self.world_identity_candidates_on(world, relation, system, valid, after, fetch, None).await
     }
 
     async fn world_identity_candidates_on(
         &self, world: rtdb_types::Iid, relation: &OwnedRelation, system: Timestamp, valid: Timestamp,
-        after: Option<&str>, fetch: usize, prefix: Option<&str>,
+        after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<&str>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         let (admitted, _charge) = self.world_registration(world).await?
             .filter(|(world, _)| !world.dropped && world.until > self.present.system_time)
@@ -154,7 +154,7 @@ impl OwnedReadSession {
         relation: &OwnedRelation,
         system: Timestamp,
         valid: Timestamp,
-        after: Option<&str>,
+        after: &OwnedIdentityScan<'_>,
         limit: usize,
     ) -> Result<OwnedIdentityPage> {
         self.identity_page_in_prefix(relation, system, valid, after, limit, None).await
@@ -166,7 +166,7 @@ impl OwnedReadSession {
     /// page holds `limit + 1` distinct keys or the relation ends, so a page is
     /// short only at the end.
     pub async fn identity_page_all_valid(
-        &self, relation: &OwnedRelation, system: Timestamp, after: Option<&str>, limit: usize,
+        &self, relation: &OwnedRelation, system: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
     ) -> Result<OwnedIdentityPage> {
         const FETCH: usize = 256;
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
@@ -178,13 +178,14 @@ impl OwnedReadSession {
         let at_head = self.admit_root_system(relation, system).await?;
         let context = self.relation_context(relation)?;
         let mut charges = vec![self.context.memory.reserve(FETCH * 128)?];
-        let mut keys: Vec<String> = Vec::with_capacity(limit + 1);
+        let mut keys: Vec<EntityId> = Vec::with_capacity(limit + 1);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        let mut cursor_after: Option<String> = after.map(str::to_owned);
+        let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
+        let mut cursor_after = after.clone().into_owned();
         'fetch: loop {
             let Some(mut cursor) = rtdb_query::open_owned_identity_page_all_valid(
-                Arc::clone(&context), &self.owner, relation, system, cursor_after.as_deref(), FETCH as i64,
+                Arc::clone(&context), &self.owner, relation, system, &cursor_after, FETCH as i64,
             ).await? else {
                 break;
             };
@@ -195,14 +196,12 @@ impl OwnedReadSession {
                 let array = batch.column(column).as_ref();
                 for row in 0..batch.num_rows() {
                     fetched += 1;
-                    let Value::Utf8(key) = read_execution_value(field, array, row)? else {
-                        return Err(invalid_page());
-                    };
-                    let previous = keys.last().map(String::as_str).or(after);
+                    let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?.into_owned();
+                    let previous = keys.last().or(bound.as_ref());
                     if keys.last().is_some_and(|last| last == &key) {
                         continue;
                     }
-                    if previous.is_some_and(|previous| previous >= key.as_str()) {
+                    if previous.is_some_and(|previous| previous >= &key) {
                         return Err(invalid_page());
                     }
                     if keys.len() == limit {
@@ -224,7 +223,7 @@ impl OwnedReadSession {
                     remaining = rest;
                     charges.push(self.context.memory.reserve(bytes)?);
                     if !at_head {
-                        self.check_point_purge_floor(relation, &EntityId::String(key.clone()), system).await?;
+                        self.check_point_purge_floor(relation, &key, system).await?;
                     }
                     keys.push(key);
                 }
@@ -235,14 +234,14 @@ impl OwnedReadSession {
             }
             // The fetch ended inside the last key's slices: continue after
             // it, so its remaining slices are not fetched again.
-            cursor_after = keys.last().cloned().or(cursor_after);
+            cursor_after = OwnedIdentityScan::seek(keys.last().ok_or_else(invalid_page)?)?.into_owned();
         }
         context.check_cancelled()?;
         Ok(OwnedIdentityPage { keys, more, _charges: charges })
     }
 
     async fn identity_page_in_prefix(
-        &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: Option<&str>,
+        &self, relation: &OwnedRelation, system: Timestamp, valid: Timestamp, after: &OwnedIdentityScan<'_>,
         limit: usize, prefix: Option<&str>,
     ) -> Result<OwnedIdentityPage> {
         if !(1..=MAX_PAGE_ROWS).contains(&limit) {
@@ -255,15 +254,16 @@ impl OwnedReadSession {
         let context = self.relation_context(relation)?;
         let count = limit + 1;
         let mut charges = vec![self.context.memory.reserve(count * 128)?];
-        let mut keys: Vec<String> = Vec::with_capacity(count);
+        let mut keys: Vec<EntityId> = Vec::with_capacity(count);
         let mut remaining = MAX_PAGE_BYTES;
         let mut more = false;
-        let cursor = match prefix {
-            Some(prefix) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
-                Arc::clone(&context), &self.owner, relation, system, after, prefix, count as i64,
+        let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
+        let cursor = match (prefix, after) {
+            (Some(prefix), OwnedIdentityScan::Text(after)) if at_head && valid == system => rtdb_query::open_owned_identity_prefix(
+                Arc::clone(&context), &self.owner, relation, system, after.as_deref(), prefix, count as i64,
             ).await?,
-            Some(_) => return Err(invalid_page()),
-            None => rtdb_query::open_owned_identity_page(
+            (Some(_), _) => return Err(invalid_page()),
+            (None, _) => rtdb_query::open_owned_identity_page(
                 Arc::clone(&context), &self.owner, relation, system, valid, after, count as i64,
             ).await?,
         };
@@ -294,19 +294,17 @@ impl OwnedReadSession {
                     };
                     remaining = rest;
                     charges.push(self.context.memory.reserve(bytes)?);
-                    let Value::Utf8(key) = read_execution_value(field, array, row)? else {
-                        return Err(invalid_page());
-                    };
-                    let previous = keys.last().map(String::as_str).or(after);
-                    if previous.is_some_and(|previous| previous >= key.as_str())
-                        || prefix.is_some_and(|prefix| !key.starts_with(prefix))
+                    let key = read_owned_entity_id(field, array, row).map_err(|_| invalid_page())?.into_owned();
+                    let previous = keys.last().or(bound.as_ref());
+                    if previous.is_some_and(|previous| previous >= &key)
+                        || prefix.is_some_and(|prefix| !matches!(&key, EntityId::String(key) if key.starts_with(prefix)))
                     {
                         return Err(invalid_page());
                     }
                     if !at_head {
                         self.check_point_purge_floor(
                             relation,
-                            &EntityId::String(key.clone()),
+                            &key,
                             system,
                         )
                         .await?;

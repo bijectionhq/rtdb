@@ -89,6 +89,7 @@ impl NativeSession {
                     rtdb_types::Value::Keyword(id) => EntityId::Keyword(id),
                     rtdb_types::Value::I64(id) => EntityId::Integer(id),
                     rtdb_types::Value::Uuid(id) => EntityId::Uuid(id),
+                    rtdb_types::Value::Binary(id) => EntityId::Binary(id),
                     _ => return Err(invalid()),
                 };
                 Some(Arc::new(OwnedRangeEvidence::Entity {

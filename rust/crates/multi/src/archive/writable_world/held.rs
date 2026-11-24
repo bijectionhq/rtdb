@@ -1,6 +1,7 @@
 use std::{future::Future, pin::Pin, time::Duration};
 
 use rtdb_flight_sql::FrozenWorldWinner;
+use rtdb_types::OwnedIdentityScan;
 use rtdb_node::{NodeOptions, OwnedChangeEdge, OwnedCountRequest, OwnedKeyBound, OwnedPathColumns, OwnedRangeCount, OwnedRangePage, OwnedRangeRequest, RetainedKeyBound};
 use rtdb_plan::Catalog;
 use rtdb_storage::{cache::CacheBudget, sealing::{PlaintextDependencies, PlaintextScopes, PlaintextView}};
@@ -334,7 +335,7 @@ enum ArchiveRead {
     Identities {
         relation: OwnedRelation,
         at: Timestamp,
-        after: Option<String>,
+        after: OwnedIdentityScan<'static>,
         fetch: usize,
         prefix: Option<String>,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
@@ -366,8 +367,8 @@ enum AncestorRead {
     PathTouch { id: EntityId, path: OwnedRelation, group: Timestamp, valid: Timestamp, images: bool },
     Version { id: EntityId, from: Timestamp, through: Timestamp, group: Timestamp },
     Schedule { id: EntityId, valid: Interval },
-    Identities { valid: Timestamp, after: Option<String>, limit: usize },
-    OverlayIdentities { valid: Timestamp, after: Option<String>, limit: usize, prefix: Option<String> },
+    Identities { valid: Timestamp, after: OwnedIdentityScan<'static>, limit: usize },
+    OverlayIdentities { valid: Timestamp, after: OwnedIdentityScan<'static>, limit: usize, prefix: Option<String> },
     Range {
         path: OwnedRelation,
         lower: Option<RetainedKeyBound>,
@@ -404,7 +405,7 @@ enum OrderedResult {
 }
 
 pub(crate) struct WorldIdentityPage {
-    pub keys: Vec<String>,
+    pub keys: Vec<EntityId>,
     pub more: bool,
     pub reservations: Vec<Arc<MemoryReservation>>,
 }
@@ -1201,16 +1202,17 @@ impl HeldCheckpointWorld {
             } else {
                 None
             };
-            let mut after = None;
+            let mut after = None::<EntityId>;
             loop {
                 guard()?;
+                let scan = after.as_ref().map(OwnedIdentityScan::seek).transpose()?.unwrap_or(OwnedIdentityScan::Unbounded);
                 // This is the physical shadow relation: its typed tombstones
                 // are still present identities and also mask the archived row.
                 let candidates = if let Some(cut) = &cut {
-                    cut.overlay_identities(valid, after.as_deref(), 128).await?
+                    cut.overlay_identities(valid, &scan, 128).await?
                 } else {
                     self.open.snapshot.world_identity_candidates(
-                        self.open.record.id, relation, valid, after.as_deref(), 128,
+                        self.open.record.id, relation, valid, &scan, 128,
                     ).await?
                 };
                 if cut.is_some() || self.open.record.schemas.relation(relation)
@@ -1219,7 +1221,7 @@ impl HeldCheckpointWorld {
                     remaining = remaining.checked_sub(candidates.keys.len()).ok_or_else(OwnedWorld::unavailable)?;
                 }
                 for key in &candidates.keys {
-                    let id = EntityId::String(key.clone());
+                    let id = key.clone();
                     if corpus.contains_shadow(partition, &id) { continue; }
                     let fact = self.search_shadow(relation, &id, valid, cut.as_ref()).await?;
                     self.projections.shadow_text(relation, column, fact.as_ref(), id, partition, &mut corpus, &self.memory, system.is_some()).await?;
@@ -1355,14 +1357,15 @@ impl HeldCheckpointWorld {
             } else {
                 None
             };
-            let mut after = None;
+            let mut after = None::<EntityId>;
             loop {
                 guard()?;
+                let scan = after.as_ref().map(OwnedIdentityScan::seek).transpose()?.unwrap_or(OwnedIdentityScan::Unbounded);
                 let candidates = if let Some(cut) = &cut {
-                    cut.overlay_identities(valid, after.as_deref(), 128).await?
+                    cut.overlay_identities(valid, &scan, 128).await?
                 } else {
                     self.open.snapshot.world_identity_candidates(
-                        self.open.record.id, relation, valid, after.as_deref(), 128,
+                        self.open.record.id, relation, valid, &scan, 128,
                     ).await?
                 };
                 if cut.is_some() || self.open.record.schemas.relation(relation)
@@ -1371,7 +1374,7 @@ impl HeldCheckpointWorld {
                     remaining = remaining.checked_sub(candidates.keys.len()).ok_or_else(OwnedWorld::unavailable)?;
                 }
                 for key in &candidates.keys {
-                    let id = EntityId::String(key.clone());
+                    let id = key.clone();
                     if shadows.contains_shadow(partition, &id) { continue; }
                     let fact = self.search_shadow(relation, &id, valid, cut.as_ref()).await?;
                     self.projections.shadow_nearest(selected, query, fact.as_ref(), id, partition, &mut shadows, &self.memory, system.is_some()).await?;
@@ -1726,13 +1729,13 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn identity_page(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
     ) -> Result<WorldIdentityPage> {
         if self.uses_frozen_overlay(None) {
             Interval::at(valid)?;
             if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
             let (result, _) = self.read_ancestor(relation, AncestorRead::Identities {
-                valid, after: after.map(str::to_owned), limit,
+                valid, after: after.clone().into_owned(), limit,
             }).await?;
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
@@ -1741,7 +1744,7 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn identity_page_at(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
         system: Timestamp, parent_only: bool,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
@@ -1754,7 +1757,7 @@ impl HeldCheckpointWorld {
         }
         if self.uses_frozen_overlay(Some(system)) && !parent_only {
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::Identities {
-                valid, after: after.map(str::to_owned), limit,
+                valid, after: after.clone().into_owned(), limit,
             }, Some(system)).await?;
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
@@ -1765,9 +1768,8 @@ impl HeldCheckpointWorld {
             self.require_overlay_coverage(relation, &witness).await?;
             self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
             let parent = self.archive_identity_candidates(relation, valid, after, limit + 1, None, None).await?;
-            for key in &parent.keys {
-                let id = EntityId::String(key.clone());
-                self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
+            for id in &parent.keys {
+                self.open.snapshot.check_point_purge_floor(relation, id, system).await?;
             }
             return self.finish_overlay_identities(relation, parent, limit);
         }
@@ -1777,7 +1779,7 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn parent_identity_page_at(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize, system: Timestamp,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize, system: Timestamp,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         Interval::at(valid)?;
@@ -1788,21 +1790,20 @@ impl HeldCheckpointWorld {
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let candidates = self.archive_identity_candidates(relation, valid, after, limit + 1, Some((system, schema)), None).await?;
-        for key in &candidates.keys {
-            let id = EntityId::String(key.clone());
-            self.open.snapshot.check_point_purge_floor(relation, &id, system).await?;
+        for id in &candidates.keys {
+            self.open.snapshot.check_point_purge_floor(relation, id, system).await?;
         }
         self.finish_overlay_identities(relation, candidates, limit)
     }
 
     async fn archive_identity_candidates(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, fetch: usize,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize,
         earlier: Option<(Timestamp, rtdb_types::OwnedSchema)>,
         prefix: Option<&str>,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Identities {
-            relation: relation.clone(), at: valid, after: after.map(str::to_owned), fetch, earlier,
+            relation: relation.clone(), at: valid, after: after.clone().into_owned(), fetch, earlier,
             prefix: prefix.map(str::to_owned),
             guard: self.open.snapshot.relation_release_guard([relation])?, reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
@@ -1811,21 +1812,22 @@ impl HeldCheckpointWorld {
     }
 
     async fn identity_page_on_cut(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
         cut: Option<&rtdb_node::OwnedWorldAcceptedCut<'_>>,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         Interval::at(valid)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
         const FETCH: usize = 129;
-        let mut cursor = after.map(|key| (key.to_owned(), None));
+        let mut cursor = None::<(EntityId, Arc<MemoryReservation>)>;
         let mut keys = Vec::with_capacity(limit);
         let mut bytes = limit * 128;
         let mut more = false;
         let mut complete = false;
         let mut reservations = vec![self.memory.reserve(bytes)?];
         for _ in 0..32 {
-            let after = cursor.as_ref().map(|(key, _)| key.as_str());
+            let next = cursor.as_ref().map(|(key, _)| OwnedIdentityScan::seek(key)).transpose()?;
+            let after = next.as_ref().unwrap_or(after);
             let local = if let Some(cut) = cut {
                 cut.overlay_identities(valid, after, FETCH).await?
             } else {
@@ -1833,7 +1835,7 @@ impl HeldCheckpointWorld {
             };
             let (parent, _parent_charges) = if self.ancestor().is_some() {
                 let (result, _) = self.read_ancestor(relation, AncestorRead::Identities {
-                    valid, after: after.map(str::to_owned), limit: FETCH,
+                    valid, after: after.clone().into_owned(), limit: FETCH,
                 }).await?;
                 let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
                 (page.keys, page.reservations)
@@ -1843,7 +1845,7 @@ impl HeldCheckpointWorld {
 
             let (candidates, through) = identity_candidates(&parent, &local.keys, FETCH);
             for key in candidates {
-                let id = EntityId::String(key.clone());
+                let id = key.clone();
                 let shadow = if let Some(cut) = cut {
                     let read = cut.shadow(&id, valid).await?;
                     decode_point(read.row.into_iter().collect(), &id, &self.memory, None)?
@@ -1868,8 +1870,8 @@ impl HeldCheckpointWorld {
                         more = true;
                         break;
                     }
-                    bytes = bytes.checked_add(key.len()).filter(|size| *size <= (8 << 20)).ok_or_else(OwnedWorld::unavailable)?;
-                    reservations.push(self.memory.reserve(key.len())?);
+                    bytes = bytes.checked_add(key.retained_bytes()).filter(|size| *size <= (8 << 20)).ok_or_else(OwnedWorld::unavailable)?;
+                    reservations.push(self.memory.reserve(key.retained_bytes())?);
                     keys.push(key.clone());
                 }
             }
@@ -1878,8 +1880,8 @@ impl HeldCheckpointWorld {
                 break;
             }
             if let Some(through) = through {
-                let charge = self.memory.reserve(through.len())?;
-                cursor = Some((through.clone(), Some(charge)));
+                let charge = self.memory.reserve(through.retained_bytes())?;
+                cursor = Some((through.clone(), charge));
             }
         }
         if !complete { return Err(OwnedWorld::unavailable()); }
@@ -1888,14 +1890,14 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn overlay_identities(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
         if self.uses_frozen_overlay(None) {
             Interval::at(valid)?;
             let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
-                valid, after: after.map(str::to_owned), limit, prefix: None,
+                valid, after: after.clone().into_owned(), limit, prefix: None,
             }).await?;
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
@@ -1914,13 +1916,13 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn overlay_identities_at(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize, system: Timestamp,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize, system: Timestamp,
     ) -> Result<WorldIdentityPage> {
         self.check_relation(relation)?;
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
         if self.uses_frozen_overlay(Some(system)) {
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::OverlayIdentities {
-                valid, after: after.map(str::to_owned), limit, prefix: None,
+                valid, after: after.clone().into_owned(), limit, prefix: None,
             }, Some(system)).await?;
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
@@ -1932,7 +1934,7 @@ impl HeldCheckpointWorld {
     }
 
     async fn merge_overlay_identities(
-        &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
+        &self, relation: &OwnedRelation, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize,
         local: rtdb_query::OwnedIdentityCandidates,
         prefix: Option<&str>,
     ) -> Result<WorldIdentityPage> {
@@ -1940,7 +1942,7 @@ impl HeldCheckpointWorld {
             return self.finish_overlay_identities(relation, local, limit);
         }
         let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
-            valid, after: after.map(str::to_owned), limit, prefix: prefix.map(str::to_owned),
+            valid, after: after.clone().into_owned(), limit, prefix: prefix.map(str::to_owned),
         }).await?;
         let AncestorResult::Identities(mut inherited) = result else { return Err(OwnedWorld::unavailable()); };
         let (keys, reservations) = local.into_parts();
@@ -2332,7 +2334,7 @@ impl<'a> InheritedRelation<'a> {
     }
 
     async fn overlay_identity_page(
-        &self, valid: Timestamp, after: Option<&str>, limit: usize, prefix: Option<&str>,
+        &self, valid: Timestamp, after: &OwnedIdentityScan<'_>, limit: usize, prefix: Option<&str>,
     ) -> Result<WorldIdentityPage> {
         let mut keys = Vec::new();
         let mut reservations = Vec::new();
@@ -2362,36 +2364,34 @@ impl<'a> InheritedRelation<'a> {
         ).await
     }
 
-    async fn identities(&self, valid: Timestamp, after: Option<String>, limit: usize) -> Result<WorldIdentityPage> {
+    async fn identities(&self, valid: Timestamp, after: OwnedIdentityScan<'static>, limit: usize) -> Result<WorldIdentityPage> {
         const FETCH: usize = 129;
         let root_basis = self.root.current_time.as_micros()?;
         let mut keys = Vec::with_capacity(limit);
         let mut bytes = limit * 128;
         let mut reservations = vec![self.memory.reserve(bytes)?];
-        let mut cursor = after.map(|key| {
-            let charge = self.memory.reserve(key.len())?;
-            Ok::<_, rtdb_types::Anomaly>((key, charge))
-        }).transpose()?;
+        let mut cursor = None::<(EntityId, Arc<MemoryReservation>)>;
         for _ in 0..32 {
-            let after = cursor.as_ref().map(|(key, _)| key.as_str());
+            let next = cursor.as_ref().map(|(key, _)| OwnedIdentityScan::seek(key)).transpose()?;
+            let after = next.as_ref().unwrap_or(&after);
             let parent = rtdb_query::owned_identity_candidates(
                 Arc::clone(&self.root), self.owner, self.relation, root_basis, valid, after, FETCH,
             ).await?;
             let overlay = self.overlay_identity_page(valid, after, FETCH, None).await?;
             let (candidates, through) = identity_candidates(&parent.keys, &overlay.keys, FETCH);
             for key in candidates {
-                let id = EntityId::String(key.clone());
+                let id = key.clone();
                 if self.point(&id, Interval::at(valid)?).await?.is_none() { continue; }
                 if keys.len() == limit {
                     return Ok(WorldIdentityPage { keys, more: true, reservations });
                 }
-                bytes = bytes.checked_add(key.len()).filter(|bytes| *bytes <= 8 << 20)
+                bytes = bytes.checked_add(key.retained_bytes()).filter(|bytes| *bytes <= 8 << 20)
                     .ok_or_else(OwnedWorld::unavailable)?;
-                reservations.push(self.memory.reserve(key.len())?);
+                reservations.push(self.memory.reserve(key.retained_bytes())?);
                 keys.push(key.clone());
             }
             let Some(through) = through else { return Ok(WorldIdentityPage { keys, more: false, reservations }); };
-            cursor = Some((through.clone(), self.memory.reserve(through.len())?));
+            cursor = Some((through.clone(), self.memory.reserve(through.retained_bytes())?));
         }
         Err(OwnedWorld::unavailable())
     }
@@ -2416,18 +2416,19 @@ impl<'a> InheritedRelation<'a> {
         let instant = Interval::at(valid)?;
         let mut cursor = None;
         loop {
-            let after = cursor.as_ref().map(|(key, _): &(String, Arc<MemoryReservation>)| key.as_str());
-            let page = self.overlay_identity_page(valid, after, 128, None).await?;
+            let after = cursor.as_ref().map(|(key, _): &(EntityId, Arc<MemoryReservation>)| OwnedIdentityScan::seek(key))
+                .transpose()?.unwrap_or(OwnedIdentityScan::Unbounded);
+            let page = self.overlay_identity_page(valid, &after, 128, None).await?;
             *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
             for key in &page.keys {
-                let id = EntityId::String(key.clone());
+                let id = key.clone();
                 if corpus.contains_shadow(partition, &id) { continue; }
                 let shadow = self.resolve_shadow(&id, instant).await?.ok_or_else(unavailable)?;
                 projections.shadow_text(self.relation, &column, shadow.as_ref(), id, partition, corpus, self.memory, historical).await?;
             }
             if !page.more { return Ok(()); }
             let key = page.keys.last().ok_or_else(unavailable)?;
-            cursor = Some((key.clone(), self.memory.reserve(key.len())?));
+            cursor = Some((key.clone(), self.memory.reserve(key.retained_bytes())?));
         }
     }
 
@@ -2440,18 +2441,19 @@ impl<'a> InheritedRelation<'a> {
         let instant = Interval::at(valid)?;
         let mut cursor = None;
         loop {
-            let after = cursor.as_ref().map(|(key, _): &(String, Arc<MemoryReservation>)| key.as_str());
-            let page = self.overlay_identity_page(valid, after, 128, None).await?;
+            let after = cursor.as_ref().map(|(key, _): &(EntityId, Arc<MemoryReservation>)| OwnedIdentityScan::seek(key))
+                .transpose()?.unwrap_or(OwnedIdentityScan::Unbounded);
+            let page = self.overlay_identity_page(valid, &after, 128, None).await?;
             *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
             for key in &page.keys {
-                let id = EntityId::String(key.clone());
+                let id = key.clone();
                 if shadows.contains_shadow(partition, &id) { continue; }
                 let shadow = self.resolve_shadow(&id, instant).await?.ok_or_else(unavailable)?;
                 projections.shadow_nearest(selected, query, shadow.as_ref(), id, partition, shadows, self.memory, historical).await?;
             }
             if !page.more { return Ok(()); }
             let key = page.keys.last().ok_or_else(unavailable)?;
-            cursor = Some((key.clone(), self.memory.reserve(key.len())?));
+            cursor = Some((key.clone(), self.memory.reserve(key.retained_bytes())?));
         }
     }
 
@@ -2482,8 +2484,8 @@ impl<'a> InheritedRelation<'a> {
 }
 
 fn identity_candidates<'a>(
-    parent: &'a [String], overlay: &'a [String], fetch: usize,
-) -> (impl Iterator<Item = &'a String>, Option<&'a String>) {
+    parent: &'a [EntityId], overlay: &'a [EntityId], fetch: usize,
+) -> (impl Iterator<Item = &'a EntityId>, Option<&'a EntityId>) {
     let through = [parent, overlay].into_iter()
         .filter(|keys| keys.len() == fetch).filter_map(|keys| keys.last()).min();
     let candidates: std::collections::BTreeSet<_> = parent.iter().chain(overlay).collect();
@@ -2833,7 +2835,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             Ok(AncestorResult::Identities(inherited.identities(valid, after, limit).await?)),
                                                         AncestorRead::OverlayIdentities { valid, after, limit, prefix } =>
                                                             Ok(AncestorResult::Identities(inherited.overlay_identity_page(
-                                                                valid, after.as_deref(), limit, prefix.as_deref(),
+                                                                valid, &after, limit, prefix.as_deref(),
                                                             ).await?)),
                                                         AncestorRead::Range { path, lower, upper, after, descending, limit, valid } => {
                                                             let request = OwnedRangeRequest {
@@ -3327,7 +3329,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                             (exact_historical_parent_context(scoped, &owner, system, &schemas).await?, system)
                                         } else { (scoped, parent_time) };
                                         rtdb_query::owned_identity_candidates_in_prefix(scoped, &owner, &relation, system,
-                                            at, after.as_deref(), fetch, prefix.as_deref(),
+                                            at, &after, fetch, prefix.as_deref(),
                                         ).await
                                     };
                                     let response = tokio::select! {

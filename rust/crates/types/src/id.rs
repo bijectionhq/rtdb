@@ -1,7 +1,7 @@
 use crate::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{fmt, str::FromStr};
+use std::{borrow::Cow, fmt, str::FromStr};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Iid(pub [u8; 16]);
@@ -88,6 +88,7 @@ pub enum EntityId {
     Keyword(Keyword),
     Integer(i64),
     Uuid([u8; 16]),
+    Binary(Vec<u8>),
 }
 
 impl EntityId {
@@ -97,6 +98,7 @@ impl EntityId {
             Self::Keyword(value) => crate::Value::Keyword(value.clone()),
             Self::Integer(value) => crate::Value::I64(*value),
             Self::Uuid(value) => crate::Value::Uuid(*value),
+            Self::Binary(value) => crate::Value::Binary(value.clone()),
         }
     }
 
@@ -106,6 +108,7 @@ impl EntityId {
             Self::String(value) => Self::string_iid(value),
             Self::Keyword(value) => Self::keyword_iid(value.as_str()),
             Self::Integer(value) => Self::prefixed_iid(b"i", &value.to_string()),
+            Self::Binary(value) => Self::binary_iid(value),
         }
     }
 
@@ -116,10 +119,14 @@ impl EntityId {
         [Self::keyword_iid(name), Self::prefixed_iid(b"k:", name)]
     }
 
-    fn prefixed_iid(prefix: &[u8], value: &str) -> Iid {
+    pub fn binary_iid(value: &[u8]) -> Iid { Self::hash_iid(b"b", value) }
+
+    fn prefixed_iid(prefix: &[u8], value: &str) -> Iid { Self::hash_iid(prefix, value.as_bytes()) }
+
+    fn hash_iid(prefix: &[u8], value: &[u8]) -> Iid {
         let mut hash = Sha256::new();
         hash.update(prefix);
-        hash.update(value.as_bytes());
+        hash.update(value);
         let mut iid = [0; 16];
         iid.copy_from_slice(&hash.finalize()[..16]);
         Iid(iid)
@@ -137,6 +144,7 @@ impl EntityId {
                 return handle;
             }
             Self::Uuid(value) => (3, value),
+            Self::Binary(value) => (4, value),
         };
         let mut handle = Vec::with_capacity(payload.len() + 1);
         handle.push(tag);
@@ -154,13 +162,70 @@ impl EntityId {
             }
             2 => Ok(Self::Integer((u64::from_be_bytes(payload.try_into().map_err(|_| invalid())?) ^ (1 << 63)) as i64)),
             3 => Ok(Self::Uuid(payload.try_into().map_err(|_| invalid())?)),
+            4 => Ok(Self::Binary(payload.to_vec())),
             _ => Err(invalid()),
+        }
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        match self {
+            Self::String(value) => value.capacity(),
+            Self::Keyword(value) => value.retained_bytes(),
+            Self::Binary(value) => value.capacity(),
+            Self::Integer(_) | Self::Uuid(_) => 0,
         }
     }
 
     pub fn uuid(value: &str) -> Result<Self> {
         uuid::Uuid::parse_str(value).map(|value| Self::Uuid(*value.as_bytes()))
             .map_err(|_| Anomaly::incorrect("xtdb/invalid-id", "Invalid UUID ID"))
+    }
+}
+
+/// Homogeneous key order of a private identity page, including an empty first bound.
+#[derive(Clone, Debug)]
+pub enum OwnedIdentityScan<'a> {
+    Text(Option<Cow<'a, str>>),
+    Binary(Option<Cow<'a, [u8]>>),
+    Unbounded,
+}
+
+impl<'a> OwnedIdentityScan<'a> {
+    pub fn text(after: Option<&'a str>) -> Self { Self::Text(after.map(Cow::Borrowed)) }
+
+    pub fn bound(&self) -> Option<crate::Value> {
+        match self {
+            Self::Text(after) => after.as_deref().map(|key| crate::Value::Utf8(key.to_owned())),
+            Self::Binary(after) => after.as_deref().map(|key| crate::Value::Binary(key.to_vec())),
+            Self::Unbounded => None,
+        }
+    }
+
+    pub fn accepts(&self, ty: &crate::LogicalType) -> bool {
+        use crate::{LogicalType, ScalarType};
+        match ty {
+            LogicalType::Null | LogicalType::Nothing => true,
+            LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => self.accepts(inner),
+            LogicalType::Scalar(ScalarType::Utf8) => !matches!(self, Self::Binary(_)),
+            LogicalType::Scalar(ScalarType::Binary) => !matches!(self, Self::Text(_)),
+            _ => false,
+        }
+    }
+
+    pub fn seek(id: &'a EntityId) -> Result<Self> {
+        match id {
+            EntityId::String(text) => Ok(Self::text(Some(text))),
+            EntityId::Binary(bytes) => Ok(Self::Binary(Some(Cow::Borrowed(bytes)))),
+            _ => Err(Anomaly::incorrect("rtdb.owned/identity-page", "An identity page requires Utf8 or Binary keys")),
+        }
+    }
+
+    pub fn into_owned(self) -> OwnedIdentityScan<'static> {
+        match self {
+            Self::Text(after) => OwnedIdentityScan::Text(after.map(|key| Cow::Owned(key.into_owned()))),
+            Self::Binary(after) => OwnedIdentityScan::Binary(after.map(|key| Cow::Owned(key.into_owned()))),
+            Self::Unbounded => OwnedIdentityScan::Unbounded,
+        }
     }
 }
 

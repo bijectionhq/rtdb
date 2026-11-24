@@ -2439,7 +2439,7 @@ impl PartitionScan {
                     std::collections::btree_map::Entry::Occupied(entry) => &mut entry.into_mut().0,
                     std::collections::btree_map::Entry::Vacant(entry) => {
                         let reservation = self.execution.context.memory.reserve(key.len().saturating_add(512))?;
-                        EntityId::from_handle_bytes(key)?;
+                        rtdb_columnar::EntityIdRef::from_handle_bytes(key)?;
                         &mut entry.insert((HistoryResolver::new_in(
                             self.bounds, self.scan.clamp_valid_time, Arc::clone(&self.execution.context.memory),
                         ), reservation)).0

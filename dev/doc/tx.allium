@@ -198,14 +198,19 @@
 -- The exact floor index covers the same ordered relation erase frontier. Missing coverage refuses historical release.
 -- Owned erase refuses governed paths and another mutation of the same identity in the commit.
 -- Owned point reads compare the complete stored identity before yielding any row.
+-- A private Binary identity retains its full byte string in the typed handle, point, change and replay paths.
+-- Binary key order compares unsigned bytes lexicographically, with a prefix preceding its extensions.
+-- An identity page selects its key type from its nullable exclusive bound and returns identities of the same type.
+-- The all-valid page returns a key once even when several visible validity slices carry it.
+-- Binary point observations retain the same original transaction and event ordinal as the selected assertion.
 -- An owned transaction refuses ordinary operations and ordinary SQL catalogs and scans exclude owned tables.
 -- Owned point reads use the principal's namespace at the admitted exact cut.
--- Ordered owned mutations reserve permanent addresses using the canonical IID and deterministic collision probes.
--- A protected registry records each locator's complete typed identity with the fact write.
--- Point reads and ordered checks open the registry at the same cut as the fact and verify its complete stored identity.
--- An existing relation without a complete registry refuses owned access.
+-- The canonical IID routes an ordered owned mutation to a physical bucket.
+-- Governed events in a bucket carry their complete typed identities independently.
+-- Point reads and ordered checks select the complete key at the admitted cut and verify the stored identity of a winning row.
+-- Owned access requires complete persisted keys for governed events.
 -- A held owned read captures the exact applied transaction key and retains that catalog for repeated reads.
--- An ordinary unscoped held Root read can prove the absent prefix of up to 64 ordered keys on one relation at a common valid instant.
+-- An ordinary unscoped held Root read can prove the absent prefix of up to 64 ordered Utf8 or Binary keys on one relation at a common valid instant.
 -- The prefix proof retains the held system and requested valid coordinates and admits only relations without a creation lifetime.
 -- A caller may submit the original per-key observations and create operations together in one ordered commit batch.
 -- The commit checks every observation at the ordering cut and publishes the page atomically.
@@ -215,7 +220,7 @@
 -- Each entry uses its scalar action's admission, held cut, authorization and delivery fence.
 -- Aligned Arrow request bodies in scalar actions and held read batches can retain their original charged Flight frame.
 -- The owner streams one scalar IPC reply per successful entry and terminates at the first refusal with that entry's scalar status.
--- Held selections carry ordered UTF-8 points and valid windows on their original handles with each entry's original cut.
+-- Held selections carry UTF-8 and Binary points and valid windows in request order on their original handles with each entry's original cut.
 -- Compatible point selections reuse the Arrow field schema and retain reply metadata per entry.
 -- Reserved audience point selections spend one original action and work allowance per entry and preserve the original route and reply limits.
 -- Fresh Flight readers can batch the Root selectors admitted by their route.

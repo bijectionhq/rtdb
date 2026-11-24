@@ -101,13 +101,17 @@ impl OpenTransaction<'_> {
         projected: impl FnOnce(&str) -> Result<Option<FixedRangeKey>>,
     ) -> Result<Option<(super::FixedRangeSide, Arc<MemoryReservation>)>> {
         let Some((rule, before)) = before? else { return Ok(None); };
-        let EntityId::String(text) = id else { return Err(rtdb_types::change_feed_uncovered()); };
-        if text.len() > rtdb_types::FIXED_RANGE_COMPONENT_BYTES {
+        let bytes = match id {
+            EntityId::String(text) => text.len(),
+            EntityId::Binary(bytes) => bytes.len(),
+            _ => return Err(rtdb_types::change_feed_uncovered()),
+        };
+        if bytes > rtdb_types::FIXED_RANGE_COMPONENT_BYTES {
             return Err(rtdb_types::change_feed_uncovered());
         }
         let after = projected(&rule.column)?.map_or(Value::Null, |key| key.to_value());
         let size = before.retained_bytes()?.checked_add(after.retained_bytes()?)
-            .and_then(|size| size.checked_add(text.len()))
+            .and_then(|size| size.checked_add(bytes))
             .and_then(|size| size.checked_add(512)).ok_or_else(overflow)?;
         if size > MAX_SIDE_BYTES {
             return Err(rtdb_types::change_feed_uncovered());

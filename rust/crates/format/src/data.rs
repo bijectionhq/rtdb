@@ -304,6 +304,8 @@ impl<'a> EventRef<'a> {
 
     pub fn put_identity(&self) -> Result<Option<rtdb_columnar::EntityIdRef<'a>>> {
         match self.put.map(|put| put.column("_id")) {
+            Some(PutColumn::Stored(field, array, row)) if self.entity_key().is_some() =>
+                rtdb_columnar::read_owned_entity_id(field, array, row).map(Some),
             Some(PutColumn::Stored(field, array, row)) => rtdb_columnar::read_entity_id(field, array, row).map(Some),
             _ => Ok(None),
         }

@@ -22,12 +22,12 @@ use arrow_flight::Result as ActionResult;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use prost::Message;
-use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_entity_id, selected_cell, try_entity_id_array};
+use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_owned_entity_id, selected_cell, try_entity_id_array};
 use rtdb_format::ipc::OwnedStream;
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -972,7 +972,7 @@ fn spatial_column_names<'a>(batch: &'a RecordBatch, name: &str) -> Result<Vec<&'
 fn spatial_after(input: &RecordBatch) -> Result<Option<EntityIdRef<'_>>, Status> {
     match input.schema_ref().column_with_name("after") {
         Some((index, field)) => selected_cell(field, input.column(index).as_ref(), 0).map_err(status)?
-            .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose(),
+            .map(|(field, array, row)| read_owned_entity_id(field, array, row).map_err(status)).transpose(),
         None => Ok(None),
     }
 }
@@ -1905,7 +1905,7 @@ impl Service {
         let cell = |name| ArrowCell::named(source, name, row);
         let id = {
             let cell = cell("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?;
-            read_entity_id(cell.field, cell.array, cell.row).map_err(status)?
+            read_owned_entity_id(cell.field, cell.array, cell.row).map_err(status)?
         };
         let mut own_id = || -> Result<EntityId, Status> {
             charge.grow_to(wire::add(charge.bytes(), id.owned_payload_bytes())?).map_err(status)?;
@@ -2054,7 +2054,7 @@ impl Service {
     ) -> Result<(), Status> {
         for mut row in rows {
             strip_owned_absence(&mut row)?;
-            let id = row.get("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?.entity_id().map_err(status)?;
+            let id = row.get("_id").ok_or_else(|| invalid("Owned commit row has no _id"))?.owned_entity_id().map_err(status)?;
             let Value::Utf8(operation) = row.remove("_op").ok_or_else(|| invalid("Owned commit row has no _op"))? else {
                 return Err(invalid("Owned commit _op must be Utf8"));
             };
@@ -2427,7 +2427,7 @@ impl Service {
         work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
     }
 
-    pub(crate) async fn held_owned_point(&self, call: &Call, body: &Bytes, time: PointTime, compact: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+    pub(crate) async fn held_owned_point(&self, call: &Call, body: &Bytes, time: PointTime, compact: Option<CompactIdentity>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -2649,11 +2649,11 @@ impl Service {
     pub(crate) async fn held_owned_valid_during_action(
         &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, ipc_stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
-        self.held_owned_valid_during(call, body, mode, false, ipc_stream).await
+        self.held_owned_valid_during(call, body, mode, None, ipc_stream).await
     }
 
     pub(crate) async fn held_owned_valid_during(
-        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, compact: bool, ipc_stream: bool,
+        &self, call: &Call, body: &Bytes, mode: ValidHistoryMode, compact: Option<CompactIdentity>, ipc_stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
         use rtdb_types::Interval;
 
@@ -2672,12 +2672,12 @@ impl Service {
             (None, request)
         };
         let (relation, request) = split_relation(request)?;
-        let legacy = (!compact).then(|| request_batch(call, call.retain_request_bytes(body.slice_ref(request)))).transpose()?;
-        let (id, _identity, system, valid) = if compact {
+        let legacy = compact.is_none().then(|| request_batch(call, call.retain_request_bytes(body.slice_ref(request)))).transpose()?;
+        let (id, _identity, system, valid) = if let Some(compact) = compact {
             let (system, request) = selection_time(request)?;
             let (from, request) = selection_time(request)?;
             let (to, request) = selection_time(request)?;
-            let (id, identity) = selection_identity(call, request)?;
+            let (id, identity) = selection_identity(call, request, compact)?;
             let valid = Interval::new(from, to).map_err(status)?;
             if valid.is_empty() { return Err(invalid("Owned history requires a nonempty valid window")); }
             (id, identity, system, valid)
@@ -2724,17 +2724,9 @@ impl Service {
         let valid = history_request_endpoint(batch, "valid_micros")?;
         let limit = usize::try_from(history_request_integer(batch, "limit")?)
             .map_err(|_| invalid("Owned identity limit is out of range"))?;
-        let (column, field) = batch.schema_ref().column_with_name("after")
-            .ok_or_else(|| invalid("Owned identity page requires an exclusive bound"))?;
-        let after = batch.column(column).as_any().downcast_ref::<StringArray>()
-            .filter(|_| field.metadata().is_empty())
-            .ok_or_else(|| invalid("Owned identity bound must be nullable Utf8"))?;
-        let after = (!after.is_null(0)).then(|| after.value(0));
-        let page = held.snapshot.identity_page(&relation, system, valid, after, limit).await.map_err(status)?;
-        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
-        let _copy = call.reserve(bytes)?;
-        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
-        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let after = identity_scan_request(batch)?;
+        let page = held.snapshot.identity_page(&relation, system, valid, &after, limit).await.map_err(status)?;
+        let (rows, _copy) = identity_scan_reply(call, &after, &page.keys)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
@@ -2761,17 +2753,9 @@ impl Service {
         let system = history_request_endpoint(batch, "system_micros")?;
         let limit = usize::try_from(history_request_integer(batch, "limit")?)
             .map_err(|_| invalid("Owned identity limit is out of range"))?;
-        let (column, field) = batch.schema_ref().column_with_name("after")
-            .ok_or_else(|| invalid("Owned identity page requires an exclusive bound"))?;
-        let after = batch.column(column).as_any().downcast_ref::<StringArray>()
-            .filter(|_| field.metadata().is_empty())
-            .ok_or_else(|| invalid("Owned identity bound must be nullable Utf8"))?;
-        let after = (!after.is_null(0)).then(|| after.value(0));
-        let page = held.snapshot.identity_page_all_valid(&relation, system, after, limit).await.map_err(status)?;
-        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
-        let _copy = call.reserve(bytes)?;
-        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
-        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let after = identity_scan_request(batch)?;
+        let page = held.snapshot.identity_page_all_valid(&relation, system, &after, limit).await.map_err(status)?;
+        let (rows, _copy) = identity_scan_reply(call, &after, &page.keys)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
@@ -2848,10 +2832,7 @@ impl Service {
         let (page, witness) = held.snapshot.protected_carrier_page(
             &relation, prefix.value(0), after, limit, scope,
         ).await.map_err(status)?;
-        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
-        let _copy = call.reserve(bytes)?;
-        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
-        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let (rows, _copy) = identity_scan_reply(call, &OwnedIdentityScan::text(None), &page.keys)?;
         let mut metadata = std::collections::HashMap::from([
             (OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string()),
         ]);
@@ -3557,9 +3538,15 @@ impl Service {
             return Err(invalid("Spatial gather requires one identity, revision, and projection"));
         }
         let columns = spatial_document_columns(input)?;
-        let (id, row) = owned_scalar::<StringArray>(input, "_id")?
-            .ok_or_else(|| invalid("Spatial gather has no identity"))?;
-        let id = EntityIdRef::String(id.value(row));
+        let id = if input.column_by_name("_id").is_some_and(|ids| ids.data_type() == &DataType::Binary) {
+            let (id, row) = owned_scalar::<BinaryArray>(input, "_id")?
+                .ok_or_else(|| invalid("Spatial gather has no identity"))?;
+            EntityIdRef::Binary(id.value(row))
+        } else {
+            let (id, row) = owned_scalar::<StringArray>(input, "_id")?
+                .ok_or_else(|| invalid("Spatial gather has no identity"))?;
+            EntityIdRef::String(id.value(row))
+        };
         let (revision, row) = owned_scalar::<Int64Array>(input, "revision_micros")?
             .ok_or_else(|| invalid("Spatial gather has no revision"))?;
         let page = held.snapshot.gather_spatial_document(&relation, id, Timestamp(revision.value(row)), &columns)
@@ -3658,7 +3645,7 @@ impl Service {
             let ids = match rtdb_columnar::relayout_arrow_column(Arc::clone(array), source, target) {
                 Ok((_, ids)) if ids.data_type() == target.data_type() => ids,
                 _ => {
-                    let ids = (0..array.len()).map(|row| read_entity_id(source, array.as_ref(), row));
+                    let ids = (0..array.len()).map(|row| read_owned_entity_id(source, array.as_ref(), row));
                     let bound = ids.clone().try_fold(4096, |bytes, id| {
                         let text = id.map_err(status)?.owned_payload_bytes();
                         wire::add(bytes, wire::add(128, wire::mul(text, 4)?)?)
@@ -3772,15 +3759,13 @@ impl Service {
             return Err(invalid("Staged search requires bounded rows and original evidence"));
         }
         let partitions = input.column_by_name("partition").and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
-        let ids = input.column_by_name("_id").and_then(|c| c.as_any().downcast_ref::<StringArray>());
+        let ids = input.column_by_name("_id").map(|ids| ids.as_ref());
         let text = input.column_by_name("text").and_then(|c| c.as_any().downcast_ref::<StringArray>());
         let (Some(partitions), Some(ids), Some(text)) = (partitions, ids, text) else {
             return Err(invalid("Invalid staged search overlay layout"));
         };
         rtdb_node::TextShadows::try_new(partitions, ids, text, |partition, id| {
-            !id.is_empty() && rank.partitions.get(partition).is_some_and(|(relation, _)| {
-                !(relation.name().ends_with("_search") && id.starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
-            })
+            rank.partitions.get(partition).is_some_and(|(relation, _)| staged_rank_identity(relation, id))
         }).ok_or_else(|| invalid("Invalid staged search identity"))
     }
 
@@ -3982,7 +3967,10 @@ impl Service {
             return Err(invalid("Staged nearest requires bounded rows and its filter columns"));
         }
         let partitions = input.column_by_name("partition").and_then(|c| c.as_any().downcast_ref::<UInt64Array>()).ok_or_else(malformed)?;
-        let ids = input.column_by_name("_id").and_then(|c| c.as_any().downcast_ref::<StringArray>()).ok_or_else(malformed)?;
+        let (id_column, id_field) = input.schema_ref().column_with_name("_id")
+            .filter(|(_, field)| matches!(field.data_type(), DataType::Utf8 | DataType::Binary))
+            .ok_or_else(malformed)?;
+        let ids = input.column(id_column).as_ref();
         let vectors = input.column_by_name("vector").and_then(|c| c.as_any().downcast_ref::<ListArray>()).ok_or_else(malformed)?;
         let components = vectors.values().as_any().downcast_ref::<arrow_array::Float32Array>().ok_or_else(malformed)?;
         let filter_columns = (0..filters).map(|ordinal| {
@@ -3992,11 +3980,13 @@ impl Service {
         }).collect::<Result<Vec<_>, _>>()?;
         let mut overlay = rtdb_node::nearest::HeldVectorOverlay::new(self.memory()).map_err(status)?;
         for row in 0..input.num_rows() {
-            if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
-                || partitions.value(row) >= nearest.partitions.len() as u64
-                || (nearest.partitions[partitions.value(row) as usize].relation.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
-            {
-                return Err(invalid("Invalid staged nearest identity"));
+            let invalid_id = || invalid("Invalid staged nearest identity");
+            if partitions.is_null(row) || partitions.value(row) >= nearest.partitions.len() as u64 {
+                return Err(invalid_id());
+            }
+            let id = read_owned_entity_id(id_field, ids, row).map_err(|_| invalid_id())?;
+            if !staged_rank_identity(&nearest.partitions[partitions.value(row) as usize].relation, id) {
+                return Err(invalid_id());
             }
             let vector = if vectors.is_null(row) {
                 None
@@ -4011,7 +4001,7 @@ impl Service {
                 .map(|column| column.is_valid(row).then(|| column.value(row)));
             overlay.shadow_staged(
                 partitions.value(row) as usize,
-                EntityIdRef::String(ids.value(row)),
+                id,
                 vector,
                 cells,
                 &nearest.query,
@@ -4207,7 +4197,7 @@ impl Service {
         // The query owns the batch reservation. Flight still charges the caller's session.
         let ids = hits.column(0).as_ref();
         let charge = (0..hits.num_rows()).try_fold(4096, |bytes, row| {
-            let id = read_entity_id(schema.field(0), ids, row).map_err(status)?;
+            let id = read_owned_entity_id(schema.field(0), ids, row).map_err(status)?;
             let size = wire::add(std::mem::size_of::<Value>(), id.owned_payload_bytes())?;
             wire::add(bytes, wire::mul(size, 4)?)
         })?;
@@ -4952,10 +4942,7 @@ impl Service {
         let root = std::str::from_utf8(root).map_err(|_| invalid("Invalid Root carrier scope"))?;
         let world = std::str::from_utf8(world).map_err(|_| invalid("Invalid world carrier scope"))?;
         let (page, witness) = held.snapshot.shared_column_census(scope, valid, root, world).await.map_err(status)?;
-        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
-        let _copy = call.reserve(bytes)?;
-        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
-        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let (rows, _copy) = identity_scan_reply(call, &OwnedIdentityScan::text(None), &page.keys)?;
         let nonce = held.remember(call, witness, false)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string())].into()
@@ -4993,29 +4980,21 @@ impl Service {
         let valid = history_request_endpoint(request, "valid_micros")?;
         let limit = usize::try_from(history_request_integer(request, "limit")?)
             .map_err(|_| invalid("Owned world identity limit is out of range"))?;
-        let (column, field) = request.schema_ref().column_with_name("after")
-            .ok_or_else(|| invalid("Owned world identities require an exclusive bound"))?;
-        let after = request.column(column).as_any().downcast_ref::<StringArray>()
-            .filter(|_| field.metadata().is_empty())
-            .ok_or_else(|| invalid("Owned world identity bound must be nullable Utf8"))?;
-        let after = (!after.is_null(0)).then(|| after.value(0));
+        let after = identity_scan_request(request)?;
         let page = match (mode, system) {
             (WorldIdentityRead::ParentAt, Some(system)) =>
-                held.snapshot.parent_identity_page_at(&relation, valid, after, limit, system).await,
+                held.snapshot.parent_identity_page_at(&relation, valid, &after, limit, system).await,
             (WorldIdentityRead::EffectiveAt, Some(system)) =>
-                held.snapshot.identity_page_at(&relation, valid, after, limit, system, parent_only).await,
+                held.snapshot.identity_page_at(&relation, valid, &after, limit, system, parent_only).await,
             (WorldIdentityRead::OverlayAt, Some(system)) =>
-                held.snapshot.overlay_identities_at(&relation, valid, after, limit, system).await,
+                held.snapshot.overlay_identities_at(&relation, valid, &after, limit, system).await,
             (WorldIdentityRead::Overlay, None) =>
-                held.snapshot.overlay_identities(&relation, valid, after, limit).await,
+                held.snapshot.overlay_identities(&relation, valid, &after, limit).await,
             (WorldIdentityRead::Effective, None) =>
-                held.snapshot.identity_page(&relation, valid, after, limit).await,
+                held.snapshot.identity_page(&relation, valid, &after, limit).await,
             _ => return Err(invalid("Invalid held world identity coordinates")),
         }.map_err(status)?;
-        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.len()))?;
-        let _copy = call.reserve(bytes)?;
-        let keys = StringArray::from_iter_values(page.keys.iter().map(String::as_str));
-        let rows = RecordBatch::try_from_iter([("_id", Arc::new(keys) as Arc<dyn Array>)]).map_err(arrow)?;
+        let (rows, _copy) = identity_scan_reply(call, &after, &page.keys)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
@@ -5772,7 +5751,7 @@ impl Service {
             let (rows, decoded) = upload::owned_documents(batch, call.memory())?;
             reservations.extend([charge, decoded]);
             for mut row in rows {
-                let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.entity_id().map_err(status)?;
+                let id = row.remove("_id").ok_or_else(|| invalid("Owned world write has no _id"))?.owned_entity_id().map_err(status)?;
                 let (Some(Value::Utf8(operation)), Some(from), Some(to), Some(payload)) = (
                     row.remove("_op"), row.remove("_valid_from_micros"), row.remove("_valid_to_micros"), row.remove("fact"),
                 ) else { return Err(invalid("Owned world write requires a typed operation and explicit valid endpoints")); };
@@ -6027,21 +6006,27 @@ fn selection_time(request: &[u8]) -> Result<(Timestamp, &[u8]), Status> {
     Ok((Timestamp(i64::from_be_bytes(*time)), rest))
 }
 
-fn selection_identity(call: &Call, request: &[u8]) -> Result<(EntityId, Arc<MemoryReservation>), Status> {
-    let id = std::str::from_utf8(request).map_err(arrow)?;
-    let reservation = call.reserve(wire::add(4096, id.len())?)?;
-    Ok((EntityId::String(id.to_owned()), reservation))
+#[derive(Clone, Copy)]
+pub(crate) enum CompactIdentity { Text, Binary }
+
+fn selection_identity(
+    call: &Call, request: &[u8], format: CompactIdentity,
+) -> Result<(EntityId, Arc<MemoryReservation>), Status> {
+    let id = match format {
+        CompactIdentity::Text => EntityIdRef::String(std::str::from_utf8(request).map_err(arrow)?),
+        CompactIdentity::Binary => EntityIdRef::Binary(request),
+    };
+    let reservation = call.reserve(wire::add(4096, id.owned_payload_bytes())?)?;
+    Ok((id.into_owned(), reservation))
 }
 
 fn selected_point_request(
-    call: &Call, envelope: &Bytes, body: &[u8], time: PointTime, compact: bool,
+    call: &Call, envelope: &Bytes, body: &[u8], time: PointTime, compact: Option<CompactIdentity>,
 ) -> Result<(OwnedRelation, EntityId, Option<Timestamp>, Arc<MemoryReservation>), Status> {
-    if !compact {
-        return point_request(call, envelope, body, time);
-    }
+    let Some(compact) = compact else { return point_request(call, envelope, body, time); };
     let (relation, request) = split_relation(body)?;
     let (valid, request) = selection_time(request)?;
-    let (id, reservation) = selection_identity(call, request)?;
+    let (id, reservation) = selection_identity(call, request, compact)?;
     Ok((relation, id, Some(valid), reservation))
 }
 
@@ -6097,13 +6082,65 @@ fn change_region_request(
     Ok((lower, upper, valid, charge))
 }
 
+fn staged_rank_identity(relation: &OwnedRelation, id: EntityIdRef<'_>) -> bool {
+    match id {
+        EntityIdRef::String(id) => !id.is_empty()
+            && !(relation.name().ends_with("_search") && id.starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX)),
+        EntityIdRef::Binary(id) => !id.is_empty(),
+        _ => false,
+    }
+}
+
+fn identity_scan_request(batch: &RecordBatch) -> Result<OwnedIdentityScan<'_>, Status> {
+    let (column, field) = batch.schema_ref().column_with_name("after")
+        .filter(|(_, field)| field.metadata().is_empty())
+        .ok_or_else(|| invalid("Owned identity page requires a plain exclusive bound"))?;
+    let array = batch.column(column);
+    if let Some(text) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(OwnedIdentityScan::text((!text.is_null(0)).then(|| text.value(0))));
+    }
+    if let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() {
+        return Ok(OwnedIdentityScan::Binary((!binary.is_null(0)).then(|| binary.value(0).into())));
+    }
+    Err(invalid("Owned identity bound must be nullable Utf8 or Binary"))
+}
+
+fn identity_scan_reply(
+    call: &Call, scan: &OwnedIdentityScan<'_>, keys: &[EntityId],
+) -> Result<(RecordBatch, Arc<MemoryReservation>), Status> {
+    let bytes = keys.iter().try_fold(4096, |size, key| wire::add(size, key.retained_bytes()))?;
+    let charge = call.reserve(bytes)?;
+    let wrong_type = || invalid("Owned identity page has a different identity type");
+    let ids: ArrayRef = match scan {
+        OwnedIdentityScan::Text(_) => {
+            let mut ids = arrow_array::builder::StringBuilder::with_capacity(keys.len(), bytes - 4096);
+            for key in keys {
+                let EntityId::String(key) = key else { return Err(wrong_type()); };
+                ids.append_value(key);
+            }
+            Arc::new(ids.finish())
+        }
+        OwnedIdentityScan::Binary(_) => {
+            let mut ids = arrow_array::builder::BinaryBuilder::with_capacity(keys.len(), bytes - 4096);
+            for key in keys {
+                let EntityId::Binary(key) = key else { return Err(wrong_type()); };
+                ids.append_value(key);
+            }
+            Arc::new(ids.finish())
+        }
+        OwnedIdentityScan::Unbounded => return Err(wrong_type()),
+    };
+    let rows = RecordBatch::try_from_iter([("_id", ids)]).map_err(arrow)?;
+    Ok((rows, charge))
+}
+
 fn absent_keys_valid(batch: &RecordBatch) -> Result<Timestamp, Status> {
     if batch.num_columns() != 2 || !(1..=64).contains(&batch.num_rows()) {
         return Err(invalid("Owned absence requires 1 to 64 keys and one valid instant"));
     }
     let ids = batch.column_by_name("_id")
-        .and_then(|column| column.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| invalid("Owned absence requires UTF-8 keys"))?;
+        .filter(|column| matches!(column.data_type(), DataType::Utf8 | DataType::Binary))
+        .ok_or_else(|| invalid("Owned absence requires Utf8 or Binary keys"))?;
     let times = batch.column_by_name("valid_micros")
         .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
         .ok_or_else(|| invalid("Owned absence requires Int64 valid instants"))?;
@@ -6128,7 +6165,7 @@ fn point_identity_at(call: &Call, batch: &RecordBatch, row: usize) -> Result<(En
     let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(|| invalid("Owned point has no _id field"))?;
     let values = batch.column(column).as_ref();
     let identity = call.reserve(wire::add(4096, rtdb_columnar::estimate_read_value_bytes(field, values, row).map_err(status)?)?)?;
-    let id = rtdb_columnar::read_execution_value(field, values, row).map_err(status)?.entity_id().map_err(status)?;
+    let id = rtdb_columnar::read_execution_value(field, values, row).map_err(status)?.owned_entity_id().map_err(status)?;
     Ok((id, identity))
 }
 

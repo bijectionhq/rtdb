@@ -147,7 +147,7 @@ pub async fn lookup_owned_unique(
     };
     owned_row_revision(row.batch(), 0, &id, &context.memory)?;
     let holder = cell(&row, "holder", &context)?
-        .entity_id()
+        .owned_entity_id()
         .map_err(|_| uncovered())?;
     let cursor =
         open_owned_point(context.clone(), owner, relation, &holder, Some(valid), None).await?;

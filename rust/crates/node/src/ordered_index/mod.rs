@@ -16,7 +16,7 @@ mod usage;
 use std::{collections::BTreeMap, future::Future, mem::size_of, ops::Deref, sync::Arc};
 
 use arrow_array::RecordBatch;
-use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_entity_id};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_owned_entity_id};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
@@ -387,9 +387,9 @@ impl<'a> OwnedKeyBound<'a> {
 
     fn identity_type(self) -> Option<Result<LogicalType>> {
         match self {
-            Self::Values(fields) => fields.get("_id").map(|id| id.entity_id().map(|_| id.logical_type())),
+            Self::Values(fields) => fields.get("_id").map(|id| id.owned_entity_id().map(|_| id.logical_type())),
             Self::Arrow { .. } => self.arrow_field("_id").map(|cell| {
-                read_entity_id(cell.field, cell.array, cell.row)?;
+                read_owned_entity_id(cell.field, cell.array, cell.row)?;
                 cell.logical_type()
             }),
         }
@@ -405,8 +405,12 @@ impl<'a> OwnedKeyBound<'a> {
                     return Err(invalid());
                 }
                 let key = self.arrow_field(column).and_then(ArrowCell::binary).ok_or_else(invalid)?;
-                let id = self.arrow_field("_id").and_then(ArrowCell::utf8).ok_or_else(invalid)?;
-                FixedRangeKey::from_parts(key, id)
+                let id = self.arrow_field("_id").ok_or_else(invalid)?;
+                if let Some(id) = id.binary() {
+                    FixedRangeKey::from_binary_parts(key, id)
+                } else {
+                    FixedRangeKey::from_parts(key, id.utf8().ok_or_else(invalid)?)
+                }
             }
         }
     }

@@ -525,7 +525,7 @@ impl ArrowDocuments {
         let (field, column) = self.array.fields().iter().zip(self.array.columns())
             .find(|(field, _)| field.name() == "_id")
             .ok_or_else(|| Anomaly::incorrect("rtdb.owned/missing-id", "Owned row has no _id"))?;
-        rtdb_columnar::read_entity_id(field, column.as_ref(), row)
+        rtdb_columnar::read_owned_entity_id(field, column.as_ref(), row)
     }
 
     pub(crate) fn select_owned_fields(&self, names: &BTreeSet<String>, memory: &Arc<MemoryBudget>) -> Result<Self> {
@@ -1196,7 +1196,10 @@ pub struct EntityIds { ids: Arc<Vec<EntityId>>, _reservation: Arc<MemoryReservat
 impl EntityIds {
     pub fn new(ids: Vec<EntityId>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let bytes = ids.iter().try_fold(ids.capacity().checked_mul(std::mem::size_of::<EntityId>()).ok_or_else(overflow)?, |bytes, id| {
-            let extra = match id { EntityId::String(value) => value.capacity(), EntityId::Keyword(value) => value.retained_bytes(), _ => 0 };
+            if matches!(id, EntityId::Binary(_)) {
+                return Err(Anomaly::incorrect("xtdb/invalid-id", "An ID must be a string, keyword, signed integer, or UUID"));
+            }
+            let extra = id.retained_bytes();
             bytes.checked_add(extra).ok_or_else(overflow)
         })?;
         Ok(Self { ids: Arc::new(ids), _reservation: memory.reserve(bytes.checked_add(128).ok_or_else(overflow)?)? })
@@ -1217,8 +1220,14 @@ impl MetadataErasureUnit {
             "Metadata erasure requires one table or owned relation and an exact entity ID");
         let Value::Struct(fields) = target else { return Err(invalid()); };
         if fields.len() != 2 { return Err(invalid()); }
-        let id = fields.get("id").ok_or_else(invalid)?.entity_id()?;
-        let unit = match (fields.get("table"), fields.get("owned_relation")) {
+        let id = fields.get("id").ok_or_else(invalid)?;
+        let target = (fields.get("table"), fields.get("owned_relation"));
+        let id = if matches!(target, (None, Some(Value::Utf8(_)))) {
+            id.owned_entity_id()?
+        } else {
+            id.entity_id()?
+        };
+        let unit = match target {
             (Some(Value::Utf8(table)), None) => {
                 let table = TableRef::parse(table)?;
                 if crate::source::is_reserved_write_schema(&table.schema) { return Err(invalid()); }

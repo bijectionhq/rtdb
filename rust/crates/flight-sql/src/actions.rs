@@ -348,12 +348,12 @@ impl Service {
                 crate::owned_actions::READ_HELD_UNIQUE_WINDOW_V1 =>
                     return self.held_owned_unique_window_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POINT_V1 =>
-                    return self.held_owned_point(&call, &action.body, PointTime::Default, false, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_owned_point(&call, &action.body, PointTime::Default, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POINT_V2 =>
-                    return self.held_owned_point(&call, &action.body, PointTime::Optional, false, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_owned_point(&call, &action.body, PointTime::Optional, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_ABSENT_KEYS_V1 => Ok(vec![Ok(Box::pin(self.held_owned_absent_keys_action(&call, &action.body)).await?)]),
                 crate::owned_actions::HELD_OWNED_FIXED_POINT_V1 =>
-                    return self.held_owned_point(&call, &action.body, PointTime::Required, false, reply_format).await.map(ActionReplies::Owned),
+                    return self.held_owned_point(&call, &action.body, PointTime::Required, None, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 =>
                     return self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_VALID_AT_V1 =>

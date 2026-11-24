@@ -1961,7 +1961,7 @@ pub(crate) enum OwnedDocumentRow<'a> {
 impl<'a> OwnedDocumentRow<'a> {
     pub(crate) fn id(&self) -> Result<EntityId> {
         match self {
-            Self::Values(row) => row.get("_id").ok_or_else(rtdb_types::OwnedWorld::unavailable)?.entity_id(),
+            Self::Values(row) => row.get("_id").ok_or_else(rtdb_types::OwnedWorld::unavailable)?.owned_entity_id(),
             Self::Arrow(page, row) => page.owned_id(*row),
         }
     }
@@ -2446,7 +2446,7 @@ pub(crate) fn hosted_proposal_land(
                     _ => Some(finite_landing_period(*valid_from, *valid_to)?),
                 };
                 for row in documents.rows() {
-                    let id = row.get("_id")?.entity_id().ok()?;
+                    let id = row.get("_id")?.owned_entity_id().ok()?;
                     assertion_count += 1;
                     if assertion_count > MAX_PROPOSAL_LAND_ROWS { return None; }
                     match writes.entry((relation.name(), id.handle_bytes())) {
@@ -2466,7 +2466,7 @@ pub(crate) fn hosted_proposal_land(
                 if relation.is_root_data() && !close && !documents.rows().is_empty() =>
             {
                 for row in documents.rows() {
-                    let id = row.get("_id")?.entity_id().ok()?;
+                    let id = row.get("_id")?.owned_entity_id().ok()?;
                     assertion_count += 1;
                     if writes.insert((relation.name(), id.handle_bytes()), ProposalLandingKey {
                         relation, id, extents: vec![None], create_only: true,
