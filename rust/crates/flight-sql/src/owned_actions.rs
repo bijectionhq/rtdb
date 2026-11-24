@@ -5739,12 +5739,14 @@ impl Service {
             let batch = batch.batch();
             let schema = batch.schema_ref();
             let field = |name| schema.column_with_name(name).map(|(_, field)| field.data_type());
-            if schema.fields().len() != 5 || field("_op") != Some(&DataType::Utf8)
+            let packed_operation = schema.column_with_name("_op")
+                .is_some_and(|(_, field)| upload::operation_dictionary(field));
+            if schema.fields().len() != 5 || !packed_operation
                 || field("_valid_from_micros") != Some(&DataType::Int64)
                 || field("_valid_to_micros") != Some(&DataType::Int64)
                 || !matches!(field("fact"), Some(DataType::Struct(_)))
             {
-                return Err(invalid("Owned world commit requires _id, _op, two Int64 valid endpoints, and a fact struct"));
+                return Err(invalid("Owned world commit requires _id, dictionary _op, two Int64 valid endpoints, and a fact struct"));
             }
             *rows_left = rows_left.checked_sub(batch.num_rows())
                 .ok_or_else(|| invalid("Owned world commit exceeds its total row limit"))?;

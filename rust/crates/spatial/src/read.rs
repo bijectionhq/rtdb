@@ -51,6 +51,7 @@ pub struct NearestPosition<'a> {
 
 pub(super) struct SelectedHit {
     pub(super) source: Arc<OwnedBatch>,
+    pub(super) probe: Option<Arc<crate::probe::DeferredPage>>,
     pub(super) row: usize,
     pub(super) distance_m: Option<f64>,
 }
@@ -449,8 +450,15 @@ async fn read_page(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
     region: &PreparedRegion, request: Request<'_>, projection: Projection<'_>, probe: Option<crate::Probe<'_>>,
 ) -> Result<Page> {
-    let (page, _) = read_page_capturing(context, owner, relation, path, region, &request, projection, probe, &mut None).await?;
-    Ok(page)
+    let result = read_page_capturing(
+        Arc::clone(&context), owner, relation, path, region, &request, projection, probe, true, &mut None,
+    ).await;
+    let result = match result {
+        Err(error) if probe.is_some_and(|probe| !probe.fields.is_empty()) && error.code == "rtdb/memory-budget-exceeded" =>
+            read_page_capturing(context, owner, relation, path, region, &request, projection, probe, false, &mut None).await,
+        result => result,
+    };
+    result.map(|(page, _)| page)
 }
 
 pub async fn open_probe(
@@ -464,11 +472,13 @@ pub async fn open_probe(
     };
     let projection = Projection::SelectedDocuments(columns);
     let (page, columns) = match read_page_capturing(
-        Arc::clone(&context), owner, relation, path, region, &request, projection, Some(probe), &mut retained,
+        Arc::clone(&context), owner, relation, path, region, &request, projection, Some(probe), true, &mut retained,
     ).await {
-        Err(error) if error.code == "rtdb/memory-budget-exceeded" && retained.take().is_some() => {
-            return read_probe(context, owner, relation, path, region, request, columns, probe).await
-                .map(|page| (page, None));
+        Err(error) if error.code == "rtdb/memory-budget-exceeded"
+            && (retained.take().is_some() || !probe.fields.is_empty()) =>
+        {
+            return read_page_capturing(context, owner, relation, path, region, &request, projection, Some(probe), false, &mut None)
+                .await.map(|(page, _)| (page, None));
         }
         result => result?,
     };
@@ -490,7 +500,7 @@ pub async fn open_probe(
 
 async fn read_page_capturing(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
-    region: &PreparedRegion, request: &Request<'_>, projection: Projection<'_>, probe: Option<crate::Probe<'_>>,
+    region: &PreparedRegion, request: &Request<'_>, projection: Projection<'_>, probe: Option<crate::Probe<'_>>, defer: bool,
     retained: &mut Option<MatchBuilder>,
 ) -> Result<(Page, DocumentColumns)> {
     let nearest = matches!(region.predicate, Predicate::Nearest { .. });
@@ -510,7 +520,7 @@ async fn read_page_capturing(
     let mut point_intersects = probe.is_some_and(|probe| probe.certify_point && probe.point_column.is_some());
     let (projection_layout, document_columns) = visit_matches(
         Arc::clone(&context), owner, relation, path, region, request, projection, retained.is_some(),
-        probe.filter(|probe| probe.certify_point).and_then(|probe| probe.point_column), |source, row, id, iid, distance_m, certified| {
+        probe, defer, |source, fallback, row, id, iid, distance_m, certified| {
                 point_intersects &= certified;
                 if let Some(matches) = retained
                     && !iid.is_some_and(|iid| matches.push(id, iid).is_ok())
@@ -523,7 +533,7 @@ async fn read_page_capturing(
                         selected.pop();
                         more = true;
                     }
-                    selected.insert(index, SelectedHit { source: Arc::clone(source), row, distance_m });
+                    selected.insert(index, SelectedHit { source: Arc::clone(source), probe: fallback.cloned(), row, distance_m });
                 } else {
                     more = true;
                 }
@@ -552,7 +562,7 @@ async fn read_page_capturing(
                     crate::probe::summarize(&selected, columns, probe, evidence, &context.memory),
                 result => result,
             };
-            gather_selected(&selected, summarized.as_deref().unwrap_or(columns), &context.memory)?
+            crate::probe::gather(&selected, summarized.as_deref().unwrap_or(columns), &context.memory)?
         } else {
             gather_selected(&selected, columns, &context.memory)?
         }
@@ -596,7 +606,7 @@ pub async fn gather_document(
             if system_from.value(row_index) != revision.0 {
                 return Err(missing());
             }
-            selected = Some(SelectedHit { source: Arc::clone(&source), row, distance_m: None });
+            selected = Some(SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: None });
         }
     }
     let hit = selected.ok_or_else(missing)?;
@@ -655,8 +665,8 @@ impl PreparedRange {
             return Err(kernel::invalid("Invalid spatial page size or continuation"));
         }
         let mut matches = MatchBuilder::new(&context.memory, Retention::Range)?;
-        let (_, columns) = visit_matches(Arc::clone(&context), owner, relation, path, region, request, Projection::Identities, true, None,
-            |_, _, id, iid, _, _| matches.push(id, iid.ok_or_else(inconsistent_projection)?),
+        let (_, columns) = visit_matches(Arc::clone(&context), owner, relation, path, region, request, Projection::Identities, true, None, false,
+            |_, _, _, id, iid, _, _| matches.push(id, iid.ok_or_else(inconsistent_projection)?),
         ).await?;
         let matches = matches.finish(|| context.check_cancelled())?;
         Ok(Self { matches, relation: relation.clone(), valid_at: request.valid_at, columns })
@@ -682,8 +692,16 @@ impl PreparedRange {
         let selection = (start..end)
             .map(|position| self.matches.get(position))
             .collect::<Result<Vec<_>>>()?;
-        super::nearest::gather_range(context, owner, &self.relation, self.valid_at, projection,
-            &self.columns, &selection, end < self.matches.len(), probe).await
+        let result = super::nearest::gather_range(
+            Arc::clone(&context), owner, &self.relation, self.valid_at, projection,
+            &self.columns, &selection, end < self.matches.len(), probe, true,
+        ).await;
+        match result {
+            Err(error) if probe.is_some_and(|probe| !probe.fields.is_empty()) && error.code == "rtdb/memory-budget-exceeded" =>
+                super::nearest::gather_range(context, owner, &self.relation, self.valid_at, projection,
+                    &self.columns, &selection, end < self.matches.len(), probe, false).await,
+            result => result,
+        }
     }
 }
 
@@ -702,8 +720,9 @@ pub(super) async fn visit_matches(
     request: &Request<'_>,
     projection: Projection<'_>,
     include_iid: bool,
-    certify_point_column: Option<&str>,
-    mut visit: impl FnMut(&Arc<OwnedBatch>, usize, EntityIdRef<'_>, Option<Iid>, Option<f64>, bool) -> Result<()>,
+    probe: Option<crate::Probe<'_>>,
+    defer: bool,
+    mut visit: impl FnMut(&Arc<OwnedBatch>, Option<&Arc<crate::probe::DeferredPage>>, usize, EntityIdRef<'_>, Option<Iid>, Option<f64>, bool) -> Result<()>,
 ) -> Result<(Option<(rtdb_plan::Schema, Vec<usize>)>, DocumentColumns)> {
     let definition =
         definition::held_definition(Arc::clone(&context), owner, relation, path).await?;
@@ -712,7 +731,7 @@ pub(super) async fn visit_matches(
             "Spatial read binds more than its declared equality partition",
         ));
     }
-    let certify_points = certify_point_column == Some(definition.geometry.as_str())
+    let certify_points = probe.filter(|probe| probe.certify_point).and_then(|probe| probe.point_column) == Some(definition.geometry.as_str())
         && definition.encoding == SpatialGeometryEncoding::BijectionGeometry
         && request.partition.len() == definition.partition.len()
         && matches!(region.predicate, Predicate::Topology(geometry::predicates::TopologyPredicate::Intersects))
@@ -818,7 +837,9 @@ pub(super) async fn visit_matches(
         return Ok((None, columns));
     };
     let mut refined = 0;
-    while let Some(source) = cursor.next_batch().await? {
+    let geometry = refined_geometry.then_some(columns.geometry.as_str());
+    let early_probe = probe.filter(|_| defer);
+    while let Some((source, fallback)) = crate::probe::next_batch(&mut cursor, early_probe, geometry, &columns.partition).await? {
         let source = Arc::new(source);
         let batch = source.batch();
         let iids = if include_iid {
@@ -864,7 +885,7 @@ pub(super) async fn visit_matches(
                 Some(None)
             };
             if let Some(distance_m) = exact {
-                visit(&source, row, id, iids.as_ref().map(|iids| iids.get(row)).transpose()?, distance_m, certified)?;
+                visit(&source, fallback.as_ref(), row, id, iids.as_ref().map(|iids| iids.get(row)).transpose()?, distance_m, certified)?;
             }
         }
     }
@@ -1025,7 +1046,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![ids]).unwrap();
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
         let selected = [2.0, 2.0, 3.0].into_iter().enumerate().map(|(row, distance_m)| SelectedHit {
-            source: Arc::clone(&source), row, distance_m: Some(distance_m),
+            source: Arc::clone(&source), probe: None, row, distance_m: Some(distance_m),
         }).collect::<Vec<_>>();
 
         assert_eq!(selection_position(&selected, EntityIdRef::Keyword("same"), Some(2.0))?, 1);
@@ -1062,7 +1083,7 @@ mod tests {
             Arc::new(StringArray::from(vec![Some("a"), None, Some("present"), Some("d")])),
         ]).unwrap();
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
-        let hit = |row| SelectedHit { source: Arc::clone(&source), row, distance_m: None };
+        let hit = |row| SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: None };
         let projection = [0, 3, 4, 2];
         let output = gather_selected(&[hit(1), hit(2)], &projection, &memory)?.unwrap();
         assert!(Arc::ptr_eq(output.reservation(), source.reservation()));
@@ -1123,7 +1144,7 @@ mod tests {
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
         let charged = source.reservation().bytes();
         assert!(charged > MAX_UNUSED_SLICE_BYTES);
-        let hits = [0, 1, 2].map(|row| SelectedHit { source: Arc::clone(&source), row, distance_m: None });
+        let hits = [0, 1, 2].map(|row| SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: None });
         let output = gather_selected(&hits, &[0], &memory)?.unwrap();
         assert!(Arc::ptr_eq(output.reservation(), source.reservation()));
 
@@ -1163,7 +1184,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("list", lists.data_type().clone(), true)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(lists)]).unwrap();
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
-        let hit = |row| SelectedHit { source: Arc::clone(&source), row, distance_m: None };
+        let hit = |row| SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: None };
         let slice = gather_selected(&[hit(1), hit(2)], &[0], &memory)?.unwrap();
         let full = gather_selected(&[hit(0), hit(1), hit(2)], &[0], &memory)?.unwrap();
         assert!(!Arc::ptr_eq(slice.reservation(), source.reservation()));
@@ -1189,7 +1210,7 @@ mod tests {
         let payloads = BinaryArray::from(vec![unused.as_slice(), b"a", b"b"]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(payloads)]).unwrap();
         let source = Arc::new(OwnedBatch::new(batch, &memory)?);
-        let hits = [1, 2].map(|row| SelectedHit { source: Arc::clone(&source), row, distance_m: None });
+        let hits = [1, 2].map(|row| SelectedHit { source: Arc::clone(&source), probe: None, row, distance_m: None });
         let output = gather_selected(&hits, &[0], &memory)?.unwrap();
         assert!(!Arc::ptr_eq(output.reservation(), source.reservation()));
         drop(hits);

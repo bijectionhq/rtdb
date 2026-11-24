@@ -1490,7 +1490,8 @@ async fn check_hosted_effect_positions() {
 }
 
 async fn check_spatial_pages_at_the_original_cut() {
-    use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, UnionArray, builder::{BinaryBuilder, Int64Builder, ListBuilder, StringBuilder}};
+    use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, ListArray, StructArray, UnionArray, builder::{BinaryBuilder, Int64Builder, ListBuilder, StringBuilder}};
+    use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_ipc::{reader::StreamReader, writer::IpcWriteOptions};
     use rtdb_format::ipc::write_arrow_stream;
 
@@ -1549,7 +1550,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     fn query_window(
         hold: &[u8], path: &str, valid: i64, after: Option<&str>, region: &[u8],
         predicate: &str, document_columns: Option<ArrayRef>, window: Option<(f64, Option<f64>)>,
-        probe: Option<(&[&str], Option<&str>)>,
+        probe: Option<(&[&str], Option<&str>, i64)>,
     ) -> Bytes {
         let mut body = hold.to_vec();
         frame(&mut body, "places");
@@ -1562,7 +1563,7 @@ async fn check_spatial_pages_at_the_original_cut() {
             ("region", Arc::new(BinaryArray::from(vec![region]))),
             ("predicate", Arc::new(StringArray::from(vec![predicate]))),
             ("valid_micros", Arc::new(Int64Array::from(vec![valid]))),
-            ("limit", Arc::new(Int64Array::from(vec![1]))),
+            ("limit", Arc::new(Int64Array::from(vec![probe.map_or(1, |(_, _, limit)| limit)]))),
             ("observe", Arc::new(BooleanArray::from(vec![false]))),
             ("reported_center", Arc::new(BooleanArray::from(vec![false]))),
             ("radius_m", Arc::new(Float64Array::from(vec![window.and_then(|(_, radius)| radius)]))),
@@ -1574,7 +1575,7 @@ async fn check_spatial_pages_at_the_original_cut() {
         if let Some((after_radius, _)) = window {
             columns.push(("after_radius_m", Arc::new(Float64Array::from(vec![after_radius]))));
         }
-        if let Some((omittable, point_column)) = probe {
+        if let Some((omittable, point_column, _)) = probe {
             columns.push(("omittable_columns", select(omittable)));
             columns.push(("point_column", Arc::new(StringArray::from(vec![point_column]))));
         }
@@ -1587,8 +1588,21 @@ async fn check_spatial_pages_at_the_original_cut() {
     let mut relation = Vec::new();
     frame(&mut relation, "places");
     let mut schema = relation.clone();
-    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"c_location","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"c_mixed","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"c_payload","type":{"kind":"binary"},"optional":true,"nullable":false}]}"#);
-    client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
+    schema.extend_from_slice(br#"{"version":2,"fields":[
+        {"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},
+        {"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},
+        {"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false},
+        {"name":"c_location","type":{"kind":"binary"},"optional":true,"nullable":false},
+        {"name":"c_mixed","type":{"kind":"binary"},"optional":true,"nullable":false},
+        {"name":"c_payload","type":{"kind":"binary"},"optional":true,"nullable":false},
+        {"name":"c_compound","type":{"kind":"struct","fields":[
+            {"name":"v2_value","type":{"kind":"list","element":{"kind":"struct","fields":[
+                {"name":"is_present_note","type":{"kind":"bool"},"optional":false,"nullable":false},
+                {"name":"value_note","type":{"kind":"utf8"},"optional":false,"nullable":true}
+            ]}},"optional":false,"nullable":true}
+        ]},"optional":true,"nullable":false}
+    ]}"#);
+    client.action("rtdb.owned.DeclareRelation.v2", schema.into()).await.unwrap();
 
     let path = "by_location";
     for (path, geometry) in [(path, "location"), ("by_unwritten", "never_written")] {
@@ -1614,6 +1628,21 @@ async fn check_spatial_pages_at_the_original_cut() {
         client.action("rtdb.owned.DeclareSpatialPath.v2", declaration.into()).await.unwrap();
     }
 
+    let items = StructArray::from(vec![
+        (Arc::new(Field::new("is_present_note", DataType::Boolean, false)), Arc::new(BooleanArray::from(vec![true, false])) as ArrayRef),
+        (Arc::new(Field::new("value_note", DataType::Utf8, true)), Arc::new(StringArray::from(vec!["é", "hidden"])) as ArrayRef),
+    ]);
+    let lists = ListArray::new(
+        Arc::new(Field::new("item", items.data_type().clone(), false)),
+        OffsetBuffer::new(vec![0, 1, 2, 2, 2].into()),
+        Arc::new(items),
+        Some(NullBuffer::from(vec![true, true, false, false])),
+    );
+    let compound = StructArray::new(
+        vec![Field::new("v2_value", lists.data_type().clone(), true)].into(),
+        vec![Arc::new(lists)],
+        Some(NullBuffer::from(vec![true, true, false, true])),
+    );
     let mut insert = relation.clone();
     ipc(&mut insert, [
         ("_id", Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef),
@@ -1626,6 +1655,7 @@ async fn check_spatial_pages_at_the_original_cut() {
         ("c_payload", Arc::new(BinaryArray::from(vec![
             Some(&b"\x09first\0\x01"[..]), Some(&b"\x09old\0\x01"[..]), None, Some(&[2_u8][..]),
         ]))),
+        ("c_compound", Arc::new(compound)),
     ]);
     client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
 
@@ -1656,7 +1686,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     client.action("rtdb.owned.DropSpatialPath.v1", relation.into()).await.unwrap();
 
     let legacy = query_window(hold, path, valid, None, &point(2.0), "intersects",
-        Some(select(&["c_location"])), None, Some((&["c_location"], Some("c_location"))));
+        Some(select(&["c_location"])), None, Some((&["c_location"], Some("c_location"), 1)));
     let reply = client.action("rtdb.owned.SpatialProbe.v1", legacy).await.unwrap();
     let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
     assert!(!stream.schema().metadata().contains_key("rtdb.owned.spatial_exact"));
@@ -1666,8 +1696,8 @@ async fn check_spatial_pages_at_the_original_cut() {
     assert!(document.column_by_name("c_location").is_some());
 
     let request = query_window(hold, canonical_path, valid, None, &point(1.0), "intersects",
-        Some(select(&["c_location", "c_payload", "borough"])), None,
-        Some((&["c_location", "c_payload"], Some("c_location"))));
+        Some(select(&["c_location", "c_payload", "c_compound", "borough"])), None,
+        Some((&["c_location", "c_payload", "c_compound"], Some("c_location"), 1)));
     let reply = client.action("rtdb.owned.SpatialProbe.v1", request).await.unwrap();
     let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
     let schema = stream.schema();
@@ -1679,7 +1709,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     assert_eq!(document.column_names(), ["borough", "_system_from"]);
     let sizes = first.column_by_name("omitted_sizes").unwrap().as_any()
         .downcast_ref::<arrow_array::StructArray>().unwrap();
-    for (name, value) in [("c_location", 46), ("c_payload", 7)] {
+    for (name, value) in [("c_location", 46), ("c_payload", 7), ("c_compound", 13)] {
         let size = sizes.column_by_name(name).unwrap().as_any().downcast_ref::<arrow_array::UInt32Array>().unwrap();
         assert_eq!(size.value(0), value);
     }
@@ -1696,6 +1726,13 @@ async fn check_spatial_pages_at_the_original_cut() {
         rtdb_columnar::EntityIdRef::String("b"));
     let document = second.column_by_name("document").unwrap().as_any()
         .downcast_ref::<arrow_array::StructArray>().unwrap();
+    let compound = document.column_by_name("c_compound").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+    let list = compound.column(0).as_any().downcast_ref::<ListArray>().unwrap().value(0);
+    let item = list.as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(!item.column(0).as_any().downcast_ref::<BooleanArray>().unwrap().value(0));
+    assert_eq!(item.column(1).as_any().downcast_ref::<StringArray>().unwrap().value(0), "hidden");
+    let sizes = second.column_by_name("omitted_sizes").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+    assert!(sizes.column_by_name("c_compound").is_none());
     let revision = document.column_by_name("_system_from").unwrap().as_any()
         .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap().value(0);
 
@@ -1727,9 +1764,28 @@ async fn check_spatial_pages_at_the_original_cut() {
         tonic::Code::Internal);
     client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
 
+    let request = query_window(hold, canonical_path, valid, None, &point(1.0), "intersects",
+        Some(select(&["c_compound"])), None, Some((&["c_compound"], None, 2)));
+    let reply = client.action("rtdb.owned.SpatialProbe.v1", request).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    let page = stream.next().unwrap().unwrap();
+    assert!(page.column_by_name("omitted_sizes").is_none());
+    let document = page.column_by_name("document").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+    let compound = document.column_by_name("c_compound").unwrap().as_any().downcast_ref::<StructArray>().unwrap();
+    let lists = compound.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    for (row, expected) in ["é", "hidden"].into_iter().enumerate() {
+        let list = lists.value(row);
+        let item = list.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(item.column(1).as_any().downcast_ref::<StringArray>().unwrap().value(0), expected);
+    }
+    let token = uuid::Uuid::parse_str(&stream.schema().metadata()["rtdb.owned.spatial_filter"]).unwrap();
+    let mut capability = hold.to_vec();
+    capability.extend_from_slice(token.as_bytes());
+    client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
+
     let request = query_window(hold, mixed_path, valid, None, &point(1.0), "intersects",
-        Some(select(&["c_mixed", "c_payload", "borough"])), None,
-        Some((&["c_mixed", "c_payload"], Some("c_mixed"))));
+        Some(select(&["c_mixed", "c_payload", "c_compound", "borough"])), None,
+        Some((&["c_mixed", "c_payload", "c_compound"], Some("c_mixed"), 1)));
     let reply = client.action("rtdb.owned.SpatialProbe.v1", request).await.unwrap();
     let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
     assert!(!stream.schema().metadata().contains_key("rtdb.owned.spatial_exact"));
@@ -1762,9 +1818,10 @@ async fn check_spatial_pages_at_the_original_cut() {
             assert!(document.column_by_name("c_mixed").is_some());
             let sizes = last.column_by_name("omitted_sizes").unwrap().as_any()
                 .downcast_ref::<arrow_array::StructArray>().unwrap();
-            let size = sizes.column_by_name("c_payload").unwrap().as_any()
-                .downcast_ref::<arrow_array::UInt32Array>().unwrap();
-            assert_eq!(size.value(0), 1);
+            for field in ["c_payload", "c_compound"] {
+                let size = sizes.column_by_name(field).unwrap().as_any().downcast_ref::<arrow_array::UInt32Array>().unwrap();
+                assert_eq!(size.value(0), 1);
+            }
         }
     }
     client.action("rtdb.owned.SpatialClose.v1", mixed_capability.into()).await.unwrap();

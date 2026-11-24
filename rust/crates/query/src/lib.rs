@@ -90,6 +90,7 @@ mod owned_unique;
 mod owned_range;
 mod owned_range_order;
 pub use owned_range::{verify_owned_entity_region, verify_owned_fixed_range};
+pub use cursor::{SpatialProbeCells, SpatialProbeFallback};
 pub use owned_relation::{OwnedSpatialScan, open_native_spatial_builds, open_owned_spatial_refinement};
 pub use owned_unique::{OwnedUniqueHit, OwnedUniquePolicy, OWNED_UNIQUE_KEY_MAX, OWNED_UNIQUE_PATHS_MAX, OWNED_UNIQUE_POLICY_ID, lookup_owned_unique, owned_unique_key_id, owned_unique_path_key, read_owned_unique_policy};
 pub use owned_relation::{
