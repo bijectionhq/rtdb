@@ -2571,6 +2571,28 @@ impl OwnedReadSession {
         Ok((hits, witnesses))
     }
 
+    /// Ranks the selected clear vectors by exact cosine distance at this read's cut.
+    #[cfg(feature = "search")]
+    pub async fn nearest_batch(
+        &self, partitions: &[rtdb_search::NearestPartition], query: &rtdb_search::NearestQuery,
+        observe: bool, valid: Option<Timestamp>, overlay: Option<rtdb_search::HeldVectorOverlay>,
+    ) -> Result<(rtdb_search::OwnedSearchBatch, Vec<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let relations = || partitions.iter().map(|partition| &partition.relation);
+        let work = rtdb_search::owned_nearest_batch(self.guard_context(Arc::clone(&self.context), relations())?, &self.owner, partitions, query, valid, overlay);
+        let hits = self.context.reading(work).await?;
+        let mut witnesses = Vec::with_capacity(partitions.len());
+        if observe {
+            for relation in relations() {
+                if let Some(witness) = self.relation_witness(relation)? {
+                    witnesses.push(witness);
+                }
+            }
+        }
+        self.check_relations(relations())?;
+        Ok((hits, witnesses))
+    }
+
     /// Observe the retained parent and, for a held world, the complete local overlay relation.
     pub async fn world_relation_witnesses<'a>(
         &self, world: rtdb_types::Iid, relations: impl IntoIterator<Item = &'a rtdb_types::OwnedRelation>,

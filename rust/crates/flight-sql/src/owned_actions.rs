@@ -345,6 +345,7 @@ pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRan
 pub(crate) const SEARCH_HELD_WORLD_AT_V1: &str = "rtdb.owned.SearchHeldWorldAt.v1";
 pub(crate) const SEARCH_HELD_WORLD_V2: &str = "rtdb.owned.SearchHeldWorld.v2";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
+pub(crate) const NEAREST_HELD_OWNED_V1: &str = "rtdb.owned.NearestHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -648,6 +649,74 @@ fn owned_rank_request<'a>(call: &Call, request: &'a [u8]) -> Result<OwnedRankReq
     if query.len() > 4096 { return Err(invalid("Owned held search query exceeds its size bound")); }
     let query = std::str::from_utf8(query).map_err(arrow)?;
     Ok(OwnedRankRequest { partitions, frame_len, offset, limit, observe, query, _reservation: reservation })
+}
+
+struct OwnedNearestRequest {
+    partitions: Vec<rtdb_node::nearest::NearestPartition>,
+    query: rtdb_node::nearest::NearestQuery,
+    observe: bool,
+    _reservation: Arc<MemoryReservation>,
+}
+
+fn owned_nearest_request(call: &Call, request: &[u8]) -> Result<OwnedNearestRequest, Status> {
+    use rtdb_node::nearest::{MAX_NEAREST_DIMENSIONS, MAX_NEAREST_FILTERS, MAX_NEAREST_FILTER_BYTES, MAX_NEAREST_FILTER_VALUES, MAX_NEAREST_K};
+    let (&filters, rest) = request.split_first().ok_or_else(|| invalid("Owned held nearest has no filter count"))?;
+    let filters = usize::from(filters);
+    if filters > MAX_NEAREST_FILTERS { return Err(invalid("Owned held nearest filter count is out of range")); }
+    let (count, mut rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest has no partition count"))?;
+    let count = usize::from(u16::from_be_bytes(*count));
+    if !(1..=32).contains(&count) { return Err(invalid("Owned held nearest partition count is out of range")); }
+    let reservation = call.reserve(count * 512 * (2 + filters))?;
+    let mut partitions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (relation, tail) = split_relation(rest)?;
+        let (vector, tail) = split_relation(tail)?;
+        rest = tail;
+        let mut columns = Vec::with_capacity(filters);
+        for _ in 0..filters {
+            let (column, tail) = split_relation(rest)?;
+            columns.push(column.name().to_owned());
+            rest = tail;
+        }
+        partitions.push(rtdb_node::nearest::NearestPartition { relation, vector: vector.name().to_owned(), filters: columns });
+    }
+    let distinct = partitions.iter().map(|partition| &partition.relation).collect::<BTreeSet<_>>();
+    if distinct.len() != partitions.len() { return Err(invalid("An owned nearest relation must be selected once")); }
+    let mut values = Vec::with_capacity(filters);
+    for _ in 0..filters {
+        let (length, tail) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest filter has no value count"))?;
+        let length = usize::from(u16::from_be_bytes(*length));
+        if !(1..=MAX_NEAREST_FILTER_VALUES).contains(&length) { return Err(invalid("Owned held nearest filter value count is out of range")); }
+        rest = tail;
+        let mut allowed = BTreeSet::new();
+        for _ in 0..length {
+            let (size, tail) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest filter value has no length"))?;
+            let size = usize::from(u16::from_be_bytes(*size));
+            if size > MAX_NEAREST_FILTER_BYTES { return Err(invalid("Owned held nearest filter value exceeds its size bound")); }
+            let (value, tail) = tail.split_at_checked(size).ok_or_else(|| invalid("Owned held nearest filter value is truncated"))?;
+            allowed.insert(value.to_vec());
+            rest = tail;
+        }
+        values.push(allowed);
+    }
+    let (settings, rest) = rest.split_first_chunk::<3>().ok_or_else(|| invalid("Owned held nearest requires a limit and evidence flag"))?;
+    let k = usize::from(u16::from_be_bytes([settings[0], settings[1]]));
+    if !(1..=MAX_NEAREST_K).contains(&k) { return Err(invalid("Owned held nearest limit is out of range")); }
+    let observe = match settings[2] {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid("Invalid owned held nearest evidence flag")),
+    };
+    let (dimensions, rest) = rest.split_first_chunk::<2>().ok_or_else(|| invalid("Owned held nearest has no dimension count"))?;
+    let dimensions = usize::from(u16::from_be_bytes(*dimensions));
+    if !(1..=MAX_NEAREST_DIMENSIONS).contains(&dimensions) || rest.len() != dimensions * 4 {
+        return Err(invalid("Owned held nearest probe does not match its dimension count"));
+    }
+    let probe = rest.chunks_exact(4)
+        .map(|bytes| f32::from_be_bytes(bytes.try_into().expect("four-byte probe component")))
+        .collect::<Vec<_>>();
+    let query = rtdb_node::nearest::NearestQuery::new(probe, values, k).map_err(status)?;
+    Ok(OwnedNearestRequest { partitions, query, observe, _reservation: reservation })
 }
 
 fn owned_rank_scope(domain: &[u8], frame: &[u8], query: &str) -> String {
@@ -3500,6 +3569,107 @@ impl Service {
             ).map_err(status)?;
         }
         Ok(corpus)
+    }
+
+    pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held nearest has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (valid, request) = request.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Held nearest has no valid instant"))?;
+        let valid = i64::from_be_bytes(*valid);
+        let valid = (valid != i64::MIN).then_some(Timestamp(valid));
+        if let Some(valid) = valid { rtdb_types::Interval::at(valid).map_err(status)?; }
+        let (length, request) = request.split_first_chunk::<4>()
+            .ok_or_else(|| invalid("Held nearest has no overlay length"))?;
+        let (ipc, request) = request.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Held nearest has a truncated overlay"))?;
+        let (overlay, staged_scope) = if ipc.is_empty() {
+            (None, None)
+        } else {
+            if valid.is_some() { return Err(invalid("A staged nearest read requires current validity")); }
+            self.hosted_control_policy(call)?;
+            let scope = self.hosted_control_scope(call).await?;
+            (Some(request_batch(call, ipc)?), Some(scope))
+        };
+        let nearest = owned_nearest_request(call, request)?;
+        if overlay.is_some() && !nearest.observe {
+            return Err(invalid("Staged nearest requires original evidence"));
+        }
+        let overlay = overlay.as_ref()
+            .map(|input| self.nearest_shadows(&nearest, input.batch()))
+            .transpose()?;
+        let (page, witnesses) = held.snapshot.nearest_batch(
+            &nearest.partitions, &nearest.query, nearest.observe, valid, overlay,
+        ).await.map_err(status)?;
+        if let Some(scope) = staged_scope {
+            if witnesses.len() != nearest.partitions.len()
+                || witnesses.iter().any(|witness| !witness.matches_scope(Some(scope)))
+            {
+                return Err(Status::failed_precondition("Staged nearest did not retain its original placed corpus"));
+            }
+        }
+        let mut nonces = Vec::new();
+        if !witnesses.is_empty() {
+            if witnesses.len() != nearest.partitions.len() { return Err(Status::internal("Incomplete owned nearest evidence")); }
+            for (partition, witness) in nearest.partitions.iter().zip(witnesses) {
+                nonces.push(held.remember(call, &partition.relation, witness)?);
+            }
+        }
+        let present = held.snapshot.present().system_time;
+        let scope = owned_rank_scope(b"rtdb.owned.nearest.held.v1\0", body, "");
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present))?;
+        held.snapshot.check_relations(nearest.partitions.iter().map(|partition| &partition.relation)).map_err(status)?;
+        Ok(reply)
+    }
+
+    fn nearest_shadows(&self, nearest: &OwnedNearestRequest, input: &RecordBatch) -> Result<rtdb_node::nearest::HeldVectorOverlay, Status> {
+        let filters = nearest.query.filter_count();
+        let malformed = || invalid("Invalid staged nearest overlay layout");
+        if !(1..=rtdb_node::nearest::MAX_NEAREST_SHADOWS).contains(&input.num_rows()) || input.num_columns() != 3 + filters {
+            return Err(invalid("Staged nearest requires bounded rows and its filter columns"));
+        }
+        let partitions = input.column_by_name("partition").and_then(|c| c.as_any().downcast_ref::<UInt64Array>()).ok_or_else(malformed)?;
+        let ids = input.column_by_name("_id").and_then(|c| c.as_any().downcast_ref::<StringArray>()).ok_or_else(malformed)?;
+        let vectors = input.column_by_name("vector").and_then(|c| c.as_any().downcast_ref::<ListArray>()).ok_or_else(malformed)?;
+        let components = vectors.values().as_any().downcast_ref::<arrow_array::Float32Array>().ok_or_else(malformed)?;
+        let filter_columns = (0..filters).map(|ordinal| {
+            input.column_by_name(&format!("filter_{ordinal}"))
+                .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+                .ok_or_else(malformed)
+        }).collect::<Result<Vec<_>, _>>()?;
+        let mut overlay = rtdb_node::nearest::HeldVectorOverlay::new(self.memory()).map_err(status)?;
+        for row in 0..input.num_rows() {
+            if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
+                || partitions.value(row) >= nearest.partitions.len() as u64
+            {
+                return Err(invalid("Invalid staged nearest identity"));
+            }
+            let vector = if vectors.is_null(row) {
+                None
+            } else {
+                let range = vectors.value_offsets()[row] as usize..vectors.value_offsets()[row + 1] as usize;
+                if range.len() != nearest.query.dimensions() || range.clone().any(|index| components.is_null(index)) {
+                    return Err(invalid("A staged nearest vector does not have the probe's dimensions"));
+                }
+                Some(range.map(|index| components.value(index)).collect::<Vec<f32>>())
+            };
+            let cells = filter_columns.iter()
+                .map(|column| (!column.is_null(row)).then(|| column.value(row).to_vec()))
+                .collect();
+            overlay.shadow(
+                partitions.value(row) as usize,
+                rtdb_types::EntityId::String(ids.value(row).to_owned()),
+                vector,
+                cells,
+            ).map_err(status)?;
+        }
+        Ok(overlay)
     }
 
     pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {

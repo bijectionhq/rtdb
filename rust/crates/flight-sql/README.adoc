@@ -498,6 +498,22 @@ Every selected partition must have complete format 11 search artefacts at the he
 A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
 An overlay requires the configured placed hosted-control owner, the live Root validity and requested evidence. One Arrow batch carries `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8` for one to 64 exact staged shadows. Null text masks the old run. The whole-relation witnesses still describe the original source.
 
+`rtdb.owned.NearestHeld.v1` ranks clear stored vectors by exact cosine distance at a held cut.
+It takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, then a big-endian u32 overlay byte length and the optional Arrow overlay bytes.
+Next comes a filter count byte F (0 to 8) and a big-endian u16 partition count (1 to 32).
+Each partition is a relation prefix, a vector column prefix and F filter column prefixes, all framed like relation prefixes; relations are distinct.
+Each filter then carries a big-endian u16 value count (1 to 64) and that many values, each a big-endian u16 length (at most 1024) and its bytes.
+A big-endian u16 k (1 to 256) and an evidence flag byte (0 or 1) follow, then a big-endian u16 dimension count D (1 to 4096) and D big-endian IEEE-754 f32 probe components, which must be finite with a nonzero norm.
+A vector column holds a list of numbers; a missing cell or a zero-norm vector is not a candidate, and a vector with other than D finite components refuses with `rtdb.owned/nearest-dimension`.
+A filter column holds Binary values; a row passes when every filter column is present and byte-equal to one of that filter's values.
+The distance is `1 - dot(a, b) / (|a| |b|)` in f64, and the reply keeps the first k candidates by ascending distance, then complete typed identity, then partition ordinal.
+The scan admits at most 100,000 candidates and otherwise refuses with `rtdb.owned/nearest-scan-limit`.
+The reply has `_id` as in SearchHeld.v5, `distance: Float64` and `partition: UInt64`, with the held present and valid instant, `rtdb.owned.search_total` (the candidates that passed the filters) and `rtdb.owned.search_witnesses` as in SearchHeld.v5.
+`rtdb.owned.search_scope` is the lowercase hex SHA-256 of the domain tag `rtdb.owned.nearest.held.v1` and a NUL byte followed by the complete request body.
+An overlay has the same admission as SearchHeld.v5.
+One Arrow batch carries `partition: UInt64`, `_id: Utf8`, nullable `vector: List<Float32>` and nullable Binary `filter_0` to `filter_{F-1}` for one to 64 exact staged shadows.
+Each shadow masks the stored row with its identity, and a shadow with a vector is itself a candidate.
+
 === Owned spatial paths
 
 Send `rtdb.owned.DeclareSpatialPath.v1` with the relation prefix and one Arrow row with `_id: Utf8` and `columns: List<Utf8>`.
