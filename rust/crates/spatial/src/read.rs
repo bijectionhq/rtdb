@@ -11,12 +11,13 @@ use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_storage::ObjectKey;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedRelation, Result, SpatialGeometryEncoding, Timestamp};
 
 use crate::{
     Predicate, Projection, definition,
     kernel::{self, Location},
     postings::{self, Partition},
+    range_matches::{MatchBuilder, RetainedMatches, Retention},
 };
 
 const MAX_CANDIDATES: usize = 65_536;
@@ -24,9 +25,6 @@ const MAX_REFINED_ROWS: usize = 65_536;
 const MAX_UNINDEXED_BYTES: u64 = 64 << 20;
 const MAX_UNINDEXED_ROWS: usize = 65_536;
 const MAX_INDEXED_BYTES: u64 = 256 << 20;
-const MAX_PROBE_MATCHES: usize = 4096;
-const MAX_PROBE_MATCH_BYTES: usize = 512 << 10;
-const PROBE_MATCH_OVERHEAD: usize = 4096;
 
 pub struct Request<'a> {
     pub partition: Vec<Cow<'a, [u8]>>,
@@ -368,7 +366,7 @@ pub async fn open_probe(
     region: &PreparedRegion, request: Request<'_>, columns: &[&str], probe: crate::Probe<'_>,
 ) -> Result<(Page, Option<PreparedProbe>)> {
     let mut retained = if matches!(request.page, PageOrder::Identity { after: None }) {
-        ProbeMatches::new(&context.memory)
+        MatchBuilder::new(&context.memory, Retention::Probe).ok()
     } else {
         None
     };
@@ -382,21 +380,18 @@ pub async fn open_probe(
         }
         result => result?,
     };
-    let matches = retained.and_then(|mut retained| {
-        retained.matches.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        if retained.matches.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return None;
-        }
-        let certified_point_column = probe.point_column
-            .filter(|_| page.certifies_point_intersects()).map(str::to_owned);
-        Some(PreparedProbe {
+    let matches = if let Some(retained) = retained {
+        let matches = retained.finish(|| context.check_cancelled())?;
+        (!matches.has_ties()).then(|| PreparedProbe {
             range: PreparedRange {
-                matches: retained.matches, relation: relation.clone(), valid_at: request.valid_at,
-                columns, _reservation: retained.reservation,
+                matches, relation: relation.clone(), valid_at: request.valid_at, columns,
             },
-            certified_point_column,
+            certified_point_column: probe.point_column
+                .filter(|_| page.certifies_point_intersects()).map(str::to_owned),
         })
-    });
+    } else {
+        None
+    };
     context.check_cancelled()?;
     Ok((page, matches))
 }
@@ -404,7 +399,7 @@ pub async fn open_probe(
 async fn read_page_capturing(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
     region: &PreparedRegion, request: &Request<'_>, projection: Projection<'_>, probe: Option<crate::Probe<'_>>,
-    retained: &mut Option<ProbeMatches>,
+    retained: &mut Option<MatchBuilder>,
 ) -> Result<(Page, DocumentColumns)> {
     let nearest = matches!(region.predicate, Predicate::Nearest { .. });
     let valid_order = match request.page {
@@ -426,7 +421,7 @@ async fn read_page_capturing(
         probe.filter(|probe| probe.certify_point).and_then(|probe| probe.point_column), |source, row, id, iid, distance_m, certified| {
                 point_intersects &= certified;
                 if let Some(matches) = retained
-                    && !iid.is_some_and(|iid| matches.push(id, iid))
+                    && !iid.is_some_and(|iid| matches.push(id, iid).is_ok())
                 {
                     *retained = None;
                 }
@@ -481,44 +476,6 @@ async fn read_page_capturing(
         _distance_reservation: reservation,
         probe: evidence,
     }, document_columns))
-}
-
-struct ProbeMatches {
-    matches: Vec<(EntityId, Iid)>,
-    payload_bytes: usize,
-    reservation: Arc<MemoryReservation>,
-}
-
-impl ProbeMatches {
-    fn new(memory: &Arc<MemoryBudget>) -> Option<Self> {
-        Some(Self { matches: Vec::new(), payload_bytes: 0, reservation: memory.reserve(PROBE_MATCH_OVERHEAD).ok()? })
-    }
-
-    fn push(&mut self, id: EntityIdRef<'_>, iid: Iid) -> bool {
-        if self.matches.len() == MAX_PROBE_MATCHES {
-            return false;
-        }
-        let mut capacity = self.matches.capacity();
-        if self.matches.len() == capacity {
-            capacity = (capacity * 2).max(8);
-        }
-        let Some(payload_bytes) = self.payload_bytes.checked_add(id.owned_payload_bytes())
-            .filter(|bytes| *bytes <= MAX_PROBE_MATCH_BYTES)
-        else {
-            return false;
-        };
-        let required = PROBE_MATCH_OVERHEAD + payload_bytes + capacity * std::mem::size_of::<(EntityId, Iid)>();
-        let reservation = Arc::get_mut(&mut self.reservation).expect("probe owns its reservation");
-        if required > MAX_PROBE_MATCH_BYTES || reservation.grow_to(required).is_err() {
-            return false;
-        }
-        if capacity > self.matches.capacity() {
-            self.matches.reserve_exact(capacity - self.matches.len());
-        }
-        self.matches.push((id.into_owned(), iid));
-        self.payload_bytes = payload_bytes;
-        true
-    }
 }
 
 pub async fn gather_document(
@@ -587,11 +544,10 @@ impl PreparedProbe {
 }
 
 pub struct PreparedRange {
-    matches: Vec<(EntityId, Iid)>,
+    matches: RetainedMatches,
     relation: OwnedRelation,
     valid_at: Timestamp,
     columns: DocumentColumns,
-    _reservation: Arc<MemoryReservation>,
 }
 
 impl PreparedRange {
@@ -606,32 +562,12 @@ impl PreparedRange {
         {
             return Err(kernel::invalid("Invalid spatial page size or continuation"));
         }
-        let mut matches = Vec::new();
-        let mut reservation = context.memory.reserve(0)?;
-        let mut payload_bytes = 0usize;
+        let mut matches = MatchBuilder::new(&context.memory, Retention::Range)?;
         let (_, columns) = visit_matches(Arc::clone(&context), owner, relation, path, region, request, Projection::Identities, true, None,
-            |_, _, id, iid, _, _| {
-                let capacity = if matches.len() == matches.capacity() {
-                    (matches.capacity() * 2).max(8)
-                } else {
-                    matches.capacity()
-                };
-                payload_bytes = payload_bytes.checked_add(id.owned_payload_bytes()).ok_or_else(postings::work_limit)?;
-                let required = payload_bytes.checked_add(capacity * std::mem::size_of::<(EntityId, Iid)>())
-                    .ok_or_else(postings::work_limit)?;
-                Arc::get_mut(&mut reservation).expect("matches own their reservation").grow_to(required)?;
-                if capacity > matches.capacity() {
-                    matches.reserve_exact(capacity - matches.len());
-                }
-                matches.push((id.into_owned(), iid.ok_or_else(inconsistent_projection)?));
-                Ok(())
-            },
+            |_, _, id, iid, _, _| matches.push(id, iid.ok_or_else(inconsistent_projection)?),
         ).await?;
-        context.check_cancelled()?;
-        matches.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        context.check_cancelled()?;
-        Ok(Self { matches, relation: relation.clone(), valid_at: request.valid_at, columns,
-            _reservation: reservation })
+        let matches = matches.finish(|| context.check_cancelled())?;
+        Ok(Self { matches, relation: relation.clone(), valid_at: request.valid_at, columns })
     }
 
     pub async fn page(
@@ -648,14 +584,12 @@ impl PreparedRange {
         if !(1..=128).contains(&limit) {
             return Err(kernel::invalid("Invalid spatial page size or continuation"));
         }
-        let start = after.map_or(0, |after| self.matches.partition_point(|entry| {
-            EntityIdRef::from(&entry.0) <= after
-        }));
+        let start = after.map(|after| self.matches.seek_after(after)).transpose()?.unwrap_or(0);
         let end = (start + limit).min(self.matches.len());
         let _selection = context.memory.reserve(std::mem::size_of::<(EntityIdRef<'_>, Iid)>() * (end - start))?;
-        let selection = self.matches[start..end].iter().map(|(id, iid)| {
-            (EntityIdRef::from(id), *iid)
-        }).collect::<Vec<_>>();
+        let selection = (start..end)
+            .map(|position| self.matches.get(position))
+            .collect::<Result<Vec<_>>>()?;
         super::nearest::gather_range(context, owner, &self.relation, self.valid_at, projection,
             &self.columns, &selection, end < self.matches.len(), probe).await
     }
@@ -937,32 +871,6 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
 mod tests {
     use super::*;
     use rtdb_columnar::{entity_id_array, entity_id_type, to_field};
-
-    #[test]
-    fn optional_probe_locators_respect_count_and_byte_limits() {
-        let memory = MemoryBudget::new(MAX_PROBE_MATCH_BYTES * 2);
-        let mut matches = ProbeMatches::new(&memory).unwrap();
-        for i in 0..MAX_PROBE_MATCHES {
-            let id = EntityIdRef::Integer(i as i64);
-            assert!(matches.push(id, id.iid()));
-        }
-        assert!(!matches.push(EntityIdRef::Integer(-1), EntityIdRef::Integer(-1).iid()));
-        drop(matches);
-        assert_eq!(memory.used_bytes(), 0);
-
-        let mut matches = ProbeMatches::new(&memory).unwrap();
-        let text = "a".repeat(MAX_PROBE_MATCH_BYTES);
-        let id = EntityIdRef::String(&text);
-        assert!(!matches.push(id, id.iid()));
-        assert!(matches.matches.is_empty());
-
-        let memory = MemoryBudget::new(PROBE_MATCH_OVERHEAD);
-        let mut matches = ProbeMatches::new(&memory).unwrap();
-        let id = EntityIdRef::Integer(1);
-        assert!(!matches.push(id, id.iid()));
-        drop(matches);
-        assert_eq!(memory.used_bytes(), 0);
-    }
 
     #[test]
     fn spatial_selection_orders_ties_by_the_typed_arrow_identity() -> Result<()> {

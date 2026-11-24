@@ -5,6 +5,7 @@ mod lane;
 mod nearest;
 mod postings;
 mod probe;
+mod range_matches;
 mod read;
 
 pub use definition::path_geometry_encoding;

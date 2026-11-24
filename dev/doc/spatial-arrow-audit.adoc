@@ -40,6 +40,14 @@ Filters whose evaluation can fail retain the full-population traversal so that p
 | A held capability retains complete keys, physical IIDs and exact distances in Arrow.
 Each page gathers only its selected documents at the original held cut.
 
+| Held range and probe pagination
+| Exact matches allocated owned identities before sorting and gathering the page.
+| Retained matches append complete typed keys and physical IIDs to Arrow buffers and sort the row positions.
+Continuation seeks by complete identity and gathers the selected IIDs at the original held cut.
+An anchor before the initial range anchor uses the exact read at the same hold.
+Probe retention is optional within the existing match-count and byte ceilings.
+A probe whose matches exceed the ceilings, have duplicate identities, or cannot keep their memory charge uses exact refinement at the same hold.
+
 | Spatial Flight request decode
 | The stream reader copied each message body into a new allocation after Flight had already received it.
 | The decoder retains the received allocation and reads messages from buffer slices.

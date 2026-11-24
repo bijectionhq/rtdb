@@ -63,6 +63,9 @@ entity SpatialPostings {
 -- Range refinement reads the complete typed identity, IID, geometry and equality partition of each candidate.
 -- A range page advances in complete typed identity order at the original hold.
 -- A held range continuation reuses refined matches after its original anchor.
+-- Retained range and probe matches carry complete typed keys and physical IIDs in Arrow columns ordered by row positions.
+-- A continuation before the initial range anchor refines the original held cut again.
+-- A held probe can refine its original held cut again when bounded match retention is unavailable.
 -- Each range page gathers documents for the IIDs selected by that page.
 -- Nearest ordering compares exact distances and breaks ties by complete typed identity.
 -- A ranked distance window excludes its exact lower radius and includes its upper radius when supplied.
