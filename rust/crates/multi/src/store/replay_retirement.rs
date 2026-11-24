@@ -156,24 +156,24 @@ pub(super) async fn terminal_checkpoint_matches(
     pack.checkpoint_matches(checkpoint, cipher).await
 }
 
-struct ObservedPack<'a> {
-    key: &'a ObjectKey,
-    index: PackIndex,
-    storage: PackStorage<'a>,
+pub(super) struct ObservedPack<'a> {
+    pub(super) key: &'a ObjectKey,
+    pub(super) index: PackIndex,
+    pub(super) storage: PackStorage<'a>,
 }
 
-enum PackStorage<'a> {
+pub(super) enum PackStorage<'a> {
     Raw { bucket: &'a dyn ObjectStore, version: Option<PhysicalObjectVersion> },
     Terminal { retirement: &'a NeverVersionedRetirement<'a>, publication: ObservedTerminalObject },
 }
 
 impl<'a> ObservedPack<'a> {
-    async fn raw(bucket: &'a dyn ObjectStore, key: &'a ObjectKey) -> rtdb_storage::Result<Self> {
+    pub(super) async fn raw(bucket: &'a dyn ObjectStore, key: &'a ObjectKey) -> rtdb_storage::Result<Self> {
         let observed = observe_pack_index(bucket, key).await?;
         Ok(Self { key, index: observed.value, storage: PackStorage::Raw { bucket, version: observed.version } })
     }
 
-    async fn terminal(retirement: &'a NeverVersionedRetirement<'a>, key: &'a ObjectKey) -> Result<Option<Self>> {
+    pub(super) async fn terminal(retirement: &'a NeverVersionedRetirement<'a>, key: &'a ObjectKey) -> Result<Option<Self>> {
         let Some(publication) = retirement.observe_readable(key).await? else { return Ok(None); };
         let read = |range| retirement.read_observed_range(key, &publication, range);
         let index = match read_pack_index_with(key, publication.size(), MAXIMUM_MEMBER_BYTES as usize, read).await {
@@ -194,11 +194,15 @@ impl<'a> ObservedPack<'a> {
     }
 
     async fn read_member(&self, entry: &PackEntry) -> Result<bytes::Bytes> {
-        let range = entry.offset..entry.offset + entry.length;
+        self.read_range(entry.offset..entry.offset + entry.length).await
+    }
+
+    pub(super) async fn read_range(&self, range: std::ops::Range<u64>) -> Result<bytes::Bytes> {
+        let length = range.end - range.start;
         match &self.storage {
             PackStorage::Raw { bucket, version } => {
                 let observed = bucket.observe_range(self.key, range).await?;
-                if observed.version.as_ref() != version.as_ref() || observed.value.len() as u64 != entry.length {
+                if observed.version.as_ref() != version.as_ref() || observed.value.len() as u64 != length {
                     return Err(Error::ConflictingObject(self.key.to_string()).into());
                 }
                 Ok(observed.value)

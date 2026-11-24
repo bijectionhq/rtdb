@@ -30,15 +30,17 @@ struct ReplayRetirement<'a> {
     capture: Uuid,
     checkpoint: Checkpoint,
     publication: Publication<'a>,
+    packed_slots: [u8; 32],
 }
 
 impl<'a> ReplayRetirement<'a> {
     fn from_work(work: &'a RetirementWork) -> Option<Self> {
         match work {
-            RetirementWork::ReplayPack { deployment, target, version, tombstone, capture, checkpoint } =>
-                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint, publication: Publication::Version { version, target: tombstone } }),
-            RetirementWork::ReplayPackTombstone { deployment, target, tombstone, allocation, capture, checkpoint } =>
-                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint,
+            RetirementWork::ReplayPack { deployment, target, version, tombstone, capture, checkpoint, packed_slots } =>
+                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint, packed_slots: *packed_slots,
+                    publication: Publication::Version { version, target: tombstone } }),
+            RetirementWork::ReplayPackTombstone { deployment, target, tombstone, allocation, capture, checkpoint, packed_slots } =>
+                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint, packed_slots: *packed_slots,
                     publication: Publication::Tombstone { allocation: *allocation, target: tombstone } }),
             _ => None,
         }
@@ -89,17 +91,24 @@ pub(in crate::store) async fn reap_hosted(
         if observed.index.entries.keys().all(|name| checkpoint_metadata_block(name) == Some(block)) {
             continue;
         }
-        let work = match observed.storage {
+        let io = IoRegion::new();
+        let census = crate::store::publication_retirement::PublicationCensus::new(keys, &deployments, &io);
+        let plan_hash = async {
+            census.pack_plan(bucket, candidate, &observed, provider).await
+                .map(|plan| crate::store::exact_retirement::plan_digest(&plan))
+        };
+        let work = match &observed.storage {
             PackStorage::Raw { version: Some(version), .. } => {
-                if references.has_declared_version(&pack.key, &version) { continue; }
-                let Some(tombstone) = provider.versioned_retirement_target(&pack.key, &version).await? else { continue; };
+                if references.has_declared_version(&pack.key, version) { continue; }
+                let Some(tombstone) = provider.versioned_retirement_target(&pack.key, version).await? else { continue; };
                 RetirementWork::ReplayPack {
-                    deployment: candidate.id.clone(), target: pack.key.to_string(), version, tombstone, capture, checkpoint,
+                    deployment: candidate.id.clone(), target: pack.key.to_string(), version: version.clone(), tombstone,
+                    capture, checkpoint, packed_slots: plan_hash.await?,
                 }
             }
             PackStorage::Terminal { publication, .. } if !references.has_declared_reference(&pack.key) => RetirementWork::ReplayPackTombstone {
                 deployment: candidate.id.clone(), target: pack.key.to_string(),
-                tombstone: publication.target().clone(), allocation: publication.allocation(), capture, checkpoint,
+                tombstone: publication.target().clone(), allocation: publication.allocation(), capture, checkpoint, packed_slots: plan_hash.await?,
             },
             _ => continue,
         };
@@ -140,14 +149,18 @@ async fn finish(
         };
         grant
     };
-    erase_granted(directory, provider, lineage, grant).await?;
+    erase_granted(directory, bucket, provider, lineage, grant, keys).await?;
     settle(directory, lineage, deployment, retirement).await?;
     Ok(true)
 }
 
-async fn erase_granted(directory: &dyn Directory, provider: &VersionedInventory, lineage: &str, grant: ExactRetirementGrant<'_>) -> Result<()> {
+async fn erase_granted(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: &VersionedInventory,
+    lineage: &str, grant: ExactRetirementGrant<'_>, keys: &dyn KeyService) -> Result<()> {
     let retirement = grant.retirement();
-    let ReplayRetirement { target, publication, .. } = ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
+    let ReplayRetirement { deployment, target, publication, packed_slots, .. } =
+        ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
+    let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
+    let slots = crate::store::exact_retirement::load_pack_slots(bucket, keys, lineage, retirement, &owner, packed_slots).await?;
     let target = key(target)?;
     let observed = || serde_json::json!({
         "lineage": lineage, "revision": grant.revision(), "residence": retirement.source, "retirement": retirement.token,
@@ -165,6 +178,7 @@ async fn erase_granted(directory: &dyn Directory, provider: &VersionedInventory,
             retire(&proof, &journal, &target, tombstone).await?;
         }
     }
+    crate::store::exact_retirement::withdraw_pack_slots(keys, &owner.org, lineage, slots).await?;
     crate::residence_trace::record("remove-replay-pack", observed);
     Ok(())
 }
@@ -174,7 +188,7 @@ async fn authorize(
     bucket: &dyn ObjectStore, provider: &VersionedInventory, lineage: &str,
     retirement: &LineageRetirement,
 ) -> Result<()> {
-    let ReplayRetirement { deployment, target, publication, capture, checkpoint } =
+    let ReplayRetirement { deployment, target, publication, capture, checkpoint, packed_slots } =
         ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
     let target = key(target)?;
     let store = format!("{}/{}", retirement.source, archive::checkpoint_storage_root()?);
@@ -192,7 +206,8 @@ async fn authorize(
     if record.required_replica_offsets(now_ms()).any(|first| first <= anchor.interval[1]) {
         return Ok(());
     }
-    let references = References::scan(bucket, &directory.deployments().await?).await?;
+    let deployments = directory.deployments().await?;
+    let references = References::scan(bucket, &deployments).await?;
     let retained = match publication {
         Publication::Version { version, .. } => references.has_declared_version(&target, version),
         Publication::Tombstone { .. } => references.has_declared_reference(&target),
@@ -234,6 +249,11 @@ async fn authorize(
         {
             return Ok(());
         }
+        let io = IoRegion::new();
+        let census = crate::store::publication_retirement::PublicationCensus::new(keys, &deployments, &io);
+        let plan = census.pack_plan(bucket, &record, &observed, provider).await?;
+        if crate::store::exact_retirement::plan_digest(&plan) != packed_slots { return Ok(()); }
+        bucket.put(&crate::store::exact_retirement::pack_plan_key(retirement.token)?, plan).await?;
         let fenced = crate::admin::update_installation(directory, deployment, |latest| {
             if latest.version != admitted.version
                 || !latest.storage_regions.get(&owner).is_some_and(|region| region.admits_archive_read(capture))

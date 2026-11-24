@@ -218,19 +218,65 @@ impl VersionedInventory {
         }
     }
 
+    /// Enumerates every immutable file version below an enrolled provider directory.
+    pub async fn data_versions_under(&self, directory: &ObjectKey) -> Result<Vec<(ObjectKey, PhysicalObjectVersion, u64)>> {
+        self.inspect(directory.clone(), |owner, directory| async move {
+            let scope = owner.prefix(&directory);
+            let base = format!("{}/", Path::from(owner.root.as_str()));
+            let mut cursor = (None, None);
+            let mut visited = BTreeSet::new();
+            let mut versions = Vec::new();
+            loop {
+                let page = owner.client.list_object_versions().bucket(&owner.namespace.bucket).prefix(&scope)
+                    .max_keys(1000).set_key_marker(cursor.0.clone()).set_version_id_marker(cursor.1.clone())
+                    .set_request_payer(owner.request_payer.clone()).send().await
+                    .map_err(|error| unavailable(format!("Reading a versioned directory failed: {error}")))?;
+                for entry in page.versions() {
+                    let path = entry.key().filter(|key| key.starts_with(&scope))
+                        .ok_or_else(|| unavailable("S3 returned a version outside its directory"))?;
+                    let key = rtdb_storage::remote::decode_provider_key(path.strip_prefix(&base)
+                        .ok_or_else(|| unavailable("S3 returned a version outside the storage root"))?)?;
+                    let id = entry.version_id().filter(|id| valid_object_version(id.as_bytes()))
+                        .ok_or_else(|| unavailable("S3 returned a version with no immutable identity"))?;
+                    let version = PhysicalObjectVersion { namespace: owner.namespace.clone(), key: path.to_owned(), version: id.to_owned() };
+                    owner.observed_path(&key, &version)?;
+                    let size = entry.size().and_then(|size| u64::try_from(size).ok())
+                        .ok_or_else(|| unavailable("S3 returned a version without its byte length"))?;
+                    versions.push((key, version, size));
+                }
+                match page.is_truncated() {
+                    Some(false) => return Ok(versions),
+                    Some(true) => (),
+                    None => return Err(unavailable("S3 omitted the directory version pagination state")),
+                }
+                cursor = (page.next_key_marker().map(str::to_owned), page.next_version_id_marker().map(str::to_owned));
+                if cursor.0.as_ref().is_none_or(|key| !key.starts_with(&scope)) || !visited.insert(cursor.clone()) {
+                    return Err(unavailable("S3 returned an incomplete directory version cursor"));
+                }
+            }
+        }).await
+    }
+
     pub async fn read_version_prefix(&self, key: &ObjectKey, version: &PhysicalObjectVersion, length: u64) -> Result<Bytes> {
         if !(1..=4096).contains(&length) { return Err(unavailable("The version prefix exceeds its header bound")); }
+        self.read_version_range(key, version, 0..length).await
+    }
+
+    pub async fn read_version_range(&self, key: &ObjectKey, version: &PhysicalObjectVersion, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let length = range.end.checked_sub(range.start).filter(|length| (1..=(16 << 20)).contains(length))
+            .ok_or_else(|| unavailable("The exact version range exceeds its bound"))?;
         let path = self.observed_path(key, version)?;
+        let start = range.start;
+        let last = range.end - 1;
         self.inspect((path.to_string(), version.version.clone()), move |owner, (path, version)| async move {
-            let last = length - 1;
             let mut result = owner.client.get_object().bucket(&owner.namespace.bucket).key(path).version_id(&version)
-                .range(format!("bytes=0-{last}")).set_request_payer(owner.request_payer.clone()).send().await
+                .range(format!("bytes={start}-{last}")).set_request_payer(owner.request_payer.clone()).send().await
                 .map_err(|error| unavailable(format!("Reading the S3 version prefix failed: {error}")))?;
-            let prefix = format!("bytes 0-{last}/");
+            let prefix = format!("bytes {start}-{last}/");
             if result.version_id() != Some(version.as_str()) || result.delete_marker().unwrap_or(false)
                 || result.content_length() != Some(length as i64)
                 || !result.content_range().and_then(|range| range.strip_prefix(&prefix))
-                    .and_then(|size| size.parse::<u64>().ok()).is_some_and(|size| size >= length)
+                    .and_then(|size| size.parse::<u64>().ok()).is_some_and(|size| size > last)
             {
                 return Err(unavailable("S3 returned a different version or byte range"));
             }

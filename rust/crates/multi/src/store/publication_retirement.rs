@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
+
+use bytes::Bytes;
+use rtdb_s3::VersionedInventory;
+use super::replay_retirement::{ObservedPack, PackStorage};
 
 use rtdb_directory::DeploymentRecord;
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, sealing::PUBLICATION_ID_BYTES};
@@ -85,6 +89,85 @@ impl<'a> PublicationCensus<'a> {
         Ok(())
     }
 
+    pub(super) async fn pack_plan(
+        &self, bucket: &dyn ObjectStore, owner: &DeploymentRecord, pack: &ObservedPack<'_>,
+        provider: &VersionedInventory,
+    ) -> Result<Bytes> {
+        let sealing = super::directory_publications(self.keys, owner, Arc::clone(self.io))?;
+        let mut slots = BTreeMap::new();
+        for (name, entry) in &pack.index.entries {
+            let logical = ObjectKey::new(name)?;
+            if !sealing.applies(&logical) { continue; }
+            if entry.length < HEADER_BYTES { return Err(changed()); }
+            let end = entry.offset.checked_add(HEADER_BYTES).ok_or_else(changed)?;
+            let header = pack.read_range(entry.offset..end).await?;
+            let (_, unit) = sealing.header(&logical, header).await?;
+            slots.insert(name.clone(), unit);
+        }
+        match &pack.storage {
+            PackStorage::Raw { version: Some(version), .. } => {
+                for peer in self.peers.iter().filter(|peer| peer.org == owner.org && peer.lineage == owner.lineage) {
+                    let residence = ObjectKey::new(peer.storage_prefix())?;
+                    for store in provider.child_directories(&residence).await? {
+                        let root = format!("{residence}/{store}");
+                        self.exclude_versioned_aliases(provider, &root, version, &mut slots).await?;
+                    }
+                }
+            }
+            PackStorage::Terminal { .. } => {
+                let candidates = std::mem::take(&mut slots);
+                for (name, unit) in candidates {
+                    let logical = ObjectKey::new(&name)?;
+                    if !self.has_another_copy(bucket, owner, pack.key, &logical, unit, true).await? {
+                        slots.insert(name, unit);
+                    }
+                }
+            }
+            _ => return Err(changed()),
+        }
+        let slots = slots.into_iter().collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&slots).map_err(|_| changed())?;
+        if bytes.len() > 16 << 20 { return Err(changed()); }
+        Ok(Bytes::from(bytes))
+    }
+
+    async fn exclude_versioned_aliases(
+        &self, provider: &VersionedInventory, root: &str, retiring: &rtdb_types::PhysicalObjectVersion,
+        slots: &mut BTreeMap<String, ServingPublication>,
+    ) -> Result<()> {
+        if slots.is_empty() { return Ok(()); }
+        let mut excluded = Vec::new();
+        for (name, expected) in slots.iter() {
+            let copy = ObjectKey::new(format!("{root}/{name}"))?;
+            for version in provider.data_versions(&copy).await? {
+                if &version == retiring { continue; }
+                let prefix = provider.read_version_prefix(&copy, &version, PUBLICATION_ID_BYTES as u64).await?;
+                if ServingPublication::from_prefix(&prefix).ok_or_else(changed)? == *expected {
+                    excluded.push(name.clone());
+                    break;
+                }
+            }
+        }
+        for name in excluded.drain(..) { slots.remove(&name); }
+        let packs = ObjectKey::new(format!("{root}/{}", crate::packing::PACK_DIRECTORY))?;
+        for (copy, version, size) in provider.data_versions_under(&packs).await? {
+            if &version == retiring { continue; }
+            let index = crate::packing::read_pack_index_with(&copy, size, 16 << 20,
+                |range| provider.read_version_range(&copy, &version, range)).await?;
+            for (name, entry) in &index.entries {
+                let Some(expected) = slots.get(name) else { continue; };
+                if entry.length < HEADER_BYTES { return Err(changed()); }
+                let end = entry.offset.checked_add(PUBLICATION_ID_BYTES as u64).ok_or_else(changed)?;
+                let prefix = provider.read_version_range(&copy, &version, entry.offset..end).await?;
+                if ServingPublication::from_prefix(&prefix).ok_or_else(changed)? == *expected {
+                    excluded.push(name.clone());
+                }
+            }
+            for name in excluded.drain(..) { slots.remove(&name); }
+        }
+        Ok(())
+    }
+
     pub(super) async fn has_another_copy(
         &self,
         bucket: &dyn ObjectStore,
@@ -164,7 +247,6 @@ fn changed() -> Anomaly {
 mod tests {
     use std::collections::BTreeMap;
 
-    use bytes::Bytes;
     use rtdb_storage::MemoryStore;
 
     use super::*;

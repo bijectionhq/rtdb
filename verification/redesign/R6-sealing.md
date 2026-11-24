@@ -88,3 +88,8 @@ An ambiguous upload reopens the exact selected body or retains the unresolved du
 Other hosted packs and unpublished packed or local attempts still require a complete publication census.
 
 [Current cipher](../../rust/crates/storage/src/sealing/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)
+
+Hosted retirement authenticates each selected pack member under its serving slot.
+The lineage grant binds the resulting withdrawal plan by digest.
+A versioned provider census checks both loose aliases and pack members at every data version.
+The owner reopens that plan after a restart and withdraws its slots after the exact provider settlement.

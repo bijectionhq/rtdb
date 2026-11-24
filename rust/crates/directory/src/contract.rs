@@ -278,6 +278,7 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
             deployment: parent.id.clone(), target: target.clone(), release: release.clone(),
             version: version(&target, "original"), release_version: version(&release, "record"),
             unit: None,
+            packed_slots: None,
         }
     };
     let retirement = LineageRetirement { token: uuid::Uuid::new_v4(), source: scope, work };

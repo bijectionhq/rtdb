@@ -263,7 +263,9 @@ Every directory serving envelope binds a fresh attempt to its original residence
 Hosted loose writes record the attempt before key allocation and bind the same attempt to their provider upload.
 The region owner closes admission and fences the upload before withdrawing definitively unsubmitted or rejected slots.
 A lost selection response keeps its attempt until the owner can authenticate the publication.
-Other hosted packs, packed and local unpublished attempts, and negative settlement of ambiguous uploads remain open.
+Hosted mixed and metadata-only packs bind an authenticated last-slot census to the exact provider grant.
+The versioned census checks loose aliases and historical pack members at their immutable provider versions.
+Packed and local unpublished attempts and negative settlement of ambiguous uploads remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

@@ -48,6 +48,15 @@ pub trait PublicationJournal: Send + Sync {
     async fn settle(&self, key: &ObjectKey, attempt: uuid::Uuid, upload: &str, submitted: bool) -> Result<()>;
 }
 
+/// Converts the provider's relative, percent-encoded path to an object key.
+pub fn decode_provider_key(relative: &str) -> Result<ObjectKey> {
+    let decoded = relative.split('/')
+        .map(|part| percent_encoding::percent_decode_str(part).decode_utf8().map(|part| part.into_owned()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::InvalidKey(relative.into()))?.join("/");
+    ObjectKey::new(decoded)
+}
+
 /// The result of this specific conditional publication.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PublicationResult {
@@ -470,9 +479,7 @@ impl RemoteObjects {
 
     fn key(relative: &str) -> Result<ObjectKey> {
         // A provider path is percent-encoded segment by segment, so a key it lists is the key that was put only once decoded.
-        let decoded = relative.split('/').map(|part| percent_encoding::percent_decode_str(part).decode_utf8().map(|part| part.into_owned()))
-            .collect::<std::result::Result<Vec<_>, _>>().map_err(|_| Error::InvalidKey(relative.into()))?.join("/");
-        ObjectKey::new(decoded)
+        decode_provider_key(relative)
     }
 
     async fn compare_file(&self, key: &ObjectKey, file: &mut tokio::fs::File, source: &std::path::Path, length: u64) -> Result<()> {

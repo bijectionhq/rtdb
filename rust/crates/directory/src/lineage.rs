@@ -102,6 +102,7 @@ pub enum RetirementWork {
         version: PhysicalObjectVersion,
         release_version: PhysicalObjectVersion,
         unit: Option<ServingPublication>,
+        packed_slots: Option<[u8; 32]>,
     },
     Tombstones {
         deployment: String,
@@ -119,6 +120,7 @@ pub enum RetirementWork {
         tombstone: S3TombstoneTarget,
         capture: Uuid,
         checkpoint: Checkpoint,
+        packed_slots: [u8; 32],
     },
     ReplayPackTombstone {
         deployment: String,
@@ -127,6 +129,7 @@ pub enum RetirementWork {
         allocation: Uuid,
         capture: Uuid,
         checkpoint: Checkpoint,
+        packed_slots: [u8; 32],
     },
 }
 
@@ -524,6 +527,7 @@ mod tests {
                     namespace: S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
                     key: format!("cell/{object}"), version: "exact-version".into(),
                 },
+                packed_slots: [0; 32],
             },
         };
         let state = LineageState::default().changed(LineageChange::ReserveRetirement {
@@ -603,6 +607,7 @@ mod tests {
                     namespace: S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
                     key: format!("cell/{target}"), condition: S3TombstoneCondition::Matches("\"original\"".into()),
                 },
+                packed_slots: [0; 32],
             },
         };
         owner.storage_regions.insert(retirement.token, StorageRegion::ReplayPackRetirement { object: target.clone(), capture });

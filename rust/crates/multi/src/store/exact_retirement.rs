@@ -217,8 +217,17 @@ pub(super) async fn reap(directory: &dyn Directory, bucket: &dyn ObjectStore, pr
                 } else {
                     None
                 };
+                let packed_slots = if witness.pack.is_some() && keys.is_some()
+                    && !provider.absent(target, version).await?
+                {
+                    versioned_pack_slots(bucket, provider, candidate, target, witness, keys, &directory.deployments().await?)
+                        .await?.as_ref().map(plan_digest)
+                } else {
+                    None
+                };
                 RetirementWork::S3 { deployment: candidate.id.clone(), target: target.to_string(),
-                    release: marker.to_string(), version: version.clone(), release_version: release_version.clone(), unit: unit_identity }
+                    release: marker.to_string(), version: version.clone(), release_version: release_version.clone(),
+                    unit: unit_identity, packed_slots }
             };
             let retirement = LineageRetirement { token: Uuid::new_v4(), source: source.clone(), work };
             let reserved = directory.change_lineage(lineage, LineageChange::ReserveRetirement {
@@ -289,6 +298,16 @@ async fn erase_granted(directory: &dyn Directory, bucket: &dyn ObjectStore, prov
         }
         _ => None,
     };
+    let pack_withdrawal = match &retirement.work {
+        RetirementWork::S3 { deployment, packed_slots: Some(digest), .. }
+        | RetirementWork::Tombstones { deployment, packed_slots: Some(digest), .. } => {
+            let keys = keys.ok_or_else(changed)?;
+            let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
+            let plan = load_pack_slots(bucket, keys, lineage, retirement, &owner, *digest).await?;
+            Some((keys, owner.org, plan))
+        }
+        _ => None,
+    };
     match &retirement.work {
         RetirementWork::S3 { target, release, version, release_version, .. } => {
             let target = ObjectKey::new(target)?;
@@ -300,29 +319,11 @@ async fn erase_granted(directory: &dyn Directory, bucket: &dyn ObjectStore, prov
                 });
                 crate::residence_trace::record("authorize-version", observed);
                 provider.erase(key, publication).await?;
+                if !provider.absent(key, publication).await? { return Err(changed()); }
                 crate::residence_trace::record("remove-version", observed);
             }
         }
-        RetirementWork::Tombstones { deployment, target, release, data_tombstone, release_tombstone, packed_slots, .. } => {
-            let plan = if let Some(digest) = packed_slots {
-                let owner = directory.deployment(deployment).await?.ok_or_else(changed)?;
-                let namespace = owner.storage_namespaces.ok_or_else(changed)?;
-                let keys = keys.ok_or_else(changed)?;
-                if owner.lineage != lineage || owner.storage_prefix() != retirement.source
-                    || keys.namespace_id().await? != namespace.keys
-                {
-                    return Err(changed());
-                }
-                let key = pack_plan_key(retirement.token)?;
-                let size = bucket.head_fresh(&key).await?.size;
-                if size > MAXIMUM_PACK_SLOT_PLAN_BYTES { return Err(changed()); }
-                let bytes = bucket.get_fresh_exact(&key, size as usize).await?;
-                if &plan_digest(&bytes) != digest { return Err(changed()); }
-                let plan = serde_json::from_slice::<Vec<(String, ServingPublication)>>(&bytes).map_err(|_| changed())?;
-                Some((keys, owner.org, plan))
-            } else {
-                None
-            };
+        RetirementWork::Tombstones { target, release, data_tombstone, release_tombstone, .. } => {
             let target = ObjectKey::new(target)?;
             let release = ObjectKey::new(release)?;
             let journal = TombstoneJournal::new(directory, lineage, retirement.token);
@@ -332,22 +333,12 @@ async fn erase_granted(directory: &dyn Directory, bucket: &dyn ObjectStore, prov
             });
             crate::residence_trace::record("authorize-tombstones", observed);
             provider.retire_tombstones(&journal, [(&target, data_tombstone), (&release, release_tombstone)]).await?;
-            if let Some((keys, org, plan)) = plan {
-                use futures::{StreamExt, TryStreamExt, stream};
-                let io = IoRegion::new();
-                let withdrawals = plan.into_iter().map(|(name, origin)| {
-                    let org = &org;
-                    let io = &io;
-                    async move {
-                        let name = ObjectKey::new(name)?;
-                        keys.withdraw_unit_key(UnitScope::directory_publication_slot(org, lineage, origin, &name), io).await
-                    }
-                });
-                stream::iter(withdrawals).buffer_unordered(16).try_collect::<Vec<()>>().await?;
-            }
             crate::residence_trace::record("remove-tombstones", observed);
         }
         _ => return Err(changed()),
+    }
+    if let Some((keys, org, plan)) = pack_withdrawal {
+        withdraw_pack_slots(keys, &org, lineage, plan).await?;
     }
     if let Some((keys, slot)) = withdrawal {
         keys.withdraw_unit_key(slot, &IoRegion::new()).await?;
@@ -574,11 +565,45 @@ async fn terminal_unit_identity(
     Ok(Some(origin))
 }
 
-fn pack_plan_key(token: Uuid) -> Result<ObjectKey> {
+pub(super) fn pack_plan_key(token: Uuid) -> Result<ObjectKey> {
     Ok(ObjectKey::new(format!("~serving-slot-retirements/{token}"))?)
 }
 
-fn plan_digest(bytes: &Bytes) -> [u8; 32] {
+pub(super) async fn load_pack_slots(
+    bucket: &dyn ObjectStore, keys: &dyn KeyService, lineage: &str,
+    retirement: &LineageRetirement, owner: &DeploymentRecord, digest: [u8; 32],
+) -> Result<Vec<(String, ServingPublication)>> {
+    let namespace = owner.storage_namespaces.ok_or_else(changed)?;
+    if owner.lineage != lineage || owner.storage_prefix() != retirement.source
+        || keys.namespace_id().await? != namespace.keys
+    {
+        return Err(changed());
+    }
+    let key = pack_plan_key(retirement.token)?;
+    let size = bucket.head_fresh(&key).await?.size;
+    if size > MAXIMUM_PACK_SLOT_PLAN_BYTES { return Err(changed()); }
+    let bytes = bucket.get_fresh_exact(&key, size as usize).await?;
+    if plan_digest(&bytes) != digest { return Err(changed()); }
+    serde_json::from_slice(&bytes).map_err(|_| changed())
+}
+
+pub(super) async fn withdraw_pack_slots(
+    keys: &dyn KeyService, org: &str, lineage: &str, plan: Vec<(String, ServingPublication)>,
+) -> Result<()> {
+    use futures::{StreamExt, TryStreamExt, stream};
+    let io = IoRegion::new();
+    let withdrawals = plan.into_iter().map(|(name, unit)| {
+        let io = &io;
+        async move {
+            let name = ObjectKey::new(name)?;
+            keys.withdraw_unit_key(UnitScope::directory_publication_slot(org, lineage, unit, &name), io).await
+        }
+    });
+    stream::iter(withdrawals).buffer_unordered(16).try_collect::<Vec<()>>().await?;
+    Ok(())
+}
+
+pub(super) fn plan_digest(bytes: &Bytes) -> [u8; 32] {
     ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().try_into().expect("SHA-256 width")
 }
 
@@ -605,6 +630,26 @@ async fn terminal_pack_slots(
     let bytes = serde_json::to_vec(&retiring).map_err(|_| changed())?;
     if bytes.len() as u64 > MAXIMUM_PACK_SLOT_PLAN_BYTES { return Err(changed()); }
     Ok(Some(Bytes::from(bytes)))
+}
+
+async fn versioned_pack_slots(
+    bucket: &dyn ObjectStore, provider: &dyn RetirementProvider, owner: &DeploymentRecord,
+    target: &ObjectKey, witness: &ReleaseWitness, keys: Option<&dyn KeyService>, deployments: &[DeploymentRecord],
+) -> Result<Option<Bytes>> {
+    use super::replay_retirement::{ObservedPack, PackStorage};
+
+    let (Some(version), Some(keys), Some(inventory), Some(_)) =
+        (&witness.version, keys, provider.versioned_units(), &witness.pack)
+    else { return Ok(None); };
+    let observed = match ObservedPack::raw(bucket, target).await {
+        Ok(observed) if matches!(&observed.storage, PackStorage::Raw { version: Some(exact), .. } if exact == version) => observed,
+        Ok(_) | Err(Error::MissingObject(_)) if provider.absent(target, version).await? => return Ok(None),
+        Ok(_) | Err(Error::MissingObject(_)) => return Err(changed()),
+        Err(error) => return Err(error.into()),
+    };
+    let io = IoRegion::new();
+    let census = super::publication_retirement::PublicationCensus::new(keys, deployments, &io);
+    census.pack_plan(bucket, owner, &observed, inventory).await.map(Some)
 }
 
 async fn versioned_unit_identity(
@@ -721,11 +766,15 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         observed_successor = Some(checkpoint);
     }
 
-    if let RetirementWork::Tombstones { packed_slots, .. } = &retirement.work {
-        let plan = terminal_pack_slots(bucket, provider, owner, target, &witness, keys, &deployments).await?;
-        if plan.as_ref().map(plan_digest) != *packed_slots { return Ok(None); }
-        if let Some(plan) = plan { bucket.put(&pack_plan_key(retirement.token)?, plan).await?; }
-    }
+    let (expected_plan, plan) = match &retirement.work {
+        RetirementWork::Tombstones { packed_slots, .. } =>
+            (packed_slots, terminal_pack_slots(bucket, provider, owner, target, &witness, keys, &deployments).await?),
+        RetirementWork::S3 { packed_slots, .. } =>
+            (packed_slots, versioned_pack_slots(bucket, provider, owner, target, &witness, keys, &deployments).await?),
+        _ => return Err(changed()),
+    };
+    if plan.as_ref().map(plan_digest) != *expected_plan { return Ok(None); }
+    if let Some(plan) = plan { bucket.put(&pack_plan_key(retirement.token)?, plan).await?; }
 
     let owner = crate::admin::update_installation(directory, deployment, |record| {
         if record.lineage != lineage || record.storage_prefix() != retirement.source || !can_reap(record)
@@ -1426,7 +1475,7 @@ mod tests {
         let queue = release_version.key.clone();
         let retirement = LineageRetirement { token: Uuid::new_v4(), source: residence,
             work: RetirementWork::S3 { deployment: owner.id.clone(), target: object.clone(),
-                release: marker.clone(), version: publication, release_version, unit: None },
+                release: marker.clone(), version: publication, release_version, unit: None, packed_slots: None },
         };
         let mut fenced = owner.clone();
         fenced.storage_regions.insert(retirement.token, StorageRegion::ExactRetirement { object, release: Some(marker) });
