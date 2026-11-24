@@ -67,7 +67,6 @@ impl Database {
     /// Identifies the database attachment that issued a wire token.
     /// A new attachment receives a new identity.
     pub fn wire_incarnation(&self) -> uuid::Uuid { self.protected_equality_epoch }
-    /// Reports whether the attachment supports establishing a fresh read barrier.
     pub fn wire_linearizable_reads(&self) -> bool {
         self.has_replica_read_index() || (!self.read_only && !self.external_source()
             && !matches!(self.configuration.log, Some(database_config::Log::OtherLog(_))))
