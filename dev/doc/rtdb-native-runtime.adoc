@@ -75,6 +75,7 @@ The server defaults to format 11 for rolling upgrades.
 Upgrade all readers and maintenance lanes that share the database before enabling Arrow writes.
 Upgraded nodes can read and repair retained formats 11 through 15.
 Nodes configured for format 16 can repair logical runs from available original L0 inputs or a complete retained local journal.
+When moving a native journal directory, keep `REPLICA_LOG.lineage` with `REPLICA_LOG` so existing search receipts continue to identify the same history.
 Accelerated queries score against the column values visible at the snapshot.
 The search accelerator can prune a ranked limit over the two-argument score and a `MATCH` on the same column.
 The five-argument score uses the ordinary SQL sort and limit.

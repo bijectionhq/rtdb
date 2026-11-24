@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
 use std::time::Duration;
 
@@ -471,7 +473,8 @@ impl DatabaseFactory {
             let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
                 let history = match self.resources.table_history(&configuration)? {
                     Some(hosted) => Some(hosted),
-                    None => NativeTableReplay::for_database(Arc::clone(&logs), &configuration),
+                    None if event_history => NativeTableReplay::for_database(Arc::clone(&logs), &configuration)?,
+                    None => None,
                 };
                 self.artefact_kinds.iter().map(|kind| {
                     let clock = Arc::clone(&self.clock);
@@ -558,17 +561,61 @@ impl DatabaseFactory {
 
 struct NativeTableReplay {
     logs: Arc<PartitionLogs>,
-    lineage: String,
+    lineage: uuid::Uuid,
 }
 
 impl NativeTableReplay {
-    fn for_database(logs: Arc<PartitionLogs>, configuration: &DatabaseConfig) -> Option<Arc<dyn rtdb_maintenance::TableHistorySource>> {
-        let Some(database_config::Log::LocalLog(log)) = &configuration.log else { return None; };
-        let path = std::path::Path::new(log.path.as_deref()?).canonicalize().ok()?;
-        let digest = rtdb_format::catalog::publication_digest(path.as_os_str().as_encoded_bytes());
-        let id: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        Some(Arc::new(Self { logs, lineage: format!("native/{id}") }))
+    fn for_database(logs: Arc<PartitionLogs>, configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> {
+        let Some(database_config::Log::LocalLog(log)) = &configuration.log else { return Ok(None); };
+        let directory = log.path.as_deref().ok_or_else(|| Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", "Local log has no path"))?;
+        let lineage = native_log_lineage(Path::new(directory))?;
+        Ok(Some(Arc::new(Self { logs, lineage })))
     }
+}
+
+fn native_log_lineage(directory: &Path) -> Result<uuid::Uuid> {
+    let path = directory.join("REPLICA_LOG.lineage");
+    let io = |error| Anomaly::fault("rtdb.node/local-log-lineage", format!("{}: {error}", path.display()));
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let id = uuid::Uuid::new_v4();
+            let mut staged = tempfile::NamedTempFile::new_in(directory).map_err(io)?;
+            staged.write_all(id.as_bytes()).map_err(io)?;
+            rtdb_storage::sync_file(staged.as_file()).map_err(io)?;
+            match staged.persist_noclobber(&path) {
+                Ok(_) => id.as_bytes().to_vec(),
+                Err(error) if error.error.kind() == ErrorKind::AlreadyExists => std::fs::read(&path).map_err(io)?,
+                Err(error) => return Err(io(error.error)),
+            }
+        }
+        Err(error) => return Err(io(error)),
+    };
+    rtdb_storage::sync_directory(directory).map_err(io)?;
+    uuid::Uuid::from_slice(&bytes).ok().filter(|id| !id.is_nil()).ok_or_else(||
+        Anomaly::fault("rtdb.node/local-log-lineage", format!("{} has an invalid journal identity", path.display())))
+}
+
+#[cfg(test)]
+#[test]
+fn native_search_lineage_follows_the_journal_after_its_directory_moves() {
+    use rtdb_storage::log::{LocalLog, LocalLogOptions};
+
+    let files = tempfile::tempdir().unwrap();
+    let original = files.path().join("original");
+    let moved = files.path().join("moved");
+    let open = |directory: &Path| {
+        LocalLog::open(directory.join("REPLICA_LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 1 }).unwrap()
+    };
+    let journal = open(&original);
+    let lineage = native_log_lineage(&original).unwrap();
+    drop(journal);
+    std::fs::rename(&original, &moved).unwrap();
+
+    let _moved_journal = open(&moved);
+    let _new_journal = open(&original);
+    assert_eq!(native_log_lineage(&moved).unwrap(), lineage);
+    assert_ne!(native_log_lineage(&original).unwrap(), lineage);
 }
 
 #[async_trait::async_trait]
@@ -584,7 +631,7 @@ impl rtdb_maintenance::TableHistorySource for NativeTableReplay {
             for row in 0..batch.len() { visit(block, HistoryRow::Stored { batch, row })?; }
             Ok(())
         }).await?.is_some() {}
-        Ok(Some(HistoryCoverage::Native { lineage: self.lineage.clone(), through }))
+        Ok(Some(HistoryCoverage::Native { lineage: format!("native/{}", self.lineage), through }))
     }
 }
 

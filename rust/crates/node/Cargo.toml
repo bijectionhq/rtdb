@@ -58,12 +58,12 @@ chrono-tz.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tantivy.workspace = true
 
 [[example]]
