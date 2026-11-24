@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use super::*;
 
 pub(crate) const READ_HELD_UNIQUE_WINDOW_V1: &str = "rtdb.owned.ReadHeldUniqueWindow.v1";
@@ -61,14 +63,15 @@ impl Service {
             let (id_index, id_field) = field("_id")?;
             let (key_index, key_field) = field(&column)?;
             for row in 0..batch.num_rows() {
-                let id = rtdb_columnar::read_execution_value(id_field, batch.column(id_index).as_ref(), row).map_err(status)?;
-                let value = rtdb_columnar::read_execution_value(key_field, batch.column(key_index).as_ref(), row).map_err(status)?;
-                let (Value::Utf8(id), Value::Binary(value)) = (id, value) else { return Err(history_invalid()); };
+                let (id, value) = unique_window_keys(
+                    id_field, batch.column(id_index).as_ref(),
+                    key_field, batch.column(key_index).as_ref(), row,
+                )?;
                 let start = history_row_time(batch, "_valid_from", row)?.ok_or_else(history_invalid)?;
                 let end = history_row_time(batch, "_valid_to", row)?.ok_or_else(history_invalid)?;
                 if start < from || end > to || start >= end
                     || value.is_empty() || value.len() > rtdb_query::OWNED_UNIQUE_KEY_MAX
-                    || key.is_some_and(|key| key != value.as_slice())
+                    || key.is_some_and(|key| key != value.as_ref())
                 {
                     return Err(history_invalid());
                 }
@@ -167,5 +170,56 @@ impl Service {
         Ok(ActionResult {
             body: wire::retain(bytes, charge),
         })
+    }
+}
+
+fn unique_window_keys<'a>(
+    id_field: &Field,
+    ids: &'a dyn Array,
+    key_field: &Field,
+    keys: &'a dyn Array,
+    row: usize,
+) -> Result<(Cow<'a, str>, Cow<'a, [u8]>), Status> {
+    if id_field.metadata().is_empty() && key_field.metadata().is_empty()
+        && let (Some(ids), Some(keys)) = (
+            ids.as_any().downcast_ref::<StringArray>(),
+            keys.as_any().downcast_ref::<BinaryArray>(),
+        )
+    {
+        if ids.is_null(row) || keys.is_null(row) {
+            return Err(history_invalid());
+        }
+        return Ok((Cow::Borrowed(ids.value(row)), Cow::Borrowed(keys.value(row))));
+    }
+    let id = rtdb_columnar::read_execution_value(id_field, ids, row).map_err(status)?;
+    let key = rtdb_columnar::read_execution_value(key_field, keys, row).map_err(status)?;
+    let (Value::Utf8(id), Value::Binary(key)) = (id, key) else { return Err(history_invalid()); };
+    Ok((Cow::Owned(id), Cow::Owned(key)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unique_window_borrows_plain_cells_and_preserves_the_fallback() {
+        let id_field = Field::new("_id", DataType::Utf8, true);
+        let key_field = Field::new("key", DataType::Binary, true);
+        let tagged_id = id_field.clone().with_metadata([("fixture".into(), "value".into())].into());
+        let ids = StringArray::from(vec![Some("α"), None]);
+        let key = &[0, 255, 23][..];
+        let keys = BinaryArray::from_iter([Some(key), Some(key)]);
+
+        let plain = unique_window_keys(&id_field, &ids, &key_field, &keys, 0).unwrap();
+        assert!(matches!(&plain.0, Cow::Borrowed(_)));
+        assert!(matches!(&plain.1, Cow::Borrowed(_)));
+        assert_eq!(plain, unique_window_keys(&tagged_id, &ids, &key_field, &keys, 0).unwrap());
+        assert_eq!(plain.0, "α");
+        assert_eq!(plain.1.as_ref(), key);
+
+        let plain_error = unique_window_keys(&id_field, &ids, &key_field, &keys, 1).unwrap_err();
+        let fallback_error = unique_window_keys(&tagged_id, &ids, &key_field, &keys, 1).unwrap_err();
+        assert_eq!(plain_error.code(), fallback_error.code());
+        assert_eq!(plain_error.message(), fallback_error.message());
     }
 }
