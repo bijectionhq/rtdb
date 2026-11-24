@@ -13,15 +13,15 @@ use crate::{
 const HEADER_BYTES: u64 =
     (PUBLICATION_ID_BYTES + crate::cipher::object::SEALED_HEADER_BYTES) as u64;
 
-/// A census of physical copies under the local volume lock and the directory's
-/// lineage reservation. The exact release remains the deletion authority.
-pub(super) struct LocalSlots<'a> {
+/// Finds aliases of an immutable serving slot inside the directory lineage.
+/// The requesting retirement owns the lineage reservation and its provider fence.
+pub(super) struct PublicationCensus<'a> {
     keys: &'a dyn KeyService,
     peers: &'a [DeploymentRecord],
     io: &'a Arc<IoRegion>,
 }
 
-impl<'a> LocalSlots<'a> {
+impl<'a> PublicationCensus<'a> {
     pub(super) fn new(
         keys: &'a dyn KeyService,
         peers: &'a [DeploymentRecord],
@@ -85,7 +85,7 @@ impl<'a> LocalSlots<'a> {
         Ok(())
     }
 
-    async fn has_another_copy(
+    pub(super) async fn has_another_copy(
         &self,
         bucket: &dyn ObjectStore,
         owner: &DeploymentRecord,

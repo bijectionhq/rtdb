@@ -108,6 +108,7 @@ pub enum RetirementWork {
         data_tombstone: S3TombstoneTarget,
         release_tombstone: S3TombstoneTarget,
         slot_origin: Option<[u8; 32]>,
+        packed_slots: Option<[u8; 32]>,
     },
     ReplayPack {
         deployment: String,

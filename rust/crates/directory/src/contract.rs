@@ -271,6 +271,7 @@ async fn exact_retirement(directory: &dyn Directory, parent: &DeploymentRecord, 
             deployment: parent.id.clone(), target: target.clone(), release: release.clone(),
             data_tombstone: tombstone(&target, "\"original\""), release_tombstone: tombstone(&release, "\"record\""),
             slot_origin: None,
+            packed_slots: None,
         }
     } else {
         crate::RetirementWork::S3 {

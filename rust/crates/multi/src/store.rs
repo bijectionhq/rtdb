@@ -1443,7 +1443,7 @@ pub async fn simulate_reap_cell(bucket: &rtdb_storage::MemoryStore, deployments:
 }
 
 enum ReleaseSweep<'a> {
-    Local(&'a crate::reference::References, Option<publication_retirement::LocalSlots<'a>>),
+    Local(&'a crate::reference::References, Option<publication_retirement::PublicationCensus<'a>>),
     Hosted,
 }
 
@@ -1872,7 +1872,7 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && can_reap(record))
             else { return Ok(Reaped::default()); };
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        let slots = keys.map(|keys| publication_retirement::LocalSlots::new(keys, &deployments, &io));
+        let slots = keys.map(|keys| publication_retirement::PublicationCensus::new(keys, &deployments, &io));
         let mut reaped = reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references, slots)).await?;
         if let Some(keys) = keys.filter(|_| replay_retirement::eligible(record)) {
             reaped.erased += replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references).await?;

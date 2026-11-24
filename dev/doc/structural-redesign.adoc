@@ -250,7 +250,9 @@ The retirement owner withdraws the original publication scopes after disposing t
 The retirement owner checks descendant references and physical loose and packed aliases before withdrawing each last slot.
 Versioned S3 examines exact loose publications and every data version at their aliases, including noncurrent versions.
 The directory fence excludes provider publications while their exact retirement executes.
-Hosted pack members and orphan slots in an open origin remain open.
+Terminal S3 checkpoint metadata packs record the authenticated last-slot census before fencing their ciphertext.
+The existing exact retirement owner reopens that census and settles those slots before it releases the lineage.
+Other hosted packs and orphan slots in an open origin remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
