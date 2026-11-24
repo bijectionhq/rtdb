@@ -516,7 +516,9 @@ variant ArtefactsRemovedMessage : SourceMessage {
 }
 
 value ArtefactEntry {
+    -- The writer records a search-pending intent with its staging owner before the posting run upload.
     -- A logical-search entry can atomically adopt a posting run and its generation's term directory under the expected catalog basis.
+    -- An ordered abandonment records retirement of an unadopted run after the collector proves the staging writer has drained.
     -- The table block checkpoints active runs and term-directory roots at the same cut.
     -- An L0 notification carrying a directory update also persists that update's original compare-and-set inputs in the staged table block.
     trie_key: trie_cat/TrieKey

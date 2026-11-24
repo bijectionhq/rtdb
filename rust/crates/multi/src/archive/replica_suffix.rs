@@ -19,7 +19,7 @@ use super::{
     ArchiveKey, CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
     unavailable, verified_archive, verified_held_archive, verify_cut,
 };
-use super::replica_artifact::{CertifiedSegments, ReplicaArtifact, extend_payload, require_chain};
+use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, extend_payload, require_chain};
 use super::stage::{RegionPublication, with_region};
 use crate::{
     admin::{administration_stream, update_installation},
@@ -124,7 +124,7 @@ pub(crate) async fn read_published_catalog(
 }
 
 pub(crate) async fn visit_table(
-    directory: &dyn Directory, record: &DeploymentRecord, storage: &CellStorage, keys: &dyn KeyService,
+    directory: &dyn Directory, record: &DeploymentRecord, region: Uuid, broker: Option<&Client>, keys: &dyn KeyService,
     checkpoint: Checkpoint, base: &BlockCatalog, target: &BlockCatalog, table: &rtdb_types::TableRef,
     io: Arc<IoRegion>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
     mut visit: impl FnMut(BlockIndex, &rtdb_format::data::EventBatch) -> Result<()> + Send,
@@ -135,15 +135,15 @@ pub(crate) async fn visit_table(
         if target.publication_sha256() != base.publication_sha256() { return Err(suffix_unavailable()); }
         return Ok(());
     }
-    let first = crate::hosted_recovery::replay_start(record, checkpoint.boundary)?;
+    let first = checkpoint.boundary.checked_add(1).ok_or_else(suffix_unavailable)?;
     if through < first || target.external_source_token().is_some() || base.external_source_token().is_some() {
         return Err(suffix_unavailable());
     }
     let stream = administration_stream(directory, record, 4 << 20).await?;
     let certificate = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
     let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?;
-    let cipher = TerminalReplicaCipher::open(record, keys).await?;
-    let payloads = ServingPayloads::new(record, storage, keys, io, memory);
+    let cipher = TerminalReplicaCipher::open(record, keys, io).await?;
+    let payloads = ServingPayloads::new(record, region, &certificate, broker, memory)?;
     let mut fence = rtdb_replication::TermFence::from_catalog(base)?;
     let mut writer = None;
     let mut logical = LogicalReplay::new(checkpoint, record.log_epoch, base);
@@ -155,7 +155,7 @@ pub(crate) async fn visit_table(
         let bytes = entries.iter().try_fold(0usize, |total, entry|
             total.checked_add(entry.payload.len().saturating_mul(2).saturating_add(64)).ok_or_else(suffix_unavailable))?;
         let _charge = memory.reserve(bytes)?;
-        cipher.open_page(&mut entries)?;
+        cipher.open_page(&mut entries).await?;
         for entry in entries {
             if cancellation.is_cancelled() { return Err(history_cancelled()); }
             if entry.lsn != next || entry.lsn > through { return Err(suffix_unavailable()); }
@@ -163,7 +163,7 @@ pub(crate) async fn visit_table(
             let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
             let _payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                let (resolved, retained) = payloads.resolve_verified(&envelope).await?;
+                let (resolved, retained) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
                 _payload = retained;
                 resolved
             } else { envelope };

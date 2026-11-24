@@ -101,7 +101,9 @@
 -- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
 -- Their tries then become garbage like any superseded trie, and the deletion rules below collect them unchanged.
 -- Directory-managed logical search staging records its writer epoch and provider region before uploading.
--- A replacement writer can order abandonment after the originating region drains.
+-- Hosted collection proves drain when the writer epoch has advanced and the originating storage region is absent from the deployment.
+-- A logical search intent on a native local store carries the writer attachment whose flock witness is held for the writer's lifetime.
+-- Native collection proves drain by acquiring that attachment's released witness lock.
 -- The installed search retirement still needs the immutable provider publication and its catalog grant.
 --
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
@@ -427,12 +429,16 @@ rule DeleteAndCommitChunkRule {
     -- Any DELETE failure aborts the chunk before the publish happens.
     -- Followers must never drop catalog entries for files still on disk.
     --
-    -- A pending search allocation with a completed object may be abandoned after its source cut is installed and its observation lease has elapsed.
+    -- A completed pending search upload may be abandoned after its source cut is installed and the staging owner has drained.
+    -- The collector uses a fresh observation to bind the completed body to its provider publication where the store requires one.
+    -- Once the writer has drained, a fresh absence observation permits removal of the intent.
     -- Ordered abandonment succeeds while the allocation is unadopted and fences later adoption at the same identity.
     -- A hosted release uses the installed retirement, the catalog admission floor, and proof of the provider version or terminal publication.
     -- Checkpoint recovery retains the abandonment after physical release.
     -- Replay checkpoint copies and archives include every authenticated page reached by the recorded term directory roots.
-    -- A serving receipt over a complete semantic entity directory omits logical posting runs and term directory pages, which the lane rebuilds.
+    -- A serving receipt over a complete semantic entity directory omits the covered obsolete L0 pairs, logical posting runs, and term directory pages.
+    -- The lane rebuilds the search files from the entity directory and the surviving primary payloads.
+    -- Replay copies retain the obsolete L0 pairs required by reset and relocation.
     -- Term directory pages can be shared across catalog generations, and survive retirement of individual posting runs.
     -- A trie's artefacts, such as its search files (fts.allium), go before its data file: they carry the data file's content, so they must not outlive it.
     -- They are found by listing the trie's artefact prefix rather than by reading its entry's records, which also catches an artefact whose record had not been applied when this cycle read its snapshot.

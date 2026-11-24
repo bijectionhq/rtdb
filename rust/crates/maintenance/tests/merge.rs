@@ -491,7 +491,7 @@ async fn reinsertion_keeps_erase_effective_at_earlier_system_times_after_compact
     }).unwrap();
     let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
     let row = |system, valid_time, operation| StoredEvent {
-        origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]),
+        position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([1; 16]),
         system_from: Timestamp(system), valid_time, operation, recency: None,
     };
     let put = |value| StoredOperation::Put(StructFields::from([("value".into(), Value::I64(value))]));

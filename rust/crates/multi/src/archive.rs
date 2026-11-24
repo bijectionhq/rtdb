@@ -92,7 +92,7 @@ mod retirement;
 mod replica_artifact;
 mod replica_suffix;
 pub(crate) use replica_suffix::reseal_live_journal;
-mod table_history;
+pub(crate) mod table_history;
 mod replay_handoff;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
 mod read_world;
@@ -1313,7 +1313,7 @@ async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, co
     catalog_objects_at_view(plaintext, catalog, CheckpointInventory::Copy(contents), false).await
 }
 
-async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, inventory: CheckpointInventory), held: bool) -> Result<CheckpointObjects> {
+async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, inventory: CheckpointInventory, held: bool) -> Result<CheckpointObjects> {
     let contents = match inventory {
         CheckpointInventory::Copy(contents) => contents,
         CheckpointInventory::Serving => CheckpointContents::Replay,
@@ -1330,9 +1330,10 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
             return Err(inconsistent("Checkpoint table bytes do not match the root manifest"));
         }
         let metadata = TableBlock::decode(&bytes)?;
-        let rebuildable_search = matches!(inventory, CheckpointInventory::Serving)
-            && metadata.as_proto().entity_directory.as_ref().is_some_and(|directory|
-                table_history::complete_directory(directory, block, metadata.row_count()));
+        let serving_directory = metadata.as_proto().entity_directory.as_ref().filter(|directory|
+            matches!(inventory, CheckpointInventory::Serving)
+                && table_history::complete_directory(directory, block, metadata.row_count()));
+        let rebuildable_search = serving_directory.is_some();
         if closure.insert(path, CheckpointMember::metadata(observed)).is_some() {
             return Err(inconsistent("Two checkpoint tables use the same storage path"));
         }
@@ -1344,10 +1345,17 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
                 .map_or_else(CheckpointMember::default, |page| CheckpointMember::metadata(page.0));
             closure.entry(key(&object)?).or_insert(member);
         }
-        for trie in metadata.trie_details() {
-            let Some(extent) = trie.data_file_size else { continue; };
-            let trie: TrieKey = trie.trie_key.as_deref().unwrap_or_default().parse()?;
-            if let Some(member) = closure.get_mut(&key(&table.slug.data_key(&trie))?) {
+        for detail in metadata.trie_details() {
+            let trie: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
+            let data = key(&table.slug.data_key(&trie))?;
+            if detail.trie_state == Some(rtdb_format::block::proto::TrieState::Garbage as i32)
+                && trie.level() == 0 && serving_directory.is_some_and(|root| trie.block_index().0 <= root.through_block())
+            {
+                closure.remove(&data);
+                closure.remove(&key(&table.slug.metadata_key(&trie))?);
+                continue;
+            }
+            if let (Some(member), Some(extent)) = (closure.get_mut(&data), detail.data_file_size) {
                 let extent = u64::try_from(extent).map_err(|_| inconsistent("A checkpoint trie has a negative extent"))?;
                 member.bind_extent(extent)?;
             }
@@ -1359,9 +1367,6 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
                 closure.get_mut(&name).ok_or_else(|| inconsistent("A search run is missing from its checkpoint inventory"))?
                     .bind_extent(extent)?;
             }
-        }
-        }
-        if contents == CheckpointContents::Replay && !rebuildable_search {
             retain_term_directory_pages(plaintext, &metadata, &table.slug, &mut closure).await?;
         }
     }

@@ -311,7 +311,6 @@ impl SearchBuilder {
         run.publication = self.store.put_file_with_publication(&key, output).await?.map(Into::into);
         if self.store.releases_exact_search_runs() && run.publication.is_none() {
             run.publication = self.store.retirement_publication(&key).await?.map(Into::into);
-            if run.publication.is_none() { return Err(fault("Search upload returned no immutable provider publication")); }
         }
         Ok(run)
     }
@@ -319,8 +318,9 @@ impl SearchBuilder {
     async fn directory_change(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, prepared: PreparedLogicalRun,
         replaces: Vec<Vec<u8>>, cancellation: &CancellationToken) -> Result<SearchRunChange> {
         let PreparedLogicalRun { run, summaries } = prepared;
-        let update = self.prepare_term_directory(index, columns, snapshot,
-            DirectoryUpdate::Adopt { run: &run, summaries: &summaries, replaces: &replaces }, cancellation).await;
+        let hold = self.hold_logical_input(snapshot).await?;
+        let update = IoRegion::reading(hold, self.prepare_term_directory(index, columns, snapshot,
+            DirectoryUpdate::Adopt { run: &run, summaries: &summaries, replaces: &replaces }, cancellation)).await;
         let mut change = SearchRunChange { run: Some(run), replaces, ..Default::default() };
         match update {
             Ok((root, basis)) => {

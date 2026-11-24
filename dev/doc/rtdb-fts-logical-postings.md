@@ -95,8 +95,12 @@ A change from an older writer invalidates routing for its generation until the l
 The checkpoint stores the active roots.
 Replay archives include the pages reachable from those roots.
 
-The writer stores a bounded intent before it uploads the immutable run.
-Collection observes the intent and the completed object, obtains provider version evidence where required, and submits abandonment through the ordered catalog.
+The writer stores a bounded `search-pending` intent with its `SearchStagingOwner` before uploading the immutable run.
+An upload error leaves the intent available to the collector because the provider can still complete the request.
+Hosted collection proves drain once the writer epoch has turned over and the original storage region has left the deployment.
+Native local collection proves drain by acquiring the released flock witness of the recorded attachment.
+After the source cut is installed and the writer has drained, the collector can record abandonment of the completed body with its immutable publication where required.
+If a fresh observation finds the body absent, the collector can remove the intent.
 Adoption and abandonment are mutually exclusive at that allocation.
 The retirement can release the body after reader and checkpoint protection drains.
 An abandoned allocation remains fenced through checkpoint recovery.
@@ -110,7 +114,7 @@ Replay supplies the erase frontier, so recovery can discard pre-erase text and p
 Events in the same commit retain source order for erasure.
 Maintenance reconstructs older runs containing erase witnesses before adopting them into ordered replacements.
 A retry after a table checkpoint is staged reuses its receipts while publishing the root.
-The same table checkpoint records the directory receipt, its writer fence, and the digest of its ordered erase frontier.
+The same table checkpoint records the directory receipt, the hosted writer epoch when available, and the digest of its ordered erase frontier.
 The receipt's row count includes each retained event and one frontier row per erased entity.
 Each update names the expected predecessor root in the ordered catalog.
 An immutable directory page is addressed by its content digest, and a later seal reuses the untouched subtrees.

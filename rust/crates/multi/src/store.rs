@@ -103,6 +103,7 @@ pub struct CellStoreFactory {
     pub(crate) storage_regions: TaskTracker,
     pub(crate) scoped_writes: Option<Arc<ScopedCellWrites>>,
     pub(crate) local_witnesses: Option<Arc<LocalWitnessPool>>,
+    pub(crate) replay_broker: Option<crate::replay_broker::Client>,
 }
 
 enum LocalWitnessSlot {
@@ -224,7 +225,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         if config.writer_epoch.is_none() { return Ok(None); }
         Ok(Some(Arc::new(crate::archive::table_history::HostedTableReplay::new(
-            Arc::clone(&self.directory), Arc::clone(&self.keys), self.hosted_task.clone(), config,
+            Arc::clone(&self.directory), Arc::clone(&self.keys), self.hosted_task.clone(), config, self.replay_broker.clone(),
         ))))
     }
 
@@ -1571,8 +1572,20 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 impl ObjectStore for GarbageStore {
     fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
     async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
-        let publication = self.retirement_publication(key).await?.map(rtdb_format::log::proto::PublishedObjectVersion::from);
-        self.release_search_run(key, publication.as_ref(), cut).await
+        let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
+        let Some(cut) = cut else { return Ok(false); };
+        let Some(publication) = self.retirement_publication(key).await? else {
+            return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
+        };
+        let (floor, allowed) = readers.close_admission(cut, &[None]).await?;
+        if !allowed[0] { return Ok(false); }
+        match publication {
+            rtdb_types::PhysicalObjectPublication::Version(version) =>
+                self.write_release_record(key, Some(floor), Some(&version), None, None).await?,
+            rtdb_types::PhysicalObjectPublication::Terminal(terminal) =>
+                self.write_release_record(key, Some(floor), None, None, Some(&terminal)).await?,
+        }
+        Ok(true)
     }
 
     fn whole_object_allocation(&self, key: &ObjectKey, length: usize) -> rtdb_storage::Result<ObjectReadAllocation> {
@@ -1645,9 +1658,7 @@ impl ObjectStore for GarbageStore {
         if version.is_none() && terminal.is_none() {
             return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
         }
-        let path = (rtdb_format::search_manifest::is_run_key(key.as_str())
-            || rtdb_format::entity_directory::page_digest(key.as_str()).is_some()
-            || rtdb_format::term_directory::page_digest(key.as_str()).is_some()).then_some(key.as_str());
+        let path = rtdb_format::search_manifest::is_run_key(key.as_str()).then_some(key.as_str());
         let (floor, allowed) = readers.close_admission(cut, &[path]).await?;
         if !allowed[0] { return Ok(false); }
         self.write_release_record(key, Some(floor), version.as_ref(), None, terminal.as_ref()).await?;
@@ -2645,7 +2656,7 @@ mod tests {
         let record = directory.create_deployment(DeploymentRecord::new("shop", "acme", Vec::new(), 0)).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, storage_regions: TaskTracker::new(),
-            scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
+            scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
         };
         for (writer_epoch, compactor) in [(Some(0), false), (None, true)] {
             let configuration = CellStoreConfig {
@@ -2671,7 +2682,7 @@ mod tests {
         deleting.lifecycle = Lifecycle::Deleting;
         let deleting = directory.create_deployment(deleting).await.unwrap();
         let config = CellStoreConfig { storage, prefix: deleting.storage_prefix(), deployment: deleting.id, writer_epoch: None, compactor: false, snapshot_block: None };
-        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None };
+        let factory = CellStoreFactory { directory, keys, storage_namespaces, storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None };
         let config = Any { type_url: CELL_STORAGE_TYPE.into(), value: serde_json::to_vec(&config).unwrap() };
         let result = factory.open(&config, &key("v06"), IoRegion::new()).await;
         assert!(matches!(result, Err(error) if error.code == rtdb_node::NOT_HELD));
@@ -2688,7 +2699,7 @@ mod tests {
         let storage_namespaces = crate::deployment::storage_namespaces(bucket.as_ref(), keys.as_ref()).await.unwrap();
         let factory = CellStoreFactory {
             directory: directory.clone(), keys: keys.clone(), storage_namespaces,
-            storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, audience_source: None,
+            storage_regions: TaskTracker::new(), scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None, audience_source: None,
         };
         let mut record = DeploymentRecord::new("shop", "acme", Vec::new(), 0);
         record.epoch = 2;
@@ -2733,7 +2744,7 @@ mod tests {
         let record = directory.create_deployment(record).await.unwrap();
         let factory = CellStoreFactory {
             directory, keys: keys.clone(), storage_namespaces, storage_regions: TaskTracker::new(),
-            scoped_writes: None, hosted_task: None, local_witnesses: None,
+            scoped_writes: None, hosted_task: None, local_witnesses: None, replay_broker: None,
             audience_source: Some(Uuid::parse_str(&record.id).unwrap()),
         };
         let storage: CellStorage = serde_json::from_value(serde_json::json!({
@@ -3072,7 +3083,7 @@ mod tests {
             directory: directory.clone(),
             keys: keys.clone(),
             storage_regions: TaskTracker::new(),
-            local_witnesses: None, audience_source: None,
+            local_witnesses: None, replay_broker: None, audience_source: None,
             storage_namespaces,
             scoped_writes: None,
             hosted_task: None,
@@ -3462,7 +3473,7 @@ mod tests {
         let tasks = TaskTracker::new();
         let storage_factory = CellStoreFactory {
             directory: directory.clone(), keys, storage_namespaces, hosted_task: None,
-            storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, audience_source: None,
+            storage_regions: tasks.clone(), scoped_writes: None, local_witnesses: None, replay_broker: None, audience_source: None,
         };
         let configuration = |snapshot_block| Any { type_url: String::new(), value: serde_json::to_vec(&CellStoreConfig {
             storage: storage.clone(), prefix: record.storage_prefix(), deployment: record.id.clone(),

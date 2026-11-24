@@ -28,6 +28,7 @@ pub(crate) struct HostedTableReplay {
     keys: Arc<dyn KeyService>,
     hosted_task: Option<HostedTask>,
     config: CellStoreConfig,
+    broker: Option<crate::replay_broker::Client>,
 }
 
 impl HostedTableReplay {
@@ -36,12 +37,14 @@ impl HostedTableReplay {
         keys: Arc<dyn KeyService>,
         hosted_task: Option<HostedTask>,
         config: CellStoreConfig,
+    broker: Option<crate::replay_broker::Client>,
     ) -> Self {
         Self {
             directory,
             keys,
             hosted_task,
             config,
+            broker,
         }
     }
 
@@ -66,6 +69,7 @@ impl HostedTableReplay {
         target: &BlockCatalog,
         read: HistoryRead<'_>,
         visit: &mut HistoryVisitor<'_>,
+        region: uuid::Uuid,
         io: Arc<IoRegion>,
     ) -> Result<Option<HistoryCoverage>> {
         let store = read.storage.object_store();
@@ -115,7 +119,8 @@ impl HostedTableReplay {
         visit_table(
             self.directory.as_ref(),
             record,
-            &self.config.storage,
+            region,
+            self.broker.as_ref(),
             self.keys.as_ref(),
             checkpoint,
             &base,
@@ -342,8 +347,8 @@ impl TableHistorySource for HostedTableReplay {
                     checkpoint.boundary,
                 )?))
             },
-            |record, _, io| async move {
-                self.replay(&record, checkpoint, target, read, visit, io)
+            |record, region, io| async move {
+                self.replay(&record, checkpoint, target, read, visit, region, io)
                     .await
             },
         );

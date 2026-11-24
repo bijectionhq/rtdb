@@ -157,7 +157,7 @@ config {
 --   L0 → L1C/L1H: recency is calculated for each event through bitemporal resolution.
 --     Events with recency = ∞ go to the current output file.
 --     Events with finite recency are routed to historical output files, partitioned into weekly buckets.
---     Native compaction assigns infinite recency to an erase marker and surviving events with the same IID and system time, preserving their merge order in the current output.
+--     Native compaction assigns infinite recency to an erase marker and surviving events that share its exact entity key and system time, preserving their merge order in the current output.
 --     With `within_file_recency_branching` on, every row of a historical output file carries the recency computed for it in a `_recency` column; current output files carry none.
 --   All other compactions: recency from the input file's trie key is preserved into a single output file.
 --     Recency is never recomputed above L1H.

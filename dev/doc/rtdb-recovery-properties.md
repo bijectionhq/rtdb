@@ -48,8 +48,8 @@ A fork checkpoint from the parent's stream grants no permission to trim the chil
 
 For a table using semantic history, the checkpoint also binds the entity directory root, its erase frontier, and every reachable directory page.
 Its recovery inventory holds current primary payload files so stable event origins still resolve after compaction removes the source tries.
-For a table whose semantic directory covers all checkpointed rows, the serving receipt allows startup and search repair after loss of logical postings and term-directory pages.
-Replay archives still verify the complete captured search inventory.
+For a table whose semantic directory covers all checkpointed rows, the serving receipt allows startup and search repair after loss of its covered obsolete L0 pairs, logical postings, and term-directory pages.
+Replay archives verify the complete captured search inventory and retain the L0 pairs required by reset and relocation.
 The holder verifies this inventory and the completeness of the directory roots before authorizing trim.
 Existing reader and archive suffix holds still constrain the first retained replica position.
 

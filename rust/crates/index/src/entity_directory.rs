@@ -84,8 +84,8 @@ mod tests {
     use crate::{CatalogTrie, TrieCatalog};
 
     #[test]
-    fn a_moved_directory_root_refuses_adoption_but_not_later_custody_steps() {
-        use rtdb_format::log::proto::{CustodyEvidence, SearchRun, SearchRunChange, SourceReceipt, custody_evidence::Kind};
+    fn a_moved_directory_root_refuses_adoption_and_allows_retirement() {
+        use rtdb_format::log::proto::{SearchRun, SearchRunChange, SourceReceipt};
 
         let table = TableRef::new("public", "docs");
         let trie = |block| TrieKey::l0(BlockIndex(block)).unwrap();
@@ -99,15 +99,13 @@ mod tests {
             .with_tries(table.clone(), (0..2).map(|block| CatalogTrie::notification(trie(block), 10, None).unwrap()), Timestamp(0)).unwrap()
             .with_artefacts(&table, [(trie(0), EntityDirectoryChange { root: Some(first.clone()), replaces_root: None }.to_artefact().unwrap())])
             .with_artefacts(&table, [(trie(1), EntityDirectoryChange { root: Some(second), replaces_root: first.root.clone() }.to_artefact().unwrap())]);
-        let run = SearchRun { allocation: Some(vec![9; 16]), writer_fence: Some(3), source_receipt: Some(SourceReceipt {
+        let run = SearchRun { allocation: Some(vec![9; 16]), source_receipt: Some(SourceReceipt {
             table: Some(table.schema_and_table()), directory_root: first.root.clone(), erase_frontier_digest: first.erase_frontier_digest.clone(),
             ..Default::default() }), ..Default::default() };
-        let uploaded = Some(CustodyEvidence { kind: Some(Kind::Uploaded as i32), fence: None });
-        let change = |reserve, stage, evidence: Option<CustodyEvidence>| SearchRunChange { run: Some(run.clone()),
-            reserve: Some(reserve), stage: Some(stage), custody_evidence: evidence, ..Default::default() };
-        assert!(catalog.accepts_search_source(&table, &change(true, false, None)));
-        assert!(catalog.accepts_search_source(&table, &change(false, true, uploaded.clone())));
-        assert!(!catalog.accepts_search_source(&table, &change(false, false, uploaded)));
+        let adoption = SearchRunChange { run: Some(run.clone()), ..Default::default() };
+        assert!(!catalog.accepts_search_source(&table, &adoption));
+        let retirement = SearchRunChange { run: Some(run), retire_only: Some(true), ..Default::default() };
+        assert!(catalog.accepts_search_source(&table, &retirement));
     }
 
     #[test]

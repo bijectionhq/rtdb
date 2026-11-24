@@ -326,7 +326,8 @@ impl TrieCatalog {
     pub fn accepts_search_run(&self, table: &TableRef, record: &log_pb::ArtefactRecord) -> bool {
         let Ok(change) = log_pb::SearchRunChange::from_artefact(record) else { return false; };
         let Some(run) = &change.run else { return false; };
-        change.abandon() || run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some()))
+        self.accepts_search_source(table, &change)
+            && (change.abandon() || run.blocks().all(|block| TrieKey::l0(block).ok().is_some_and(|key| self.trie(table, &key).is_some())))
     }
 
     pub(crate) fn accepts_search_source(&self, table: &TableRef, change: &log_pb::SearchRunChange) -> bool {
@@ -399,8 +400,7 @@ impl TrieCatalog {
                 if record.kind() == rtdb_format::search_manifest::RECORD_KIND {
                     if key.level() == 0 && self.accepts_search_run(table, &record)
                         && let Ok(change) = log_pb::SearchRunChange::from_artefact(&record)
-                        && change.run.as_ref().is_some_and(|run| run.blocks.first() == Some(&key.block_index().0))
-                        && self.accepts_search_source(table, &change) {
+                        && change.run.as_ref().is_some_and(|run| run.blocks.first() == Some(&key.block_index().0)) {
                         std::sync::Arc::make_mut(&mut state.search).apply_uploaded(change, as_of);
                     }
                     continue;

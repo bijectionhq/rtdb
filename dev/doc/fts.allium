@@ -179,7 +179,7 @@ rule SearchJobRuns {
     -- A format 15 writer seals search files with primary level-0 data at the block boundary when admitted.
     -- The format 15 lane fills missing coverage and can replace committed singleton files with one pack independently of primary compaction.
     -- A format 16 writer seals forward witnesses for the indexed fields with the primary block.
-    -- After block adoption the independent lane can build a posting run over that accepted extent.
+    -- The seal can publish a posting run for its L0 extent, and the independent lane fills gaps after block adoption.
     -- Queries account for that extent from primary history until the run is adopted.
     -- The table directory covers a sealed prefix of accepted events and carries each erased entity's latest erase frontier.
     -- The table also owns event header pages for individual primary tries.
@@ -189,7 +189,9 @@ rule SearchJobRuns {
     -- Histories with different entity keys under one IID resolve through the scan.
     -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
     -- A resolved event must identify itself before a forward witness can certify its score.
-    -- A posting run records durable custody before uploading its immutable body.
+    -- The writer stores a search-pending intent with its staging owner before uploading the immutable body.
+    -- A successful upload supplies the immutable publication for ordered adoption when the provider exposes it.
+    -- An unsuccessful upload leaves the intent for collection under the same writer-drain rules.
     -- A captured catalog routes each required term using the authenticated locator of each eligible run.
     -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
     -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.
@@ -225,7 +227,7 @@ rule RetireSearchFiles {
     -- A format 15 file and every superseded singleton stay available to pinned readers.
     -- Sealed level-0 search files retire once their trie is obsolete in the checkpoint and all reader holds have expired.
     -- A format 16 run retires on ordered replacement or when its definition leaves force.
-    -- An unadopted upload can also be abandoned through the ordered manifest after its durable source cut is installed.
+    -- Collection orders abandonment of a completed upload once the source cut is installed and the staging owner has drained.
     -- An ordered upload receipt for a rejected replacement is itself eligible for retirement.
     -- Collection waits for active catalog captures, the latest recovery checkpoint, and the reader lease before releasing a retired run.
     -- Every node's lane retires on its own, so a removal may be appended more than once, and a second changes nothing.

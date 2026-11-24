@@ -686,6 +686,10 @@ impl ObjectStore for LocalStore {
         crate::classic_retirement::retire_search_run(self, key, publication, cut, None).await
     }
 
+    async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        crate::classic_retirement::retire_search_run(self, key, None, cut, None).await
+    }
+
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         self.io.read(self.root.clone(), key.clone(), move |root, key| {
             let path = root.join(key.as_str());

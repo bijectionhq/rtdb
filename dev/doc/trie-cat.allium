@@ -200,6 +200,8 @@ entity TrieCatalog {
     -- Each table also owns an independent logical search manifest of authenticated posting receipts.
     -- Primary trie replacement and search-run replacement advance their respective inventories in the catalog cut.
     -- A checkpoint carries active run receipts and pending retirements with the primary trie inventory.
+    -- The search-pending intent records the staging owner during upload.
+    -- Ordered abandonment retires an unadopted allocation and its receipt survives checkpoint recovery.
     -- Each table has at most one active entity directory.
     -- An entity-directory record is anchored to the L0 block the receipt covers.
     -- Installing the receipt makes it active and retains the former root for collection.

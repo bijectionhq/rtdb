@@ -168,6 +168,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         audience_source: audience.map(|(_, profile)| profile.source()),
         storage_regions: storage_regions.clone(),
         local_witnesses,
+        replay_broker: settings.agent.replay_broker.clone(),
     });
     let receiver_clock = crate::receiver_clock::ReceiverClock::new(Arc::clone(&directory), storage_namespaces.objects);
     let decision_clock: Arc<dyn rtdb_node::DecisionClock> = receiver_clock.clone();

@@ -82,6 +82,9 @@ impl Snapshot {
             Some(())
         };
         for table in self.trie_catalog.tables() {
+            if self.trie_catalog.entity_directory(table).is_some() || self.trie_catalog.term_directories(table).next().is_some() {
+                return None;
+            }
             let entry = self.table_catalog.entry(table)?;
             for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0) {
                 if trie.state == TrieState::Live {

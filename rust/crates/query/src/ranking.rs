@@ -321,7 +321,7 @@ mod tests {
 
     fn row(id: u8, version: i64, key: RankKey) -> VerifiedRankRow {
         VerifiedRankRow { key, row: ResolvedSearchRow {
-            version: RowVersion { iid: Iid([id; 16]), system_from: Timestamp(version), commit_position: 0 },
+            version: RowVersion { position: None, iid: Iid([id; 16]), system_from: Timestamp(version), commit_position: 0 },
             origin: None,
             location: SearchRowLocation::Persisted { trie: TrieKey::l0(BlockIndex(0)).unwrap(), page: 0, row: 0 },
             visibility: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL },

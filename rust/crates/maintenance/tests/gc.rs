@@ -950,64 +950,10 @@ async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_nex
 }
 
 #[tokio::test]
-async fn a_staged_upload_is_abandoned_only_after_a_successor_writer_fence() {
-    use rtdb_format::log::proto::{ArtefactsAdded, ArtefactsRemoved, CustodyEvidence, SearchRun, SearchRunChange, custody_evidence::Kind};
-    use rtdb_index::Custody;
-    use rtdb_maintenance::ArtefactPublisher;
-    use rtdb_types::{SourcePosition, WriterFence};
-
-    struct SearchPublisher { table: TableRef, state: Arc<PartitionState> }
-    #[async_trait]
-    impl ArtefactPublisher for SearchPublisher {
-        async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> {
-            let entries = message.entries.into_iter().map(|entry| {
-                (entry.trie_key.unwrap().parse::<TrieKey>().unwrap(), entry.record.unwrap())
-            }).collect();
-            self.state.add_artefacts_at(&self.table, entries, Timestamp(100));
-            Ok(SourcePosition(1))
-        }
-
-        async fn remove(&self, _: ArtefactsRemoved) -> Result<SourcePosition> { panic!("Staged uploads leave through custody") }
-    }
-
-    let table = TableRef::new("public", "docs");
-    let tables = TableCatalog::load(Some(block(0)), &BTreeMap::new()).unwrap().with_seeded_table(table.clone(), Vec::new()).unwrap();
-    let entry = tables.entry(&table).unwrap().clone();
-    let l0 = TrieKey::l0(BlockIndex(0)).unwrap();
-    let catalog = TrieCatalog::default().with_tries(table.clone(), [CatalogTrie::notification(l0.clone(), 1, None).unwrap()], Timestamp(10)).unwrap();
-    let state = Arc::new(PartitionState::new(PartitionValue::loaded(catalog, tables, TrieConfig::default()).unwrap()));
-    let run = SearchRun { definition_id: Some("docs_bodyf16".into()), definition_version: Some(1), blocks: vec![0],
-        digest: Some(vec![7; 32]), locator: Some(vec![1]), file_size: Some(4), source_rows: Some(1),
-        allocation: Some(vec![16; 16]), writer_fence: Some(10), ..Default::default() };
-    let reserve = SearchRunChange { run: Some(run.clone()), reserve: Some(true), ..Default::default() };
-    let stage = SearchRunChange { run: Some(run.clone()), stage: Some(true),
-        custody_evidence: Some(CustodyEvidence { kind: Some(Kind::Uploaded as i32), fence: None }), ..Default::default() };
-    state.add_artefacts_at(&table, vec![(l0.clone(), reserve.to_artefact().unwrap())], Timestamp(1));
-    state.add_artefacts_at(&table, vec![(l0, stage.to_artefact().unwrap())], Timestamp(2));
-    assert!(matches!(state.snapshot().trie_catalog().search_upload(&table, &run), Some(Custody::Staged(_))));
-
-    let store = Arc::new(MemoryStore::default());
-    let publisher = Arc::new(SearchPublisher { table: table.clone(), state: state.clone() });
-    let observer = Arc::new(Observer::default());
-    let collector = |fence| {
-        let deletions = Arc::new(DeletedPublisher { table: entry.clone(), store: store.clone(), commits: Mutex::default() });
-        TrieCollector::new(store.clone(), state.clone(), deletions, observer.clone(), unleased(), fixed_clock()).unwrap()
-            .with_search(publisher.clone(), StorageVersion(0), StorageEpoch(0), WriterFence(fence))
-    };
-    let stop = CancellationToken::new();
-    collector(10).collect_as_of(Timestamp(100), &stop).await.unwrap();
-    assert!(matches!(state.snapshot().trie_catalog().search_upload(&table, &run), Some(Custody::Staged(_))),
-        "the reserving writer may still adopt its staged upload");
-    collector(11).collect_as_of(Timestamp(101), &stop).await.unwrap();
-    assert!(matches!(state.snapshot().trie_catalog().search_upload(&table, &run), Some(Custody::Abandoned { .. })));
-    assert!(observer.0.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
 async fn term_directory_pages_no_held_root_reaches_are_swept() {
     use rtdb_format::{cow_tree::{PageDigest, page_key}, log::proto::{ArtefactsAdded, ArtefactsRemoved}, term_directory};
     use rtdb_maintenance::ArtefactPublisher;
-    use rtdb_types::{SourcePosition, WriterFence};
+    use rtdb_types::SourcePosition;
 
     struct Unused;
     #[async_trait]
@@ -1027,7 +973,7 @@ async fn term_directory_pages_no_held_root_reaches_are_swept() {
     for key in &orphans { store.put(key, Bytes::from_static(b"page")).await.unwrap(); }
     let deletions = Arc::new(DeletedPublisher { table: entry.clone(), store: store.clone(), commits: Mutex::default() });
     let collector = TrieCollector::new(store.clone(), state.clone(), deletions, Arc::new(Observer::default()), unleased(), fixed_clock()).unwrap()
-        .with_search(Arc::new(Unused), StorageVersion(0), StorageEpoch(0), WriterFence(1));
+        .with_search(Arc::new(Unused), StorageVersion(0), StorageEpoch(0));
     collector.collect_as_of(Timestamp(100), &CancellationToken::new()).await.unwrap();
     for key in &orphans { assert!(store.head(key).await.is_err(), "{key:?}"); }
 }
