@@ -1,13 +1,13 @@
 use std::{num::NonZeroU64, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_node::{OriginalAssertionFamilyReader, nearest::{HeldVectorOverlay, NearestPartition, NearestQuery}};
 use tokio_util::sync::CancellationToken;
 use rtdb_storage::IoRegion;
 use rtdb_types::{AssertionId, EntityId, OwnedRelation, OwnedWorld, Result};
-use serde::Deserialize;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use super::{WorldFact, search_text};
 use crate::keys::{
@@ -18,6 +18,9 @@ use crate::keys::{
 const FIELD: &str = "sealed_world_projection";
 const CARRIER: &[u8] = b"BJWP1";
 const CODEC: u32 = u32::from_be_bytes(*b"BJWR");
+const BINARY_BODY: &[u8] = b"BJPS\x01";
+const COUNT_WIDTH: usize = size_of::<u32>();
+const SOURCE_COLUMN_WIDTH: usize = 16;
 
 pub(super) struct WorldProjectionCustody {
     keys: Arc<dyn KeyService>,
@@ -60,18 +63,98 @@ impl<'a> ProjectionCarrier<'a> {
     }
 }
 
-#[derive(Deserialize)]
-struct TextPath(String, String, String);
+struct OpenedProjection(BytesMut);
 
-#[derive(Deserialize)]
-struct VectorPath(String, Vec<f32>, Vec<(String, String)>);
+impl OpenedProjection {
+    fn new(bytes: Bytes) -> Result<Self> {
+        // The assertion vault returns an exclusively owned buffer.
+        bytes.try_into_mut().map(Self).map_err(|_| OwnedWorld::unavailable())
+    }
 
-#[derive(Deserialize)]
-struct Projection(Vec<TextPath>, Vec<VectorPath>);
+    fn decode(&self) -> Result<BinaryProjection<'_>> {
+        let body = self.0.strip_prefix(BINARY_BODY).ok_or_else(OwnedWorld::unavailable)?;
+        BinaryProjection::decode(body)
+    }
+}
+
+impl Drop for OpenedProjection {
+    fn drop(&mut self) {
+        self.0.as_mut().zeroize();
+    }
+}
+
+struct BinaryProjection<'a> {
+    texts: Vec<(&'a str, &'a str)>,
+    vectors: Vec<BinaryVectorPath<'a>>,
+}
+
+struct BinaryVectorPath<'a> {
+    column: &'a str,
+    components: &'a [[u8; 4]],
+    filters: Vec<(&'a str, &'a [u8])>,
+}
+
+impl<'a> BinaryProjection<'a> {
+    fn decode(body: &'a [u8]) -> Result<Self> {
+        let mut input = ProjectionReader(body);
+        let texts = input.list(2 * COUNT_WIDTH + SOURCE_COLUMN_WIDTH, |input| {
+            let alias = input.text()?;
+            input.take(SOURCE_COLUMN_WIDTH)?;
+            Ok((alias, input.text()?))
+        })?;
+        let vectors = input.list(3 * COUNT_WIDTH, |input| {
+            let column = input.text()?;
+            let bytes = input.count()?.checked_mul(size_of::<f32>()).ok_or_else(OwnedWorld::unavailable)?;
+            let (components, _) = input.take(bytes)?.as_chunks::<4>();
+            if components.iter().any(|bytes| !f32::from_le_bytes(*bytes).is_finite()) {
+                return Err(OwnedWorld::unavailable());
+            }
+            let filters = input.list(2 * COUNT_WIDTH, |input| Ok((input.text()?, input.bytes()?)))?;
+            Ok(BinaryVectorPath { column, components, filters })
+        })?;
+        if !input.0.is_empty() {
+            return Err(OwnedWorld::unavailable());
+        }
+        Ok(Self { texts, vectors })
+    }
+}
+
+struct ProjectionReader<'a>(&'a [u8]);
+
+impl<'a> ProjectionReader<'a> {
+    fn take(&mut self, size: usize) -> Result<&'a [u8]> {
+        let (part, rest) = self.0.split_at_checked(size).ok_or_else(OwnedWorld::unavailable)?;
+        self.0 = rest;
+        Ok(part)
+    }
+
+    fn count(&mut self) -> Result<usize> {
+        let (width, rest) = self.0.split_first_chunk::<COUNT_WIDTH>().ok_or_else(OwnedWorld::unavailable)?;
+        self.0 = rest;
+        Ok(u32::from_le_bytes(*width) as usize)
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8]> {
+        let size = self.count()?;
+        self.take(size)
+    }
+
+    fn text(&mut self) -> Result<&'a str> {
+        std::str::from_utf8(self.bytes()?).map_err(|_| OwnedWorld::unavailable())
+    }
+
+    fn list<T>(&mut self, min_item_bytes: usize, mut read: impl FnMut(&mut Self) -> Result<T>) -> Result<Vec<T>> {
+        let count = self.count()?;
+        if count > self.0.len() / min_item_bytes {
+            return Err(OwnedWorld::unavailable());
+        }
+        (0..count).map(|_| read(self)).collect()
+    }
+}
 
 enum SearchRow<'a> {
     Clear(Option<&'a WorldFact>),
-    Sealed(Projection, Arc<MemoryReservation>),
+    Sealed(OpenedProjection, Arc<MemoryReservation>),
     Erased,
 }
 
@@ -114,16 +197,17 @@ impl WorldProjectionCustody {
                 assertion_id: carrier.member, scope_commitment: world_row_scope(slot, &carrier.disclosure), codec: CODEC,
             };
             let envelope = AssertionEnvelope::try_from(Bytes::copy_from_slice(carrier.envelope))?;
-            let body = vault.open_assertion_for_resolution(stage, authoring, &self.region, envelope).await?;
+            let body = OpenedProjection::new(
+                vault.open_assertion_for_resolution(stage, authoring, &self.region, envelope).await?,
+            );
             families.require_derived_capability(family, stage, carrier.member, slot).await?;
-            Ok::<_, rtdb_types::Anomaly>(body)
+            body
         };
         let charge = memory.reserve(bytes.len().saturating_mul(16))?;
         match opened.await {
-            Ok(bytes) => {
+            Ok(body) => {
                 families.track_family_delivery(carrier.family)?;
-                let projection = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-                Ok(SearchRow::Sealed(projection, charge))
+                Ok(SearchRow::Sealed(body, charge))
             }
             Err(error) if !historical && error.code == "rtdb/erased-under-view" => Ok(SearchRow::Erased),
             Err(error) => Err(error),
@@ -137,15 +221,12 @@ impl WorldProjectionCustody {
         match self.row(relation, &id, fact, memory, historical).await? {
             SearchRow::Clear(fact) => corpus.shadow(partition, id, fact.map(|fact| search_text(fact, column)).transpose()?.flatten()),
             SearchRow::Erased => corpus.shadow(partition, id, None),
-            SearchRow::Sealed(Projection(paths, _), _charge) => {
-                let mut selected = paths.iter().filter(|path| path.0 == column);
-                let text = selected.next().map(|TextPath(_, field, value)| {
-                    if field.is_empty() { return Err(OwnedWorld::unavailable()); }
-                    canonical_text(value)
-                }).transpose()?;
-                if selected.next().is_some() { return Err(OwnedWorld::unavailable()); }
-                corpus.shadow(partition, id, text.as_deref())
-            }
+            SearchRow::Sealed(body, _charge) => {
+                let projection = body.decode()?;
+                let text = unique(projection.texts.iter().filter(|(alias, _)| *alias == column))?
+                    .map(|(_, text)| *text);
+                corpus.shadow(partition, id, text)
+            },
         }
     }
 
@@ -156,57 +237,67 @@ impl WorldProjectionCustody {
         match self.row(&selected.relation, &id, fact, memory, historical).await? {
             SearchRow::Clear(fact) => shadows.shadow_row(partition, selected, id, fact.map(|fact| &fact.row), query),
             SearchRow::Erased => shadows.shadow_row(partition, selected, id, None, query),
-            SearchRow::Sealed(Projection(_, paths), _charge) => {
-                let invalid = OwnedWorld::unavailable;
-                let mut paths = paths.iter().filter(|path| path.0 == selected.vector);
-                let Some(VectorPath(_, vector, filter_paths)) = paths.next() else {
+            SearchRow::Sealed(body, _charge) => {
+                let projection = body.decode()?;
+                let paths = projection.vectors.iter().filter(|path| path.column == selected.vector.as_str());
+                let Some(path) = unique(paths)? else {
                     return shadows.shadow_row(partition, selected, id, None, query);
                 };
-                if paths.next().is_some() { return Err(invalid()); }
                 let filters = selected.filters.iter().map(|column| {
-                    let mut keys = filter_paths.iter().filter(|(name, _)| name == column);
-                    let selected = keys.next().map(|(_, value)| hex_bytes(value)).transpose()?;
-                    if keys.next().is_some() { return Err(invalid()); }
-                    Ok(selected)
+                    Ok(unique(path.filters.iter().filter(|(name, _)| *name == column.as_str()))?
+                        .map(|(_, key)| *key))
                 }).collect::<Result<Vec<_>>>()?;
+                let vector = path.components.iter().map(|bytes| f32::from_le_bytes(*bytes));
                 shadows.shadow_opened_projection(partition, id, vector, &filters, query)
-            }
+            },
         }
     }
 }
 
-fn hex_bytes(value: &str) -> Result<Vec<u8>> {
-    let invalid = OwnedWorld::unavailable;
-    let (pairs, rest) = value.as_bytes().as_chunks::<2>();
-    if !rest.is_empty() { return Err(invalid()); }
-    let digit = |byte| match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        _ => Err(invalid()),
-    };
-    pairs.iter().map(|&[high, low]| Ok(digit(high)? << 4 | digit(low)?)).collect()
-}
-
-fn canonical_text(encoded: &str) -> Result<String> {
-    let invalid = OwnedWorld::unavailable;
-    let bytes = hex_bytes(encoded)?;
-    let mut body = bytes.strip_prefix(&[9]).and_then(|bytes| bytes.strip_suffix(&[0, 1])).ok_or_else(invalid)?;
-    let mut text = Vec::with_capacity(body.len());
-    while let Some((&byte, rest)) = body.split_first() {
-        text.push(byte);
-        body = if byte == 0 { rest.strip_prefix(&[0xff]).ok_or_else(invalid)? } else { rest };
+fn unique<T>(mut matching: impl Iterator<Item = T>) -> Result<Option<T>> {
+    let first = matching.next();
+    if matching.next().is_some() {
+        return Err(OwnedWorld::unavailable());
     }
-    String::from_utf8(text).map_err(|_| invalid())
+    Ok(first)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const BINARY_FIXTURE: &[u8] = b"BJPS\x01\
+        \x01\0\0\0\x01\0\0\0s\
+        \x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\x02\
+        \x04\0\0\0a\0\xc3\xa9\
+        \x01\0\0\0\x01\0\0\0v\x02\0\0\0\0\0\xc0\x3f\0\0\0\x80\
+        \x01\0\0\0\x01\0\0\0f\x03\0\0\0\0\xff\x05";
+
     #[test]
-    fn world_projection_text_decodes_canonical_utf8_and_escaped_nulls() {
-        assert_eq!(canonical_text("096100ffc3a90001").unwrap(), "a\0é");
-        assert_eq!(canonical_text("090001").unwrap(), "");
-        assert!(canonical_text("09610001620001").is_err());
+    fn world_projection_decodes_binary_plaintext() {
+        let opened = OpenedProjection::new(Bytes::copy_from_slice(BINARY_FIXTURE)).unwrap();
+        let binary = opened.decode().unwrap();
+        assert_eq!(binary.texts, [("s", "a\0é")]);
+        let [vector] = binary.vectors.as_slice() else { panic!("Expected one vector path"); };
+        assert_eq!(vector.column, "v");
+        assert_eq!(vector.components, &[1.5f32.to_le_bytes(), (-0.0f32).to_le_bytes()]);
+        assert_eq!(vector.filters, [("f", &[0u8, 255, 5][..])]);
+    }
+
+    #[test]
+    fn binary_world_projection_refuses_malformed_framing() {
+        assert!(OpenedProjection(BytesMut::new()).decode().is_err());
+        for end in 1..BINARY_FIXTURE.len() {
+            let opened = OpenedProjection::new(Bytes::copy_from_slice(&BINARY_FIXTURE[..end])).unwrap();
+            assert!(opened.decode().is_err());
+        }
+        let mut trailing = BINARY_FIXTURE.to_vec();
+        trailing.push(0);
+        assert!(OpenedProjection::new(trailing.into()).unwrap().decode().is_err());
+
+        let mut impossible_count = BINARY_FIXTURE.to_vec();
+        let start = BINARY_BODY.len();
+        impossible_count[start..start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(OpenedProjection::new(impossible_count.into()).unwrap().decode().is_err());
     }
 }

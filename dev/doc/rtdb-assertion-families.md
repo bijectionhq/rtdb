@@ -324,10 +324,17 @@ Its authoring scope binds the private family identity and the Root target.
 ## World search
 
 A derived overlay row stores its projection in the declared opaque binary field `sealed_world_projection`.
-The carrier is ASCII `BJWP1`, family `uuid`, `stage`, `assertion`, member `assertion`, disclosure scope (32), and the `RTAS` envelope.
+The carrier is ASCII `BJWP1`, family UUID, deployment UUID, incarnation, stage UUID, assertion ID, member assertion ID, disclosure scope (32), and the `RTAS` envelope.
 The codec is the u32 representation of ASCII `BJWR`.
-Ranking takes the authoring world, relation and row key from the winning overlay layer and performs the current family and stage check before opening the envelope.
-The opened body is the JSON pair of text paths and vector paths, used only as transient ranking input.
+Ranking takes the authoring world, relation and row key from the winning overlay layer and checks the current family and derived stage before and after opening the envelope.
+The opened body is transient ranking input.
+The body starts with the five-byte tag `BJPS\x01` and is wiped after ranking.
+The binary body has a count followed by that many text paths, then a count followed by that many vector paths.
+A text path stores its length-prefixed UTF-8 alias, 16-byte source column identity and length-prefixed UTF-8 value.
+A vector path stores its length-prefixed UTF-8 column, a count followed by that many IEEE 754 Float32 components, and a count followed by that many filters.
+A filter stores its length-prefixed UTF-8 column and length-prefixed raw sort key.
+Counts, byte lengths and Float32 components are little-endian and four bytes wide.
+The Bijection writer and RTDB reader use this body in the same release.
 In current ranking, a fenced or retired derived winner continues to shadow a parent row and contributes no ranking input.
 At an exact earlier cut, a fenced or retired winner refuses with `rtdb/erased-under-view` before text, nearest or hybrid ranking can return an altered corpus.
 Historical nearest ranks the exact corpus.
