@@ -43,7 +43,7 @@ use owned_capacity::OwnedCapacityChanges;
 mod owned_unique;
 use owned_unique::OwnedUniqueChanges;
 mod world_constraints;
-pub use world_constraints::{ArchivedWorldConstraints, WorldConstraintArchive};
+pub use world_constraints::{ArchivedWorldConstraints, AssertionFenceClaim, WorldConstraintArchive};
 
 pub const IDEMPOTENCY_GUARD_RESULT: &str = "rtdb/idempotency-guard";
 
@@ -390,6 +390,7 @@ impl TxResolver {
         tx.clock_slot = slot.filter(|_| slot_time.is_ok());
         tx.decision = decision;
         tx.trace_parent = span.as_ref().map(|span| span.context());
+        tx.placed_attempt = attempt;
         let replay = match &request.guard {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
@@ -731,13 +732,14 @@ pub struct OpenTransaction<'a> {
     owned_changes: BTreeMap<String, PendingOwnedChanges>,
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
+    placed_attempt: Option<PlacedAttempt>,
     decision: Option<crate::DecisionObservation>,
     clock_slot: Option<crate::OwnedClockSlot>,
     terms_time: Timestamp,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, decision: None, clock_slot: None, terms_time: key.system_time })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, placed_attempt: None, decision: None, clock_slot: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
@@ -2421,7 +2423,9 @@ impl<'a> OpenTransaction<'a> {
                 return Err(unavailable());
             }
         }
+        let archive_replay = replay.is_some();
         self.check_hosted_controls(operations, source_scope, replay).await?;
+        self.claim_assertion_family_fences(operations, archive_replay).await?;
         let signed_root_count = has_clock_slot && proposal_land.is_some_and(|landing| {
             landing.effect != crate::hosted_control::ProposalLandingEffect::Close
         });

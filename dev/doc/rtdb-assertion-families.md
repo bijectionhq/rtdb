@@ -182,6 +182,12 @@ The reply has the same order, inventory digest and counted sections as `FenceAss
 If the vault already fenced the family, the reply preserves its first order.
 The plan leaves the vault and source unchanged.
 The retiring transaction must take a claim over this inventory before it can order an immutable marker.
+The claim freezes the family record under its vault compare-and-swap and binds the exact placed source attempt.
+The checked insert targets `bj_fact_assertion_family_fences` with the family UUID as 32 lowercase hexadecimal characters and a null expectation.
+Its binary `body` is version 1 (u8), selected `position`, order `uuid` and inventory digest (32).
+Each Root inventory entry requires an erase of its named relation and exact UTF-8 row key in the same transaction.
+The erasure obligation binds the same digest.
+The marker route refuses until current original-authority reads guard both regular and archive release.
 
 ### `rtdb.owned.FenceAssertionFamily.v1`
 

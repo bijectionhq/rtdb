@@ -17,6 +17,43 @@ fn funded_booking_missing() -> Anomaly {
 }
 
 impl OpenTransaction<'_> {
+    pub(super) async fn claim_assertion_family_fences(
+        &self, operations: &[Operation], replay: bool,
+    ) -> Result<()> {
+        use rtdb_types::{ASSERTION_FAMILY_FENCES, AssertionFamilyFenceMarker};
+
+        let mut controls = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::HostedControl(control)) if control.name() == ASSERTION_FAMILY_FENCES =>
+                Some(control),
+            _ => None,
+        }).peekable();
+        if controls.peek().is_none() { return Ok(()); }
+
+        let invalid = || Anomaly::incorrect("rtdb.owned/assertion-family-fence-marker", "Invalid ordered family fence marker");
+        let attempt = self.placed_attempt.filter(|attempt| Some(attempt.scope()) == self.context.owned_witness_scope)
+            .ok_or_else(invalid)?;
+        if replay { return Err(invalid()); }
+        let archive = self.context.world_constraints.as_ref().ok_or_else(invalid)?;
+        let root_erases = operations.iter().filter_map(|operation| match operation {
+            Operation::Public(TxOp::OwnedErase { relation, id }) if relation.is_root_data() => Some((relation, id)),
+            _ => None,
+        }).collect::<BTreeSet<_>>();
+        for control in controls {
+            let EntityId::String(id) = control.id() else { return Err(invalid()); };
+            let family = AssertionFamilyFenceMarker::family_id(id).map_err(|_| invalid())?;
+            let row = control.replacement().filter(|row| row.len() == 2).ok_or_else(invalid)?;
+            let Some(Value::Binary(body)) = row.get("body") else { return Err(invalid()); };
+            if control.expected().is_some() {
+                return Err(invalid());
+            }
+            let marker = AssertionFamilyFenceMarker::decode(body).map_err(|_| invalid())?;
+            archive.claim_assertion_family_fence(super::AssertionFenceClaim {
+                database: &self.context.database, attempt, family, marker, root_erases: &root_erases,
+            }).await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn check_hosted_controls(
         &mut self,
         operations: &[Operation],
