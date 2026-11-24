@@ -32,6 +32,7 @@ pub use placed_receipts::{AwaitAuthority, ClosedEpochRecovery, PlacedReceiptCode
 pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
+pub mod serving;
 pub use rtdb_tx::{ArchivedWorldConstraints, HostedControlWrite, WorldConstraintArchive};
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{DurableRange, FundedMutationClock, MAX_DURABLE_RANGE_BYTES, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};
