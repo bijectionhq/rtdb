@@ -276,6 +276,13 @@ The landing authority verifies that Proposal and Root have the same installed pa
 This comparison includes the effective world payload-read gate at the reviewed source and the installed payload-read authority at Root.
 Matching label strings alone does not establish equality.
 Proposal authoring, review and approval grants give no payload-read standing.
+Bijection's direct app landing resolves the approved branch at its original audience.
+The Proposal owner and Root hold bind the deployment, serving incarnation, concrete label registration, installed grant catalog and exact table declaration.
+The current caller's Clear grant and the original approval invitation are checked independently.
+The private acceptance names that audience commitment and orders its current authority checks together with the selected world point and Root predecessor.
+The initial admitted case is one unindexed, acceptance-valid keyed creation on an unchanged Root publication.
+The exact key must retain the reviewed protected incarnation and have no Root winner.
+The original registered execution receipt authenticates the sealed review commitment and the guest rerun command, which is sealed under the source family.
 The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
 The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
 
