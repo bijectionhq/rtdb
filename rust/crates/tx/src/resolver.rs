@@ -1157,7 +1157,9 @@ impl<'a> OpenTransaction<'a> {
                 Err(Anomaly::incorrect("rtdb.hosted/constraint-receipt", "Unexpected refusal boundary"))
             }
             Operation::Public(TxOp::HostedControl(control)) => {
-                if self.hosted_replay.as_ref().is_some_and(|replay| replay.is_transient_replay_control(control)) {
+                let transient_replay = self.hosted_replay.as_ref()
+                    .is_some_and(|replay| replay.is_transient_replay_control(control));
+                if !control_order::writes_hosted_control(control.is_check(), transient_replay) {
                     return Ok(());
                 }
                 if let Some(documents) = control.arrow_replacement() {
