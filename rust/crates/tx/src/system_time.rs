@@ -64,13 +64,61 @@ pub(crate) fn admits_historical_time(previous: Option<i64>, requested: i64, logg
     historical_time(previous, requested) == requested && requested <= logged
 }
 
+const CLOCK_SLOT_WIDTH: i64 = 1_000_000;
+const CLOCK_SLOT_LEAD: i64 = 500_000;
+
+#[cfg(not(verus_keep_ghost))]
+pub const MAX_CLOCK_SLOT_WAIT_MICROS: i64 = CLOCK_SLOT_WIDTH + CLOCK_SLOT_LEAD;
+
 #[cfg(not(verus_keep_ghost))]
 pub fn clock_slot_reading(observed: rtdb_types::Timestamp) -> Option<rtdb_types::Timestamp> {
-    observed.0.checked_add(500_000).map(rtdb_types::Timestamp)
+    next_grid_reading(observed.0).map(rtdb_types::Timestamp)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures match out {
+        Some(reading) => observed >= 0 && reading as int >= observed as int + 500000
+            && (reading as int) < observed as int + 1500000
+            && reading % 1000000 == 0 && reading <= i64::MAX - 1000000,
+        None => true,
+    },
+))]
+pub(crate) fn next_grid_reading(observed: i64) -> Option<i64> {
+    if observed < 0 { return None; }
+    let candidate = observed.checked_add(CLOCK_SLOT_LEAD)?;
+    let remainder = candidate % CLOCK_SLOT_WIDTH;
+    let adjustment = if remainder == 0 { 0 } else { CLOCK_SLOT_WIDTH - remainder };
+    let reading = candidate.checked_add(adjustment)?;
+    reading.checked_add(CLOCK_SLOT_WIDTH)?;
+    Some(reading)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(live =>
+    ensures live == (observed < exclusive_deadline),
+))]
+pub(crate) fn owned_deadline_is_live(observed: i64, exclusive_deadline: i64) -> bool {
+    observed < exclusive_deadline
+}
+
+/// Compares the full assertion identity. History is authenticated separately
+/// because it still supplies the business-time projection used by some guards.
+#[cfg_attr(verus_keep_ghost, verus_spec(matches =>
+    ensures matches == (actual == expected),
+))]
+pub(crate) fn owned_point_matches(
+    actual: Option<(i64, u64, i64)>, expected: Option<(i64, u64, i64)>,
+) -> bool {
+    match (actual, expected) {
+        (None, None) => true,
+        (Some(actual), Some(expected)) =>
+            actual.0 == expected.0 && actual.1 == expected.1 && actual.2 == expected.2,
+        _ => false,
+    }
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(admitted =>
     ensures admitted == (through <= predecessor && reading <= appended && reading <= observed
+        && reading >= 0 && reading % 1000000 == 0
         && reading as int + 1000000 <= i64::MAX as int && (observed as int) < reading as int + 1000000),
 ))]
 pub(crate) fn clock_slot_admits(
@@ -80,12 +128,13 @@ pub(crate) fn clock_slot_admits(
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(admitted =>
-    ensures admitted == (reading <= observed && reading as int + 1000000 <= i64::MAX as int
+    ensures admitted == (reading >= 0 && reading % 1000000 == 0
+        && reading <= observed && reading as int + 1000000 <= i64::MAX as int
         && (observed as int) < reading as int + 1000000),
 ))]
 pub(crate) fn clock_slot_contains(reading: i64, observed: i64) -> bool {
-    let Some(until) = reading.checked_add(1_000_000) else { return false; };
-    reading <= observed && observed < until
+    let Some(until) = reading.checked_add(CLOCK_SLOT_WIDTH) else { return false; };
+    reading >= 0 && reading % CLOCK_SLOT_WIDTH == 0 && reading <= observed && observed < until
 }
 
 #[cfg(not(verus_keep_ghost))]
@@ -167,16 +216,17 @@ mod tests {
     #[test]
     fn clock_slot_tests_position_and_independent_half_open_window() {
         let reading = clock_slot_reading(Timestamp(100)).unwrap();
+        assert_eq!(reading, Timestamp(1_000_000));
         let slot = OwnedClockSlot { through: TxId(8), reading };
         let behind = TransactionKey { tx_id: TxId(7), system_time: Timestamp(100) };
         let carried = TransactionKey { tx_id: TxId(9), system_time: Timestamp(301) };
-        let later_history = TransactionKey { tx_id: TxId(9), system_time: Timestamp(600_000) };
+        let later_history = TransactionKey { tx_id: TxId(9), system_time: Timestamp(1_100_000) };
 
         assert_eq!(clock_slot_time(slot, Some(carried), reading, reading), Some(reading));
         assert_eq!(clock_slot_time(slot, Some(behind), reading, reading), None);
         assert_eq!(clock_slot_time(slot, Some(carried), Timestamp(500_099), reading), None);
         assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(500_099)), None);
-        assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(1_500_100)), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(2_000_000)), None);
         assert_eq!(clock_slot_time(slot, Some(later_history), reading, reading), Some(reading));
     }
 }

@@ -1,4 +1,4 @@
-use crate::production::{clock_slot_admits, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
 use vstd::prelude::*;
 
 verus! {
@@ -86,15 +86,54 @@ pub fn an_admitted_client_time_leaves_a_following_chronon(previous: Option<i64>,
 }
 
 pub fn a_proposal_slot_checks_the_observation_independently_of_append() {
-    let accepted = clock_slot_admits(3, 5, 80, 99, 80);
-    let before_window = clock_slot_admits(3, 5, 80, 99, 79);
-    let at_end = clock_slot_admits(3, 5, 80, 99, 1000080);
+    let accepted = clock_slot_admits(3, 5, 1_000_000, 1_000_007, 1_000_000);
+    let before_window = clock_slot_admits(3, 5, 1_000_000, 1_000_007, 999_999);
+    let at_end = clock_slot_admits(3, 5, 1_000_000, 1_000_007, 2_000_000);
     assert(accepted && !before_window && !at_end);
 }
 
 pub fn an_observation_cannot_authorize_a_history_time_ahead_of_append() {
-    let accepted = clock_slot_admits(3, 5, 80, 79, 80);
+    let accepted = clock_slot_admits(3, 5, 1_000_000, 999_999, 1_000_000);
     assert(!accepted);
+}
+
+// V3. A receiver clock and the original deadline suffice for the temporal verdict.
+pub fn equal_receiver_observations_keep_the_same_deadline_verdict(
+    left: i64, right: i64, deadline: i64,
+)
+    requires left == right,
+{
+    assert(owned_deadline_is_live(left, deadline) == owned_deadline_is_live(right, deadline));
+    assert(!owned_deadline_is_live(deadline, deadline));
+}
+
+// V12. Two different original events cannot spend the same point witness.
+pub fn a_tied_history_coordinate_does_not_match_another_assertion(
+    before: i64, after: i64, ordinal: u64, history: i64,
+)
+    requires before < after,
+{
+    assert(!owned_point_matches(Some((before, ordinal, history)), Some((after, ordinal, history))));
+    assert(!owned_point_matches(Some((before, 0, history)), Some((before, 1, history))));
+}
+
+// The paired check assumes that both paths reached their original prepared cut
+// and admitted the same public receiver observation at the advertised reading.
+pub fn the_prepared_clock_verdict_does_not_depend_on_extra_predecessors(
+    through: i64, left_predecessor: i64, right_predecessor: i64, reading: i64,
+    left_append: i64, right_append: i64, observed: i64,
+)
+    requires through <= left_predecessor, through <= right_predecessor,
+        reading <= left_append, reading <= right_append,
+{
+    assert(clock_slot_admits(through, left_predecessor, reading, left_append, observed)
+        == clock_slot_admits(through, right_predecessor, reading, right_append, observed));
+}
+
+pub fn an_advertised_reading_is_on_the_receiver_grid(observed: i64) {
+    if let Some(reading) = next_grid_reading(observed) {
+        assert(clock_slot_admits(1, 1, reading, reading, reading));
+    }
 }
 
 }

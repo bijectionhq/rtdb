@@ -999,11 +999,12 @@ It accepts only point and control equality checks and issued durable range evide
 An ordinary fresh Flight receiver acquires and applies a protected journal cut, verifies the supplied evidence and returns the covered transaction and receiver observation, or refuses release.
 The receiver can be an enrolled subscriber while the writer grant is vacant.
 
-`rtdb.owned.OfferClockSlot.v1` takes a 16-byte placed Root hold handle and returns a signed big-endian microsecond reading five hundred milliseconds beyond its reserved present.
-`rtdb.owned.DecideHosted.v2` can order at that reading using the original handle.
-`rtdb.owned.DecideHeldWorlds.v1` can also order at the offered reading.
+`rtdb.owned.OfferClockSlot.v1` takes a 16-byte placed Root hold handle and returns the first one-second grid reading at least five hundred milliseconds after the held receiver clock.
+The reading is a signed big-endian microsecond count.
+`rtdb.owned.DecideHosted.v2` and `rtdb.owned.DecideHeldWorlds.v1` can use that reading with the original handle.
 The placement and session must still own the hold.
-The source append must fall in the first second starting at the offered time, and the ordered history must still be below that reading.
+The source append must reach the offered reading. The receiver's sampled clock must be in the half-open second starting there.
+A committed receipt keeps the exact reading and original held position alongside the unrounded receiver observation.
 Flight waits outside the writer order if the request reaches the server early.
 A missed offer returns `rtdb.owned/clock-slot-missed` and orders no application writes.
 

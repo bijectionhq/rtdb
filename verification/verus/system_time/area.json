@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 19,
+  "min_verified_functions": 26,
   "controls": {
     "reuse_the_previous_tick": {
       "mutate": [
@@ -238,6 +238,70 @@
           "file": "rust/crates/tx/src/system_time.rs",
           "find": "through <= predecessor && reading <= appended && clock_slot_contains",
           "replace": "through <= predecessor && clock_slot_contains"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "include_the_exclusive_owned_deadline": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "observed < exclusive_deadline\n}",
+          "replace": "observed <= exclusive_deadline\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "owned_deadline_is_live",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "collapse_equal_history_times": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "actual.0 == expected.0 && actual.1 == expected.1 && actual.2 == expected.2",
+          "replace": "actual.2 == expected.2"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "owned_point_matches",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "omit_grid_alignment": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "let reading = candidate.checked_add(adjustment)?;",
+          "replace": "let reading = candidate;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "next_grid_reading",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "substitute_whole_root_progress_for_the_prepared_floor": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "through <= predecessor && reading <= appended && clock_slot_contains(reading, observed)",
+          "replace": "through == predecessor && reading <= appended && clock_slot_contains(reading, observed)"
         }
       ],
       "expect": [

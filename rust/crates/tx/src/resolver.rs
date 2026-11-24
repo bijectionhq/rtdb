@@ -430,7 +430,7 @@ impl TxResolver {
                 return Err(Anomaly::fault("rtdb.owned/prepared-generation", "A prepared generation carried unsupported transaction options"));
             }
             if primary.iter().any(|operation| matches!(operation,
-                Operation::Public(TxOp::OwnedDeadline { until, .. }) if tx.decision_time() >= *until
+                Operation::Public(TxOp::OwnedDeadline { until, .. }) if !crate::system_time::owned_deadline_is_live(tx.decision_time().0, until.0)
             )) {
                 Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"))
             } else {
@@ -1734,7 +1734,7 @@ impl<'a> OpenTransaction<'a> {
         }) {
             return Err(unavailable());
         }
-        if deadline.is_some_and(|until| self.decision_time() >= until) {
+        if deadline.is_some_and(|until| !crate::system_time::owned_deadline_is_live(self.decision_time().0, until.0)) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         if let Some(root) = operations.iter().find_map(|operation| match operation {
@@ -2252,7 +2252,10 @@ impl<'a> OpenTransaction<'a> {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/invalid-read-instant", "The observation's valid instant has no following microsecond"))?;
             let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
             let actual = rtdb_query::read_owned_point_version(context, owner, relation, id, Interval::new(observed, upper)?).await?;
-            if actual != *expected {
+            let coordinate = |version: rtdb_types::OwnedPointVersion| {
+                (version.position.transaction.0, version.position.ordinal, version.history.0)
+            };
+            if !crate::system_time::owned_point_matches(actual.map(coordinate), expected.map(coordinate)) {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
             }
         }

@@ -93,8 +93,8 @@ mod tests {
 
     #[test]
     fn retained_slot_keeps_the_original_target_and_cut() {
-        let observation = DecisionObservation { domain: [7; 16], epoch: 3, sequence: 8, instant: Timestamp(900) };
-        let slot = OwnedClockSlot { through: TxId(5), reading: Timestamp(800) };
+        let observation = DecisionObservation { domain: [7; 16], epoch: 3, sequence: 8, instant: Timestamp(1_200_000) };
+        let slot = OwnedClockSlot { through: TxId(5), reading: Timestamp(1_000_000) };
         let original = OrderedClockEvidence { observation, slot: Some(slot) };
         let bytes = original.encode();
         assert_eq!(OrderedClockEvidence::decode(&bytes, TxId(6)).unwrap(), original);

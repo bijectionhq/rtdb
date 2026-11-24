@@ -1038,7 +1038,7 @@ impl Service {
 
     async fn wait_for_clock_slot(&self, call: &Call, slot: OwnedClockSlot) -> Result<(), Status> {
         let delay = slot.reading.0.saturating_sub(self.0.node.now().0);
-        if delay > 1_000_000 {
+        if delay > rtdb_tx::MAX_CLOCK_SLOT_WAIT_MICROS {
             return Err(Self::clock_slot_missed());
         }
         if delay > 0 {
