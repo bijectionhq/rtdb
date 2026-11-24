@@ -866,6 +866,26 @@ mod tests {
                 .await
                 .is_err()
         );
+        let world = Uuid::from_bytes(original_position.line_generation);
+        let slot = WorldRowSlot {
+            world,
+            relation: "facts",
+            key: b"key",
+        };
+        let destination = EnrolledWorldRow {
+            world,
+            assertion: reservation.destination,
+            capability: reservation.capability,
+            scope_commitment: [25; 32],
+            slot_commitment: world_row_slot_commitment(slot),
+            codec: 1,
+        };
+        assert!(
+            families
+                .require_row_capability(family, destination, slot)
+                .await
+                .is_err()
+        );
         let (mut record, _) = families.read(family).await?.unwrap();
         assert!(!record.native_landings_drained());
         assert!(

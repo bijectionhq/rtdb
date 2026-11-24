@@ -591,7 +591,7 @@ impl<'a> AssertionFamilies<'a> {
                 && landing.reservation.capability == occurrence.capability
                 && landing.accepted.as_ref().is_some_and(|accepted| accepted.position == occurrence.position)
         }) {
-            Ok(())
+            self.require_native_landing_live(&record, occurrence.assertion).await
         } else {
             Err(conflict())
         }
@@ -666,14 +666,16 @@ impl<'a> AssertionFamilies<'a> {
         record.require_live()?;
         if record.original == row || record.rewrites.iter().any(|rewrite| rewrite.row == row)
             || record.landings.iter().any(|landing| {
-                landing.reservation.capability == row.capability && landing.reservation.destination == row.assertion
+                landing.native.is_none() && landing.reservation.capability == row.capability
+                    && landing.reservation.destination == row.assertion
             })
-            || record.derived_capability(row.capability, row.assertion, slot)
         {
-            Ok(())
-        } else {
-            Err(conflict())
+            return Ok(());
         }
+        if !record.derived_capability(row.capability, row.assertion, slot) {
+            return Err(conflict());
+        }
+        self.require_native_landing_live(&record, row.assertion).await
     }
 
     pub async fn require_derived_capability(
@@ -681,7 +683,8 @@ impl<'a> AssertionFamilies<'a> {
     ) -> Result<()> {
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
-        if record.derived_capability(stage, member, slot) { Ok(()) } else { Err(conflict()) }
+        if !record.derived_capability(stage, member, slot) { return Err(conflict()); }
+        self.require_native_landing_live(&record, member).await
     }
 
     /// Admits sealing the private link of an enrolled reservation.
