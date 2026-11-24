@@ -207,13 +207,12 @@ fn declaration(
                 if index.kind != proto::IndexKind::Ordered as i32 {
                     return Err(error::unsupported("declare.index.kind"));
                 }
-                let [column]: [String; 1] = index
-                    .columns
-                    .try_into()
-                    .map_err(|_| error::incorrect("Ordered index needs one column"))?;
+                let mut columns = index.columns.into_iter();
+                let column = columns.next().ok_or_else(|| error::incorrect("Ordered index needs a column"))?;
                 Declaration::Index(IndexDefinition {
                     name: index.name,
                     column,
+                    additional_columns: columns.collect(),
                 })
             }
             Change::Ttl(ttl) => Declaration::Ttl(ttl.duration_micros),

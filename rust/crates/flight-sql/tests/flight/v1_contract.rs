@@ -1153,6 +1153,64 @@ async fn transact_wire(
 }
 
 #[tokio::test]
+async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
+    use rtdb_node::serving::NativeServingAuthority;
+    use rtdb_types::rtdb_v1::ClaimSealer;
+
+    let incarnation = [29; 16];
+    let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
+        "xtdb",
+        NativeServingAuthority {
+            incarnation,
+            claims: Arc::new(ClaimSealer::new(incarnation, [7; 32])),
+            checkpoints: None,
+        },
+    );
+    let running = Running::start_with_resources(
+        None, FlightConfig::default(), &[], None, Default::default(), None, Some(Arc::new(resources)),
+    ).await;
+    let database = running.node.catalog().database("xtdb").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let declare_index = |name: &str, columns: &[&str]| v1::Op {
+        op: Some(v1::op::Op::Declare(v1::Declare {
+            table: "public.events".into(),
+            change: Some(v1::declare::Change::Index(v1::Index {
+                name: name.into(),
+                kind: v1::IndexKind::Ordered as i32,
+                columns: columns.iter().map(|column| (*column).into()).collect(),
+            })),
+        })),
+    };
+    let first = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![1; 16],
+        ops: vec![declare_index("events_by_partition", &["partition_key", "sequence_no"])],
+        ..Default::default()
+    }).await.unwrap();
+    let mut read = input("SELECT COUNT(*) FROM xt.ordered_indexes WHERE _id = 'events_by_partition' \
+        AND schema_name = 'public' AND table_name = 'events' AND columns = ARRAY['partition_key', 'sequence_no']");
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.clone().map(Selection::AtLeast) });
+    let (rows, trailer) = query(&mut client, read).await;
+    assert_eq!(ints(&rows), [1]);
+    assert_eq!(trailer.basis, first.basis);
+
+    let second = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![2; 16],
+        ops: vec![declare_index("events_by_sequence", &["sequence_no", "partition_key"])],
+        ..Default::default()
+    }).await.unwrap();
+    let mut read = input("SELECT COUNT(*) FROM xt.ordered_indexes WHERE table_name = 'events'");
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: second.basis.map(Selection::AtLeast) });
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [2]);
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.map(Selection::Exactly) });
+    assert_eq!(ints(&query(&mut client, read).await.0), [1]);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and_changes() {
     let database = uuid::Uuid::from_bytes(FIXTURE_INCARNATION);
     let kms: Arc<dyn rtdb_crypt::Kms> = Arc::new(rtdb_crypt::LocalKms::new(|| 0));

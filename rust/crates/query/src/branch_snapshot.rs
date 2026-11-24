@@ -7,7 +7,7 @@ use rtdb_index::{
 };
 use rtdb_trie::TrieConfig;
 use rtdb_types::{
-    Anomaly, BlockIndex, EntityId, Interval, Result, StructFields, TableRef, Timestamp,
+    Anomaly, BlockIndex, EntityId, Interval, LogicalType, Result, ScalarType, StructFields, TableRef, Timestamp,
     TransactionKey, TxId, Value,
     rtdb_v1::{Basis, Claim, ClaimScope, ClaimSealer},
 };
@@ -55,6 +55,7 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
                 buffer.declare_document_types(table, &definition.columns)?;
             }
             append_lineage(view, &mut buffer)?;
+            append_ordered_indexes(view, &mut buffer)?;
         }
         live = Arc::new(live.apply(&buffer.stage()?)?);
     }
@@ -89,6 +90,36 @@ fn append_lineage(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Resu
             ("dropped_basis".into(), row.dropped.map_or(Value::Null, basis_value)),
         ]);
         buffer.put(table.clone(), cells, Interval::ALL)?;
+    }
+    Ok(())
+}
+
+fn append_ordered_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+    let catalog = TableRef::new("xt", "ordered_indexes");
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    let columns = StructFields::from([
+        ("_id".into(), text.clone()),
+        ("schema_name".into(), text.clone()),
+        ("table_name".into(), text.clone()),
+        ("columns".into(), LogicalType::list(text)),
+        ("version".into(), LogicalType::Scalar(ScalarType::I64)),
+    ]);
+    buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
+    buffer.declare_document_types(&catalog, &columns)?;
+    for (table, definition) in view.tables() {
+        for index in definition.indexes.values() {
+            let basis = view.index_version(table, index).ok_or_else(|| {
+                Anomaly::fault("rtdb/index-version", "The index has no declaration at the selected cut")
+            })?;
+            let cells = StructFields::from([
+                ("_id".into(), Value::Utf8(index.name.clone())),
+                ("schema_name".into(), Value::Utf8(table.schema.clone())),
+                ("table_name".into(), Value::Utf8(table.table.clone())),
+                ("columns".into(), Value::list(index.columns().map(|name| Value::Utf8(name.into())).collect())),
+                ("version".into(), Value::I64(tx_key(BranchCut { basis, system_time: view.cut().system_time })?.tx_id.0)),
+            ]);
+            buffer.put(catalog.clone(), cells, Interval::ALL)?;
+        }
     }
     Ok(())
 }

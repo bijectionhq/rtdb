@@ -132,7 +132,7 @@ fn claim_guards_detect_writes_to_rows_and_both_sides_of_index_moves() {
 
     let mut state = TransactState::new(INCARNATION);
     commit(&mut state, 1, &request(1, vec![
-        Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by_key".into(), column: "key".into() }) },
+        Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by_key".into(), column: "key".into(), additional_columns: Vec::new() }) },
         put(MAIN_BRANCH, 1, "b"), put(MAIN_BRANCH, 2, "z"),
     ]));
     let row = Verified(evidence(1, [claimed_row(1)]));
@@ -259,7 +259,7 @@ fn replay_orders_refusal_when_a_timed_write_has_no_terminal_record() {
 #[test]
 fn otherwise_discards_the_candidate_and_validation_never_appends() {
     let mut state = TransactState::new(INCARNATION);
-    let index = IndexDefinition { name: "by_key".into(), column: "key".into() };
+    let index = IndexDefinition { name: "by_key".into(), column: "key".into(), additional_columns: Vec::new() };
     commit(&mut state, 1, &request(1, vec![
         Op::Declare { table: table(), change: Declaration::Index(index) },
         put(MAIN_BRANCH, 1, "a"),
@@ -337,7 +337,7 @@ fn branch_tombstones_hold_the_fork_cut_and_merge_rejects_overlap() {
 #[test]
 fn declarations_and_branch_lifetimes_are_ordered_with_writes() {
     let mut state = TransactState::new(INCARNATION);
-    let index = IndexDefinition { name: "key".into(), column: "key".into() };
+    let index = IndexDefinition { name: "key".into(), column: "key".into(), additional_columns: Vec::new() };
     let range = CountRange { table: table(), index: "key".into(), lower: None, upper: None, valid_at: None, n: 1 };
     commit(&mut state, 1, &request(1, vec![
         Op::Declare { table: table(), change: Declaration::Ttl(Some(30)) },

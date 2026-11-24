@@ -25,6 +25,16 @@ pub struct BranchCut {
 pub struct IndexDefinition {
     pub name: String,
     pub column: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_columns: Vec<String>,
+}
+
+impl IndexDefinition {
+    pub fn columns(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.column.as_str()).chain(self.additional_columns.iter().map(String::as_str))
+    }
+
+    pub fn is_compound(&self) -> bool { !self.additional_columns.is_empty() }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,7 +331,8 @@ impl BranchIndex {
                 ClaimRegion::IndexRange { index, lower, upper, .. } => {
                     let column = view.table(table).and_then(|definition| definition.indexes.get(index))
                         .ok_or_else(|| Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-index", "Claim names an unknown index"))?;
-                    Some((&column.column, lower.as_deref(), upper.as_deref()))
+                    // A table footprint covers changes to any component of a compound key.
+                    (!column.is_compound()).then_some((&column.column, lower.as_deref(), upper.as_deref()))
                 }
                 _ => None,
             };
@@ -478,6 +489,13 @@ impl<'a> BranchView<'a> {
         self.index.definition(table, self.cut.basis).filter(|definition| !definition.dropped)
     }
 
+    pub fn index_version(&self, table: &TableRef, index: &IndexDefinition) -> Option<Basis> {
+        self.index.catalog.get(table)?.iter().rev()
+            .skip_while(|(basis, _)| *basis > self.cut.basis)
+            .take_while(|(_, definition)| !definition.dropped && definition.indexes.get(&index.name) == Some(index))
+            .last().map(|(basis, _)| *basis)
+    }
+
     fn layers(&self) -> impl Iterator<Item = (Basis, &'a BranchData)> + use<'a> {
         let index = self.index;
         let layer = self.layer;
@@ -540,15 +558,25 @@ impl<'a> BranchView<'a> {
         }
         let index = self.table(&range.table).and_then(|table| table.indexes.get(&range.index))
             .ok_or_else(|| Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-index", "Count guard names an unknown index"))?;
+        if index.is_compound() && (range.lower.is_some() || range.upper.is_some()) {
+            return Err(Anomaly::unsupported("rtdb/compound-index-range", "A compound index count needs an unbounded range"));
+        }
         let at = range.valid_at.unwrap_or(default_at);
         let mut count = 0;
         for id in self.ids(&range.table) {
             let Some(event) = self.row(&range.table, id, at) else { continue; };
             let image = event.image_at(at).expect("visible row");
-            let Some(key) = image.cells.get(&index.column).and_then(index_key) else { continue; };
-            if range.lower.as_ref().is_none_or(|lower| key >= lower.as_slice())
-                && range.upper.as_ref().is_none_or(|upper| key < upper.as_slice())
-            {
+            let matches = if index.is_compound() {
+                index.columns().all(|column| image.cells.get(column).is_some_and(|value| {
+                    !matches!(value, Value::Null | Value::Undefined)
+                }))
+            } else {
+                image.cells.get(&index.column).and_then(index_key).is_some_and(|key| {
+                    range.lower.as_ref().is_none_or(|lower| key >= lower.as_slice())
+                        && range.upper.as_ref().is_none_or(|upper| key < upper.as_slice())
+                })
+            };
+            if matches {
                 if count == range.n { return Ok(false); }
                 count += 1;
             }

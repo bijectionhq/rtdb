@@ -53,6 +53,11 @@ surface StatelessDatabase {
         -- The region can name rows, an index interval, a table, or the selected branch.
         -- The authority issues identical claim bytes for the same evidence under one key generation.
 
+    @guarantee OrderedIndexCatalog
+        -- An ordered index declaration preserves its columns in the order sent by the caller.
+        -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.
+        -- A binary or text range guard can name a single-column index, and an unbounded count can name a compound index.
+
     @guarantee TokenAuthority
         -- All routes to an incarnation use the same wrapped token key for each published generation.
         -- New queries use the latest published generation.

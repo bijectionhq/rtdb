@@ -249,16 +249,29 @@ impl Candidate<'_> {
                 if index.name.is_empty() {
                     return Err(Anomaly::incorrect("rtdb/invalid-index", "An index needs a name"));
                 }
-                validate_column(&index.column)?;
+                let columns = index.columns().collect::<BTreeSet<_>>();
+                if columns.len() != 1 + index.additional_columns.len() {
+                    return Err(Anomaly::incorrect("rtdb/invalid-index", "Index columns must be distinct"));
+                }
+                for name in columns {
+                    validate_column(name)?;
+                }
+                if self.index.tables(cut.basis).any(|(other, definition)| {
+                    other != table && definition.indexes.contains_key(&index.name)
+                }) {
+                    return Err(conflict("rtdb/index-exists", "An index with that name already covers another table"));
+                }
                 if definition.indexes.get(&index.name).is_some_and(|old| old != index) {
                     return Err(conflict("rtdb/index-exists", "An index with that name already has a different definition"));
                 }
-                for branch in self.index.active_names(cut.system_time) {
-                    let view = self.view(branch, Layer::Merged)?;
-                    for id in view.ids(table) {
-                        for event in view.history(table, id) {
-                            if let Some(cell) = event.image.as_ref().and_then(|image| image.cells.get(&index.column)) {
-                                validate_index_key(&index.column, cell)?;
+                if !index.is_compound() {
+                    for branch in self.index.active_names(cut.system_time) {
+                        let view = self.view(branch, Layer::Merged)?;
+                        for id in view.ids(table) {
+                            for event in view.history(table, id) {
+                                if let Some(cell) = event.image.as_ref().and_then(|image| image.cells.get(&index.column)) {
+                                    validate_index_key(&index.column, cell)?;
+                                }
                             }
                         }
                     }
@@ -379,7 +392,7 @@ fn validate_cells(definition: &BranchTable, cells: &StructFields<Value>) -> Resu
         {
             return Err(Anomaly::incorrect("rtdb/schema-type", format!("Invalid type for declared column {name}")));
         }
-        if definition.indexes.values().any(|index| index.column == *name) {
+        if definition.indexes.values().any(|index| !index.is_compound() && index.column == *name) {
             validate_index_key(name, cell)?;
         }
     }
