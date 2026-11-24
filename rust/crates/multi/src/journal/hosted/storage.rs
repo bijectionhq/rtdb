@@ -49,14 +49,14 @@ struct WriteScope {
 /// worker's lease and the clock drift bound have passed, the journal may dispose
 /// of its holds, so every read checks the lease on the worker's monotonic clock.
 #[derive(Default)]
-struct ServingLease {
+pub(super) struct ServingLease {
     /// The lease deadline and the instant after which a read renews it.
     state: std::sync::Mutex<Option<(Instant, Instant)>>,
     renewal: tokio::sync::Mutex<()>,
 }
 
 impl ServingLease {
-    async fn serving(&self, renew: impl std::future::Future<Output = Result<u64>>) -> Result<Instant> {
+    pub(super) async fn serving(&self, renew: impl std::future::Future<Output = Result<u64>>) -> Result<Instant> {
         if let Some((deadline, renew_after)) = self.lease_state() && Instant::now() < renew_after {
             return Ok(deadline);
         }
@@ -286,9 +286,8 @@ impl StoreFactory {
         if route.writer.epoch != epoch {
             return Err(invalid("The ordered reader epoch changed during attachment"));
         }
-        let (lower, blocks) = with_read_lease(deadline, |_| async {
-            self.open_checkpoint(placement, attachment, hold, Arc::clone(&io)).await
-                .map_err(|error| Error::Remote { key: "ordered checkpoint".into(), message: error.to_string() })
+        let (lower, blocks) = with_read_lease(deadline, |_| {
+            self.open_checkpoint(placement, attachment, hold, Arc::clone(&io))
         }).await?;
         let objects = ReplicaObjects {
             installed: placement.worker.placement(), storage_prefix: placement.record.storage_prefix(),
@@ -558,12 +557,15 @@ impl ServingStore {
     }
 }
 
-async fn with_read_lease<T, F>(deadline: Instant, work: impl FnOnce(Instant) -> F) -> rtdb_storage::Result<T>
-where F: std::future::Future<Output = rtdb_storage::Result<T>> {
+pub(super) async fn with_read_lease<T, F, E>(deadline: Instant, work: impl FnOnce(Instant) -> F) -> std::result::Result<T, E>
+where
+    F: std::future::Future<Output = std::result::Result<T, E>>,
+    E: From<Error>,
+{
     let lease = Arc::new(ReadLease::until(deadline));
     let result = tokio::time::timeout_at(deadline.into(), IoRegion::leased(Some(Arc::clone(&lease)), work(deadline))).await;
     lease.check()?;
-    result.map_err(|_| Error::Closed("The installed serving lease expired".into()))?
+    result.map_err(|_| E::from(Error::Closed("The installed serving lease expired".into())))?
 }
 
 #[async_trait]

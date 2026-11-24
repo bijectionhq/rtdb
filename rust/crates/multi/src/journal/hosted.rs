@@ -821,10 +821,13 @@ impl Placement {
         if hold.checkpoint != route.checkpoint || hold.start != route.checkpoint.cut || hold.through != route.head {
             return Err(invalid("The requested cold reader basis changed"));
         }
-        self.worker.read_lease(hold, route.writer.epoch).await?;
+        let deadline = storage::ServingLease::default()
+            .serving(self.worker.read_lease(hold, route.writer.epoch)).await?;
         let checkpoint = if genesis(hold.checkpoint) { None } else {
-            let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
-            Some(provider.open(hold.checkpoint).await?.checkpoint)
+            Some(storage::with_read_lease(deadline, |_| async {
+                let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+                Ok::<_, Anomaly>(provider.open(hold.checkpoint).await?.checkpoint)
+            }).await?)
         };
         self.reader_opening.lock().clone_from(&Arc::downgrade(&recovery));
         let config = Self::database_configuration(Attachment {
