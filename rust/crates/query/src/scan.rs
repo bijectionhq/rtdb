@@ -11,7 +11,7 @@ use bytes::Bytes;
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{IidView, MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
-use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{data::{EventBatch, PutText}, ipc::{PageDecoder, PageProjection, inspect_file_reserved}, keys::{TableSlug, TrieKey}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, LocatedRows, RowSource, Snapshot, TrieState};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, audience_work, cache::{BufferPool, CacheLease, Cached, View}};
@@ -38,7 +38,6 @@ struct OpenedLayout {
 
 enum DataProjection<'a> {
     Full,
-    Iid,
     PutColumns(&'a [String]),
 }
 
@@ -80,17 +79,40 @@ impl DataFile {
         }
         audience_work::decode_bytes(bound)?;
         let charged = memory.reserve(bound)?;
-        let bytes = if matches!(projection, DataProjection::Iid) {
-            Buffer::from(Bytes::from_owner(bytes))
-        } else {
-            page_buffer(bytes)
-        };
+        let bytes = page_buffer(bytes);
         let batch = match projection {
             DataProjection::Full => reader.decode_page(page, bytes)?,
-            DataProjection::Iid => reader.decode_iid_page(page, bytes)?,
             DataProjection::PutColumns(columns) => reader.decode_event_page(page, bytes, columns)?,
         };
         Ok((batch, charged))
+    }
+
+    async fn decode_spatial_page(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: PageProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
+        self.open(memory).await?;
+        let opened = self.opened.as_ref().expect("the data file is open");
+        let reader = &opened.layout.decoder;
+        let wire = self.read_range(opened.whole.as_ref(), reader.page_range(page)?, memory).await?;
+        let reserve = |bound| {
+            audience_work::decode_bytes(bound)?;
+            memory.reserve(bound)
+        };
+        if let Some((mut batch, charge)) = reader.decode_projected_page_reserved(page, wire.clone(), projection, reserve)? {
+            if matches!(projection, PageProjection::PutColumns(_)) && batch.get_array_memory_size() > charge.bytes() {
+                // Arrow reports the wire owner's full capacity on each slice, even though the lease already funds it.
+                let columns = batch.columns().iter().map(|array| rtdb_columnar::retain_array(Arc::clone(array), &charge))
+                    .collect::<Result<Vec<_>>>()?;
+                batch = arrow_array::RecordBatch::try_new(batch.schema(), columns).map_err(|error| invalid("page-size", error))?;
+            }
+            return Ok((batch, charge));
+        }
+
+        let charge = reserve(reader.full_page_decode_bound(page, wire.as_slice())?)?;
+        let bytes = match projection {
+            PageProjection::Iid => Buffer::from(Bytes::from_owner(wire)),
+            PageProjection::PutColumns(_) => page_buffer(wire),
+        };
+        let batch = reader.decode_page(page, bytes)?;
+        Ok((batch, charge))
     }
 
     async fn read_range(&self, whole: Option<&CacheLease>, range: std::ops::Range<u64>, memory: &Arc<MemoryBudget>) -> Result<CacheLease> {
@@ -158,11 +180,11 @@ pub async fn visit_trie_iids(
     for page in 0..pages {
         context.check_cancelled()?;
         if let Some(held) = file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
-            let _charged = context.memory.reserve(held.bound)?;
             visit_iids(context, held.batch.view().iids()?, &mut visit)?;
         } else {
-            let (batch, _charged) = file.decode_page_as(page, &context.memory, DataProjection::Iid).await?;
-            visit_iids(context, IidView::new(batch.column(0).as_ref())?, &mut visit)?;
+            let (batch, _charged) = file.decode_spatial_page(page, &context.memory, PageProjection::Iid).await?;
+            let iids = batch.column_by_name("_iid").ok_or_else(|| invalid("page-iid", "Arrow page has no IID column"))?;
+            visit_iids(context, IidView::new(iids.as_ref())?, &mut visit)?;
         }
     }
     Ok(())
@@ -2135,22 +2157,22 @@ impl PartitionScan {
         let rows = match (&page.source, hit) {
             (PageSource::Live { table, rows }, _) => ActiveRows::Live { table: Arc::clone(table), rows: Arc::clone(rows) },
             (PageSource::File { .. }, Some(held)) => {
-                audience_work::decode_bytes(held.bound)?;
-                charge = Some(self.execution.context.memory.reserve(held.bound)?);
+                if !self.execution.context.spatial_refinement {
+                    audience_work::decode_bytes(held.bound)?;
+                    charge = Some(self.execution.context.memory.reserve(held.bound)?);
+                }
                 cached = true;
                 ActiveRows::File(Arc::clone(&held.batch))
             }
             (PageSource::File { file, page: page_index, .. }, None) => {
                 let data = &mut self.files.entries[*file];
                 let context = &self.execution.context;
-                let selected;
-                let projection = if context.spatial_refinement {
-                    selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
-                    DataProjection::PutColumns(&selected)
+                let (page, charged) = if context.spatial_refinement {
+                    let selected = self.scan.columns.iter().map(|field| field.name.clone()).collect::<Vec<_>>();
+                    data.decode_spatial_page(*page_index, &context.memory, PageProjection::PutColumns(&selected)).await?
                 } else {
-                    DataProjection::Full
+                    data.decode_page(*page_index, &context.memory).await?
                 };
-                let (page, charged) = data.decode_page_as(*page_index, &context.memory, projection).await?;
                 let bound = charged.bytes();
                 audience_work::scan_items(page.num_rows())?;
                 let headers = IndexBatch::header_bytes(page.num_rows())?;

@@ -7,11 +7,33 @@ use arrow_schema::{DataType, FieldRef, Schema, UnionFields, UnionMode};
 use flatbuffers::FlatBufferBuilder;
 use rtdb_types::Result;
 
-use super::{invalid, validate_lz4_batch};
+use super::{PageProjection, allocation_add, allocation_mul, arrow_descriptors, codec_workspace,
+    compressed_buffer_length, decoded_buffer_bound, decoded_buffer_length, field_metadata_bound,
+    invalid, schema_metadata_bound, validate_lz4_batch};
 
-pub(super) enum Selection<'a> {
-    Iid,
-    PutColumns(&'a [String]),
+pub(super) fn allocation_bound(
+    body: &[u8],
+    batch: arrow_ipc::RecordBatch<'_>,
+    schema: &Schema,
+    version: MetadataVersion,
+    selection: PageProjection<'_>,
+) -> Result<Option<(usize, usize)>> {
+    let workspace = codec_workspace(batch)?;
+    let compressed = batch.compression().is_some();
+    for node in batch.nodes().into_iter().flatten() {
+        usize::try_from(node.length()).map_err(invalid)?;
+    }
+    for buffer in batch.buffers().into_iter().flatten() {
+        decoded_buffer_length(buffer, body.len(), compressed, |start| compressed_buffer_length(body, start))?;
+    }
+
+    let mut bound = Bound {
+        body, compressed, decompresses: false,
+        bytes: allocation_add(8192, schema_metadata_bound(schema.metadata())?)?,
+    };
+    let mut layout = Layout::new(batch, version, Output::Measure(&mut bound));
+    if layout.select(schema, selection).is_err() { return Ok(None); }
+    Ok(Some((bound.bytes, if bound.decompresses { workspace } else { 0 })))
 }
 
 pub(super) fn decode(
@@ -19,36 +41,17 @@ pub(super) fn decode(
     batch: arrow_ipc::RecordBatch<'_>,
     schema: &Schema,
     version: MetadataVersion,
-    selection: Selection<'_>,
+    selection: PageProjection<'_>,
 ) -> Result<RecordBatch> {
-    let mut layout = Layout {
-        batch, version, node: 0, buffer: 0, variadic: 0,
-        nodes: Vec::new(), buffers: Vec::new(), counts: Vec::new(),
-    };
-    let mut fields = Vec::new();
-    for field in schema.fields() {
-        let selected = match selection {
-            Selection::Iid if field.name() == "_iid" => FieldSelection::All,
-            Selection::Iid => FieldSelection::Skip,
-            Selection::PutColumns(names) if field.name() == "op" => FieldSelection::Operations(names),
-            Selection::PutColumns(_) => FieldSelection::All,
-        };
-        if let Some(field) = layout.field(field, selected)? {
-            fields.push(field);
-        }
-    }
-    if layout.node != batch.nodes().map_or(0, |nodes| nodes.len())
-        || layout.buffer != batch.buffers().map_or(0, |buffers| buffers.len())
-        || layout.variadic != batch.variadicBufferCounts().map_or(0, |counts| counts.len())
-    {
-        return Err(invalid("Arrow schema and field-node inventory disagree"));
-    }
+    let mut descriptors = Descriptors::default();
+    let mut layout = Layout::new(batch, version, Output::Decode(&mut descriptors));
+    let fields = layout.select(schema, selection)?;
 
     // The projected descriptors still address the original body.
     let mut builder = FlatBufferBuilder::new();
-    let nodes = builder.create_vector(&layout.nodes);
-    let buffers = builder.create_vector(&layout.buffers);
-    let counts = (!layout.counts.is_empty()).then(|| builder.create_vector(&layout.counts));
+    let nodes = builder.create_vector(&descriptors.nodes);
+    let buffers = builder.create_vector(&descriptors.buffers);
+    let counts = (!descriptors.counts.is_empty()).then(|| builder.create_vector(&descriptors.counts));
     let compression = batch.compression().map(|compression| arrow_ipc::BodyCompression::create(
         &mut builder,
         &arrow_ipc::BodyCompressionArgs { codec: compression.codec(), method: compression.method() },
@@ -64,6 +67,31 @@ pub(super) fn decode(
     arrow_ipc::reader::read_record_batch(body, batch, schema, &HashMap::new(), None, &version).map_err(invalid)
 }
 
+struct Bound<'a> {
+    body: &'a [u8],
+    compressed: bool,
+    decompresses: bool,
+    bytes: usize,
+}
+
+impl Bound<'_> {
+    fn field(&mut self, field: &FieldRef, node: &FieldNode, buffers: impl Iterator<Item = arrow_ipc::Buffer>) -> Result<()> {
+        let mut descriptor = field_metadata_bound(field)?;
+        if let DataType::Timestamp(_, Some(zone)) = field.data_type() {
+            descriptor = allocation_add(descriptor, allocation_mul(zone.len(), 16)?)?;
+        }
+        let rows = usize::try_from(node.length()).map_err(invalid)?;
+        self.bytes = allocation_add(self.bytes, allocation_add(arrow_descriptors(rows)?, descriptor)?)?;
+        for buffer in buffers {
+            let (decoded, decompresses) = decoded_buffer_length(&buffer, self.body.len(), self.compressed,
+                |start| compressed_buffer_length(self.body, start))?;
+            self.decompresses |= decompresses;
+            self.bytes = allocation_add(self.bytes, decoded_buffer_bound(decoded)?)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy)]
 enum FieldSelection<'a> {
     All,
@@ -72,28 +100,60 @@ enum FieldSelection<'a> {
     PutFields(&'a [String]),
 }
 
-struct Layout<'a> {
-    batch: arrow_ipc::RecordBatch<'a>,
-    version: MetadataVersion,
-    node: usize,
-    buffer: usize,
-    variadic: usize,
+#[derive(Default)]
+struct Descriptors {
     nodes: Vec<FieldNode>,
     buffers: Vec<arrow_ipc::Buffer>,
     counts: Vec<i64>,
 }
 
-impl Layout<'_> {
+enum Output<'a, 'b> {
+    Measure(&'a mut Bound<'b>),
+    Decode(&'a mut Descriptors),
+}
+
+struct Layout<'a, 'b, 'c> {
+    batch: arrow_ipc::RecordBatch<'a>,
+    version: MetadataVersion,
+    node: usize,
+    buffer: usize,
+    variadic: usize,
+    output: Output<'b, 'c>,
+}
+
+impl<'a, 'b, 'c> Layout<'a, 'b, 'c> {
+    fn new(batch: arrow_ipc::RecordBatch<'a>, version: MetadataVersion, output: Output<'b, 'c>) -> Self {
+        Self { batch, version, node: 0, buffer: 0, variadic: 0, output }
+    }
+
+    fn select(&mut self, schema: &Schema, selection: PageProjection<'_>) -> Result<Vec<FieldRef>> {
+        let mut fields = Vec::new();
+        for field in schema.fields() {
+            let selected = match selection {
+                PageProjection::Iid if field.name() == "_iid" => FieldSelection::All,
+                PageProjection::Iid => FieldSelection::Skip,
+                PageProjection::PutColumns(names) if field.name() == "op" => FieldSelection::Operations(names),
+                PageProjection::PutColumns(_) => FieldSelection::All,
+            };
+            if let Some(field) = self.field(field, selected)? { fields.push(field); }
+        }
+        if self.node != self.batch.nodes().map_or(0, |nodes| nodes.len())
+            || self.buffer != self.batch.buffers().map_or(0, |buffers| buffers.len())
+            || self.variadic != self.batch.variadicBufferCounts().map_or(0, |counts| counts.len())
+        {
+            return Err(invalid("Arrow schema and field-node inventory disagree"));
+        }
+        Ok(fields)
+    }
+
     fn field(&mut self, field: &FieldRef, selection: FieldSelection<'_>) -> Result<Option<FieldRef>> {
         let keep = !matches!(selection, FieldSelection::Skip);
+        let materialize = keep && matches!(&self.output, Output::Decode(_));
         let nodes = self.batch.nodes().filter(|nodes| self.node < nodes.len())
             .ok_or_else(|| invalid("Arrow schema exceeds its field-node inventory"))?;
-        if keep {
-            let node = nodes.get(self.node);
-            if node.null_count() < 0 {
-                return Err(invalid("Projected Arrow fields require known null counts"));
-            }
-            self.nodes.push(*node);
+        let node = nodes.get(self.node);
+        if keep && node.null_count() < 0 {
+            return Err(invalid("Projected Arrow fields require known null counts"));
         }
         self.node += 1;
 
@@ -101,6 +161,7 @@ impl Layout<'_> {
             DataType::Dictionary(key, _) => key.as_ref(),
             data_type => data_type,
         };
+        let mut variadic = None;
         let buffers = match physical {
             DataType::Null | DataType::RunEndEncoded(_, _) => 0,
             DataType::Union(_, mode) =>
@@ -114,7 +175,7 @@ impl Layout<'_> {
                     .ok_or_else(|| invalid("Arrow view exceeds its variadic inventory"))?;
                 let count = counts.get(self.variadic);
                 self.variadic += 1;
-                if keep { self.counts.push(count); }
+                variadic = Some(count);
                 usize::try_from(count).ok().and_then(|count| count.checked_add(2))
                     .ok_or_else(|| invalid("Arrow view buffer-count overflow"))?
             }
@@ -124,7 +185,15 @@ impl Layout<'_> {
         let inventory = self.batch.buffers().filter(|buffers| end <= buffers.len())
             .ok_or_else(|| invalid("Arrow schema exceeds its buffer inventory"))?;
         if keep {
-            self.buffers.extend((self.buffer..end).map(|index| *inventory.get(index)));
+            let buffers = (self.buffer..end).map(|index| *inventory.get(index));
+            match &mut self.output {
+                Output::Measure(bound) => bound.field(field, node, buffers)?,
+                Output::Decode(descriptors) => {
+                    descriptors.nodes.push(*node);
+                    descriptors.buffers.extend(buffers);
+                    descriptors.counts.extend(variadic);
+                }
+            }
         }
         self.buffer = end;
 
@@ -140,7 +209,7 @@ impl Layout<'_> {
                     };
                     if let Some(child) = self.field(child, selected_child)? { selected.push(child); }
                 }
-                (keep && matches!(selection, FieldSelection::PutFields(_)))
+                (materialize && matches!(selection, FieldSelection::PutFields(_)))
                     .then(|| DataType::Struct(selected.into()))
             }
             DataType::Union(legs, mode) => {
@@ -153,7 +222,7 @@ impl Layout<'_> {
                     };
                     if let Some(leg) = self.field(leg, selection)? { selected.push((id, leg)); }
                 }
-                if matches!(selection, FieldSelection::Operations(_)) {
+                if materialize && matches!(selection, FieldSelection::Operations(_)) {
                     let (ids, fields): (Vec<_>, Vec<_>) = selected.into_iter().unzip();
                     Some(DataType::Union(UnionFields::try_new(ids, fields).map_err(invalid)?, *mode))
                 } else {
@@ -172,7 +241,7 @@ impl Layout<'_> {
             }
             _ => None,
         };
-        Ok(keep.then(|| match replacement {
+        Ok(materialize.then(|| match replacement {
             Some(data_type) => Arc::new(field.as_ref().clone().with_data_type(data_type)),
             None => Arc::clone(field),
         }))
