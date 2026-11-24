@@ -1,14 +1,14 @@
 use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use rtdb_crypt::Kms;
+use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{Decision, LINEARIZABLE, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis, ClaimSealer}};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis}};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -40,7 +40,6 @@ pub struct TransactSubmission {
 #[derive(Clone)]
 pub struct NativeServingAuthority {
     pub incarnation: [u8; 16],
-    pub claims: Arc<ClaimSealer>,
     pub checkpoints: Option<NativeCheckpointAuthority>,
 }
 
@@ -110,11 +109,11 @@ impl NativeServingHandle {
         Ok(())
     }
 
-    pub async fn transact(&self, request: TransactSubmission, cancellation: &CancellationToken) -> Result<Receipt> {
+    pub async fn transact(&self, request: TransactSubmission, claims: VerifiedClaims, cancellation: &CancellationToken) -> Result<Receipt> {
         if request.transaction.ops.is_empty() && request.transaction.otherwise.is_empty() {
             self.replication.serving_barrier(cancellation).await?;
         }
-        self.replication.serving_transact(request, cancellation).await
+        self.replication.serving_transact(request, claims, cancellation).await
     }
 
     pub async fn tx_status(&self, key: Vec<u8>, cancellation: &CancellationToken) -> Result<Receipt> {
@@ -231,10 +230,10 @@ impl NativeServing {
     }
 
     pub(crate) fn decide_batch(
-        &mut self, now: Timestamp, requests: Vec<(TransactSubmission, Completion)>,
+        &mut self, now: Timestamp, requests: Vec<(TransactSubmission, VerifiedClaims, Completion)>,
     ) -> Result<Vec<proto::NoOp>> {
         if !self.view.borrow().compatible {
-            for (_, completion) in requests { let _ = completion.send(Err(incompatible())); }
+            for (_, _, completion) in requests { let _ = completion.send(Err(incompatible())); }
             return Ok(Vec::new());
         }
         if !self.deciding {
@@ -248,11 +247,11 @@ impl NativeServing {
             self.deciding = true;
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
-        let records = requests.iter().map(|(request, _)| request.transaction.clone()).collect::<Vec<_>>();
-        let decisions = pipeline.decide_batch(&records, now, NATIVE_WRITE_FEATURES, self.authority.claims.as_ref());
-        if decisions.len() != requests.len() { return Err(invalid()); }
+        let decisions = requests.iter().map(|(request, claims, _)| {
+            pipeline.decide(&request.transaction, now, NATIVE_WRITE_FEATURES, claims)
+        }).collect::<Vec<_>>();
         let mut messages = Vec::new();
-        for ((request, completion), decision) in requests.into_iter().zip(decisions) {
+        for ((request, _, completion), decision) in requests.into_iter().zip(decisions) {
             match decision {
                 Ok(Decision::Answer(receipt)) => { let _ = completion.send(Ok(receipt)); }
                 Err(error) => { let _ = completion.send(Err(error)); }
@@ -384,7 +383,7 @@ mod tests {
     const INCARNATION: [u8; 16] = [7; 16];
 
     fn authority() -> NativeServingAuthority {
-        NativeServingAuthority { incarnation: INCARNATION, claims: Arc::new(ClaimSealer::new(INCARNATION, [1; 32])), checkpoints: None }
+        NativeServingAuthority { incarnation: INCARNATION, checkpoints: None }
     }
 
     fn put(key: u8) -> TransactSubmission {
@@ -407,7 +406,10 @@ mod tests {
         let first = put(1);
         let (first_reply, mut first_result) = oneshot::channel();
         let (second_reply, mut second_result) = oneshot::channel();
-        let mut messages = serving.decide_batch(Timestamp(41), vec![(first, first_reply), (put(2), second_reply)]).unwrap();
+        let mut messages = serving.decide_batch(Timestamp(41), vec![
+            (first, VerifiedClaims::default(), first_reply),
+            (put(2), VerifiedClaims::default(), second_reply),
+        ]).unwrap();
         assert_eq!(messages.len(), 2);
         let excluded = messages.pop().unwrap().serving_record.unwrap();
         let committed = messages.pop().unwrap().serving_record.unwrap();
@@ -427,7 +429,8 @@ mod tests {
         assert!(serving.status(&[1; 16]).unwrap().replayed);
         assert_eq!(serving.status(&[2; 16]).unwrap_err().code, "rtdb/unknown-transaction");
         let (reply, result) = oneshot::channel();
-        let message = serving.decide_batch(Timestamp(42), vec![(put(3), reply)]).unwrap().remove(0).serving_record.unwrap();
+        let message = serving.decide_batch(Timestamp(42), vec![(put(3), VerifiedClaims::default(), reply)])
+            .unwrap().remove(0).serving_record.unwrap();
         assert!(serving.apply(&excluded, true).is_err());
         serving.apply(&message, true).unwrap();
         assert_eq!(result.await.unwrap().unwrap().basis.position(), 2);

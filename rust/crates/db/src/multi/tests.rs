@@ -900,6 +900,7 @@ async fn multi_driver_routes_the_same_idempotency_key_in_two_receipt_namespaces(
         let Op::Put { rows, .. } = &mut request.ops[0] else {
             unreachable!()
         };
+        rows[0].valid = Some(rtdb_types::Interval::ALL);
         rows[0]
             .cells
             .insert("label".into(), Cell::Value(Value::Binary(vec![1])));

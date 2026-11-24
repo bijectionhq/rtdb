@@ -19,7 +19,7 @@ use crate::ordered_index::OrderedIndexMaintenance;
 use crate::read_currency::ReadCurrency;
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, REPLICA_BEHIND, ReplicaReadIndex, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
-mod tokens;
+pub(crate) mod tokens;
 
 type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
@@ -36,7 +36,7 @@ impl Drop for ReplicaReadSession {
 pub struct Database {
     writes_event_history: bool,
     pub(crate) protected_equality_epoch: uuid::Uuid,
-    tokens: tokens::DatabaseTokens,
+    tokens: Arc<tokens::DatabaseTokens>,
     name: String,
     configuration: DatabaseConfig,
     read_only: bool,
@@ -71,7 +71,7 @@ impl Database {
     pub async fn wire_incarnation(&self) -> Result<uuid::Uuid> { self.tokens.incarnation().await }
 
     pub async fn token_authority(&self) -> Result<rtdb_crypt::tokens::TokenAuthority> {
-        if let Some(driver) = self.serving_driver() {
+        if let Some(driver) = self.serving_driver().filter(|driver| !driver.uses_database_tokens()) {
             return driver.token_authority().ok_or_else(|| Anomaly::unsupported(
                 "rtdb/token-authority", "This serving driver has no shared token authority",
             ));
@@ -80,19 +80,20 @@ impl Database {
     }
 
     pub fn wire_tokens_supported(&self) -> bool {
-        self.serving_driver().map_or_else(|| self.tokens.supported(), |driver| driver.token_authority().is_some())
+        self.serving_driver().filter(|driver| !driver.uses_database_tokens())
+            .map_or_else(|| self.tokens.supported(), |driver| driver.token_authority().is_some())
     }
 
     /// The writer calls this after committing the rotation and recovers using its original deadline.
     pub async fn apply_token_key_rotation(&self, next: u64, unreadable_by: i64) -> Result<()> {
-        if let Some(driver) = self.serving_driver() {
+        if let Some(driver) = self.serving_driver().filter(|driver| !driver.uses_database_tokens()) {
             return driver.apply_token_key_rotation(next, unreadable_by).await;
         }
         self.tokens.apply_rotation(next, unreadable_by).await
     }
 
     pub async fn destroy_retired_token_key(&self, generation: u64) -> Result<()> {
-        if let Some(driver) = self.serving_driver() {
+        if let Some(driver) = self.serving_driver().filter(|driver| !driver.uses_database_tokens()) {
             return driver.destroy_retired_token_key(generation).await;
         }
         self.tokens.destroy_retired(generation).await
@@ -581,19 +582,23 @@ impl DatabaseFactory {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
             let mut serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
-            if serving.is_none() && self.options.replication.enabled
-                && configuration.external_source.is_none()
-                && let Some(authority) = self.resources.native_serving_authority(&name, &configuration)?
-            {
+            let native_authority = if serving.is_none() && self.options.replication.enabled && configuration.external_source.is_none() {
+                self.resources.native_serving_authority(&name, &configuration)?
+            } else {
+                None
+            };
+            let incarnation = serving.as_ref().map(|driver| driver.incarnation())
+                .or_else(|| native_authority.as_ref().map(|authority| authority.incarnation))
+                .map(uuid::Uuid::from_bytes);
+            let tokens = Arc::new(tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
+                self.resources.token_kms(), Arc::clone(&self.clock), incarnation));
+            if let Some(authority) = native_authority {
                 let handle = replica_driver.attach_native_serving(replication.clone(), authority, self.options.automatic_gc).await?;
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
-                    handle, memory: Arc::clone(&self.memory), clock: Arc::clone(&self.clock),
+                    handle, memory: Arc::clone(&self.memory), clock: Arc::clone(&self.clock), tokens: Arc::clone(&tokens),
                     writable: !read_only && self.options.replication.may_lead,
                 }));
             }
-            let incarnation = serving.as_ref().map(|driver| uuid::Uuid::from_bytes(driver.incarnation()));
-            let tokens = tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
-                self.resources.token_kms(), Arc::clone(&self.clock), incarnation);
             let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, serving, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,

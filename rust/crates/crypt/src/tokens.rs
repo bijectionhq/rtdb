@@ -377,6 +377,7 @@ impl TokenIssuer {
     }
 }
 
+#[derive(Default)]
 pub struct VerifiedClaims(Vec<(Claim, Result<ClaimEvidence>)>);
 
 impl VerifiedClaims {

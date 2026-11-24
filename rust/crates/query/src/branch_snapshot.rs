@@ -9,7 +9,7 @@ use rtdb_trie::TrieConfig;
 use rtdb_types::{
     Anomaly, BlockIndex, EntityId, Interval, LogicalType, Result, ScalarType, StructFields, TableRef, Timestamp,
     TransactionKey, TxId, Value,
-    rtdb_v1::{Basis, Claim, ClaimScope, ClaimSealer},
+    rtdb_v1::Basis,
 };
 
 pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Result<Snapshot> {
@@ -60,10 +60,6 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
         live = Arc::new(live.apply(&buffer.stage()?)?);
     }
     Ok(Snapshot::new(tries, tables, live))
-}
-
-pub fn seal_branch_claim(view: &BranchView<'_>, claims: &ClaimSealer) -> Result<Claim> {
-    claims.seal(&ClaimScope { branch: view.branch().into(), basis: view.cut().basis, layer: view.layer() })
 }
 
 fn tx_key(cut: BranchCut) -> Result<TransactionKey> {

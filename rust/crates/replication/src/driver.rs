@@ -25,6 +25,7 @@ use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
 use crate::serving::{self, NativeServing, NativeServingAuthority, NativeServingHandle, TransactSubmission};
+use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_tx::transact::Receipt as ServingReceipt;
 
 #[async_trait]
@@ -144,10 +145,10 @@ impl ReplicationHandle {
         if reached.role == Role::Stopped { return Err(serving::unavailable()); }
         Ok(())
     }
-    pub(crate) async fn serving_transact(&self, request: TransactSubmission, cancellation: &CancellationToken) -> Result<ServingReceipt> {
+    pub(crate) async fn serving_transact(&self, request: TransactSubmission, claims: VerifiedClaims, cancellation: &CancellationToken) -> Result<ServingReceipt> {
         let term = self.term().ok_or_else(serving::unavailable)?.term();
         let (completion, receipt) = oneshot::channel();
-        cancellation.run_until_cancelled(self.commands.send(Command::ServingWrite { term, request, completion })).await
+        cancellation.run_until_cancelled(self.commands.send(Command::ServingWrite { term, request, claims, completion })).await
             .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
         cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::interrupted())?
     }
@@ -290,7 +291,7 @@ impl ExternalReceipt {
 }
 
 enum Command {
-    ServingWrite { term: Term, request: TransactSubmission, completion: serving::Completion },
+    ServingWrite { term: Term, request: TransactSubmission, claims: VerifiedClaims, completion: serving::Completion },
     ServingStatus { key: Vec<u8>, completion: serving::Completion },
     ResetCompactor { term: Term, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
@@ -1906,16 +1907,16 @@ impl ReplicationDriver {
         if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
             Command::ServingStatus { .. } => unreachable!("handled before checking the writer term"),
-            Command::ServingWrite { term, request, completion } => {
+            Command::ServingWrite { term, request, claims, completion } => {
                 let Some(serving) = &mut self.serving else {
                     let _ = completion.send(Err(serving::unavailable()));
                     return Ok(());
                 };
-                let mut requests = vec![(request, completion)];
+                let mut requests = vec![(request, claims, completion)];
                 if leader.deferred_commands.is_empty() {
                     while requests.len() < 64 {
                         match self.commands.try_recv() {
-                            Ok(Command::ServingWrite { term: admitted, request, completion }) if admitted == term => requests.push((request, completion)),
+                            Ok(Command::ServingWrite { term: admitted, request, claims, completion }) if admitted == term => requests.push((request, claims, completion)),
                             Ok(command) => { leader.deferred_commands.push_back(command); break; }
                             Err(_) => break,
                         }

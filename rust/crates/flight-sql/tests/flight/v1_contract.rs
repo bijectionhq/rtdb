@@ -1155,14 +1155,12 @@ async fn transact_wire(
 #[tokio::test]
 async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
     use rtdb_node::serving::NativeServingAuthority;
-    use rtdb_types::rtdb_v1::ClaimSealer;
 
     let incarnation = [29; 16];
     let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
         "xtdb",
         NativeServingAuthority {
             incarnation,
-            claims: Arc::new(ClaimSealer::new(incarnation, [7; 32])),
             checkpoints: None,
         },
     );
@@ -1422,11 +1420,11 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
 #[tokio::test]
 async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_checkpoint() {
     use rtdb_node::serving::NativeServingAuthority;
-    use rtdb_types::rtdb_v1::{Basis, ClaimSealer};
+    use rtdb_types::rtdb_v1::Basis;
 
     let incarnation = [27; 16];
     let resources = rtdb_node::NativeResources::default().with_native_serving_authority("xtdb", NativeServingAuthority {
-        incarnation, claims: Arc::new(ClaimSealer::new(incarnation, [8; 32])), checkpoints: None,
+        incarnation, checkpoints: None,
     });
     let mut options = rtdb_node::NodeOptions::default();
     options.replication.rows_per_block = 2;
@@ -1492,13 +1490,12 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
 #[tokio::test]
 async fn rtdb_v1_native_driver_requires_fences_both_arms_and_replays() {
     use rtdb_node::serving::NativeServingAuthority;
-    use rtdb_types::rtdb_v1::ClaimSealer;
     use v1::{receipt::Outcome, version::Expect};
 
     let incarnation = [27; 16];
     let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
         "xtdb", NativeServingAuthority {
-            incarnation, claims: Arc::new(ClaimSealer::new(incarnation, [8; 32])), checkpoints: None,
+            incarnation, checkpoints: None,
         },
     );
     let running = Running::start_with_resources(

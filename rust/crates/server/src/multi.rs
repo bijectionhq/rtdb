@@ -18,7 +18,7 @@ use rtdb_node::{
     SystemClock, serving::ServingDriver,
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, rtdb_v1::ClaimSealer};
+use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -166,13 +166,6 @@ impl MultiRuntime {
         let kms: Arc<dyn Kms> = Arc::new(FileKms::open(&backends.vault, || SystemClock.now().0)?);
         let mut serving = BTreeMap::new();
         for (name, database) in databases {
-            let file = backends.vault.join(format!("{}.claim", database.simple()));
-            let key = load_or_create(&file, || {
-                let mut key = [0; 32];
-                key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
-                key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
-                key
-            })?;
             let options = MultiOptions {
                 database,
                 node: backends.node,
@@ -185,7 +178,6 @@ impl MultiRuntime {
                 Arc::clone(&backends.store),
                 Arc::clone(&kms),
                 Arc::new(|| SystemClock.now()),
-                Arc::new(ClaimSealer::new(*database.as_bytes(), key)),
             )?;
             match backends.journal.head(StreamId(database.as_u128())).await {
                 Ok(_) => (),

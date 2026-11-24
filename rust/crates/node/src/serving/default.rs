@@ -2,10 +2,11 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
+use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_index::branches::{BranchView, BranchWrite};
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingView};
 use rtdb_tx::transact::Receipt;
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, Layer}};
+use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
 
 use super::{ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
@@ -16,12 +17,14 @@ pub(crate) struct DefaultServing {
     pub(crate) handle: NativeServingHandle,
     pub(crate) memory: Arc<MemoryBudget>,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) tokens: Arc<crate::database::tokens::DatabaseTokens>,
     pub(crate) writable: bool,
 }
 
 #[async_trait]
 impl ServingDriver for DefaultServing {
     fn incarnation(&self) -> [u8; 16] { self.handle.authority().incarnation }
+    fn uses_database_tokens(&self) -> bool { true }
 
     fn features(&self) -> &[&str] {
         if self.writable { NATIVE_WRITE_FEATURES } else { NATIVE_READ_FEATURES }
@@ -33,7 +36,14 @@ impl ServingDriver for DefaultServing {
         let snapshot = self.handle.view(source.at, cancellation).await?;
         let at = if source.at == At::Linearizable { At::Latest } else { source.at };
         let branch = snapshot.index.view(&source.branch, at, source.layer, now)?;
-        let claim = track.then(|| rtdb_query::seal_branch_claim(&branch, &self.handle.authority().claims)).transpose()?;
+        let claim = if track {
+            Some(self.tokens.authority().await?.seal_claim(&ClaimEvidence {
+                scope: ClaimScope { branch: branch.branch().into(), basis: branch.cut().basis, layer: source.layer },
+                footprint: Default::default(),
+            }).await?)
+        } else {
+            None
+        };
         let snapshot = rtdb_query::branch_snapshot(&branch, &self.memory)?;
         Ok(QueryView { snapshot, cut: branch.cut(), claim })
     }
@@ -42,7 +52,12 @@ impl ServingDriver for DefaultServing {
         if !self.writable {
             return Err(Anomaly::unsupported("rtdb/default-serving-read-only", "The default serving attachment is read-only"));
         }
-        self.handle.transact(request, cancellation).await
+        let claims = if request.transaction.claims().next().is_some() {
+            self.tokens.authority().await?.verify_claims(request.transaction.claims()).await
+        } else {
+            VerifiedClaims::default()
+        };
+        self.handle.transact(request, claims, cancellation).await
     }
 
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {

@@ -25,7 +25,7 @@ enum Custody {
     Missing,
 }
 
-pub(super) struct DatabaseTokens {
+pub(crate) struct DatabaseTokens {
     store: Arc<dyn ObjectStore>,
     prefix: String,
     read_only: bool,
@@ -114,7 +114,7 @@ impl DatabaseTokens {
             .copied()
     }
 
-    pub(super) async fn authority(&self) -> Result<TokenAuthority> {
+    pub(crate) async fn authority(&self) -> Result<TokenAuthority> {
         Ok(self.database_authority().await?.authority.clone())
     }
 
