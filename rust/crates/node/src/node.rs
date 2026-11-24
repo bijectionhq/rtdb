@@ -842,6 +842,9 @@ impl Node {
 
     async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, permit: Option<crate::ReplaySubmissionPermit>, identity: &dyn SessionIdentity, placement: Option<&Weak<Database>>, cancellation: &CancellationToken) -> Result<SubmittedTx> {
         self.admit(database, DatabaseAccess::Write, identity, cancellation).await?;
+        if self.factory.resources.journal_native_sql() {
+            return Err(Anomaly::unsupported("rtdb.multi/sql-write", "Multi writes use rtdb.v1.Transact"));
+        }
         if !self.factory.options.owned_relations
             && operations.iter().any(TxOp::is_owned)
         {
@@ -4330,6 +4333,16 @@ impl NativeSessionService {
         let context = self.node.query_context_in_placement(
             database, basis, self.identity.as_ref(), self.placement.as_ref(), CatalogReadCut::Current, cancellation,
         ).await?;
+        #[cfg(feature = "multi")]
+        if self.node.factory.resources.journal_native_sql() {
+            let attachment = self.node.catalog().database(database)?;
+            let driver = attachment.serving_driver().ok_or_else(|| Anomaly::fault("rtdb/multi-attachment", "Multi SQL requires a journal attachment"))?;
+            let time = basis.snapshot_time.unwrap_or(basis.current_time.as_micros()?);
+            let view = driver.query(crate::serving::QuerySource {
+                branch: "main".into(), at: rtdb_types::rtdb_v1::At::AsOf(time), layer: rtdb_types::rtdb_v1::Layer::Merged,
+            }, false, time, cancellation).await?;
+            return context.with_wire_snapshot(view.snapshot, view.cut.system_time, basis.current_time);
+        }
         let context = if let Some(token) = &basis.resume_token {
             let view = admission.restore(token, &context, cancellation).await?;
             context.with_snapshot_view(view, token.clone())?

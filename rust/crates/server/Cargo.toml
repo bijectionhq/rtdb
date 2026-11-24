@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+multi = ["rtdb-node/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-journal-logkeeper", "dep:tempfile", "dep:sha2"]
 kafka = ["rtdb-node/kafka", "dep:rtdb-kafka", "rtdb-metrics/kafka"]
 kafka-connect = ["kafka", "rtdb-node/kafka-connect"]
 s3 = ["rtdb-node/s3", "dep:rtdb-s3"]
@@ -19,7 +20,7 @@ azure = ["rtdb-node/azure", "dep:rtdb-azure"]
 gcs = ["rtdb-node/gcs"]
 pg-source = ["rtdb-node/pg-source", "rtdb-metrics/pg-source", "dep:rtdb-pg-source"]
 cloudwatch = ["dep:aws-config", "dep:aws-sdk-cloudwatch"]
-all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source", "cloudwatch"]
+all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source", "cloudwatch", "multi"]
 
 [dependencies]
 async-trait.workspace = true
@@ -31,6 +32,11 @@ arrow-schema.workspace = true
 serde.workspace = true
 rtdb-node.workspace = true
 rtdb-crypt.workspace = true
+journal-contract = { workspace = true, optional = true }
+rtdb-db = { path = "../db", optional = true }
+rtdb-journal-logkeeper = { path = "../journal-logkeeper", optional = true }
+tempfile = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 rtdb-tx.workspace = true
 rtdb-query.workspace = true
 rtdb-auth.workspace = true

@@ -403,6 +403,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "asn1-rs"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "synstructure 0.13.2",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "async-compression"
 version = "0.4.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1754,6 +1793,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
+
+[[package]]
 name = "datafusion-common"
 version = "54.2.0"
 dependencies = [
@@ -1922,6 +1967,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd2735a791158376708f9347fe8faba9667589d82427ef3aed6794a8981de3d9"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "der-parser"
+version = "10.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -3106,6 +3165,14 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb#896ed7818780d86e435ebf25c467ac179a1023fb"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
+name = "journal-contract"
+version = "0.1.0"
 source = "git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0#f17bedb0e01ce58709dc05aa3189d028ff1620a0"
 dependencies = [
  "bytes",
@@ -3284,6 +3351,30 @@ name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
+
+[[package]]
+name = "logkeeper"
+version = "0.2.0"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb#896ed7818780d86e435ebf25c467ac179a1023fb"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "fs2",
+ "futures",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb)",
+ "libc",
+ "parking_lot",
+ "prost",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tokio-util",
+ "uuid",
+ "x509-parser",
+]
 
 [[package]]
 name = "logkeeper"
@@ -3652,6 +3743,15 @@ dependencies = [
  "walkdir",
  "wasm-bindgen-futures",
  "web-time",
+]
+
+[[package]]
+name = "oid-registry"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
+dependencies = [
+ "asn1-rs",
 ]
 
 [[package]]
@@ -4932,6 +5032,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtdb-journal-logkeeper"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb)",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
+ "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=896ed7818780d86e435ebf25c467ac179a1023fb)",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "rtdb-kafka"
 version = "0.1.0"
 dependencies = [
@@ -5070,7 +5182,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
- "logkeeper",
+ "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f17bedb0e01ce58709dc05aa3189d028ff1620a0)",
  "openssl",
  "parking_lot",
  "prost",
@@ -5409,15 +5521,18 @@ dependencies = [
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=f2b964da847ce2487c35fa1dc31fae05a32d6d86)",
  "regex",
  "reqwest 0.13.4",
  "rtdb-auth",
  "rtdb-azure",
  "rtdb-columnar",
  "rtdb-crypt",
+ "rtdb-db",
  "rtdb-expr",
  "rtdb-flight-sql",
  "rtdb-format",
+ "rtdb-journal-logkeeper",
  "rtdb-kafka",
  "rtdb-maintenance",
  "rtdb-metrics",
@@ -5436,6 +5551,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-rustls 0.26.6",
@@ -5771,6 +5887,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -6410,6 +6535,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
 dependencies = [
  "futures-core",
+]
+
+[[package]]
+name = "synstructure"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -7564,6 +7700,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
+name = "x509-parser"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror",
+ "time",
+]
+
+[[package]]
 name = "xmlparser"
 version = "0.13.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7589,7 +7742,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
- "synstructure",
+ "synstructure 0.14.0",
 ]
 
 [[package]]
@@ -7630,7 +7783,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
- "synstructure",
+ "synstructure 0.14.0",
 ]
 
 [[package]]

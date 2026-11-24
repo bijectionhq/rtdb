@@ -410,6 +410,8 @@ variant Detach : DbOp {
 -- A frame above the byte budget occupies its own batch.
 -- A successful flush makes the batch's records visible and completes their append receipts.
 -- Reopening checks each frame in order and reports an incomplete final frame at its offset.
+-- A native development node opens the ordinary local source and replica logs and filesystem storage under its selected data directory.
+-- Restarting a development node with the same directory recovers committed data through ordinary local replay.
 
 entity SourceMessage {
     msg_id: MessageId

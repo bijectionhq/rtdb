@@ -59,11 +59,68 @@ async fn run() -> Result<()> {
             let (handle, driver) = if options.mode == cli::NodeMode::Compactor {
                 ServerDriver::open_compactor_with_memory(config, options.allocation_limit_bytes, memory).await?
             } else { ServerDriver::open_with_memory(config, options.allocation_limit_bytes, memory).await? };
-            let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "RTDB listeners bound: {:?}", handle.addresses()));
-            if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
-            run_server(&handle, driver, shutdown_signal()).await
+            run_started(&handle, driver).await
+        }
+        Command::StartMulti(options) => {
+            #[cfg(all(feature = "multi", feature = "s3"))]
+            {
+                let limit = options.allocation_limit_bytes;
+                let (mut config, memory, _configuration) = options.load_reserved()?.into_execution(limit)?;
+                let multi = rtdb_server::multi::MultiRuntime::production(&mut config, memory.clone()).await?;
+                serve_multi(config, limit, memory, multi).await
+            }
+            #[cfg(not(all(feature = "multi", feature = "s3")))]
+            {
+                let _ = options;
+                Err(Anomaly::unsupported("rtdb.multi/backend", "Installed Multi nodes require the multi and s3 features"))
+            }
+        }
+        Command::Dev(options) => {
+            let limit = options.allocation_limit_bytes;
+            let (config, memory, _configuration) = options.load_reserved()?.into_execution(limit)?;
+            if options.multi {
+                #[cfg(feature = "multi")]
+                {
+                    let mut config = config;
+                    let multi = rtdb_server::multi::MultiRuntime::development(&options.data, &mut config, memory.clone()).await?;
+                    return serve_multi(config, limit, memory, multi).await;
+                }
+                #[cfg(not(feature = "multi"))]
+                return Err(Anomaly::unsupported("rtdb.multi/backend", "Multi development requires the multi feature"));
+            }
+            let (handle, driver) = ServerDriver::open_with_memory(config, limit, memory).await?;
+            run_started(&handle, driver).await
         }
     }
+}
+
+#[cfg(feature = "multi")]
+async fn serve_multi(
+    config: rtdb_server::config::NodeConfiguration,
+    limit: usize,
+    memory: std::sync::Arc<rtdb_columnar::MemoryBudget>,
+    multi: rtdb_server::multi::MultiRuntime,
+) -> Result<()> {
+    let result = async {
+        let (handle, driver) = ServerDriver::open_with_multi(config, limit, memory, &multi).await?;
+        let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "RTDB listeners bound: {:?}", handle.addresses()));
+        if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
+        let stop = tokio_util::sync::CancellationToken::new();
+        run_server(&handle, driver, async {
+            tokio::select! {
+                result = shutdown_signal() => result,
+                result = multi.drive(&stop) => result,
+            }
+        }).await
+    }.await;
+    multi.close().await;
+    result
+}
+
+async fn run_started(handle: &ServerHandle, driver: ServerDriver) -> Result<()> {
+    let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "RTDB listeners bound: {:?}", handle.addresses()));
+    if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
+    run_server(handle, driver, shutdown_signal()).await
 }
 
 async fn report_checkpoint_repair(

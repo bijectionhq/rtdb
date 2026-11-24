@@ -148,6 +148,7 @@ pub trait ResourceFactory: Send + Sync {
         -> Result<Option<Arc<dyn crate::serving::ServingDriver>>> { Ok(None) }
     fn native_serving_authority(&self, _name: &str, _configuration: &DatabaseConfig)
         -> Result<Option<crate::serving::NativeServingAuthority>> { Ok(None) }
+    fn journal_native_sql(&self) -> bool { false }
     fn table_history(&self, _configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
     fn has_private_storage(&self, _configuration: &DatabaseConfig) -> bool { false }
     fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { None }
