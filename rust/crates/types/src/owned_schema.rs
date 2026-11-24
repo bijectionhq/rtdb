@@ -536,6 +536,10 @@ impl OwnedSchema {
         })
     }
 
+    pub fn has_world_assertion_journal(&self) -> bool {
+        self.path_column_type("membership_until") == Some(ScalarType::Binary)
+    }
+
     pub fn lifetime_micros(&self) -> Option<i64> { self.0.lifetime_micros }
 
     pub fn has_acceptance_validity(&self) -> bool {

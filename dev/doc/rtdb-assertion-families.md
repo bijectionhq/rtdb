@@ -249,6 +249,14 @@ Protected-row payload carriers retain their `BJWC1` framing.
 Current and accepted-cut point reads can return the opaque carrier with the resolver's authoring line and ordinal.
 Resolution uses that original authoring line for a winner inherited from a parent world.
 
+## World overlay admission
+
+Writable world overlays admit the installed custody controls `fact_unit_fences`, `fact_unit_column_payloads`, `fact_row_probe_floors`, `fact_row_legal_holds`, `fact_row_publications` and `fact_sealed_search_erasures` at the full valid interval.
+An insert still requires original absence for its identity.
+A checked Proposal settlement requires the matching point witness for each effect, and the existing bounded-period rules apply to ordinary facts.
+The resolver checks each payload against the world’s installed schema.
+A sealed derived projection is an opaque binary field on its declared search relation, carried as binary through source and resolved archive replay.
+
 ## Fence semantics across dependent forks
 
 A fence takes effect in the vault, not in any one world, so it closes every world at once.

@@ -1314,6 +1314,47 @@ mod retained_release_tests {
     }
 
     #[test]
+    fn proposal_custody_controls_at_full_validity_require_the_exact_point() -> Result<()> {
+        let scope = PlacedAttemptScope::new("proposal-custody", 1)?;
+        let world = Iid([1; 16]);
+        let control = OwnedRelation::new("bj_owner")?;
+        let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let id = EntityId::String("key".into());
+        let controls = [
+            TxOp::HostedControl(HostedControlWrite::check(control.clone(), scope, Some(Timestamp(1)), row("installed"))?),
+            TxOp::HostedControl(HostedControlWrite::new(control, scope, Some(Timestamp(2)), row("owner"))?),
+            TxOp::OwnedPublishWorld {
+                world, parent_pin: world, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                expected: None, advance_to: None, drop_world: false, settlement_pin: None,
+                delete_root: None, land_root: None,
+            },
+        ].into_iter().map(Operation::Public).collect::<Vec<_>>();
+        for name in [
+            "fact_unit_fences", "fact_unit_column_payloads", "fact_row_probe_floors",
+            "fact_row_legal_holds", "fact_row_publications", "fact_sealed_search_erasures", "facts",
+        ] {
+            let relation = OwnedRelation::new(name)?.in_world(world)?;
+            let mut operations = controls.clone();
+            operations.push(Operation::Public(TxOp::OwnedInsertDocs {
+                relation: relation.clone(), documents: crate::Documents::new(vec![row("key")], &memory)?,
+                valid_from: Some(Timestamp::MIN), valid_to: Some(Timestamp::MAX),
+            }));
+            operations.push(Operation::Public(TxOp::OwnedCheck {
+                relation: relation.clone(), id: EntityId::String("other".into()),
+                valid_at: Timestamp(4), expected: None,
+            }));
+            assert_eq!(hosted_proposal_overlay(&operations), None);
+            operations.pop();
+            operations.push(Operation::Public(TxOp::OwnedCheck {
+                relation, id: id.clone(), valid_at: Timestamp(4), expected: None,
+            }));
+            assert_eq!(hosted_proposal_overlay(&operations), (name != "facts").then_some(world));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn later_proposal_appends_require_absence_for_each_carrier() -> Result<()> {
         let scope = PlacedAttemptScope::new("proposal-appends", 1)?;
         let world = Iid([1; 16]);
@@ -1705,6 +1746,7 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                 let write = proposal_overlay_write(operation)?;
                 let start = match (write.from, write.to) {
                     (None, None) => None,
+                    (Some(Timestamp::MIN), Some(Timestamp::MAX)) if write.relation.is_world_custody_control() => None,
                     (Some(from), Some(to)) if Timestamp::MIN < from && from < to && to < Timestamp::MAX => Some(from),
                     _ => return None,
                 };

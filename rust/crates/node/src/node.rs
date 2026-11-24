@@ -3979,7 +3979,8 @@ impl NativeSession {
         &self, ops: &mut Vec<TxOp>, world: rtdb_types::Iid, writes: Vec<OwnedWorldWrite>,
     ) -> Result<()> {
         for OwnedWorldWrite { relation, id, shadow, valid, create_only, ordered_keys } in writes {
-            if create_only && (valid.is_some()
+            if create_only && (valid.is_some_and(|valid| valid != rtdb_types::Interval::ALL
+                || !relation.is_world_custody_control())
                 || !matches!(&shadow, rtdb_types::WorldShadow::Present(_)))
             {
                 return Err(rtdb_types::OwnedWorld::unavailable());

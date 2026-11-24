@@ -2213,28 +2213,36 @@ impl<'a> OpenTransaction<'a> {
             let world = write.relation.world().ok_or_else(unavailable)?;
             let root = write.relation.root_relation().ok_or_else(unavailable)?;
             let (record, _) = self.owned_worlds.get(&world).ok_or_else(unavailable)?;
-            let bounded = record.schemas.relation(&root).is_some_and(|schema| schema.requires_bounded_period());
+            let schema = record.schemas.relation(&root).ok_or_else(unavailable)?;
+            let bounded = schema.requires_bounded_period();
+            let custody_control = root.is_world_custody_control();
+            let protected_create = write.create_only && (custody_control
+                || root.admits_world_ciphertext_points(schema) || schema.has_world_assertion_journal());
+            let custody_all_time = custody_control && (write.from, write.to) == (Some(Timestamp::MIN), Some(Timestamp::MAX));
+            let explicit = write.from.is_some() && write.to.is_some() && !custody_all_time;
             let held = matches!(record.mode, rtdb_types::WorldClockMode::Held { .. });
             let publishes_overlay = publications.iter().any(|(published, _, _, advance, drop, settlement, _)| {
                 *published == world && (advance.is_none() || held) && !*drop && settlement.is_none()
             });
             if !publishes_overlay
-                || (!held && (bounded || write.create_only) && proposal_overlay != Some(world))
-                || (proposal_overlay == Some(world) && bounded != (write.from.is_some() && write.to.is_some()))
+                || (!held && (bounded || (write.create_only && !protected_create)) && proposal_overlay != Some(world))
+                || (proposal_overlay == Some(world) && bounded != explicit)
             {
                 return Err(unavailable());
             }
-            if held && write.create_only {
-                if !record.schemas.relation(&root).is_some_and(|schema| schema.has_acceptance_validity())
-                    || write.from.is_some() || write.to.is_some()
-                {
+            if write.create_only && (held || protected_create) {
+                if held && ((!schema.has_acceptance_validity() && !custody_control) || explicit) {
                     return Err(unavailable());
                 }
-                let reading = match held_create_readings.entry(world) {
-                    std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
-                    std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
-                        self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()),
-                    ),
+                let reading = if held {
+                    Some(match held_create_readings.entry(world) {
+                        std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::btree_map::Entry::Vacant(entry) => *entry.insert(
+                            self.owned_world_clock(owner, world).await?.unwrap_or(record.initial_clock()),
+                        ),
+                    })
+                } else {
+                    None
                 };
                 for row in write.documents.rows() {
                     use crate::hosted_control::OwnedDocumentRow;
@@ -2248,7 +2256,7 @@ impl<'a> OpenTransaction<'a> {
                     };
                     if !operations.iter().any(|operation| matches!(operation,
                         Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: None })
-                            if relation == write.relation && observed == &id && *valid_at == reading
+                            if relation == write.relation && observed == &id && reading.is_none_or(|reading| *valid_at == reading)
                     )) {
                         return Err(unavailable());
                     }
@@ -3078,7 +3086,11 @@ impl<'a> OpenTransaction<'a> {
         let schema = record.schemas.relation(root)
             .ok_or_else(|| Anomaly::incorrect("rtdb.owned/world-undeclared", "World writes require a schema retained from the parent cut"))?;
         if schema.lifetime_micros().is_some() { return Err(lifetime_uncovered()); }
-        let (from, to, explicit) = if matches!(record.mode, WorldClockMode::Held { .. }) && schema.has_acceptance_validity() {
+        let custody_control = root.is_world_custody_control();
+        let custody_all_time = custody_control && (from, to) == (Some(Timestamp::MIN), Some(Timestamp::MAX));
+        let (from, to, explicit) = if matches!(record.mode, WorldClockMode::Held { .. })
+            && (schema.has_acceptance_validity() || (custody_control && (from, to) == (None, None)))
+        {
             let accepted = self.held_overlay_reading(owner, record).await?;
             if (from, to) != (None, None) && (from, to) != (Some(accepted), Some(Timestamp::MAX)) {
                 return Err(Anomaly::incorrect(
@@ -3094,7 +3106,7 @@ impl<'a> OpenTransaction<'a> {
                 _ => return Err(unavailable()),
             }
         };
-        if (create_only && (!record.mode.is_writable() || explicit))
+        if (create_only && (!record.mode.is_writable() || (explicit && !custody_all_time)))
             || from >= to || !exact
         {
             return Err(unavailable());

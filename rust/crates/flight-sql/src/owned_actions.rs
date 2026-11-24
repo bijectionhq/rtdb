@@ -5657,8 +5657,10 @@ impl Service {
                     _ => return Err(invalid("Owned world write has only one valid endpoint")),
                 };
                 let create_only = operation == "insert";
-                if create_only && valid.is_some() {
-                    return Err(invalid("A create-only Proposal effect uses acceptance validity"));
+                if create_only && valid.is_some()
+                    && !(relation.is_world_custody_control() && valid == Some(Interval::ALL))
+                {
+                    return Err(invalid("World creates require acceptance validity or a full custody control interval"));
                 }
                 let mut ordered_keys = None;
                 let shadow = match (operation.as_str(), payload) {

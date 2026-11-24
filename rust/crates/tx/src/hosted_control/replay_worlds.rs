@@ -298,7 +298,7 @@ mod tests {
         frame(&mut body, "key");
         body.extend_from_slice(&10i64.to_be_bytes());
         body.extend_from_slice(&20i64.to_be_bytes());
-        body.extend_from_slice(&3u16.to_be_bytes());
+        body.extend_from_slice(&4u16.to_be_bytes());
         frame(&mut body, "body");
         body.push(5);
         frame(&mut body, "café\0🙂");
@@ -307,6 +307,9 @@ mod tests {
         frame(&mut body, "legacy");
         body.push(1);
         frame(&mut body, "legacy");
+        frame(&mut body, "sealed_world_projection");
+        body.push(2);
+        frame(&mut body, "BJWP1");
         body.extend_from_slice(&0u32.to_be_bytes());
 
         let replay = ReplayWorlds::decode(&body).unwrap();
@@ -314,6 +317,7 @@ mod tests {
         assert_eq!(fields.get("body"), Some(&fact_text(Value::Utf8("café\0🙂".into()))));
         assert_eq!(fields.get("null"), Some(&fact_text(Value::Null)));
         assert_eq!(fields.get("legacy"), Some(&Value::Utf8("legacy".into())));
+        assert_eq!(fields.get("sealed_world_projection"), Some(&Value::Binary(b"BJWP1".to_vec())));
         assert!(fields.get("missing").is_none());
     }
 
