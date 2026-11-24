@@ -1151,6 +1151,10 @@ impl Tree {
         Ok(links)
     }
 
+    fn page_encoding_bound(bytes: usize) -> usize {
+        bytes.saturating_mul(8).saturating_add(4096)
+    }
+
     pub fn persist<'a>(
         &'a self,
         link: &'a Link,
@@ -1175,15 +1179,11 @@ impl Tree {
             if let Some(pointer) = written.get(&identity) {
                 return Ok(Arc::clone(pointer));
             }
-            let bytes = match &node.page {
-                Page::Leaf(leaf) => leaf.encoding_bytes(),
-                Page::Branch(_) => node.page.bytes(),
-            };
-            let _scratch = self
-                .memory
-                .reserve(bytes.saturating_mul(8).saturating_add(4096))?;
-            let encoded = match &node.page {
+            let (mut output, encoded) = match &node.page {
                 Page::Leaf(leaf) => {
+                    let encoding = self
+                        .memory
+                        .reserve(Self::page_encoding_bound(leaf.encoding_bytes()))?;
                     if !leaf
                         .metadata
                         .iter()
@@ -1193,7 +1193,9 @@ impl Tree {
                             "Ordered index revision refers to a later block",
                         ));
                     }
-                    if leaf.postings.is_some() || matches!(leaf.metadata[0].key, Key::Row(_)) {
+                    let encoded = if leaf.postings.is_some()
+                        || matches!(leaf.metadata[0].key, Key::Row(_))
+                    {
                         encode_leaf(leaf.postings.as_ref(), &leaf.metadata)?
                     } else {
                         let revisions = leaf
@@ -1210,9 +1212,13 @@ impl Tree {
                         } else {
                             serde_json::to_vec(&StoredPage::Revisions(revisions)).map_err(format_error)?
                         }
-                    }
+                    };
+                    (encoding, encoded)
                 }
                 Page::Branch(children) => {
+                    let mut encoding = self
+                        .memory
+                        .reserve(children.len() * size_of::<Arc<Pointer>>())?;
                     let mut pointers = Vec::with_capacity(children.len());
                     for child in children {
                         pointers.push(
@@ -1220,19 +1226,33 @@ impl Tree {
                                 .await?,
                         );
                     }
-                    if self.arrow_references {
+                    Arc::get_mut(&mut encoding)
+                        .expect("branch encoding owns its reservation")
+                        .grow_to(Self::page_encoding_bound(node.page.bytes()))?;
+                    let encoded = if self.arrow_references {
                         let references = pointers.iter().map(|pointer| (None, Some(pointer.as_ref()))).collect::<Vec<_>>();
                         ipc::encode(&references::encode(&references)?)?
                     } else {
                         serde_json::to_vec(&StoredPage::Branch(pointers)).map_err(format_error)?
-                    }
+                    };
+                    (encoding, encoded)
                 }
             };
+            let reservation = Arc::get_mut(&mut output).expect("page encoding owns its reservation");
+            let capacity = encoded.capacity();
+            if capacity > reservation.bytes() {
+                reservation.grow_to(capacity)?;
+            } else {
+                reservation.shrink_to(capacity)?;
+            }
             let digest = format!("{:x}", Sha256::digest(&encoded));
             let size = encoded.len();
             let object = self.page_key(generation, &digest)?;
-            self.admitted(self.storage.object_store().put(&object, encoded.into()))
-                .await?;
+            IoRegion::retaining(
+                output,
+                self.admitted(self.storage.object_store().put(&object, encoded.into())),
+            )
+            .await?;
             let pointer = Arc::new(Pointer {
                 digest,
                 generation,
