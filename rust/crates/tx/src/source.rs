@@ -355,15 +355,18 @@ impl SourceTransaction {
     pub(crate) fn body_digest(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
-        let mut field = |bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
         let batch = self.operation_batch(None, SourcePurpose::Receipt)?;
-        field(crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?.as_slice());
-        field(self.options.default_tz.as_bytes());
+        crate::ipc::hash_batch(batch.batch(), &self.memory, &mut hash)?;
+        let timezone = self.options.default_tz.as_bytes();
+        hash.update((timezone.len() as u64).to_be_bytes());
+        hash.update(timezone);
         if let Some(Value::Struct(fields)) = self.options.user_metadata.as_ref().map(UserMetadata::value) {
             let mut rest = fields.clone();
             rest.remove("idempotency_key");
             if matches!(self.guard, Some(SourceGuard::Bounded(_))) { rest.remove(BOUNDED_RETRY_METADATA_KEY); }
-            field(encode_metadata(&UserMetadata::new(Value::Struct(rest), &self.memory)?, &self.memory)?.as_slice());
+            let metadata = UserMetadata::new(Value::Struct(rest), &self.memory)?;
+            let batch = metadata_batch(&metadata, &self.memory)?;
+            crate::ipc::hash_batch(batch.batch(), &self.memory, &mut hash)?;
         }
         Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
@@ -3066,11 +3069,15 @@ pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudg
 }
 
 fn encode_metadata(metadata: &UserMetadata, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    let owned = metadata_batch(metadata, memory)?;
+    crate::ipc::encode(owned.batch().schema_ref(), [owned.batch()], memory)
+}
+
+fn metadata_batch(metadata: &UserMetadata, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let ty = metadata.value().logical_type().maybe();
     let reservation = memory.reserve(estimate_builder_bytes(&ty, std::slice::from_ref(metadata.value()))?)?;
     let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("user-metadata", &ty)?])), vec![build_array(&ty, std::slice::from_ref(metadata.value()))?]).map_err(|error| invalid(error.to_string()))?;
-    let owned = OwnedBatch::with_reservation(batch, reservation)?;
-    crate::ipc::encode(owned.batch().schema().as_ref(), [owned.batch()], memory)
+    OwnedBatch::with_reservation(batch, reservation)
 }
 fn decode_metadata(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<UserMetadata> {
     let _value_reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
@@ -5127,6 +5134,37 @@ mod tests {
         let cell = DocumentCell::Arrow { cell: ArrowCell { field: &field, array: &array, row: 0 }, declared: Some(&LogicalType::Nothing) };
         assert_eq!(cell.bound().unwrap(), 0);
         assert_eq!(*cell.value().unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn receipt_digest_matches_buffered_java_ipc_and_length_prefixes() {
+        use sha2::{Digest, Sha256};
+
+        let memory = budget();
+        let business_metadata = StructFields::from([("business".into(), Value::Utf8("audit".into()))]);
+        let mut receipt_metadata = business_metadata.clone();
+        receipt_metadata.insert(BOUNDED_RETRY_METADATA_KEY.into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("0123456789abcdef0123456789abcdef".into())),
+            ("not_after_micros".into(), Value::I64(10)),
+        ])));
+        let source = SourceTransaction::new(vec![TxOp::Sql {
+            sql: format!("ASSERT TRUE /*{}*/", "x".repeat(16_384)), args: None,
+        }], SubmitOptions {
+            default_tz: "Europe/Paris".into(),
+            user_metadata: Some(UserMetadata::new(Value::Struct(receipt_metadata), &memory).unwrap()),
+            ..Default::default()
+        }, &memory).unwrap();
+
+        let batch = source.operation_batch(None, SourcePurpose::Receipt).unwrap();
+        let ops = crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], &memory).unwrap();
+        let metadata = UserMetadata::new(Value::Struct(business_metadata), &memory).unwrap();
+        let metadata = encode_metadata(&metadata, &memory).unwrap();
+        let mut expected = Sha256::new();
+        for field in [ops.as_slice(), b"Europe/Paris", metadata.as_slice()] {
+            expected.update((field.len() as u64).to_be_bytes());
+            expected.update(field);
+        }
+        assert_eq!(source.body_digest().unwrap(), format!("{:x}", expected.finalize()));
     }
 
     #[test]
