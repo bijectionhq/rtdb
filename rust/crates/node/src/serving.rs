@@ -32,6 +32,7 @@ pub struct QueryView {
     pub cut: BranchCut,
     pub claim: Option<Claim>,
     pub custody_groups: BTreeSet<CustodyGroupId>,
+    pub key_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub struct ChangePage {
     pub through: Basis,
     pub complete: bool,
     pub custody_groups: BTreeSet<CustodyGroupId>,
+    pub key_generation: Option<u64>,
 }
 
 pub struct ChangeGroup {
@@ -159,6 +161,13 @@ pub trait ServingDriver: Send + Sync {
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, _cancellation: &CancellationToken) -> Result<()> {
         if groups.is_empty() { return Ok(()); }
         Err(rtdb_types::Anomaly::unsupported("rtdb/row-custody", "The query route has no protected delivery authority"))
+    }
+
+    async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        if generation.is_some() {
+            return Err(rtdb_types::Anomaly::fault("rtdb/delivery-generation", "The serving route cannot verify its view generation"));
+        }
+        self.check_custody_delivery(groups, cancellation).await
     }
 
     async fn current_custody(&self, _cancellation: &CancellationToken) -> Result<BranchIndex> {

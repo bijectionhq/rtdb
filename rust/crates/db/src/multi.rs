@@ -393,6 +393,7 @@ impl MultiDatabase {
             index: self.durable_transactions().index(),
             after_floor,
             through: state.coordinates.position(state.head)?,
+            generation: state.generation,
             groups: &state.effects,
             now: (self.clock)(),
         })

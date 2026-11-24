@@ -81,6 +81,7 @@ impl ServingDriver for MultiServing {
                             view.claim = Some(self.tokens.issuer().await?.seal_scoped_claim(raw, &scope.labels).await?);
                         }
                         self.database.lock().await.check_generation(generation).await?;
+                        view.key_generation = Some(generation);
                         return Ok(view);
                     }
                     Err(error) if error.code == "rtdb/basis-ahead" && Instant::now() < deadline => {
@@ -112,10 +113,11 @@ impl ServingDriver for MultiServing {
             let start = Instant::now();
             loop {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
-                let page = scope.changes(&index, &request)?;
+                let mut page = scope.changes(&index, &request)?;
                 let remaining = request.wait.saturating_sub(start.elapsed());
                 if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
                     self.database.lock().await.check_generation(generation).await?;
+                    page.key_generation = Some(generation);
                     if index.has_custody_groups() {
                         return crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await;
                     }
@@ -164,6 +166,7 @@ impl ServingDriver for MultiServing {
                     cut,
                     claim,
                     custody_groups,
+                    key_generation: Some(generation),
                 })
             })
             .await
@@ -187,11 +190,19 @@ impl ServingDriver for MultiServing {
     }
 
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
-        if groups.is_empty() { return Ok(()); }
+        self.check_read_delivery(None, groups, cancellation).await
+    }
+
+    async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        if generation.is_none() && groups.is_empty() { return Ok(()); }
         cancellation.run_until_cancelled(async {
-            let (index, generation) = self.database.lock().await.fresh_view().await?;
-            crate::serving::custody::check_delivery(&index, &self.tokens.custody_vault(), groups).await?;
-            self.database.lock().await.check_generation(generation).await
+            let mut database = self.database.lock().await;
+            if !groups.is_empty() {
+                let index = database.fresh_index().await?;
+                crate::serving::custody::check_delivery(index, &self.tokens.custody_vault(), groups).await?;
+            }
+            if let Some(generation) = generation { database.check_generation(generation).await?; }
+            Ok(())
         }).await.ok_or_else(interrupted)?
     }
 
@@ -376,6 +387,7 @@ fn changes_page(
         through: Basis::new(incarnation, through),
         complete: next.is_none() && until.is_none_or(|until| until <= history.through),
         custody_groups: BTreeSet::new(),
+        key_generation: Some(history.generation),
     })
 }
 

@@ -92,6 +92,7 @@ struct OpenedQuery {
     limit: u64,
     trailer: proto::QueryTrailer,
     custody_groups: BTreeSet<CustodyGroupId>,
+    key_generation: Option<u64>,
 }
 
 impl Service {
@@ -100,7 +101,7 @@ impl Service {
         call: Call,
         request: proto::QueryRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
-        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg, custody_groups } = self
+        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg, custody_groups, key_generation } = self
             .open_v1_query(&call, request)
             .await
             .map_err(|status| call.error(status))?;
@@ -114,7 +115,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
             let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
-            check_custody(&call, &database, &custody_groups).await?;
+            check_read_delivery(&call, &database, key_generation, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
             yield schema_frame;
@@ -142,7 +143,7 @@ impl Service {
                 for item in data {
                     if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
                     let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
-                    check_custody(&call, &database, &custody_groups).await?;
+                    check_read_delivery(&call, &database, key_generation, &custody_groups).await?;
                     service.check_attachment(&call, &database)?;
                     call.handoff(grant, cutoff).map_err(error::map_status)?;
                     yield item;
@@ -157,7 +158,7 @@ impl Service {
             if skip != 0 { Err(cursor_expired())?; }
             if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
             let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
-            check_custody(&call, &database, &custody_groups).await?;
+            check_read_delivery(&call, &database, key_generation, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
@@ -222,7 +223,7 @@ impl Service {
             Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
             None => (None, None),
         };
-        let (context, page, cut, scoped_claim, custody_groups) = if let Some(driver) = driver {
+        let (context, page, cut, scoped_claim, custody_groups, key_generation) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
@@ -244,7 +245,7 @@ impl Service {
                 (context, clock)
             };
             let page = PageToken { basis: view.cut.basis, clock, offset, request: request_hash };
-            (context, page, cut, view.claim, view.custody_groups)
+            (context, page, cut, view.claim, view.custody_groups, view.key_generation)
         } else {
             let minimum = match (continuation, selection) {
                 (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
@@ -295,7 +296,7 @@ impl Service {
             let context = context
                 .with_wire_cut(cut, page.clock.into())
                 .map_err(error::anomaly)?;
-            (context, page, cut, None, BTreeSet::new())
+            (context, page, cut, None, BTreeSet::new(), None)
         };
         let parameters = request
             .params_ipc
@@ -330,14 +331,14 @@ impl Service {
             claim,
             next: None,
         };
-        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups })
+        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }
 }
 
-pub(super) async fn check_custody(call: &Call, database: &Database, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
-    if groups.is_empty() { return Ok(()); }
-    let driver = database.serving_driver().ok_or_else(|| error::unsupported("row-custody"))?;
-    driver.check_custody_delivery(groups, &call.cancellation).await.map_err(error::anomaly)
+pub(super) async fn check_read_delivery(call: &Call, database: &Database, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
+    if generation.is_none() && groups.is_empty() { return Ok(()); }
+    let driver = database.serving_driver().ok_or_else(|| error::unsupported("read delivery authority"))?;
+    driver.check_read_delivery(generation, groups, &call.cancellation).await.map_err(error::anomaly)
 }
 
 fn applied_source(

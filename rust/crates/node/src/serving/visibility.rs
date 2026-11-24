@@ -43,7 +43,7 @@ impl ServingScope {
         } else {
             (rtdb_query::branch_snapshot(&view, memory)?, BTreeSet::new())
         };
-        Ok((QueryView { snapshot, cut, claim: None, custody_groups }, raw_cut))
+        Ok((QueryView { snapshot, cut, claim: None, custody_groups, key_generation: None }, raw_cut))
     }
 
     pub fn changes(&self, index: &BranchIndex, request: &Changes) -> Result<ChangePage> {
@@ -111,6 +111,7 @@ impl ServingScope {
             through: Basis::new(head.incarnation(), through),
             complete: !more && until.is_none_or(|until| until <= head.position()),
             custody_groups: BTreeSet::new(),
+            key_generation: None,
         })
     }
 }

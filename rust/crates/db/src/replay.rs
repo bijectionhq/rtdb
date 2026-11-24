@@ -19,6 +19,7 @@ pub struct ChangeHistory<'a> {
     pub index: &'a BranchIndex,
     pub after_floor: u64,
     pub through: u64,
+    pub generation: u64,
     pub groups: &'a [AppliedEffects],
     pub now: Timestamp,
 }

@@ -61,7 +61,7 @@ impl ServingDriver for DefaultServing {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::snapshot(&branch, &self.memory, &vault).await?
         } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new()) };
-        Ok(QueryView { snapshot, cut, claim, custody_groups })
+        Ok(QueryView { snapshot, cut, claim, custody_groups, key_generation: None })
     }
 
     async fn transact(&self, mut request: Transact, cancellation: &CancellationToken) -> Result<Receipt> {
@@ -240,5 +240,5 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
         }
         Ok(ChangeGroup { cut: *cut, rows })
     }).collect::<Result<_>>()?;
-    Ok(ChangePage { groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new() })
+    Ok(ChangePage { groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new(), key_generation: None })
 }

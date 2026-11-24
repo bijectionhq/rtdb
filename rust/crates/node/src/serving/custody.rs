@@ -284,6 +284,7 @@ mod tests {
             through: row.cut.basis,
             complete: true,
             custody_groups: BTreeSet::new(),
+            key_generation: None,
         };
         let opened_changes = open_changes(state.index(), &vault, page()).await.unwrap();
         let after = opened_changes.groups[0].rows[0].after.as_ref().unwrap();
