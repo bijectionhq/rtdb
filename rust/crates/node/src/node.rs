@@ -1531,6 +1531,7 @@ impl OwnedReadSession {
         Ok(OwnedForkCut {
             root_point: None,
             public_root: false,
+            exact_retained: false,
             basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
@@ -1589,8 +1590,9 @@ impl OwnedReadSession {
         Ok(cut)
     }
 
-    pub async fn fork_held_root_publication_cut(
-        &self, scope: rtdb_types::PlacedAttemptScope, basis: Timestamp,
+    /// Certify an exact original publication for a new Held or retained world.
+    pub async fn fork_root_publication_at(
+        &self, scope: rtdb_types::PlacedAttemptScope, basis: Timestamp, mode: WorldClockRequest,
     ) -> Result<OwnedForkCut> {
         let mut cut = self.fork_publication_cut(scope).await?;
         if basis > cut.basis() {
@@ -1603,6 +1605,7 @@ impl OwnedReadSession {
         self.check()?;
         cut.basis = publication.system_time;
         cut.publication = Some(publication);
+        cut.exact_retained = matches!(mode, WorldClockRequest::Retained);
         Ok(cut)
     }
 
@@ -3073,6 +3076,7 @@ fn world_create_absence_matches_the_observed_valid_instant() {
 pub struct OwnedForkCut {
     root_point: Option<rtdb_types::OwnedPointVersion>,
     public_root: bool,
+    exact_retained: bool,
     basis: Timestamp,
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
@@ -3317,7 +3321,7 @@ impl NativeSession {
             || (requested == rtdb_types::WorldClockMode::Proposal && !proposal_publication && !proposal_hold);
         let requires_tip = requires_live_tip || proposal_publication
             || (root != OwnedForkRoot::None && !fork.cut.is_renewal() && !held_publication
-                && record.parent_publication == Some(record.basis.system_time));
+                && !fork.cut.exact_retained && record.parent_publication == Some(record.basis.system_time));
         let effects = fork.controls.len()
             .saturating_add(fork.root.as_ref().map_or(0, |section| section.checks.len()
                 .saturating_add(if section.refusal.is_empty() { 0 } else { section.refusal.len() + 3 })))
@@ -3344,6 +3348,9 @@ impl NativeSession {
             || (requires_live_tip && fork.cut.live.is_none())
             || (fork.cut.is_publication() && (root == OwnedForkRoot::None
                 || record.parent_publication != Some(fork.cut.basis())))
+            || (fork.cut.exact_retained && (requested != rtdb_types::WorldClockMode::Retained
+                || root != OwnedForkRoot::Controls || fork.previous.is_some()
+                || fork.root.as_ref().is_some_and(|section| !section.checks.is_empty() || !section.refusal.is_empty())))
             || effects > 4096 || !fork.controls.iter().any(rtdb_tx::HostedControlWrite::is_check)
             || (root == OwnedForkRoot::None && fork.controls.iter().any(|control| !control.is_check()))
             || ((held_publication || matches!(root, OwnedForkRoot::Controls | OwnedForkRoot::ProposalControls | OwnedForkRoot::ProposalWrites))

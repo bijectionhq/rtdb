@@ -20,6 +20,14 @@ In `PublishHeldWorldRetention.v3` it follows the 22-byte attempt identity after 
 In `PublishWorldCut.v1` and `DecideWorldCut.v1` it follows the 22-byte attempt identity after the hold, world, pin, previous hold, capture, suffix, expiry, deadline and clock mode with any mode operand.
 The action decoder reads the same 32 bytes and continues at the first byte after the slot.
 
+On the co-ordered Root cut action, clock mode 12 carries an eight-byte signed
+big-endian microsecond timestamp before the attempt identity. It selects an
+exact retained Root publication under the original live hold. The previous
+hold, capture and suffix fields are zero. The receiver resolves the original
+transaction position, derives the archive and admits hosted controls only.
+Registration checks the publication at its original position and orders the
+current hosted authority controls independently of the current Root tip.
+
 A held point response with a visible marker carries that row's `fingerprint` binary cell and the same row's signed microsecond system-from revision in schema metadata `rtdb.owned.revision_micros`, rendered as canonical decimal.
 A missing point carries neither a row nor a revision.
 Decoding the response preserves the fingerprint and revision of the selected row exactly.

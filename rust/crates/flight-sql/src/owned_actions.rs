@@ -4193,8 +4193,11 @@ impl Service {
         let public_version = *mode == 11 && publish_root;
         let proposed_publication = *mode == 5 && publish_root;
         let held_publication = *mode == 10 && publish_root;
-        if held_publication && (*previous_handle != [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
-            return Err(invalid("A held Root fork derives its archive from the selected publication"));
+        let retained_publication = *mode == 12 && publish_root;
+        if (held_publication || retained_publication)
+            && (*previous_handle != [0; 16] || *capture != [0; 16] || *suffix != [0; 16])
+        {
+            return Err(invalid("An exact Root fork derives its archive from the selected publication"));
         }
         let proposal_hold = matches!(*mode, 8 | 9) && publish_root;
         let proposal_shorten = *mode == 9 && publish_root;
@@ -4209,15 +4212,16 @@ impl Service {
         } else {
             (None, rest)
         };
-        let (held_basis, rest) = if held_publication {
+        let (exact_basis, rest) = if held_publication || retained_publication {
             let (basis, rest) = rest.split_first_chunk::<8>()
-                .ok_or_else(|| invalid("Held Root fork has no exact publication"))?;
+                .ok_or_else(|| invalid("Exact Root fork has no publication"))?;
             (Some(Timestamp(i64::from_be_bytes(*basis))), rest)
         } else {
             (None, rest)
         };
         let (requested, rest) = match *mode {
             10 if held_publication => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
+            12 if retained_publication => (rtdb_node::WorldClockRequest::Retained, rest),
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
             8 | 9 if proposal_hold => (rtdb_node::WorldClockRequest::Proposal, rest),
             6 | 7 if renewal => (rtdb_node::WorldClockRequest::Retained, rest),
@@ -4242,8 +4246,8 @@ impl Service {
         let scope = self.hosted_control_scope(call).await?;
         let cut = if let Some(basis) = public_basis {
             held.snapshot.fork_public_version_cut(scope, basis).await.map_err(status)?
-        } else if let Some(basis) = held_basis {
-            held.snapshot.fork_held_root_publication_cut(scope, basis).await.map_err(status)?
+        } else if let Some(basis) = exact_basis {
+            held.snapshot.fork_root_publication_at(scope, basis, requested).await.map_err(status)?
         } else if select_publication {
             held.snapshot.fork_publication_cut(scope).await.map_err(status)?
         } else {
@@ -4280,8 +4284,10 @@ impl Service {
         } else {
             cut
         };
-        let root_point = held.snapshot.root_point_at(cut.basis(), public_version).await.map_err(status)?;
-        cut.original_root_point(root_point);
+        if !retained_publication {
+            let root_point = held.snapshot.root_point_at(cut.basis(), public_version).await.map_err(status)?;
+            cut.original_root_point(root_point);
+        }
         // Deadline, registration, one immutable attempt and a Root head
         // (or the standalone fork's optional tip check).
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS - 4 - usize::from(select_publication);
@@ -4367,6 +4373,9 @@ impl Service {
                 ]))
             {
                 return Err(invalid("The authored custody change requires one acceptance-valid Root effect"));
+            }
+            if retained_publication && (!writes.is_empty() || !root.checks.is_empty() || !root.refusal.is_empty()) {
+                return Err(invalid("An exact retained Root publication accepts only hosted controls"));
             }
             if !writes.is_empty() {
                 root.publication = Some(rtdb_node::OwnedRootPublication { attempt: attempt.to_owned(), writes });

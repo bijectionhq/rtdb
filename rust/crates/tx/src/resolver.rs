@@ -1993,6 +1993,15 @@ impl<'a> OpenTransaction<'a> {
             )));
             let tip_matches = match (expected_tip, checked_tip) {
                 (None, None) => true,
+                (Some((basis, Some(_))), None) if root == OwnedForkRoot::Controls => {
+                    // An exact retained archive can be registered after its
+                    // publication stopped being the tip. Certify the original
+                    // marker at that position independently of today's head.
+                    let base = self.buffer.base_snapshot();
+                    let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                    let context = context.with_owned_transaction_cut(basis, &context.cancellation)?;
+                    rtdb_query::read_owned_root_publication(context, owner).await? == Some(basis)
+                }
                 (Some((basis, publication)), Some((valid_at, observed, public))) => {
                     valid_at == basis.system_time && observed.map(|point| point.history) == publication
                         && if public {
