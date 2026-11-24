@@ -71,6 +71,17 @@ class ReleaseSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             release.verify_hosted_protocol({}, {"hosted_protocol": 8})
 
+    def test_multi_image_attests_only_compiled_hosted_features(self):
+        hosted = {"api": "rtdb.v1", "features": ["owned.hosted", "owned.retired-original-family"]}
+        compiled = {"hosted_protocol": 227, "capabilities": hosted}
+        labels = {"io.rtdb.hosted-protocol": "227", "io.rtdb.capabilities": json.dumps(hosted)}
+        image = {"Config": {"Labels": labels}}
+        release.verify_hosted_protocol(image, compiled)
+        for attestation in [None, "not json", json.dumps({"api": "rtdb.v1", "features": ["owned.hosted"]})]:
+            labels["io.rtdb.capabilities"] = attestation
+            with self.assertRaises(ValueError):
+                release.verify_hosted_protocol(image, compiled)
+
     def test_base_images_require_content_digests(self):
         pinned = "registry.example/runtime:bookworm@sha256:" + "a" * 64
         self.assertEqual(immutable_image(pinned), pinned)

@@ -77,14 +77,37 @@ impl FamilyReleaseAuthority for CarrierJournal<'_> {
     }
 }
 
+fn registry_part_key(part: FamilyResponsePart) -> String {
+    [lower_hex(&part.cell_history), lower_hex(&part.usher), lower_hex(&part.conductor),
+        lower_hex(&part.response), lower_hex(&part.ordinal.get().to_be_bytes())].join("/")
+}
+
+pub(super) fn registry_locator(registration: FamilyReleaseRegistration) -> String {
+    let origin = lower_hex(&registration.origin());
+    let attempt = lower_hex(&registration.attempt());
+    format!("{origin}/{attempt}/{}", registry_part_key(registration.part()))
+}
+
 pub(super) async fn observe_registry(
     current: &CurrentAssertionFamilyRead, creator: &str, registration: FamilyReleaseRegistration,
+) -> Result<(FamilyReleaseObservation, (OwnedBatch, Timestamp))> {
+    let (phase, (row, revision)) = read_registry(current, registration).await?;
+    if registry_creator(&row)? != creator { return Err(OwnedWorld::unavailable()); }
+    Ok((phase, (row, revision)))
+}
+
+pub(super) fn registry_creator(row: &OwnedBatch) -> Result<&str> {
+    ArrowCell::named(row.batch(), "creator", 0).and_then(ArrowCell::utf8)
+        .filter(|creator| !creator.is_empty() && creator.len() <= 128).ok_or_else(OwnedWorld::unavailable)
+}
+
+pub(super) async fn read_registry(
+    current: &CurrentAssertionFamilyRead, registration: FamilyReleaseRegistration,
 ) -> Result<(FamilyReleaseObservation, (OwnedBatch, Timestamp))> {
     let unavailable = OwnedWorld::unavailable;
     let part = registration.part();
     let cell_history = lower_hex(&part.cell_history);
-    let part_key = [cell_history.clone(), lower_hex(&part.usher), lower_hex(&part.conductor),
-        lower_hex(&part.response), lower_hex(&part.ordinal.get().to_be_bytes())].join("/");
+    let part_key = registry_part_key(part);
     let origin = lower_hex(&registration.origin());
     let key = format!("{origin}/{}/{part_key}", lower_hex(&registration.attempt()));
     let point = current.carrier_journal_registration(&key).await?;
@@ -94,8 +117,7 @@ pub(super) async fn observe_registry(
         let cell = cell(name)?;
         rtdb_columnar::read_value(cell.field, cell.array, cell.row)
     };
-    if cell("creator")?.utf8() != Some(creator)
-        || cell("origin")?.utf8() != Some(origin.as_str())
+    if cell("origin")?.utf8() != Some(origin.as_str())
         || cell("cell_history")?.utf8() != Some(cell_history.as_str())
         || cell("part")?.utf8() != Some(part_key.as_str())
         || cell("address")?.binary() != Some(registration.address().as_slice())

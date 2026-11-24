@@ -158,7 +158,7 @@ fn finish(bytes: Context) -> [u8; 32] {
     bytes.finish().as_ref().try_into().expect("SHA-256 commitment")
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FamilyReleaseRegistration {
     owner: CarrierJournalIdentity,
     client_family: Uuid,

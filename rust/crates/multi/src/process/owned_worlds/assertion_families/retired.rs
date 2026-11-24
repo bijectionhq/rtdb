@@ -44,7 +44,7 @@ impl RetiredJournal {
         let signed = framed_digest(
             b"rtdb.owned/retired-family-action/v1\0", &[&id, &request.signed_body],
         );
-        if matches!(request.signed_body.first(), Some(3 | 4)) {
+        if matches!(request.signed_body.first(), Some(3 | 4 | 5)) {
             grant.verify_controller(&signed, &request.signature)?;
         } else {
             grant.verify_reader(&signed, &request.signature)?;
@@ -156,6 +156,35 @@ impl FamilyReleaseAuthority for RetiredJournal {
     }
 }
 
+struct HistoricalDisposition<'a> {
+    journal: &'a RetiredJournal,
+    registered: TransactionKey,
+    registration: FamilyReleaseRegistration,
+}
+
+#[async_trait::async_trait]
+impl FamilyReleaseAuthority for HistoricalDisposition<'_> {
+    fn identity(&self) -> CarrierJournalIdentity { self.registration.owner() }
+
+    async fn observe(&self, registration: FamilyReleaseRegistration) -> Result<FamilyReleaseObservation> {
+        let unavailable = OwnedWorld::unavailable;
+        if registration != self.registration { return Err(unavailable()); }
+        let (current, _) = self.journal.current().await?;
+        let recorded_creator = current.carrier_creator_commitment_at(
+            &release::registry_locator(registration), self.registered, &registration.address(),
+        ).await?;
+        let (phase, (row, _)) = release::read_registry(current.current(), registration).await?;
+        let source = &self.journal.grant.source;
+        let owner = release::carrier_identity(
+            source.deployment, source.history, *source.installation.as_bytes(), release::registry_creator(&row)?,
+        );
+        if owner != self.identity() || owner.original_writer != recorded_creator || phase != FamilyReleaseObservation::Disposed {
+            return Err(unavailable());
+        }
+        Ok(phase)
+    }
+}
+
 struct RetiredDelivery {
     journal: Arc<RetiredJournal>,
     keys: Arc<dyn KeyService>,
@@ -205,6 +234,14 @@ pub(in crate::process::owned_worlds) async fn serve(
                 journal: Arc::clone(&journal), keys: Arc::clone(&keys), registration,
             }))?;
             Ok(FamilyReply::Opened(opened))
+        }
+        RetiredFamilyOperation::RecoverPreFence { registered, registration } => {
+            let registration = release::registration(registration)?;
+            registration.require_input(journal.grant.family, journal.input(&scope)?)?;
+            let authority = HistoricalDisposition { journal: &journal, registered, registration };
+            authority.observe(registration).await?;
+            families.with_release_authority(&authority).settle_family_release(registration).await?;
+            Ok(FamilyReply::Done)
         }
     }
 }

@@ -362,6 +362,7 @@
 -- A hit proves both the full occupancy identity and the winning fact holder's complete Binary key.
 -- A covered miss or verified hit can yield one original held relation witness.
 -- An admitted finite unique window projects complete Binary keys and winning fact holders with clipped valid intervals.
+-- Its Flight reply retains each holder as a complete typed identity in the standard dense Arrow identity union.
 -- A held decision mask applies to fact assertions before key selection, and a masked or historical window issues no commit witness.
 -- An unmasked present window may issue a relation-frontier witness after admitting the complete bounded result.
 -- The ordered resolver validates the final staged key set with typed holders and commits occupancy and rows together.
@@ -409,6 +410,7 @@
 --      A silent writer and uncertified staged suffix add no dependency when a quorum, hold and selected applied cut are available.
 --      An enrolled ordered reader can protect replay and apply the barrier while the writer grant is vacant.
 --      Ordinary Flight release consumes durable, authenticated range evidence at a protected applied cut of the same history.
+--      The optional hosted applied point can carry a complete typed handle and checks the original revision and event position on the original and newly pinned catalogs.
 --      A replay-safe unpinned read may retry within the same lineage before output, with its causal floor and audience intact.
 --      A read transaction retains its captured basis across later statements.
 --      Each explicit snapshot token identifies the basis the caller selected.

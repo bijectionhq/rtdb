@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use ring::{digest::{Context, SHA256, digest}, signature::{ED25519, UnparsedPublicKey}};
-use rtdb_directory::DeploymentRecord;
+use rtdb_directory::{Checkpoint, DeploymentRecord};
 use rtdb_flight_sql::{FamilyOccurrenceWire, FamilyStage};
 use rtdb_node::RetiredOriginalFamilySource;
 use rtdb_types::{OwnedWorld, Result, RootLandingBinding, Timestamp, TransactionKey, TxId};
@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{capability::CellSecret, keys::assertion_root_line};
 
-pub const FAMILY_CUSTODY_GRANT_BYTES: usize = 716;
+pub(crate) const FAMILY_CUSTODY_GRANT_BYTES: usize = 716;
 const GRANT_DOMAIN: &[u8] = b"rtdb.multi/original-family-custody/v1\0";
 
 pub(crate) struct FamilyCustodyGrant {
@@ -153,12 +153,27 @@ impl FamilyCustodyGrant {
     }
 }
 
-pub fn family_custody_id(deployment: Uuid, installation: Uuid, namespace: &[u8; 32]) -> [u8; 32] {
+fn family_custody_id(deployment: Uuid, installation: Uuid, namespace: &[u8; 32]) -> [u8; 32] {
     framed_digest(b"rtdb.multi/original-family-custody-id/v1\0", &[deployment.as_bytes(), installation.as_bytes(), namespace])
 }
 
-pub fn endorse_family_custody(secret: &CellSecret, record: &DeploymentRecord, body: &[u8]) -> Result<[u8; 32]> {
-    FamilyCustodyGrant::decode(body)?.require_original(record)?;
+pub(crate) fn original_family_custody(record: &DeploymentRecord, authority: Uuid) -> Result<([u8; 32], [u8; 32])> {
+    if Uuid::parse_str(&record.id).ok() != Some(authority) { return Err(OwnedWorld::unavailable()); }
+    let namespaces = record.storage_namespaces.as_ref().ok_or_else(OwnedWorld::unavailable)?;
+    let history = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?.history_fingerprint();
+    Ok((history, family_custody_id(authority, authority, &namespaces.keys)))
+}
+
+pub(crate) fn endorse_family_custody(
+    secret: &CellSecret, record: &DeploymentRecord, authority: Uuid, capture: Checkpoint, body: &[u8],
+) -> Result<[u8; 32]> {
+    let grant = FamilyCustodyGrant::decode(body)?;
+    grant.require_original(record)?;
+    if grant.source.deployment != authority || grant.source.installation != authority
+        || grant.source.captured.system_time != Timestamp(capture.system_time)
+    {
+        return Err(OwnedWorld::unavailable());
+    }
     Ok(secret.sign_route(&mac_input(body)))
 }
 
@@ -181,7 +196,7 @@ mod tests {
             objects: Uuid::from_bytes([2; 16]), keys: [3; 32],
         });
         let deployment = Uuid::from_bytes([1; 16]);
-        let installation = Uuid::from_bytes([4; 16]);
+        let installation = deployment;
         let history = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?.history_fingerprint();
         let reader = Ed25519KeyPair::from_seed_unchecked(&[5; 32]).unwrap();
         let controller = Ed25519KeyPair::from_seed_unchecked(&[6; 32]).unwrap();
@@ -218,7 +233,11 @@ mod tests {
         body.extend_from_slice(controller.public_key().as_ref());
         assert_eq!(body.len(), FAMILY_CUSTODY_GRANT_BYTES);
         let id = grant_id(&body);
-        let proof = endorse_family_custody(&secret, &record, &body)?;
+        let checkpoint = Checkpoint { block: 1, boundary: 4, source: 4, system_time: 40, root_sha256: Some([22; 32]) };
+        assert!(endorse_family_custody(&secret, &record, Uuid::from_bytes([4; 16]), checkpoint, &body).is_err());
+        let stale = Checkpoint { system_time: 39, ..checkpoint };
+        assert!(endorse_family_custody(&secret, &record, installation, stale, &body).is_err());
+        let proof = endorse_family_custody(&secret, &record, installation, checkpoint, &body)?;
         body.extend_from_slice(&proof);
         let grant = FamilyCustodyGrant::authenticate(&body, id, &secret, &record)?;
         let request = [21; 32];

@@ -64,8 +64,6 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi observe-holder --directory DIR --id UUID --incarnation N\n\
        rtdb-multi move-observed-holder --directory DIR --observation FILE --to MEMBER [--cell-secret FILE]\n\
        rtdb-multi audience-writer-handoff --directory DIR --cell-secret FILE --action ACTION --handoff FILE --from MEMBER --to MEMBER --incarnation N --maximum-clock-error-ns N --switch-deadline-ns N --incumbent-drain-until-ns N\n\
-       rtdb-multi family-custody-identity --directory DIR --id UUID --installation UUID\n\
-       rtdb-multi endorse-family-custody --directory DIR --cell-secret FILE --grant FILE\n\
        rtdb-multi audit --directory DIR --keys PATH --name NAME [--require-quorum]\n\
        rtdb-multi audit-acceptance --directory DIR --keys PATH --id UUID --incarnation N --log-epoch N --replica-offset N\n\
        rtdb-multi audit-log --data PATH --stream STREAM [--from LSN --through LSN] [--prefix-report FILE] [--expect DIGEST]\n\
@@ -351,11 +349,18 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             return Err(usage("--build-info accepts no arguments".into()));
         }
         #[derive(serde::Serialize)]
+        struct HostedCapabilities {
+            api: &'static str,
+            features: [&'static str; 3],
+        }
+        #[derive(serde::Serialize)]
         struct MultiBuildInfo {
             #[serde(flatten)]
             provenance: rtdb_types::BuildInfo,
             standalone_protocol: u32,
             hosted_protocol: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            capabilities: Option<HostedCapabilities>,
             held_root_catalog: bool,
             installed_authority_fence: bool,
             pgwire_arrow_copy_out: bool,
@@ -365,6 +370,14 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             provenance: rtdb_types::compiled_build_info(),
             standalone_protocol: process::STANDALONE_PROTOCOL,
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 227 } else { 56 },
+            capabilities: cfg!(feature = "s3-key-vault").then_some(HostedCapabilities {
+                api: "rtdb.v1",
+                features: [
+                    rtdb_flight_sql::OWNED_HOSTED_FEATURE,
+                    rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_FEATURE,
+                    rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE,
+                ],
+            }),
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,
             held_root_catalog: true,
@@ -908,34 +921,6 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         "roll-engine" => {
             let directory = directory(arguments.required("directory")?).await?;
             for member in admin::roll_engine(directory.as_ref(), arguments.required("version")?).await? { println!("{member}"); }
-            Ok(())
-        }
-        "family-custody-identity" => {
-            let deployment = required_uuid(&arguments, "id")?;
-            let installation = required_uuid(&arguments, "installation")?;
-            let directory = directory(arguments.required("directory")?).await?;
-            let record = directory.deployment(&deployment.to_string()).await?.ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-            let namespaces = record.storage_namespaces.as_ref().ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-            let history = rtdb_types::PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?.history_fingerprint();
-            let custody = rtdb_multi::family_custody::family_custody_id(deployment, installation, &namespaces.keys);
-            println!("{}", serde_json::json!({"history": history, "custody": custody}));
-            Ok(())
-        }
-        "endorse-family-custody" => {
-            use rtdb_multi::family_custody::{FAMILY_CUSTODY_GRANT_BYTES, endorse_family_custody};
-
-            let file = std::fs::File::open(arguments.required("grant")?).map_err(|error| usage(error.to_string()))?;
-            let mut body = Vec::with_capacity(FAMILY_CUSTODY_GRANT_BYTES + 1);
-            file.take((FAMILY_CUSTODY_GRANT_BYTES + 1) as u64).read_to_end(&mut body)
-                .map_err(|error| usage(error.to_string()))?;
-            if body.len() != FAMILY_CUSTODY_GRANT_BYTES { return Err(rtdb_types::OwnedWorld::unavailable()); }
-            let deployment = uuid::Uuid::from_slice(&body[4..20]).map_err(|_| rtdb_types::OwnedWorld::unavailable())?;
-            let directory = directory(arguments.required("directory")?).await?;
-            let record = directory.deployment(&deployment.to_string()).await?.ok_or_else(rtdb_types::OwnedWorld::unavailable)?;
-            let secret = cell_secret(&arguments)?.ok_or_else(|| usage("Endorsing family custody requires the current cell secret".into()))?;
-            let proof = endorse_family_custody(&secret, &record, &body)?;
-            let hex = proof.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            println!("{hex}");
             Ok(())
         }
         "enable-placed-receipt-retirement" => {

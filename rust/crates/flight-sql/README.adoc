@@ -338,8 +338,12 @@ The reservation admits preparation, applied open and confirmation, held point an
 The gateway routes only action RPCs on a reserved session.
 
 `rtdb.owned.ConfirmAppliedHosted.v6` takes the 16-byte original held handle, the same source and transaction floor input, an exclusive signed big-endian i64 Unix microsecond cutoff, a point option, and the normal hosted control groups.
-The point option is one zero byte for a control-only read or one byte of value one followed by the ordinary relation prefix, a big-endian u16 UTF-8 key length and key, and a signed big-endian i64 valid instant in microseconds.
-An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision.
+The point option starts with one byte: zero for a control-only read, one for a raw Utf8 key, and two for a complete typed handle.
+For a point, send the ordinary relation prefix, the big-endian u16 key byte length, the key and a signed big-endian i64 valid instant in microseconds.
+The Utf8 key is 1 to 4096 bytes.
+For a typed point, the length includes the handle tag and may be 2 to 4097 bytes.
+A Binary fact handle contains tag byte `04` followed by the raw identity.
+An included point ends with a zero byte for absence or one byte of value one followed by its signed big-endian i64 expected revision and the 16-byte original event position.
 The original handle must come from `rtdb.owned.OpenAppliedRead.v5`.
 Every control must be a check from the placed attachment's installed allowlist.
 The point must be an ordinary Root point at the original held valid instant.
@@ -612,6 +616,12 @@ ordinary point IPC response. There is one full fact row for a unique hit,
 or no rows for a covered absence. The resolver revalidates this relation
 witness in the same way as other held range evidence. The complete occupancy
 identity, holder identity, and holder's declared key must all agree.
+
+`rtdb.owned.ReadHeldUniqueWindow.v1` uses the held handle, a position mask option, the relation and path prefixes, and a one-row Arrow selector.
+The selector contains nullable Binary `key` and Int64 `system_micros`, `valid_from_micros`, `valid_to_micros` and `limit`.
+The reply has a dense typed identity union in `_id`, a Binary `key`, and Int64 `valid_from_micros` and `valid_to_micros`.
+The active identity child contains its complete value, and an empty result has the same schema.
+The reply preserves the selected clipped slices and includes a witness only when the original cut and mask admit one.
 
 === Reading valid history at a held cut
 

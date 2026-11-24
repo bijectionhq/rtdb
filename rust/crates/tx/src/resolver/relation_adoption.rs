@@ -511,7 +511,7 @@ mod tests {
         let publications = OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
         let source_head = EntityId::String(format!("fact_partition_head:{}", source.name()));
         let target_head = EntityId::String(format!("fact_partition_head:{}", target.name()));
-        let id = EntityId::String("original".into());
+        let id = EntityId::Binary(vec![0, 0xff]);
         let document = |id: &EntityId, order: &str, creation: &str, payload: Option<Value>| {
             let mut row = StructFields::from([
                 ("_id".into(), id.as_value()), (order.into(), Value::Binary(Vec::new())),
@@ -524,8 +524,8 @@ mod tests {
         original.terms_time = Timestamp(180);
         let put = Documents::new(vec![
             document(&id, &source_order, &source_creation, Some(Value::Binary(vec![12, 0, 0]))),
-            document(&EntityId::String("missing".into()), &source_order, &source_creation, None),
-            document(&EntityId::String("null".into()), &source_order, &source_creation, Some(Value::Binary(vec![2]))),
+            document(&EntityId::Binary(vec![0, 0xff, 1]), &source_order, &source_creation, None),
+            document(&EntityId::Binary(vec![1]), &source_order, &source_creation, Some(Value::Binary(vec![2]))),
         ], &memory)?;
         original.write_owned(&source, &put, None, None, None, true).await?;
         let marker = Documents::new(vec![StructFields::from([("_id".into(), source_head.as_value())])], &memory)?;
@@ -599,6 +599,7 @@ mod tests {
         assert_eq!(stored.system_from, Timestamp(200));
         assert_eq!(stored.valid_time.lower(), Timestamp(180));
         let StoredOperation::Put(fields) = stored.operation else { unreachable!() };
+        assert_eq!(fields.get("_id"), Some(&id.as_value()));
         assert!(matches!(fields.get(PAYLOAD), Some(Value::Struct(wrapper)) if wrapper.contains_key("v2_value")));
         assert_eq!(fields.get(&target_order), Some(&Value::Binary(Vec::new())));
         let StoredOperation::Put(missing) = data.view().read_event(1)?.operation else { unreachable!() };
@@ -627,7 +628,7 @@ mod tests {
         assert!(!repeat.writes().tables().contains_key(&table));
         let mut next = OpenTransaction::new(state.snapshot(), key(5, 400), &options, &context)?;
         let put = Documents::new(vec![
-            document(&EntityId::String("fresh".into()), &target_order, &target_creation, None),
+            document(&EntityId::Binary(vec![2]), &target_order, &target_creation, None),
         ], &memory)?;
         next.write_owned(&target, &put, None, None, None, true).await?;
         next.write_owned_changes().await?;

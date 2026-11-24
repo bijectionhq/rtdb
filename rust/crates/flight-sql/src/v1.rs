@@ -28,6 +28,9 @@ const API: &str = "rtdb.v1";
 const RECEIVER_CLOCK: &str = "query.receiver-clock";
 const APPLIED_POSITION: &str = "query.applied-position";
 const FOLLOWER_PROGRESS: &str = "query.follower-progress";
+pub const OWNED_HOSTED_FEATURE: &str = "owned.hosted";
+pub const RETIRED_ORIGINAL_FAMILY_FEATURE: &str = "owned.retired-original-family";
+pub const RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE: &str = "owned.retired-original-family-recovery";
 const MAX_PAGE_ROWS: u32 = 4096;
 const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -109,6 +112,17 @@ impl Service {
             }.await,
             CAPABILITIES => decode::<proto::CapabilitiesRequest>(action.body).map(|_| {
                 let mut features = Vec::new();
+                if !self.follower_only() {
+                    if self.supports_hosted_upload(&call) && self.0.config.owned_world_host.is_some() {
+                        features.push(OWNED_HOSTED_FEATURE.into());
+                    }
+                    if self.supports_retired_original_family(&call) {
+                        features.push(RETIRED_ORIGINAL_FAMILY_FEATURE.into());
+                        if self.supports_hosted_upload(&call) {
+                            features.push(RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE.into());
+                        }
+                    }
+                }
                 if self.follower_only() {
                     features.extend(["query", "query.track", "query.page", APPLIED_POSITION, FOLLOWER_PROGRESS].map(str::to_owned));
                     features.extend([CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS].map(str::to_owned));

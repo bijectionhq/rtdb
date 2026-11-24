@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 
+use rtdb_types::Interval;
+
 use super::*;
 
 pub(crate) const READ_HELD_UNIQUE_WINDOW_V1: &str = "rtdb.owned.ReadHeldUniqueWindow.v1";
@@ -13,9 +15,6 @@ impl Service {
         body: &Bytes,
         stream: bool,
     ) -> Result<OwnedIpcReply, Status> {
-        use arrow_array::builder::{BinaryBuilder, Int64Builder, StringBuilder};
-        use rtdb_types::Interval;
-
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned unique window has no handle"))?;
@@ -52,41 +51,10 @@ impl Service {
         if bytes > self.0.config.maximum_message_bytes {
             return Err(Status::resource_exhausted("Owned unique window exceeds the response limit"));
         }
-        let _copy = call.reserve(bytes)?;
-        let mut ids = StringBuilder::new();
-        let mut keys = BinaryBuilder::new();
-        let mut starts = Int64Builder::new();
-        let mut ends = Int64Builder::new();
-        for page in pages {
-            let batch = page.batch();
-            let field = |name| batch.schema_ref().column_with_name(name).ok_or_else(history_invalid);
-            let (id_index, id_field) = field("_id")?;
-            let (key_index, key_field) = field(&column)?;
-            for row in 0..batch.num_rows() {
-                let (id, value) = unique_window_keys(
-                    id_field, batch.column(id_index).as_ref(),
-                    key_field, batch.column(key_index).as_ref(), row,
-                )?;
-                let start = history_row_time(batch, "_valid_from", row)?.ok_or_else(history_invalid)?;
-                let end = history_row_time(batch, "_valid_to", row)?.ok_or_else(history_invalid)?;
-                if start < from || end > to || start >= end
-                    || value.is_empty() || value.len() > rtdb_query::OWNED_UNIQUE_KEY_MAX
-                    || key.is_some_and(|key| key != value.as_ref())
-                {
-                    return Err(history_invalid());
-                }
-                ids.append_value(id);
-                keys.append_value(value);
-                starts.append_value(start.0);
-                ends.append_value(end.0);
-            }
-        }
-        let rows = RecordBatch::try_from_iter([
-            ("_id", Arc::new(ids.finish()) as Arc<dyn Array>),
-            ("key", Arc::new(keys.finish())),
-            ("valid_from_micros", Arc::new(starts.finish())),
-            ("valid_to_micros", Arc::new(ends.finish())),
-        ]).map_err(arrow)?;
+        let row_count = pages.iter().map(|page| page.batch().num_rows()).sum();
+        let id_scratch = wire::mul(row_count, std::mem::size_of::<EntityIdRef<'_>>())?;
+        let _copy = call.reserve(wire::add(bytes, id_scratch)?)?;
+        let rows = unique_window_rows(&pages, &column, key, valid, row_count)?;
         let mut metadata = [
             (OWNED_PRESENT.into(), system.0.to_string()),
             (OWNED_VALID_FROM.into(), from.0.to_string()),
@@ -179,28 +147,71 @@ fn encode_unique_point(
     Ok((bytes, retained))
 }
 
+fn unique_window_rows(
+    pages: &[OwnedBatch], column: &str, key: Option<&[u8]>, valid: Interval, row_count: usize,
+) -> Result<RecordBatch, Status> {
+    use arrow_array::builder::{BinaryBuilder, Int64Builder};
+
+    let mut ids = Vec::with_capacity(row_count);
+    let mut keys = BinaryBuilder::new();
+    let mut starts = Int64Builder::with_capacity(row_count);
+    let mut ends = Int64Builder::with_capacity(row_count);
+    for page in pages {
+        let batch = page.batch();
+        let field = |name| batch.schema_ref().column_with_name(name).ok_or_else(history_invalid);
+        let (id_index, id_field) = field("_id")?;
+        let (key_index, key_field) = field(column)?;
+        for row in 0..batch.num_rows() {
+            let (id, value) = unique_window_keys(
+                id_field, batch.column(id_index).as_ref(),
+                key_field, batch.column(key_index).as_ref(), row,
+            )?;
+            let start = history_row_time(batch, "_valid_from", row)?.ok_or_else(history_invalid)?;
+            let end = history_row_time(batch, "_valid_to", row)?.ok_or_else(history_invalid)?;
+            if start < valid.lower() || end > valid.upper() || start >= end
+                || value.is_empty() || value.len() > rtdb_query::OWNED_UNIQUE_KEY_MAX
+                || key.is_some_and(|key| key != value.as_ref())
+            {
+                return Err(history_invalid());
+            }
+            ids.push(id);
+            keys.append_value(value);
+            starts.append_value(start.0);
+            ends.append_value(end.0);
+        }
+    }
+    RecordBatch::try_from_iter([
+        ("_id", rtdb_columnar::entity_id_array(ids).map_err(status)?),
+        ("key", Arc::new(keys.finish())),
+        ("valid_from_micros", Arc::new(starts.finish())),
+        ("valid_to_micros", Arc::new(ends.finish())),
+    ]).map_err(arrow)
+}
+
 fn unique_window_keys<'a>(
     id_field: &Field,
     ids: &'a dyn Array,
     key_field: &Field,
     keys: &'a dyn Array,
     row: usize,
-) -> Result<(Cow<'a, str>, Cow<'a, [u8]>), Status> {
-    if id_field.metadata().is_empty() && key_field.metadata().is_empty()
-        && let (Some(ids), Some(keys)) = (
-            ids.as_any().downcast_ref::<StringArray>(),
-            keys.as_any().downcast_ref::<BinaryArray>(),
-        )
-    {
-        if ids.is_null(row) || keys.is_null(row) {
-            return Err(history_invalid());
+) -> Result<(EntityIdRef<'a>, Cow<'a, [u8]>), Status> {
+    let id = match rtdb_columnar::read_execution_owned_entity_id(id_field, ids, row) {
+        Ok(id) => id,
+        Err(error) if error.code == "xtdb/invalid-id" => None,
+        Err(error) => return Err(status(error)),
+    };
+    let key = if let Some(keys) = keys.as_any().downcast_ref::<BinaryArray>().filter(|_| key_field.metadata().is_empty()) {
+        (!keys.is_null(row)).then(|| Cow::Borrowed(keys.value(row)))
+    } else {
+        match rtdb_columnar::read_execution_value(key_field, keys, row).map_err(status)? {
+            Value::Binary(key) => Some(Cow::Owned(key)),
+            _ => None,
         }
-        return Ok((Cow::Borrowed(ids.value(row)), Cow::Borrowed(keys.value(row))));
+    };
+    match (id, key) {
+        (Some(id), Some(key)) => Ok((id, key)),
+        _ => Err(history_invalid()),
     }
-    let id = rtdb_columnar::read_execution_value(id_field, ids, row).map_err(status)?;
-    let key = rtdb_columnar::read_execution_value(key_field, keys, row).map_err(status)?;
-    let (Value::Utf8(id), Value::Binary(key)) = (id, key) else { return Err(history_invalid()); };
-    Ok((Cow::Owned(id), Cow::Owned(key)))
 }
 
 #[cfg(test)]
@@ -247,15 +258,48 @@ mod tests {
         let keys = BinaryArray::from_iter([Some(key), Some(key)]);
 
         let plain = unique_window_keys(&id_field, &ids, &key_field, &keys, 0).unwrap();
-        assert!(matches!(&plain.0, Cow::Borrowed(_)));
+        assert!(matches!(plain.0, EntityIdRef::String(id) if id.as_ptr() == ids.value(0).as_ptr()));
         assert!(matches!(&plain.1, Cow::Borrowed(_)));
         assert_eq!(plain, unique_window_keys(&tagged_id, &ids, &key_field, &keys, 0).unwrap());
-        assert_eq!(plain.0, "α");
+        assert_eq!(plain.0, EntityIdRef::String("α"));
         assert_eq!(plain.1.as_ref(), key);
 
         let plain_error = unique_window_keys(&id_field, &ids, &key_field, &keys, 1).unwrap_err();
         let fallback_error = unique_window_keys(&tagged_id, &ids, &key_field, &keys, 1).unwrap_err();
         assert_eq!(plain_error.code(), fallback_error.code());
         assert_eq!(plain_error.message(), fallback_error.message());
+    }
+
+    #[test]
+    fn unique_window_reply_keeps_typed_identities_and_repeated_slices_in_source_order() {
+        let memory = MemoryBudget::new(1 << 20);
+        let key = &[9, 255][..];
+        let id = EntityIdRef::Binary(&[0, 255, 0]);
+        let ids = [id, EntityIdRef::String("00ff00"), id];
+        let times = |values| Arc::new(TimestampMicrosecondArray::from(values)) as ArrayRef;
+        let page = RecordBatch::try_from_iter([
+            ("_id", rtdb_columnar::entity_id_array(ids).unwrap()),
+            ("unique_key", Arc::new(BinaryArray::from_iter_values([key; 3]))),
+            ("_valid_from", times(vec![10, 12, 20])),
+            ("_valid_to", times(vec![20, 14, 30])),
+        ]).unwrap();
+        let pages = [OwnedBatch::new(page, &memory).unwrap()];
+        let valid = Interval::from_micros(10, 30).unwrap();
+        let reply = unique_window_rows(&pages, "unique_key", Some(key), valid, ids.len()).unwrap();
+        let schema = reply.schema_ref();
+        let field = rtdb_columnar::to_field("_id", &entity_id_type()).unwrap();
+        assert_eq!(schema.field(0), &field);
+        for (row, id) in ids.into_iter().enumerate() {
+            assert_eq!(read_owned_entity_id(&field, reply.column(0).as_ref(), row).unwrap(), id);
+        }
+        for (column, expected) in [("valid_from_micros", [10, 12, 20]), ("valid_to_micros", [20, 14, 30])] {
+            let times = reply.column_by_name(column).unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+            assert_eq!(times.values().as_ref(), &expected);
+        }
+        let empty = unique_window_rows(&[], "unique_key", Some(key), valid, 0).unwrap();
+        assert_eq!(empty.schema_ref(), schema);
+        assert_eq!(empty.num_rows(), 0);
+        let error = unique_window_rows(&pages, "unique_key", Some(&[4]), valid, ids.len()).unwrap_err();
+        assert_eq!(error.message(), history_invalid().message());
     }
 }

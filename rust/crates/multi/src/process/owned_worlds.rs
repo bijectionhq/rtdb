@@ -57,6 +57,8 @@ impl PlacedWorldHost {
 }
 
 impl OwnedWorldHost for PlacedWorldHost {
+    fn supports_retired_original_family(&self) -> bool { self.hosted_task.is_some() && self.cell_secret.is_some() }
+
     fn prepare_world_overlay<'a>(
         &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut, child: Uuid, retain_until: Timestamp, writable: bool,
     ) -> BoxFuture<'a, Result<rtdb_flight_sql::PreparedWorldOverlay>> {
