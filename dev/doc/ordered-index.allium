@@ -25,9 +25,12 @@ entity Checkpoint {
 -- Aligned bucket decomposition places an eligible row in exactly one of the prefixes containing a valid-time point.
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
 -- Plain scalar keys project from selected positions in the source Arrow columns.
+-- Retained projected tuples own compact key batches and their memory reservations.
 -- A governed put binds its typed Arrow identity to the borrowed identity in its event header.
 -- A world shadow's logical null field marker identifies a local tombstone.
--- A leaf edit with matching key layouts selects surviving and edited rows from their Arrow columns.
+-- Leaf edits and correction writes select key slots from their Arrow columns across plain and dense-union layouts.
+-- Each rebuilt slot derives its layout from selected rows and assigns dense-union offsets in selection order.
+-- Compact contiguous selections may share the backing allocations of index-owned Arrow keys.
 -- A correction page serializes just the Arrow key rows for the validity spans it owns.
 -- The read opens a root at its system-time point and applies captured uncovered events, including erasures.
 -- A snapshot may reuse decoded index definitions for the same catalog read time.

@@ -503,13 +503,7 @@ impl Leaf {
                         entry.posting.expect("survivors have a posting batch")
                     }
                 }).collect::<Vec<_>>();
-                match Postings::interleave(&selected)? {
-                    Some(postings) => Some(postings),
-                    None => Some(Postings::build(&keys.iter().map(|entry| {
-                        let KeyRef::Posting(bucket, tuple, address) = entry.key else { unreachable!() };
-                        (bucket, tuple, address)
-                    }).collect::<Vec<_>>())?),
-                }
+                Some(Postings::interleave(&selected)?)
             }
         };
         Self::new(
