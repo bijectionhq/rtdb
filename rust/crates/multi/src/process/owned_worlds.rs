@@ -166,6 +166,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
+    fn ancestors(&self) -> Vec<(rtdb_types::Iid, Timestamp)> { HeldCheckpointWorld::ancestors(self) }
     fn ancestor(&self) -> Option<(rtdb_types::Iid, Timestamp)> { HeldCheckpointWorld::ancestor(self) }
 
     fn application_publication(&self) -> Option<(Timestamp, Timestamp)> {

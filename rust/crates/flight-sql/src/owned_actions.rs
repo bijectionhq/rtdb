@@ -269,8 +269,8 @@ pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2"
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
-pub(crate) const RETAIN_REPLAYED_WORLD_V3: &str = "rtdb.owned.RetainReplayedWorld.v3";
-pub(crate) const OPEN_WORLD_READ_V5: &str = "rtdb.owned.OpenWorldRead.v5";
+pub(crate) const RETAIN_REPLAYED_WORLD_V4: &str = "rtdb.owned.RetainReplayedWorld.v4";
+pub(crate) const OPEN_WORLD_READ_V6: &str = "rtdb.owned.OpenWorldRead.v6";
 pub(crate) const READ_HELD_WORLD_HEAD_V1: &str = "rtdb.owned.ReadHeldWorldHead.v1";
 pub(crate) const SELECT_HELD_WORLD_PARENT_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldParentAsOf.v1";
 pub(crate) const HELD_WORLD_PARENT_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentPointAt.v1";
@@ -3514,7 +3514,7 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
-        let charge = call.reserve(4096)?;
+        let charge = call.reserve(128 * 1024)?;
         let retained = host.retain_replayed_world(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
             *binding, Uuid::from_bytes(world),
@@ -3533,7 +3533,6 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
-        let reply_charge = call.reserve(96)?;
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
@@ -3543,23 +3542,24 @@ impl Service {
         ).await.map_err(status)?;
         let handle = Uuid::new_v4();
         let parent = snapshot.parent_basis();
-        let mut reply = Vec::with_capacity(57);
+        let ancestors = snapshot.ancestors();
+        let reply_size = 57 + ancestors.len() * 24;
+        let reply_charge = call.reserve(reply_size + 64)?;
+        let mut reply = Vec::with_capacity(reply_size);
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.present().0.to_be_bytes());
         reply.extend_from_slice(&parent.tx_id.0.to_be_bytes());
         reply.extend_from_slice(&parent.system_time.0.to_be_bytes());
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
         reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
-        if let Some((world, system)) = snapshot.ancestor() {
-            reply.push(if snapshot.clock_mode().is_writable() { 4 } else { 3 });
+        reply.push(match snapshot.clock_mode() {
+            rtdb_types::WorldClockMode::Retained => 0,
+            rtdb_types::WorldClockMode::Held { .. } => 1,
+            rtdb_types::WorldClockMode::Proposal => 2,
+        });
+        for (world, system) in ancestors {
             reply.extend_from_slice(&world.0);
             reply.extend_from_slice(&system.0.to_be_bytes());
-        } else {
-            reply.push(match snapshot.clock_mode() {
-                rtdb_types::WorldClockMode::Retained => 0,
-                rtdb_types::WorldClockMode::Held { .. } => 1,
-                rtdb_types::WorldClockMode::Proposal => 2,
-            });
         }
         let held = Arc::new(OwnedWorldReadResource {
             snapshot, world, conditions: Mutex::new(BTreeMap::new()),

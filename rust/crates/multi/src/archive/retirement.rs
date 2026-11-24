@@ -539,7 +539,7 @@ mod tests {
         let primary = Uuid::new_v4();
         update_installation(directory.as_ref(), &installation.id, |record| {
             record.checkpoint_worlds.insert(world, CheckpointWorldRetention {
-                ancestor: Some(rtdb_directory::CheckpointWorldAncestor {
+                ancestors: vec![rtdb_directory::CheckpointWorldAncestor {
                     world: Uuid::new_v4(),
                     pin: Uuid::new_v4(),
                     capture,
@@ -549,7 +549,7 @@ mod tests {
                     system: basis.system_time,
                     source_root: basis,
                     logical: basis.system_time,
-                }),
+                }],
                 world,
                 owner: "owner".into(),
                 capture: primary,
@@ -640,7 +640,7 @@ mod tests {
         record.checkpoint_worlds.insert(
             world,
             CheckpointWorldRetention {
-                ancestor: None,
+                ancestors: Vec::new(),
                 world,
                 owner: "owner".into(),
                 capture,

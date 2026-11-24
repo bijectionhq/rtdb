@@ -219,19 +219,20 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     }).ok_or_else(unavailable)?;
     if cut.basis() <= original.basis.system_time || cut.until() <= now() { return Err(unavailable()); }
     if live.world_registration(Iid(*child.as_bytes())).await?.is_some() { return Err(unavailable()); }
-    let (ancestor, until) = if let Some(inherited) = &retained.ancestor {
-        if !cut.admits_overlay(inherited.basis, cut.basis())
-            || !original.ancestor.as_ref().is_some_and(|ancestor| ancestor.covers(cut.basis(), logical))
-        {
+    let inherited_at = original.ancestor_at(cut.basis());
+    let (mut ancestors, ancestor, until) = if let Some(inherited_at) = inherited_at {
+        let index = original.ancestors.iter().position(|layer| layer == inherited_at).ok_or_else(unavailable)?;
+        let inherited = retained.ancestors.get(index).ok_or_else(unavailable)?;
+        if !cut.admits_overlay(inherited.basis, cut.basis()) || !inherited_at.covers(cut.basis(), logical) {
             return Err(unavailable());
         }
         let mut selected = inherited.clone();
         selected.system = cut.basis();
         selected.logical = logical;
-        (selected, cut.until())
+        (retained.ancestors[..index].to_vec(), selected, cut.until())
     } else {
         let (capture, suffix) = if let Some(prior) = source.checkpoint_worlds.get(&child).filter(|prior| prior.until > now()) {
-            let ancestor = prior.ancestor.as_ref().filter(|ancestor| {
+            let ancestor = prior.ancestors.last().filter(|ancestor| {
                 ancestor.world.as_bytes() == &world.0 && ancestor.pin.as_bytes() == &pin.0
                     && ancestor.logical == logical && cut.matches_basis(ancestor.basis)
             }).ok_or_else(unavailable)?;
@@ -253,7 +254,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         }
         let basis = prepared.basis;
         let reusable = installed.checkpoint_worlds.get(&child).is_some_and(|prior|
-            prior.until > now() && prior.ancestor.as_ref().is_some_and(|ancestor| ancestor.suffix == suffix));
+            prior.until > now() && prior.ancestors.iter().any(|ancestor| ancestor.suffix == suffix));
         let until = if reusable { cut.until() }
             else { cut.until().min(Timestamp(prepared.expires_at_ms.saturating_mul(1000))) };
         let owner = &retained.owner;
@@ -275,12 +276,12 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
             world: Uuid::from_bytes(world.0), pin: Uuid::from_bytes(pin.0), capture, suffix,
             manifest_sha256: manifest, basis, system: basis.system_time, source_root: original.basis, logical,
         };
-        (ancestor, until)
+        (retained.ancestors.clone(), ancestor, until)
     };
     let owner = &retained.owner;
     let reopened = open_world(directory.as_ref(), archive, session, deployment, Uuid::from_bytes(world.0)).await?;
     if reopened.record != original || now() >= until { return Err(unavailable()); }
-    if original.ancestor.is_some() {
+    if inherited_at.is_some() {
         reopened.snapshot.check_overlay_standing(&original).await?;
     } else {
         let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), &original, ancestor.system, None).await?;
@@ -289,8 +290,9 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         }
     }
     if now() >= until { return Err(unavailable()); }
+    ancestors.push(ancestor.clone());
     let binding = CheckpointWorldRetention {
-        world: child, ancestor: Some(ancestor.clone()), owner: owner.clone(),
+        world: child, ancestors, owner: owner.clone(),
         capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
         schema_digest: retained.schema_digest, suffix: retained.suffix, basis: retained.basis,
         parent_publication: retained.parent_publication, mode, until: retain_until,
@@ -452,7 +454,8 @@ pub(crate) async fn retain_replayed_checkpoint_world(
         Arc::clone(&directory), archive, storage, agent, keys, hosted_task, session,
         deployment, binding, Some(staged.world.basis), Some(&staged.world.schemas), resources.clone(),
     ).await?.ok_or_else(unavailable)?;
-    let ancestor = if let Some(original) = &staged.world.ancestor {
+    let mut ancestors = Vec::with_capacity(staged.world.ancestors.len());
+    for original in &staged.world.ancestors {
         let archived = prepare_checkpoint_replay_parent(
             Arc::clone(&directory), archive, storage, agent, keys, hosted_task, session,
             deployment, binding, Some(original.basis), None, resources.clone(),
@@ -471,18 +474,18 @@ pub(crate) async fn retain_replayed_checkpoint_world(
                 deployment, capture, manifest: &archived.manifest, suffix: Some(suffix),
                 expected_basis: Some(archived.basis), require_replay: false,
             },
-            resources,
+            resources.clone(),
             |context, basis| async move {
                 let (record, _) = rtdb_query::read_owned_world(Arc::clone(&context), owner, source_world)
                     .await?.ok_or_else(unavailable)?;
-                if record.dropped || record.pin.0 != original.pin || record.ancestor.is_some()
+                if record.dropped || record.pin.0 != original.pin
                     || record.basis != original.source_root
                     || !matches!(record.mode, WorldClockMode::Held { .. }) || &record.schemas != schemas
                 {
                     return Err(unavailable());
                 }
                 let (system, logical) = rtdb_query::select_owned_world_clock(
-                    &context, owner, source_world, record.basis.system_time, record.initial_clock(), original.logical,
+                    &context, owner, source_world, record.inherited_system(), record.initial_clock(), original.logical,
                 ).await?.ok_or_else(unavailable)?;
                 if logical != original.logical
                     || (system == basis.system_time) != (original.system == original.basis.system_time)
@@ -492,14 +495,12 @@ pub(crate) async fn retain_replayed_checkpoint_world(
                 Ok(system)
             },
         ).await?;
-        Some(rtdb_directory::CheckpointWorldAncestor {
+        ancestors.push(rtdb_directory::CheckpointWorldAncestor {
             world: Uuid::from_bytes(original.world), pin: Uuid::from_bytes(original.pin),
             capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis, system,
             source_root: original.source_root, logical: original.logical,
-        })
-    } else {
-        None
-    };
+        });
+    }
     let live = session.open_owned_read().await?;
     let current = live.replayed_world(binding, iid).await?;
     let world = current.world;
@@ -516,7 +517,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     live.check()?;
     let pin = Uuid::from_bytes(world.pin.0);
     let retained = CheckpointWorldRetention {
-        ancestor,
+        ancestors,
         world: id,
         owner,
         capture: Uuid::from_bytes(parent.capture),
@@ -542,7 +543,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
             if existing.world != id || existing.owner != retained.owner
                 || existing.schema_digest != retained.schema_digest || existing.basis != retained.basis
                 || existing.parent_publication != retained.parent_publication || existing.mode != retained.mode
-                || existing.ancestor != retained.ancestor
+                || existing.ancestors != retained.ancestors
             {
                 return Err(unavailable());
             }
@@ -560,7 +561,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     let retained = installed.checkpoint_worlds.get(&pin).ok_or_else(unavailable)?;
     Ok(rtdb_flight_sql::RetainedReplayWorld {
         pin: *pin.as_bytes(),
-        ancestor: world_ancestor(retained),
+        ancestors: world_ancestors(retained),
         capture: *retained.capture.as_bytes(),
         suffix: retained.suffix.map(|suffix| *suffix.as_bytes()),
         manifest: retained.manifest_sha256.clone(),
@@ -600,8 +601,8 @@ pub(crate) async fn finish_checkpoint_replay_parents(
     Ok(())
 }
 
-fn world_ancestor(retained: &CheckpointWorldRetention) -> Option<rtdb_types::OwnedWorldAncestor> {
-    retained.ancestor.as_ref().map(|ancestor| rtdb_types::OwnedWorldAncestor {
+fn world_ancestors(retained: &CheckpointWorldRetention) -> Vec<rtdb_types::OwnedWorldAncestor> {
+    retained.ancestors.iter().map(|ancestor| rtdb_types::OwnedWorldAncestor {
         world: *ancestor.world.as_bytes(),
         pin: *ancestor.pin.as_bytes(),
         capture: *ancestor.capture.as_bytes(),
@@ -611,7 +612,7 @@ fn world_ancestor(retained: &CheckpointWorldRetention) -> Option<rtdb_types::Own
         system: ancestor.system,
         source_root: ancestor.source_root,
         logical: ancestor.logical,
-    })
+    }).collect()
 }
 
 fn world_record(
@@ -620,7 +621,7 @@ fn world_record(
     schemas: rtdb_types::WorldSchemas,
 ) -> OwnedWorld {
     OwnedWorld {
-        ancestor: world_ancestor(retained),
+        ancestors: world_ancestors(retained),
         fork_lineage: Vec::new(),
         id: Iid(*retained.world.as_bytes()),
         pin: Iid(*pin.as_bytes()),
@@ -713,7 +714,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         let unavailable = OwnedWorld::unavailable;
         let child = Uuid::from_bytes(fork.world.0);
         let retained = source.checkpoint_worlds.get(&child).ok_or_else(unavailable)?;
-        let ancestor = retained.ancestor.as_ref().ok_or_else(unavailable)?;
+        let ancestor = retained.ancestors.last().ok_or_else(unavailable)?;
         let mode = match fork.requested {
             rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
             rtdb_node::WorldClockRequest::Held { start: None } => WorldClockMode::Held { start: logical },
@@ -888,7 +889,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         return Err(OwnedWorld::unavailable());
     }
     let retained = CheckpointWorldRetention {
-        ancestor: None,
+        ancestors: Vec::new(),
         world: id,
         owner,
         capture: parent.capture,
@@ -977,7 +978,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
 }
 
 fn matches_retention(world: &OwnedWorld, retained: &CheckpointWorldRetention) -> bool {
-    world.ancestor == world_ancestor(retained)
+    world.ancestors == world_ancestors(retained)
         && world.id.0 == *retained.world.as_bytes()
         && world.capture.0 == *retained.capture.as_bytes()
         && world.suffix.map(|suffix| Uuid::from_bytes(suffix.0)) == retained.suffix
@@ -1007,7 +1008,7 @@ fn admit_world_media(
     installation: &DeploymentRecord, archive: &CellStorage, deployment: Uuid, retained: &CheckpointWorldRetention,
 ) -> Result<()> {
     admit_capture(installation, archive, &parent_media(deployment, retained))?;
-    if let Some(ancestor) = &retained.ancestor {
+    for ancestor in &retained.ancestors {
         admit_capture(installation, archive, &ancestor_media(deployment, ancestor))?;
     }
     Ok(())

@@ -48,7 +48,7 @@ struct ArchivedWorld {
     pin: [u8; 16],
     mode: ArchivedMode,
     parent: ArchivedParent,
-    ancestor: Option<OwnedWorldAncestor>,
+    ancestors: Vec<OwnedWorldAncestor>,
     fork_lineage: Vec<rtdb_types::OwnedWorldForkLink>,
     until: i64,
     dropped: bool,
@@ -84,7 +84,7 @@ impl ArchivedWorld {
         };
         let schemas = serde_json::to_vec(&self.parent.schemas).map_err(|_| invalid())?;
         let world = OwnedWorld {
-            ancestor: self.ancestor,
+            ancestors: self.ancestors,
             fork_lineage: self.fork_lineage,
             id: Iid(self.id),
             pin: Iid(self.pin),

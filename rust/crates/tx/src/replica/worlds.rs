@@ -473,7 +473,7 @@ mod tests {
     fn held_birth_has_its_own_control_and_registration_inventory() -> Result<()> {
         let child = OwnedWorld {
             id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([2; 16]), suffix: None,
-            ancestor: None, fork_lineage: Vec::new(), manifest: "a".repeat(43),
+            ancestors: Vec::new(), fork_lineage: Vec::new(), manifest: "a".repeat(43),
             basis: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
             parent_publication: Some(Timestamp(100)), mode: WorldClockMode::Held { start: Timestamp(100) },
             until: Timestamp(300), schemas: WorldSchemas::new(BTreeMap::new())?, dropped: false,

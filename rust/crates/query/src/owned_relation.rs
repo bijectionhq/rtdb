@@ -693,7 +693,7 @@ pub async fn read_owned_worlds(context: Arc<QueryContext>, catalog: TableRef) ->
     use rtdb_types::{OwnedWorld, StructFields};
 
     if catalog.owned_world_catalog().as_ref() != Some(&catalog) { return Err(OwnedWorld::unavailable()); }
-    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor", "fork_lineage"];
+    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestors", "fork_lineage"];
     let memory = Arc::clone(&context.memory);
     let Some(mut cursor) = open_private_catalog(context, catalog, &names, None).await? else { return Ok(Vec::new()); };
     let mut worlds = Vec::new();
@@ -1047,9 +1047,9 @@ pub async fn read_held_world_publication(
     let unavailable = rtdb_types::OwnedWorld::unavailable;
     let at = context.with_owned_system_cut(system, &context.cancellation)?;
     let (source, charge) = read_owned_world(Arc::clone(&at), owner, world).await?
-        .filter(|(source, _)| !source.dropped && source.ancestor.is_none()
+        .filter(|(source, _)| !source.dropped
             && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
-            && source.basis.system_time < system)
+            && source.inherited_system() < system)
         .ok_or_else(unavailable)?;
     let (reading, _) = read_owned_world_clock_revision(at, owner, world).await?
         .filter(|(reading, revision)| *revision == system && source.admits_clock_publication(*reading, *revision))
@@ -1117,7 +1117,7 @@ pub async fn read_owned_world_with_revision(
 
     let memory = Arc::clone(&context.memory);
     let id = EntityId::Uuid(world.0);
-    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestor", "fork_lineage"];
+    let names = ["_id", "pin", "capture", "manifest", "basis_id", "basis_time", "parent_publication", "mode", "held_start", "until", "schemas", "dropped", "suffix", "ancestors", "fork_lineage"];
     let Some(mut cursor) = open_owned_point(
         context, owner, &OwnedRelation::world_catalog(), &id, None, Some(&names),
     ).await? else { return Ok(None); };

@@ -22,7 +22,7 @@ pub(crate) struct WorldReadmission {
     pub(crate) source_cut: Timestamp,
     pub(crate) original_parent: TransactionKey,
     pub(crate) original_until: Timestamp,
-    pub(crate) ancestor: Option<RelocatedAncestor>,
+    pub(crate) ancestors: Vec<RelocatedAncestor>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -41,7 +41,7 @@ pub(crate) fn world_readmission_control<'a>(
         return Ok(None);
     };
     let invalid = replay_invalid;
-    let body = control_body(marker, 4096).ok_or_else(invalid)?;
+    let body = control_body(marker, 128 * 1024).ok_or_else(invalid)?;
     let admission: WorldReadmission = serde_json::from_slice(body).map_err(|_| invalid())?;
     if candidates.next().is_some()
         || marker.expected().is_some()
@@ -100,32 +100,33 @@ fn is_readmission(control: &HostedControlWrite) -> bool {
 }
 
 impl WorldReadmission {
-    pub(crate) fn retained_ancestor(&self, world: &OwnedWorld) -> Result<Option<&OwnedWorldAncestor>> {
-        match (&world.ancestor, &self.ancestor) {
-            (None, None) => Ok(None),
-            (Some(old), Some(relocated))
-                if relocated.original == old.basis
-                    && relocated.selected.system_time == old.system
-                    && relocated.selected.tx_id.0 >= 0
-                    && (relocated.selected == old.basis
-                        || (relocated.selected.tx_id < old.basis.tx_id && old.system < old.basis.system_time))
-                    && old.basis.system_time <= self.source_cut
-                    && (old.system == old.basis.system_time)
-                        == (relocated.retained.system == relocated.retained.basis.system_time)
-                    && relocated.retained.system > self.basis.system_time
-                    && relocated.retained.system <= relocated.retained.basis.system_time
-                    && relocated.retained.world == old.world
-                    && relocated.retained.pin == old.pin
-                    && relocated.retained.logical == old.logical
-                    && relocated.retained.source_root == old.source_root
-                    && relocated.retained.basis.tx_id > self.basis.tx_id
-                    && relocated.retained.basis.system_time > self.basis.system_time
-                    && relocated.retained.basis.system_time < self.until =>
-            {
-                Ok(Some(&relocated.retained))
-            }
-            _ => Err(replay_invalid()),
+    pub(crate) fn require_retained_ancestors(&self, world: &OwnedWorld) -> Result<()> {
+        if self.ancestors.len() != world.ancestors.len() {
+            return Err(replay_invalid());
         }
+        let mut previous = self.basis.system_time;
+        for (old, RelocatedAncestor { original, selected, retained }) in world.ancestors.iter().zip(&self.ancestors) {
+            if *original != old.basis
+                || selected.system_time != old.system
+                || selected.tx_id.0 < 0
+                || (*selected != old.basis
+                    && (selected.tx_id >= old.basis.tx_id || old.system >= old.basis.system_time))
+                || old.basis.system_time > self.source_cut
+                || (old.system == old.basis.system_time) != (retained.system == retained.basis.system_time)
+                || retained.system <= previous
+                || retained.system > retained.basis.system_time
+                || retained.world != old.world
+                || retained.pin != old.pin
+                || retained.logical != old.logical
+                || retained.source_root != old.source_root
+                || retained.basis.tx_id <= self.basis.tx_id
+                || retained.basis.system_time >= self.until
+            {
+                return Err(replay_invalid());
+            }
+            previous = retained.system;
+        }
+        Ok(())
     }
 
     pub(crate) fn require_relocation(
@@ -134,6 +135,7 @@ impl WorldReadmission {
         next: &OwnedWorld,
         logical: Timestamp,
     ) -> Result<()> {
+        self.require_retained_ancestors(prior)?;
         if self.binding == [0; 32]
             || prior.id.0 != self.world
             || next.id != prior.id
@@ -145,8 +147,8 @@ impl WorldReadmission {
             || next.schemas != prior.schemas
             || next.fork_lineage != prior.fork_lineage
             || next.parent_publication != Some(prior.root_clock())
-            || self.retained_ancestor(prior)? != next.ancestor.as_ref()
-            || next.ancestor.as_ref().is_some_and(|ancestor| ancestor.basis.system_time >= logical)
+            || !self.ancestors.iter().map(|layer| &layer.retained).eq(next.ancestors.iter())
+            || next.ancestors.iter().any(|ancestor| ancestor.basis.system_time >= logical)
             || prior.basis != self.original_parent
             || prior.until != self.original_until
             || prior.basis.system_time > self.source_cut
@@ -273,7 +275,7 @@ mod tests {
             mode: WorldClockMode::Retained,
             until: Timestamp(100),
             schemas: WorldSchemas::from_bytes(b"{}")?,
-            ancestor: Some(original.clone()),
+            ancestors: vec![original.clone()],
             fork_lineage: vec![rtdb_types::OwnedWorldForkLink {
                 world: original.world, pin: original.pin, registered: Timestamp(16),
                 system: original.system, logical: original.logical,
@@ -295,18 +297,18 @@ mod tests {
             source_cut: Timestamp(90),
             original_parent: world.basis,
             original_until: world.until,
-            ancestor: Some(RelocatedAncestor { original: original.basis, selected: original.basis, retained: retained.clone() }),
+            ancestors: vec![RelocatedAncestor { original: original.basis, selected: original.basis, retained }],
         };
-        assert_eq!(admission.retained_ancestor(&world)?, Some(&retained));
-        let moved = admission.ancestor.as_mut().expect("fixture has a relocated ancestor");
+        admission.require_retained_ancestors(&world)?;
+        let moved = admission.ancestors.first_mut().expect("fixture has a relocated ancestor");
         moved.selected = position(1, original.system.0);
-        assert!(admission.retained_ancestor(&world).is_err());
-        let moved = admission.ancestor.as_mut().expect("fixture has a relocated ancestor");
+        assert!(admission.require_retained_ancestors(&world).is_err());
+        let moved = admission.ancestors.first_mut().expect("fixture has a relocated ancestor");
         moved.selected = original.basis;
         moved.retained.source_root = position(101, 110);
-        assert!(admission.retained_ancestor(&world).is_err());
-        admission.ancestor = None;
-        assert!(admission.retained_ancestor(&world).is_err());
+        assert!(admission.require_retained_ancestors(&world).is_err());
+        admission.ancestors.clear();
+        assert!(admission.require_retained_ancestors(&world).is_err());
         Ok(())
     }
 }

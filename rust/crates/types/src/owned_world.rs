@@ -109,6 +109,50 @@ pub struct OwnedWorldAncestor {
 }
 
 impl OwnedWorldAncestor {
+    const WIDTH: usize = 155;
+
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(&self.world);
+        bytes.extend_from_slice(&self.pin);
+        bytes.extend_from_slice(&self.capture);
+        bytes.extend_from_slice(&self.suffix);
+        bytes.extend_from_slice(self.manifest.as_bytes());
+        for value in [self.basis.tx_id.0, self.basis.system_time.0, self.system.0,
+            self.source_root.tx_id.0, self.source_root.system_time.0, self.logical.0]
+        {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let unavailable = OwnedWorld::unavailable;
+        let uuid = |offset| {
+            let id: [u8; 16] = bytes[offset..offset + 16].try_into().map_err(|_| unavailable())?;
+            if id == [0; 16] { return Err(unavailable()); }
+            Ok(id)
+        };
+        let number = |offset: usize| {
+            i64::from_be_bytes(bytes[107 + offset * 8..115 + offset * 8].try_into().expect("fixed ancestor width"))
+        };
+        let manifest = std::str::from_utf8(&bytes[64..107]).map_err(|_| unavailable())?;
+        if !valid_manifest(manifest) { return Err(unavailable()); }
+        Ok(Self {
+            world: uuid(0)?, pin: uuid(16)?, capture: uuid(32)?, suffix: uuid(48)?,
+            manifest: manifest.to_owned(),
+            basis: TransactionKey { tx_id: TxId(number(0)), system_time: Timestamp(number(1)) },
+            system: Timestamp(number(2)),
+            source_root: TransactionKey { tx_id: TxId(number(3)), system_time: Timestamp(number(4)) },
+            logical: Timestamp(number(5)),
+        })
+    }
+
+    fn holds_same_media(&self, other: &Self) -> bool {
+        self.world == other.world && self.pin == other.pin
+            && self.capture == other.capture && self.suffix == other.suffix
+            && self.manifest == other.manifest && self.basis == other.basis
+            && self.source_root == other.source_root
+    }
+
     pub fn covers(&self, system: Timestamp, logical: Timestamp) -> bool {
         (system == self.system && logical == self.logical)
             || (system < self.system && logical < self.logical)
@@ -171,7 +215,7 @@ pub struct OwnedWorld {
     pub id: Iid,
     pub pin: Iid,
     pub capture: Iid,
-    pub ancestor: Option<OwnedWorldAncestor>,
+    pub ancestors: Vec<OwnedWorldAncestor>,
     pub fork_lineage: Vec<OwnedWorldForkLink>,
     pub suffix: Option<Iid>,
     pub manifest: String,
@@ -184,7 +228,18 @@ pub struct OwnedWorld {
 }
 
 impl OwnedWorld {
-    pub const MAX_FORK_LINEAGE: usize = 8;
+    /// Bound the retained certificate by encoded bytes.
+    pub const MAX_FORK_CERTIFICATE_BYTES: usize = 32 * 1024;
+
+    pub fn ancestor(&self) -> Option<&OwnedWorldAncestor> {
+        self.ancestors.last()
+    }
+
+    /// Oldest to newest, selecting the writer responsible for this physical cut.
+    pub fn ancestor_at(&self, system: Timestamp) -> Option<&OwnedWorldAncestor> {
+        if system <= self.basis.system_time { return None; }
+        self.ancestors.iter().find(|layer| system <= layer.system)
+    }
 
     /// Extend the independently retained certificate before publishing a child.
     pub fn retained_child_lineage(&self, next: &Self, registered: Timestamp) -> Result<Vec<OwnedWorldForkLink>> {
@@ -196,25 +251,25 @@ impl OwnedWorld {
             system: next.inherited_system(),
             logical: next.inherited_clock(),
         });
-        Self::validate_fork_lineage(next.id, next.mode, next.ancestor.as_ref(), next.inherited_clock(), &lineage)?;
+        Self::validate_fork_lineage(next.id, next.mode, &next.ancestors, next.inherited_clock(), &lineage)?;
         Ok(lineage)
     }
 
     fn validate_fork_lineage(
-        id: Iid, mode: WorldClockMode, ancestor: Option<&OwnedWorldAncestor>,
+        id: Iid, mode: WorldClockMode, ancestors: &[OwnedWorldAncestor],
         inherited: Timestamp, lineage: &[OwnedWorldForkLink],
     ) -> Result<()> {
         let unavailable = Self::unavailable;
-        if lineage.len() > Self::MAX_FORK_LINEAGE {
+        if lineage.len() * OwnedWorldForkLink::WIDTH + ancestors.len() * OwnedWorldAncestor::WIDTH > Self::MAX_FORK_CERTIFICATE_BYTES {
             return Err(unavailable());
         }
         if lineage.is_empty() {
-            return if ancestor.is_none() { Ok(()) } else { Err(unavailable()) };
+            return if ancestors.is_empty() { Ok(()) } else { Err(unavailable()) };
         }
         let admitted_mode = mode == WorldClockMode::Retained
             || mode == (WorldClockMode::Held { start: inherited });
         if !admitted_mode || lineage.last().is_none_or(|link| link.logical != inherited)
-            || ancestor.is_some_and(|source| !lineage.iter().any(|link|
+            || ancestors.iter().any(|source| !lineage.iter().any(|link|
                 link.world == source.world && link.pin == source.pin))
         {
             return Err(unavailable());
@@ -236,7 +291,7 @@ impl OwnedWorld {
 
     /// The publication inherited when this world began its own journal.
     pub fn inherited_system(&self) -> Timestamp {
-        self.ancestor.as_ref().map_or(self.basis.system_time, |ancestor| ancestor.system)
+        self.ancestor().map_or(self.basis.system_time, |ancestor| ancestor.system)
     }
 
     pub fn root_clock(&self) -> Timestamp {
@@ -244,7 +299,7 @@ impl OwnedWorld {
     }
 
     pub fn inherited_clock(&self) -> Timestamp {
-        self.ancestor.as_ref().map_or_else(|| self.root_clock(), |ancestor| ancestor.logical)
+        self.ancestor().map_or_else(|| self.root_clock(), |ancestor| ancestor.logical)
     }
 
     pub fn initial_clock(&self) -> Timestamp {
@@ -263,7 +318,7 @@ impl OwnedWorld {
     }
 
     pub fn is_held_root_fork(&self) -> bool {
-        self.ancestor.is_none()
+        self.ancestors.is_empty()
             && self.parent_publication == Some(self.basis.system_time)
             && self.mode == (WorldClockMode::Held { start: self.basis.system_time })
     }
@@ -291,20 +346,12 @@ impl OwnedWorld {
                 Value::Binary(self.schemas.encoded.clone()),
             ),
         ]);
-        if let Some(ancestor) = &self.ancestor {
-            row.insert("ancestor".into(), Value::Struct(StructFields::from([
-                ("world".into(), Value::Uuid(ancestor.world)),
-                ("pin".into(), Value::Uuid(ancestor.pin)),
-                ("capture".into(), Value::Uuid(ancestor.capture)),
-                ("suffix".into(), Value::Uuid(ancestor.suffix)),
-                ("manifest".into(), Value::Utf8(ancestor.manifest.clone())),
-                ("basis_id".into(), Value::I64(ancestor.basis.tx_id.0)),
-                ("basis_time".into(), Value::I64(ancestor.basis.system_time.0)),
-                ("system".into(), Value::I64(ancestor.system.0)),
-                ("source_root_id".into(), Value::I64(ancestor.source_root.tx_id.0)),
-                ("source_root_time".into(), Value::I64(ancestor.source_root.system_time.0)),
-                ("logical".into(), Value::I64(ancestor.logical.0)),
-            ])));
+        if !self.ancestors.is_empty() {
+            let mut bytes = Vec::with_capacity(self.ancestors.len() * OwnedWorldAncestor::WIDTH);
+            for layer in &self.ancestors {
+                layer.encode(&mut bytes);
+            }
+            row.insert("ancestors".into(), Value::Binary(bytes));
         }
         if !self.fork_lineage.is_empty() {
             let mut bytes = Vec::with_capacity(self.fork_lineage.len() * OwnedWorldForkLink::WIDTH);
@@ -361,58 +408,43 @@ impl OwnedWorld {
             Some(Value::Uuid(id)) if *id != [0; 16] => Some(Iid(*id)),
             _ => return Err(Self::unavailable()),
         };
-        let ancestor = match row.get("ancestor") {
-            None | Some(Value::Null | Value::Undefined) => None,
-            Some(Value::Struct(fields)) if fields.len() == 11 => {
-                let uuid = |name| match fields.get(name) {
-                    Some(Value::Uuid(id)) if *id != [0; 16] => Ok(*id),
-                    _ => Err(Self::unavailable()),
-                };
-                let integer = |name| match fields.get(name) {
-                    Some(Value::I64(value)) => Ok(*value),
-                    _ => Err(Self::unavailable()),
-                };
-                let manifest = match fields.get("manifest") {
-                    Some(Value::Utf8(manifest)) if valid_manifest(manifest) => manifest.clone(),
-                    _ => return Err(Self::unavailable()),
-                };
-                let basis = TransactionKey {
-                    tx_id: TxId(integer("basis_id")?),
-                    system_time: Timestamp(integer("basis_time")?),
-                };
-                let source_root = TransactionKey {
-                    tx_id: TxId(integer("source_root_id")?),
-                    system_time: Timestamp(integer("source_root_time")?),
-                };
-                let logical = Timestamp(integer("logical")?);
-                let system = Timestamp(integer("system")?);
-                let world = uuid("world")?;
-                if world == *id || *pin != *id
-                    || (mode != WorldClockMode::Retained && mode != (WorldClockMode::Held { start: logical }))
-                    || basis.tx_id.0 <= *tx_id || basis.system_time.0 <= *time
-                    || basis.system_time.0 >= *until || system.0 <= *time || system > basis.system_time
-                    || logical <= inherited || logical == Timestamp::MAX
-                    || source_root.tx_id.0 < 0 || source_root.system_time.0 <= 0 || source_root.system_time.0 > *time
-                {
-                    return Err(Self::unavailable());
-                }
-                Some(OwnedWorldAncestor { world, pin: uuid("pin")?, capture: uuid("capture")?,
-                    suffix: uuid("suffix")?, manifest, basis, system, source_root, logical })
+        let ancestors = match row.get("ancestors") {
+            None | Some(Value::Null | Value::Undefined) => Vec::new(),
+            Some(Value::Binary(bytes)) if !bytes.is_empty() && bytes.len() % OwnedWorldAncestor::WIDTH == 0
+                && bytes.len() <= Self::MAX_FORK_CERTIFICATE_BYTES =>
+            {
+                bytes.chunks_exact(OwnedWorldAncestor::WIDTH).map(OwnedWorldAncestor::decode).collect::<Result<Vec<_>>>()?
             }
             _ => return Err(Self::unavailable()),
         };
+        let mut writers = BTreeSet::from([*id]);
+        let mut previous_system = Timestamp(*time);
+        let mut previous_logical = inherited;
+        for layer in &ancestors {
+            if !writers.insert(layer.world)
+                || *pin != *id || layer.basis.tx_id.0 <= *tx_id
+                || layer.basis.system_time.0 >= *until
+                || layer.system <= previous_system || layer.system > layer.basis.system_time
+                || layer.logical <= previous_logical || layer.logical == Timestamp::MAX
+                || layer.source_root.tx_id.0 < 0 || layer.source_root.system_time.0 <= 0
+                || layer.source_root.system_time.0 > *time
+            {
+                return Err(Self::unavailable());
+            }
+            previous_system = layer.system;
+            previous_logical = layer.logical;
+        }
         let fork_lineage = match row.get("fork_lineage") {
             None | Some(Value::Null | Value::Undefined) => Vec::new(),
             Some(Value::Binary(bytes)) if !bytes.is_empty() && bytes.len() % OwnedWorldForkLink::WIDTH == 0
-                && bytes.len() / OwnedWorldForkLink::WIDTH <= Self::MAX_FORK_LINEAGE =>
+                && bytes.len() <= Self::MAX_FORK_CERTIFICATE_BYTES =>
             {
                 bytes.chunks_exact(OwnedWorldForkLink::WIDTH).map(OwnedWorldForkLink::decode).collect::<Result<Vec<_>>>()?
             }
             _ => return Err(Self::unavailable()),
         };
-        let inherited = ancestor.as_ref().map_or(inherited, |overlay| overlay.logical);
-        Self::validate_fork_lineage(Iid(*id), mode, ancestor.as_ref(), inherited, &fork_lineage)?;
-        if row.len() != 12 + usize::from(row.contains_key("suffix")) + usize::from(row.contains_key("ancestor"))
+        Self::validate_fork_lineage(Iid(*id), mode, &ancestors, previous_logical, &fork_lineage)?;
+        if row.len() != 12 + usize::from(row.contains_key("suffix")) + usize::from(row.contains_key("ancestors"))
             + usize::from(row.contains_key("fork_lineage"))
             || *id == [0; 16] || *pin == [0; 16]
             || *capture == [0; 16]
@@ -422,7 +454,7 @@ impl OwnedWorld {
             return Err(Self::unavailable());
         }
         Ok(Self {
-            ancestor,
+            ancestors,
             fork_lineage,
             id: Iid(*id),
             pin: Iid(*pin),
@@ -446,7 +478,7 @@ impl OwnedWorld {
     }
 
     pub fn can_advance_to(&self, next: &Self) -> bool {
-        self.ancestor.is_none() && next.ancestor.is_none() && self.id == next.id
+        self.ancestors.is_empty() && next.ancestors.is_empty() && self.id == next.id
             && self.fork_lineage.is_empty() && next.fork_lineage.is_empty()
             && self.pin != next.pin
             && !self.dropped && !next.dropped
@@ -465,8 +497,8 @@ impl OwnedWorld {
 
     /// Retain the exact Root publication already held by this world.
     pub fn can_retain_parent(&self, next: &Self) -> bool {
-        self.ancestor.is_none()
-            && next.ancestor.is_none()
+        self.ancestors.is_empty()
+            && next.ancestors.is_empty()
             && self.mode != WorldClockMode::Proposal
             && self.parent_publication.is_some()
             && self.id != next.id
@@ -478,29 +510,28 @@ impl OwnedWorld {
             && self.same_parent_archive(next)
     }
 
-    /// A child takes its own custody of the source's exact media. The
-    /// hosted profile holds one frozen writer above its original Root.
+    /// A child owns the complete selected prefix, optionally freezing this writer.
     pub fn can_retain_overlay(&self, next: &Self) -> bool {
-        let Some(overlay) = &next.ancestor else { return false; };
-        let same_overlay = match &self.ancestor {
-            Some(inherited) => self.mode != WorldClockMode::Proposal
-                && inherited.world == overlay.world && inherited.pin == overlay.pin
-                && inherited.capture == overlay.capture && inherited.suffix == overlay.suffix
-                && inherited.manifest == overlay.manifest && inherited.basis == overlay.basis
-                && inherited.source_root == overlay.source_root
-                && inherited.covers(overlay.system, overlay.logical),
-            None => matches!(self.mode, WorldClockMode::Held { .. })
+        let Some((overlay, prefix)) = next.ancestors.split_last() else { return false; };
+        let source = if prefix == self.ancestors.as_slice() {
+            matches!(self.mode, WorldClockMode::Held { .. })
                 && self.id.0 == overlay.world && self.pin.0 == overlay.pin && self.basis == overlay.source_root
-                && overlay.system == overlay.basis.system_time,
+                && overlay.system == overlay.basis.system_time
+                && overlay.system > self.inherited_system() && overlay.logical > self.initial_clock()
+        } else {
+            self.mode != WorldClockMode::Proposal
+                && self.ancestors.get(..prefix.len()) == Some(prefix)
+                && self.ancestors.get(prefix.len()).is_some_and(|inherited|
+                    inherited.holds_same_media(overlay) && inherited.covers(overlay.system, overlay.logical))
         };
-        same_overlay && self.id != next.id && next.id == next.pin && !self.dropped && !next.dropped
+        source && self.id != next.id && next.id == next.pin && !self.dropped && !next.dropped
             && (next.mode == WorldClockMode::Retained
                 || next.mode == (WorldClockMode::Held { start: overlay.logical }))
             && next.until <= self.until && self.same_parent_archive(next)
     }
 
     fn shares_retained_archive(&self, next: &Self) -> bool {
-        self.ancestor.is_none() && next.ancestor.is_none() && self.pin != next.pin && !self.dropped && !next.dropped
+        self.ancestors.is_empty() && next.ancestors.is_empty() && self.pin != next.pin && !self.dropped && !next.dropped
             && self.fork_lineage == next.fork_lineage
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
             && self.same_parent_archive(next)
@@ -529,7 +560,7 @@ impl OwnedWorld {
     }
 
     pub fn same_fork(&self, other: &Self) -> bool {
-        self.id == other.id && self.ancestor == other.ancestor && self.fork_lineage == other.fork_lineage
+        self.id == other.id && self.ancestors == other.ancestors && self.fork_lineage == other.fork_lineage
             && self.pin == other.pin
             && self.capture == other.capture
             && self.suffix == other.suffix
@@ -629,7 +660,7 @@ mod tests {
     fn held_parent_retention_preserves_the_original_root_and_lease() -> Result<()> {
         let source = OwnedWorld {
             id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([2; 16]), suffix: None,
-            ancestor: None, fork_lineage: Vec::new(), manifest: "a".repeat(43),
+            ancestors: Vec::new(), fork_lineage: Vec::new(), manifest: "a".repeat(43),
             basis: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
             parent_publication: Some(Timestamp(100)), mode: WorldClockMode::Held { start: Timestamp(120) },
             until: Timestamp(300), schemas: WorldSchemas::new(BTreeMap::new())?, dropped: false,
@@ -666,17 +697,59 @@ mod tests {
     }
 
     #[test]
+    fn writable_forks_freeze_each_writer_and_can_select_an_earlier_prefix() -> Result<()> {
+        let mut source = OwnedWorld {
+            id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([31; 16]), suffix: None,
+            ancestors: Vec::new(), fork_lineage: Vec::new(), manifest: "a".repeat(43),
+            basis: TransactionKey { tx_id: TxId(1), system_time: Timestamp(10) },
+            parent_publication: Some(Timestamp(10)), mode: WorldClockMode::Held { start: Timestamp(10) },
+            until: Timestamp(600), schemas: WorldSchemas::new(BTreeMap::new())?, dropped: false,
+        };
+        for writer in 1..=12u8 {
+            let system = Timestamp(20 * i64::from(writer) + 10);
+            let mut next = source.clone();
+            next.id = Iid([writer + 1; 16]);
+            next.pin = next.id;
+            next.mode = WorldClockMode::Held { start: system };
+            next.ancestors.push(OwnedWorldAncestor {
+                world: source.id.0, pin: source.pin.0, capture: [31; 16], suffix: [32 + writer; 16],
+                manifest: "b".repeat(43), basis: TransactionKey { tx_id: TxId(i64::from(writer) + 1), system_time: system },
+                system, source_root: source.basis, logical: system,
+            });
+            assert!(source.can_retain_overlay(&next));
+            next.fork_lineage = source.retained_child_lineage(&next, Timestamp(system.0 - 1))?;
+            assert_eq!(OwnedWorld::from_record(&next.record())?, next);
+            source = next;
+        }
+        assert_eq!(source.ancestor_at(Timestamp(55)).unwrap().world, [3; 16]);
+        let mut child = source.clone();
+        child.id = Iid([14; 16]);
+        child.pin = child.id;
+        child.ancestors.truncate(3);
+        let selected = child.ancestors.last_mut().unwrap();
+        selected.system = Timestamp(55);
+        selected.logical = Timestamp(54);
+        child.mode = WorldClockMode::Held { start: Timestamp(54) };
+        assert!(source.can_retain_overlay(&child));
+        child.fork_lineage = source.retained_child_lineage(&child, Timestamp(255))?;
+        assert_eq!(OwnedWorld::from_record(&child.record())?, child);
+        child.ancestors.remove(1);
+        assert!(!source.can_retain_overlay(&child));
+        Ok(())
+    }
+
+    #[test]
     fn exact_held_ancestor_requires_independent_retained_child() -> Result<()> {
         let mut child = OwnedWorld {
             id: Iid([1; 16]), pin: Iid([1; 16]), capture: Iid([2; 16]), suffix: None,
-            ancestor: Some(OwnedWorldAncestor {
+            ancestors: vec![OwnedWorldAncestor {
                 world: [3; 16], pin: [3; 16], capture: [4; 16], suffix: [5; 16],
                 manifest: "b".repeat(43),
                 basis: TransactionKey { tx_id: TxId(20), system_time: Timestamp(200) },
                 system: Timestamp(200),
                 source_root: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
                 logical: Timestamp(150),
-            }),
+            }],
             fork_lineage: vec![OwnedWorldForkLink {
                 world: [3; 16], pin: [3; 16], registered: Timestamp(125),
                 system: Timestamp(200), logical: Timestamp(150),
@@ -702,8 +775,8 @@ mod tests {
         descendant.until = Timestamp(250);
         assert!(child.can_retain_overlay(&descendant));
         assert!(!limit.admits(&descendant, Timestamp(150)));
-        assert_eq!(descendant.ancestor, child.ancestor);
-        let selection = descendant.ancestor.as_mut().unwrap();
+        assert_eq!(descendant.ancestors, child.ancestors);
+        let selection = descendant.ancestors.last_mut().unwrap();
         selection.system = Timestamp(190);
         selection.logical = Timestamp(149);
         assert!(child.can_retain_overlay(&descendant));
@@ -714,12 +787,12 @@ mod tests {
         assert_eq!(reopened.fork_lineage[1].world, child.id.0);
         assert_eq!(reopened.fork_lineage[1].registered, Timestamp(225));
         assert_eq!(reopened.fork_lineage[1].logical, Timestamp(149));
-        descendant.ancestor.as_mut().unwrap().logical = Timestamp(150);
+        descendant.ancestors.last_mut().unwrap().logical = Timestamp(150);
         assert!(!child.can_retain_overlay(&descendant));
-        descendant.ancestor = child.ancestor.clone();
-        descendant.ancestor.as_mut().unwrap().suffix = [7; 16];
+        descendant.ancestors = child.ancestors.clone();
+        descendant.ancestors.last_mut().unwrap().suffix = [7; 16];
         assert!(!child.can_retain_overlay(&descendant));
-        descendant.ancestor = child.ancestor.clone();
+        descendant.ancestors = child.ancestors.clone();
         descendant.until = Timestamp(301);
         assert!(!child.can_retain_overlay(&descendant));
         descendant.until = Timestamp(250);
@@ -733,13 +806,13 @@ mod tests {
         assert!(OwnedWorld::from_record(&child.record()).is_err());
 
         child.mode = WorldClockMode::Retained;
-        child.ancestor.as_mut().expect("fixture contains an ancestor").logical = Timestamp(201);
+        child.ancestors.last_mut().expect("fixture contains an ancestor").logical = Timestamp(201);
         assert!(OwnedWorld::from_record(&child.record()).is_err());
         child.fork_lineage[0].logical = Timestamp(201);
         let retained = OwnedWorld::from_record(&child.record())?;
         assert_eq!(retained.initial_clock(), Timestamp(201));
         assert_eq!(retained.inherited_system(), Timestamp(200));
-        child.ancestor.as_mut().unwrap().logical = Timestamp::MAX;
+        child.ancestors.last_mut().unwrap().logical = Timestamp::MAX;
         child.fork_lineage[0].logical = Timestamp::MAX;
         assert!(OwnedWorld::from_record(&child.record()).is_err());
         Ok(())

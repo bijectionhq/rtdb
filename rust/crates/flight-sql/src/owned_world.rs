@@ -64,7 +64,7 @@ pub struct PreparedReplayParent {
 #[derive(serde::Serialize)]
 pub struct RetainedReplayWorld {
     pub pin: [u8; 16],
-    pub ancestor: Option<rtdb_types::OwnedWorldAncestor>,
+    pub ancestors: Vec<rtdb_types::OwnedWorldAncestor>,
     pub capture: [u8; 16],
     pub suffix: Option<[u8; 16]>,
     pub manifest: String,
@@ -121,6 +121,7 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>>;
     fn present(&self) -> Timestamp;
+    fn ancestors(&self) -> Vec<(rtdb_types::Iid, Timestamp)>;
     fn ancestor(&self) -> Option<(rtdb_types::Iid, Timestamp)>;
     /// Local logical reading and its ordered physical revision.
     fn application_publication(&self) -> Option<(Timestamp, Timestamp)>;

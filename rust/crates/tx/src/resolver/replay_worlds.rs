@@ -132,9 +132,10 @@ impl OpenTransaction<'_> {
         {
             return Err(unavailable());
         }
-        let ancestor = admission.retained_ancestor(&world)?.cloned();
-        if let Some(ancestor) = &ancestor {
-            let original = world.ancestor.as_ref().ok_or_else(unavailable)?.basis;
+        admission.require_retained_ancestors(&world)?;
+        for layer in &admission.ancestors {
+            let ancestor = &layer.retained;
+            let original = layer.original;
             let locator = format!("native-transaction/{}", original.tx_id.0);
             let (receipt, destination) = replay_control(context, &locator).await?;
             replayed_parent_logical_time(&receipt, admission.binding, &archive, original)?;
@@ -146,7 +147,7 @@ impl OpenTransaction<'_> {
             {
                 return Err(unavailable());
             }
-            let selected = admission.ancestor.as_ref().ok_or_else(unavailable)?.selected;
+            let selected = layer.selected;
             let locator = format!("native-transaction/{}", selected.tx_id.0);
             let (receipt, selected_destination) = replay_control(context, &locator).await?;
             replayed_parent_logical_time(&receipt, admission.binding, &archive, selected)?;
@@ -160,7 +161,7 @@ impl OpenTransaction<'_> {
             }
         }
         admission.require_application(&world, controls)?;
-        world.ancestor = ancestor;
+        world.ancestors = admission.ancestors.into_iter().map(|layer| layer.retained).collect();
         world.capture = Iid(admission.capture);
         world.suffix = admission.suffix.map(Iid);
         world.manifest = admission.manifest;
@@ -207,7 +208,7 @@ impl OpenTransaction<'_> {
             let previous =
                 rtdb_query::read_owned_world(Arc::clone(context), owner, world.id).await?;
             if world.basis.system_time > at || world.until <= logical
-                || world.ancestor.as_ref().is_some_and(|ancestor| ancestor.basis.system_time >= at)
+                || world.ancestors.iter().any(|ancestor| ancestor.basis.system_time >= at)
             {
                 return Err(OwnedWorld::unavailable());
             }
@@ -497,7 +498,7 @@ async fn require_replayed_fork_parent(
         rtdb_query::read_owned_world_with_revision(Arc::clone(context), owner, Iid(link.world))
             .await?
             .ok_or_else(unavailable)?;
-    let admits_child = if world.ancestor.is_some() {
+    let admits_child = if !world.ancestors.is_empty() {
         source.can_retain_overlay(world)
     } else {
         source.can_retain_parent(world)
@@ -517,7 +518,7 @@ async fn require_replayed_fork_parent(
     {
         return Err(unavailable());
     }
-    if let Some(ancestor) = &world.ancestor {
+    for ancestor in &world.ancestors {
         require_replayed_held_publication(context, owner, replay, ancestor).await?;
     }
     Ok(())

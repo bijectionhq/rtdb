@@ -654,8 +654,7 @@ pub struct CheckpointWorldAncestor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointWorldRetention {
     pub world: uuid::Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ancestor: Option<CheckpointWorldAncestor>,
+    pub ancestors: Vec<CheckpointWorldAncestor>,
     pub owner: String,
     pub capture: uuid::Uuid,
     pub manifest_sha256: String,
@@ -672,13 +671,13 @@ pub struct CheckpointWorldRetention {
 impl CheckpointWorldRetention {
     pub fn retains_capture(&self, capture: uuid::Uuid, now: rtdb_types::Timestamp) -> bool {
         self.until > now && (self.capture == capture
-            || self.ancestor.as_ref().is_some_and(|ancestor| ancestor.capture == capture))
+            || self.ancestors.iter().any(|ancestor| ancestor.capture == capture))
     }
 
     fn retains_suffix(&self, suffix: uuid::Uuid, pin: &CheckpointSuffixPin, now_ms: i64) -> bool {
         self.until.0 > now_ms.saturating_mul(1000)
             && ((self.suffix == Some(suffix) && self.capture == pin.capture)
-                || self.ancestor.as_ref().is_some_and(|ancestor|
+                || self.ancestors.iter().any(|ancestor|
                     ancestor.suffix == suffix && ancestor.capture == pin.capture && ancestor.basis == pin.basis
                         && ancestor.manifest_sha256 == pin.manifest_sha256))
     }

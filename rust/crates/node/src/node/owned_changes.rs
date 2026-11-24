@@ -38,6 +38,43 @@ impl OwnedMergedChanges {
             .ok_or_else(change_feed_uncovered)
     }
 
+    /// Join a later scan band after this band's certified edge, in scan order.
+    /// If the next whole band exceeds the page budget, resume from the last emitted group.
+    pub fn append_archive_band(&mut self, mut next: Self, reverse: bool) -> Result<()> {
+        if !self.complete
+            || next.commits.first().is_some_and(|commit| {
+                if reverse { commit.revision > self.complete_boundary } else { commit.revision <= self.complete_boundary }
+            })
+        {
+            return Err(change_feed_uncovered());
+        }
+        if next.commits.is_empty() {
+            if !next.complete { return Err(change_feed_uncovered()); }
+            self.complete_boundary = next.complete_boundary;
+            return Ok(());
+        }
+        if self.commits.is_empty() {
+            *self = next;
+            return Ok(());
+        }
+        if next.retained_bytes > OWNED_CHANGE_PAGE_BYTES - self.retained_bytes {
+            self.complete = false;
+            return Ok(());
+        }
+        self.retained_bytes += next.retained_bytes;
+        self.commits.append(&mut next.commits);
+        self._reservations.append(&mut next._reservations);
+        self.complete_boundary = next.complete_boundary;
+        self.complete = next.complete;
+        Ok(())
+    }
+
+    pub fn stop_at_last_group(&mut self) -> Result<()> {
+        if self.commits.is_empty() { return Err(change_feed_uncovered()); }
+        self.complete = false;
+        Ok(())
+    }
+
     /// A single-relation page carries its examined coverage independently of visible groups.
     pub fn into_relation_page(self) -> Result<OwnedChangePage> {
         let covered_through = self.covered_through()?;

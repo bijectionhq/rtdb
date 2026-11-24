@@ -1511,7 +1511,7 @@ impl OwnedReadSession {
             return Err(unavailable());
         }
         if !(1..=32).contains(&world.schemas.relations().count()) { return Err(unavailable()); }
-        let clock = match (&world.ancestor, archived) {
+        let clock = match (world.ancestor_at(system), archived) {
             (Some(ancestor), Some(archived)) if world.mode != rtdb_types::WorldClockMode::Proposal
                 && ancestor.basis.system_time < self.present.system_time =>
                 archived.reading(ancestor, system)?,
@@ -1538,7 +1538,7 @@ impl OwnedReadSession {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let mut cut = self.fork_cut(scope).await?;
         if cut.live.is_none_or(|live| world.basis.system_time >= live.system_time || world.basis.tx_id >= live.tx_id)
-            || world.ancestor.is_some() || world.dropped
+            || !world.ancestors.is_empty() || world.dropped
             || world.mode == rtdb_types::WorldClockMode::Proposal
             || world.parent_publication.is_none()
             || !(1..=32).contains(&world.schemas.relations().count())
@@ -1729,7 +1729,7 @@ impl OwnedReadSession {
         &self, world: &rtdb_types::OwnedWorld, relations: &[rtdb_types::OwnedRelation], system: Timestamp,
     ) -> Result<Timestamp> {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
-        if system <= world.basis.system_time { return Err(unavailable()); }
+        if system <= world.inherited_system() { return Err(unavailable()); }
         let context = self.admit_world_accepted_scope(world, relations, system).await?;
         let context = context.with_owned_system_cut(system, &context.cancellation)?;
         let (registration, _schema) = rtdb_query::read_owned_world(Arc::clone(&context), &self.owner, world.id)
@@ -1751,13 +1751,13 @@ impl OwnedReadSession {
         let unavailable = rtdb_types::OwnedWorld::unavailable;
         let context = self.admit_world_accepted_scope(world, relations, self.present.system_time).await?;
         let selected = rtdb_query::select_owned_world_clock(
-            &context, &self.owner, world.id, world.basis.system_time, world.initial_clock(), requested,
+            &context, &self.owner, world.id, world.inherited_system(), world.initial_clock(), requested,
         ).await?;
         if let Some((system, reading)) = selected {
             let confirmed = self.certify_world_accepted_scope(world, relations, system).await?;
             if confirmed != reading { return Err(unavailable()); }
         } else {
-            self.admit_world_accepted_scope(world, relations, world.basis.system_time).await?;
+            self.admit_world_accepted_scope(world, relations, world.inherited_system()).await?;
         }
         Ok(selected)
     }
@@ -1771,7 +1771,7 @@ impl OwnedReadSession {
         if !(1..=32).contains(&relations.len()) || !world.mode.is_writable() || world.dropped
             || relations.iter().any(|relation| !relation.is_root_data() || world.schemas.relation(relation)
                 .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
-            || system < world.basis.system_time || system > self.present.system_time
+            || system < world.inherited_system() || system > self.present.system_time
         {
             return Err(unavailable());
         }
@@ -3126,7 +3126,7 @@ impl NativeSession {
         let retaining_child = root == OwnedForkRoot::None && fork.previous.is_none()
             && fork.sibling.is_none();
         let can_seed_root = matches!(fork.requested, WorldClockRequest::Retained | WorldClockRequest::Held { start: None });
-        let matches_archive = match (&record.ancestor, overlay_source) {
+        let matches_archive = match (record.ancestor(), overlay_source) {
             (None, None) => fork.cut.matches_basis(record.basis)
                 && parent_source.is_none_or(|(source, _)| retaining_child && can_seed_root && record.id != source),
             (Some(ancestor), Some((source, _, clock))) => record.id != source && ancestor.logical == clock

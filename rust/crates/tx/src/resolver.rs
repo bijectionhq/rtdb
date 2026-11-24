@@ -1844,7 +1844,7 @@ impl<'a> OpenTransaction<'a> {
                         }
                         if let Some((source_id, source_pin)) = overlay_source {
                             if with_root || previous.is_some() || sibling.is_some()
-                                || world.ancestor.as_ref().is_some_and(|ancestor|
+                                || world.ancestors.iter().any(|ancestor|
                                     ancestor.basis.system_time >= self.tx_key().system_time
                                         || ancestor.basis.tx_id >= self.tx_key().tx_id)
                             {
@@ -1854,7 +1854,7 @@ impl<'a> OpenTransaction<'a> {
                             let context = self.context.query_context(base, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
                             let (source, registered, _charge) = rtdb_query::read_owned_world_with_revision(Arc::clone(&context), owner, *source_id)
                                 .await?.ok_or_else(unavailable)?;
-                            let admits_child = if world.ancestor.is_some() {
+                            let admits_child = if !world.ancestors.is_empty() {
                                 source.can_retain_overlay(&world)
                             } else {
                                 source.can_retain_parent(&world)
@@ -1868,9 +1868,8 @@ impl<'a> OpenTransaction<'a> {
                             // The live writer can independently certify the actual local
                             // publication. A retained alias owns its original archive
                             // through the directory even after the writer's live history is gone.
-                            if let Some(ancestor) = &world.ancestor
-                                && matches!(source.mode, WorldClockMode::Held { .. })
-                                && source.ancestor.is_none()
+                            if let Some(ancestor) = world.ancestor()
+                                && ancestor.world == source.id.0
                             {
                                 let (original, reading, _charge) = rtdb_query::read_held_world_publication(
                                     &context, owner, source.id, ancestor.system,
@@ -1879,7 +1878,7 @@ impl<'a> OpenTransaction<'a> {
                                     return Err(unavailable());
                                 }
                             }
-                        } else if world.ancestor.is_some()
+                        } else if !world.ancestors.is_empty()
                             || (previous.is_none() && !world.fork_lineage.is_empty())
                         {
                             return Err(unavailable());
@@ -4001,7 +4000,7 @@ mod tests {
         for (mode, valid) in [(WorldClockMode::Proposal, Timestamp(200)), (WorldClockMode::Held { start: Timestamp(100) }, Timestamp(101))] {
             let world = Iid([1; 16]);
             let record = OwnedWorld {
-                ancestor: None,
+                ancestors: Vec::new(),
                 fork_lineage: Vec::new(),
                 id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
                 manifest: "a".repeat(43), basis: cut, parent_publication: None,
@@ -4102,7 +4101,7 @@ mod tests {
         };
         for mode in [WorldClockMode::Proposal, WorldClockMode::Held { start: cut.system_time }] {
             let record = OwnedWorld {
-                ancestor: None, fork_lineage: Vec::new(), id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
+                ancestors: Vec::new(), fork_lineage: Vec::new(), id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None,
                 manifest: "a".repeat(43), basis: cut, parent_publication: None, mode,
                 until: Timestamp(1000), dropped: false,
                 schemas: WorldSchemas::new(BTreeMap::from([(relation.name().into(), schema.clone())]))?,
@@ -4195,7 +4194,7 @@ mod tests {
         let world = Iid([1; 16]);
         let overlay = relation.in_world(world)?;
         let record = OwnedWorld {
-            ancestor: None,
+            ancestors: Vec::new(),
             fork_lineage: Vec::new(),
             id: world, pin: Iid([2; 16]), capture: Iid([3; 16]), suffix: None, manifest: "a".repeat(43),
             basis: cut, parent_publication: None, mode: WorldClockMode::Proposal, until: Timestamp(1000), dropped: false,

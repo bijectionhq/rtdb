@@ -421,11 +421,14 @@ variant TxMessage : SourceMessage {
     -- Held writer's actual clock publication. Its source receipt binds the exact
     -- writer pin, Root basis, accepted reading and physical transaction. If the
     -- retained archive extends further, that media end has its own source receipt.
-    -- A Held child may publish over one frozen writer and its original Root.
-    -- The child owns separate pins for both preserved media and has an independent
-    -- local journal. Reads resolve the child's shadow, then the frozen writer's
-    -- shadow, then the held Root. A tombstone stops resolution in either writer.
-    -- Forks from a publication that would freeze two writers are unavailable.
+    -- A Held child can retain the frozen writer prefix at any admitted publication.
+    -- Retaining its parent's local publication adds that writer's own frozen layer.
+    -- The child holds the exact media of every selected layer and the Root, with
+    -- an independent local journal. Reads resolve writers newest first and then
+    -- the held Root. A tombstone stops the search for that identity.
+    -- Each writer's feed owns the interval after its inherited cut through its
+    -- selected publication. Replay relocates and verifies each cut independently.
+    -- The encoded fork certificate and installed custody capacity bound admission.
     -- The fork inherits the archived publication's clock while Root witnesses validate at ordering.
     -- A reviewed Proposal landing must consume an offered Root clock slot before any of its effects can publish.
     -- The slot's reading binds the Root writes, ordered predicates and landing outcome.
