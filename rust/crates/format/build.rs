@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Prost resolves a map's synthetic value field under the containing message.
         ".xtdb.log.proto.ResolvedTx.value", ".xtdb.log.proto.ResolvedTx.error",
         ".xtdb.log.proto.ResolvedTx.placed_attempt", ".xtdb.log.proto.ResolvedTx.search_delta",
+        ".xtdb.log.proto.NoOp.serving_record",
     ]);
     config.include_file("xtdb.rs");
     for field in ["Listy.el", "FixedSizeList.el", "MapType.el", "Maybe.mono", "ColumnMeta.type",

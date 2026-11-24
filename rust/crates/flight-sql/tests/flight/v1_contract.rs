@@ -1182,3 +1182,73 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
     assert!(erased.value(0));
     running.stop().await;
 }
+
+#[tokio::test]
+async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_checkpoint() {
+    use rtdb_node::serving::NativeServingAuthority;
+    use rtdb_types::rtdb_v1::{Basis, ClaimSealer};
+
+    let incarnation = [27; 16];
+    let resources = rtdb_node::NativeResources::default().with_native_serving_authority("xtdb", NativeServingAuthority {
+        incarnation, claims: Arc::new(ClaimSealer::new(incarnation, [8; 32])), checkpoints: None,
+    });
+    let mut options = rtdb_node::NodeOptions::default();
+    options.replication.rows_per_block = 2;
+    let running = Running::start_with_resources(None, FlightConfig::default(), &[], None, options, None, Some(Arc::new(resources))).await;
+    let database = running.node.catalog().database("xtdb").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let put = |branch: &str, id| v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+        branch: branch.into(), table: "public.native_branch".into(), if_absent: false,
+        rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(id * 10))].into_iter().collect() }],
+    })) };
+    let first = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![1; 16], ops: vec![put("main", 1)], ..Default::default()
+    }).await.unwrap();
+    let mut read = input("SELECT n FROM native_branch ORDER BY n");
+    read.track = true;
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.clone().map(Selection::AtLeast) });
+    let (rows, main) = query(&mut client, read.clone()).await;
+    assert_eq!(ints(&rows), [10]);
+    assert_eq!(main.basis, first.basis);
+    let validated = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![2; 16],
+        guards: vec![v1::Guard { guard: Some(v1::guard::Guard::Unchanged(main.claim.unwrap())) }],
+        ..Default::default()
+    }).await.unwrap();
+    assert_eq!(validated.basis, first.basis);
+    let second_request = v1::TransactRequest {
+        key: vec![3; 16],
+        ops: vec![v1::Op { op: Some(v1::op::Op::Fork(v1::Fork {
+            child: "trial".into(), writable: true, expires_at_micros: None,
+            from: Some(v1::BranchBasis { branch: "main".into(), basis: first.basis.clone() }),
+        })) }, put("trial", 2)],
+        ..Default::default()
+    };
+    let second = transact_wire(&mut client, second_request.clone()).await.unwrap();
+    assert_eq!(Basis::from_bytes(&second.basis.as_ref().unwrap().value).unwrap(), Basis::new(incarnation, 2));
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: second.basis.clone().map(Selection::AtLeast) });
+    read.source.as_mut().unwrap().branch = "trial".into();
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [10, 20]);
+    read.source.as_mut().unwrap().layer = v1::Layer::Local as i32;
+    assert_eq!(ints(&query(&mut client, read).await.0), [20]);
+    let (changes, coverage) = get::<_, v1::ChangesTrailer>(&mut client, v1::ChangesRequest {
+        branch: "trial".into(), tables: vec!["public.native_branch".into()], limit: 1,
+        after: first.basis, images: v1::Images::Both as i32, ..Default::default()
+    }).await.unwrap();
+    assert_eq!(changes.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(coverage.through, second.basis);
+
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        status.adopted_block.as_ref().is_some_and(|block| block.as_proto().serving_checkpoint.is_some())
+    })).await.unwrap().unwrap();
+    let status_reply = client.action("rtdb.v1.TxStatus", v1::TxStatusRequest { key: vec![3; 16] }.encode_to_vec().into()).await.unwrap();
+    assert_eq!(v1::Receipt::decode(status_reply[0].body.clone()).unwrap().basis, second.basis);
+    let replay = transact_wire(&mut client, second_request).await.unwrap();
+    assert_eq!(replay.basis, second.basis);
+    assert!(replay.replayed);
+    running.stop().await;
+}

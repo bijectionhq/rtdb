@@ -92,6 +92,8 @@ message NoOp {
 
     // A placed receiver's reservation does not advance applied source progress.
     bytes placed_slot_reservation = 2;
+    // An applied-branch record occupies a replica position without consuming the Classic source log.
+    bytes serving_record = 3;
 }
 
 // Stands in for a message the log declined for its size: the encoded message is in the

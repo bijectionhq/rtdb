@@ -24,6 +24,8 @@ use crate::logs::{APPEND_CAPACITY, DecodedReplica, PartitionReplay, STRICT_DISPA
 use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
+use crate::serving::{self, NativeServing, NativeServingAuthority, NativeServingHandle, TransactSubmission};
+use rtdb_tx::transact::Receipt as ServingReceipt;
 
 #[async_trait]
 pub trait DatabaseEffects: Send + Sync {
@@ -133,6 +135,28 @@ impl ReplicationHandle {
     }
     pub async fn await_tx(&self, id: TxId, cancellation: &CancellationToken) -> Result<Option<Arc<TransactionResult>>> { self.progress.await_tx(id, cancellation).await }
     pub async fn await_source(&self, position: SourcePosition, cancellation: &CancellationToken) -> Result<()> { self.progress.await_source(position, cancellation).await }
+    pub(crate) async fn serving_barrier(&self, cancellation: &CancellationToken) -> Result<()> {
+        let required = self.logs.latest_replica_position()?;
+        let mut status = self.watch_status();
+        let reached = cancellation.run_until_cancelled(status.wait_for(|status| {
+            status.role == Role::Stopped || status.installed.is_some_and(|prefix| prefix.replica >= required)
+        })).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
+        if reached.role == Role::Stopped { return Err(serving::unavailable()); }
+        Ok(())
+    }
+    pub(crate) async fn serving_transact(&self, request: TransactSubmission, cancellation: &CancellationToken) -> Result<ServingReceipt> {
+        let term = self.term().ok_or_else(serving::unavailable)?.term();
+        let (completion, receipt) = oneshot::channel();
+        cancellation.run_until_cancelled(self.commands.send(Command::ServingWrite { term, request, completion })).await
+            .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
+        cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::interrupted())?
+    }
+    pub(crate) async fn serving_status(&self, key: Vec<u8>, cancellation: &CancellationToken) -> Result<ServingReceipt> {
+        let (completion, receipt) = oneshot::channel();
+        cancellation.run_until_cancelled(self.commands.send(Command::ServingStatus { key, completion })).await
+            .ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?;
+        cancellation.run_until_cancelled(receipt).await.ok_or_else(serving::interrupted)?.map_err(|_| serving::unavailable())?
+    }
     pub async fn flush(&self) -> Result<SourcePosition> {
         let expected = self.partition.value().table_catalog().block_index().map_or(-1, |block| block.0);
         self.submit_source(&SourceMessage::Protobuf(SourceBody::FlushBlock(proto::FlushBlock { expected_block_idx: Some(expected) })), (self.clock)()).await
@@ -266,17 +290,21 @@ impl ExternalReceipt {
 }
 
 enum Command {
+    ServingWrite { term: Term, request: TransactSubmission, completion: serving::Completion },
+    ServingStatus { key: Vec<u8>, completion: serving::Completion },
     ResetCompactor { term: Term, primary: PublishedPrimaryReset, reservations: Arc<[Arc<MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
     Retire { term: Term, tables: Vec<TableRef>, as_of: Timestamp, completion: oneshot::Sender<Result<Applied>> },
     External { term: Term, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>, completion: oneshot::Sender<Result<Applied>> },
 }
 impl Command {
-    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::Retire { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } => *term } }
+    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::Retire { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } | Self::ServingWrite { term, .. } => *term, Self::ServingStatus { .. } => Term(0) } }
     fn fail(self, error: Anomaly) {
         match self {
             Self::Delete { completion, .. } | Self::Retire { completion, .. } | Self::External { completion, .. } => { let _ = completion.send(Err(error)); }
             Self::ResetCompactor { completion, .. } => { let _ = completion.send(Err(error)); }
+            Self::ServingWrite { completion, .. } => { let _ = completion.send(Err(serving::interrupted())); }
+            Self::ServingStatus { completion, .. } => { let _ = completion.send(Err(error)); }
         }
     }
 }
@@ -448,6 +476,7 @@ pub struct ReplicationDriver {
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     serving_search: Option<Arc<dyn ServingSearchBuilder>>,
+    serving: Option<NativeServing>,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
     track_catalog_cut: bool,
@@ -507,7 +536,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -515,7 +544,23 @@ impl ReplicationDriver {
         self
     }
 
+    pub async fn attach_native_serving(&mut self, replication: ReplicationHandle, authority: NativeServingAuthority, collect_checkpoints: bool) -> Result<NativeServingHandle> {
+        let block = self.status.borrow().adopted_block.clone();
+        let checkpoint = match &block {
+            Some(block) => authority.read_checkpoint(self.blocks.object_store(), block.as_proto().serving_checkpoint.as_deref(),
+                block.as_proto().serving_checkpoint_object.as_deref()).await?,
+            None => None,
+        };
+        let (serving, view) = NativeServing::open(authority.clone(), checkpoint.as_deref(), collect_checkpoints)?;
+        if block.as_ref().and_then(|block| block.latest_completed_tx()).is_some() {
+            serving.mark_classic_writes();
+        }
+        self.serving = Some(serving);
+        Ok(NativeServingHandle { replication, view, authority })
+    }
+
     async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>) -> Result<()> {
+        if let Some(serving) = &self.serving { serving.mark_classic_writes(); }
         let Some(builder) = &self.serving_search else { return self.partition.apply(write); };
         let prepared = self.partition.prepare_write(write)?;
         let search = builder.install_delta(prepared.snapshot(), write, search_delta, &self.cancellation).await?;
@@ -895,6 +940,7 @@ impl ReplicationDriver {
     }
     async fn demote(&mut self) -> Result<VecDeque<AdmittedReplica>> {
         self.deferred_cut = false;
+        if let Some(serving) = &mut self.serving { serving.withdraw(); }
         if let Some(mut leader) = self.leader.take() {
             leader.cancellation.cancel();
             drop(leader.compactor_reset.take());
@@ -1161,7 +1207,7 @@ impl ReplicationDriver {
 
     async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
         if matches!(&record.envelope.message, ReplicaBody::NoOp(message)
-            if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none()) { return Ok(()); }
+            if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none() && message.serving_record.is_none()) { return Ok(()); }
         if let Some(leader) = &mut self.leader {
             if leader.resolution.is_some() {
                 let bytes = leader.held_bytes.checked_add(record.retained_bytes()).ok_or_else(|| invalid("Resolution read-back buffer size overflow"))?;
@@ -1356,7 +1402,13 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => {
-                    if let Some(wire) = message.placed_slot_reservation.as_deref() {
+                    if let Some(frame) = message.serving_record.as_deref() {
+                        if message.src_msg_id.is_some() || message.placed_slot_reservation.is_some() || self.placed_slot.is_some() {
+                            return Err(invalid("A serving record occupies its own replica position"));
+                        }
+                        let own = self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term);
+                        self.serving.as_mut().ok_or_else(serving::unavailable)?.apply(frame, own)?;
+                    } else if let Some(wire) = message.placed_slot_reservation.as_deref() {
                         if message.src_msg_id.is_some() || self.placed_slot.is_some() {
                             return Err(invalid("Placed receiver reservations must occupy a fresh control position"));
                         }
@@ -1457,9 +1509,10 @@ impl ReplicationDriver {
         let search = self.serving_search.clone();
         let leader = self.leader.as_mut().ok_or_else(|| invalid("Follower attempted block production"))?;
         if leader.production.is_some() { return Err(invalid("Block production is already running")); }
+        let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(leader.term, leader.confirmed)).transpose()?;
         let cancellation = leader.cancellation.clone();
         leader.production = Some(Production::Writing(Box::pin(async move {
-            blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref()).await
+            blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref(), serving_checkpoint).await
         })));
         Ok(())
     }
@@ -1672,6 +1725,7 @@ impl ReplicationDriver {
         let record = ReplicaBody::NoOp(proto::NoOp {
             src_msg_id: None,
             placed_slot_reservation: Some(reservation.encode()),
+            ..Default::default()
         });
         leader.enqueue(WriteBody::Message(record), self.partition.value().live().block_index(), None, &self.resolve.memory)?;
         leader.awaiting_placed = Some(source);
@@ -1841,11 +1895,41 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
+        if let Command::ServingStatus { key, completion } = command {
+            let status = self.serving.as_ref().ok_or_else(serving::unavailable).and_then(|serving| serving.status(&key));
+            let _ = completion.send(status);
+            return Ok(());
+        }
         let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some();
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
+            Command::ServingStatus { .. } => unreachable!("handled before checking the writer term"),
+            Command::ServingWrite { term, request, completion } => {
+                let Some(serving) = &mut self.serving else {
+                    let _ = completion.send(Err(serving::unavailable()));
+                    return Ok(());
+                };
+                let mut requests = vec![(request, completion)];
+                if leader.deferred_commands.is_empty() {
+                    while requests.len() < 64 {
+                        match self.commands.try_recv() {
+                            Ok(Command::ServingWrite { term: admitted, request, completion }) if admitted == term => requests.push((request, completion)),
+                            Ok(command) => { leader.deferred_commands.push_back(command); break; }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let block = self.partition.value().live().block_index();
+                let messages = serving.decide_batch((self.clock)(), requests)?;
+                leader.cycle.resolved(messages.len() as u64)?;
+                for message in messages {
+                    leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;
+                }
+                if leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+                Ok(())
+            }
             Command::ResetCompactor { primary, reservations, completion, .. } => {
                 let value = self.partition.value();
                 if !leader.confirmed || !leader.pending.is_empty() || self.pending_block.is_some() || leader.production.is_some() || leader.compactor_reset.is_some()

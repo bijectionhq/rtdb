@@ -1,15 +1,16 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use rtdb_index::{Snapshot, branches::BranchCut};
-use rtdb_tx::transact::{Receipt, Transact};
+use rtdb_tx::transact::Receipt;
+pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority, TransactSubmission};
 use rtdb_types::{
     EntityId, Interval, Result, StructFields, TableRef, Timestamp, Value,
     rtdb_v1::{At, Basis, Branch, Claim, Layer},
 };
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
+
+pub(crate) mod default;
 
 pub struct QuerySource {
     pub branch: Branch,
@@ -23,12 +24,6 @@ pub struct QueryView {
     pub claim: Option<Claim>,
 }
 
-pub struct TransactSubmission {
-    pub transaction: Transact,
-    pub attempt: Uuid,
-    pub submitted_at: Timestamp,
-    pub source: Bytes,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ChangeOrder {
