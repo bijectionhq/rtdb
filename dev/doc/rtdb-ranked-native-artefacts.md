@@ -23,6 +23,13 @@ It reopens the immutable object, checks the footer and directory against the rec
 The check reports current-trie generation coverage.
 The native v1 query still uses the exact SQL route until a mounted shortlist reader can report the realized method for that query.
 
+## Full-text build and readback
+
+The ordered search projection in `xt.native_search_builds` feeds analyzer, history and ordered columns to the existing full-text artefact lane.
+Default can prove an exact selected placement for format 13 postings with the recorded owner, file size, authenticated footer and posting checksums.
+Other search formats remain false until their owner can prove the equivalent complete coverage.
+Logical search needs a proof for the run, forward witness and primary inventory together.
+
 ## Readiness dependencies
 
 The native Default read builds its SQL snapshot from the selected branch fold.
@@ -33,7 +40,7 @@ The checker verifies the file length, digest, and Arrow layout within the existi
 An empty persisted inventory, a live tail, missing or invalid objects, unmatched cuts, and routes without this association report false.
 
 Multi's committed view returns the native fold and key generation, and the native query snapshot constructs its own live rows.
-Multi needs a committed primary catalogue and an artefact publication under its existing writer and storage authority before the same spatial or IVF proof can be made.
+Multi needs a committed primary catalogue and an artefact publication under its existing writer and storage authority before the same proof can be made.
 The reader needs the associated storage generation and a retained read on the selected catalogue.
 
 Negotiate `query.ranked-artefact-readiness` and set `verify_ranked_artefacts = true` (QueryRequest field 10) along with the clear exact-cut guard and tracking.

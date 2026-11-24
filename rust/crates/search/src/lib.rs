@@ -3,6 +3,7 @@
 
 pub mod accelerate;
 pub mod definitions;
+mod readiness;
 pub mod file;
 pub mod lane;
 mod held_corpus;
@@ -19,6 +20,7 @@ mod delta;
 
 pub use file::{DocMatch, FORMAT_VERSION, MemberMatches, SearchFile, SearchRow, Source, build_search_file, write_group_search_file};
 pub use definitions::{SearchDefinition, definitions_in};
+pub use readiness::committed_native_ready;
 pub use lane::{GROUP_BYTES, KIND, SearchArtefacts, SearchBuilder, search_pages};
 pub use accelerate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, SearchAccelerator, owned_corpus, owned_ranked, owned_ranked_with_overlay, owned_ranked_overlay_batch};
 pub use held_corpus::{HeldTextCorpus, TextShadows, owned_search_analyzer, owned_text_column};

@@ -6,7 +6,7 @@ use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut,
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
-    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SPATIAL_BUILD_CATALOG, VECTOR_BUILD_CATALOG, ranked_build_id}};
+    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SEARCH_BUILD_CATALOG, SPATIAL_BUILD_CATALOG, VECTOR_BUILD_CATALOG, ranked_build_id}};
 use tokio_util::sync::CancellationToken;
 
 pub(super) fn data_table(table: &TableRef) -> bool {
@@ -185,9 +185,9 @@ fn stage_ranked_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &m
     let _scratch = memory.reserve(declarations.clone().count().saturating_mul(128))?;
     let final_tables: BTreeMap<_, _> = declarations.collect();
     let catalog = |kind: &RankedIndexKind| match kind {
-        RankedIndexKind::Search { .. } => None,
-        RankedIndexKind::Spatial { .. } => Some(SPATIAL_BUILD_CATALOG),
-        RankedIndexKind::Ivf { .. } => Some(VECTOR_BUILD_CATALOG),
+        RankedIndexKind::Search { .. } => SEARCH_BUILD_CATALOG,
+        RankedIndexKind::Spatial { .. } => SPATIAL_BUILD_CATALOG,
+        RankedIndexKind::Ivf { .. } => VECTOR_BUILD_CATALOG,
     };
     for (table, final_definition) in final_tables {
         let old = prior.definition(table, prior.head().basis).filter(|definition| !definition.dropped);
@@ -195,15 +195,15 @@ fn stage_ranked_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &m
         let id = |name: &str| ranked_build_id(table, name);
         if let Some(old) = old {
             for (name, declaration) in &old.ranked_indexes {
-                if let Some(catalog_name) = catalog(&declaration.definition.kind)
-                    && final_indexes.get(name).and_then(|index| catalog(&index.definition.kind)) != Some(catalog_name)
+                let catalog_name = catalog(&declaration.definition.kind);
+                if final_indexes.get(name).map(|index| catalog(&index.definition.kind)) != Some(catalog_name)
                 {
                     buffer.delete(TableRef::new("xt", catalog_name), &EntityId::String(id(name)), Interval::ALL)?;
                 }
             }
         }
         for (name, declaration) in final_indexes {
-            let Some(catalog) = catalog(&declaration.definition.kind) else { continue; };
+            let catalog = catalog(&declaration.definition.kind);
             if old.and_then(|old| old.ranked_indexes.get(name)) == Some(declaration) { continue; }
             let Ok(generation) = i64::try_from(declaration.position) else { continue; };
             let mut row = StructFields::from([
@@ -227,7 +227,11 @@ fn stage_ranked_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &m
                     row.insert("method".into(), Value::Utf8("ivf".into()));
                     row.insert("recall".into(), Value::F64(f64::from_bits(*recall_bits)));
                 }
-                RankedIndexKind::Search { .. } => continue,
+                RankedIndexKind::Search { analyzer, history } => {
+                    row.insert("columns".into(), Value::list(columns.iter().cloned().map(Value::Utf8).collect()));
+                    row.insert("analyzer".into(), Value::Utf8(analyzer.clone()));
+                    row.insert("history".into(), Value::Bool(*history));
+                }
             }
             buffer.put(TableRef::new("xt", catalog), row, Interval::ALL)?;
         }
@@ -286,7 +290,7 @@ mod tests {
     use rtdb_types::{EventOp, Value};
 
     #[test]
-    fn the_ordered_native_spatial_definition_stages_its_generation_and_withdraws_on_drop() {
+    fn ordered_native_ranked_definitions_stage_their_generations_and_withdraw_on_drop() {
         use rtdb_index::branches::{RankedIndexDeclaration, RankedIndexDefinition};
         use rtdb_tx::transact::Outcome;
 
@@ -297,13 +301,14 @@ mod tests {
         let mut index = BranchIndex::new([7; 16]);
         let basis = Basis::new([7; 16], 20);
         let define = BranchEffect::Declare { table: table.clone(), definition: BranchTable {
-            ranked_indexes: [("by_geometry".into(), RankedIndexDeclaration {
-                definition: RankedIndexDefinition {
-                    columns: vec!["geometry".into(), "region".into()],
-                    kind: RankedIndexKind::Spatial { geometry_encoding: "tagged-wkb-v1".into() },
-                },
+            ranked_indexes: [
+                ("by_geometry", "geometry", RankedIndexKind::Spatial { geometry_encoding: "tagged-wkb-v1".into() }),
+                ("by_text", "body", RankedIndexKind::Search { analyzer: "english".into(), history: true }),
+                ("by_vector", "embedding", RankedIndexKind::Ivf { dimensions: 3, recall_bits: 0.75f64.to_bits() }),
+            ].map(|(name, column, kind)| (name.into(), RankedIndexDeclaration {
+                definition: RankedIndexDefinition { columns: vec![column.into(), "region".into()], kind },
                 position: basis.position(),
-            })].into(),
+            })).into(),
             ..Default::default()
         }};
         let receipt = |basis, time| Receipt { basis, system_time: Timestamp(time), key: vec![1; 16], outcome: Outcome::Then,
@@ -315,6 +320,15 @@ mod tests {
         assert_eq!(row.get("version"), Some(&Value::I64(20)));
         assert_eq!(row.get("columns"), Some(&Value::list(vec![Value::Utf8("geometry".into()), Value::Utf8("region".into())])));
         let iid = event.iid;
+        for (catalog, option, expected) in [
+            (SEARCH_BUILD_CATALOG, "analyzer", Value::Utf8("english".into())),
+            (VECTOR_BUILD_CATALOG, "recall", Value::F64(0.75)),
+        ] {
+            let event = write.tables()[&TableRef::new("xt", catalog)].batch().unwrap().view().read_event(0).unwrap();
+            let StoredOperation::Put(row) = event.operation else { panic!("expected a build definition"); };
+            assert_eq!(row.get("version"), Some(&Value::I64(20)));
+            assert_eq!(row.get(option), Some(&expected));
+        }
         partition.apply(&write).unwrap();
         index.advance(BranchCut { basis, system_time: Timestamp(10) }).unwrap();
         index.apply(define).unwrap();
@@ -323,6 +337,10 @@ mod tests {
         let event = write.tables()[&catalog].batch().unwrap().view().read_event(0).unwrap();
         assert!(matches!(event.operation, StoredOperation::Delete));
         assert_eq!(event.iid, iid);
+        for catalog in [SEARCH_BUILD_CATALOG, VECTOR_BUILD_CATALOG] {
+            let event = write.tables()[&TableRef::new("xt", catalog)].batch().unwrap().view().read_event(0).unwrap();
+            assert!(matches!(event.operation, StoredOperation::Delete));
+        }
     }
 
     #[test]

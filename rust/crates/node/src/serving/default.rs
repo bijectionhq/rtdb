@@ -40,7 +40,6 @@ impl DefaultServing {
         use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 
         let indexes = || branch.tables().flat_map(|(table, definition)| definition.ranked_indexes.iter()
-            .filter(|(_, index)| !matches!(&index.definition.kind, RankedIndexKind::Search { .. }))
             .map(move |(name, declaration)| (table, name, declaration)));
         let count = indexes().count();
         if count == 0 {
@@ -64,7 +63,12 @@ impl DefaultServing {
             let verified = match &declaration.definition.kind {
                 RankedIndexKind::Spatial { .. } => rtdb_spatial::committed_native_ready(Arc::clone(&context), table, name, declaration).await,
                 RankedIndexKind::Ivf { .. } => rtdb_vector::committed_native_ready(Arc::clone(&context), table, name, declaration).await,
-                RankedIndexKind::Search { .. } => continue,
+                RankedIndexKind::Search { .. } => {
+                    #[cfg(feature = "search")]
+                    { rtdb_search::committed_native_ready(Arc::clone(&context), table, name, declaration).await }
+                    #[cfg(not(feature = "search"))]
+                    { continue; }
+                }
             };
             match verified {
                 Ok(true) => { ready.insert(name.as_str()); }

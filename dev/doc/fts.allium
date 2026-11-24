@@ -353,6 +353,9 @@ rule RepairUnreadableSearchFile {
 -- SEARCH_TERM_MATCHES(document, query[, analyzer]) gives one boolean per distinct term in SEARCH_TERMS order.
 -- The analyzer receives the entire document as literal text, and each boolean reports term membership independently of phrase matching.
 -- SEARCH_TERM_MATCHES returns null unless both inputs are UTF-8 and an empty list if the query has no terms.
+-- The Default shared-main projection feeds native search declarations to the existing artefact writer under the native declaration generation.
+-- Native physical readiness proves format 13 coverage at an installed exact cut using each selected trie's recorded owner, locator and checksums.
+-- Other formats require their own complete coverage proof before native readback reports them ready.
 -- Each columnar expression batch prepares its constant query and fixed corpus weights once and infers each source field's text type once.
 -- Evaluation streams analyzer tokens into the length, term frequencies, and phrase matches it needs.
 -- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.

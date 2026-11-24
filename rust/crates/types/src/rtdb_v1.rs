@@ -14,6 +14,7 @@ pub const CLEAR_RANK_INPUT: &str = "query.clear-rank-input";
 pub const RANKED_INDEX_DECLARATIONS: &str = "declare.ranked-index";
 pub const SPATIAL_BUILD_CATALOG: &str = "native_spatial_builds";
 pub const VECTOR_BUILD_CATALOG: &str = "native_vector_builds";
+pub const SEARCH_BUILD_CATALOG: &str = "native_search_builds";
 pub const RANKED_ARTEFACT_READINESS: &str = "query.ranked-artefact-readiness";
 
 pub fn ranked_build_id(table: &TableRef, name: &str) -> String {

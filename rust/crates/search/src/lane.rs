@@ -72,8 +72,9 @@ impl SearchBuilder {
         let now = (self.clock)();
         let snapshot = partition.snapshot();
         let public = self.runtime.definitions(&self.database, std::slice::from_ref(&snapshot), &self.storage, &self.memory, now, cancellation).await?;
+        let native = crate::definitions::native_build_definitions(&self.database, snapshot.clone(), &self.storage, &self.memory, now, cancellation).await?;
         let owned = crate::definitions::owned_definitions_in(&self.database, snapshot, &self.storage, &self.memory, now, cancellation).await?;
-        Ok(public.iter().cloned().chain(owned).collect())
+        Ok(public.iter().cloned().chain(native).chain(owned).collect())
     }
 }
 

@@ -121,6 +121,7 @@ For spatial and vector, send the value column first and then the ordered equalit
 After an applied receipt, use a separate `Query` at `Exactly(receipt.basis)` to read `xt.ranked_indexes`.
 Compare `_id`, `schema_name`, `table_name`, `kind`, `columns`, and the relevant `analyzer, history`, `geometry_encoding`, or `method, dimensions, recall` fields.
 The `version` names the original declaration position and stays stable on an identical redeclaration.
-The applied v1 snapshot reports `serving_mode = 'exact-sql'` and `artefacts_ready = false`.
+The applied v1 snapshot reports `serving_mode = 'exact-sql'` and `approximate = false`.
+Opt in to [physical readiness verification](rtdb-ranked-native-artefacts.md) to obtain `artefacts_ready = true` where the installed exact cut supplies persisted coverage.
 The search accelerator can use the same declaration projected into `xt.search_indexes` for eligible MATCH plans.
 A startup policy that requires a physical spatial or IVF index must gate the route on `artefacts_ready`.

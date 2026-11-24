@@ -47,8 +47,45 @@ pub async fn definitions_in(database: &str, partitions: Vec<Snapshot>, storage: 
     let catalog = CatalogSnapshot::new(database, BTreeMap::from([(database.to_string(), DatabaseSnapshot { partitions, storage })]), false)?;
     let context = QueryContext::new(catalog, Arc::clone(&memory), now, "UTC", QueryOptions::default(), cancellation)?;
     let sql = "SELECT _id, schema_name, table_name, columns, version, history, analyzer FROM xt.search_indexes";
+    read_public_definitions(context, sql, Vec::new()).await
+}
+
+pub(crate) async fn native_build_definitions(
+    database: &str, snapshot: Snapshot, storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>,
+    now: Instant, cancellation: &CancellationToken,
+) -> Result<Vec<SearchDefinition>> {
+    let table = TableRef::new("xt", rtdb_types::rtdb_v1::SEARCH_BUILD_CATALOG);
+    if !snapshot.contains_table(&table) { return Ok(Vec::new()); }
+    let catalog = CatalogSnapshot::new(database, BTreeMap::from([(
+        database.to_owned(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(storage) },
+    )]), false)?;
+    let context = QueryContext::new(catalog, Arc::clone(memory), now, "UTC", QueryOptions::default(), cancellation)?;
+    read_public_definitions(context, NATIVE_BUILD_DEFINITIONS, Vec::new()).await
+}
+
+const NATIVE_BUILD_DEFINITIONS: &str = "SELECT index_name || '~native' AS name, schema_name, table_name,
+    columns, version, history, analyzer FROM xt.native_search_builds";
+
+pub(crate) async fn committed_native_definition(
+    context: Arc<QueryContext>, table: &TableRef, name: &str,
+) -> Result<Option<SearchDefinition>> {
+    let catalog = TableRef::new("xt", rtdb_types::rtdb_v1::SEARCH_BUILD_CATALOG);
+    if !context.catalog.database(context.catalog.default_database())?.partitions.iter()
+        .any(|snapshot| snapshot.contains_table(&catalog))
+    {
+        return Ok(None);
+    }
+    let id = rtdb_types::rtdb_v1::ranked_build_id(table, name);
+    let sql = format!("{NATIVE_BUILD_DEFINITIONS} WHERE _id = $1");
+    let mut definitions = read_public_definitions(context, &sql, vec![rtdb_types::Value::Utf8(id)]).await?;
+    Ok(definitions.pop().filter(|definition| definitions.is_empty()
+        && &definition.table == table && definition.name == format!("{name}~native")))
+}
+
+async fn read_public_definitions(context: Arc<QueryContext>, sql: &str, arguments: Vec<rtdb_types::Value>) -> Result<Vec<SearchDefinition>> {
+    let memory = Arc::clone(&context.memory);
     let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory)?;
-    let cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, Vec::new()).await?;
+    let cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, arguments).await?;
     read_definitions(cursor, None).await
 }
 
