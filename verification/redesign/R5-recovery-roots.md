@@ -166,7 +166,7 @@ The local and hosted Multi reapers can retire older original block packs for a p
 For a mixed pack, the exact provider publication is the deletion unit.
 Each member outside the replaced checkpoint metadata must have matching plaintext in the authenticated successor archive, or be a receipt L0 member covered by the receipt retirement rule.
 The parked selection closes generic fork admission. The lineage reservation protects an in-progress fork, and its published references protect the original pack.
-Age is no longer a condition of this replay-pack grant.
+Age is no longer a condition of this replay-pack grant or of the checkpoint-metadata pack grant with exact release evidence for every member.
 The local reaper holds the maintenance lock, lineage reservation and archive region while verifying and unlinking the pack. Hosted retirement uses the same lineage authority with exact version settlement or enrolled terminal tombstone evidence.
 It requires drained storage and catalog readers, no declared descendant references, and a certified replica prefix that passes the old boundary while retaining the published boundary.
 Only the physical original pack is erased, so the archive continues to serve the logical L0 descriptors.

@@ -174,7 +174,7 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 Classic remote holds use conditional writes and finish after admitted provider work drains.
 Compaction and stored artefact builds on coordinated storage hold their input catalogs through provider drain.
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
-Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
+Hosted exact trie, checkpoint-metadata pack and replica-payload releases use their installed authority without reaper grace. A moved source enters disposal once the destination route commits. The original owner's drain and provider evidence still gate settlement.
 The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
 The approved reachability contract replaces the cutoff for deletion.
 For hosted and versioned Classic S3 loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.

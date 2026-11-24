@@ -3383,10 +3383,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let left_behind = || async { east_bucket.list(Some(&rtdb_storage::ObjectKey::new(tombstone.storage_prefix()).unwrap())).await.unwrap().len() };
     assert!(left_behind().await > 0, "the old cell still holds the deployment's objects right after the move");
     let keys = east.keys();
-    let hour = Duration::from_secs(3600);
-    let moved = tombstone.moved_at_ms.unwrap();
-    assert!(!rtdb_multi::store::move_cleanup_due(&tombstone, moved, hour));
-    assert!(rtdb_multi::store::move_cleanup_due(&tombstone, moved + 3_600_000, hour));
+    assert!(rtdb_multi::store::move_cleanup_due(&tombstone));
     let wrong = admin::finish_disposal(east.directory.as_ref(), &west_storage, &keys, &tombstone.id, 4 << 20).await.unwrap_err();
     assert_eq!(wrong.code, "rtdb.multi/move-storage-custody");
     assert!(left_behind().await > 0);
@@ -3399,7 +3396,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     assert_eq!(recovered.cell_transfer, arrived.cell_transfer);
     let retired = east.directory.deployment(&tombstone.id).await.unwrap().unwrap();
     assert_eq!(retired.disposal.as_deref(), Some(&receipt));
-    assert!(!rtdb_multi::store::move_cleanup_due(&retired, moved + 3_600_000, hour));
+    assert!(!rtdb_multi::store::move_cleanup_due(&retired));
     assert_eq!(values(&through_west, "SELECT total FROM orders").await, ["10", "20", "30"], "while the deployment reads on in its new cell");
     drop((through_east, through_west));
     east.stop().await;

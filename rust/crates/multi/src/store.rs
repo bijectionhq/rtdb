@@ -1645,10 +1645,9 @@ pub async fn run_reaper(
                         if let CellStorage::S3 { config } = &storage {
                             match CellStorage::s3_inventory(config).await {
                                 Ok(provider) => {
-                                    let threshold = now.saturating_sub(grace.as_millis() as i64);
                                     for record in &deployments {
                                         if cancellation.is_cancelled() { return; }
-                                        if let Err(error) = exact_retirement::reap(directory.as_ref(), bucket.as_ref(), &provider, record, threshold, references.as_ref().ok(), keys.as_deref()).await {
+                                        if let Err(error) = exact_retirement::reap(directory.as_ref(), bucket.as_ref(), &provider, record, references.as_ref().ok(), keys.as_deref()).await {
                                             eprintln!("Exact garbage for {} is pending: {}", record.id, error.code);
                                         }
                                         if let (Some(keys), Some(task)) = (keys.as_deref(), hosted_task.as_ref())
@@ -1715,7 +1714,7 @@ pub async fn run_reaper(
                             }
                         }
                         for record in deployments.iter().filter(|record| {
-                            record.lifecycle == Lifecycle::Deleting || move_cleanup_due(record, now, grace)
+                            record.lifecycle == Lifecycle::Deleting || move_cleanup_due(record)
                         }) {
                             let disposal = crate::admin::finish_disposal_at(
                                 directory.as_ref(), &storage, keys, &record.id, Some(record.incarnation), 4 << 20,
@@ -1753,11 +1752,10 @@ pub async fn run_reaper(
     }
 }
 
-/// A moved source retains its serving media until the route is published
-/// to a prepared destination and the grace has elapsed.
-pub fn move_cleanup_due(record: &DeploymentRecord, now_ms: i64, grace: Duration) -> bool {
-    record.lifecycle == Lifecycle::Deleted && record.disposal.is_none()
-        && record.moved_at_ms.is_some_and(|moved| now_ms.saturating_sub(moved) >= grace.as_millis() as i64)
+/// Routing has selected an independent destination. The original owner
+/// can now check drain and settle the closed source residence.
+pub fn move_cleanup_due(record: &DeploymentRecord) -> bool {
+    record.lifecycle == Lifecycle::Deleted && record.disposal.is_none() && record.moved_at_ms.is_some()
 }
 
 fn can_reap(record: &DeploymentRecord) -> bool {
