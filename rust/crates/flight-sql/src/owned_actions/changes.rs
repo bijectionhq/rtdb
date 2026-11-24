@@ -327,7 +327,7 @@ mod tests {
     use rtdb_node::OwnedRelationChanges;
     use rtdb_types::{EntityId, Keyword, OwnedRelation, TransactionKey, TxId};
 
-    use crate::actions::encode_ipc_frames;
+    use crate::actions::OwnedIpcReply;
 
     fn touches() -> Vec<OwnedChange> {
         let bounded = Interval::new(Timestamp(100), Timestamp(105)).unwrap();
@@ -366,11 +366,16 @@ mod tests {
         };
         let legacy = unary(&[legacy]);
         assert_eq!(unary(std::slice::from_ref(&actual)), legacy);
+        let memory = MemoryBudget::new(1 << 20);
         for (pages, expected) in [(std::slice::from_ref(&actual), legacy), (&[][..], unary(&[]))] {
-            let frames = encode_ipc_frames(&schema, pages).unwrap();
+            let OwnedIpcReply::Frames(frames) =
+                OwnedIpcReply::encode(&memory, &schema, pages, true, 1 << 20).unwrap()
+            else {
+                panic!("expected a framed Changes reply");
+            };
             assert_eq!(frames.len(), if pages.is_empty() { 2 } else { 3 });
-            assert_eq!(frames.last().unwrap().as_ref(), [255, 255, 255, 255, 0, 0, 0, 0]);
-            assert_eq!(frames.iter().flat_map(|frame| frame.iter().copied()).collect::<Vec<_>>(), expected);
+            assert_eq!(frames.last().unwrap().body.as_ref(), [255, 255, 255, 255, 0, 0, 0, 0]);
+            assert_eq!(frames.iter().flat_map(|frame| frame.body.iter().copied()).collect::<Vec<_>>(), expected);
         }
     }
 
