@@ -295,9 +295,8 @@ impl ObjectCipher for ClassicObjectKeys {
             return Err(Error::InvalidKey(key.to_string()));
         }
         let path = self.name(key);
-        let key = key.clone();
         self.region
-            .run_blocking(move || {
+            .read(Arc::clone(&self.path), key.clone(), move |_, key| {
                 if matches!(operation, UnitOperation::Grant) {
                     let custody = Arc::new(open_slot_lock(&path)?);
                     custody.lock_shared().map_err(io(&path))?;
@@ -310,7 +309,7 @@ impl ObjectCipher for ClassicObjectKeys {
                     return Ok(UnitOutput::HeldGrant { until: None, custody });
                 }
                 with_key(&path, operation.provisions(), |cipher| {
-                    operation.apply(cipher, &key)
+                    operation.apply(cipher, key)
                 })
             })
             .await

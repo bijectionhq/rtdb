@@ -39,11 +39,12 @@ pub(super) struct CatalogLedger {
     client: Arc<dyn ProviderStore>,
     key: ObjectKey,
     path: Path,
+    reads: Arc<IoRegion>,
 }
 
 impl CatalogLedger {
     pub fn new(client: Arc<dyn ProviderStore>, key: ObjectKey, path: Path) -> Arc<Self> {
-        Arc::new(Self { client, key, path })
+        Arc::new(Self { client, key, path, reads: IoRegion::new() })
     }
 
     pub async fn retain(self: &Arc<Self>, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>, io: &IoRegion)
@@ -54,7 +55,7 @@ impl CatalogLedger {
                 && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
                     <= rtdb_types::CATALOG_PRIMARY_PATH_BYTES
         }).map(<[String]>::to_vec) };
-        let admission: IoAdmission = io.admit()?;
+        let admission: IoAdmission = io.admit_read(self.clone(), self.key.clone())?;
         let ledger = Arc::clone(self);
         let (answer, result) = oneshot::channel();
         let (permit, drained) = oneshot::channel::<()>();
@@ -86,11 +87,11 @@ impl CatalogLedger {
         result.await.map_err(|_| unavailable("Remote catalog admission ended"))?
     }
 
-    pub async fn advance(&self, cut: CatalogCut) -> Result<bool> {
+    pub async fn advance(self: &Arc<Self>, cut: CatalogCut) -> Result<bool> {
         Ok(self.close_admission(cut, &[None]).await?[0])
     }
 
-    pub async fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
+    pub async fn close_admission(self: &Arc<Self>, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
         if !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0 {
             return Err(unavailable("Invalid remote catalog floor"));
         }
@@ -113,10 +114,16 @@ impl CatalogLedger {
         }).await
     }
 
-    async fn read(&self) -> Result<(Ledger, PutMode)> {
+    async fn read(self: &Arc<Self>) -> Result<(Ledger, PutMode)> {
+        self.reads.read_async(self.clone(), self.key.clone(), |ledger, key| async move {
+            Ok(ledger.read_ledger(&key).await)
+        }).await?
+    }
+
+    async fn read_ledger(&self, key: &ObjectKey) -> Result<(Ledger, PutMode)> {
         let response = match self.client.get(&self.path).await {
             Err(ProviderError::NotFound { .. }) => return Ok((Ledger::default(), PutMode::Create)),
-            result => result.map_err(|error| super::provider_error(&self.key, error))?,
+            result => result.map_err(|error| super::provider_error(key, error))?,
         };
         if response.meta.size > MAX_LEDGER_BYTES as u64 {
             return Err(unavailable("The remote catalog ledger exceeds its size limit"));
@@ -125,7 +132,7 @@ impl CatalogLedger {
         if version.e_tag.is_none() && version.version.is_none() {
             return Err(unavailable("The remote catalog ledger has no conditional update identity"));
         }
-        let bytes = response.bytes().await.map_err(|error| super::provider_error(&self.key, error))?;
+        let bytes = response.bytes().await.map_err(|error| super::provider_error(key, error))?;
         let (sequence, floor, holds): (u64, Option<CatalogCut>, CatalogHolds) =
             serde_json::from_slice(&bytes).map_err(unavailable)?;
         if sequence == 0 || floor.is_some_and(|floor| !well_formed(floor))
@@ -136,7 +143,7 @@ impl CatalogLedger {
         Ok((Ledger { sequence, floor, holds }, PutMode::Update(version)))
     }
 
-    async fn update<T>(&self, mut change: impl FnMut(&mut Ledger) -> Result<(bool, T)>) -> Result<T> {
+    async fn update<T>(self: &Arc<Self>, mut change: impl FnMut(&mut Ledger) -> Result<(bool, T)>) -> Result<T> {
         for _ in 0..8 {
             let (mut state, mode) = self.read().await?;
             let (changed, answer) = change(&mut state)?;

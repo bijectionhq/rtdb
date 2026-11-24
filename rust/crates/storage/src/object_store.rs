@@ -438,8 +438,9 @@ impl LocalStore {
     }
     /// Shares a caller-owned I/O region with sibling stores; closing the region closes admission for every sibling.
     pub fn open_in(root: impl AsRef<Path>, io: Arc<IoRegion>) -> Result<Self> {
-        let _operation = io.admit()?;
-        let root = root.as_ref();
+        let selected = Arc::new(root.as_ref().to_path_buf());
+        let _operation = io.admit_read(selected.clone(), ())?;
+        let root = selected.as_path();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
         Ok(Self { root: Arc::new(root), io, catalog: None })
@@ -451,13 +452,11 @@ impl LocalStore {
     }
     /// Synchronizes an existing immutable object and its directory entries through the storage root.
     pub async fn sync_existing(&self, key: &ObjectKey) -> Result<()> {
-        let root = self.root.clone();
-        let path = self.path(key);
-        let key = key.clone();
-        self.io.run(move || {
-            let file = open_object(&path, &key)?;
+        self.io.read(self.root.clone(), key.clone(), |root, key| {
+            let path = root.join(key.as_str());
+            let file = open_object(&path, key)?;
             crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
-            sync_parents(&path, &root)
+            sync_parents(&path, root)
         }).await
     }
 
@@ -465,20 +464,20 @@ impl LocalStore {
     pub async fn hold_recovery_open(&self) -> rtdb_types::Result<Arc<dyn Send + Sync>> {
         let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
-        Ok(Arc::new(self.io.run(move || Ok(ledger.hold_recovery_open())).await??))
+        Ok(Arc::new(self.io.read(ledger, "recovery-open", |ledger, _| Ok(ledger.hold_recovery_open())).await??))
     }
 
     pub(crate) async fn try_lock_recovery_deletion(&self) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let ledger = self.catalog.as_ref().ok_or_else(|| rtdb_types::Anomaly::unsupported(
             "rtdb.storage/recovery-hold", "This store has no local catalog ledger"))?.clone();
-        let gate = self.io.run(move || Ok(ledger.try_lock_recovery_deletion())).await??;
+        let gate = self.io.read(ledger, "recovery-open", |ledger, _| Ok(ledger.try_lock_recovery_deletion())).await??;
         Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
     }
 
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
     pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
-        let ledger = crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch());
-        self.io.run(move || Ok(ledger.install_repair_anchor(anchor))).await?
+        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch()));
+        self.io.read(ledger, "repair-anchor", move |ledger, _| Ok(ledger.install_repair_anchor(anchor))).await?
     }
 
     /// Loads the durable repair anchor at this local storage root.
@@ -486,7 +485,7 @@ impl LocalStore {
         let ledger = self.catalog.clone().unwrap_or_else(|| {
             Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), rtdb_types::StorageEpoch(0)))
         });
-        self.io.run(move || Ok(ledger.retained_repair_anchor())).await?
+        self.io.read(ledger, "repair-anchor", |ledger, _| Ok(ledger.retained_repair_anchor())).await?
     }
 
     /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
@@ -583,7 +582,7 @@ impl ObjectStore for LocalStore {
 
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let Some(ledger) = self.catalog.clone() else { return Ok(None); };
-        Ok(Some(Arc::new(self.io.run(move || Ok(ledger.retain(cut))).await??)))
+        Ok(Some(Arc::new(self.io.read(ledger, ("floor", cut), |ledger, &(_, cut)| Ok(ledger.retain(cut))).await??)))
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
@@ -591,7 +590,7 @@ impl ObjectStore for LocalStore {
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
         let Some(ledger) = self.catalog.clone() else { return Ok(true); };
-        self.io.run(move || Ok(ledger.advance(installed))).await?
+        self.io.read(ledger, ("floor", installed), |ledger, &(_, installed)| Ok(ledger.advance(installed))).await?
     }
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
@@ -634,21 +633,21 @@ impl ObjectStore for LocalStore {
     }
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        self.io.read(self.root.clone(), key.clone(), move |root, key| {
-            read_local_range(&root.join(key.as_str()), key, range)
+        self.io.read(self.root.clone(), (key.clone(), range), |root, (key, range)| {
+            read_local_range(&root.join(key.as_str()), key, range.clone())
         }).await
     }
 
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
-        self.io.read(self.root.clone(), key.clone(), move |root, key| {
-            reservation.finish(read_local_range(&root.join(key.as_str()), key, range)?)
+        self.io.read(self.root.clone(), (key.clone(), range), move |root, (key, range)| {
+            reservation.finish(read_local_range(&root.join(key.as_str()), key, range.clone())?)
         }).await
     }
 
     async fn get_reserved_scan_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
-        self.io.read(self.root.clone(), key.clone(), move |root, key| {
-            map_range(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None), key, range, reservation)
+        self.io.read(self.root.clone(), (key.clone(), range), move |root, (key, range)| {
+            map_range(LocalFile::new(open_object(&root.join(key.as_str()), key)?, None), key, range.clone(), reservation)
         }).await
     }
 
@@ -677,7 +676,7 @@ impl ObjectStore for LocalStore {
     }
 
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
-        let admission = self.io.admit()?;
+        let admission = self.io.admit_read(self.root.clone(), source.to_path_buf())?;
         let file = File::open(source).map_err(|error| Error::io(source, error))?;
         self.publish_file(key, AdmittedFile { file, _admission: admission }).await
     }
@@ -739,8 +738,10 @@ impl ObjectStore for LocalStore {
         };
         let path = self.path(key);
         let root = self.root.clone();
-        let ledger = crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0));
-        self.io.run(move || Ok(ledger.collect_recovery_file(block, || remove_local_object(&root, &path)))).await?
+        let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(root.clone(), rtdb_types::StorageEpoch(0)));
+        self.io.read(ledger, ("repair-anchor", key.clone(), block), move |ledger, (_, _, block)| {
+            Ok(ledger.collect_recovery_file(*block, || remove_local_object(&root, &path)))
+        }).await?
     }
 }
 

@@ -202,7 +202,7 @@ impl IoRegion {
     ) -> Result<T>
     where
         T: Send + 'static,
-        O: Send + Sync + 'static,
+        O: Send + Sync + ?Sized + 'static,
         A: Send + Sync + 'static,
     {
         let selection = Arc::new((owner, target));
@@ -212,7 +212,7 @@ impl IoRegion {
 
     pub(crate) fn admit_read<O, A>(&self, owner: Arc<O>, target: A) -> Result<IoAdmission>
     where
-        O: Send + Sync + 'static,
+        O: Send + Sync + ?Sized + 'static,
         A: Send + Sync + 'static,
     {
         let mut operation = self.admit()?;
@@ -227,7 +227,7 @@ impl IoRegion {
     ) -> Result<T>
     where
         T: Send + 'static,
-        O: Send + Sync + 'static,
+        O: Send + Sync + ?Sized + 'static,
         A: Clone + Send + Sync + 'static,
         F: std::future::Future<Output = Result<T>> + Send + 'static,
     {

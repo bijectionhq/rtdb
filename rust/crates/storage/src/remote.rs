@@ -300,10 +300,10 @@ impl ObjectStore for RemoteStore {
     }
     async fn observe_fresh_exact(&self, key: &ObjectKey, length: usize) -> Result<ObjectObservation<Bytes>> {
         let namespace = self.version_namespace.clone();
-        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { objects.observe_exact(&key, length, namespace.as_deref()).await }).await
+        self.io.read_async(self.objects.clone(), (key.clone(), length), move |objects, (key, length)| async move { objects.observe_exact(&key, length, namespace.as_deref()).await }).await
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
-        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { objects.get_range(&key, range).await }).await
+        self.io.read_async(self.objects.clone(), (key.clone(), range), |objects, (key, range)| async move { objects.get_range(&key, range).await }).await
     }
     async fn observe_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<ObjectObservation<Bytes>> {
         let Some(namespace) = self.version_namespace.clone() else {
@@ -316,7 +316,7 @@ impl ObjectStore for RemoteStore {
             }
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: observed.value.size });
         }
-        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move {
+        self.io.read_async(self.objects.clone(), (key.clone(), range), move |objects, (key, range)| async move {
             let path = objects.path(&key);
             let length = usize::try_from(range.end - range.start)
                 .map_err(|_| Error::Task("The reserved provider range exceeds addressable memory".into()))?;
@@ -342,7 +342,7 @@ impl ObjectStore for RemoteStore {
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
-        self.io.read_async(self.objects.clone(), key.clone(), move |objects, key| async move { reservation.finish(objects.get_range(&key, range).await?) }).await
+        self.io.read_async(self.objects.clone(), (key.clone(), range), move |objects, (key, range)| async move { reservation.finish(objects.get_range(&key, range).await?) }).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         self.put_with_publication(key, bytes).await.map(drop)

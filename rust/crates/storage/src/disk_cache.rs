@@ -52,8 +52,11 @@ impl DiskCache {
     /// The region owner must call `close_and_wait` before dropping the cache or shutting down its Tokio runtime.
     pub fn open(root: impl AsRef<Path>, maximum_bytes: u64, memory: Arc<MemoryBudget>) -> Result<Arc<Self>> {
         if maximum_bytes == 0 { return Err(Error::Task("Disk cache capacity must be positive".into())); }
-        fs::create_dir_all(root.as_ref()).map_err(|error| Error::io(root.as_ref(), error))?;
-        let root = fs::canonicalize(root.as_ref()).map_err(|error| Error::io(root.as_ref(), error))?;
+        let operations = IoRegion::new();
+        let selected = Arc::new(root.as_ref().to_path_buf());
+        let _discovery = operations.admit_read(selected.clone(), ())?;
+        fs::create_dir_all(selected.as_path()).map_err(|error| Error::io(selected.as_path(), error))?;
+        let root = fs::canonicalize(selected.as_path()).map_err(|error| Error::io(selected.as_path(), error))?;
         let temporary = root.join(".tmp");
         match fs::create_dir(&temporary) {
             Ok(()) => {},
@@ -78,7 +81,7 @@ impl DiskCache {
             if item.file_type().map_err(|error| Error::io(&path, error))?.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }.map_err(|error| Error::io(&path, error))?;
         }
         let cache = Arc::new(Self { root, maximum_bytes, memory, state: Mutex::new(State { entries: BTreeMap::new(), clock: 0 }),
-            operations: IoRegion::new(), cancellation: CancellationToken::new(), _directory_lock: directory_lock });
+            operations, cancellation: CancellationToken::new(), _directory_lock: directory_lock });
         cache.discover(&cache.root)?;
         cache.trim(None);
         Ok(cache)
