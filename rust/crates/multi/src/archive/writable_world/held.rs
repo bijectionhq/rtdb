@@ -1315,7 +1315,7 @@ impl HeldCheckpointWorld {
             None
         };
         let historical = earlier.is_some() || parent_at.is_some();
-        let query = if historical { query.exact() } else { query };
+        let query = query.exact();
         let writable = self.clock_mode().is_writable();
         let use_overlay = writable && parent_at.is_none()
             && !earlier.is_some_and(|(system, parent_only)| parent_only || self.uses_frozen_overlay(Some(system)));
@@ -3219,7 +3219,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         } else {
                                             overlay
                                         };
-                                        let page = rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay).await?;
+                                        let (page, _) = rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)
                                     };
