@@ -163,6 +163,8 @@ enum Function {
     Match,
     Score,
     Length,
+    TokenCount,
+    TermMatches,
     Terms,
     Fingerprint,
 }
@@ -175,6 +177,8 @@ impl Function {
             ("match", 2) => Self::Match,
             ("search_score", 2 | 5) => Self::Score,
             ("search_length", 1) => Self::Length,
+            ("search_token_count", 1) => Self::TokenCount,
+            ("search_term_matches", 2) => Self::TermMatches,
             ("search_terms", 1) => Self::Terms,
             ("search_corpus_fingerprint", 2) => Self::Fingerprint,
             _ => return None,
@@ -280,6 +284,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
     let mut length = Int64Builder::new();
     let mut binary = BinaryBuilder::new();
     let mut terms = ListBuilder::new(StringBuilder::new());
+    let mut term_matches = ListBuilder::new(BooleanBuilder::new());
     let mut types = TextTypes::default();
     let mut parsed = None;
     let mut prepared = None;
@@ -290,7 +295,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
         let null = inputs.iter().try_fold(false, |null, input| Ok::<_, Anomaly>(null || input.row(row).null()?))?;
         let first = if null { None } else { cell(0).str(&mut types)? };
         match function {
-            Function::Match | Function::Score => {
+            Function::Match | Function::Score | Function::TermMatches => {
                 let query = if null { None } else { cell(1).str(&mut types)? };
                 let outcome = query.map(|query| {
                     let _scratch = context.memory.reserve(256usize.saturating_add(query.len().saturating_mul(32))
@@ -304,6 +309,15 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
                     };
                     Ok::<_, Anomaly>(match function {
                         Function::Match => (first.is_some_and(|text| query.matches_text(text)), 0.0),
+                        Function::TermMatches => {
+                            if let Some(text) = first {
+                                let owner = Arc::get_mut(&mut retained).expect("Search projection owns its allocation");
+                                owner.grow_to(owner.bytes().saturating_add(query.terms().len()).saturating_add(8))?;
+                                let (_, frequencies, _) = query.text_terms(text, false);
+                                for count in frequencies { term_matches.values().append_value(count != 0); }
+                            }
+                            (false, 0.0)
+                        }
                         Function::Score => {
                             let build = || -> Result<Scorer> {
                                 Ok(if inputs.len() == 5 {
@@ -329,13 +343,15 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
                 match function {
                     Function::Match => boolean.append_option(outcome.map(|value| value.0)),
                     Function::Score => real.append_option(outcome.map(|value| value.1)),
+                    Function::TermMatches => term_matches.append(outcome.is_some() && first.is_some()),
                     _ => unreachable!(),
                 }
             }
-            Function::Length => {
+            Function::Length | Function::TokenCount => {
                 let count = first.map(|text| {
                     let _scratch = context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                    Ok::<_, Anomaly>(i64::from(stored_length(analyzer.count_tokens(text).len())))
+                    let count = analyzer.count_tokens(text).len();
+                    Ok::<_, Anomaly>(if matches!(function, Function::Length) { i64::from(stored_length(count)) } else { count as i64 })
                 }).transpose()?;
                 length.append_option(count);
             }
@@ -363,7 +379,8 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
     let array: ArrayRef = match function {
         Function::Match => Arc::new(boolean.finish()),
         Function::Score => Arc::new(real.finish()),
-        Function::Length => Arc::new(length.finish()),
+        Function::Length | Function::TokenCount => Arc::new(length.finish()),
+        Function::TermMatches => Arc::new(term_matches.finish()),
         Function::Terms => Arc::new(terms.finish()),
         Function::Fingerprint => Arc::new(binary.finish()),
     };

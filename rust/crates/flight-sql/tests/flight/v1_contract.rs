@@ -1457,6 +1457,17 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
         assert_eq!(trailer.system_time_micros, original.system_time_micros);
         assert!(!trailer.receiver_clock.unwrap().proof.is_empty());
     }
+    for (text, expected) in [("receipt", vec![1]), ("absent", vec![])] {
+        let mut request = input(&format!(
+            "SELECT SEARCH_TOKEN_COUNT(body) FROM ranked_rows WHERE MATCH(body, '{text}')"
+        ));
+        request.source.as_mut().unwrap().at = Some(v1::At { selection: original.basis.clone().map(Selection::Exactly) });
+        request.track = true;
+        let (rows, trailer) = query(&mut client, request).await;
+        assert_eq!(ints(&rows), expected);
+        assert_eq!(trailer.basis, original.basis);
+        assert!(!trailer.claim.unwrap().value.is_empty());
+    }
     running.stop().await;
 }
 

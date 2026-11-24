@@ -6,7 +6,8 @@ use crate::Expr;
 /// Where a search function call names its analyzer: a string literal after its other arguments.
 pub fn analyzer_index(name: &str, arity: usize) -> Option<usize> {
     match (name, arity) {
-        ("match" | "search_score", 3) | ("search_terms" | "search_length", 2) => Some(arity - 1),
+        ("match" | "search_score" | "search_term_matches", 3)
+        | ("search_terms" | "search_length" | "search_token_count", 2) => Some(arity - 1),
         ("search_score", 6) => Some(5),
         _ => None,
     }
@@ -31,9 +32,10 @@ pub(crate) fn signature(name: &str, arguments: &[L]) -> Option<Result<L>> {
     let result = match name {
         "match" => L::Scalar(S::Bool),
         "search_score" => L::Scalar(S::F64),
-        "search_length" => L::Scalar(S::I64).maybe(),
+        "search_length" | "search_token_count" => L::Scalar(S::I64).maybe(),
         "search_corpus_fingerprint" => L::Scalar(S::Binary),
         "search_terms" => L::list(L::Scalar(S::Utf8)),
+        "search_term_matches" => L::list(L::Scalar(S::Bool)).maybe(),
         _ => return None,
     };
     Some((|| {
@@ -44,9 +46,9 @@ pub(crate) fn signature(name: &str, arguments: &[L]) -> Option<Result<L>> {
             return Err(Anomaly::incorrect("xtdb.expression/type-error", format!("The analyzer argument to `{name}` must be a string")));
         }
         let query = match (name, &arguments[..arity]) {
-            ("search_length", [_]) | ("search_corpus_fingerprint", [_, _]) => None,
+            ("search_length" | "search_token_count", [_]) | ("search_corpus_fingerprint", [_, _]) => None,
             ("search_terms", [query]) => Some(query),
-            ("match" | "search_score", [_, query]) => Some(query),
+            ("match" | "search_score" | "search_term_matches", [_, query]) => Some(query),
             ("search_score", [_, query, _, _, _]) => Some(query),
             _ => {
                 return Err(Anomaly::incorrect(

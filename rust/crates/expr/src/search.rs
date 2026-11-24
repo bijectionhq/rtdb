@@ -9,6 +9,7 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
     if !matches!(
         name,
         "match" | "search_score" | "search_length" | "search_terms" | "search_corpus_fingerprint"
+            | "search_token_count" | "search_term_matches"
     ) {
         return None;
     }
@@ -30,10 +31,16 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                     query.terms().iter().cloned().map(Value::Utf8).collect(),
                 ))
             }
-            ("search_length", [Value::Utf8(text)]) => {
+            ("search_length" | "search_token_count", [Value::Utf8(text)]) => {
                 let count = analyzer.count_tokens(text);
                 context.reserve(count.arrow_bytes().saturating_add(256))?;
-                Ok(Value::I64(i64::from(stored_length(count.len()))))
+                Ok(Value::I64(if name == "search_length" { i64::from(stored_length(count.len())) } else { count.len() as i64 }))
+            }
+            ("search_term_matches", [Value::Utf8(text), Value::Utf8(query)]) => {
+                let query = parse_query(query, analyzer, context)?;
+                let (count, frequencies, _) = query.text_terms(text, false);
+                context.reserve(count.arrow_bytes().saturating_add(256))?;
+                Ok(Value::list(frequencies.into_iter().map(|count| Value::Bool(count != 0)).collect()))
             }
             ("search_corpus_fingerprint", [Value::List(ids), Value::List(bodies)]) => {
                 if ids.is_empty() || ids.len() != bodies.len() {

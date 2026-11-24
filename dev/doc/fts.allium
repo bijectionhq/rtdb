@@ -342,6 +342,10 @@ rule RepairUnreadableSearchFile {
 -- The five-argument form computes BM25 from its document count, total stored length and document frequencies.
 -- The frequency vector follows the distinct term order returned by SEARCH_TERMS.
 -- SEARCH_LENGTH gives the stored length of a UTF-8 document for aggregation over the admitted rows and null for any other input.
+-- SEARCH_TOKEN_COUNT gives the unquantized number of analyzer tokens in a UTF-8 document, including split long tokens, and null for any other input.
+-- SEARCH_TERM_MATCHES(document, query[, analyzer]) gives one boolean per distinct term in SEARCH_TERMS order.
+-- The analyzer receives the entire document as literal text, and each boolean reports term membership independently of phrase matching.
+-- SEARCH_TERM_MATCHES returns null unless both inputs are UTF-8 and an empty list if the query has no terms.
 -- Each columnar expression batch prepares its constant query and fixed corpus weights once and infers each source field's text type once.
 -- Evaluation streams analyzer tokens into the length, term frequencies, and phrase matches it needs.
 -- SEARCH_CORPUS_FINGERPRINT hashes the ordered text id and body pairs passed as two arrays.

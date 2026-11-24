@@ -997,6 +997,17 @@ async fn explicit_search_statistics_rank_the_admitted_corpus() {
         vec![],
     ).await.unwrap()).await;
     assert_eq!(terms, [vec![Value::list(vec![Value::Utf8("invoice".into()), Value::Utf8("paid".into())])]]);
+    let long_document = r#"runners "café" "#.repeat(90);
+    let analyzed = rows(session.query_sql(
+        "SELECT SEARCH_TOKEN_COUNT($1, 'english_stop'), \
+         SEARCH_TERM_MATCHES($1, $2, 'english_stop'), MATCH($1, $2, 'english_stop'), \
+         SEARCH_TOKEN_COUNT(NULL), SEARCH_TERM_MATCHES(42, 'café')",
+        vec![Value::Utf8(long_document), Value::Utf8(r#""café runners" absent"#.into())],
+    ).await.unwrap()).await;
+    assert_eq!(analyzed, [vec![
+        Value::I64(180), Value::list(vec![Value::Bool(true), Value::Bool(true), Value::Bool(false)]),
+        Value::Bool(false), Value::Null, Value::Null,
+    ]]);
     let fingerprint = rows(session.query_sql(
         "SELECT SEARCH_LENGTH(42), SEARCH_LENGTH(''), \
          SEARCH_CORPUS_FINGERPRINT(ARRAY['1', '2'], ARRAY['a', 'b']) = \
