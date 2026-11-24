@@ -8,6 +8,7 @@ use std::{
 use arrow_array::{Float64Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 

@@ -182,9 +182,11 @@ impl VectorAccelerator {
             output.extend(lane::indexed_rows(std::io::Cursor::new(lease), definition, request.memory, request.cancellation)?);
         }
         for segment in request.snapshot.iter_segments(&definition.table) {
-            let events = segment.view();
-            for row in 0..events.len() {
-                if let Some(indexed) = rows::indexed_row(&events.borrow_event(row)?, definition)? { output.push(indexed); }
+            for batch in segment.batches() {
+                let events = batch.view();
+                for row in 0..events.len() {
+                    if let Some(indexed) = rows::indexed_row(&events.borrow_event(row)?, definition)? { output.push(indexed); }
+                }
             }
         }
         Ok(output)
