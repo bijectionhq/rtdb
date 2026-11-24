@@ -1184,11 +1184,11 @@ pub async fn open_owned_path_catalog(
     ).await
 }
 
-pub async fn open_native_spatial_builds(context: Arc<QueryContext>) -> Result<Option<QueryCursor>> {
+pub async fn open_native_spatial_builds(context: Arc<QueryContext>, id: Option<&str>) -> Result<Option<QueryCursor>> {
     let catalog = TableRef::new("xt", rtdb_types::rtdb_v1::SPATIAL_BUILD_CATALOG);
     open_private_catalog(context, catalog, &[
-        "index_name", "schema_name", "table_name", "columns", "version", "geometry_encoding",
-    ], None).await
+        "_id", "index_name", "schema_name", "table_name", "columns", "version", "geometry_encoding",
+    ], id.map(|id| EntityId::string_iid(id))).await
 }
 
 async fn open_private_catalog(

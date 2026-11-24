@@ -1124,12 +1124,16 @@ impl ReplicationDriver {
                     boundary.after_offset(self.logs.replica_epoch) >= 0 && boundary <= through
                 })
             }) {
-                self.partition.publish_catalog_cut(CatalogCut {
+                let catalog = CatalogCut {
                     storage_version: self.logs.storage_version,
                     storage_epoch: self.logs.storage_epoch,
                     replica_epoch: self.logs.replica_epoch,
                     through,
-                })?;
+                };
+                self.partition.publish_catalog_cut(catalog)?;
+                if let Some(serving) = &self.serving {
+                    serving.publish_ranked_catalog(catalog);
+                }
             }
             let source = self.progress.current().source_position;
             self.logs.record_source_applied(source);

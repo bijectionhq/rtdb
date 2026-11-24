@@ -88,6 +88,9 @@ surface StatelessDatabase {
         -- Query of xt.ranked_indexes reads the definitions present at its selected cut and their serving mode and artefact readiness.
         -- Search declarations also supply analyzer and history definitions to the search accelerator.
         -- A declaration on an exact-SQL route reports artefacts_ready false for a physical index that the route cannot prove.
+        -- VerifyRankedArtefacts checks the storage placement paired with the selected clear exact cut.
+        -- Spatial readiness requires a persisted posting file for every selected primary trie in the same placement and declared generation.
+        -- The serving mode and approximate status describe the permitted query path.
 
     @guarantee CountConstraintCatalog
         -- A count range limits one ordered index interval.

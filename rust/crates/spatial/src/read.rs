@@ -210,6 +210,57 @@ pub async fn path_ready(
     definition_ready(context, &definition).await
 }
 
+pub async fn committed_native_ready(
+    context: Arc<QueryContext>, table: &rtdb_types::TableRef, name: &str,
+    declaration: &rtdb_index::branches::RankedIndexDeclaration,
+) -> Result<bool> {
+    use rtdb_index::branches::RankedIndexKind;
+
+    let RankedIndexKind::Spatial { geometry_encoding } = &declaration.definition.kind else { return Ok(false); };
+    let Some((geometry, partition)) = declaration.definition.columns.split_first() else { return Ok(false); };
+    context.reading(async {
+        let database = context.catalog.database(context.catalog.default_database())?;
+        let [snapshot] = database.partitions.as_slice() else { return Ok(false); };
+        if snapshot.catalog_cut().is_none() || snapshot.has_overlays()
+            || snapshot.iter_segments(table).any(|segment| segment.row_count() != 0)
+        {
+            return Ok(false);
+        }
+        let Some(table_entry) = snapshot.table_entry(table) else { return Ok(false); };
+        let Some(definition) = definition::committed_native_definition(Arc::clone(&context), table, name).await? else {
+            return Ok(false);
+        };
+        if i64::try_from(declaration.position).ok() != Some(definition.generation) || geometry != &definition.geometry
+            || partition != definition.partition.as_slice() || geometry_encoding.as_str() != definition.encoding.name()
+        {
+            return Ok(false);
+        }
+        let artefact = definition.artefact();
+        let count = snapshot.trie_catalog().iter_tries(table).count();
+        let _inventory = context.memory.reserve(4096usize.saturating_add(count.saturating_mul(128)))?;
+        let mut found = false;
+        let mut bytes_read = 0;
+        for trie in snapshot.trie_entries(table) {
+            let Some(record) = trie.artefact(&artefact.kind, &artefact.id, artefact.version) else { return Ok(false); };
+            let Some(size) = record.file_size.and_then(|size| u64::try_from(size).ok())
+                .filter(|size| (1..=postings::MAX_FILE_BYTES).contains(size)) else { return Ok(false); };
+            let Some(digest) = record.stats.as_deref().filter(|digest| digest.len() == 32) else { return Ok(false); };
+            if record.scope() != rtdb_format::log::proto::ArtefactScope::Trie || !record.pack_members.is_empty() {
+                return Ok(false);
+            }
+            charge_bytes(&mut bytes_read, size, MAX_INDEXED_BYTES)?;
+            let key = ObjectKey::new(table_entry.slug.recorded_artefact_key(&trie.key, record)?)?;
+            let bytes = database.storage.get_fresh_exact_or(&key, usize::try_from(size).map_err(|_| postings::work_limit())?, &context.memory).await?;
+            let check = || context.check_cancelled();
+            postings::verify_digest(bytes.sha256(|bytes| postings::sha256(bytes, &check))?, digest)?;
+            postings::candidates(bytes, None, &[geometry::KeyRange { start: i64::MIN, end: i64::MAX }],
+                &context.memory, check, |_| Ok(()))?;
+            found = true;
+        }
+        Ok(found)
+    }).await
+}
+
 pub async fn require_path_ready(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
     columns: &[String], encoding: SpatialGeometryEncoding,

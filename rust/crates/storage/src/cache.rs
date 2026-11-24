@@ -508,6 +508,11 @@ impl BufferPool {
         {
             return Ok(lease);
         }
+        self.get_fresh_exact_or(key, length, fallback).await
+    }
+
+    /// Reopens the persisted immutable object without using a resident pool allocation.
+    pub async fn get_fresh_exact_or(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
         let allocation = self.store.exact_object_allocation(key, length)?;
         let reservation = reserve_read(length, allocation, |bytes| self.reserve(bytes).or_else(|_| reserve_from(fallback, bytes)))?;
         let bytes = reservation.retaining_io(self.store.get_fresh_exact(key, length)).await?;

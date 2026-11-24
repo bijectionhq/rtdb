@@ -15,14 +15,20 @@ Retained declarations that predate the projection need replay of their ordered d
 
 ## Readiness dependencies
 
-The native Default read currently builds its SQL snapshot from the selected branch fold.
-The Default replica publishes its physical catalogue at a separate replica coordinate after applying the shared-main projection.
-A physical readiness proof needs the replica owner's association between that published cut and the exact applied branch state.
-The reader must retain the selected catalogue and confirm the live primary inventory and the exact generation's persisted posting files in that placement.
+The native Default read builds its SQL snapshot from the selected branch fold.
+Its replica owner pairs the applied native head with the installed physical catalogue at publication.
+Readiness admits the current merged main branch when its exact native cut, clock, and physical catalogue agree.
+The checker retains that catalogue, compares the complete mirrored definition, and reopens each posting file from storage under its recorded trie owner and exact index generation.
+The checker verifies the file length, digest, and Arrow layout within the existing spatial read budget.
+An empty persisted inventory, a live tail, missing or invalid objects, unmatched cuts, and routes without this association report false.
 
 Multi's committed view returns the native fold and key generation, and the native query snapshot constructs its own live rows.
 Multi needs a committed primary catalogue and an artefact publication under its existing writer and storage authority before the same spatial proof can be made.
 The reader needs the associated storage generation and a retained read on the selected catalogue.
 
-The current native spatial method remains exact SQL.
-Published postings require a mounted exact-cut spatial selector before a read can use them for narrowing.
+Negotiate `query.ranked-artefact-readiness` and set `verify_ranked_artefacts = true` (QueryRequest field 10) along with the clear exact-cut guard and tracking.
+Read `xt.ranked_indexes` without a Flight continuation.
+The row reports the declared options and original generation, the result of the physical proof in `artefacts_ready`, and the permitted method in `serving_mode`.
+Check the declaration at its original receipt; check physical readiness at a current exact basis once the writer has published the postings.
+The current native method remains `exact-sql` and reports `approximate = false`.
+Persisted postings require a mounted exact-cut spatial selector before the query can use them for narrowing.

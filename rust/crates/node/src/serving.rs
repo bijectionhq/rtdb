@@ -246,6 +246,12 @@ pub trait ServingDriver: Send + Sync {
         cancellation: &CancellationToken,
     ) -> Result<QueryView>;
 
+    async fn query_ranked_artefacts(
+        &self, _database: &str, source: QuerySource, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        self.query(source, false, now, cancellation).await
+    }
+
     async fn transact(
         &self,
         request: Transact,

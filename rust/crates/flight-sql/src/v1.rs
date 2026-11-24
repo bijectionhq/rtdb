@@ -7,7 +7,7 @@ use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_tx::transact::{PHYSICAL_ERASURE, TIMED_TRANSACT, TRANSACT_REQUIRES};
-use rtdb_types::{Timestamp, rtdb_v1::CLEAR_RANK_INPUT};
+use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS}};
 use tonic::{Response, Status, metadata::MetadataMap};
 
 use crate::{
@@ -120,7 +120,7 @@ impl Service {
                                 }
                             }
                         } else {
-                            features.retain(|feature| feature != "query.track" && feature != "query.page" && feature != CLEAR_RANK_INPUT);
+                            features.retain(|feature| !matches!(feature.as_str(), "query.track" | "query.page" | CLEAR_RANK_INPUT | RANKED_ARTEFACT_READINESS));
                         }
                     }
                 }

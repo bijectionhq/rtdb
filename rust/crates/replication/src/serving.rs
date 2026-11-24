@@ -13,7 +13,7 @@ use rtdb_tx::transact::{
 };
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
-use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, ReplicaPosition, Result, SourcePosition, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
 use parking_lot::Mutex as ReplyLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot, watch};
@@ -48,6 +48,7 @@ pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, TIMED_TRANSACT, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, "row-visibility", "tx-status", "sql.history",
     "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
     rtdb_types::rtdb_v1::CLEAR_RANK_INPUT,
+    rtdb_types::rtdb_v1::RANKED_ARTEFACT_READINESS,
     rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS,
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
@@ -55,6 +56,7 @@ pub const NATIVE_READ_FEATURES: &[&str] = &[
     "changes", "changes.progress-only", "tx-status", "sql.history",
     "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
     rtdb_types::rtdb_v1::CLEAR_RANK_INPUT,
+    rtdb_types::rtdb_v1::RANKED_ARTEFACT_READINESS,
 ];
 const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TRANSACT_REQUIRES, TIMED_TRANSACT, "row-visibility"];
 
@@ -150,6 +152,7 @@ pub struct NativeServingView {
     pub read_custody: Option<Arc<crate::LocalErasureRead>>,
     compatible: bool,
     classic_head: Option<ReplicaPosition>,
+    ranked_catalog: Option<(BranchCut, CatalogCut)>,
 }
 
 #[derive(Clone)]
@@ -167,6 +170,15 @@ impl NativeServingHandle {
     pub fn has_local_erasure_fence(&self) -> bool { self.local_read_fence.is_some() }
     pub fn supports_row_custody(&self) -> bool {
         self.authority.checkpoints.is_some() && !self.has_local_erasure_fence()
+    }
+
+    pub fn ranked_catalog(&self, selected: &NativeServingView, cut: BranchCut) -> Option<Snapshot> {
+        if self.has_local_erasure_fence() { return None; }
+        let (native, physical) = selected.ranked_catalog?;
+        if native != cut || selected.index.head() != cut { return None; }
+        let snapshot = self.replication.serving_partition()?;
+        (snapshot.catalog_cut() == Some(physical)
+            && snapshot.tx_basis().is_some_and(|basis| basis.system_time == cut.system_time)).then_some(snapshot)
     }
 
     pub async fn check_read_generation(&self, generation: u64) -> Result<()> {
@@ -498,7 +510,7 @@ impl NativeServing {
             floor: fold.index().head().basis,
             key_generation,
             read_custody: None,
-            changes: Arc::default(), compatible: true, classic_head: None,
+            changes: Arc::default(), compatible: true, classic_head: None, ranked_catalog: None,
         });
         let source_authority = Arc::new(SourceAuthority::new(store, authority.incarnation));
         Ok((Self {
@@ -752,6 +764,17 @@ impl NativeServing {
                 view.floor = retained.pop_front().expect("full retained groups").0.basis;
             }
             retained.push_back((cut, changes));
+        });
+    }
+
+    pub(crate) fn publish_ranked_catalog(&self, installed: CatalogCut) {
+        let cut = self.durable().index().head();
+        self.view.send_if_modified(|view| {
+            let selected = (self.shares_main && view.compatible && view.index.head() == cut)
+                .then_some((cut, installed));
+            if view.ranked_catalog == selected { return false; }
+            view.ranked_catalog = selected;
+            true
         });
     }
 

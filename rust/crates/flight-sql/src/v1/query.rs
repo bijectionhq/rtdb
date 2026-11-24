@@ -93,6 +93,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     if query.custody_release_evidence { hash.update(b"custody-release-evidence"); }
     if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
     if query.observe_applied_position { hash.update(b"observe-applied-position"); }
+    if query.verify_ranked_artefacts { hash.update(b"ranked-artefact-readiness"); }
     hash.finalize().into()
 }
 
@@ -211,6 +212,12 @@ impl Service {
         ) {
             return Err(error::unsupported(super::CLEAR_RANK_INPUT));
         }
+        if request.verify_ranked_artefacts && (
+            !request.require_clear_rank_input || request.page.is_some()
+                || driver.is_none_or(|driver| !driver.features().contains(&super::RANKED_ARTEFACT_READINESS))
+        ) {
+            return Err(error::unsupported(super::RANKED_ARTEFACT_READINESS));
+        }
         if request.observe_receiver_clock && (
             driver.is_none_or(|driver| !driver.supports_query_tokens())
                 || visibility.is_some()
@@ -273,6 +280,7 @@ impl Service {
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
             let view = match &visibility {
                 Some(scope) => driver.query_scoped(query_source, request.track, now, scope, &call.cancellation).await,
+                None if request.verify_ranked_artefacts => driver.query_ranked_artefacts(&call.database, query_source, now, &call.cancellation).await,
                 None => driver.query(query_source, false, now, &call.cancellation).await,
             }.map_err(error::anomaly)?;
             let cut = view.cut.system_time;

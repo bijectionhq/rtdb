@@ -70,6 +70,8 @@ message QueryRequest {
   // Obtain the comparable position of this Query's selected native cut.
   // Available only on an unscoped native database route.
   bool observe_applied_position = 9;
+  // Inspect persisted ranked artefacts for a tracked, clear exact-cut catalog read.
+  bool verify_ranked_artefacts = 10;
 }
 message QueryTrailer {
   Basis basis = 1;

@@ -1,9 +1,9 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
-use rtdb_index::branches::BranchIndex;
+use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView, RankedIndexKind}};
 use rtdb_replication::{NATIVE_READ_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
 use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, ROW_CUSTODY, Receipt, Transact, TrustedCustodyCommand};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
@@ -33,25 +33,47 @@ impl DefaultServing {
         let vault = self.tokens.authority().await?.custody_vault();
         super::custody::open_changes(&view.index, &vault, page).await
     }
-}
 
-#[async_trait]
-impl ServingDriver for DefaultServing {
-    fn incarnation(&self) -> [u8; 16] { self.handle.authority().incarnation }
-    fn uses_database_tokens(&self) -> bool { true }
-    fn supports_query_tokens(&self) -> bool { self.handle.is_compatible() }
-    fn supports_row_visibility(&self) -> bool { self.handle.is_compatible() && self.tokens.supported() }
+    async fn ranked_snapshot(
+        &self, database: &str, branch: &BranchView<'_>, physical: Snapshot, cancellation: &CancellationToken,
+    ) -> Result<Snapshot> {
+        use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 
-    fn features(&self) -> &[&str] {
-        if self.handle.has_classic_read() {
-            return &["query", "query.linearizable", "sql.history", "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance"];
+        let spatial = || branch.tables().flat_map(|(table, definition)| definition.ranked_indexes.iter()
+            .filter(|(_, index)| matches!(&index.definition.kind, RankedIndexKind::Spatial { .. }))
+            .map(move |(name, declaration)| (table, name, declaration)));
+        let count = spatial().count();
+        if count == 0 {
+            return rtdb_query::branch_snapshot(branch, &self.memory);
         }
-        if !self.handle.is_compatible() { return &[]; }
-        if self.writable { &self.write_features } else { NATIVE_READ_FEATURES }
+        let physical = match rtdb_query::retain_catalog_snapshot(physical, &self.storage).await {
+            Ok(physical) => physical,
+            Err(error) if error.category != AnomalyCategory::Interrupted => {
+                return rtdb_query::branch_snapshot(branch, &self.memory);
+            }
+            Err(error) => return Err(error),
+        };
+        let catalog = CatalogSnapshot::new(database, BTreeMap::from([(database.into(), DatabaseSnapshot {
+            partitions: vec![physical], storage: Arc::clone(&self.storage),
+        })]), false)?;
+        let context = QueryContext::new(catalog, Arc::clone(&self.memory), branch.cut().system_time,
+            "UTC", QueryOptions::default(), cancellation)?;
+        let _ready = self.memory.reserve(count.saturating_mul(128))?;
+        let mut ready = BTreeSet::new();
+        for (table, name, declaration) in spatial() {
+            match rtdb_spatial::committed_native_ready(Arc::clone(&context), table, name, declaration).await {
+                Ok(true) => { ready.insert(name.as_str()); }
+                Ok(false) => {}
+                Err(error) if error.category == AnomalyCategory::Interrupted => return Err(error),
+                Err(_) => {}
+            }
+        }
+        rtdb_query::branch_snapshot_with_ranked_artefacts(branch, &self.memory, &ready)
     }
 
-    async fn query(
+    async fn capture_query(
         &self, source: QuerySource, track: bool, now: Timestamp, cancellation: &CancellationToken,
+        ranked_database: Option<&str>,
     ) -> Result<QueryView> {
         if self.handle.has_classic_read() {
             if self.handle.has_local_erasure_fence() { return Err(rtdb_crypt::erased_under_view()); }
@@ -79,7 +101,16 @@ impl ServingDriver for DefaultServing {
         let (snapshot, custody_groups, custody_contributors) = if snapshot.index.has_custody_groups() {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::snapshot(&branch, &self.memory, &vault).await?
-        } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
+        } else {
+            let physical = ranked_database.filter(|_| branch.branch() == rtdb_types::rtdb_v1::MAIN_BRANCH
+                && branch.layer() == Layer::Merged && matches!(source.at, At::Exactly(_)))
+                .and_then(|database| self.handle.ranked_catalog(&snapshot, cut).map(|physical| (database, physical)));
+            let rows = match physical {
+                Some((database, physical)) => self.ranked_snapshot(database, &branch, physical, cancellation).await?,
+                None => rtdb_query::branch_snapshot(&branch, &self.memory)?,
+            };
+            (rows, BTreeSet::new(), Some(BTreeSet::new()))
+        };
         let snapshot = match snapshot_read_custody {
             Some(custody) => {
                 let deadline = custody.deadline();
@@ -88,6 +119,34 @@ impl ServingDriver for DefaultServing {
             None => snapshot,
         };
         Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, key_generation })
+    }
+}
+
+#[async_trait]
+impl ServingDriver for DefaultServing {
+    fn incarnation(&self) -> [u8; 16] { self.handle.authority().incarnation }
+    fn uses_database_tokens(&self) -> bool { true }
+    fn supports_query_tokens(&self) -> bool { self.handle.is_compatible() }
+    fn supports_row_visibility(&self) -> bool { self.handle.is_compatible() && self.tokens.supported() }
+
+    fn features(&self) -> &[&str] {
+        if self.handle.has_classic_read() {
+            return &["query", "query.linearizable", "sql.history", "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance"];
+        }
+        if !self.handle.is_compatible() { return &[]; }
+        if self.writable { &self.write_features } else { NATIVE_READ_FEATURES }
+    }
+
+    async fn query(
+        &self, source: QuerySource, track: bool, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        self.capture_query(source, track, now, cancellation, None).await
+    }
+
+    async fn query_ranked_artefacts(
+        &self, database: &str, source: QuerySource, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        self.capture_query(source, false, now, cancellation, Some(database)).await
     }
 
     async fn transact(&self, mut request: Transact, cancellation: &CancellationToken) -> Result<Receipt> {

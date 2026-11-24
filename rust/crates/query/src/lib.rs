@@ -7,7 +7,7 @@ pub use ranking::{QueryRanking, QueryWinners, RankOutcome, RankSource, RankWork,
 mod aggregate;
 mod context;
 mod branch_snapshot;
-pub use branch_snapshot::{branch_snapshot, branch_snapshot_with};
+pub use branch_snapshot::{branch_snapshot, branch_snapshot_with, branch_snapshot_with_ranked_artefacts};
 mod parameters;
 pub use parameters::BoundParameters;
 mod cursor;

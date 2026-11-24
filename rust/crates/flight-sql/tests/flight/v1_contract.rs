@@ -1619,11 +1619,14 @@ async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
     }).await.unwrap();
     assert!(matches!(ranked.outcome, Some(v1::receipt::Outcome::Then(()))));
     let mut read = input("SELECT COUNT(*) FROM xt.ranked_indexes WHERE table_name = 'events'
-        AND serving_mode = 'exact-sql' AND NOT artefacts_ready AND (
+        AND serving_mode = 'exact-sql' AND NOT artefacts_ready AND NOT approximate AND (
         (kind = 'search' AND analyzer = 'english_stop' AND history)
         OR (kind = 'spatial' AND geometry_encoding = 'tagged-wkb-v1' AND columns = ARRAY['geometry', 'partition_key'])
         OR (kind = 'vector' AND method = 'ivf' AND dimensions = 2 AND recall > 0.8))");
     read.source.as_mut().unwrap().at = Some(v1::At { selection: ranked.basis.map(Selection::Exactly) });
+    read.track = true;
+    read.require_clear_rank_input = true;
+    read.verify_ranked_artefacts = true;
     assert_eq!(ints(&query(&mut client, read.clone()).await.0), [3]);
     read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.clone().map(Selection::Exactly) });
     assert_eq!(ints(&query(&mut client, read).await.0), [0]);

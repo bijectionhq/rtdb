@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::{
@@ -13,7 +13,13 @@ use rtdb_types::{
 };
 
 pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Result<Snapshot> {
-    branch_snapshot_with(view, memory, |image| {
+    branch_snapshot_with_ranked_artefacts(view, memory, &BTreeSet::new())
+}
+
+pub fn branch_snapshot_with_ranked_artefacts(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>,
+) -> Result<Snapshot> {
+    snapshot(view, memory, ready, |image| {
         if image.custody_payload.is_some() {
             return Err(Anomaly::unsupported("rtdb/row-custody", "The query route has no protected value reader"));
         }
@@ -23,6 +29,13 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
 
 pub fn branch_snapshot_with(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>,
+    open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
+) -> Result<Snapshot> {
+    snapshot(view, memory, &BTreeSet::new(), open_image)
+}
+
+fn snapshot(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>,
     mut open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
 ) -> Result<Snapshot> {
     let tables = Arc::new(TableCatalog::default());
@@ -74,7 +87,7 @@ pub fn branch_snapshot_with(
             }
             append_lineage(view, &mut buffer)?;
             append_ordered_indexes(view, &mut buffer)?;
-            append_ranked_indexes(view, &mut buffer)?;
+            append_ranked_indexes(view, &mut buffer, ready)?;
             append_count_constraints(view, &mut buffer)?;
             append_custody_inventory(view, &mut buffer)?;
             append_custody_placements(view, &mut buffer)?;
@@ -181,7 +194,7 @@ fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffe
     Ok(())
 }
 
-fn append_ranked_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+fn append_ranked_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer, ready: &BTreeSet<&str>) -> Result<()> {
     let catalog = TableRef::new("xt", "ranked_indexes");
     let search = TableRef::new("xt", "search_indexes");
     let text = LogicalType::Scalar(ScalarType::Utf8);
@@ -203,7 +216,8 @@ fn append_ranked_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer) 
     }
     catalog_columns.insert("dimensions".into(), integer);
     catalog_columns.insert("recall".into(), LogicalType::Scalar(ScalarType::F64));
-    catalog_columns.insert("artefacts_ready".into(), boolean);
+    catalog_columns.insert("artefacts_ready".into(), boolean.clone());
+    catalog_columns.insert("approximate".into(), boolean);
     buffer.declare_table(catalog.clone(), catalog_columns.keys().cloned())?;
     buffer.declare_document_types(&catalog, &catalog_columns)?;
     for (table, definition) in view.tables() {
@@ -238,7 +252,8 @@ fn append_ranked_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer) 
             };
             row.insert("kind".into(), Value::Utf8(kind.into()));
             row.insert("serving_mode".into(), Value::Utf8("exact-sql".into()));
-            row.insert("artefacts_ready".into(), Value::Bool(false));
+            row.insert("artefacts_ready".into(), Value::Bool(ready.contains(name.as_str())));
+            row.insert("approximate".into(), Value::Bool(false));
             buffer.put(catalog.clone(), row, Interval::ALL)?;
         }
     }

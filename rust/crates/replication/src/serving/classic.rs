@@ -6,7 +6,7 @@ use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut,
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
-    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SPATIAL_BUILD_CATALOG}};
+    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, SPATIAL_BUILD_CATALOG, spatial_build_id}};
 use tokio_util::sync::CancellationToken;
 
 pub(super) fn data_table(table: &TableRef) -> bool {
@@ -188,7 +188,7 @@ fn stage_spatial_builds(prior: &BranchIndex, effects: &[BranchEffect], buffer: &
     for (table, final_definition) in final_tables {
         let old = prior.definition(table, prior.head().basis).filter(|definition| !definition.dropped);
         let final_indexes = &final_definition.ranked_indexes;
-        let id = |name: &str| format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table);
+        let id = |name: &str| spatial_build_id(table, name);
         if let Some(old) = old {
             for (name, declaration) in &old.ranked_indexes {
                 if matches!(&declaration.definition.kind, RankedIndexKind::Spatial { .. })
