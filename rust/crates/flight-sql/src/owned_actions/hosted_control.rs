@@ -1,7 +1,7 @@
 use super::*;
 use rtdb_node::RootCatalogRead;
 
-pub(crate) const READ_HELD_HOSTED_CONTROL_V2: &str = "rtdb.owned.ReadHeldHostedControl.v2";
+pub(crate) const READ_HELD_HOSTED_CONTROL_V3: &str = "rtdb.owned.ReadHeldHostedControl.v3";
 pub(crate) const READ_HELD_ROOT_CATALOG_V1: &str = "rtdb.owned.ReadHeldRootCatalog.v1";
 
 pub(super) fn require_audience_control(

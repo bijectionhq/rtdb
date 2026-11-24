@@ -46,6 +46,7 @@ pub async fn read_hosted_control_point(
         columns.push(rtdb_types::HOSTED_RECEIPT_TX_ID);
     }
     if include_payload {
+        columns.push(rtdb_types::OWNED_EVENT_POSITION_COLUMN);
         for name in table_binding
             .columns
             .keys()

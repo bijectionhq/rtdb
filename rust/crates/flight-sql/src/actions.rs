@@ -14,7 +14,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | OWNED_SPATIAL_READINESS_V1
         | OBSERVE_HELD_HOSTED_V1
         | CONFIRM_APPLIED_HOSTED_V6
-        | READ_HELD_HOSTED_CONTROL_V2
+        | READ_HELD_HOSTED_CONTROL_V3
         | READ_HELD_ROOT_CATALOG_V1
         | OPEN_OWNED_SCOPED_READ_V2
         | OPEN_OWNED_READ_AS_OF_V1
@@ -65,7 +65,7 @@ fn fresh_replica_action(action: &str) -> bool {
 impl Service {
     pub async fn action(&self, call: Call, action: Action) -> Result<Response<Output<ActionResult>>, Status> {
         use crate::config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_TURN_ACTIONS, AUDIENCE_TURN_LIMITS};
-        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_TABLE_PUBLICATION_SEQUENCE_V1, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V2};
+        use crate::owned_actions::{CLOSE_OWNED_READ_V1, CONFIRM_APPLIED_HOSTED_V6, HELD_OWNED_POINT_V2, HELD_OWNED_RANGE_V2, HELD_TABLE_PUBLICATION_SEQUENCE_V1, OPEN_APPLIED_OWNED_READ_V5, PREPARE_APPLIED_READ_V3, READ_HELD_HOSTED_CONTROL_V3};
         use rtdb_storage::audience_work;
         if call.session.fresh_replica && !fresh_replica_action(&action.r#type) {
             return Err(call.error(Status::permission_denied("The fresh Flight route only admits reads and release of their holds")));
@@ -83,7 +83,7 @@ impl Service {
                             Some(audience_work::TurnAllowance::new(AUDIENCE_TURN_LIMITS, AUDIENCE_TURN_ACTIONS))
                         }
                     },
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V2 | CONFIRM_APPLIED_HOSTED_V6 =>
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V3 | CONFIRM_APPLIED_HOSTED_V6 =>
                         Some(self.audience_read_work(&call, &action.r#type, &action.body)?),
                     _ => None,
                 })
@@ -101,7 +101,7 @@ impl Service {
                 match action_type {
                     // Catalog acquisition checks the placement and quorum at the captured cut.
                     PREPARE_APPLIED_READ_V3 | OPEN_APPLIED_OWNED_READ_V5 | CONFIRM_APPLIED_HOSTED_V6 => {}
-                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V2 => {
+                    HELD_OWNED_POINT_V2 | HELD_OWNED_RANGE_V2 | HELD_TABLE_PUBLICATION_SEQUENCE_V1 | READ_HELD_HOSTED_CONTROL_V3 => {
                         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
                         let attachment = attachment.ok_or_else(unsupported)?;
                         self.0.node.confirm_audience_route(&attachment, source).await.map_err(status)?;
@@ -148,7 +148,7 @@ impl Service {
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 => Ok(vec![Ok(Box::pin(self.confirm_hosted_source_action(&call, &action.body)).await?)]),
-                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V3 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 => Ok(vec![Ok(Box::pin(self.read_held_root_catalog_action(&call, &action.body)).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
                 COMMIT_OWNED_V1 | COMMIT_OWNED_V2 => {
