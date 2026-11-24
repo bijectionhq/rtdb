@@ -17,6 +17,10 @@ pub(crate) struct Location {
 }
 
 impl Location {
+    pub(crate) fn is_point_geometry(&self) -> bool {
+        self.position_accuracy.is_none() && self.geometry.heights.is_none() && matches!(&self.geometry.coords, Coords::Point(_))
+    }
+
     pub(crate) fn decode(bytes: &[u8], work: &mut GeometryWork) -> Result<Self> {
         let Some((&tag, payload)) = bytes.split_first() else {
             return Err(invalid("Missing location encoding"));

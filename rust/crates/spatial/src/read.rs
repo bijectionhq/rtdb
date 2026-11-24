@@ -1,10 +1,10 @@
 use std::{borrow::Cow, collections::BTreeSet, sync::Arc};
 
-use arrow_array::{Float64Array, RecordBatch};
+use arrow_array::{Float64Array, RecordBatch, StructArray, TimestampMicrosecondArray};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
-    BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell,
+    BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
     copy_selected_cells, estimate_copy_cell_bytes, read_entity_id,
 };
 use rtdb_format::data::EventBatch;
@@ -59,9 +59,18 @@ pub struct Page {
     pub(super) includes_documents: bool,
     pub(super) distances: Float64Array,
     pub(super) _distance_reservation: Arc<MemoryReservation>,
+    pub(super) probe: Option<crate::probe::Evidence>,
 }
 
 impl Page {
+    pub fn omitted_sizes(&self) -> Option<&StructArray> {
+        self.probe.as_ref()?.omitted.as_ref()
+    }
+
+    pub fn certifies_point_intersects(&self) -> bool {
+        self.probe.as_ref().is_some_and(|probe| probe.point_intersects)
+    }
+
     pub fn distance_column(&self) -> Float64Array {
         self.distances.clone()
     }
@@ -241,6 +250,7 @@ pub async fn read_held(
 pub struct PreparedRegion {
     predicate: Predicate,
     location: Option<RegionGeometry>,
+    point_geometry: bool,
     ranges: Vec<KeyRange>,
     steps: usize,
     _reservation: Arc<MemoryReservation>,
@@ -283,6 +293,7 @@ impl PreparedRegion {
             predicate.validate_region(&region)?;
             Some(region)
         };
+        let point_geometry = region.as_ref().is_some_and(Location::is_point_geometry);
         let (region, ranges) = match region {
             Some(region) if !region.geometry.is_empty() && predicate.cover_predicate().is_some() => {
                 work.scoped(|work| {
@@ -318,7 +329,7 @@ impl PreparedRegion {
         } else {
             lease.shrink_to(bytes)?;
         }
-        Ok(Self { predicate, location: region, ranges, steps: work.usage().steps, _reservation: reservation })
+        Ok(Self { predicate, location: region, point_geometry, ranges, steps: work.usage().steps, _reservation: reservation })
     }
 }
 
@@ -330,6 +341,20 @@ pub async fn read_prepared(
     region: &PreparedRegion,
     request: Request<'_>,
     projection: Projection<'_>,
+) -> Result<Page> {
+    read_page(context, owner, relation, path, region, request, projection, None).await
+}
+
+pub async fn read_probe(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
+    region: &PreparedRegion, request: Request<'_>, columns: &[&str], probe: crate::Probe<'_>,
+) -> Result<Page> {
+    read_page(context, owner, relation, path, region, request, Projection::SelectedDocuments(columns), Some(probe)).await
+}
+
+async fn read_page(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation,
+    region: &PreparedRegion, request: Request<'_>, projection: Projection<'_>, probe: Option<crate::Probe<'_>>,
 ) -> Result<Page> {
     let nearest = matches!(region.predicate, Predicate::Nearest { .. });
     let valid_order = match request.page {
@@ -345,8 +370,11 @@ pub async fn read_prepared(
         .reserve(capacity * std::mem::size_of::<SelectedHit>())?;
     let mut selected = Vec::<SelectedHit>::with_capacity(capacity);
     let mut more = false;
-    let (projection_layout, _) =
-        visit_matches(Arc::clone(&context), owner, relation, path, region, &request, projection, false, |source, row, id, _, distance_m| {
+    let mut point_intersects = probe.is_some_and(|probe| probe.certify_point && probe.point_column.is_some());
+    let (projection_layout, _) = visit_matches(
+        Arc::clone(&context), owner, relation, path, region, &request, projection, false,
+        probe.filter(|probe| probe.certify_point).and_then(|probe| probe.point_column), |source, row, id, _, distance_m, certified| {
+                point_intersects &= certified;
                 let index = selection_position(&selected, id, distance_m)?;
                 if index < capacity {
                     if selected.len() == capacity {
@@ -363,6 +391,7 @@ pub async fn read_prepared(
         more = false;
     }
     context.check_cancelled()?;
+    let mut evidence = probe.map(|_| crate::probe::Evidence::new(point_intersects && !selected.is_empty()));
     let rows = if selected.is_empty() {
         empty_projected_documents(
             projection, projection_layout.as_ref().map(|(schema, columns)| (schema, columns.as_slice())), &context.memory,
@@ -374,7 +403,12 @@ pub async fn read_prepared(
         } else {
             &identities
         };
-        gather_selected(&selected, columns, &context.memory)?
+        if let (Some(probe), Some(evidence)) = (probe, evidence.as_mut()) {
+            let columns = crate::probe::summarize(&selected, columns, probe, evidence, &context.memory);
+            gather_selected(&selected, &columns, &context.memory)?
+        } else {
+            gather_selected(&selected, columns, &context.memory)?
+        }
     };
     let reservation = context.memory.reserve(4096 + selected.len() * 16)?;
     let distances = Float64Array::from_iter(selected.iter().map(|hit| hit.distance_m));
@@ -385,6 +419,50 @@ pub async fn read_prepared(
         includes_documents: projection.has_documents(),
         distances,
         _distance_reservation: reservation,
+        probe: evidence,
+    })
+}
+
+pub async fn gather_document(
+    context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    valid_at: Timestamp, id: EntityIdRef<'_>, revision: Timestamp, columns: &[&str],
+) -> Result<Page> {
+    let projection = Projection::SelectedDocuments(columns);
+    let scan = rtdb_query::open_owned_spatial_scan(
+        Arc::clone(&context), owner, relation, None, &[], valid_at, [id.iid()].into(), projection, false,
+    ).await?;
+    let missing = || Anomaly::fault("rtdb.spatial/gather", "The held spatial document changed identity or revision");
+    let rtdb_query::OwnedSpatialScan { mut cursor, document_columns } = scan.ok_or_else(missing)?;
+    let mut selected = None;
+    while let Some(source) = cursor.next_batch().await? {
+        let source = Arc::new(source);
+        let batch = source.batch();
+        for row in 0..batch.num_rows() {
+            context.check_cancelled_at(row)?;
+            if selected.is_some() || read_entity_id(batch.schema_ref().field(0), batch.column(0).as_ref(), row)? != id {
+                return Err(missing());
+            }
+            let (index, field) = batch.schema_ref().column_with_name("_system_from").ok_or_else(missing)?;
+            let (_, array, row_index) =
+                selected_cell(field, batch.column(index).as_ref(), row)?.ok_or_else(missing)?;
+            let system_from = array.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(missing)?;
+            if system_from.value(row_index) != revision.0 {
+                return Err(missing());
+            }
+            selected = Some(SelectedHit { source: Arc::clone(&source), row, distance_m: None });
+        }
+    }
+    let hit = selected.ok_or_else(missing)?;
+    let rows = gather_selected(&[hit], &document_columns, &context.memory)?;
+    let reservation = context.memory.reserve(4096)?;
+    Ok(Page {
+        more: false,
+        next_distance_m: None,
+        rows,
+        includes_documents: true,
+        distances: Float64Array::from(vec![None]),
+        _distance_reservation: reservation,
+        probe: None,
     })
 }
 
@@ -415,8 +493,8 @@ impl PreparedRange {
         let mut matches = Vec::new();
         let mut reservation = context.memory.reserve(0)?;
         let mut payload_bytes = 0usize;
-        let (_, columns) = visit_matches(Arc::clone(&context), owner, relation, path, region, request, Projection::Identities, true,
-            |_, _, id, iid, _| {
+        let (_, columns) = visit_matches(Arc::clone(&context), owner, relation, path, region, request, Projection::Identities, true, None,
+            |_, _, id, iid, _, _| {
                 let capacity = if matches.len() == matches.capacity() {
                     (matches.capacity() * 2).max(8)
                 } else {
@@ -474,7 +552,8 @@ pub(super) async fn visit_matches(
     request: &Request<'_>,
     projection: Projection<'_>,
     include_iid: bool,
-    mut visit: impl FnMut(&Arc<OwnedBatch>, usize, EntityIdRef<'_>, Option<Iid>, Option<f64>) -> Result<()>,
+    certify_point_column: Option<&str>,
+    mut visit: impl FnMut(&Arc<OwnedBatch>, usize, EntityIdRef<'_>, Option<Iid>, Option<f64>, bool) -> Result<()>,
 ) -> Result<(Option<(rtdb_plan::Schema, Vec<usize>)>, DocumentColumns)> {
     let definition =
         definition::held_definition(Arc::clone(&context), owner, relation, path).await?;
@@ -483,6 +562,11 @@ pub(super) async fn visit_matches(
             "Spatial read binds more than its declared equality partition",
         ));
     }
+    let certify_points = certify_point_column == Some(definition.geometry.as_str())
+        && definition.encoding == SpatialGeometryEncoding::BijectionGeometry
+        && request.partition.len() == definition.partition.len()
+        && matches!(region.predicate, Predicate::Topology(geometry::predicates::TopologyPredicate::Intersects))
+        && region.point_geometry;
     let _geometry_memory = context.memory.reserve(kernel::WORK_BYTES)?;
     let mut work = GeometryWork::with_limits(kernel::WORK_STEPS, kernel::WORK_BYTES);
     work.charge(region.steps).map_err(kernel::geometry_error)?;
@@ -614,6 +698,7 @@ pub(super) async fn visit_matches(
             {
                 continue;
             }
+            let mut certified = false;
             let exact = if let Some(location_filter) = &region.location {
                 let Some(bytes) =
                     binary_cell(batch.schema_ref().field(1), batch.column(1).as_ref(), row)?
@@ -624,13 +709,14 @@ pub(super) async fn visit_matches(
                     let Some(location) = Location::decode_stored(bytes, definition.encoding, work)? else {
                         return Ok(None);
                     };
+                    certified = certify_points && location.is_point_geometry();
                     location_filter.evaluate(region.predicate, &location, work)
                 })?
             } else {
                 Some(None)
             };
             if let Some(distance_m) = exact {
-                visit(&source, row, id, iids.as_ref().map(|iids| iids.get(row)).transpose()?, distance_m)?;
+                visit(&source, row, id, iids.as_ref().map(|iids| iids.get(row)).transpose()?, distance_m, certified)?;
             }
         }
     }

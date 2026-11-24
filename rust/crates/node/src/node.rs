@@ -2712,6 +2712,34 @@ impl OwnedReadSession {
         Ok((page, witness))
     }
 
+    pub async fn spatial_probe_page(
+        &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
+        request: rtdb_spatial::Request<'_>, observe: bool, columns: &[&str],
+        prepared: &rtdb_spatial::PreparedRegion, probe: rtdb_spatial::Probe<'_>,
+    ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let work = Box::pin(rtdb_spatial::read_probe(Arc::clone(&context), &self.owner, relation,
+            path, prepared, request, columns, probe));
+        let page = context.reading(work).await?;
+        let witness = if observe { self.relation_witness(relation)? } else { None };
+        self.check_relation(relation)?;
+        Ok((page, witness))
+    }
+
+    pub async fn gather_spatial_document(
+        &self, relation: &rtdb_types::OwnedRelation, id: rtdb_columnar::EntityIdRef<'_>,
+        revision: Timestamp, columns: &[&str],
+    ) -> Result<rtdb_spatial::Page> {
+        self.admit_read().await?;
+        let context = self.relation_context(relation)?;
+        let work = Box::pin(rtdb_spatial::gather_document(Arc::clone(&context), &self.owner,
+            relation, self.system_time(), id, revision, columns));
+        let page = context.reading(work).await?;
+        self.check_relation(relation)?;
+        Ok(page)
+    }
+
     pub async fn open_spatial_nearest(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         request: rtdb_spatial::Request<'_>, after_radius: Option<f64>, observe: bool, projection: rtdb_spatial::Projection<'_>,

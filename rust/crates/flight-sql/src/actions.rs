@@ -32,6 +32,8 @@ fn fresh_replica_action(action: &str) -> bool {
         | VALIDATE_FRESH_HOSTED_V1
         | OPEN_FRESH_OWNED_READ_V2
         | SPATIAL_OPEN_OWNED
+        | SPATIAL_PROBE_OWNED
+        | SPATIAL_GATHER_OWNED
         | SPATIAL_RANK_NEXT_OWNED
         | SPATIAL_NEXT_OWNED
         | SPATIAL_RANK_OPEN_OWNED
@@ -153,11 +155,12 @@ impl Service {
             use crate::owned_actions::{
                 COMMIT_ORDERED_V1, COMMIT_OWNED_V1, COMMIT_OWNED_V2, COMMIT_OWNED_V3, COMMIT_OWNED_V4,
                 CommitFormat, SPATIAL_HELD_OWNED_V1, SPATIAL_HELD_OWNED_V2, SPATIAL_HELD_OWNED_V3,
-                SPATIAL_OPEN_OWNED, SPATIAL_RANK_OPEN_OWNED, SPATIAL_RANK_OPEN_OWNED_V2, SpatialHeldWire,
+                SPATIAL_OPEN_OWNED, SPATIAL_PROBE_OWNED, SPATIAL_RANK_OPEN_OWNED, SPATIAL_RANK_OPEN_OWNED_V2, SpatialHeldWire,
             };
             // Sharing the await site keeps duplicate handler futures off the worker stack.
             let spatial_wire = match action_type {
                 SPATIAL_OPEN_OWNED => Some(SpatialHeldWire::Open),
+                SPATIAL_PROBE_OWNED => Some(SpatialHeldWire::Probe),
                 SPATIAL_RANK_OPEN_OWNED => Some(SpatialHeldWire::RankOpen),
                 SPATIAL_RANK_OPEN_OWNED_V2 => Some(SpatialHeldWire::RankWindow),
                 SPATIAL_HELD_OWNED_V1 => Some(SpatialHeldWire::V1),
@@ -223,6 +226,8 @@ impl Service {
                 crate::owned_actions::OPEN_OWNED_READ_AT_PUBLICATION_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
+                crate::owned_actions::SPATIAL_GATHER_OWNED =>
+                    Ok(vec![Ok(Box::pin(self.gather_spatial_owned_action(&call, &action.body)).await?)]),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
                     let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
                     Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body, ranked).await?)])

@@ -55,7 +55,8 @@ impl PreparedNearest {
             &request,
             Projection::Identities,
             true,
-            |_, _, id, iid, distance| {
+            None,
+            |_, _, id, iid, distance, _| {
                 let distance = distance.ok_or_else(inconsistent_ranking)?;
                 if after_radius.is_some_and(|after| distance <= after) { return Ok(()); }
                 ranking.push(id, iid.ok_or_else(inconsistent_ranking)?, distance)
@@ -181,6 +182,7 @@ impl PreparedNearest {
             includes_documents: projection.has_documents(),
             distances: distances.slice(start, end - start),
             _distance_reservation: Arc::clone(self.ranking.reservation()),
+            probe: None,
         })
     }
 }
@@ -254,6 +256,7 @@ pub(super) async fn gather_range(
         includes_documents: projection.has_documents(),
         distances,
         _distance_reservation: distance_reservation,
+        probe: None,
     })
 }
 

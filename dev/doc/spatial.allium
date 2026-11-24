@@ -78,6 +78,14 @@ entity SpatialPostings {
 -- Selection compares complete identity cells on the retained Arrow pages.
 -- A selected document projection gathers identity, system revision and the requested fields present in the held relation schema.
 -- An empty selected document page carries the same projection schema as a populated page at the same hold.
+-- A current Root probe uses the identity order and carries the full projection and the fields eligible for omission.
+-- A probe gathers full values for the fields needed by local operators and sends nullable logical sizes for omitted clear values.
+-- A null size means the field is absent, and a present logical null has size one.
+-- Unsupported clear measurements keep their original projected values.
+-- The Point intersection certificate binds the complete equality partition and canonical Bijection geometry column to an admitted Point region.
+-- Every matching row inspected on the first page has a canonical Point geometry before the held filter can certify matches.
+-- A winner gather resolves the selected complete identity at the original present and requires the same winning system revision.
+-- A winner gather uses the original relation release guard and issues no additional witness.
 -- An observed read with an admitted placed witness scope, including an empty page, binds the relation frontier for ordered validation.
 -- Erasure orders against the held admission, and its newly compacted source carries no erased posting.
 -- Superseded source tries and their derived files follow trie-cat.allium and gc.allium.

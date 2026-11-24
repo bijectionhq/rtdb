@@ -66,6 +66,8 @@ pub(crate) const DECLARE_OWNED_UNIQUE_PATH_V1: &str = "rtdb.owned.DeclareUniqueP
 pub(crate) const SPATIAL_HELD_OWNED_V1: &str = "rtdb.owned.SpatialHeld.v1";
 pub(crate) const SPATIAL_HELD_OWNED_V2: &str = "rtdb.owned.SpatialHeld.v2";
 pub(crate) const SPATIAL_OPEN_OWNED: &str = "rtdb.owned.SpatialOpen.v1";
+pub(crate) const SPATIAL_PROBE_OWNED: &str = "rtdb.owned.SpatialProbe.v1";
+pub(crate) const SPATIAL_GATHER_OWNED: &str = "rtdb.owned.SpatialGather.v1";
 pub(crate) const SPATIAL_NEXT_OWNED: &str = "rtdb.owned.SpatialNext.v1";
 pub(crate) const SPATIAL_CLOSE_OWNED: &str = "rtdb.owned.SpatialClose.v1";
 pub(crate) const SPATIAL_RANK_OPEN_OWNED: &str = "rtdb.owned.SpatialRankOpen.v1";
@@ -76,7 +78,7 @@ const MAX_SPATIAL_FILTERS: usize = 32;
 pub(crate) const SPATIAL_HELD_OWNED_V3: &str = "rtdb.owned.SpatialHeld.v3";
 
 #[derive(Clone, Copy)]
-pub(crate) enum SpatialHeldWire { V1, V2, V3, Open, RankOpen, RankWindow }
+pub(crate) enum SpatialHeldWire { V1, V2, V3, Open, Probe, RankOpen, RankWindow }
 pub(crate) const DROP_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DropSpatialPath.v1";
 pub(crate) const DROP_OWNED_SPATIAL_PATH_V2: &str = "rtdb.owned.DropSpatialPath.v2";
 pub(crate) const DECLARE_OWNED_SPATIAL_PATH_V1: &str = "rtdb.owned.DeclareSpatialPath.v1";
@@ -399,6 +401,7 @@ enum RetainedSpatialQuery {
         matches: rtdb_node::HeldSpatialRange,
         earlier: Option<(OwnedRelation, rtdb_spatial::PreparedRegion)>,
     },
+    Probe { path: OwnedRelation, region: rtdb_spatial::PreparedRegion, certify_point: bool },
     Nearest(HeldSpatialNearest),
 }
 
@@ -761,12 +764,16 @@ fn single_owned_batch(stream: OwnedStream) -> Result<OwnedBatch, Status> {
 fn spatial_filters_unavailable() -> Status { Status::internal("Owned spatial filter storage is unavailable") }
 
 fn spatial_document_columns(batch: &RecordBatch) -> Result<Vec<&str>, Status> {
-    let layout = batch.schema_ref().field_with_name("document_columns").map(Field::data_type);
+    spatial_column_names(batch, "document_columns")
+}
+
+fn spatial_column_names<'a>(batch: &'a RecordBatch, name: &str) -> Result<Vec<&'a str>, Status> {
+    let layout = batch.schema_ref().field_with_name(name).map(Field::data_type);
     if !matches!(layout, Ok(DataType::List(item)) if item.data_type() == &DataType::Utf8
         && !item.metadata().contains_key(rtdb_columnar::EXTENSION_NAME_KEY)) {
         return Err(invalid("Spatial document_columns must be a List<Utf8>"));
     }
-    let columns = ArrowCell::named(batch, "document_columns", 0).and_then(ArrowCell::list)
+    let columns = ArrowCell::named(batch, name, 0).and_then(ArrowCell::list)
         .ok_or_else(|| invalid("Spatial document_columns must be a List<Utf8>"))?;
     if columns.len() > 128 {
         return Err(invalid("Spatial document_columns exceeds its column limit"));
@@ -788,6 +795,17 @@ fn spatial_after(input: &RecordBatch) -> Result<Option<EntityIdRef<'_>>, Status>
             .map(|(field, array, row)| read_entity_id(field, array, row).map_err(status)).transpose(),
         None => Ok(None),
     }
+}
+
+fn spatial_probe_request<'a>(
+    batch: &'a RecordBatch, fields: &'a [&str], columns: &[&str], certify_point: bool,
+) -> Result<rtdb_spatial::Probe<'a>, Status> {
+    let point_column = owned_scalar::<StringArray>(batch, "point_column")?
+        .map(|(array, row)| array.value(row));
+    if fields.iter().chain(point_column.iter()).any(|field| !field.starts_with("c_") || !columns.contains(field)) {
+        return Err(invalid("Spatial probe fields must belong to the full fact projection"));
+    }
+    Ok(rtdb_spatial::Probe { fields, point_column, certify_point })
 }
 
 fn spatial_partition(batch: &RecordBatch) -> Result<Vec<std::borrow::Cow<'_, [u8]>>, Status> {
@@ -3127,19 +3145,19 @@ impl Service {
         let batch = decode_retained_batch(call, body.slice_ref(request))?;
         let ranked_window = matches!(wire, SpatialHeldWire::RankWindow);
         let ranked = ranked_window || matches!(wire, SpatialHeldWire::RankOpen);
-        let selected_documents = ranked || matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open);
-        let expected_columns = 9 + usize::from(selected_documents) + usize::from(ranked_window);
+        let probe = matches!(wire, SpatialHeldWire::Probe);
+        let selected_documents = ranked || matches!(wire, SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::Probe);
+        let expected_columns = 9 + usize::from(selected_documents) + usize::from(ranked_window) + 2 * usize::from(probe);
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != expected_columns {
             return Err(invalid("Owned held spatial read requires one request row"));
         }
         let input = batch.batch();
-        let document_columns;
+        let document_columns = selected_documents.then(|| spatial_document_columns(input)).transpose()?;
         let projection = match wire {
             SpatialHeldWire::V1 => rtdb_spatial::Projection::Identities,
             SpatialHeldWire::V2 => rtdb_spatial::Projection::Documents,
-            SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::RankOpen | SpatialHeldWire::RankWindow => {
-                document_columns = spatial_document_columns(input)?;
-                rtdb_spatial::Projection::SelectedDocuments(&document_columns)
+            SpatialHeldWire::V3 | SpatialHeldWire::Open | SpatialHeldWire::Probe | SpatialHeldWire::RankOpen | SpatialHeldWire::RankWindow => {
+                rtdb_spatial::Projection::SelectedDocuments(document_columns.as_deref().expect("selected projection"))
             }
         };
         let (Some((region, region_row)), Some((predicate, predicate_row)),
@@ -3161,6 +3179,13 @@ impl Service {
             None
         };
         let predicate = rtdb_spatial::Predicate::parse(predicate.value(predicate_row), radius, reported_center.value(center_row)).map_err(status)?;
+        if probe && (matches!(predicate, rtdb_spatial::Predicate::Nearest { .. })
+            || Timestamp(valid_at.value(valid_row)) != held.snapshot.system_time()
+            || held.snapshot.historical_publication().is_some()
+            || !relation.is_root_data())
+        {
+            return Err(invalid("A spatial probe requires current validity and identity ordering"));
+        }
         let after = spatial_after(input)?;
         use rtdb_spatial::{PageOrder, Predicate};
         let page = if matches!(predicate, Predicate::Nearest { .. }) {
@@ -3169,6 +3194,9 @@ impl Service {
         } else {
             PageOrder::Identity { after }
         };
+        if probe && after.is_some() {
+            return Err(invalid("A spatial probe continues through its held filter capability"));
+        }
         let valid_at = Timestamp(valid_at.value(valid_row));
         let limit = usize::try_from(limit.value(limit_row)).map_err(|_| invalid("Invalid spatial limit"))?;
         let observe = observe.value(observe_row);
@@ -3177,6 +3205,17 @@ impl Service {
             let (ranking, page, witness) = held.snapshot.open_spatial_nearest(&relation, &path, request, after_radius, observe, projection)
                 .await.map_err(status)?;
             (page, witness, Some(RetainedSpatialQuery::Nearest(ranking)))
+        } else if probe {
+            held.snapshot.check_relation(&relation).map_err(status)?;
+            let region = rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?;
+            let columns = document_columns.as_deref().expect("selected projection");
+            let fields = spatial_column_names(input, "omittable_columns")?;
+            let request_probe = spatial_probe_request(input, &fields, columns, true)?;
+            let (page, witness) = held.snapshot.spatial_probe_page(
+                &relation, &path, request, observe, columns, &region, request_probe,
+            ).await.map_err(status)?;
+            let certify_point = page.certifies_point_intersects();
+            (page, witness, Some(RetainedSpatialQuery::Probe { path, region, certify_point }))
         } else if matches!(wire, SpatialHeldWire::Open) {
             held.snapshot.check_relation(&relation).map_err(status)?;
             let region = rtdb_spatial::PreparedRegion::new(region, predicate, call.memory()).map_err(status)?;
@@ -3247,6 +3286,17 @@ impl Service {
                     held.snapshot.next_spatial_range(matches, after, limit, observe, projection).await
                 }
             }
+            (RetainedSpatialQuery::Probe { path, region, certify_point }, None) => {
+                let request = rtdb_spatial::Request {
+                    partition: spatial_partition(filter.batch.batch())?,
+                    region: Default::default(), predicate: rtdb_spatial::Predicate::All,
+                    valid_at: filter.valid_at, page: rtdb_spatial::PageOrder::Identity { after: Some(after) }, limit,
+                };
+                let input = filter.batch.batch();
+                let fields = spatial_column_names(input, "omittable_columns")?;
+                let probe = spatial_probe_request(input, &fields, &columns, *certify_point)?;
+                held.snapshot.spatial_probe_page(&filter.relation, path, request, observe, &columns, region, probe).await
+            }
             (RetainedSpatialQuery::Nearest(ranking), Some(distance_m)) => {
                 held.snapshot.next_spatial_nearest(ranking, rtdb_spatial::NearestPosition { distance_m, id: after },
                     limit, observe, projection).await
@@ -3254,6 +3304,30 @@ impl Service {
             _ => return Err(invalid("Spatial continuation uses another query order")),
         }.map_err(status)?;
         self.spatial_reply(call, &held, &filter.relation, filter.valid_at, page, witness, true, Some(token))
+    }
+
+    pub(crate) async fn gather_spatial_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Spatial gather has no hold"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, request) = split_relation(request)?;
+        if held.snapshot.historical_publication().is_some() || !relation.is_root_data() {
+            return Err(invalid("A spatial gather requires a current Root relation"));
+        }
+        let batch = decode_retained_batch(call, body.slice_ref(request))?;
+        let input = batch.batch();
+        if input.num_rows() != 1 || input.num_columns() != 3 {
+            return Err(invalid("Spatial gather requires one identity, revision, and projection"));
+        }
+        let columns = spatial_document_columns(input)?;
+        let (id, row) = owned_scalar::<StringArray>(input, "_id")?
+            .ok_or_else(|| invalid("Spatial gather has no identity"))?;
+        let id = EntityIdRef::String(id.value(row));
+        let (revision, row) = owned_scalar::<Int64Array>(input, "revision_micros")?
+            .ok_or_else(|| invalid("Spatial gather has no revision"))?;
+        let page = held.snapshot.gather_spatial_document(&relation, id, Timestamp(revision.value(row)), &columns)
+            .await.map_err(status)?;
+        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), page, None, true, None)
     }
 
     pub(crate) fn close_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
@@ -3290,6 +3364,10 @@ impl Service {
             let nonce = held.remember(call, relation, witness)?;
             metadata.insert(OWNED_RANGE_WITNESS.into(), nonce.simple().to_string());
         }
+        if page.certifies_point_intersects() {
+            metadata.insert("rtdb.owned.spatial_exact".into(), "point-intersects-v1".into());
+        }
+        let omitted = page.omitted_sizes();
         let documents = page.documents();
         let document = documents.as_ref().map(|documents| {
             let mut batch = documents.batch().clone();
@@ -3302,6 +3380,9 @@ impl Service {
         ];
         if let Some(document) = &document {
             fields.push(Field::new("document", DataType::Struct(document.fields().clone()), false));
+        }
+        if let Some(omitted) = omitted {
+            fields.push(Field::new("omitted_sizes", DataType::Struct(omitted.fields().clone()), false));
         }
         let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
         let mut charge = None;
@@ -3330,6 +3411,9 @@ impl Service {
             let mut columns = vec![ids, distances];
             if let Some(document) = document {
                 columns.push(Arc::new(document));
+            }
+            if let Some(omitted) = omitted {
+                columns.push(Arc::new(omitted.clone()));
             }
             Some(RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?)
         } else { None };

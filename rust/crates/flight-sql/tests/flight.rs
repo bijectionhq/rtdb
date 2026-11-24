@@ -1512,6 +1512,18 @@ async fn check_spatial_pages_at_the_original_cut() {
         bytes
     }
 
+    fn canonical_point(longitude: f64) -> Vec<u8> {
+        let mut image = vec![13];
+        image.extend_from_slice(b"coordinates\0\x01");
+        image.push(12);
+        for coordinate in [longitude, 0.0] {
+            image.push(5);
+            image.extend_from_slice(&(coordinate.to_bits() ^ (1 << 63)).to_be_bytes());
+        }
+        image.extend_from_slice(b"\0\0type\0\x01\x09Point\0\x01\0\0");
+        image
+    }
+
     fn select(names: &[&str]) -> ArrayRef {
         let mut selected = ListBuilder::new(StringBuilder::new());
         for name in names { selected.values().append_value(name); }
@@ -1523,12 +1535,13 @@ async fn check_spatial_pages_at_the_original_cut() {
         hold: &[u8], path: &str, valid: i64, after: Option<&str>, region: &[u8],
         predicate: &str, document_columns: Option<ArrayRef>,
     ) -> Bytes {
-        query_window(hold, path, valid, after, region, predicate, document_columns, None)
+        query_window(hold, path, valid, after, region, predicate, document_columns, None, None)
     }
 
     fn query_window(
         hold: &[u8], path: &str, valid: i64, after: Option<&str>, region: &[u8],
         predicate: &str, document_columns: Option<ArrayRef>, window: Option<(f64, Option<f64>)>,
+        probe: Option<(&[&str], Option<&str>)>,
     ) -> Bytes {
         let mut body = hold.to_vec();
         frame(&mut body, "places");
@@ -1553,6 +1566,10 @@ async fn check_spatial_pages_at_the_original_cut() {
         if let Some((after_radius, _)) = window {
             columns.push(("after_radius_m", Arc::new(Float64Array::from(vec![after_radius]))));
         }
+        if let Some((omittable, point_column)) = probe {
+            columns.push(("omittable_columns", select(omittable)));
+            columns.push(("point_column", Arc::new(StringArray::from(vec![point_column]))));
+        }
         ipc(&mut body, columns);
         body.into()
     }
@@ -1562,7 +1579,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     let mut relation = Vec::new();
     frame(&mut relation, "places");
     let mut schema = relation.clone();
-    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false}]}"#);
+    schema.extend_from_slice(br#"{"fields":[{"name":"location","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"never_written","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"borough","type":{"kind":"binary"},"optional":false,"nullable":false},{"name":"c_location","type":{"kind":"binary"},"optional":true,"nullable":false},{"name":"c_payload","type":{"kind":"binary"},"optional":true,"nullable":false}]}"#);
     client.action("rtdb.owned.DeclareRelation.v1", schema.into()).await.unwrap();
 
     let path = "by_location";
@@ -1577,11 +1594,24 @@ async fn check_spatial_pages_at_the_original_cut() {
         client.action("rtdb.owned.DeclareSpatialPath.v1", declaration).await.unwrap();
     }
 
+    let canonical_path = "by_canonical_location";
+    let mut declaration = relation.clone();
+    ipc(&mut declaration, [
+        ("_id", Arc::new(StringArray::from(vec![canonical_path])) as ArrayRef),
+        ("columns", select(&["c_location", "borough"])),
+        ("geometry_encoding", Arc::new(StringArray::from(vec!["bijection-geometry-v1"]))),
+    ]);
+    client.action("rtdb.owned.DeclareSpatialPath.v2", declaration.into()).await.unwrap();
+
     let mut insert = relation.clone();
     ipc(&mut insert, [
         ("_id", Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef),
         ("location", Arc::new(BinaryArray::from_iter_values([point(1.0), point(2.0), point(1.0), point(1.0)]))),
         ("borough", Arc::new(BinaryArray::from_vec(vec![b"montrouge", b"montrouge", b"elsewhere", b"montrouge"]))),
+        ("c_location", Arc::new(BinaryArray::from_iter_values(std::array::from_fn::<_, 4, _>(|_| canonical_point(1.0))))),
+        ("c_payload", Arc::new(BinaryArray::from(vec![
+            Some(&b"\x09first\0\x01"[..]), Some(&b"\x09old\0\x01"[..]), None, Some(&[2_u8][..]),
+        ]))),
     ]);
     client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
 
@@ -1596,6 +1626,8 @@ async fn check_spatial_pages_at_the_original_cut() {
         ("location", Arc::new(BinaryArray::from_iter_values([point(9.0)]))),
         ("borough", Arc::new(BinaryArray::from_iter_values([b"montrouge"]))),
         ("never_written", Arc::new(BinaryArray::from(vec![None::<&[u8]>]))),
+        ("c_location", Arc::new(BinaryArray::from_iter_values([canonical_point(9.0)]))),
+        ("c_payload", Arc::new(BinaryArray::from_iter_values([b"\x09new\0\x01"]))),
         ("_absent", select(&["never_written"])),
     ]);
     client.action("rtdb.owned.Commit.v1", replace.into()).await.unwrap();
@@ -1607,6 +1639,73 @@ async fn check_spatial_pages_at_the_original_cut() {
     client.action("rtdb.owned.DropSpatialPath.v2", drop.into()).await.unwrap();
     frame(&mut relation, path);
     client.action("rtdb.owned.DropSpatialPath.v1", relation.into()).await.unwrap();
+
+    let legacy = query_window(hold, path, valid, None, &point(2.0), "intersects",
+        Some(select(&["c_location"])), None, Some((&["c_location"], Some("c_location"))));
+    let reply = client.action("rtdb.owned.SpatialProbe.v1", legacy).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    assert!(!stream.schema().metadata().contains_key("rtdb.owned.spatial_exact"));
+    let first = stream.next().unwrap().unwrap();
+    let document = first.column_by_name("document").unwrap().as_any()
+        .downcast_ref::<arrow_array::StructArray>().unwrap();
+    assert!(document.column_by_name("c_location").is_some());
+
+    let request = query_window(hold, canonical_path, valid, None, &point(1.0), "intersects",
+        Some(select(&["c_location", "c_payload", "borough"])), None,
+        Some((&["c_location", "c_payload"], Some("c_location"))));
+    let reply = client.action("rtdb.owned.SpatialProbe.v1", request).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    let schema = stream.schema();
+    assert_eq!(schema.metadata()["rtdb.owned.spatial_exact"], "point-intersects-v1");
+    let token = uuid::Uuid::parse_str(&schema.metadata()["rtdb.owned.spatial_filter"]).unwrap();
+    let first = stream.next().unwrap().unwrap();
+    let document = first.column_by_name("document").unwrap().as_any()
+        .downcast_ref::<arrow_array::StructArray>().unwrap();
+    assert_eq!(document.column_names(), ["borough", "_system_from"]);
+    let sizes = first.column_by_name("omitted_sizes").unwrap().as_any()
+        .downcast_ref::<arrow_array::StructArray>().unwrap();
+    for (name, value) in [("c_location", 46), ("c_payload", 7)] {
+        let size = sizes.column_by_name(name).unwrap().as_any().downcast_ref::<arrow_array::UInt32Array>().unwrap();
+        assert_eq!(size.value(0), value);
+    }
+
+    let mut capability = hold.to_vec();
+    capability.extend_from_slice(token.as_bytes());
+    let mut next = capability.clone();
+    next.extend_from_slice(&[1, 0, 0, b'a']);
+    let reply = client.action("rtdb.owned.SpatialNext.v1", next.into()).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    assert_eq!(stream.schema().metadata()["rtdb.owned.spatial_exact"], "point-intersects-v1");
+    let second = stream.next().unwrap().unwrap();
+    assert_eq!(rtdb_columnar::read_entity_id(second.schema_ref().field(0), second.column(0).as_ref(), 0).unwrap(),
+        rtdb_columnar::EntityIdRef::String("b"));
+    let document = second.column_by_name("document").unwrap().as_any()
+        .downcast_ref::<arrow_array::StructArray>().unwrap();
+    let revision = document.column_by_name("_system_from").unwrap().as_any()
+        .downcast_ref::<arrow_array::TimestampMicrosecondArray>().unwrap().value(0);
+
+    let gather = |revision| {
+        let mut request = hold.to_vec();
+        frame(&mut request, "places");
+        ipc(&mut request, [
+            ("_id", Arc::new(StringArray::from(vec!["b"])) as ArrayRef),
+            ("revision_micros", Arc::new(Int64Array::from(vec![revision]))),
+            ("document_columns", select(&["c_location", "c_payload", "borough"])),
+        ]);
+        Bytes::from(request)
+    };
+    let reply = client.action("rtdb.owned.SpatialGather.v1", gather(revision)).await.unwrap();
+    let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+    assert_eq!(stream.schema().metadata()["rtdb.owned.valid_micros"], valid.to_string());
+    let winner = stream.next().unwrap().unwrap();
+    let document = winner.column_by_name("document").unwrap().as_any()
+        .downcast_ref::<arrow_array::StructArray>().unwrap();
+    let payload = document.column_by_name("c_payload").unwrap().as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert_eq!(payload.value(0), b"\x09old\0\x01");
+    assert!(winner.column_by_name("omitted_sizes").is_none());
+    assert_eq!(client.action("rtdb.owned.SpatialGather.v1", gather(revision + 1)).await.unwrap_err().code(),
+        tonic::Code::Internal);
+    client.action("rtdb.owned.SpatialClose.v1", capability.into()).await.unwrap();
 
     let projected = "rtdb.owned.SpatialHeld.v3";
     for (action, documents, selected) in [
@@ -1798,7 +1897,7 @@ async fn check_spatial_pages_at_the_original_cut() {
     let complete_radius = tied_distance.unwrap();
     let outside_radius = previous_distance.unwrap();
     let window = |lower, upper| query_window(hold, path, valid, None, &point(0.0), "nearest",
-        Some(select(&["location"])), Some((lower, upper)));
+        Some(select(&["location"])), Some((lower, upper)), None);
     let expanded = client.action("rtdb.owned.SpatialRankOpen.v2", window(complete_radius, Some(outside_radius))).await.unwrap();
     let mut stream = StreamReader::try_new(expanded[0].body.as_ref(), None).unwrap();
     assert_eq!(stream.schema().metadata()["rtdb.owned.present_micros"], valid.to_string());
