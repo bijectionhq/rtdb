@@ -417,6 +417,8 @@ variant TxMessage : SourceMessage {
     -- Client-submitted transaction operations.
     -- Coalesced SQL argument batches align compatible Arrow columns by position and preserve argument row order in source IPC.
     -- Operation argument columns write the retained argument IPC bytes into Arrow binary cells.
+    -- A uniformly typed upload can reuse its sole populated page of null-free numeric vectors with unannotated fields for a single source IPC batch.
+    -- When a source operation leg has one populated cell from typed SQL arguments, the binary column can adopt the encoded stream as its values buffer.
     -- The encoder writes the operation IPC into the retained source record with the same protobuf field order and framing.
     -- Source intake retains legacy transaction bytes and protobuf byte fields from the delivered record through operation decoding.
     -- A message body that lands at an unaligned address in its transport uses aligned storage during Arrow decoding.

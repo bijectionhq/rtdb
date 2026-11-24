@@ -2,8 +2,8 @@ use rtdb_types::StructFields;
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
+use arrow_buffer::{Buffer, NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::{BufMut, Bytes};
 use prost::{Message, encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len}};
@@ -562,13 +562,27 @@ struct SourceOperation<'a> {
 }
 
 enum SourceOperationBody<'a> {
-    Values { fields: StructFields<Value>, arguments: Option<Cow<'a, RetainedBytes>> },
+    Values { fields: StructFields<Value>, arguments: Option<SourceArgumentBytes<'a>> },
     Path {
         relation: &'a str,
         name: &'a str,
         columns: Option<&'a [String]>,
         encoding: Option<rtdb_types::SpatialGeometryEncoding>,
     },
+}
+
+enum SourceArgumentBytes<'a> {
+    Direct { bytes: Vec<u8>, _reservation: Arc<MemoryReservation> },
+    Encoded(Cow<'a, RetainedBytes>),
+}
+
+impl SourceArgumentBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Direct { bytes, .. } => bytes,
+            Self::Encoded(bytes) => bytes.as_slice(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -686,13 +700,19 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         Operation::Public(TxOp::Sql { sql, args }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), Value::Null);
-            arguments = args.as_ref().map(|args| encode_arguments(args, memory).map(Cow::Owned)).transpose()?;
+            arguments = args.as_ref().map(|args| match purpose {
+                SourcePurpose::Log => {
+                    let (bytes, reservation) = argument_output(args, memory, purpose)?.into_parts();
+                    Ok(SourceArgumentBytes::Direct { bytes, _reservation: reservation })
+                }
+                SourcePurpose::Receipt => encode_arguments(args, memory).map(|bytes| SourceArgumentBytes::Encoded(Cow::Owned(bytes))),
+            }).transpose()?;
             "sql"
         }
         Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), Value::Null);
-            arguments = (!arg_bytes.as_slice().is_empty()).then_some(Cow::Borrowed(arg_bytes));
+            arguments = (!arg_bytes.as_slice().is_empty()).then_some(SourceArgumentBytes::Encoded(Cow::Borrowed(arg_bytes)));
             "sql"
         }
         Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, at_most }) => {
@@ -1211,17 +1231,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
         let column = if name == "iids" {
             iid_vector(&iids, &field, arrays)?
         } else if name == "args" {
-            let bytes = arguments.iter().flatten().try_fold(0usize, |bytes, value| {
-                bytes.checked_add(value.as_slice().len()).ok_or_else(overflow)
-            })?;
-            i32::try_from(bytes).map_err(|_| overflow())?;
-            let bound = arguments.len().checked_mul(16).and_then(|size| size.checked_add(bytes.checked_mul(2)?))
-                .and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?;
-            arrays.column(bound, || {
-                let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(arguments.len(), bytes);
-                for args in &arguments { builder.append_option(args.as_ref().map(|bytes| bytes.as_slice())); }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
-            })?
+            argument_column(std::mem::take(&mut arguments), arrays)?
         } else {
             let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
             let bound = estimate_builder_bytes_refs(&ty, cells())?;
@@ -2915,7 +2925,43 @@ impl SourceOperationReader<'_> {
     }
 }
 
+fn argument_column(mut arguments: Vec<Option<SourceArgumentBytes<'_>>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+    let bytes = arguments.iter().flatten().try_fold(0usize, |bytes, value| {
+        bytes.checked_add(value.as_slice().len()).ok_or_else(overflow)
+    })?;
+    let end = i32::try_from(bytes).map_err(|_| overflow())?;
+    let bound = arguments.len().checked_mul(16).and_then(|size| size.checked_add(bytes.checked_mul(2)?))
+        .and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?;
+    let mut populated = arguments.iter().enumerate().filter_map(|(index, args)| args.as_ref().map(|args| (index, args)));
+    if let Some((index, SourceArgumentBytes::Direct { .. })) = populated.next()
+        && populated.next().is_none()
+    {
+        return arrays.column(bound, || {
+            let Some(SourceArgumentBytes::Direct { bytes, _reservation }) = arguments[index].take() else { unreachable!() };
+            let mut offsets = vec![0; arguments.len() + 1];
+            offsets[index + 1..].fill(end);
+            let mut nulls = NullBufferBuilder::new(arguments.len());
+            for row in 0..arguments.len() { nulls.append(row == index); }
+            // Release the writer's spare capacity before transferring the allocation to the batch's reservation.
+            let values = Buffer::from_vec(bytes.into_boxed_slice().into_vec());
+            let array = BinaryArray::try_new(OffsetBuffer::new(offsets.into()), values, nulls.finish())
+                .map_err(|error| invalid(error.to_string()))?;
+            Ok(Arc::new(array) as ArrayRef)
+        });
+    }
+    arrays.column(bound, || {
+        let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(arguments.len(), bytes);
+        for args in &arguments { builder.append_option(args.as_ref().map(SourceArgumentBytes::as_slice)); }
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    })
+}
+
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    let (bytes, reservation) = argument_output(arguments, memory, SourcePurpose::Receipt)?.into_parts();
+    RetainedBytes::with_reservation(bytes, reservation)
+}
+
+fn argument_output(arguments: &SqlArguments, memory: &Arc<MemoryBudget>, purpose: SourcePurpose) -> Result<crate::ipc::Output> {
     if arguments.retains_uploaded_source_layout() && let Some(pages) = arguments.uniform_arrow_pages() {
         let first = pages[0];
         let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
@@ -2925,20 +2971,34 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
             field.as_ref().clone().with_name(format!("?_{index}"))
         }).collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(fields));
+        let mut populated = pages.iter().copied().filter(|page| page.num_rows() != 0);
         let combined;
         let page = if pages.len() == 1 {
             first
+        } else if purpose == SourcePurpose::Log
+            && let Some(page) = populated.next()
+            && populated.next().is_none()
+            && page.schema_ref().fields().iter().zip(page.columns()).all(|(field, column)| {
+                field.data_type().is_numeric() && field.metadata().is_empty() && column.null_count() == 0
+            })
+        {
+            page
         } else {
+            // Replay uses IPC page boundaries for SQL error indices and single-page execution.
             combined = arrow_select::concat::concat_batches(first.schema_ref(), pages).map_err(|error| invalid(error.to_string()))?;
             &combined
         };
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.num_rows()));
         let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
             .map_err(|error| invalid(error.to_string()))?;
-        return crate::ipc::encode(&schema, [&page], memory);
+        let mut output = crate::ipc::Output::new(memory, 0)?;
+        output.write_stream(&schema, [&page])?;
+        return Ok(output);
     }
     let batch = arguments.source_columnar_batch(memory)?;
-    crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory)
+    let mut output = crate::ipc::Output::new(memory, 0)?;
+    output.write_stream(batch.batch().schema_ref(), [batch.batch()])?;
+    Ok(output)
 }
 
 pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
@@ -3474,6 +3534,40 @@ mod tests {
             (index, values[0].clone())
         }).collect();
         assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
+    }
+
+    #[test]
+    fn sql_source_adopts_the_only_argument_stream_with_canonical_bytes_and_null_offsets() {
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![Field::new("client_value", DataType::Float64, true)]));
+        let values = arrow_array::Float64Array::from(vec![1.0, -0.0, f64::from_bits(0x7ff8_0000_0000_0007), 3.0]);
+        let page = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap().slice(1, 2);
+        let upload = |page| SqlArguments::from_arrow(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
+        let mut arguments = upload(page.slice(0, 0));
+        arguments.append(upload(page.clone())).unwrap();
+        arguments.append(upload(page.slice(2, 0))).unwrap();
+        let arg_bytes = encode_arguments(&arguments, &memory).unwrap();
+
+        let sql = "UPDATE docs SET v = ?";
+        let request = |bound| {
+            SourceTransaction::new(vec![
+                TxOp::Sql { sql: "ASSERT TRUE".into(), args: None },
+                bound,
+                TxOp::Sql { sql: "ASSERT TRUE".into(), args: None },
+            ], SubmitOptions::default(), &memory).unwrap()
+        };
+        let legacy = request(TxOp::SqlBytes { sql: sql.into(), arg_bytes });
+        let source = request(TxOp::Sql { sql: sql.into(), args: Some(arguments) });
+        assert_eq!(source.encode().unwrap().as_slice(), legacy.encode().unwrap().as_slice());
+        assert_eq!(source.body_digest().unwrap(), legacy.body_digest().unwrap());
+
+        let replayed = roundtrip(&source);
+        assert_eq!(source.body_digest().unwrap(), replayed.body_digest().unwrap());
+        let Operation::Public(TxOp::Sql { args: Some(arguments), .. }) = &replayed.operations[1] else {
+            panic!("Expected SQL arguments");
+        };
+        assert_eq!(arguments.single_arrow_page().unwrap().batch().num_rows(), 2);
+        assert_eq!(arguments.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1]);
     }
 
     #[test]
