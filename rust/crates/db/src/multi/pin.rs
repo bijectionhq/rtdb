@@ -9,13 +9,14 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::replay::{Committed, JournalCoordinates, RestoreOrigin};
+use crate::replay::{CheckpointSource, Committed, JournalCoordinates, RestoreOrigin};
 
 use super::{MultiDatabase, next, no_writer};
 
 const EXACT_EXPORT: &[u8; 5] = b"RTEX1";
 
 pub struct PinnedExport {
+    pin: Uuid,
     image: VerifiedManifest,
     store: Arc<dyn ObjectStore>,
     kms: Arc<dyn Kms>,
@@ -100,6 +101,7 @@ impl MultiDatabase {
     pub async fn open_export(&mut self, id: Uuid) -> Result<PinnedExport> {
         let image = self.open_pin(id).await?;
         Ok(PinnedExport {
+            pin: id,
             image,
             store: Arc::clone(&self.store),
             kms: Arc::clone(&self.stream.kms),
@@ -153,12 +155,16 @@ impl MultiDatabase {
         if writer.pipeline.next_position() != next(through)?.0 {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/restore-pending-writes", "The writer is settling an admitted transaction"));
         }
-        let (_, mut transactions) = export.exact_checkpoint().await?;
+        let (source_cut, mut transactions) = export.exact_checkpoint().await?;
         transactions.restore_in(destination)?;
         let cut = transactions.index().head();
         let coordinates = JournalCoordinates {
             offset: cut.basis.position().saturating_sub(through.0),
-            origin: Some(RestoreOrigin { digest: source_identity, through: cut.basis.position() }),
+            origin: Some(RestoreOrigin {
+                digest: source_identity,
+                through: cut.basis.position(),
+                source: Some(CheckpointSource { cut: source_cut, pin: export.pin }),
+            }),
         };
         coordinates.position(next(next(through)?)?)?;
         let manifest = Manifest {
@@ -179,6 +185,11 @@ impl MultiDatabase {
         })).await?;
         self.trim(lease, through).await?;
         Ok(cut)
+    }
+
+    pub async fn checkpoint_source(&mut self) -> Result<Option<CheckpointSource>> {
+        self.refresh().await?;
+        Ok(self.state().coordinates.origin.and_then(|origin| origin.source))
     }
 
     /// The destination must durably publish its independent backing before returning success.

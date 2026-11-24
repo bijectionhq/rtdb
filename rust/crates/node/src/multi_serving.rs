@@ -76,6 +76,11 @@ impl ServingDriver for MultiServing {
         cancellation.run_until_cancelled(self.writes.restore(export)).await.ok_or_else(interrupted)?
     }
 
+    async fn checkpoint_source(&self, cancellation: &CancellationToken) -> Result<Option<rtdb_db::CheckpointSource>> {
+        cancellation.run_until_cancelled(async { self.database.lock().await.checkpoint_source().await })
+            .await.ok_or_else(interrupted)?
+    }
+
     fn features(&self) -> &[&str] {
         &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
           "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history",

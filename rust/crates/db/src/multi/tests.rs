@@ -308,6 +308,8 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     let restored = child.restore_export(&export).await.unwrap();
     let local = |basis: Basis| Basis::new(*destination.as_bytes(), basis.position());
     assert_eq!(restored.basis, local(selected.basis));
+    let source = Some(crate::CheckpointSource { cut, pin: id });
+    assert_eq!(child.checkpoint_source().await.unwrap(), source);
     assert_eq!(child.tx_status(&original.key).await.unwrap().basis, local(original.basis));
     let index = child.fresh_index().await.unwrap();
     assert_eq!(index.exact(selected.basis).unwrap_err().code, "rtdb/foreign-basis");
@@ -330,6 +332,7 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     child.checkpoint(Vec::new()).await.unwrap();
     let mut follower = cluster.node_for(destination, 3, Arc::new(journal.handle(NODE_3_IDENTITY)));
     assert_eq!(follower.tx_status(&timed.key).await.unwrap().basis, written.basis);
+    assert_eq!(follower.checkpoint_source().await.unwrap(), source);
     assert_eq!(text_at(&mut follower, "report", 1).await, Some(Value::Utf8("parent row".into())));
 }
 

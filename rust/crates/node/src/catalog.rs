@@ -53,13 +53,49 @@ impl DatabaseCatalog {
     ) -> Result<rtdb_types::rtdb_v1::Basis> {
         let original = self.database(source)?;
         let restored = self.database(destination)?;
+        self.restore_checkpoint(&original, &restored, ticket, cancellation).await
+    }
+
+    /// Pins one ordered source cut and creates its copy in an independently provisioned deployment.
+    /// The source pin retains its supplied lifetime across retries and destination recovery.
+    #[cfg(feature = "multi")]
+    pub async fn fork_deployment_checkpoint(
+        &self, source: &str, destination: &str, pin: uuid::Uuid, basis: rtdb_types::rtdb_v1::Basis,
+        until: Option<rtdb_types::Timestamp>, cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_types::rtdb_v1::Basis> {
+        let original = self.database(source)?;
+        let restored = self.database(destination)?;
+        let driver = original.serving_driver().ok_or_else(export_unavailable)?;
+        let target = restored.serving_driver().ok_or_else(export_unavailable)?;
+        if driver.incarnation() == target.incarnation() {
+            return Err(Anomaly::incorrect("rtdb/restore-same-deployment", "Fork needs a distinct deployment"));
+        }
+        let ticket = driver.export_checkpoint(pin, basis, until, cancellation).await?;
+        self.restore_checkpoint(&original, &restored, ticket, cancellation).await
+    }
+
+    #[cfg(feature = "multi")]
+    pub async fn deployment_checkpoint_source(
+        &self, name: &str, cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<rtdb_db::CheckpointSource>> {
+        let attachment = self.database(name)?;
+        let driver = attachment.serving_driver().ok_or_else(export_unavailable)?;
+        let source = driver.checkpoint_source(cancellation).await?;
+        self.with_current_attachment(&attachment, || Ok(source))
+    }
+
+    #[cfg(feature = "multi")]
+    async fn restore_checkpoint(
+        &self, original: &Arc<Database>, restored: &Arc<Database>, ticket: Vec<u8>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_types::rtdb_v1::Basis> {
         let source = original.serving_driver().ok_or_else(export_unavailable)?;
         let target = restored.serving_driver().ok_or_else(export_unavailable)?;
         let export = source.open_checkpoint_export(ticket, cancellation).await?;
-        self.with_current_attachment(&original, || Ok(()))?;
-        self.with_current_attachment(&restored, || Ok(()))?;
+        self.with_current_attachment(original, || Ok(()))?;
+        self.with_current_attachment(restored, || Ok(()))?;
         let cut = target.restore_checkpoint(export, cancellation).await?;
-        self.with_current_attachment(&restored, || Ok(cut.basis))
+        self.with_current_attachment(restored, || Ok(cut.basis))
     }
 
     pub(crate) fn new(membership: Membership) -> Arc<Self> {
