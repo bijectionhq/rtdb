@@ -87,7 +87,7 @@ These bounds cover the key operations and affected storage responses; decoded pa
 Independent checkpoint member slots allow a staged successor to open with no dependency on the prior writer or checkpoint allocation's object keys.
 Retained plaintext delivery grants inherit the original object read lease, including when a key owner could still answer.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
-The current provider profile keeps the order-relative 120-second operational target.
+The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring inventory and latest destruction time. The fixed commitment binds the same inventory and deadline to the authenticated switch. The original authority reports destruction with separate signed evidence of the completed drain and provider disposition. A late disposition is recorded as a missed fixed deadline. A pending provider result does not furnish a disposition.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

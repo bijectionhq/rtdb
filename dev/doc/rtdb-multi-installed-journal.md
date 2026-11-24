@@ -170,6 +170,7 @@ An old view may continue work under its original lease. Existing decoded data ca
 The custody authority must persist the exact destruction obligations and later record completed drain and physical destruction evidence.
 An old view requiring a revoked key receives `rtdb/erased-under-view`.
 A fixed deadline requires an authority that bounds the drain and original-provider destruction under its installed clock and fault premises. The current provider profile retains the 120-second operational target.
+The coordinator authenticates a fixed reservation before requesting rotation. The reservation binds the prepared attempt and retiring inventory. The independently authenticated commitment adds the exact ordered switch. Destruction evidence carries the drain time and provider disposition, and can report a missed fixed deadline.
 
 The coordinator fixture supplies a staged root and a custody commit. Logkeeper's separate voter test exercises torn-slot recovery and authenticated slot evidence. Production SQL integration still needs the survivor producer, custody-wide working plaintext and egress drain, and the provider deadline and destruction authority.
 

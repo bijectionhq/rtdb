@@ -153,9 +153,8 @@ impl Fixture {
                 Ok(Outcome::Appended(_))
             ));
         }
-        let Ok(Outcome::Barrier { read: view, .. }) = journal
-            .apply(worker, Command::Barrier)
-            .outcome
+        let Ok(Outcome::Barrier { read: view, .. }) =
+            journal.apply(worker, Command::Barrier).outcome
         else {
             panic!("view admission failed");
         };
@@ -175,6 +174,7 @@ impl Fixture {
                 operation: Uuid::new_v4(),
                 custody_domain: Uuid::new_v4(),
                 incumbent,
+                timing: ErasureTiming::OperationalTarget,
             },
             view,
             io,
@@ -188,6 +188,7 @@ impl Fixture {
             &self.custody.keys,
             &self.custody,
             self.erasure,
+            None,
         )
         .await
     }
@@ -370,7 +371,7 @@ impl ErasureCustody for CustodyFixture {
             prepared.erasure.incumbent.key_generation,
         );
         let now = rtdb_directory::now_ms();
-        let due = now + MAX_REVOCATION_DELAY_MS as i64;
+        let due = now + OPERATIONAL_TARGET_MS as i64;
         if self.revoke_early {
             self.keys.withdraw_archive_key(&old_key.id()).await?;
         } else {
@@ -379,7 +380,9 @@ impl ErasureCustody for CustodyFixture {
         let commit = ErasureCommit {
             prepared,
             committed_at_ms: now as u64,
-            deadline_ms: due as u64,
+            deadline: ErasureDeadline::Target { at_ms: due as u64 },
+            retiring_inventory: [10; 32],
+            switch_evidence: ready.binding(),
         };
         *self.attempt.lock().unwrap() = Some(ErasureProgress::Committed(commit));
         if self.lose_commit_reply {
@@ -554,7 +557,7 @@ async fn old_generation_appends_are_fenced_and_the_successor_suffix_opens() -> R
 async fn arming_preserves_the_held_view_and_early_withdrawal_breaks_it() -> Result<()> {
     let fixture = Fixture::new().await?;
     let commit = fixture.commit().await?;
-    assert!((rtdb_directory::now_ms() as u64) < commit.deadline_ms);
+    assert!((rtdb_directory::now_ms() as u64) < commit.deadline.at_ms());
     assert_eq!(
         fixture.open_held_view().await?,
         Bytes::from_static(b"erased history")
@@ -574,10 +577,93 @@ async fn arming_preserves_the_held_view_and_early_withdrawal_breaks_it() -> Resu
     let mut weakened = Fixture::new().await?;
     weakened.custody.revoke_early = true;
     let commit = weakened.commit().await?;
-    assert!((rtdb_directory::now_ms() as u64) < commit.deadline_ms);
+    assert!((rtdb_directory::now_ms() as u64) < commit.deadline.at_ms());
     assert_eq!(
         weakened.open_held_view().await.unwrap_err().code,
         "rtdb/erased-under-view"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> Result<()> {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    let mut fixture = Fixture::new().await?;
+    let signer = Ed25519KeyPair::from_seed_unchecked(&[4; 32]).unwrap();
+    let authority = CustodyEvidence::new(signer.public_key().as_ref().try_into().unwrap())?;
+    let sign = |bytes: &[u8]| signer.sign(bytes).as_ref().try_into().unwrap();
+    let mut commit = fixture.commit().await?;
+    let committed = commit.committed_at_ms;
+    let by_ms = committed + 10;
+    commit.prepared.erasure.timing = ErasureTiming::Fixed { before_ms: by_ms };
+    let mut reservation = DeadlineReservation {
+        by_ms,
+        retiring_inventory: commit.retiring_inventory,
+        signature: [0; 64],
+    };
+    reservation.signature = sign(&reservation.signing_bytes(commit.prepared));
+    authority.verify_reservation(commit.prepared, reservation)?;
+    assert!(
+        authority
+            .verify_reservation(
+                commit.prepared,
+                DeadlineReservation {
+                    retiring_inventory: [9; 32],
+                    ..reservation
+                }
+            )
+            .is_err()
+    );
+
+    commit.deadline = ErasureDeadline::Enforced {
+        by_ms,
+        signature: [0; 64],
+    };
+    commit.deadline = ErasureDeadline::Enforced {
+        by_ms,
+        signature: sign(&commit.signing_bytes()),
+    };
+    validate_commit(
+        commit.prepared,
+        commit,
+        Some(commit.switch_evidence),
+        Some(&authority),
+    )?;
+    let other_switch = ErasureCommit {
+        switch_evidence: [9; 32],
+        ..commit
+    };
+    assert!(validate_commit(other_switch.prepared, other_switch, None, Some(&authority)).is_err());
+
+    let mut destruction = DestructionEvidence {
+        drain_observed_at_ms: committed + 1,
+        destroyed_at_ms: by_ms + 1,
+        disposition: [12; 32],
+        signature: [0; 64],
+    };
+    destruction.signature = sign(&destruction.signing_bytes(&commit));
+    authority.verify_destruction(commit, &destruction)?;
+    assert_eq!(destruction.fixed_deadline_met(&commit), Some(false));
+    assert!(
+        authority
+            .verify_destruction(other_switch, &destruction)
+            .is_err()
+    );
+    destruction.drain_observed_at_ms = destruction.destroyed_at_ms + 1;
+    destruction.signature = sign(&destruction.signing_bytes(&commit));
+    assert!(authority.verify_destruction(commit, &destruction).is_err());
+
+    let journal = fixture.custody.journal.get_mut().unwrap();
+    let head = journal.state.head();
+    fixture.erasure.timing = commit.prepared.erasure.timing;
+    assert_eq!(
+        fixture.commit().await.unwrap_err().code,
+        "rtdb.multi/fixed-erasure-authority"
+    );
+    assert_eq!(
+        fixture.custody.journal.get_mut().unwrap().state.head(),
+        head
     );
     Ok(())
 }

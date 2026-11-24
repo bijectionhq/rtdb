@@ -222,6 +222,7 @@ Installed serving reads enforce their journal lease through body delivery, and i
 Installed recovery opens independently sealed checkpoint closures before their publication, then serves and replays from the selected closure.
 The installed journal orders clean checkpoint publication, key rotation, and old-root and replay admission closure together. Its accepting quorum reads back both durable voter slots and the installed RTDB custodian verifies the signed evidence before it asks for a deadline.
 Plaintext delivery inherits the originating object read lease and cannot extend it through a separate key check.
+The coordinator distinguishes the current provider's 120-second operational target from a signed fixed commitment. A fixed request requires an authenticated deadline reservation before the switch. The original authority's separate destruction evidence binds the switch, retiring inventory, completed drain, and provider disposition.
 Production SQL erasure still requires a complete survivor rebuild and retiring-key census, bounded plaintext and egress drain, and evidenced provider destruction.
 
 |8
