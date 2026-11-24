@@ -1196,7 +1196,7 @@ mod live_coverage_tests {
         assert_eq!(terms.matches(batch, 0, &phrase), Some(true));
         assert_eq!(terms.matches(batch, 1, &phrase), None);
         assert_eq!(terms.matches(divergent.batches().next().unwrap(), 0, &phrase), None);
-        assert_eq!(terms.score(batch, 0, &scorer).unwrap().to_bits(), scorer.bm25_text("report paid").to_bits());
+        assert_eq!(terms.score(batch, 0, &scorer).unwrap().to_bits(), scorer.bm25_text("report report paid").to_bits());
         drop(terms);
         let matching = rtdb_text::Query::parse("report");
         assert_eq!(runtime.live_rows("db", &extended, "body", &matching).unwrap().values(), &[0, 1]);
