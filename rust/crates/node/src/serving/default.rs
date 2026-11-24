@@ -3,14 +3,13 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
-use rtdb_index::branches::{BranchView, BranchWrite};
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
 use rtdb_tx::transact::{CustodyGroupId, ROW_CUSTODY, Receipt, Transact};
-use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
 
-use super::{ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ServingDriver, ServingScope};
+use super::{ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ServingDriver,
+    ServingScope, append_change_rows};
 use crate::Clock;
 
 pub(crate) struct DefaultServing {
@@ -226,57 +225,14 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
     };
     let groups = entries.into_iter().map(|(cut, writes)| {
         let before = view.index.before(cut.basis)?.and_then(|previous| {
-            view.index.view(&request.branch, At::Exactly(previous.basis), Layer::Merged, previous.system_time).ok()
+            view.index.view(&request.branch, At::Exactly(previous.basis), Layer::Merged, cut.system_time).ok()
         });
         let after = view.index.view(&request.branch, At::Exactly(cut.basis), Layer::Merged, cut.system_time).ok();
         let mut rows = Vec::new();
         for write in writes.iter().filter(|write| write.branch == request.branch && request.tables.contains(&write.table)) {
-            append_images(&mut rows, write, before.as_ref(), after.as_ref(), request.images)?;
+            append_change_rows(&mut rows, write, before.as_ref(), after.as_ref(), request.images)?;
         }
         Ok(ChangeGroup { cut: *cut, rows })
     }).collect::<Result<_>>()?;
     Ok(ChangePage { groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new() })
-}
-
-fn append_images(
-    output: &mut Vec<ChangeRow>, write: &BranchWrite, before: Option<&BranchView<'_>>,
-    after: Option<&BranchView<'_>>, images: ChangeImages,
-) -> Result<()> {
-    let make_row = |valid, kind, before, after| ChangeRow {
-        table: write.table.clone(), id: write.id.clone(), valid, kind, before, after,
-        erased_written_basis: write.erased_written_basis,
-    };
-    if write.erased_written_basis.is_some() {
-        output.push(make_row(write.valid, ChangeKind::Erased, None, None));
-        return Ok(());
-    }
-    let Some(valid) = write.valid else {
-        output.push(make_row(None, ChangeKind::Erased, None, None));
-        return Ok(());
-    };
-    let mut boundaries = BTreeSet::from([valid.lower(), valid.upper()]);
-    for view in before.into_iter().chain(after) {
-        for event in view.history(&write.table, &write.id) {
-            for boundary in [Some(event.valid.lower()), Some(event.valid.upper()), event.image.as_ref().and_then(|image| image.expires_at)].into_iter().flatten() {
-                if valid.contains(boundary) { boundaries.insert(boundary); }
-            }
-        }
-    }
-    let starts = boundaries.iter().copied();
-    for (from, to) in starts.clone().zip(starts.skip(1)) {
-        let valid = Some(Interval::new(from, to)?);
-        let previous = before.and_then(|view| view.row(&write.table, &write.id, from)).and_then(|event| event.image_at(from));
-        let current = after.and_then(|view| view.row(&write.table, &write.id, from)).and_then(|event| event.image_at(from));
-        if let Some(previous) = previous {
-            let image = matches!(images, ChangeImages::Before | ChangeImages::Both).then(|| previous.clone());
-            output.push(make_row(valid, ChangeKind::Closed, image, None));
-        }
-        if let Some(current) = current {
-            let image = matches!(images, ChangeImages::After | ChangeImages::Both).then(|| current.clone());
-            output.push(make_row(valid, ChangeKind::Opened, None, image));
-        } else if previous.is_none() {
-            output.push(make_row(valid, ChangeKind::Closed, None, None));
-        }
-    }
-    Ok(())
 }

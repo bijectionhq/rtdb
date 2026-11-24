@@ -3,18 +3,18 @@ use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
-use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
+use rtdb_index::branches::{BranchCut, BranchEffect, BranchWrite};
 use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
+    Anomaly, AnomalyCategory, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
 };
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
-    ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ROW_VISIBILITY, ServingDriver, ServingScope,
+    ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ROW_VISIBILITY,
+    ServingDriver, ServingScope, append_change_rows,
 };
 
 pub struct MultiServing {
@@ -298,6 +298,7 @@ fn changes_page(
                 group.cut.system_time,
             )
             .ok();
+        let after = index.view(&request.branch, At::Exactly(group.cut.basis), Layer::Merged, group.cut.system_time).ok();
         let mut rows = Vec::new();
         for effect in &group.effects {
             match effect {
@@ -306,7 +307,11 @@ fn changes_page(
                     table,
                     event,
                 } if branch == &request.branch && matches_table(request, table) => {
-                    rows.extend(change_rows(table, event, before.as_ref(), request.images)?);
+                    let write = BranchWrite {
+                        branch: branch.clone(), table: table.clone(), id: event.id.clone(),
+                        valid: Some(event.valid), erased_written_basis: None,
+                    };
+                    append_change_rows(&mut rows, &write, before.as_ref(), after.as_ref(), request.images)?;
                 }
                 BranchEffect::Erase { branch, table, id }
                     if branch
@@ -314,28 +319,21 @@ fn changes_page(
                         .is_none_or(|branch| branch == &request.branch)
                         && matches_table(request, table) =>
                 {
-                    rows.push(ChangeRow {
+                    let write = BranchWrite {
+                        branch: request.branch.clone(),
                         table: table.clone(),
                         id: id.clone(),
                         valid: None,
-                        kind: ChangeKind::Erased,
                         erased_written_basis: None,
-                        before: None,
-                        after: None,
-                    });
+                    };
+                    append_change_rows(&mut rows, &write, None, None, request.images)?;
                 }
                 BranchEffect::RevokeCustodyGroup { group: id } => {
-                    rows.extend(index.custody_revocation_writes(*id, group.cut)?.into_iter().filter(|write| {
+                    for write in index.custody_revocation_writes(*id, group.cut)?.into_iter().filter(|write| {
                         write.branch == request.branch && matches_table(request, &write.table)
-                    }).map(|write| ChangeRow {
-                        table: write.table,
-                        id: write.id,
-                        valid: write.valid,
-                        kind: ChangeKind::Erased,
-                        erased_written_basis: write.erased_written_basis,
-                        before: None,
-                        after: None,
-                    }));
+                    }) {
+                        append_change_rows(&mut rows, &write, None, None, request.images)?;
+                    }
                 }
                 _ => {}
             }
@@ -370,67 +368,6 @@ fn matches_table(request: &Changes, table: &TableRef) -> bool {
     request.tables.is_empty() || request.tables.contains(table)
 }
 
-fn change_rows(
-    table: &TableRef,
-    event: &BranchEvent,
-    before: Option<&BranchView<'_>>,
-    images: ChangeImages,
-) -> Result<Vec<ChangeRow>> {
-    let lower = event.valid.lower();
-    let upper = event.valid.upper();
-    let mut boundaries = BTreeSet::from([lower, upper]);
-    let mut insert = |timestamp| {
-        if lower < timestamp && timestamp < upper {
-            boundaries.insert(timestamp);
-        }
-    };
-    for previous in before
-        .into_iter()
-        .flat_map(|view| view.history(table, &event.id))
-    {
-        insert(previous.valid.lower());
-        insert(previous.valid.upper());
-        if let Some(until) = previous.image.as_ref().and_then(|image| image.expires_at) {
-            insert(until);
-        }
-    }
-    if let Some(until) = event.image.as_ref().and_then(|image| image.expires_at) {
-        insert(until);
-    }
-    boundaries
-        .iter()
-        .zip(boundaries.iter().skip(1))
-        .map(|(&from, &to)| {
-            let prior = if matches!(images, ChangeImages::Before | ChangeImages::Both) {
-                before
-                    .and_then(|view| view.row(table, &event.id, from))
-                    .and_then(|event| event.image_at(from))
-                    .cloned()
-            } else {
-                None
-            };
-            let after = if matches!(images, ChangeImages::After | ChangeImages::Both) {
-                event.image_at(from).cloned()
-            } else {
-                None
-            };
-            Ok(ChangeRow {
-                table: table.clone(),
-                id: event.id.clone(),
-                valid: Some(Interval::new(from, to)?),
-                kind: if event.image.is_some() {
-                    ChangeKind::Opened
-                } else {
-                    ChangeKind::Closed
-                },
-                before: prior,
-                after,
-                erased_written_basis: None,
-            })
-        })
-        .collect()
-}
-
 fn interrupted() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Interrupted,
@@ -451,12 +388,13 @@ mod tests {
     use rtdb_store::MemoryStore;
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Window};
     use rtdb_types::{
-        EntityId, StructFields, Value,
+        EntityId, Interval, StructFields, Value,
         rtdb_v1::MAIN_BRANCH,
     };
     use uuid::Uuid;
 
     use super::*;
+    use crate::serving::{ChangeImages, ChangeKind};
 
     fn write(key: u8, title: &str, before: Option<Timestamp>) -> Transact {
         Transact {
@@ -596,13 +534,15 @@ mod tests {
         assert!(page.complete);
         assert_eq!(page.through, second.basis);
         assert_eq!(page.groups.len(), 1);
-        let row = &page.groups[0].rows[0];
+        let [closed, opened] = page.groups[0].rows.as_slice() else { panic!("expected a closure and an opening"); };
+        assert!(matches!(closed.kind, ChangeKind::Closed));
+        assert!(matches!(opened.kind, ChangeKind::Opened));
         assert_eq!(
-            row.before.as_ref().unwrap().cells["title"],
+            closed.before.as_ref().unwrap().cells["title"],
             Value::Utf8("one".into())
         );
         assert_eq!(
-            row.after.as_ref().unwrap().cells["title"],
+            opened.after.as_ref().unwrap().cells["title"],
             Value::Utf8("two".into())
         );
 

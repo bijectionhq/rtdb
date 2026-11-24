@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{
     Snapshot,
-    branches::{BranchCut, RowImage},
+    branches::{BranchCut, BranchView, BranchWrite, RowImage},
 };
 use rtdb_tx::transact::{CustodyGroupId, Receipt, Transact};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
@@ -86,6 +86,55 @@ pub struct ChangeRow {
     pub erased_written_basis: Option<Basis>,
     pub before: Option<RowImage>,
     pub after: Option<RowImage>,
+}
+
+pub(crate) fn append_change_rows(
+    output: &mut Vec<ChangeRow>,
+    write: &BranchWrite,
+    before: Option<&BranchView<'_>>,
+    after: Option<&BranchView<'_>>,
+    images: ChangeImages,
+) -> Result<()> {
+    let row = |valid, kind, before, after| ChangeRow {
+        table: write.table.clone(),
+        id: write.id.clone(),
+        valid,
+        kind,
+        erased_written_basis: write.erased_written_basis,
+        before,
+        after,
+    };
+    let Some(valid) = write.valid.filter(|_| write.erased_written_basis.is_none()) else {
+        output.push(row(write.valid, ChangeKind::Erased, None, None));
+        return Ok(());
+    };
+    let mut boundaries = BTreeSet::from([valid.lower(), valid.upper()]);
+    for view in before.into_iter().chain(after) {
+        for event in view.history(&write.table, &write.id) {
+            let expiry = event.image.as_ref().and_then(|image| image.expires_at);
+            boundaries.extend([Some(event.valid.lower()), Some(event.valid.upper()), expiry]
+                .into_iter().flatten().filter(|boundary| valid.contains(*boundary)));
+        }
+    }
+    fn image_at<'a>(view: Option<&BranchView<'a>>, write: &BranchWrite, from: Timestamp) -> Option<&'a RowImage> {
+        view.and_then(|view| view.row(&write.table, &write.id, from))
+            .and_then(|event| event.image_at(from))
+    }
+    let starts = boundaries.iter().copied();
+    for (from, to) in starts.clone().zip(starts.skip(1)) {
+        let valid = Some(Interval::new(from, to)?);
+        let previous = image_at(before, write, from);
+        let current = image_at(after, write, from);
+        if previous.is_some() || current.is_none() {
+            let image = previous.filter(|_| matches!(images, ChangeImages::Before | ChangeImages::Both)).cloned();
+            output.push(row(valid, ChangeKind::Closed, image, None));
+        }
+        if current.is_some() {
+            let image = current.filter(|_| matches!(images, ChangeImages::After | ChangeImages::Both)).cloned();
+            output.push(row(valid, ChangeKind::Opened, None, image));
+        }
+    }
+    Ok(())
 }
 
 /// An admitted database attachment. Each mode establishes its own barriers and publishes only applied state.

@@ -78,7 +78,9 @@ surface StatelessDatabase {
     @guarantee TransactionReceipt
         -- A route that advertises writes returns its selected outcome with the applied basis and system time.
         -- A matching committed request returns the stored receipt for its key.
-        -- The carrier passes the attempt identity, its submission time, and the exact admitted request bytes to the selected driver.
+        -- The idempotency key within its receipt namespace identifies the request.
+        -- The writer records its admission time, the complete canonical request and the selected outcome with resolved effects.
+        -- Followers apply the recorded effects. Checkpoints preserve the namespaced key, request digest and outcome for retries.
         -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
 
     @guarantee TransactionRequirements
@@ -96,6 +98,7 @@ surface StatelessDatabase {
         -- An applied-position route takes its coverage from the driver's retained effect history.
         -- After opening a default branch checkpoint, the retained change interval starts at the checkpoint's basis.
         -- A reported erasure has a key when keys are requested and omits both row images.
+        -- Default and Multi report the previous image at a closure and the new image at an opening.
         -- A returned page carries whole system-time groups.
         -- An expired starting cut returns the cursor-expired code.
         -- A waiting call returns after a relevant change, complete coverage of its requested interval or expiry of its wait.
