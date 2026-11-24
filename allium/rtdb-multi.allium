@@ -832,6 +832,36 @@ contract ObjectStorage {
         -- A deployment whose request rate exceeds one partition's adds a second hash level inside its prefix.
 }
 
+contract FencedStreamWriter {
+    @invariant OrderedAuthority
+        -- A node may attempt takeover if rendezvous ranking selects it and the last observed lease has lapsed beyond the clock drift allowance.
+        -- A new stream with an empty committed prefix is eligible for its first seal.
+        -- A candidate replays through the end returned by its seal before it publishes its lease.
+        -- A journal record authenticates its writer epoch and position.
+        -- A candidate that observes a competing seal without a committed lease waits a lease interval and the drift allowance before advancing that epoch.
+        -- A writer stops admitting and acknowledging commits before its lease expires.
+        -- A writer drops its allocation and in-flight authority when fenced.
+
+    @invariant TimedTransactionSettlement
+        -- An accepted timed transaction has a committed Settle record following its Tx record.
+        -- The writer appends Settle only after the original durable acknowledgement arrives before the exclusive cutoff under the clock bound.
+        -- Recovery appends Refuse for a pending timed transaction before admitting writes.
+        -- A pending transaction has no visible effects.
+
+    @invariant SpeculativeWriteSuffix
+        -- The writer resolves ordinary requests in order against a private overlay of its durable prefix and staged writes.
+        -- An ordinary transaction has one journal append.
+        -- A reply that depends on staged writes follows their durable acknowledgements.
+        -- A rejected append withdraws the dependent unacknowledged suffix.
+        -- Reads and status lookups use the committed fold.
+
+    @invariant CheckpointRecovery
+        -- A writer trims through the position immediately before a committed checkpoint record.
+        -- A checkpoint image carries the applied transaction cut, active pins and the publishing writer's lease.
+        -- A follower starts from the retained checkpoint and applies its committed suffix in position order.
+
+}
+
 contract EpochScopedStorage {
     @invariant UniqueObjectCreation
         -- Each database writer epoch has one allocation sequence for files and manifests.
@@ -864,6 +894,8 @@ contract EpochScopedStorage {
         -- Erasure publishes a clean checkpoint recoverable under the next generation and then commits rotation at its cut.
         -- The writer arms the retiring generation's key-grant deadline and trims to the clean checkpoint.
         -- Key custody refuses old-generation delivery at the deadline and destroys the retiring generation once the deadline has elapsed.
+        -- A replacement resumes an incomplete rotation from the adjacent checkpoint and rotation records.
+        -- The original durable rotation time fixes the deadline across retries and writer replacement.
 }
 
 ------------------------------------------------------------

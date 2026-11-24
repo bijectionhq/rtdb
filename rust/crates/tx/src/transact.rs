@@ -174,6 +174,10 @@ pub struct ResolvedTransact {
     before: Option<Timestamp>,
 }
 
+impl ResolvedTransact {
+    pub fn effects(&self) -> &[BranchEffect] { &self.effects }
+}
+
 struct Pending {
     position: u64,
     tx: ResolvedTransact,
