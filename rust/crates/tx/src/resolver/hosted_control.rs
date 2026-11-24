@@ -299,7 +299,7 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedCheckCapacity { .. }
                         | TxOp::OwnedDeclareCapacity { .. }
                         | TxOp::OwnedRequireSpatialPath { .. }
-                        | TxOp::OwnedRetireRelation { .. }
+                        | TxOp::OwnedRetireRelation { .. } | TxOp::OwnedAdoptRelation { .. }
                         | TxOp::OwnedInsertDocs { .. }
                         | TxOp::OwnedReplaceDocs { .. }
                         | TxOp::OwnedArrowDocs { .. }
@@ -380,7 +380,7 @@ impl OpenTransaction<'_> {
                     return Err(unavailable());
                 }
             }
-            has_native_effect |= matches!(operation, Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedReplayResidue { .. } | TxOp::OwnedDeclareCapacity { .. } | TxOp::OwnedRetireRelation { .. }))
+            has_native_effect |= matches!(operation, Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedReplayResidue { .. } | TxOp::OwnedDeclareCapacity { .. } | TxOp::OwnedRetireRelation { .. } | TxOp::OwnedAdoptRelation { .. }))
                 || operation.owned_documents().is_some_and(|(_, rows)| rows > 0);
         }
         let fork_with_controls = operations.iter().any(|operation| matches!(

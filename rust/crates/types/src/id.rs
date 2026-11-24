@@ -208,6 +208,7 @@ const OWNED_SEARCH_CATALOG: &str = ".search-paths";
 const OWNED_SPATIAL_CATALOG: &str = ".spatial-paths";
 const OWNED_VECTOR_CATALOG: &str = ".vector-paths";
 const OWNED_RELATION_CATALOG: &str = ".relation-schemas";
+const OWNED_ADOPTED_CATALOG: &str = ".adopted-relations";
 const OWNED_RETIRED_CATALOG: &str = ".retired-relations";
 pub const OWNED_ATTEMPT_RELATION: &str = "fact_attempts";
 pub const OWNED_ROOT_PUBLICATION_RELATION: &str = "fact_publications";
@@ -294,6 +295,9 @@ impl OwnedRelation {
 
     /// The principal's retired relations, each fenced against later writes and declarations.
     pub fn retired_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_RETIRED_CATALOG) }
+
+    #[doc(hidden)]
+    pub fn adopted_catalog(owner: &str) -> TableRef { owned_table(owner, OWNED_ADOPTED_CATALOG) }
 
     /// Every physical table this Root relation owns in the namespace of `namespace`, an owned table of the same principal.
     /// World overlays and their journals stay outside: a world's own retirement reclaims them.
@@ -508,7 +512,7 @@ impl TableRef {
         self.schema == OWNED_SCHEMA_V1
             && self.table.split_once('-').is_some_and(|(owner, name)| {
                 owner.len() == 64 && owner.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_SPATIAL_CATALOG | OWNED_VECTOR_CATALOG | OWNED_RELATION_CATALOG | OWNED_RETIRED_CATALOG | OWNED_WORLD_CLOCKS)
+                    && (matches!(name, OWNED_PATH_CATALOG | OWNED_SEARCH_CATALOG | OWNED_SPATIAL_CATALOG | OWNED_VECTOR_CATALOG | OWNED_RELATION_CATALOG | OWNED_RETIRED_CATALOG | OWNED_ADOPTED_CATALOG | OWNED_WORLD_CLOCKS)
                         || name.strip_prefix(OWNED_LIFETIME_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_FLOOR_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
                         || name.strip_prefix(OWNED_PURGE_PREFIX).is_some_and(|relation| OwnedRelation::new(relation).is_ok())
