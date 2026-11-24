@@ -282,6 +282,11 @@ The journal belongs to the installed base relation underlying the search relatio
 The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
 The Root contributor uses the journal assertion ordinal.
 A decorated selector with a different carrier or with a visible raw alias refuses.
+Hosted protocol 223 advertises the binary ranked-reply actions via Flight `ListActions`.
+The Root actions are `SearchHeld.v7`, `NearestHeld.v4` and `HybridHeld.v4` in the `rtdb.owned.` namespace.
+World text uses `SearchHeldWorld.v4`, `SearchHeldWorldAt.v3` and `SearchHeldWorldParentAt.v3`.
+World vector and hybrid use `NearestHeldWorld.v3`, `NearestHeldWorldAt.v3`, `NearestHeldWorldParentAt.v3`, `HybridHeldWorld.v3`, `HybridHeldWorldAt.v3` and `HybridHeldWorldParentAt.v3`.
+The action request bodies and rank-scope digest domains are unchanged.
 Ranked replies require the `x-rtdb-owned-ipc: stream-v1` request header.
 The first Flight action result body carries the binary inventory as a big-endian u16 entry count followed by entries in strictly increasing byte order.
 Even a zero count has its own result body.
