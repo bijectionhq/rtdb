@@ -577,6 +577,12 @@ impl LocalStore {
         Ok(gate.map(|gate| Arc::new(gate) as Arc<dyn Send + Sync>))
     }
 
+    pub(crate) async fn close_erasure_catalog(&self, cut: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        let ledger = self.catalog.clone().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb.storage/erasure-catalog", "This store has no local catalog ledger"))?;
+        self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.close_erasure_admission(cut))).await?
+    }
+
     /// Persists a verified repair anchor selected at the current checkpoint under exclusive maintenance.
     pub async fn install_repair_anchor(&self, anchor: crate::LocalRepairAnchor) -> rtdb_types::Result<()> {
         let ledger = Arc::new(crate::local_catalog::LocalCatalogLedger::new(self.root.clone(), anchor.boundary.epoch()));

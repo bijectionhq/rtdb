@@ -33,6 +33,7 @@ fn an_ordered_retirement_keeps_the_deadline_when_reopened() -> Result<()> {
             cut,
             boundary: ReplicaPosition(42),
             members_sha256: [4; 32],
+            inventory_sha256: Some([8; 32]),
         },
         checkpoint: PublishedCheckpoint {
             block: BlockIndex(8),

@@ -291,6 +291,9 @@ pub struct CheckpointPrefix {
 
 #[async_trait]
 pub trait CheckpointKeyRetirement: Send + Sync {
+    /// Dense offsets allow the inventory scan to reject a missing record within the retained prefix.
+    fn checkpoint_offsets_are_dense(&self) -> bool { false }
+
     /// Checks the provider's exact prefix before key admission changes.
     async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> rtdb_types::Result<()>;
     /// Closes key admission and settles a batch after the caller has closed older recovery cuts.

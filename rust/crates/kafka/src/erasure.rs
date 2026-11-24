@@ -34,7 +34,10 @@ impl KafkaLog {
     ) -> Result<(&KafkaFrameKeys, i64)> {
         let (keys, topic) = self.native_prefix_custody()?;
         let (broker_floor, broker_end) = self.verified_watermarks(topic).await?;
-        if broker_floor > retirement.before || broker_end < retirement.before {
+        if broker_end < retirement.before
+            || broker_floor > retirement.before
+                && !keys.has_kafka_prefix_retirement(retirement).await?
+        {
             return Err(Anomaly::incorrect(
                 "rtdb.kafka/native-retirement",
                 "The authorized recovery cut is outside the verified broker interval",
@@ -56,6 +59,10 @@ impl KafkaLog {
 
 #[async_trait]
 impl CheckpointKeyRetirement for KafkaLog {
+    fn checkpoint_offsets_are_dense(&self) -> bool {
+        true
+    }
+
     async fn validate_checkpoint_prefix(&self, cut: CheckpointPrefix) -> Result<()> {
         let retirement = broker_cut(cut)?;
         let (keys, broker_end) = self.verified_retirement_cut(retirement).await?;

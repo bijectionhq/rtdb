@@ -413,6 +413,7 @@ mod tests {
             },
             boundary: boundary.metadata.position,
             members_sha256: [1; 32],
+            inventory_sha256: None,
         };
         let prefix = &image[..41];
         let without_witness = evidence.frame(prefix, &fold.encode_checkpoint()?)?;

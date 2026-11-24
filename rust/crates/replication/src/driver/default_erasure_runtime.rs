@@ -50,13 +50,25 @@ impl ReplicationDriver {
             }
             Some(DefaultErasure::Retiring {
                 intent,
-                log_prefixes_settled: false,
-            }) => {
+                log_prefixes_settled,
+                objects_settled,
+            }) if !log_prefixes_settled || !objects_settled => {
                 let intent = *intent;
-                let log_prefixes_settled = intent.settle_log_prefixes(&self.logs).await?;
+                let log_prefixes_settled =
+                    *log_prefixes_settled || intent.settle_log_prefixes(&self.logs).await?;
+                let now_lower = Timestamp(
+                    (self.clock)()
+                        .0
+                        .saturating_sub(SERVING_CLOCK_UNCERTAINTY_MICROS),
+                );
+                let objects_settled = log_prefixes_settled
+                    && intent
+                        .settle_objects(&self.blocks, &self.logs, now_lower)
+                        .await?;
                 self.default_erasure = Some(DefaultErasure::Retiring {
                     intent,
                     log_prefixes_settled,
+                    objects_settled,
                 });
                 Ok(())
             }
@@ -69,7 +81,7 @@ impl ReplicationDriver {
             && matches!(
                 self.default_erasure,
                 Some(DefaultErasure::Retiring {
-                    log_prefixes_settled: false,
+                    objects_settled: false,
                     ..
                 })
             )
@@ -119,6 +131,7 @@ impl ReplicationDriver {
         self.default_erasure = Some(DefaultErasure::Retiring {
             intent,
             log_prefixes_settled: false,
+            objects_settled: false,
         });
         Ok(true)
     }

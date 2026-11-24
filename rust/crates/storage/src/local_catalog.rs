@@ -94,8 +94,36 @@ impl LocalCatalogLedger {
 
     pub(crate) fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
         let _gate = self.lock()?;
-        if cut.replica_epoch != self.replica_epoch || !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0
-            || paths.iter().flatten().any(|path| !terminal_name(path))
+        if paths.iter().flatten().any(|path| !terminal_name(path))
+        {
+            return Err(invalid("Invalid local catalog retirement"));
+        }
+        let closed = self.covers_floor(cut)?;
+        let holds = self.held_catalogs()?;
+        let advance = !closed && (paths.iter().any(Option::is_some)
+            || holds.iter().all(|hold| !hold.retains(cut, None)));
+        if advance { self.install_floor(cut)?; }
+        if !closed && !advance { return Ok(vec![false; paths.len()]); }
+        self.sync_ledger()?;
+        let mut allowed = Vec::with_capacity(paths.len());
+        for path in paths {
+            let release = holds.iter().all(|hold| !hold.retains(cut, *path));
+            if release && let Some(path) = path { self.close_publication(path)?; }
+            allowed.push(release);
+        }
+        Ok(allowed)
+    }
+
+    pub(crate) fn close_erasure_admission(&self, cut: CatalogCut) -> Result<bool> {
+        let _gate = self.lock()?;
+        if !self.covers_floor(cut)? { self.install_floor(cut)?; }
+        self.sync_ledger()?;
+        Ok(self.held_catalogs()?.iter().all(|hold| !hold.retains(cut, None)))
+    }
+
+    fn covers_floor(&self, cut: CatalogCut) -> Result<bool> {
+        if cut.replica_epoch != self.replica_epoch || !well_formed(cut)
+            || cut.through.after_offset(cut.replica_epoch) < 0
         {
             return Err(invalid("Invalid local catalog retirement"));
         }
@@ -106,25 +134,16 @@ impl LocalCatalogLedger {
         }) {
             return Err(invalid("The local catalog floor belongs to a different storage root or newer journal"));
         }
-        let holds = self.held_catalogs()?;
-        let advance = !closed && (paths.iter().any(Option::is_some)
-            || holds.iter().all(|hold| !hold.retains(cut, None)));
-        if advance {
-            let mut next = tempfile::NamedTempFile::new_in(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
-            next.write_all(&serde_json::to_vec(&cut).map_err(invalid)?).map_err(|error| Error::io(next.path(), error))?;
-            crate::sync_file(next.as_file()).map_err(|error| Error::io(next.path(), error))?;
-            let path = self.directory.join("floor");
-            next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-        }
-        if !closed && !advance { return Ok(vec![false; paths.len()]); }
-        self.sync_ledger()?;
-        let mut allowed = Vec::with_capacity(paths.len());
-        for path in paths {
-            let release = holds.iter().all(|hold| !hold.retains(cut, *path));
-            if release && let Some(path) = path { self.close_publication(path)?; }
-            allowed.push(release);
-        }
-        Ok(allowed)
+        Ok(closed)
+    }
+
+    fn install_floor(&self, cut: CatalogCut) -> Result<()> {
+        let mut next = tempfile::NamedTempFile::new_in(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
+        next.write_all(&serde_json::to_vec(&cut).map_err(invalid)?).map_err(|error| Error::io(next.path(), error))?;
+        crate::sync_file(next.as_file()).map_err(|error| Error::io(next.path(), error))?;
+        let path = self.directory.join("floor");
+        next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
+        Ok(())
     }
 
     fn held_catalogs(&self) -> Result<Vec<CatalogHold>> {

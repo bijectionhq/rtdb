@@ -21,6 +21,10 @@ use crate::{
     sql_survivor::SurvivorInput,
 };
 
+mod inventory;
+
+use inventory::RetirementInventory;
+
 const REWRITE_IMAGE: u8 = b'E';
 const RETIREMENT_FRAME: u8 = 6;
 const MAX_CONTROL_BYTES: usize = 2048;
@@ -57,6 +61,8 @@ pub(crate) struct RewriteEvidence {
     pub cut: ErasureCut,
     pub boundary: ReplicaPosition,
     pub members_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,6 +89,7 @@ pub(crate) enum DefaultErasure {
     Retiring {
         intent: ErasureRetirement,
         log_prefixes_settled: bool,
+        objects_settled: bool,
     },
 }
 
@@ -129,16 +136,18 @@ impl AppliedErasure {
             Ok(_) => {
                 let (catalog, tables) = blocks.load(prepared.block_index()).await?;
                 validate_boundary(&catalog, prepared, boundary)?;
-                let evidence = self.evidence(
+                let members = physical_members(&catalog, &tables)?;
+                let mut evidence = self.evidence(
                     boundary,
-                    members_sha256(
-                        blocks,
-                        store,
-                        physical_members(&catalog, &tables)?,
-                        cancellation,
-                    )
-                    .await?,
+                    members_sha256(blocks, store, members.clone(), cancellation).await?,
                 );
+                let mut protected = members;
+                protect_checkpoint_objects(&catalog, &mut protected)?;
+                let inventory =
+                    RetirementInventory::read(blocks, catalog.block_index(), evidence, &protected)
+                        .await?
+                        .ok_or_else(inventory::incomplete)?;
+                evidence.inventory_sha256 = Some(inventory.store(blocks).await?);
                 checkpoint.bind_rewrite(evidence)?;
                 checkpoint
                     .verify(
@@ -188,7 +197,27 @@ impl AppliedErasure {
             .collect::<BTreeSet<_>>();
         let digest =
             members_sha256(blocks, survivor.store(), members.clone(), cancellation).await?;
-        checkpoint.bind_rewrite(self.evidence(boundary, digest))?;
+        let mut evidence = self.evidence(boundary, digest);
+        let inventory =
+            match RetirementInventory::read(blocks, prepared.block_index(), evidence, &members)
+                .await?
+            {
+                Some(staged) => staged,
+                None => {
+                    RetirementInventory::capture(
+                        blocks,
+                        logs,
+                        snapshot.table_catalog().block(),
+                        prepared.block_index(),
+                        evidence,
+                        &members,
+                        cancellation,
+                    )
+                    .await?
+                }
+            };
+        evidence.inventory_sha256 = Some(inventory.store(blocks).await?);
+        checkpoint.bind_rewrite(evidence)?;
         let object = checkpoint.store_rewrite(blocks, cancellation).await?;
         for key in members {
             check_cancelled(cancellation)?;
@@ -213,6 +242,7 @@ impl AppliedErasure {
             cut: self.cut,
             boundary: boundary.metadata.position,
             members_sha256,
+            inventory_sha256: None,
         }
     }
 }
@@ -282,19 +312,21 @@ pub(crate) async fn recover_rewrite(
     {
         return Err(invalid());
     }
+    if evidence.inventory_sha256.is_none() {
+        return Err(inventory::incomplete());
+    }
     let (loaded, tables) = blocks.load(catalog.block_index()).await?;
+    let mut members = physical_members(&loaded, &tables)?;
     if loaded.publication_sha256() != catalog.publication_sha256()
-        || members_sha256(
-            blocks,
-            blocks.object_store(),
-            physical_members(&loaded, &tables)?,
-            cancellation,
-        )
-        .await?
+        || members_sha256(blocks, blocks.object_store(), members.clone(), cancellation).await?
             != evidence.members_sha256
     {
         return Err(invalid());
     }
+    protect_checkpoint_objects(&loaded, &mut members)?;
+    RetirementInventory::read(blocks, loaded.block_index(), evidence, &members)
+        .await?
+        .ok_or_else(inventory::incomplete)?;
     Ok(Some(selected))
 }
 
@@ -356,7 +388,7 @@ impl SelectedRewrite {
 
 impl ErasureRetirement {
     pub async fn settle_log_prefixes(self, logs: &PartitionLogs) -> Result<bool> {
-        use rtdb_storage::{LocalErasureRecovery, log::CheckpointPrefix};
+        use rtdb_storage::log::CheckpointPrefix;
         let (source, replica) = logs.checkpoint_log_keys().ok_or_else(unsupported)?;
         let local = logs
             .storage()
@@ -371,21 +403,66 @@ impl ErasureRetirement {
         let replica_plan = plan(self.evidence.boundary.after_offset(logs.replica_epoch));
         source.validate_checkpoint_prefix(source_plan).await?;
         replica.validate_checkpoint_prefix(replica_plan).await?;
-        if !local
-            .close_erasure_recovery(LocalErasureRecovery {
-                block: self.block,
-                boundary: self.evidence.boundary,
-                source: self.evidence.cut.source,
-                root_sha256: self.root_sha256,
-                unreadable_by: self.unreadable_by,
-            })
-            .await?
-        {
+        if !local.close_erasure_recovery(self.recovery_fence()?).await? {
             return Ok(false);
         }
         let source_done = source.settle_checkpoint_prefix(source_plan).await?;
         let replica_done = replica.settle_checkpoint_prefix(replica_plan).await?;
         Ok(source_done && replica_done)
+    }
+
+    pub async fn settle_objects(
+        self,
+        blocks: &BlockStore,
+        logs: &PartitionLogs,
+        now_lower: Timestamp,
+    ) -> Result<bool> {
+        let store = blocks.object_store();
+        let local = store.local_maintenance_store().ok_or_else(unsupported)?;
+        let fence = self.recovery_fence()?;
+        let catalog = blocks.load_fresh_catalog(fence.block).await?;
+        fence.require(
+            fence.block,
+            catalog.latest_source_position(),
+            catalog.boundary_replica_position(),
+            catalog.publication_sha256(),
+        )?;
+        let mut protected = BTreeSet::new();
+        protect_checkpoint_objects(&catalog, &mut protected)?;
+        let inventory = RetirementInventory::read(blocks, fence.block, self.evidence, &protected)
+            .await?
+            .ok_or_else(inventory::incomplete)?;
+        let objects = inventory.objects()?;
+        let cut = CatalogCut {
+            storage_version: logs.storage_version,
+            storage_epoch: logs.storage_epoch,
+            replica_epoch: logs.replica_epoch,
+            through: fence.boundary,
+        };
+        let settled = local
+            .settle_erasure_objects(store, fence, cut, &objects, now_lower)
+            .await?;
+        if settled {
+            for key in &objects {
+                blocks.storage().invalidate(key).await?;
+            }
+        }
+        Ok(settled)
+    }
+
+    fn recovery_fence(self) -> Result<rtdb_storage::LocalErasureRecovery> {
+        let digest = self
+            .evidence
+            .inventory_sha256
+            .ok_or_else(inventory::incomplete)?;
+        Ok(rtdb_storage::LocalErasureRecovery {
+            block: self.block,
+            boundary: self.evidence.boundary,
+            source: self.evidence.cut.source,
+            root_sha256: self.root_sha256,
+            inventory_sha256: Some(digest),
+            unreadable_by: self.unreadable_by,
+        })
     }
 
     pub fn observe(selected: SelectedRewrite, upper: Timestamp, lease_micros: u64) -> Result<Self> {
@@ -482,6 +559,17 @@ impl RewriteEvidence {
             state,
         ))
     }
+}
+
+fn protect_checkpoint_objects(
+    catalog: &BlockCatalog,
+    members: &mut BTreeSet<ObjectKey>,
+) -> Result<()> {
+    members.insert(ObjectKey::new(block_key(catalog.block_index())?)?);
+    if let Some(path) = &catalog.as_proto().serving_checkpoint_object {
+        members.insert(ObjectKey::new(path)?);
+    }
+    Ok(())
 }
 
 pub(crate) fn physical_members(

@@ -65,6 +65,19 @@ impl KafkaFrameKeys {
         Ok(Intent::read(&self.0.path.join(INTENT))?.map_or(0, |intent| intent.retirement.before))
     }
 
+    pub async fn has_kafka_prefix_retirement(
+        &self,
+        retirement: KafkaPrefixRetirement,
+    ) -> crate::Result<bool> {
+        let path = self.0.path.join(INTENT);
+        self.0
+            .region
+            .run_blocking(move || {
+                Ok(Intent::read(&path)?.is_some_and(|intent| intent.retirement == retirement))
+            })
+            .await
+    }
+
     /// Closes new decryptions below a checkpoint-authorized cut and retains its receipt deadline.
     /// The caller must first order recovery from the exact checkpoint on this topic lineage.
     /// `broker_end` is the exclusive end of the same broker partition's observed committed prefix.
@@ -287,6 +300,15 @@ mod tests {
         keys.arm_kafka_prefix_retirement(cut(1), 2).await?;
         let keys = vault.kafka_log_keys(topic, false, IoRegion::new())?;
         assert_eq!(keys.kafka_erasure_floor()?, 1);
+        assert!(keys.has_kafka_prefix_retirement(cut(1)).await?);
+        assert!(
+            !keys
+                .has_kafka_prefix_retirement(KafkaPrefixRetirement {
+                    unreadable_by: Timestamp(101),
+                    ..cut(1)
+                })
+                .await?
+        );
         assert!(matches!(
             keys.open_kafka_publication(0, earlier.clone()).await,
             Err(Error::UnavailableLogRange {

@@ -21,6 +21,11 @@
 -- Per-frame withdrawal preserves the log record coordinates and the suffix used to replay the retirement record.
 -- The Default erasure rewrite binds its fresh physical membership to the pending canonical receipt and its original source position, replica position and term.
 -- Recovery accepts the rewrite only when the authenticated checkpoint contains that same receipt installation.
+-- An authenticated inventory binds prior checkpoint and replay objects to the exact replacement.
+-- A Local retirement closes admission to prior catalogs and waits for their reader holds and the original deadline.
+-- Object retirement follows settlement of both ordered log prefixes.
+-- Recovery resumes object retirement from the same inventory and cursor after an interruption.
+-- Missing object provenance or a gap in the required replica prefix keeps the route gated.
 -- A live adoption switches subsequent native read delivery to the verified successor generation and preserves the generation of previously acquired views.
 -- Retained replay requires the Default recovery fence before it can cross a pending erase or copy its checkpoint.
 -- A default attachment with a stable branch authority shares main-branch relation effects between the physical partition and the v1 transaction fold.
