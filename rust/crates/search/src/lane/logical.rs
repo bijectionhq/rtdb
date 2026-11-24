@@ -4,7 +4,7 @@ use arrow_array::Array;
 use rtdb_format::{keys::{TableSlug, TrieKey}, log::proto::{ArtefactEntry, ArtefactRecord, ArtefactsAdded, SearchRun, SearchRunChange}};
 use rtdb_index::{PartitionValue, Snapshot};
 use rtdb_maintenance::{ArtefactDefinition, ArtefactPublisher, SnapshotSource, input::{download, open_input}};
-use rtdb_storage::ObjectKey;
+use rtdb_storage::{HeldView, IoRegion, ObjectKey};
 use rtdb_types::{AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, Interval, Result, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -129,6 +129,10 @@ fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], incl
 }
 
 impl SearchBuilder {
+    async fn hold_logical_input(&self, snapshot: &Snapshot) -> Result<Arc<HeldView>> {
+        HeldView::catalog(self.store.as_ref(), Arc::new(snapshot.clone()), snapshot.catalog_cut(), None).await
+    }
+
     pub(super) async fn seal_logical(&self, index: &LogicalIndex, snapshot: &Arc<PartitionValue>, trie: &TrieKey, path: &Path, size: u64,
         cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let view = snapshot.snapshot();
@@ -288,7 +292,11 @@ impl SearchBuilder {
                         && pair[0].file_size().saturating_add(pair[1].file_size()) <= limit
                 }) else { break; };
                 let input = pair.iter().map(|run| run.digest().to_vec()).collect::<Vec<_>>();
-                let run = match self.merge_logical(&index, &definition.columns, &snapshot, pair, cancellation).await {
+                let hold = self.hold_logical_input(&snapshot).await?;
+                let merged = IoRegion::reading(hold,
+                    self.merge_logical(&index, &definition.columns, &snapshot, pair, cancellation),
+                ).await;
+                let run = match merged {
                     Ok(run) => run,
                     Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
                     Err(error) => return Err(error),
@@ -316,32 +324,36 @@ impl SearchBuilder {
         for run in &runs { digest.update(run.digest()); }
         let fingerprint = digest.finalize().into();
         if self.scrubbed.lock().get(&cache_key) == Some(&fingerprint) { return Ok(()); }
-        let mut frontier_charge = self.memory.reserve(4096)?;
-        let mut erases = Erases::new();
-        for run in runs.iter().filter(|run| run.has_erases()) {
-            if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
-            let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
-            let (witnesses, _charge) = file.erases(&self.memory).await?;
-            let frontier = Arc::get_mut(&mut frontier_charge).expect("unpublished erase frontier owns its charge");
-            let need = 4096usize.saturating_add(erases.len().saturating_add(witnesses.len()).saturating_mul(128));
-            if need > frontier.bytes() { frontier.grow_to(need)?; }
-            extend_erases(&mut erases, witnesses);
-        }
-        for run in runs.into_iter().filter(|run| !needs_order_replay(run)) {
-            if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
-            let indexing = self.memory.reserve(indexing_allowance(run.file_size().saturating_mul(4)))?;
-            let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
-            let mut documents = file.documents().await?;
-            if !scrub_documents(&mut documents, &erases) { continue; }
-            let (local, _erase_charge) = if run.has_erases() { file.erases(&self.memory).await? }
-                else { (Erases::new(), self.memory.reserve(0)?) };
-            let rebuild = run.rebuild().checked_add(1).ok_or_else(|| fault("Search rebuild generation exhausted"))?;
-            let replacement = self.store_documents(index, columns, &entry.slug, run.blocks.clone(), rebuild, run.source_rows(),
-                RunContents { documents, erases: local }, indexing, cancellation).await?;
-            publish_change(publisher, storage, index, SearchRunChange {
-                run: Some(replacement), replaces: vec![run.digest().to_vec()], ..Default::default()
-            }).await?;
-        }
+        let hold = self.hold_logical_input(&snapshot).await?;
+        IoRegion::reading(hold, async {
+            let mut frontier_charge = self.memory.reserve(4096)?;
+            let mut erases = Erases::new();
+            for run in runs.iter().filter(|run| run.has_erases()) {
+                if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+                let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
+                let (witnesses, _charge) = file.erases(&self.memory).await?;
+                let frontier = Arc::get_mut(&mut frontier_charge).expect("unpublished erase frontier owns its charge");
+                let need = 4096usize.saturating_add(erases.len().saturating_add(witnesses.len()).saturating_mul(128));
+                if need > frontier.bytes() { frontier.grow_to(need)?; }
+                extend_erases(&mut erases, witnesses);
+            }
+            for run in runs.into_iter().filter(|run| !needs_order_replay(run)) {
+                if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
+                let indexing = self.memory.reserve(indexing_allowance(run.file_size().saturating_mul(4)))?;
+                let file = self.runtime.logical_file(&self.storage, &entry.slug, run, columns).await?;
+                let mut documents = file.documents().await?;
+                if !scrub_documents(&mut documents, &erases) { continue; }
+                let (local, _erase_charge) = if run.has_erases() { file.erases(&self.memory).await? }
+                    else { (Erases::new(), self.memory.reserve(0)?) };
+                let rebuild = run.rebuild().checked_add(1).ok_or_else(|| fault("Search rebuild generation exhausted"))?;
+                let replacement = self.store_documents(index, columns, &entry.slug, run.blocks.clone(), rebuild, run.source_rows(),
+                    RunContents { documents, erases: local }, indexing, cancellation).await?;
+                publish_change(publisher, storage, index, SearchRunChange {
+                    run: Some(replacement), replaces: vec![run.digest().to_vec()], ..Default::default()
+                }).await?;
+            }
+            Ok::<_, rtdb_types::Anomaly>(())
+        }).await?;
         let mut scrubbed = self.scrubbed.lock();
         if scrubbed.len() >= 1024 { scrubbed.clear(); }
         scrubbed.insert(cache_key, fingerprint);
@@ -395,7 +407,8 @@ impl SearchBuilder {
                 continue;
             };
             let index = LogicalIndex::of(definition);
-            let attempt = async {
+            let hold = self.hold_logical_input(&snapshot).await?;
+            let attempt = IoRegion::reading(hold, async {
                 let entry = snapshot.table_entry(&table).ok_or_else(|| fault("Logical repair has no table slug"))?;
                 if !needs_order_replay(target) {
                     let checked = async {
@@ -452,7 +465,7 @@ impl SearchBuilder {
                 publish_change(publisher, storage, &index, SearchRunChange {
                     run: Some(run), replaces: vec![id.to_vec()], ..Default::default()
                 }).await
-            }.await;
+            }).await;
             match attempt {
                 Ok(()) => self.runtime.clear_run(&self.database, &table, id),
                 Err(error) if super::is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),

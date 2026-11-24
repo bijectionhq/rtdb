@@ -174,7 +174,7 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 |Residence ledger with holds and an admission floor; delete the timer stack.
 |Multi, native local storage, and classic S3, Azure and GCS storage enforce a catalog admission floor and retry trie retirement from installed receipts.
 Classic remote holds use conditional writes and finish after admitted provider work drains.
-Compaction and stored artefact builds on coordinated storage hold their input catalogs through provider drain.
+Compaction, stored artefact builds and logical search merge, repair and scrub on coordinated storage hold their input catalogs through provider drain.
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
 Hosted exact trie, checkpoint-metadata pack and replica-payload releases use their installed authority without reaper grace. A moved source enters disposal once the destination route commits. The original owner's drain and provider evidence still gate settlement.
 The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
