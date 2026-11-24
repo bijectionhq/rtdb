@@ -129,6 +129,8 @@ The native reset regression keeps the old files with a catalog reader held acros
 [Verus](../verus/reset_retirement/proof.rs) checks the production adoption predicate and [TLC](../tla/ResetRetirement.tla) checks the bounded restart and release protocol.
 The L0-inventory reset still depends on the original L0 inputs, and those files stay outside automatic collection.
 
+Snapshot export verifies the retained primary inventory under a catalog hold. The plan carries that hold into every copy and publishes the root after its members.
+
 ## Retained checkpoint reset
 
 Native local maintenance can replay from a detached retained anchor to its adopted checkpoint and install the resulting primary catalog in place.

@@ -513,7 +513,8 @@ impl BlockStore {
         Ok((block, tables))
     }
 
-    pub(crate) async fn verify_primary_inventory(&self, root: &BlockCatalog,
+    /// Verifies the extent of each primary required by the authenticated checkpoint.
+    pub async fn verify_primary_inventory(&self, root: &BlockCatalog,
         tables: &BTreeMap<rtdb_types::TableRef, TableBlock>,
     ) -> Result<()> {
         let invalid_extent = |key| Anomaly::fault("rtdb.replication/checkpoint-primary-extent",

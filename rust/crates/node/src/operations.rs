@@ -4,7 +4,7 @@ use rtdb_format::{catalog::CheckpointContents, keys::{CURRENT_STORAGE_VERSION, S
 use rtdb_index::{CatalogTrie, PartitionValue};
 use rtdb_maintenance::ResetRetirements;
 use rtdb_replication::PrimaryReset;
-use rtdb_storage::{ObjectKey, ObjectStore};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result, StorageEpoch, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 use crate::{Node, database::PublishDeletions};
@@ -67,6 +67,7 @@ fn reset_cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rt
 
 pub struct SnapshotExport {
     store: Arc<dyn ObjectStore>,
+    hold: Arc<HeldView>,
     block_index: BlockIndex,
     export_time: Timestamp,
     directory: ObjectKey,
@@ -87,12 +88,14 @@ impl SnapshotExport {
     /// Completed copies remain on failure and identical retries are accepted.
     /// Cancellation is checked between copies; an admitted object copy finishes before returning.
     pub async fn copy(&self, cancellation: &CancellationToken) -> Result<()> {
-        // The root makes the destination visible to checkpoint discovery.
-        for key in self.files.iter().skip(1).chain(self.files.first()) {
-            if cancellation.is_cancelled() { return Err(Anomaly::new(AnomalyCategory::Interrupted, "rtdb.export/cancelled", "Snapshot export was cancelled")); }
-            self.store.copy(key, &self.destination(key)?).await?;
-        }
-        Ok(())
+        IoRegion::reading(Arc::clone(&self.hold), async {
+            // The root makes the destination visible to checkpoint discovery.
+            for key in self.files.iter().skip(1).chain(self.files.first()) {
+                if cancellation.is_cancelled() { return Err(Anomaly::new(AnomalyCategory::Interrupted, "rtdb.export/cancelled", "Snapshot export was cancelled")); }
+                self.store.copy(key, &self.destination(key)?).await?;
+            }
+            Ok(())
+        }).await
     }
 }
 
@@ -166,7 +169,7 @@ impl Node {
         Ok(CompactorReset { database, term, expected: value, primary, preview, files, reservations: reservations.into() })
     }
     /// Plans an offline export from the loaded block's immutable dependency closure.
-    /// Indexing and compaction must be disabled on this node; source files must remain available until copying finishes.
+    /// Indexing and compaction must be disabled on this node. The plan retains its source through provider drain on coordinated stores.
     /// Returns None when the database has no completed block.
     pub async fn snapshot_export(&self, database: &str, now: Timestamp) -> Result<Option<SnapshotExport>> {
         self.require_offline_export()?;
@@ -175,16 +178,23 @@ impl Node {
         let Some(captured) = value.table_catalog().block() else { return Ok(None); };
         let block_index = captured.block_index();
         let expected = captured.publication_sha256();
+        let store = Arc::clone(database.storage.object_store());
+        let cut = value.snapshot().catalog_cut();
+        let hold = HeldView::catalog(store.as_ref(), Arc::clone(&value) as Arc<dyn Send + Sync>, cut, None).await?;
         let blocks = rtdb_replication::BlockStore::new(
-            Arc::clone(database.storage.object_store()),
+            Arc::clone(&store),
             Arc::clone(&database.storage),
             Arc::clone(self.memory()),
             value.trie_catalog().file_size_target(),
         )?;
-        let (block, tables) = blocks.load(block_index).await?;
-        if expected.is_some_and(|digest| block.publication_sha256() != Some(digest)) {
-            return Err(invalid("Loaded checkpoint root changed while planning the export"));
-        }
+        let (block, tables) = IoRegion::reading(Arc::clone(&hold), async {
+            let (block, tables) = blocks.load(block_index).await?;
+            if expected.is_some_and(|digest| block.publication_sha256() != Some(digest)) {
+                return Err(invalid("Loaded checkpoint root changed while planning the export"));
+            }
+            blocks.verify_primary_inventory(&block, &tables).await?;
+            Ok::<_, Anomaly>((block, tables))
+        }).await?;
         let date = rtdb_types::CivilDateTime::from_epoch_second(now.epoch_parts().0, 0)?;
         let (year, month, day) = date.date().ymd();
         let year_of_era = if year <= 0 { 1 - year } else { year };
@@ -214,7 +224,7 @@ impl Node {
                 files.push(ObjectKey::new(file)?);
             }
         }
-        Ok(Some(SnapshotExport { store: Arc::clone(database.storage.object_store()), block_index, export_time: now, directory, storage_root: root, table_count, files, _reservation: reservation }))
+        Ok(Some(SnapshotExport { store, hold, block_index, export_time: now, directory, storage_root: root, table_count, files, _reservation: reservation }))
     }
 }
 
