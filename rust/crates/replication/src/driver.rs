@@ -329,14 +329,21 @@ struct ArchivedPayload { bytes: Vec<u8>, _reservation: Arc<rtdb_columnar::Memory
 impl AsRef<[u8]> for ArchivedPayload { fn as_ref(&self) -> &[u8] { &self.bytes } }
 fn start_poll(mut tail: PartitionReplay, timeout: Duration) -> Poll {
     Box::pin(async move {
-        let result = match &mut tail {
-            PartitionReplay::Prepared(cursor) => cursor.poll_head(timeout).await.map(TailPoll::Prepared),
-            PartitionReplay::Legacy(tail) => match tail.replay() {
-                Some(cursor) => cursor.poll_head(timeout).await.map(TailPoll::Prepared),
-                None => tail.poll(timeout).await.map(TailPoll::Legacy),
-            },
-        };
-        (tail, result.map_err(Into::into))
+        loop {
+            let result = match &mut tail {
+                PartitionReplay::Prepared(cursor) => cursor.poll_head(timeout).await.map(TailPoll::Prepared),
+                PartitionReplay::Legacy(tail) => match tail.replay() {
+                    Some(cursor) => cursor.poll_head(timeout).await.map(TailPoll::Prepared),
+                    None => tail.poll(timeout).await.map(TailPoll::Legacy),
+                },
+            };
+            if !matches!(result, Err(StorageError::LogFetchPending { .. })) {
+                return (tail, result.map_err(Into::into));
+            }
+            // The observed prefix still has a record at this cursor. Keep reading
+            // it before reporting an empty read to the election or source driver.
+            tokio::task::yield_now().await;
+        }
     })
 }
 async fn pending_poll(poll: &mut Option<Poll>) -> (PartitionReplay, Result<TailPoll>) {

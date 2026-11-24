@@ -123,8 +123,9 @@ impl KafkaTail {
     }
 
     fn confirm_tip(&self) -> Result<()> {
-        if self.next == self.end()? { return Ok(()); }
-        Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka fetch timed out before the observed tip".into() })
+        let end = self.end()?;
+        if self.next == end { return Ok(()); }
+        Err(Error::LogFetchPending { requested: self.next, tip: end - 1 })
     }
 }
 

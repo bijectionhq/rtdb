@@ -18,6 +18,8 @@ pub enum Error {
     CorruptLog { path: PathBuf, offset: u64, reason: String },
     #[error("requested log position {requested} is unavailable; first retained position is {first_retained}")]
     UnavailableLogRange { requested: i64, first_retained: i64 },
+    #[error("log position {requested} is durable through {tip} and the fetch is still pending")]
+    LogFetchPending { requested: i64, tip: i64 },
     #[error("log is closed: {0}")]
     Closed(String),
     #[error("cannot append to read-only log {0}")]
@@ -73,6 +75,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::Io { path, .. } => (Category::Unavailable, "rtdb.storage/io", serde_json::json!({"path": path})),
             Error::CorruptLog { path, offset, .. } => (Category::Fault, "rtdb.storage/corrupt-log", serde_json::json!({"path": path, "offset": offset})),
             Error::UnavailableLogRange { requested, first_retained } => (Category::Unavailable, "rtdb.storage/log-range-unavailable", serde_json::json!({"requested": requested, "first-retained": first_retained})),
+            Error::LogFetchPending { requested, tip } => (Category::Unavailable, "rtdb.storage/log-fetch-pending", serde_json::json!({"requested": requested, "tip": tip})),
             Error::Closed(_) => (Category::Unavailable, "rtdb.storage/closed", serde_json::json!({})),
             Error::ReadOnlyLog(path) => (Category::Incorrect, "rtdb.storage/read-only-log", serde_json::json!({"path": path})),
             Error::LogReadLimit { maximum_records, maximum_payload_bytes } => (Category::Busy, "rtdb.storage/log-read-limit", serde_json::json!({"maximum-records": maximum_records, "maximum-payload-bytes": maximum_payload_bytes})),
