@@ -5,7 +5,9 @@ use arrow_buffer::Buffer;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::MemoryBudget;
+use rtdb_format::data::{EncodedEvent, EventBatch};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
+use rtdb_maintenance::input;
 use rtdb_query::IidScope;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TemporalBounds};
@@ -14,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     definition::{self, VectorDefinition},
     file::{Block, Cluster, Directory, Locator},
-    lane, probe,
-    rows::{self, IndexedRow, IndexedRows, Partition},
+    probe,
+    rows::{self, Partition},
 };
 
 /// Where and at which cut a shortlist reads (vector.allium: ApproximateRead).
@@ -64,12 +66,9 @@ impl Shortlist {
         if !(bounds.valid_time.is_point() && bounds.system_time.is_point()) || cut.snapshot.has_overlays() { return Ok(None); }
         if probe.len() != definition.dimensions { return Ok(None); }
         let Some(sources) = sources(cut, definition, budget) else { return Ok(None) };
-        let mut gathered = Vec::new();
-        let frontier = frontier_rows(cut, definition, &sources).await?;
-        for row in frontier.rows() {
-            if admits(row, partition, scope, bounds) { gathered.push((rows::unit_distance(&probe, frontier.unit(row)), row.iid)); }
-        }
-        drop(frontier);
+        let gathered = FrontierRanker {
+            definition, probe: &probe, partition, scope, bounds, unit: Vec::new(), gathered: Vec::new(),
+        }.rank(cut, &sources).await?;
         let mut opened = Vec::new();
         for source in &sources {
             let Source::Generation { key, locator } = source else { continue };
@@ -152,23 +151,56 @@ fn sources(cut: Cut<'_>, definition: &VectorDefinition, budget: Budget) -> Optio
     (uncovered <= budget.max_uncovered_bytes).then_some(sources)
 }
 
-/// The indexable puts above the published frontier: tries without a generation, then the live segments.
-async fn frontier_rows(cut: Cut<'_>, definition: &VectorDefinition, sources: &[Source]) -> Result<IndexedRows> {
-    let mut output = IndexedRows::new(definition.dimensions);
-    for source in sources {
-        let Source::Frontier { data } = source else { continue };
-        let lease = cut.storage.get_or(data, cut.memory).await?;
-        lane::read_indexed_rows(std::io::Cursor::new(lease), definition, cut.memory, cut.cancellation, &mut output)?;
-    }
-    for segment in cut.snapshot.iter_segments(&definition.table) {
-        for batch in segment.batches() {
-            let events = batch.view();
-            for row in 0..events.len() {
-                output.push_event(&events.borrow_event(row)?, definition)?;
+struct FrontierRanker<'a> {
+    definition: &'a VectorDefinition,
+    probe: &'a [f32],
+    partition: Option<Partition>,
+    scope: Option<IidScope<'a>>,
+    bounds: TemporalBounds,
+    unit: Vec<f32>,
+    gathered: Vec<(f64, Iid)>,
+}
+
+impl FrontierRanker<'_> {
+    async fn rank(mut self, cut: Cut<'_>, sources: &[Source]) -> Result<Vec<(f64, Iid)>> {
+        let definition = self.definition;
+        for source in sources {
+            let Source::Frontier { data } = source else { continue };
+            let lease = cut.storage.get_or(data, cut.memory).await?;
+            let (mut reader, _metadata) = input::open_input(std::io::Cursor::new(lease), cut.memory)?;
+            let columns = definition.put_columns();
+            for page in 0..reader.page_count() {
+                if cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
+                let _page = cut.memory.reserve(reader.page_allocation_bound(page)?)?;
+                let events = EventBatch::new(reader.read_event_page(page, &columns)?)?;
+                self.rank_batch(&events)?;
             }
         }
+        for segment in cut.snapshot.iter_segments(&definition.table) {
+            for batch in segment.batches() {
+                self.rank_batch(batch.view())?;
+            }
+        }
+        Ok(self.gathered)
     }
-    Ok(output)
+
+    fn rank_batch(&mut self, events: &EventBatch) -> Result<()> {
+        let dimensions = self.definition.dimensions;
+        for row in 0..events.len() {
+            let event = events.borrow_event(row)?;
+            self.unit.clear();
+            // A put outside the requested cut can still fail vector or partition decoding.
+            let Some(partition) = rows::append_indexable_event_unit(&event, self.definition, dimensions, &mut self.unit)? else { continue };
+            let header = event.header();
+            if self.partition.is_none_or(|expected| partition == expected)
+                && self.scope.is_none_or(|scope| scope.contains(&header.iid))
+                && may_be_visible(header.valid_time.lower().0, header.valid_time.upper().0, header.system_from.0, self.bounds)
+            {
+                self.gathered.push((rows::unit_distance(self.probe, &self.unit), header.iid));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The `target` nearest distinct IIDs of the gathered rows, which this leaves sorted and truncated to them,
@@ -185,12 +217,6 @@ fn nearest(gathered: &mut Vec<(f64, Iid)>, target: usize) -> (BTreeSet<Iid>, boo
     (seen, truncated)
 }
 
-fn admits(row: &IndexedRow, partition: Option<Partition>, scope: Option<IidScope<'_>>, bounds: TemporalBounds) -> bool {
-    partition.is_none_or(|partition| row.partition == partition)
-        && scope.is_none_or(|scope| scope.contains(&row.iid))
-        && may_be_visible(row.valid_from, row.valid_to, row.system_from, bounds)
-}
-
 /// A version can be visible only if its valid interval meets the read's and it was written by the read's system instant.
 /// Resolution only narrows this, so it rules candidates out and never in.
 fn may_be_visible(valid_from: i64, valid_to: i64, system_from: i64, bounds: TemporalBounds) -> bool {
@@ -205,8 +231,75 @@ pub fn declined(error: &Anomaly) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::nearest;
-    use rtdb_types::Iid;
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_types::{Interval, LogicalType, ScalarType, StructFields, TableRef, Timestamp, Value};
+
+    use super::*;
+    use crate::definition::{Approximate, Method};
+
+    fn definition() -> VectorDefinition {
+        VectorDefinition {
+            name: "neighbors".into(), table: TableRef::new("public", "documents"), column: "embedding".into(),
+            partition: vec!["tenant".into()], dimensions: 2, approximate: Approximate { method: Method::Ivf, recall: 0.9 }, generation: 0,
+        }
+    }
+
+    fn put(id: u8, components: [f32; 2], tenant: Value) -> StoredEvent {
+        StoredEvent {
+            position: None, origin: None, entity_key: None, commit_position: 0, recency: None,
+            iid: Iid([id; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(StructFields::from([
+                ("embedding".into(), Value::list(components.into_iter().map(Value::F32).collect())),
+                ("tenant".into(), tenant),
+            ])),
+        }
+    }
+
+    fn batch(events: &[StoredEvent], tenant: ScalarType) -> Result<EventBatch> {
+        let fields = StructFields::from([
+            ("embedding".into(), LogicalType::list(LogicalType::Scalar(ScalarType::F32))),
+            ("tenant".into(), LogicalType::Scalar(tenant)),
+        ]);
+        EventBatch::new(build_event_batch(events, Some(fields), None)?)
+    }
+
+    fn frontier<'a>(definition: &'a VectorDefinition, scope: &'a BTreeSet<Iid>, partition: Option<Partition>) -> FrontierRanker<'a> {
+        let point = Interval::at(Timestamp(10)).unwrap();
+        FrontierRanker {
+            definition, probe: &[1.0, 0.0], partition, scope: Some(IidScope::Set(scope)),
+            bounds: TemporalBounds { valid_time: point, system_time: point }, unit: Vec::new(), gathered: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frontier_scores_the_admitted_rows_across_batches() -> Result<()> {
+        let definition = definition();
+        let scope = BTreeSet::from([Iid([1; 16]), Iid([2; 16]), Iid([3; 16]), Iid([4; 16]), Iid([5; 16])]);
+        let tenant = |name: &str| Value::Utf8(name.into());
+        let partition = Partition::of([Some(std::borrow::Cow::Owned(tenant("a")))])?;
+        let mut ranker = frontier(&definition, &scope, Some(partition));
+        let mut expired = put(3, [1.0, 0.0], tenant("a"));
+        expired.valid_time = Interval::from_micros(0, 10)?;
+        let mut future = put(4, [1.0, 0.0], tenant("a"));
+        future.system_from = Timestamp(11);
+        ranker.rank_batch(&batch(&[put(1, [3.0, 4.0], tenant("a")), expired, future], ScalarType::Utf8)?)?;
+        ranker.rank_batch(&batch(&[
+            put(2, [1.0, 0.0], tenant("a")), put(5, [1.0, 0.0], tenant("b")), put(6, [1.0, 0.0], tenant("a")),
+        ], ScalarType::Utf8)?)?;
+        assert_eq!(ranker.gathered, [(1.0 - f64::from(0.6_f32), Iid([1; 16])), (0.0, Iid([2; 16]))]);
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_reports_partition_errors_only_for_indexable_vectors_even_outside_the_scope() -> Result<()> {
+        let definition = definition();
+        let scope = BTreeSet::new();
+        let mut ranker = frontier(&definition, &scope, None);
+        ranker.rank_batch(&batch(&[put(1, [0.0, -0.0], Value::F64(1.0))], ScalarType::F64)?)?;
+        let batch = batch(&[put(1, [1.0, 0.0], Value::F64(1.0))], ScalarType::F64)?;
+        assert_eq!(ranker.rank_batch(&batch).unwrap_err().code, "rtdb.vector/partition-type");
+        Ok(())
+    }
 
     #[test]
     fn the_shortlist_keeps_the_nearest_distinct_iids_and_reports_truncation() {
