@@ -270,12 +270,22 @@ impl AppendBuffer {
         }
         result
     }
+
+    pub async fn append(&mut self, log: &dyn SharedLog, timestamp: Timestamp) -> Result<AppendReceipt> {
+        let bytes = std::mem::take(&mut self.bytes).freeze();
+        let result = log.append(self.retain(bytes.slice(self.prefix..)), timestamp).await;
+        if matches!(result, Err(Error::MessageTooLarge { .. })) {
+            self.bytes = bytes.try_into_mut().unwrap_or_else(|bytes| BytesMut::from(bytes.as_ref()));
+        }
+        result
+    }
 }
 
 #[async_trait]
 pub trait Log: Send + Sync {
     /// The identity stored in the opened native replica journal, if it has a lineage header.
     fn journal_lineage(&self) -> Option<uuid::Uuid> { None }
+    fn shared(&self) -> Option<&dyn SharedLog> { None }
     fn needs_published_recovery_checkpoint(&self) -> bool { false }
     /// This replica log confers offload access only through a delivered payload permit.
     fn requires_replica_payload_permit(&self) -> bool { false }

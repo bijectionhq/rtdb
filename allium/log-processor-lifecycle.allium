@@ -104,6 +104,7 @@ contract DurableTotalOrder {
 
     @invariant PreparedReadAdvancesOnDelivery
         -- Preparation identifies the next retained record above the reader's position.
+        -- A native ordered log opens its prepared cursor at the configured replica epoch's replay position.
         -- Delivery advances the reader's position.
         -- An unavailable delivery reservation is a read error at the current position.
 

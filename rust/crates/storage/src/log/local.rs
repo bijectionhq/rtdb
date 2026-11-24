@@ -522,6 +522,7 @@ impl super::SharedLog for LocalLog {
 #[async_trait]
 impl Log for LocalLog {
     fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
+    fn shared(&self) -> Option<&dyn super::SharedLog> { Some(self) }
     fn retains_synced_history(&self) -> bool { true }
     fn maximum_append_bytes(&self) -> Option<usize> { Some(self.maximum_message_bytes) }
 

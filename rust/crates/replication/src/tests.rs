@@ -131,8 +131,8 @@ async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head()
     let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
     let logs = PartitionLogs::new(source.clone(), replica.clone(), StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION,
         StorageEpoch(0), store, cache, Arc::clone(&memory)).unwrap();
-    let source_tail = logs.source_tail(logs.source_floor().unwrap()).await.unwrap();
-    let replica_tail = logs.replica_tail(logs.replica_floor().unwrap()).await.unwrap();
+    let source_tail = logs.source_replay(logs.source_floor().unwrap()).await.unwrap();
+    let replica_tail = logs.replica_replay(logs.replica_floor().unwrap()).await.unwrap();
     let ((mut source_tail, source_ready), (mut replica_tail, replica_ready)) =
         tokio::join!(start_poll(source_tail, Duration::ZERO), start_poll(replica_tail, Duration::ZERO));
     let TailPoll::Prepared(Some(source_head)) = source_ready.unwrap() else { panic!("expected a prepared source head"); };
@@ -147,7 +147,7 @@ async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head()
     let running = CancellationToken::new();
     let blocker_bytes = memory.limit_bytes() - replica_needed;
     let one_byte_short = memory.reserve(blocker_bytes + 1).unwrap();
-    let refusal = read_replay_head(replica_tail.as_mut(), replica_head, logs.memory(), replica_decode_bound, &running).await
+    let refusal = read_replay_head(&mut replica_tail, replica_head, logs.memory(), replica_decode_bound, &running).await
         .err().expect("expected a replay admission failure");
     assert_eq!(refusal.code, "rtdb/memory-budget-exceeded");
     assert_eq!(memory.used_bytes(), blocker_bytes + 1);
@@ -155,7 +155,7 @@ async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head()
     drop(one_byte_short);
 
     let blocker = memory.reserve(blocker_bytes).unwrap();
-    let record = read_replay_head(replica_tail.as_mut(), replica_head, logs.memory(), replica_decode_bound, &running).await.unwrap().unwrap();
+    let record = read_replay_head(&mut replica_tail, replica_head, logs.memory(), replica_decode_bound, &running).await.unwrap().unwrap();
     assert_eq!(memory.used_bytes(), memory.limit_bytes());
     let decoded = logs.decode_reserved_replica(record.raw, record.decode_reservation).unwrap().unwrap();
     assert_eq!(decoded.envelope.term, Term(1));
@@ -170,10 +170,10 @@ async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head()
 
     let cancelled = CancellationToken::new();
     cancelled.cancel();
-    assert!(read_replay_head(source_tail.as_mut(), source_head, &memory, source_decode_bound, &cancelled).await.unwrap().is_none());
+    assert!(read_replay_head(&mut source_tail, source_head, &memory, source_decode_bound, &cancelled).await.unwrap().is_none());
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(source_tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), Some(source_head));
-    let record = read_replay_head(source_tail.as_mut(), source_head, &memory, source_decode_bound, &running).await.unwrap().unwrap();
+    let record = read_replay_head(&mut source_tail, source_head, &memory, source_decode_bound, &running).await.unwrap().unwrap();
     assert_eq!(record.raw.metadata, source_metadata);
     assert_eq!(memory.used_bytes(), memory.limit_bytes());
     let message = SourceMessage::decode(&record.raw.payload).unwrap().unwrap();
@@ -185,7 +185,8 @@ async fn two_ready_local_tails_leave_room_to_read_and_decode_the_selected_head()
     assert_eq!(source_tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), None);
 
     let legacy = ReadOnlyLocalLog::open(directory.path().join("REPLICA_LOG"), ReadOnlyLocalLogOptions::default()).unwrap();
-    let (_, result) = start_poll(legacy.tail(LogOffset(-1)).await.unwrap(), Duration::ZERO).await;
+    let tail = crate::logs::PartitionReplay::Legacy(legacy.tail(LogOffset(-1)).await.unwrap());
+    let (_, result) = start_poll(tail, Duration::ZERO).await;
     let TailPoll::Legacy(batch) = result.unwrap() else { panic!("expected legacy batch delivery"); };
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].metadata, replica_metadata);
