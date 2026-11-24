@@ -1194,16 +1194,64 @@ impl rtdb_node::ResourceFactory for AppliedFixtureResources {
 }
 
 fn integer_cell(value: i64) -> v1::Cell {
-    let batch = RecordBatch::try_from_iter([(
-        "value",
-        Arc::new(Int64Array::from(vec![value])) as arrow_array::ArrayRef,
-    )])
-    .unwrap();
+    scalar_cell(Arc::new(Int64Array::from(vec![value])))
+}
+
+fn scalar_cell(value: arrow_array::ArrayRef) -> v1::Cell {
+    let batch = RecordBatch::try_from_iter([("value", value)]).unwrap();
     v1::Cell {
         value: Some(v1::cell::Value::ArrowIpc(
             rtdb_format::ipc::write_stream(batch.schema_ref(), &[batch.clone()]).unwrap(),
         )),
     }
+}
+
+#[tokio::test]
+async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
+    let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
+        "xtdb", rtdb_node::serving::NativeServingAuthority { incarnation: [32; 16], checkpoints: None },
+    );
+    let running = Running::start_with_resources(
+        None, FlightConfig::default(), &[], None, Default::default(), None, Some(Arc::new(resources)),
+    ).await;
+    let database = running.node.catalog().database("xtdb").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let row = |id, text, vector: [f64; 2]| {
+        let embedding = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float64Type, _, _>([
+            Some(vector.map(Some)),
+        ]);
+        v1::Row {
+            cells: [("_id".into(), integer_cell(id)),
+                ("body".into(), scalar_cell(Arc::new(StringArray::from(vec![text])))),
+                ("embedding".into(), scalar_cell(Arc::new(embedding)))].into_iter().collect(),
+            ..Default::default()
+        }
+    };
+    let put = |key: u8, rows| v1::TransactRequest {
+        key: vec![key; 16],
+        ops: vec![v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+            branch: "main".into(), table: "public.ranked_rows".into(), rows, if_absent: false,
+        })) }],
+        ..Default::default()
+    };
+    let original = transact_wire(&mut client, put(1, vec![row(1, "receipt", [1.0, 0.0]), row(2, "invoice", [0.0, 1.0])])).await.unwrap();
+    let later = transact_wire(&mut client, put(2, vec![row(1, "invoice", [0.0, 1.0])])).await.unwrap();
+    assert!(matches!(later.outcome, Some(v1::receipt::Outcome::Then(()))));
+    for (sql, expected) in [
+        ("SELECT _id FROM RTDB_SEARCH(ranked_rows, body, 'receipt')", 1),
+        ("SELECT _id FROM RTDB_NEAREST(ranked_rows, embedding, ARRAY[0.0, 1.0], 1)", 2),
+    ] {
+        let mut request = input(sql);
+        request.source.as_mut().unwrap().at = Some(v1::At { selection: original.basis.clone().map(Selection::Exactly) });
+        let (rows, trailer) = query(&mut client, request).await;
+        assert_eq!(ints(&rows), [expected]);
+        assert_eq!(trailer.basis, original.basis);
+    }
+    running.stop().await;
 }
 
 async fn transact_wire(

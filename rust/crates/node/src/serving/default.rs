@@ -40,7 +40,9 @@ impl ServingDriver for DefaultServing {
     fn supports_row_visibility(&self) -> bool { self.handle.is_compatible() && self.tokens.supported() }
 
     fn features(&self) -> &[&str] {
-        if self.handle.has_classic_read() { return &["query", "query.linearizable"]; }
+        if self.handle.has_classic_read() {
+            return &["query", "query.linearizable", "sql.history", "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance"];
+        }
         if !self.handle.is_compatible() { return &[]; }
         if self.writable { NATIVE_WRITE_FEATURES } else { NATIVE_READ_FEATURES }
     }
