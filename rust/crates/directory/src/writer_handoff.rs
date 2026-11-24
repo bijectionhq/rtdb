@@ -158,6 +158,8 @@ impl WriterHandoffPlan {
             && record.linearizable_reads
             && !record.is_resident_idle()
             && record.checkpoint_recovery.is_none()
+            && record.checkpoint_stage.is_none()
+            && record.cell_transfer.is_none()
             && record.move_from.is_none()
             && record.cell_move.is_none()
             && record.placement_move.is_none()
@@ -275,6 +277,10 @@ pub(crate) fn require_writer_handoff_update(
     let same_placement = current.incarnation == next.incarnation
         && current.log_epoch == next.log_epoch
         && current.ensemble == next.ensemble
+        && current.log_copy_servers == next.log_copy_servers
+        && current.org == next.org
+        && current.lineage == next.lineage
+        && current.storage_generation == next.storage_generation
         && current.storage_namespaces == next.storage_namespaces;
     if before == after {
         if before.last().is_some_and(RetainedWriterHandoff::pending)
