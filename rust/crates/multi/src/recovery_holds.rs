@@ -288,6 +288,7 @@ mod tests {
         let reference = Bytes::from(body.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(record.log_epoch),
             BlockIndex(0), allocation, &payload).encode());
         let io = IoRegion::new();
+        keys.key(&record.key_id()).await.unwrap();
         let journal_keys = JournalUnits::open(keys.as_ref(), &record.key_id(), "replica", io.clone()).await.unwrap();
         let sealed = journal_keys.seed(0, reference.clone()).await.unwrap();
         let committed = writer.enqueue(sealed, Timestamp(0)).await.unwrap().durable().await.unwrap();
