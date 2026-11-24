@@ -38,6 +38,7 @@ impl AdminOptions {
         let mut endpoint = None;
         let mut authorization_file = None;
         let mut retain_until_micros = None;
+        let mut incarnation = None;
         let mut targets = Vec::new();
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -47,6 +48,14 @@ impl AdminOptions {
                 "--authorization-file" if authorization_file.is_none() => {
                     authorization_file =
                         Some(PathBuf::from(option(&mut args, "--authorization-file")?))
+                }
+                "--incarnation" if verb == "create" && incarnation.is_none() => {
+                    let id = option(&mut args, "--incarnation")?;
+                    let id = Uuid::parse_str(&id)
+                        .ok()
+                        .filter(|id| !id.is_nil())
+                        .ok_or_else(|| invalid("Expected a nonzero deployment incarnation UUID"))?;
+                    incarnation = Some(id.as_bytes().to_vec());
                 }
                 "--retain-until-micros"
                     if retain_until_micros.is_none()
@@ -72,7 +81,7 @@ impl AdminOptions {
         let operation = match (verb.as_str(), args.as_slice()) {
             ("create", [deployment]) => Operation::Create(proto::CreateDeploymentRequest {
                 deployment: (*deployment).into(),
-                incarnation: None,
+                incarnation,
             }),
             ("delete", [deployment]) => Operation::Delete(proto::DeleteDeploymentRequest {
                 deployment: (*deployment).into(),
@@ -167,7 +176,10 @@ fn option(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String>
 }
 
 fn deployment(reply: proto::Deployment) -> Value {
-    json!({"deployment": reply.deployment, "basis": reply.basis.map(|basis| encode_hex(&basis.value))})
+    let incarnation = Uuid::from_slice(&reply.incarnation)
+        .ok()
+        .filter(|id| !id.is_nil());
+    json!({"deployment": reply.deployment, "basis": reply.basis.map(|basis| encode_hex(&basis.value)), "incarnation": incarnation})
 }
 
 fn basis(text: &str) -> Result<data::Basis> {

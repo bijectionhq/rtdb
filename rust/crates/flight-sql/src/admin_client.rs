@@ -54,7 +54,15 @@ impl DeploymentAdminClient {
         &mut self,
         request: proto::CreateDeploymentRequest,
     ) -> Result<proto::Deployment> {
-        self.invoke(crate::admin::CREATE, request).await
+        let deployment = request.deployment.clone();
+        let incarnation = request.incarnation.clone();
+        let reply: proto::Deployment = self.invoke(crate::admin::CREATE, request).await?;
+        if reply.deployment != deployment
+            || incarnation.is_some_and(|incarnation| reply.incarnation != incarnation)
+        {
+            return Err(invalid_result());
+        }
+        Ok(reply)
     }
 
     pub async fn delete(
