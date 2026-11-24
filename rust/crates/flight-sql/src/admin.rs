@@ -14,10 +14,14 @@ use crate::{
 const EXPORT: &str = "rtdb.admin.v1.ExportCheckpoint";
 const RESTORE: &str = "rtdb.admin.v1.RestoreDeployment";
 const FORK: &str = "rtdb.admin.v1.ForkDeployment";
-pub(crate) const ACTIONS: [&str; 3] = [EXPORT, RESTORE, FORK];
+const CREATE: &str = "rtdb.admin.v1.CreateDeployment";
+pub(crate) const ACTIONS: [&str; 4] = [EXPORT, RESTORE, FORK, CREATE];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeploymentAdminAction<'a> {
+    Create {
+        deployment: &'a str,
+    },
     Export {
         deployment: &'a str,
     },
@@ -41,6 +45,10 @@ pub trait DeploymentAdminAuthority: std::fmt::Debug + Send + Sync {
 }
 
 impl Service {
+    pub(crate) fn supports_admin_action(&self, call: &Call, name: &str) -> bool {
+        self.has_admin_route(call) && (name != CREATE || self.0.node.catalog().is_managed())
+    }
+
     pub(crate) fn has_admin_route(&self, call: &Call) -> bool {
         let principal = &call.session.caller.principal;
         self.0.config.deployment_admin.is_some()
@@ -71,6 +79,27 @@ impl Service {
         let principal = &call.session.caller.principal;
         let catalog = self.0.node.catalog();
         match name {
+            CREATE => {
+                let request: proto::CreateDeploymentRequest = decode(body)?;
+                authority
+                    .authorize(
+                        principal,
+                        DeploymentAdminAction::Create {
+                            deployment: &request.deployment,
+                        },
+                    )
+                    .map_err(error::anomaly)?;
+                self.0
+                    .node
+                    .create_managed_deployment(request.deployment.clone())
+                    .await
+                    .map_err(error::anomaly)?;
+                Ok(proto::Deployment {
+                    deployment: request.deployment,
+                    basis: None,
+                }
+                .encode_to_vec())
+            }
             EXPORT => {
                 let request: proto::ExportCheckpointRequest = decode(body)?;
                 authority

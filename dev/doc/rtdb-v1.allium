@@ -1,5 +1,8 @@
 -- allium: 3
 -- The consumer boundary for a database served by the default or Multi driver.
+-- Multi deployment registration uses an internal journal stream. Its writer reserves the name and incarnation before provisioning the data stream.
+-- The writer orders readiness after observing the selected data stream and key authority. Nodes attach the ready incarnation and recover it on restart.
+-- Flight administration requires an installed deployment authorizer and a verified credential. The authority sees both names for restore and fork.
 
 external entity ConsumerClient {
     -- A caller with credentials for the selected database.

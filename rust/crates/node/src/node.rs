@@ -310,7 +310,7 @@ impl Node {
                 }
             }
             Membership::Placed => {}
-            Membership::Fixed(databases) => for (name, configuration) in databases {
+            Membership::Fixed(databases) | Membership::Managed(databases) => for (name, configuration) in databases {
                 let opened = node.factory.open(name, configuration, Arc::clone(&node.catalog), node.commands.clone(), &node.cancellation).await?;
                 node.catalog.insert_open(Arc::clone(&opened.database))?;
                 initial.push((opened.database, opened.driver));
@@ -1193,6 +1193,16 @@ impl Node {
         let (completion, result) = oneshot::channel();
         self.commands.send(CatalogCommand::AttachLocal { name, configuration, slot, completion }).await.map_err(|_| closed())?;
         result.await.map_err(|_| closed())?
+    }
+    /// Creates or reopens a database through the deployment host's durable registration.
+    pub async fn create_managed_deployment(&self, name: String) -> Result<()> {
+        self.ensure_open()?;
+        if !self.catalog.is_managed() {
+            return Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"));
+        }
+        let configuration = self.factory.resources.provision_managed_database(&name).await?;
+        let database = self.database_or_attach(name, configuration).await?.ok_or_else(closed)?;
+        self.catalog.with_current_attachment(&database, || Ok(()))
     }
     /// Stops running a database this node holds under a placed catalog: its driver is cancelled and its resources drained.
     /// Returns once the detach has begun; the name stays occupied until the drain completes.

@@ -184,6 +184,9 @@ impl ServerDriver {
             Some(install) => install(resources),
             None => Arc::new(resources) as Arc<dyn ResourceFactory>,
         };
+        if resources.journal_native_sql() && let rtdb_node::Membership::Fixed(initial) = &mut options.membership {
+            options.membership = rtdb_node::Membership::Managed(std::mem::take(initial));
+        }
         let mut services = NodeServices { resources, external_sources, execution_observer: Some(metrics.clone()), tracer, compaction_relay, world_constraints, read_fence, scan_fragmenter, decision_clock,
             ..NodeServices::local_with_search_format(authority, metrics.clone(), auth.clone(), metrics.clone(), config.search.write_format) };
         if !config.search.enabled { services.scan_accelerators.clear(); }

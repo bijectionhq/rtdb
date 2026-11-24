@@ -144,6 +144,11 @@ pub trait RemoteStorageFactory: Send + Sync {
 
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
+    /// Provisions or recovers an ordered registration before the node attaches it.
+    async fn provision_managed_database(&self, _name: &str) -> Result<DatabaseConfig> {
+        Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
+    }
+
     fn serving_driver(&self, _name: &str, _configuration: &DatabaseConfig, _cancellation: &CancellationToken)
         -> Result<Option<Arc<dyn crate::serving::ServingDriver>>> { Ok(None) }
     fn native_serving_authority(&self, _name: &str, _configuration: &DatabaseConfig)

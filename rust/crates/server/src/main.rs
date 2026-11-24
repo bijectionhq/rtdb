@@ -109,7 +109,7 @@ async fn serve_multi(
         run_server(&handle, driver, async {
             tokio::select! {
                 result = shutdown_signal() => result,
-                result = multi.drive(&stop) => result,
+                result = multi.drive(handle.node(), &stop) => result,
             }
         }).await
     }.await;

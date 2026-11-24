@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -14,11 +14,11 @@ use journal_contract::{
 };
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Kms};
-use rtdb_db::{JournalBatchAppender, MultiDatabase, MultiOptions, discover_nodes};
+use rtdb_db::{JournalBatchAppender, MultiDatabase, MultiOptions, Role, discover_nodes};
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
 use rtdb_node::{
-    Clock, DatabaseStorage, LogAccess, MultiServing, NativeResources, OpenedLogs, ResourceFactory,
-    SystemClock, serving::ServingDriver,
+    Clock, DatabaseStorage, LogAccess, MultiServing, NativeResources, Node, OpenedLogs,
+    ResourceFactory, SystemClock, serving::ServingDriver,
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -28,13 +28,19 @@ use uuid::Uuid;
 
 use crate::config::NodeConfiguration;
 
+mod catalog;
+
+type ServingDatabases = Arc<RwLock<BTreeMap<String, Arc<MultiServing>>>>;
+
+#[derive(Clone)]
 pub struct MultiRuntime {
-    databases: BTreeMap<String, Arc<MultiServing>>,
+    databases: ServingDatabases,
+    catalog: Arc<catalog::Catalog>,
+    bootstrap: Arc<BTreeMap<String, Uuid>>,
+    configuration: DatabaseConfig,
+    memory: Arc<MemoryBudget>,
     kms: Arc<dyn Kms>,
-    io: Arc<IoRegion>,
-    node: IpAddr,
-    peers: Option<String>,
-    _credential_slot: Option<File>,
+    backends: Backends,
 }
 
 impl MultiRuntime {
@@ -72,7 +78,7 @@ impl MultiRuntime {
             vault,
             node: Ipv4Addr::LOCALHOST.into(),
             peers: None,
-            credential_slot: None,
+            _credential_slot: None,
         };
         Self::open(
             config,
@@ -149,7 +155,7 @@ impl MultiRuntime {
             vault,
             node,
             peers,
-            credential_slot: Some(lock),
+            _credential_slot: Some(Arc::new(lock)),
         };
         Self::open(config, memory, databases, backends).await
     }
@@ -171,33 +177,43 @@ impl MultiRuntime {
         }
         FileKms::create_directory(&backends.vault)?;
         let kms: Arc<dyn Kms> = Arc::new(FileKms::open(&backends.vault, || SystemClock.now().0)?);
+        let control = catalog::identity(b"catalog", databases["xtdb"], "");
+        if databases.values().any(|id| *id == control) {
+            return Err(invalid(
+                "A bootstrap database cannot use the deployment catalog identity",
+            ));
+        }
+        let catalog = catalog::Catalog::new(open_database(&backends, &kms, control, false).await?);
+        let observed = catalog.read().await?;
         let mut serving = BTreeMap::new();
-        for (name, database) in databases {
-            let options = MultiOptions {
-                database,
-                node: backends.node,
-                lease_micros: 5_000_000,
-                drift_micros: 250_000,
-            };
-            let mut driver = MultiDatabase::new(
-                options,
-                Arc::clone(&backends.journal),
-                Arc::clone(&backends.store),
-                Arc::clone(&kms),
-                Arc::new(|| SystemClock.now()),
-            )?;
-            if let Some(batch) = &backends.batch {
-                driver = driver.with_batch_appender(Arc::clone(batch));
+        for (name, id) in &databases {
+            if observed
+                .get(name)
+                .is_some_and(|entry| entry.database != *id)
+                || observed
+                    .iter()
+                    .any(|(other, entry)| other != name && entry.database == *id)
+            {
+                return Err(invalid(
+                    "The bootstrap map conflicts with the ordered deployment catalog",
+                ));
             }
-            match backends.journal.head(StreamId(database.as_u128())).await {
-                Ok(_) => (),
-                Err(JournalError::NotFound) => driver.create().await?,
-                Err(JournalError::Unavailable) => (),
-                Err(error) => return Err(Anomaly::fault("rtdb/multi-open", error.to_string())),
-            }
+        }
+        let initial = databases
+            .iter()
+            .map(|(name, id)| (name.clone(), *id))
+            .chain(
+                observed
+                    .iter()
+                    .filter(|(_, entry)| entry.ready)
+                    .map(|(name, entry)| (name.clone(), entry.database)),
+            )
+            .collect::<BTreeMap<_, _>>();
+        for (name, id) in initial {
+            let database = open_database(&backends, &kms, id, true).await?;
             serving.insert(
                 name,
-                Arc::new(MultiServing::new(driver, Arc::clone(&memory))),
+                Arc::new(MultiServing::new(database, Arc::clone(&memory))),
             );
         }
         config.fixed_databases = Some(
@@ -209,77 +225,144 @@ impl MultiRuntime {
         config.server = None;
         config.indexer.enabled = false;
         config.garbage.enabled = false;
+        config.playground = false;
         Ok(Self {
-            databases: serving,
+            databases: Arc::new(RwLock::new(serving)),
+            catalog: Arc::new(catalog),
+            bootstrap: Arc::new(databases),
+            configuration: config.primary.clone(),
+            memory,
             kms,
-            io: backends.io,
-            node: backends.node,
-            peers: backends.peers,
-            _credential_slot: backends.credential_slot,
+            backends,
         })
     }
 
     pub(crate) fn resource_override(
         &self,
     ) -> Box<dyn FnOnce(NativeResources) -> Arc<dyn ResourceFactory> + Send> {
-        let databases = self.databases.clone();
-        let kms = Arc::clone(&self.kms);
-        Box::new(move |native| {
-            Arc::new(ServingResources {
-                native,
-                databases,
-                kms,
-            })
-        })
+        let runtime = self.clone();
+        Box::new(move |native| Arc::new(ServingResources { native, runtime }))
     }
 
-    pub async fn drive(&self, stop: &CancellationToken) -> Result<()> {
+    async fn provision(&self, name: &str) -> Result<DatabaseConfig> {
+        if name.is_empty() || name.len() > 255 || name.chars().any(char::is_control) {
+            return Err(invalid("Invalid deployment name"));
+        }
+        let id = self
+            .bootstrap
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| self.catalog.deployment_id(name));
+        let selected = self.catalog.reserve(name, id).await?;
+        self.ensure_driver(name, id).await?;
+        if !selected.ready {
+            self.catalog.mark_ready(name, id).await?;
+        }
+        Ok(self.configuration.clone())
+    }
+
+    pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         stop.run_until_cancelled(async {
             loop {
                 interval.tick().await;
-                self.tick().await?;
+                self.tick(node).await?;
             }
         })
         .await
         .unwrap_or(Ok(()))
     }
 
-    async fn tick(&self) -> Result<()> {
-        let live = match &self.peers {
-            None => BTreeSet::from([self.node]),
+    async fn tick(&self, node: &Node) -> Result<()> {
+        let live = match &self.backends.peers {
+            None => BTreeSet::from([self.backends.node]),
             Some(host) => match discover_nodes(host).await {
                 Ok(live) => live,
                 Err(error) if error.category == AnomalyCategory::Unavailable => return Ok(()),
                 Err(error) => return Err(error),
             },
         };
-        for driver in self.databases.values() {
+        match self.reconcile(node, &live).await {
+            Ok(()) => (),
+            Err(error) if retryable(&error) => (),
+            Err(error) => return Err(error),
+        }
+        let databases = self
+            .databases
+            .read()
+            .expect("Multi serving catalog")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for driver in databases {
             match driver.tick(&live).await {
                 Ok(_) => (),
-                Err(error)
-                    if matches!(
-                        error.category,
-                        AnomalyCategory::Unavailable
-                            | AnomalyCategory::Busy
-                            | AnomalyCategory::Conflict
-                    ) =>
-                {
-                    ()
-                }
+                Err(error) if retryable(&error) => (),
                 Err(error) => return Err(error),
             }
         }
         Ok(())
     }
 
+    async fn reconcile(&self, node: &Node, live: &BTreeSet<IpAddr>) -> Result<()> {
+        let writer = matches!(self.catalog.tick(live).await?, Role::Writer(_));
+        let mut rows = self.catalog.read().await?;
+        if writer {
+            for (name, id) in self.bootstrap.iter() {
+                if !rows.contains_key(name) {
+                    rows.insert(name.clone(), self.catalog.reserve(name, *id).await?);
+                }
+            }
+        }
+        for (name, entry) in rows {
+            if !entry.ready && !writer {
+                continue;
+            }
+            self.ensure_driver(&name, entry.database).await?;
+            if !entry.ready {
+                self.catalog.mark_ready(&name, entry.database).await?;
+            }
+            self.attach(node, &name).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_driver(&self, name: &str, id: Uuid) -> Result<()> {
+        if let Some(driver) = self
+            .databases
+            .read()
+            .expect("Multi serving catalog")
+            .get(name)
+        {
+            return check_incarnation(driver, id);
+        }
+        let mut database = open_database(&self.backends, &self.kms, id, false).await?;
+        database.fresh_view().await?;
+        database.token_authority().issuer().await?;
+        let mut databases = self.databases.write().expect("Multi serving catalog");
+        let driver = databases
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(MultiServing::new(database, Arc::clone(&self.memory))));
+        check_incarnation(driver, id)
+    }
+
+    async fn attach(&self, node: &Node, name: &str) -> Result<()> {
+        node.database_or_attach(name.to_owned(), self.configuration.clone())
+            .await?
+            .ok_or_else(|| {
+                invalid("The selected deployment was skipped during local attachment")
+            })?;
+        Ok(())
+    }
+
     pub async fn close(self) {
         drop(self.databases);
-        self.io.close_and_wait().await;
+        self.backends.io.close_and_wait().await;
     }
 }
 
+#[derive(Clone)]
 struct Backends {
     journal: Arc<dyn Journal>,
     batch: Option<Arc<dyn JournalBatchAppender>>,
@@ -288,7 +371,80 @@ struct Backends {
     vault: PathBuf,
     node: IpAddr,
     peers: Option<String>,
-    credential_slot: Option<File>,
+    _credential_slot: Option<Arc<File>>,
+}
+
+async fn open_database(
+    backends: &Backends,
+    kms: &Arc<dyn Kms>,
+    id: Uuid,
+    allow_unavailable: bool,
+) -> Result<MultiDatabase> {
+    let mut database = MultiDatabase::new(
+        MultiOptions {
+            database: id,
+            node: backends.node,
+            lease_micros: 5_000_000,
+            drift_micros: 250_000,
+        },
+        Arc::clone(&backends.journal),
+        Arc::clone(&backends.store),
+        Arc::clone(kms),
+        Arc::new(|| SystemClock.now()),
+    )?;
+    if let Some(batch) = &backends.batch {
+        database = database.with_batch_appender(Arc::clone(batch));
+    }
+    match backends.journal.head(StreamId(id.as_u128())).await {
+        Ok(head) if head.0 > 0 => (),
+        Ok(_) | Err(JournalError::NotFound) => {
+            // Concurrent catalog followers must open the same initial token key.
+            let path = backends.vault.join(format!("bootstrap-{id}.lock"));
+            let _bootstrap = tokio::task::spawn_blocking(move || {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(path)?;
+                fs2::FileExt::lock_exclusive(&file)?;
+                Ok::<_, io::Error>(file)
+            })
+            .await
+            .map_err(|error| Anomaly::fault("rtdb/multi-open", error.to_string()))?
+            .map_err(io_error)?;
+            database.create().await?;
+        }
+        Err(JournalError::Unavailable) if allow_unavailable => (),
+        Err(JournalError::Unavailable) => {
+            return Err(Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb/journal-unavailable",
+                "The deployment journal is unavailable",
+            ));
+        }
+        Err(error) => return Err(Anomaly::fault("rtdb/multi-open", error.to_string())),
+    }
+    Ok(database)
+}
+
+fn check_incarnation(driver: &MultiServing, id: Uuid) -> Result<()> {
+    if driver.incarnation() != *id.as_bytes() {
+        return Err(invalid(
+            "The local database incarnation differs from its ordered registration",
+        ));
+    }
+    Ok(())
+}
+
+fn retryable(error: &Anomaly) -> bool {
+    matches!(
+        error.category,
+        AnomalyCategory::Unavailable
+            | AnomalyCategory::Busy
+            | AnomalyCategory::Conflict
+            | AnomalyCategory::Interrupted
+    )
 }
 
 #[cfg(feature = "s3")]
@@ -308,12 +464,15 @@ impl JournalBatchAppender for StreamJournalBatch {
 
 struct ServingResources {
     native: NativeResources,
-    databases: BTreeMap<String, Arc<MultiServing>>,
-    kms: Arc<dyn Kms>,
+    runtime: MultiRuntime,
 }
 
 #[async_trait::async_trait]
 impl ResourceFactory for ServingResources {
+    async fn provision_managed_database(&self, name: &str) -> Result<DatabaseConfig> {
+        self.runtime.provision(name).await
+    }
+
     fn serving_driver(
         &self,
         name: &str,
@@ -321,7 +480,10 @@ impl ResourceFactory for ServingResources {
         _: &CancellationToken,
     ) -> Result<Option<Arc<dyn ServingDriver>>> {
         Ok(self
+            .runtime
             .databases
+            .read()
+            .expect("Multi serving catalog")
             .get(name)
             .cloned()
             .map(|driver| driver as Arc<dyn ServingDriver>))
@@ -332,7 +494,7 @@ impl ResourceFactory for ServingResources {
     }
 
     fn token_kms(&self) -> Option<Arc<dyn Kms>> {
-        Some(Arc::clone(&self.kms))
+        Some(Arc::clone(&self.runtime.kms))
     }
 
     fn validate(&self, name: &str, config: &DatabaseConfig) -> Result<()> {
@@ -343,8 +505,12 @@ impl ResourceFactory for ServingResources {
         let storage = self.native.open_storage(name, config).await?;
         let install = async {
             let driver = self
+                .runtime
                 .databases
+                .read()
+                .expect("Multi serving catalog")
                 .get(name)
+                .cloned()
                 .ok_or_else(|| invalid("Database is outside the Multi catalog"))?;
             let incarnation = driver.incarnation();
             let marker = rtdb_storage::ObjectKey::new(format!(
@@ -588,6 +754,8 @@ mod tests {
             let database = handle.node().catalog().database("xtdb").unwrap();
             let driver = database.serving_driver().unwrap();
             if reopen {
+                let reports = handle.node().catalog().database("reports").unwrap();
+                assert!(reports.serving_driver().is_some());
                 let receipt = driver.tx_status(&key, &stop).await.unwrap();
                 assert_eq!(Some(receipt.basis), expected);
                 let user = handle.authenticator().authenticate_trusted("xtdb").unwrap();
@@ -607,7 +775,17 @@ mod tests {
                     Value::I64(42)
                 );
             } else {
-                runtime.tick().await.unwrap();
+                runtime.tick(handle.node()).await.unwrap();
+                handle
+                    .node()
+                    .create_managed_deployment("reports".into())
+                    .await
+                    .unwrap();
+                handle
+                    .node()
+                    .create_managed_deployment("reports".into())
+                    .await
+                    .unwrap();
                 let receipt = driver
                     .transact(
                         Transact {

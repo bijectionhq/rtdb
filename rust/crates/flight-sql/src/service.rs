@@ -599,7 +599,7 @@ impl FlightService for Service {
         ];
         let root_rank = self.0.config.owned_native_actions && call.session.audience_source().is_none();
         #[cfg(feature = "multi")]
-        let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|_| self.has_admin_route(&call)))
+        let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|name| self.supports_admin_action(&call, name)))
             .collect::<Vec<_>>();
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS)
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
