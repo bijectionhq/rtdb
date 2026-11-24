@@ -4673,6 +4673,7 @@ dependencies = [
  "chrono",
  "futures",
  "hmac 0.12.1",
+ "lz4_flex",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
