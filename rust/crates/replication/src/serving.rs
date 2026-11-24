@@ -30,7 +30,7 @@ pub(crate) use source::SourceRequest;
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_CHANGE_GROUPS: usize = 4096;
 const FRAME_VERSION: u8 = 2;
-const SHARED_CHECKPOINT: u8 = b'S';
+pub(crate) const SHARED_CHECKPOINT: u8 = b'S';
 const SOURCE_DECISION_FRAME: u8 = 3;
 const SOURCE_REPLY_FRAME: u8 = 4;
 const SHARED_DECISION_FRAME: u8 = 5;
@@ -38,6 +38,7 @@ const SOURCE_DECISION_HEADER_BYTES: usize = FRAME_HEADER_BYTES + 8;
 const MAX_SOURCE_REPLIES: usize = 4096;
 const FRAME_HEADER_BYTES: usize = 9;
 const LEGACY_FRAME_HEADER_BYTES: usize = 65;
+const CHECKPOINT_HEADER_BYTES: usize = 40;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches", "branch.local-layer",
@@ -335,19 +336,7 @@ impl ServingCheckpoint {
 impl NativeServing {
     pub(crate) fn open(authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&[u8]>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
         let (fold, position, shared_checkpoint) = match checkpoint {
-            Some(checkpoint) => {
-                let mut bytes = checkpoint;
-                let Some((cut_bytes, state)) = bytes.split_at_checked(40) else { return Err(invalid()); };
-                bytes = cut_bytes;
-                let position = bytes.get_u64();
-                let basis = Basis::from_bytes(&bytes[..24])?;
-                bytes.advance(24);
-                let cut = BranchCut { basis, system_time: Timestamp(bytes.get_i64()) };
-                if basis.incarnation() != authority.incarnation || position < basis.position() { return Err(invalid()); }
-                let shared = state.first() == Some(&SHARED_CHECKPOINT);
-                let state = if shared { &state[1..] } else { state };
-                (TransactState::decode_checkpoint(state, cut)?, position, shared)
-            }
+            Some(checkpoint) => decode_checkpoint_image(checkpoint, authority.incarnation)?,
             None => (TransactState::new(authority.incarnation), 0, false),
         };
         let (view, receiver) = watch::channel(NativeServingView {
@@ -369,7 +358,7 @@ impl NativeServing {
         let fold = self.durable();
         let cut = fold.index().head();
         let checkpoint = fold.encode_checkpoint()?;
-        let mut frame = BytesMut::with_capacity(41 + checkpoint.len());
+        let mut frame = BytesMut::with_capacity(CHECKPOINT_HEADER_BYTES + usize::from(self.shares_main) + checkpoint.len());
         frame.put_u64(self.position);
         frame.extend_from_slice(&cut.basis.to_bytes());
         frame.put_i64(cut.system_time.0);
@@ -659,6 +648,18 @@ pub(crate) fn require_physical_replay_support(message: &proto::NoOp) -> Result<(
         return Err(Anomaly::unsupported("rtdb/shared-suffix-replay", "This replay path requires the shared transaction fold"));
     }
     Ok(())
+}
+
+pub(crate) fn decode_checkpoint_image(image: &[u8], incarnation: [u8; 16]) -> Result<(TransactState, u64, bool)> {
+    let (mut header, state) = image.split_at_checked(CHECKPOINT_HEADER_BYTES).ok_or_else(invalid)?;
+    let position = header.get_u64();
+    let basis = Basis::from_bytes(&header[..24])?;
+    header.advance(24);
+    let cut = BranchCut { basis, system_time: Timestamp(header.get_i64()) };
+    if basis.incarnation() != incarnation || position < basis.position() { return Err(invalid()); }
+    let shared = state.first() == Some(&SHARED_CHECKPOINT);
+    let state = if shared { &state[1..] } else { state };
+    Ok((TransactState::decode_checkpoint(state, cut)?, position, shared))
 }
 
 fn replica_basis_position(replica: ReplicaPosition) -> Result<u64> {
