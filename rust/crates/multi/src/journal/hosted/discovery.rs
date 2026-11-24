@@ -15,7 +15,7 @@ use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 use rtdb_types::{BlockIndex, ReplicaPosition, Result, StorageEpoch, Term, TermSequence};
 
 use super::{
-    CheckpointCustody, InstalledJournal, Placement, Preparation, checkpoint_for_block, genesis,
+    CheckpointAuthority, CheckpointCustody, InstalledJournal, Placement, Preparation, checkpoint_for_block, genesis,
     invalid, storage::ReplicaObjects,
 };
 
@@ -123,6 +123,7 @@ pub(super) async fn discover(
                         ));
                     }
                     return Ok(Some(Preparation {
+                        authority: CheckpointAuthority::Upload,
                         writer: row.grant,
                         base,
                         through: boundary.cut,

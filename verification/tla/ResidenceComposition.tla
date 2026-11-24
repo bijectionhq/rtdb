@@ -47,9 +47,13 @@ Needs(cut) == IF cut = 0 THEN {"old", "shared"} ELSE {"new", "shared"}
 Publications == {"old", "shared", "new"}
 
 Open == phase \in {"serving", "retiring"}
-Protected == {query, providerRead, recovery, checkpoint, fork} \ {None}
-RetirementCuts == Protected \ (IF Mutation = "ignore_recovery" THEN {recovery} \ {query, providerRead, checkpoint, fork} ELSE {})
-ServingDependencies == IF Open THEN {head, checkpoint, query, providerRead, recovery} \ {None} ELSE {}
+LiveAnswerCut ==
+    IF authority.delivery.state \in {"admitted", "writing"} /\ authority.delivery.time < authority.delivery.deadline
+    THEN 0 ELSE None
+HeldCatalogs == {query, providerRead, LiveAnswerCut} \ {None}
+Protected == HeldCatalogs \cup ({recovery, checkpoint, fork} \ {None})
+RetirementCuts == Protected \ (IF Mutation = "ignore_recovery" THEN {recovery} \ (HeldCatalogs \cup {checkpoint, fork}) ELSE {})
+ServingDependencies == IF Open THEN HeldCatalogs \cup ({head, checkpoint, recovery} \ {None}) ELSE {}
 
 AuthorityInit ==
     [systemTime |-> 0, rawTime |-> 0, receiptClock |-> 0, clockRegressed |-> FALSE, mode |-> "", requestedTime |-> 0,
@@ -124,7 +128,7 @@ Trim ==
 
 AdvanceFloor ==
     /\ phase = "serving" /\ floor < head
-    /\ (~ExtendAuthorities \/ Mutation = "ignore_floor_readers" \/ \A cut \in {query, providerRead} \ {None} : cut >= head)
+    /\ (~ExtendAuthorities \/ Mutation = "ignore_floor_readers" \/ \A cut \in HeldCatalogs : cut >= head)
     /\ floor' = head
     /\ UNCHANGED <<head, checkpoint, query, providerRead, recovery, firstRecord,
                    phase, source, forkCopy, prepared, fork, stalePublication>>
@@ -170,6 +174,7 @@ SettleVersion ==
 AuthorizeDisposal ==
     /\ phase = "serving" /\ query = None /\ recovery = None
     /\ (providerRead = None \/ Mutation = "dispose_before_drain")
+    /\ (LiveAnswerCut = None \/ Mutation = "dispose_ignores_answer")
     /\ (prepared = None \/ Mutation = "publish_after_close")
     /\ phase' = "disposing"
     /\ UNCHANGED <<head, checkpoint, floor, query, providerRead, recovery, firstRecord,
@@ -391,12 +396,12 @@ RevokedCacheClosed == authority.cacheResult # "page"
 OnlyLiveTransportWrites == authority.delivery.lastWrite # None =>
     authority.delivery.lastWrite < authority.delivery.deadline
 
-FloorKeepsHeldCatalogs == ExtendAuthorities => \A cut \in {query, providerRead} \ {None} : cut >= floor
+FloorKeepsHeldCatalogs == ExtendAuthorities => \A cut \in HeldCatalogs : cut >= floor
 RetainedCutsReadable == \A cut \in ServingDependencies : Needs(cut) \subseteq source
 ReplaySurvivesTrim == Open => firstRecord <= checkpoint + 1 /\ (recovery = None \/ firstRecord <= recovery + 1)
 ForkReadable == fork = None \/ Needs(fork) \subseteq (source \cup forkCopy)
 ForkCopyMatches == fork # None => forkCopy \subseteq Needs(fork)
-ClosedAfterDrain == ~Open => query = None /\ providerRead = None /\ recovery = None
+ClosedAfterDrain == ~Open => query = None /\ providerRead = None /\ recovery = None /\ LiveAnswerCut = None
 ReceiptConfirmsAbsence == phase = "disposed" => source = {}
 PublicationRespectsClose == ~stalePublication
 Safe == FloorKeepsHeldCatalogs /\ RetainedCutsReadable /\ ReplaySurvivesTrim /\ ForkReadable

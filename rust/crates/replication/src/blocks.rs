@@ -21,6 +21,7 @@ pub struct RecoveredPartition {
     pub fence: TermFence,
     pub(crate) compaction_replay_cutoff: Option<ReplicaPosition>,
     refresh_allowed: bool,
+    erasure_checkpoint: bool,
     published_checkpoint: Option<PublishedCheckpoint>,
     replay_tail: Option<PreparedReplay>,
     table_blocks: BTreeMap<rtdb_types::TableRef, TableBlock>,
@@ -92,6 +93,7 @@ impl RecoveredPartition {
     pub(crate) fn allows_catalog_cut_tracking(&self) -> bool { self.refresh_allowed }
 
     pub(crate) fn confirmation(&self, replica_epoch: StorageEpoch, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Option<RecoveredBlockConfirmation>> {
+        if self.erasure_checkpoint { return Ok(None); }
         let Some(catalog) = &self.block else { return Ok(None); };
         let Some(boundary) = catalog.boundary_replica_position() else { return Ok(None); };
         if boundary.after_offset(replica_epoch) < 0 { return Ok(None); }
@@ -223,6 +225,9 @@ pub enum BlockDiscovery {
     At(BlockIndex),
     /// Recovers exactly the block and journal boundary admitted by the directory.
     AtPublished(PublishedCheckpoint),
+    /// The installed journal's erasure decision certifies a clean root at its
+    /// head. The checkpoint has no upload record in the successor suffix.
+    AtErasure(PublishedCheckpoint),
 }
 
 pub struct BlockStore {
@@ -239,7 +244,11 @@ impl BlockStore {
     }
     pub async fn recover(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, discovery: BlockDiscovery) -> Result<RecoveredPartition> {
         let published = match discovery {
-            BlockDiscovery::FromPublished(checkpoint) | BlockDiscovery::AtPublished(checkpoint) => Some(checkpoint),
+            BlockDiscovery::AtErasure(checkpoint) if checkpoint.root_sha256.is_none() || checkpoint.boundary.0 < 0 => {
+                return Err(invalid("The erasure checkpoint needs an exact root and replay cut"));
+            }
+            BlockDiscovery::FromPublished(checkpoint) | BlockDiscovery::AtPublished(checkpoint)
+            | BlockDiscovery::AtErasure(checkpoint) => Some(checkpoint),
             _ => None,
         };
         let selected = self.load_selected_checkpoint(discovery, None, published).await?;
@@ -321,7 +330,8 @@ impl BlockStore {
                 block: block.block_index(), boundary, root_sha256: admitted.root_sha256,
             })
         });
-        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, published_checkpoint, replay_tail: None }.with_source_floor(source_floor))
+        let erasure_checkpoint = matches!(discovery, BlockDiscovery::AtErasure(_));
+        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks, compaction_replay_cutoff, refresh_allowed, published_checkpoint, erasure_checkpoint, replay_tail: None }.with_source_floor(source_floor))
     }
     async fn load_selected_checkpoint(&self, discovery: BlockDiscovery, previous: Option<BlockIndex>,
         published: Option<PublishedCheckpoint>) -> Result<Option<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)>> {
@@ -361,7 +371,7 @@ impl BlockStore {
             }
         };
         let discovery = match discovery {
-            BlockDiscovery::AtPublished(published) => BlockDiscovery::At(published.block),
+            BlockDiscovery::AtPublished(published) | BlockDiscovery::AtErasure(published) => BlockDiscovery::At(published.block),
             BlockDiscovery::FromPublished(published) if published.root_sha256.is_some() => BlockDiscovery::At(published.block),
             BlockDiscovery::FromRestored { checkpoint, root_sha256: Some(_), .. } => BlockDiscovery::At(checkpoint),
             other => other,

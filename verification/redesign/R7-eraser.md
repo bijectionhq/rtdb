@@ -75,6 +75,8 @@ Chosen replay uses that generation and reports `rtdb/erased-under-view` when the
 The custodian orders the exact prepared clean checkpoint, incumbent grant and journal head in one Logkeeper decision.
 The same decision selects the clean checkpoint, rotates the payload key generation, and closes new admissions below the erasure replay floor and on the previous recovery roots.
 The ordinary checkpoint publisher skips an erasure preparation.
+The coordinator can stage a rewritten closure whose catalog ends at the exact quiesced head. Logkeeper's preparation binds the operation, custody domain, timing profile and rotation request. The provider seals the same binding into the successor manifest and the coordinator reopens it before requesting the switch.
+Installed recovery uses the clean manifest's exact root and replay cut. Its first eligible replay is the successor suffix, with the ordered erasure decision supplying confirmation of the root.
 The erasure coordinator reopens the staged checkpoint through its provider, checks the rotation receipt, and verifies the installed Logkeeper client's signed proof that both recovery slots on each voter in an accepting quorum were read back.
 The custody adapter owns staging and verifying a complete survivor closure, draining plaintext and egress and enforcing a deadline backed by evidenced destruction of the retiring key slots.
 The current provider profile keeps the 120-second operational target.
