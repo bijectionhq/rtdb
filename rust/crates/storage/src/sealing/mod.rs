@@ -7,7 +7,7 @@ mod publication;
 pub use publication::{PublicationSealing, PUBLICATION_ID_BYTES};
 pub use delivery::{DeliveryDeadline, DeliveryIo, current_delivery_deadline, PlaintextDelivery, PlaintextDependencies, PlaintextReleaseCheck, PlaintextScopes, PlaintextView, RootRankAuthority, RootRankSelection, drain_unit_delivery};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
-pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD};
+pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD, KafkaFrameKeys, KafkaPrefixRetirement};
 
 use std::{collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 

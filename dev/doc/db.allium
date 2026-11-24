@@ -10,6 +10,11 @@
 --
 -- Source and replica are always separate logs — an invariant, not a convention.
 -- The default source and replica logs share the `SharedLog` port for ordered append, latest position, and replay from a prior position.
+-- The sealed Kafka provider can close key admission below an ordered native recovery cut on the original topic.
+-- The cut binds the clean checkpoint digest, the exclusive offset and the receipt deadline.
+-- Arming requires an exact position census through the observed broker tip and preserves every key in the retained suffix.
+-- The provider persists the key admission floor before withdrawing slots and resumes withdrawal from durable progress.
+-- Classic retention continues to settle keys through the broker's verified floor.
 -- A default attachment with a stable branch authority shares main-branch relation effects between the physical partition and the v1 transaction fold.
 -- Default development and the bundled default cluster configuration enable this route for the primary database.
 -- Replicas use the incarnation published in that database's object store.
