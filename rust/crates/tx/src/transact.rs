@@ -23,6 +23,7 @@ mod custody_release;
 mod operations;
 mod pipeline;
 pub mod workload;
+use workload::Family as WorkloadFamily;
 
 pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
@@ -391,6 +392,8 @@ pub struct ResolvedTransact {
     #[serde(alias = "submitted_at")]
     admitted_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload: Option<WorkloadFamily>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     request: Option<Box<RawValue>>,
 }
 
@@ -420,7 +423,13 @@ impl ResolvedTransact {
         // Older v2 records are replayable using their stored effects and digest.
         if let Some(request) = &self.request {
             let fields: AdmissionFields = serde_json::from_str(request.get()).map_err(|_| invalid_record())?;
-            if fields.key != self.receipt.key || fields.window.before != self.before
+            let window_matches = if self.workload.is_some() {
+                self.receipt_namespace.is_some()
+                    && fields.window.before.is_none_or(|before| self.before.is_some_and(|cutoff| cutoff <= before))
+            } else {
+                fields.window.before == self.before
+            };
+            if fields.key != self.receipt.key || !window_matches
                 || self.admitted_at > self.receipt.system_time
             {
                 return Err(invalid_record());
@@ -444,6 +453,8 @@ pub(crate) struct StoredReceipt {
     receipt_namespace: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     installed: Option<InstalledReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workload: Option<WorkloadFamily>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,6 +544,7 @@ impl TransactState {
             for (key, expected) in receipts {
                 let actual = actual.get(key).ok_or_else(invalid_record)?;
                 if actual.fingerprint != expected.fingerprint || actual.receipt != expected.receipt
+                    || actual.workload != expected.workload
                     || expected.installed.is_some_and(|position| actual.installed != Some(position))
                 {
                     return Err(invalid_record());
@@ -687,16 +699,17 @@ impl TransactState {
     }
 
     fn tx_status_with_namespace(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<Receipt> {
+        self.lookup_receipt(key, namespace).map(|stored| replay(&stored.receipt))
+    }
+
+    fn lookup_receipt(&self, key: &[u8], namespace: Option<[u8; 32]>) -> Result<&StoredReceipt> {
         validate_key(key)?;
         if self.pending.as_ref().is_some_and(|pending| {
             pending.tx.receipt_namespace == namespace && pending.tx.receipt.key == key
         }) {
             return Err(pending_error());
         }
-        self.receipts.get(&namespace).and_then(|receipts| receipts.get(key))
-            .map(|stored| replay(&stored.receipt)).ok_or_else(|| {
-            Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-transaction", "No transaction has committed with this key")
-        })
+        self.receipts.get(&namespace).and_then(|receipts| receipts.get(key)).ok_or_else(unknown_receipt)
     }
 
     pub fn resolve(
@@ -731,7 +744,7 @@ impl TransactState {
             pending: self.pending.is_some(),
             time_floor: None,
         };
-        Self::resolve_in(view, request, position, now, features, claims, authority).map(|(resolution, _)| resolution)
+        Self::resolve_in(view, request, position, now, features, claims, authority, None).map(|(resolution, _)| resolution)
     }
 
     /// Resolves `request` at `position` against `view`. For an append it also returns the
@@ -740,12 +753,15 @@ impl TransactState {
     /// then the effects in order).
     pub(crate) fn resolve_in(
         view: View<'_>, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
-        authority: Option<ScopedTransact<'_>>,
+        authority: Option<ScopedTransact<'_>>, workload: Option<&workload::Admission>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         view.index.require_local_custody()?;
         validate_key(&request.key)?;
-        let receipt_namespace = request.receipt_namespace(authority.map(|authority| authority.receipt_namespace));
-        let (fingerprint, canonical_request) = match request.custody_request_digest {
+        let receipt_namespace = request.receipt_namespace(
+            workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
+        );
+        let family = workload.map(workload::Admission::family);
+        let (fingerprint, canonical_request) = match workload.map(workload::Admission::digest).or(request.custody_request_digest) {
             Some(digest) => (digest, None),
             None => {
                 let request = request.canonical_request()?;
@@ -753,10 +769,15 @@ impl TransactState {
             }
         };
         if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
-            if stored.fingerprint != fingerprint {
+            if stored.fingerprint != fingerprint || stored.workload != family {
                 return Err(conflicting_key());
             }
             return Ok((Resolution::Answer(replay(&stored.receipt)), None));
+        }
+        if workload.is_some() {
+            for claim in request.claims() {
+                if claims.verify(claim)?.scope.branch != MAIN_BRANCH { return Err(workload::denied()); }
+            }
         }
         if request.has_unsealed_custody() {
             return Err(if !features.contains(&ROW_CUSTODY) {
@@ -772,7 +793,7 @@ impl TransactState {
 
         if view.pending { return Err(pending_error()); }
         let head = view.index.head();
-        let validation = request.ops.is_empty() && request.otherwise.is_empty();
+        let validation = workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty();
         let before = if validation {
             if !features.contains(&LINEARIZABLE) { return Err(feature_required(LINEARIZABLE)); }
             None
@@ -780,7 +801,7 @@ impl TransactState {
             if request.window.before.is_some() && !features.contains(&TIMED_TRANSACT) {
                 return Err(feature_required(TIMED_TRANSACT));
             }
-            request.window.before
+            workload.map_or(request.window.before, |admission| admission.cutoff())
         };
         let cut = if validation {
             head
@@ -805,7 +826,13 @@ impl TransactState {
         let decision_time = now.max(cut.system_time);
         let advanced = base.clone();
         let scope = authority.map(|authority| authority.labels);
-        let result = Self::decide(request, base, now, decision_time, features, claims, scope, view.durable_index);
+        let result = if let Some(outcome) = workload.and_then(workload::Admission::settlement) {
+            Ok((outcome, Vec::new(), base))
+        } else if workload.is_some() && before.is_some_and(|deadline| decision_time >= deadline) {
+            return Err(workload::denied());
+        } else {
+            Self::decide(request, base, now, decision_time, features, claims, scope, view.durable_index)
+        };
         let (outcome, effects, after) = match result {
             Ok(decision) => decision,
             Err(error) if error.is_caller_error() => (Outcome::Refused { error }, Vec::new(), advanced),
@@ -821,7 +848,7 @@ impl TransactState {
             // For a timed write, `after` is the index once it settles at `position + 1`.
             let canonical_request = canonical_request.map_or_else(|| request.canonical_request(), Ok)?;
             let record = TransactionRecord::Tx(ResolvedTransact {
-                fingerprint, receipt, effects, before, receipt_namespace, admitted_at: now,
+                fingerprint, receipt, effects, before, receipt_namespace, admitted_at: now, workload: family,
                 request: Some(canonical_request),
             });
             Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
@@ -958,7 +985,7 @@ impl TransactState {
                     self.pending = Some(Pending { position, tx });
                     Ok(None)
                 } else {
-                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.effects).map(Some)
+                    self.publish(tx.receipt, tx.fingerprint, tx.receipt_namespace, tx.workload, tx.effects).map(Some)
                 }
             }
             TransactionRecord::Settle { tx_lsn } => {
@@ -970,7 +997,7 @@ impl TransactState {
                     return Err(invalid_record());
                 }
                 let receipt = self.publish(
-                    pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.effects.clone(),
+                    pending.tx.receipt.clone(), pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload, pending.tx.effects.clone(),
                 )?;
                 self.pending = None;
                 Ok(Some(receipt))
@@ -987,7 +1014,7 @@ impl TransactState {
                             "The original transaction lacks timely durable acknowledgement"),
                     };
                 }
-                let receipt = self.publish(receipt, pending.tx.fingerprint, pending.tx.receipt_namespace, Vec::new())?;
+                let receipt = self.publish(receipt, pending.tx.fingerprint, pending.tx.receipt_namespace, pending.tx.workload, Vec::new())?;
                 self.pending = None;
                 Ok(Some(receipt))
             }
@@ -995,7 +1022,7 @@ impl TransactState {
     }
 
     fn publish(&mut self, receipt: Receipt, fingerprint: [u8; 32], receipt_namespace: Option<[u8; 32]>,
-               effects: Vec<BranchEffect>) -> Result<Receipt> {
+               workload: Option<WorkloadFamily>, effects: Vec<BranchEffect>) -> Result<Receipt> {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
@@ -1009,7 +1036,7 @@ impl TransactState {
             candidate.apply(effect)?;
         }
         self.index = candidate;
-        let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None });
+        let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace, installed: None, workload });
         debug_assert!(previous.is_none());
         Ok(receipt)
     }
@@ -1021,6 +1048,10 @@ fn native_custody_command_error() -> Anomaly {
 
 fn erasure_pending() -> Anomaly {
     Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement")
+}
+
+fn unknown_receipt() -> Anomaly {
+    Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-transaction", "No transaction has committed with this key")
 }
 
 fn conflicting_key() -> Anomaly {

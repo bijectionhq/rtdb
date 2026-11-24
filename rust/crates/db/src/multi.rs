@@ -741,6 +741,7 @@ impl MultiDatabase {
             .reserve()?)?;
         let write = Append {
             at,
+            admit_before: None,
             entry: Entry {
                 epoch: lease.epoch,
                 generation,

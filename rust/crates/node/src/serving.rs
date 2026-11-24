@@ -6,7 +6,7 @@ use rtdb_index::{
     Snapshot,
     branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage},
 };
-use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand};
+use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand, workload};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
     EntityId, Interval, Result, TableRef, Timestamp,
@@ -222,6 +222,11 @@ pub trait ServingDriver: Send + Sync {
     async fn query_scoped(&self, _source: QuerySource, _track: bool, _now: Timestamp,
                           _scope: &ServingScope, _cancellation: &CancellationToken) -> Result<QueryView> {
         Err(visibility::unsupported())
+    }
+
+    async fn managed_workload(&self, _request: workload::Request,
+                              _cancellation: &CancellationToken) -> Result<workload::Reply> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/managed-workload", "The attachment has no managed workload writer"))
     }
 
     async fn transact_scoped(&self, _request: Transact, _scope: ServingScope,

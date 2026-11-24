@@ -3,7 +3,7 @@ use rtdb_tx::transact::workload::{Authority, Point};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::forbidden;
+use crate::{Method, MethodRule, forbidden};
 
 pub(super) const CLAIM: &str = "rtdb_workload_grant";
 pub(super) const MAX_LIFETIME_MICROS: i64 = 300_000_000;
@@ -42,6 +42,16 @@ impl WorkloadGrantConfig {
     }
 
     pub fn assignment(&self) -> Option<&Point> { self.assignment.as_ref() }
+
+    pub fn validate_rules(&self, rules: &[MethodRule]) -> Result<()> {
+        if self.assignment.is_some()
+            && (rules.is_empty() || rules.iter().any(|rule| rule.method != Method::ClientCredentials))
+        {
+            return Err(Anomaly::incorrect("rtdb.auth/workload-grant-config",
+                "Managed assignment requires a dedicated client-credentials authentication profile"));
+        }
+        Ok(())
+    }
 
     pub fn audience(&self) -> &str {
         &self.audience
@@ -134,6 +144,8 @@ impl VerifiedWorkloadGrant {
     pub fn database(&self) -> &str {
         &self.database
     }
+
+    pub fn is_assignment(&self) -> bool { matches!(self.permission, Permission::Assignment { .. }) }
 
     pub fn receipt_namespace(&self) -> [u8; 32] {
         self.receipt_namespace

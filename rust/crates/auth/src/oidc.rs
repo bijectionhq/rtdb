@@ -91,6 +91,9 @@ impl Credentials {
 
 impl Provider {
     pub async fn open(config: OidcConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
+        if let Some(grants) = &config.workload_grants {
+            grants.validate_rules(&config.rules)?;
+        }
         if config.workload_grants.is_some()
             && (!https_endpoint(&config.issuer_url) || config.issuer_url.query().is_some())
         {
@@ -166,7 +169,9 @@ impl Provider {
         Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials, static_grants: None, _reservation: reservation }))
     }
     pub async fn password(self: &Arc<Self>, user: &str, password: &str) -> Result<Arc<Principal>> {
-        if self.workload_config(user).is_some() {
+        if self.workload_config(user).is_some()
+            || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some())
+        {
             return Err(workload_grant::invalid_grant());
         }
         let response = self.token(fields([("grant_type", "password"), ("scope", "openid"), ("username", user), ("password", password)])).await?;
@@ -175,6 +180,11 @@ impl Provider {
     }
     pub async fn client_credentials(self: &Arc<Self>, id: &str, secret: &str) -> Result<Arc<Principal>> {
         let workload_started = self.workload_config(id).map(|_| self.clock.now());
+        if workload_started.is_none()
+            && self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some())
+        {
+            return Err(workload_grant::invalid_grant());
+        }
         let response = self.token(fields([("grant_type", "client_credentials"), ("scope", "openid"), ("client_id", id), ("client_secret", secret)])).await?;
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Client credentials authentication failed for client: {id}")).with_context("status", response.status.into())); }
         let token_time = if let Some(started) = workload_started {
@@ -191,6 +201,9 @@ impl Provider {
         self.principal(Token::parse(&response.body, token_time, None, &self.memory)?, RefreshGrant::ClientCredentials { id: id.into(), secret: Secret::new(secret), _reservation: reservation }).await
     }
     pub async fn device(self: &Arc<Self>) -> Result<DeviceAuthorization> {
+        if self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()) {
+            return Err(workload_grant::invalid_grant());
+        }
         let endpoint = self.device_endpoint.as_ref().ok_or_else(|| Anomaly::unsupported("xtdb.authn/device-auth-unsupported", "OIDC provider does not support device authorization flow - missing device_authorization_endpoint"))?;
         let mut body = self.base_fields(); body.insert("scope".into(), Secret::new("openid"));
         let response = self.http.request(HttpRequest::Form { url: endpoint.clone(), fields: body }).await?;

@@ -47,7 +47,12 @@ async fn setup_with_workload(extra: Vec<(u16, Value)>, gate: bool, workload_gran
     responses.extend(extra);
     let script = Arc::new(Script { memory: Arc::clone(&memory), responses: Mutex::new(responses), forms: Mutex::new(Vec::new()), refreshes: AtomicUsize::new(0), refresh_gate: gate.then(|| Semaphore::new(0)) });
     let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig { issuer_url: "https://issuer.example".parse().unwrap(), issuer_ca_pem: None, client_id: "configured-client".into(), client_secret: Secret::new("configured-secret"), rules: vec![MethodRule::any(Method::Password)], workload_grants }), memory, clock.clone(), script.clone()).await.unwrap();
+    let method = if workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()) {
+        Method::ClientCredentials
+    } else {
+        Method::Password
+    };
+    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig { issuer_url: "https://issuer.example".parse().unwrap(), issuer_ca_pem: None, client_id: "configured-client".into(), client_secret: Secret::new("configured-secret"), rules: vec![MethodRule::any(method)], workload_grants }), memory, clock.clone(), script.clone()).await.unwrap();
     (auth, script, clock)
 }
 
@@ -325,6 +330,8 @@ async fn assignment_recovery_uses_a_distinct_bounded_authority() {
         (200, json!({"access_token":"scoped", "expires_in":1})),
         (200, json!({"sub":"recovery", "rtdb_workload_grant":claim})),
     ], false, Some(configured.clone())).await;
+    assert!(auth.verify_client_credentials("unenrolled", "secret").await.is_err());
+    assert!(auth.verify_password("recovery", "secret").await.is_err());
     let principal = auth.verify_client_credentials("workload-recovery", "secret").await.unwrap();
     let grant = principal.workload_grant().unwrap();
     assert_eq!(grant.assignment("catalog", incarnation, Timestamp(0)).unwrap(),

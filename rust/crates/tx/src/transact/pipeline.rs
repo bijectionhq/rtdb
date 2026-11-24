@@ -56,7 +56,7 @@ pub struct Terminal {
 
 enum Entry {
     /// An ordinary decision; `after` is the index once it applies.
-    Untimed { after: BranchIndex, receipt: Receipt, fingerprint: [u8; 32] },
+    Untimed { after: BranchIndex, receipt: Receipt, fingerprint: [u8; 32], workload: Option<WorkloadFamily> },
     /// A timed write's original record. It publishes at its terminal record.
     TimedTx { record: TransactionRecord },
     /// A timed write's `Settle` or `Refuse`.
@@ -154,9 +154,22 @@ impl TransactPipeline {
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>,
     ) -> Result<Decision> {
-        let identity = TxKey { namespace: request.receipt_namespace(authority.map(|authority| authority.receipt_namespace)), key: request.key.clone() };
+        self.decide_with_admission(request, now, features, claims, authority, time_floor, None)
+    }
+
+    pub fn decide_workload(&mut self, request: &Transact, now: Timestamp, features: &[&str],
+                           claims: &dyn ClaimVerifier, workload: &workload::Admission) -> Result<Decision> {
+        self.decide_with_admission(request, now, features, claims, None, None, Some(workload))
+    }
+
+    fn decide_with_admission(
+        &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
+        authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>, workload: Option<&workload::Admission>,
+    ) -> Result<Decision> {
+        let namespace = workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace));
+        let identity = TxKey { namespace: request.receipt_namespace(namespace), key: request.key.clone() };
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
-        if request.ops.is_empty() && request.otherwise.is_empty() {
+        if workload.is_none() && request.ops.is_empty() && request.otherwise.is_empty() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.
             let view = View {
                 index: &self.durable.index,
@@ -166,7 +179,7 @@ impl TransactPipeline {
                 time_floor,
             };
             let position = self.durable.index.head().basis.position();
-            return match TransactState::resolve_in(view, request, position, now, features, claims, authority)?.0 {
+            return match TransactState::resolve_in(view, request, position, now, features, claims, authority, workload)?.0 {
                 Resolution::Answer(receipt) => Ok(Decision::Answer(receipt)),
                 Resolution::Append(_) => Err(order_error("A validation cannot append")),
             };
@@ -183,7 +196,7 @@ impl TransactPipeline {
             pending: false,
             time_floor,
         };
-        let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority)?;
+        let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority, workload)?;
         let prepared = match resolution {
             Resolution::Answer(receipt) => return Ok(Decision::Answer(receipt)),
             Resolution::Append(prepared) => prepared,
@@ -200,7 +213,7 @@ impl TransactPipeline {
             entry
         } else {
             let TransactionRecord::Tx(tx) = prepared.record else { unreachable!("checked above") };
-            Entry::Untimed { after: after.clone(), receipt: tx.receipt, fingerprint: tx.fingerprint }
+            Entry::Untimed { after: after.clone(), receipt: tx.receipt, fingerprint: tx.fingerprint, workload: tx.workload }
         };
         // A timed write's overlay assumes it settles at `position + 1`.
         self.speculative = after;
@@ -272,14 +285,14 @@ impl TransactPipeline {
         while self.in_flight.front().is_some_and(|entry| entry.position <= through) {
             let InFlight { position, key, entry } = self.in_flight.pop_front().expect("checked front");
             match entry {
-                Entry::Untimed { after, receipt, fingerprint } => {
+                Entry::Untimed { after, receipt, fingerprint, workload } => {
                     if self.durable.pending.is_some() {
                         return Err(order_error("A timed write's terminal record must be durable before later records"));
                     }
                     // Adopt the decided index: identical to applying the record, without re-applying it.
                     self.durable.index = after;
                     let previous = self.durable.store_receipt(StoredReceipt {
-                        receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace, installed: None,
+                        receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace, installed: None, workload,
                     });
                     debug_assert!(previous.is_none());
                     self.deciding.remove(&key);

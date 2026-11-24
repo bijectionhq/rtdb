@@ -59,11 +59,11 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, ManagedCreate }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, ManagedCreate, ManagedWorkload, TxStatus }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action | Self::TxStatus)
     }
 
     fn serves_assigned_follower(self) -> bool {
@@ -71,7 +71,7 @@ impl CallKind {
     }
 
     fn allows_workload_grant(self) -> bool {
-        matches!(self, Self::Handshake | Self::ManagedCreate)
+        matches!(self, Self::Handshake | Self::ManagedCreate | Self::ManagedWorkload | Self::TxStatus)
     }
 
     fn action(audience: bool, name: &str) -> Self {
@@ -310,6 +310,8 @@ impl Service {
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
                 if !kind.allows_workload_grant()
+                    || matches!(kind, CallKind::ManagedCreate) && grant.is_assignment()
+                    || matches!(kind, CallKind::ManagedWorkload | CallKind::TxStatus) && !grant.is_assignment()
                     || audience.is_some()
                     || self.follower_only()
                     || fresh_replica
@@ -339,11 +341,11 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action) {
+            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::TxStatus) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::AudienceCleanup)
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::TxStatus | CallKind::AudienceCleanup)
             {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
@@ -660,7 +662,8 @@ impl FlightService for Service {
         #[cfg(feature = "multi")]
         let actions = actions.into_iter().chain(crate::admin::ACTIONS.into_iter().filter(|name| self.supports_admin_action(&call, name)))
             .collect::<Vec<_>>();
-        result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS)
+        result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS.into_iter()
+            .filter(|name| *name != crate::v1::MANAGED_WORKLOAD))
             .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(crate::owned_actions::ROOT_RANK_ACTIONS.into_iter().filter(|_| root_rank))
             .chain(crate::owned_actions::WORLD_RANK_ACTIONS.into_iter().filter(|_| hosted_worlds))
@@ -724,6 +727,8 @@ impl FlightService for Service {
             let kind = match name {
                 crate::v1::CAPABILITIES => CallKind::V1Capabilities,
                 crate::v1::MANAGED_CREATE => CallKind::ManagedCreate,
+                crate::v1::MANAGED_WORKLOAD => CallKind::ManagedWorkload,
+                crate::v1::TX_STATUS => CallKind::TxStatus,
                 _ => CallKind::V1Action,
             };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
@@ -754,10 +759,10 @@ mod tests {
 
     #[test]
     fn label_scope_is_only_admitted_to_v1_and_handshake() {
-        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
+        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action, CallKind::TxStatus] {
             assert!(kind.allows_label_scope());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::ManagedCreate] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::ManagedCreate, CallKind::ManagedWorkload] {
             assert!(!kind.allows_label_scope());
         }
     }
@@ -767,14 +772,14 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities] {
             assert!(kind.serves_assigned_follower());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(!kind.serves_assigned_follower());
         }
     }
 
     #[test]
-    fn workload_scope_is_only_admitted_to_managed_create_and_handshake() {
-        for kind in [CallKind::Handshake, CallKind::ManagedCreate] {
+    fn workload_scope_has_a_positive_managed_action_allowlist() {
+        for kind in [CallKind::Handshake, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(kind.allows_workload_grant());
         }
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {

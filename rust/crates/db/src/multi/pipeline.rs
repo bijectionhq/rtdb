@@ -10,7 +10,7 @@ use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
-    TransactPipeline, TransactState, TransactionRecord, TxKey,
+    TransactPipeline, TransactState, TransactionRecord, TxKey, workload,
 };
 use rtdb_index::branches::BranchCut;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, ClaimVerifier, LabelScope}};
@@ -33,6 +33,7 @@ type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
     Transact(Work),
+    Workload(workload::Request, Reply<workload::Reply>),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
     Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
     OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
@@ -134,6 +135,10 @@ impl WritePipeline {
         result.await.map_err(|_| pipeline_closed())?
     }
 
+    pub async fn workload(&self, request: workload::Request) -> Result<workload::Reply> {
+        self.request(|reply| Command::Workload(request, reply)).await
+    }
+
     pub async fn tick(&self, live: BTreeSet<IpAddr>) -> Result<Role> {
         self.request(|reply| Command::Tick(live, reply)).await
     }
@@ -180,6 +185,7 @@ struct Staged {
 pub(super) struct Append {
     pub(super) at: Lsn,
     pub(super) entry: Entry,
+    pub(super) admit_before: Option<Timestamp>,
 }
 
 pub(super) struct Authority {
@@ -221,8 +227,12 @@ impl Authority {
                 .map_err(AttemptError::Local)?;
             records.push((write.at, bytes));
         }
-        if self.upper().0 >= self.lease.until {
+        let upper = self.upper();
+        if upper.0 >= self.lease.until {
             return Err(AttemptError::Local(no_writer()));
+        }
+        if writes.iter().any(|write| write.admit_before.is_some_and(|cutoff| upper >= cutoff)) {
+            return Err(AttemptError::Local(workload::denied()));
         }
         let expected = writes.last().expect("nonempty append group").at;
         let appended = self
@@ -266,6 +276,10 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
                     .transact_in(&work.request, work.scope.as_ref().map(Scope::authority))
                     .await;
                 let _ = work.reply.send(result);
+            }
+            Command::Workload(request, reply) => {
+                let result = database.lock().await.managed_workload(request).await;
+                let _ = reply.send(result);
             }
             Command::Tick(live, reply) => {
                 let result = database.lock().await.tick(&live).await;
@@ -603,6 +617,65 @@ impl MultiDatabase {
             .collect())
     }
 
+    pub(super) async fn managed_workload(&mut self, request: workload::Request) -> Result<workload::Reply> {
+        let result = self.managed_workload_serial(&request).await;
+        if result.is_err() && self.writer.as_ref().is_some_and(|writer| writer.recovering) {
+            let _ = self.recover_writer().await;
+        }
+        result
+    }
+
+    async fn managed_workload_serial(&mut self, request: &workload::Request) -> Result<workload::Reply> {
+        self.refresh().await?;
+        self.require_active()?;
+        let lease = self.authority()?;
+        let claims = match &request.operation {
+            workload::Operation::Submit { transaction: Some(transaction), .. } =>
+                self.tokens.verify_claims_in(transaction.claims(), None).await,
+            _ => self.tokens.verify_claims_in(std::iter::empty(), None).await,
+        };
+        let now = (self.clock)();
+        let upper = self.append_authority(lease.epoch)?.upper();
+        let state = self.durable_transactions();
+        let decision_time = now.max(state.index().head().system_time.next()?);
+        request.check_expiry(upper.max(decision_time))?;
+        let (transaction, admission) = match request.prepare(state, decision_time)? {
+            workload::Prepared::Answer(reply) => return Ok(reply),
+            workload::Prepared::Append { transaction, admission } => (transaction, admission),
+        };
+        self.require_armed_rotation()?;
+        let generation = self.state().generation;
+        let coordinates = self.state().coordinates;
+        let decision = self.writer.as_mut().ok_or_else(no_writer)?.pipeline
+            .decide_workload(&transaction, now, FEATURES, &claims, &admission)?;
+        let mut write = match plan(decision, lease, generation, coordinates)? {
+            Planned::Answer(receipt) => return Ok(workload::Reply::Receipt(receipt)),
+            Planned::Append(write) => write,
+        };
+        let original = write.at;
+        write.admit_before = Some(admission.cutoff().unwrap_or(request.expires_at));
+        let (upper, receipts) = self.commit_one(lease, write).await?;
+        let (position, receipts) = if let Some(cutoff) = admission.cutoff() {
+            let upper = upper.max(self.append_authority(lease.epoch)?.upper());
+            let terminal_clock = if request.check_effect(self.durable_transactions(), upper).is_ok() {
+                upper
+            } else {
+                Timestamp::MAX
+            };
+            let (mut terminal, _) = self.decide_terminal(lease, original, terminal_clock)
+                .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
+            if matches!(terminal.entry.record, Record::Settle { .. }) {
+                terminal.admit_before = Some(cutoff);
+            }
+            let at = terminal.at;
+            let (_, receipts) = self.commit_one(lease, terminal).await?;
+            (at, receipts)
+        } else {
+            (original, receipts)
+        };
+        Ok(workload::Reply::Receipt(receipt_for(receipts, coordinates.position(position)?, &transaction.key)?))
+    }
+
     pub(super) fn decide_terminal(
         &mut self,
         lease: Lease,
@@ -624,6 +697,7 @@ impl MultiDatabase {
         Ok((
             Append {
                 at: coordinates.lsn(position)?,
+                admit_before: None,
                 entry: Entry {
                     epoch: lease.epoch,
                     generation,
@@ -660,7 +734,7 @@ impl MultiDatabase {
             self.catch_up(through).await?;
         }
         let mut state = self.committed.take().ok_or_else(no_writer)?;
-        for Append { at, entry } in writes {
+        for Append { at, entry, .. } in writes {
             if at > state.head {
                 state.apply_entry(&self.stream, self.store.as_ref(), at, entry).await?;
             }
@@ -816,6 +890,7 @@ fn plan(decision: Decision, lease: Lease, generation: u64, coordinates: JournalC
         Decision::Answer(receipt) => Planned::Answer(receipt),
         Decision::Append { position, record } => Planned::Append(Append {
             at: coordinates.lsn(position)?,
+            admit_before: None,
             entry: Entry {
                 epoch: lease.epoch,
                 generation,

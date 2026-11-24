@@ -6,7 +6,7 @@ use rtdb_db::{ChangeHistory, MultiDatabase, NativeCheckpointInstallation, Pinned
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, CustodyGroupId, CustodyWriterFence, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
-    ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyCommand,
+    ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyCommand, workload,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, MemoryBudget, Result, TableRef, Timestamp,
@@ -397,6 +397,11 @@ impl ServingDriver for MultiServing {
                 }
             }
         }).await.ok_or_else(interrupted)?
+    }
+
+    async fn managed_workload(&self, request: workload::Request,
+                              cancellation: &CancellationToken) -> Result<workload::Reply> {
+        cancellation.run_until_cancelled(self.writes.workload(request)).await.ok_or_else(interrupted)?
     }
 
     async fn transact_scoped(&self, request: Transact, scope: ServingScope,

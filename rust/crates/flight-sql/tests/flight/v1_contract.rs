@@ -142,6 +142,7 @@ async fn managed_workload_can_only_create_and_reopen_its_exact_deployment() {
         (create, request("reports", Some(vec![7; 16]))),
         ("rtdb.admin.v1.DeleteDeployment", Bytes::new()),
         ("rtdb.v1.Transact", Bytes::new()),
+        ("rtdb.v1.ManagedWorkload", Bytes::new()),
         ("rtdb.v1.TxStatus", Bytes::new()),
         ("BeginTransaction", Bytes::new()),
     ] {

@@ -114,9 +114,15 @@ The operator enables assignment on the intended Multi service by adding the trus
 Put these fields under `authn.workloadGrants`.
 Use the same point for the life of the original incarnation and across its writers.
 The branch is always `main`.
+The assignment profile admits only reserved-prefix OIDC clients under explicit `CLIENT_CREDENTIALS` rules.
+Only the active local Multi writer answers assignment actions and namespaced status.
+A deployment with several serving nodes must deliver these calls to that writer.
+Route changes and uncertain transport outcomes can be recovered at the active writer under the original attempt identity.
 The point is outside the issuer claim and the client request.
 Keep the operator and issuer responsible for the admitted Original and its accepted assignment.
 Use a separate local OIDC Create profile and a fixed `!UserList` placement and Conductor profile until the exact assignment route is qualified.
+Start an exact test incarnation with an empty authority point.
+Converting a fixed-profile authority row requires an explicit installation transition.
 
 [cols="1,3"]
 |===
@@ -163,6 +169,33 @@ The protobuf definitions in `rust/proto/rtdb.v1.proto` specify the new `rtdb.v1.
 A mutation returns a `ManagedWorkloadResponse` with the retained receipt and its original namespace.
 For reads, send the exact named proof in the corresponding action arm with an empty request key.
 The existing `rtdb.v1.TxStatus` request takes only the key and uses the credential's explicit receipt-recovery namespace and family.
+A key absent from that namespace or operation family returns `rtdb/unknown-transaction`.
+Store the returned namespace, receipt key, Basis and system time before publishing dependent catalog state.
+Treat `Then` as the positive control-operation outcome.
+
+RTDB authors the authority row on the configured point at validity `[validAtMicros, infinity)`.
+The row contains the original incarnation, `kind = 'hosted'`, a 20-character zero-padded `placement_epoch`, `placement_assignment`, `placement_holder`, `placement_fence_basis` and `writer`.
+A replacement preserves the last actual predecessor close Basis in `predecessor_retirement_basis`.
+A vacant placement uses an empty assignment and holder and has a positive placement receipt.
+A catalog-only vacancy can advance past its last native close by presenting `previous.closed` with that close and using the higher accepted epoch.
+The claim marker is lowercase hex of the exact Claim request key.
+Close uses the 16 closure bytes as its request key and writes `closed:<lowercase closure hex>`.
+An unclaimed placement has no positive writer receipt and requires separate abandoned-placement recovery.
+
+Write uses the same key in the outer action and embedded `TransactRequest`.
+It admits main-branch puts, deletes and table declarations on data relations.
+Each arm must preserve the configured authority relation.
+The exact workload credential uses the named evidence actions for its control reads.
+Generic data queries, branch control, custody and erasure require their own admission routes.
+
+Freeze the exact protobuf request body before the first positive submission and retain it with the namespace, key and family.
+The attempt digest is SHA-256 of the ASCII bytes `rtdb.v1/managed-workload-attempt`, a single zero byte, and that frozen body.
+Keep the original bytes for retry, including any serialized map entry ordering.
+The OIDC token and grant expiry remain outside the commitment.
+For a still-unknown attempt, issue a separate settlement grant naming the original namespace, family, key and digest.
+Send the original key as the outer key of `settle_attempt`.
+A matching positive outcome wins if already retained.
+Otherwise a winning settlement persists `rtdb/managed-workload-attempt-settled` as a Refused receipt under the original attempt identity.
 
 * Build `verified_grant` only from a configured issuer's authenticated authorization.
 For an assignment, bind the accepted holder, placement epoch and assignment to the grant.

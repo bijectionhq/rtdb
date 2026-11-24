@@ -59,6 +59,11 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
         _ => return Err(invalid(format!("Unknown authentication configuration tag '{tag}'"))),
     };
     fields.finish()?;
+    if let AuthConfig::OpenIdConnect(oidc) = &config
+        && let Some(grants) = &oidc.workload_grants
+    {
+        grants.validate_rules(&oidc.rules)?;
+    }
     Ok(config)
 }
 

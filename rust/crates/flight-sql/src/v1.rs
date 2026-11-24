@@ -21,6 +21,7 @@ pub(crate) mod error;
 mod query;
 mod tokens;
 mod transact;
+mod workload;
 
 const API: &str = "rtdb.v1";
 const RECEIVER_CLOCK: &str = "query.receiver-clock";
@@ -31,10 +32,13 @@ const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const CAPABILITIES: &str = "rtdb.v1.Capabilities";
 pub(crate) const MANAGED_CREATE: &str = "rtdb.admin.v1.CreateDeployment";
-pub(crate) const ACTIONS: [&str; 3] = [
+pub(crate) const MANAGED_WORKLOAD: &str = "rtdb.v1.ManagedWorkload";
+pub(crate) const TX_STATUS: &str = "rtdb.v1.TxStatus";
+pub(crate) const ACTIONS: [&str; 4] = [
     CAPABILITIES,
     "rtdb.v1.Transact",
-    "rtdb.v1.TxStatus",
+    TX_STATUS,
+    MANAGED_WORKLOAD,
 ];
 
 #[derive(Default)]
@@ -157,7 +161,8 @@ impl Service {
             }),
             custody::RELEASE => self.custody_release_action(&call, &action.body).await,
             "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
-            "rtdb.v1.TxStatus" => match decode(action.body) {
+            MANAGED_WORKLOAD => self.managed_workload_action(&call, action.body).await,
+            TX_STATUS => match decode(action.body) {
                 Ok(request) => self.v1_tx_status(&call, request).await,
                 Err(status) => Err(status),
             },
@@ -206,6 +211,9 @@ impl Service {
         request: proto::TxStatusRequest,
     ) -> Result<Vec<u8>, Status> {
         check_key(&request.key)?;
+        if call.session.caller.principal.workload_grant().is_some() {
+            return self.managed_workload_status(call, request.key).await;
+        }
         let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
         let driver = database
             .serving_driver()

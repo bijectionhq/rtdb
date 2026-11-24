@@ -44,6 +44,22 @@ surface StatelessDatabase {
         -- The catalog orders that identity before provisioning and the reply confirms the current matching attachment.
         -- A retry with a renewed grant can recover the same ordered identity.
 
+    @guarantee ManagedWorkloadAssignment
+        -- A bounded issuer grant authorizes one exact operation on the Original incarnation.
+        -- The deployment owner configures the original main-branch authority point.
+        -- Placement compares the applied predecessor version and requires positive original writer and close evidence for a retired holder.
+        -- Claim compares the accepted fence version and orders its writer image and receipt together.
+        -- Write and close authenticate the exact fence and original claim receipt before either arm is considered.
+        -- The current authority image must match at the configured valid time and at the writer's decision time.
+        -- The original writer orders closure, placement replacement and mutation in the same stream.
+        -- Before a timed effect settles, the writer checks the original fence and the exclusive grant and request cutoffs again.
+        -- Named predecessor evidence returns only the authenticated fence, writer and close at their original applied cuts.
+        -- The retained result binds the original namespace, key, operation family and immutable attempt commitment.
+        -- An exact retry recovers the retained result independently of the former writer's current fence.
+        -- Explicit receipt recovery can observe that outcome after closure, writer replacement, checkpoint and trim.
+        -- Authorized settlement and a positive submit compete under the same durable attempt identity on the Original.
+        -- A winning negative settlement refuses a later positive attempt under that identity.
+
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
         -- The database incarnation survives node restart and is shared by routes to the same database.

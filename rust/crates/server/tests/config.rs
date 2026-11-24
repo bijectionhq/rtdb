@@ -272,13 +272,15 @@ fn an_out_of_range_listener_port_is_the_reference_illegal_argument() {
 
 #[test]
 fn assignment_coordinates_come_from_operator_configuration() {
-    let oidc = "authn: !OpenIdConnect\n  issuerUrl: https://issuer.example/realm\n  clientId: db\n  clientSecret: secret\n  workloadGrants:\n    audience: cell\n    clientIdPrefix: workload-";
+    let oidc = "authn: !OpenIdConnect\n  issuerUrl: https://issuer.example/realm\n  clientId: db\n  clientSecret: secret\n  rules: [{method: CLIENT_CREDENTIALS}]\n  workloadGrants:\n    audience: cell\n    clientIdPrefix: workload-";
     let config = decode(&format!("{oidc}\n    assignment: {{relation: public.bj_installation, rowId: authority, validAtMicros: 0}}")).unwrap();
     let AuthConfig::OpenIdConnect(config) = config.auth else { panic!() };
     let grants = config.workload_grants.unwrap();
     let point = grants.assignment().unwrap();
     assert_eq!(point.table.to_string(), "public.bj_installation");
     assert_eq!(point.valid_at, rtdb_types::Timestamp(0));
+    assert!(decode(&format!("{}\n    assignment: {{relation: public.bj_installation, rowId: authority, validAtMicros: 0}}",
+        oidc.replace("CLIENT_CREDENTIALS", "TRUST"))).is_err());
     assert!(decode(&format!("{oidc}\n    assignment: {{relation: bj_installation, rowId: authority, validAtMicros: 0}}")).is_err());
     assert!(decode(&format!("{oidc}\n    assignment: {{relation: public.bj_installation, rowId: authority}}")).is_err());
 }
