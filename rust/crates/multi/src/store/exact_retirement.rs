@@ -13,6 +13,7 @@ use crate::checkpoint_retention::checkpoint_pack_collectable;
 use rtdb_storage::{IoRegion, sealing::{PUBLICATION_ID_BYTES, PublicationSealing}};
 use crate::keys::{KeyService, UnitScope};
 use crate::packing::{PackIndex, block_pack, observe_pack_index, pack_block};
+use crate::reclamation_decision::matches_object_fence;
 
 const PUBLICATION_HEADER: u64 = (PUBLICATION_ID_BYTES + crate::cipher::object::SEALED_HEADER_BYTES) as u64;
 use crate::reference::{Base, References, stores};
@@ -576,7 +577,10 @@ impl<'a> InstalledPublicationDeletionGrant<'a> {
         key: &'a ObjectKey, publication: &'a InstalledPublication, fence: ordered_logkeeper::ordered::ObjectFence,
         placement: ordered_logkeeper::ordered::Placement,
     ) -> Result<Self> {
-        if publication.withdrawal()? != fence.object { return Err(changed()); }
+        let expected = publication.withdrawal()?;
+        if !matches_object_fence(fence.object.name, fence.object.version, expected.name, expected.version) {
+            return Err(changed());
+        }
         Ok(Self { key, publication, fence, placement })
     }
 
@@ -704,7 +708,7 @@ async fn terminal_unit_identity(
             if size < PUBLICATION_HEADER { return Err(changed()); }
             let prefix = bucket.observe_range(&copy, 0..PUBLICATION_ID_BYTES as u64).await?;
             let copy_origin = ServingPublication::from_prefix(&prefix.value).ok_or_else(changed)?;
-            if copy_origin == origin { return Ok(None); }
+            if super::publication_retirement::is_serving_alias(copy_origin, origin) { return Ok(None); }
         }
     }
     Ok(Some(origin))
@@ -818,7 +822,8 @@ async fn versioned_unit_identity(
             for observed in inventory.data_versions(&copy).await? {
                 if &copy == target && &observed == version { continue; }
                 let prefix = inventory.read_version_prefix(&copy, &observed, PUBLICATION_ID_BYTES as u64).await?;
-                if ServingPublication::from_prefix(&prefix).ok_or_else(changed)? == origin { return Ok(None); }
+                let copy_origin = ServingPublication::from_prefix(&prefix).ok_or_else(changed)?;
+                if super::publication_retirement::is_serving_alias(copy_origin, origin) { return Ok(None); }
             }
         }
     }

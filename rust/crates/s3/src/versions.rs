@@ -12,6 +12,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3Obje
 #[path = "never_versioned.rs"]
 mod never_versioned;
 pub use never_versioned::{NeverVersionedObject, NeverVersionedRetirement, ObservedTerminalObject};
+mod retirement_decision;
+use retirement_decision::{VersionStatus, exact_version_status, matches_terminal_target};
 
 fn collect_child(parent: &str, key: Option<&str>, children: &mut BTreeSet<String>) {
     if let Some((child, _)) = key.and_then(|key| key.strip_prefix(parent)).and_then(|relative| relative.split_once('/')) {
@@ -35,13 +37,6 @@ pub enum CreateAttemptPublication {
     Absent,
     Other,
     Published(PhysicalObjectVersion),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VersionStatus {
-    Absent,
-    WouldExposeOlderData,
-    SafeToRemove,
 }
 
 const RETIRED_VERSION_ATTRIBUTE: &str = "rtdb-retired-version";
@@ -462,11 +457,7 @@ impl VersionedInventory {
                 }
             }
             match page.is_truncated() {
-                Some(false) => return Ok(match target_latest {
-                    None => VersionStatus::Absent,
-                    Some(true) if other_data => VersionStatus::WouldExposeOlderData,
-                    Some(_) => VersionStatus::SafeToRemove,
-                }),
+                Some(false) => return Ok(exact_version_status(target_latest, other_data)),
                 Some(true) => {},
                 None => return Err(unavailable("S3 omitted the version listing's pagination state")),
             }

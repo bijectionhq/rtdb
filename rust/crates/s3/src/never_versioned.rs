@@ -266,7 +266,10 @@ impl NeverVersionedRetirement<'_> {
         self.checked_path(key, &target)?;
         Ok(match self.observe(key).await? {
             NeverVersionedObject::Retired(previous) => previous == token,
-            NeverVersionedObject::Open(observed) => observed == target,
+            NeverVersionedObject::Open(observed) => super::matches_terminal_target(
+                observed.namespace == target.namespace && observed.key == target.key,
+                observed.condition == target.condition,
+            ),
         })
     }
 

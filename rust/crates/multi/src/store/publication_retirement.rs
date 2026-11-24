@@ -11,6 +11,7 @@ use rtdb_types::{Anomaly, Result, ServingPublication};
 use crate::{
     keys::KeyService,
     packing::{held_back, is_pack_key, read_index},
+    reclamation_decision::retains_serving_slot,
     reference::{physical_objects, stores},
 };
 
@@ -87,7 +88,7 @@ impl<'a> PublicationCensus<'a> {
             for version in provider.data_versions(&copy).await? {
                 if &version == retiring { continue; }
                 let prefix = provider.read_version_prefix(&copy, &version, PUBLICATION_ID_BYTES as u64).await?;
-                if ServingPublication::from_prefix(&prefix).ok_or_else(changed)? == *expected {
+                if is_serving_alias(ServingPublication::from_prefix(&prefix).ok_or_else(changed)?, *expected) {
                     excluded.push(name.clone());
                     break;
                 }
@@ -104,7 +105,7 @@ impl<'a> PublicationCensus<'a> {
                 if entry.length < HEADER_BYTES { return Err(changed()); }
                 let end = entry.offset.checked_add(PUBLICATION_ID_BYTES as u64).ok_or_else(changed)?;
                 let prefix = provider.read_version_range(&copy, &version, entry.offset..end).await?;
-                if ServingPublication::from_prefix(&prefix).ok_or_else(changed)? == *expected {
+                if is_serving_alias(ServingPublication::from_prefix(&prefix).ok_or_else(changed)?, *expected) {
                     excluded.push(name.clone());
                 }
             }
@@ -162,6 +163,10 @@ impl<'a> PublicationCensus<'a> {
     }
 }
 
+pub(super) fn is_serving_alias(observed: ServingPublication, expected: ServingPublication) -> bool {
+    retains_serving_slot(observed.origin == expected.origin, observed.attempt == expected.attempt)
+}
+
 async fn has_origin(
     bucket: &dyn ObjectStore,
     key: &ObjectKey,
@@ -173,7 +178,7 @@ async fn has_origin(
         .ok_or_else(changed)?;
     match bucket.observe_range(key, offset..end).await {
         Ok(prefix) if prefix.value.len() == PUBLICATION_ID_BYTES => {
-            Ok(ServingPublication::from_prefix(&prefix.value).ok_or_else(changed)? == expected)
+            Ok(is_serving_alias(ServingPublication::from_prefix(&prefix.value).ok_or_else(changed)?, expected))
         }
         Ok(_) => Err(changed()),
         Err(Error::MissingObject(_)) => Ok(false),

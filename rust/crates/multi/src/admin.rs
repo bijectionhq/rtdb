@@ -1981,9 +1981,9 @@ async fn withdraw_terminal_lineage_slots(
         return withdraw_unreferenced_publication_origin(keys, record, &record.storage_prefix()).await;
     }
     let peers = others.iter().filter(|peer| peer.org == record.org && peer.lineage == record.lineage);
-    if peers.clone().any(|peer| peer.lifecycle != Lifecycle::Deleted
-        || peer.disposal.is_none() || !peer.storage_regions.is_empty())
-    {
+    if peers.clone().any(|peer| crate::reclamation_decision::retains_publication_scope(
+        peer.lifecycle == Lifecycle::Deleted, peer.disposal.is_some(), peer.storage_regions.is_empty(),
+    )) {
         return Ok(());
     }
     let mut origins = BTreeSet::from([record.storage_prefix()]);

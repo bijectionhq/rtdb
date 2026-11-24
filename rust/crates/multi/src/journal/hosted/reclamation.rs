@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{Placement, genesis, prefix_retirement::GrantDescriptor};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
+use crate::reclamation_decision::release_is_covered;
 use crate::store::{EncryptingStore, exact_retirement::{InstalledPublication, InstalledPublicationDeletionGrant}};
 use crate::reference::{Bucket, PrefixedStore};
 
@@ -207,8 +208,7 @@ pub(super) async fn settle_receipts(
         let through = candidate.cut.through.after_offset(candidate.cut.replica_epoch);
         if candidate.cut.replica_epoch != custodian.log_epoch()
             || rtdb_format::keys::StorageRoot::new(candidate.cut.storage_version, candidate.cut.storage_epoch)?.key() != root.as_str()
-            || u64::try_from(through).ok().is_none_or(|through| through >= route.floor.next_lsn)
-            || route.floor.next_lsn > route.checkpoint.cut.next_lsn
+            || !release_is_covered(through, route.floor.next_lsn, route.checkpoint.cut.next_lsn)
             || !can_fence_trie_file(&candidate.key)
         {
             continue;

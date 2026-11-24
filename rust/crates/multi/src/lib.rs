@@ -37,6 +37,7 @@ mod recovery_holds;
 pub mod reference;
 pub mod process;
 mod receiver_clock;
+mod reclamation_decision;
 pub mod relay;
 mod replica_retention;
 mod hosted_recovery;

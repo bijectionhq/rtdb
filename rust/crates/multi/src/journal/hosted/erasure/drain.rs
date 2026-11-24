@@ -195,7 +195,8 @@ pub(super) async fn retirement_completed(
 }
 
 async fn recorded_cut(provider: &CheckpointCustody, placement: Placement, floor: u64, name: &str) -> Result<bool> {
-    Ok(floor == 0 || cut_record(provider, placement, floor, name).await?.is_some())
+    Ok(!crate::reclamation_decision::erasure_requires_custody_join(floor)
+        || cut_record(provider, placement, floor, name).await?.is_some())
 }
 
 async fn cut_record(provider: &CheckpointCustody, placement: Placement, floor: u64, name: &str) -> Result<Option<RetirementAdmission>> {

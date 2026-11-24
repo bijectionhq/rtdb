@@ -447,7 +447,9 @@ impl InstalledJournal {
     ) -> Result<Option<ordered_logkeeper::ordered::ObjectFence>> {
         let decision = self.execute(&self.request(route, Command::WithdrawObject { object })?).await?;
         match decision.receipt.outcome {
-            Ok(Outcome::ObjectWithdrawn(fence)) if fence.object == object => {
+            Ok(Outcome::ObjectWithdrawn(fence)) if crate::reclamation_decision::matches_object_fence(
+                fence.object.name, fence.object.version, object.name, object.version,
+            ) => {
                 let placement = route.placement;
                 crate::residence_trace::record("ordered-object-fence", || serde_json::json!({
                     "deployment": placement.deployment, "incarnation": placement.incarnation,
