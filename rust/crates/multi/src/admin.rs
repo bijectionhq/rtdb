@@ -22,6 +22,7 @@ pub(crate) use cell_attempts::{dispose_generations, has_pending_disposal};
 
 mod holder;
 pub use holder::{HolderObservation, observe_holder};
+mod holder_handoff;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);
 const CONCURRENT_SUSPICION_PROBES: usize = 16;
@@ -253,7 +254,7 @@ pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &Mem
 
 pub(crate) async fn move_from_holding(directory: &dyn Directory, name: &str, target: &MemberId,
                                       source: Option<(&MemberId, u64)>, control: &ControlKey) -> Result<()> {
-    move_placement(directory, name, target, source, None, control).await
+    move_placement(directory, name, target, source, None, control).await.map(|_| ())
 }
 
 /// Move only the installation named by an actual holder observation.
@@ -275,12 +276,13 @@ pub async fn move_observed_holder(
     }
     let name = directory.deployment(&original.authority.to_string()).await?
         .ok_or_else(changed)?.name;
-    move_placement(
+    let settled_epoch = move_placement(
         directory, &name, target, Some((&original.holder, original.epoch)), Some(original), control,
     ).await?;
     let successor = observe_holder(directory, original.authority, original.incarnation).await?;
     if &successor.holder != target || successor.log_epoch != original.log_epoch
-        || successor.epoch <= original.epoch || successor.directory_version <= original.directory_version
+        || !holder_handoff::exact_holder_handoff(original.epoch, settled_epoch, successor.epoch)
+        || successor.directory_version <= original.directory_version
         || successor.engine_version != original.engine_version
     {
         return Err(changed());
@@ -290,7 +292,7 @@ pub async fn move_observed_holder(
 
 async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId,
                         source: Option<(&MemberId, u64)>, observed: Option<&HolderObservation>,
-                        control: &ControlKey) -> Result<()> {
+                        control: &ControlKey) -> Result<u64> {
     let members = if let Some(observed) = observed {
         let mut selected = BTreeMap::new();
         for id in [&observed.holder, target] {
@@ -339,7 +341,7 @@ async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId
         record.placement_move = Some(reservation.clone());
         Ok(())
     }).await?;
-    if effective_holder(&intended, &members, now_ms()) == Some(target) { return Ok(()); }
+    if effective_holder(&intended, &members, now_ms()) == Some(target) { return Ok(intended.epoch); }
     if intended.placement_move.as_ref() != Some(&reservation) {
         return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-reservation-lost", "The directory did not retain the move reservation"));
     }
@@ -353,7 +355,7 @@ async fn move_placement(directory: &dyn Directory, name: &str, target: &MemberId
         let reserved_for = Duration::from_millis(reservation.expires_at_ms.saturating_sub(now_ms()).max(0) as u64);
         let retry_window = reserved_for.saturating_sub(CONTROL_TIMEOUT).min(CONTROL_TIMEOUT);
         match control::retry_activation(retry_window, || expect(&address, activation.clone(), control)).await? {
-            Response::Held { .. } => Ok(()),
+            Response::Held { epoch, .. } => Ok(epoch),
             other => Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/move-failed", format!("The target answered {other:?}"))),
         }
     }.await;

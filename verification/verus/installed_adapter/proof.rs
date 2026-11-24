@@ -2,6 +2,8 @@
 
 #[path = "../../../rust/crates/multi/src/journal/adapter_command.rs"]
 mod production;
+#[path = "../../../rust/crates/multi/src/admin/holder_handoff.rs"]
+mod holder_handoff;
 mod laws;
 
 mod uuid_model {

@@ -1,16 +1,54 @@
 {
-  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment. A writer nomination accepts only the immediate successor epoch and preserves the active predecessor key generation.",
+  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment. A writer nomination accepts only the immediate successor epoch and preserves the active predecessor key generation. Directory handoff readback retains the exact epoch from the authenticated activation response.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
     "production",
     "--verify-module",
+    "holder_handoff",
+    "--verify-module",
     "laws",
     "--verify-module",
     "uuid_model"
   ],
-  "min_verified_functions": 23,
+  "min_verified_functions": 25,
   "controls": {
+    "expose-later-holding": {
+      "defect": "An unrelated later holding on the same member confirms the original move.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/admin/holder_handoff.rs",
+          "find": "    predecessor < settled && settled == observed\n}",
+          "replace": "    predecessor < settled && settled <= observed\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/admin/holder_handoff.rs",
+          "function": "exact_holder_handoff",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "reuse-original-holding": {
+      "defect": "The incumbent holding can be presented as a completed move.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/admin/holder_handoff.rs",
+          "find": "    predecessor < settled && settled == observed\n}",
+          "replace": "    predecessor <= settled && settled == observed\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/admin/holder_handoff.rs",
+          "function": "exact_holder_handoff",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
     "reuse-writer-epoch": {
       "defect": "A nomination accepts an unchanged epoch as a writer handoff.",
       "mutate": [
