@@ -453,7 +453,9 @@ The listener authenticates the ordinary recovery envelope against the exact fenc
 The destination keeps that name and authority UUID and uses a separately reserved native catalog row, native stream and encrypted manifest.
 
 The four actions take a `selection` with `destination`, `stage_operation`, `staged_manifest_sha256`, `ciphertext_sha256`, `command_id`, `command_digest` and optional `original_receipt_table`.
-`destination` equals the original authority UUID, while `stage_operation` names the independent Classic scratch installation.
+`destination` equals the original authority UUID.
+`stage_operation` selects the independent Classic scratch installation named `checkpoint-stage-{stage_operation}`.
+The sealed stage intent and scratch directory record must authenticate that scratch name.
 The command ID and digest identify Bijection's retained migration request.
 Choose the exact public receipt-control table with `{schema, table}` when the migration needs Classic receipt read-through.
 Every reply uses `classic_migration_destination` and returns the exact `selection`, old terminal transaction and frontiers, `terminal_sha256` and `request_sha256` in `evidence`.

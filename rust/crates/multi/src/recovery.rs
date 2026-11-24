@@ -780,7 +780,7 @@ impl RecoveryService {
                 let intent = CheckpointStageIntent {
                     operation: stage_operation, source: request.authority, capture: request.capture,
                     source_manifest_sha256, destination: stage_operation,
-                    name: format!("checkpoint-stage-{stage_operation}"), org: self.org.clone(),
+                    name: classic_destination::scratch_name(stage_operation), org: self.org.clone(),
                     classic_migration: Some(ClassicMigration { source, destination }),
                 };
                 if discard_migration {

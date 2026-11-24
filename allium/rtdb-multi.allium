@@ -616,6 +616,7 @@ contract LogService {
 
     @invariant ClassicMigrationNativeCandidate
         -- The authenticated recovery operator selects the exact fenced source name and authority, capture, scratch artifact and migration request.
+        -- The recovery envelope authenticates the Original tenant name and the sealed stage binds its independently determined scratch name.
         -- Native catalog reservation compares both name and physical stream identity and retains the exact projection commitment.
         -- Candidate admission stays closed while a private writer appends the restored checkpoint to the native stream.
         -- The import preserves admitted literal event times and retains their exact transaction cuts under the candidate's native coordinates.

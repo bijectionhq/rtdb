@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
+use rtdb_directory::{CheckpointTransferTerminal, DeploymentRecord, Directory, Lifecycle};
 use rtdb_server::multi::ClassicCandidate;
 use rtdb_types::{Anomaly, EntityId, Result, TableRef, TransactionKey};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,74 @@ pub(super) struct Selection {
     command_id: [u8; 16],
     command_digest: [u8; 32],
     original_receipt_table: Option<TableRef>,
+}
+
+pub(super) fn scratch_name(operation: Uuid) -> String {
+    format!("checkpoint-stage-{operation}")
+}
+
+impl Selection {
+    fn source_terminal<'a>(
+        &self,
+        source: &'a DeploymentRecord,
+        authority: Uuid,
+        capture: Uuid,
+    ) -> Option<&'a CheckpointTransferTerminal> {
+        let expected_scratch = scratch_name(self.stage_operation);
+        source
+            .checkpoint_transfer_terminal
+            .as_deref()
+            .filter(|terminal| {
+                let stage = &terminal.fence.destination;
+                source.id == authority.to_string()
+                    && stage.transfer_only
+                    && source.lifecycle == Lifecycle::Restoring
+                    && source.holder.is_none()
+                    && source.checkpoint_stage.is_none()
+                    && source.epoch == terminal.fence.fenced_writer_epoch
+                    && source.incarnation == stage.source_incarnation
+                    && source.log_epoch == stage.source_log_epoch
+                    && source.checkpoint == Some(stage.checkpoint)
+                    && source.checkpoint_transfer_fence.as_deref() == Some(&terminal.fence)
+                    && stage.intent.source == authority
+                    && stage.intent.capture == capture
+                    && stage.intent.operation == self.stage_operation
+                    && stage.intent.destination == self.stage_operation
+                    && stage.intent.name == expected_scratch
+                    && stage.intent.org == source.org
+                    && stage.staged_manifest_sha256.as_deref()
+                        == Some(self.staged_manifest_sha256.as_str())
+                    && stage
+                        .intent
+                        .classic_migration
+                        .is_some_and(|migration| migration.destination == self.destination)
+            })
+    }
+
+    fn matches_scratch(
+        &self,
+        scratch: &DeploymentRecord,
+        terminal: &CheckpointTransferTerminal,
+    ) -> bool {
+        let stage = &terminal.fence.destination;
+        scratch.id == self.stage_operation.to_string()
+            && scratch.lineage == scratch.id
+            && scratch.incarnation == 1
+            && scratch.lifecycle == Lifecycle::Restoring
+            && scratch.parent.is_none()
+            && scratch.holder.is_none()
+            && scratch.name == stage.intent.name
+            && scratch.org == stage.intent.org
+            && scratch.checkpoint_stage.as_deref() == Some(stage)
+            && scratch.checkpoint_transfer_fence.as_deref() == Some(&terminal.fence)
+            && scratch
+                .checkpoint_transfer_bootstrap
+                .as_deref()
+                .is_some_and(|bootstrap| {
+                    &bootstrap.terminal == terminal
+                        && bootstrap.ciphertext_sha256 == self.ciphertext_sha256
+                })
+    }
 }
 
 pub(super) enum Operation {
@@ -76,44 +144,13 @@ impl RecoveryService {
         {
             return Ok(Reply::Refused);
         }
-        let terminal = source
-            .checkpoint_transfer_terminal
-            .as_deref()
-            .filter(|terminal| {
-                let stage = &terminal.fence.destination;
-                source.lifecycle == Lifecycle::Restoring
-                    && source.holder.is_none()
-                    && source.checkpoint_stage.is_none()
-                    && source.epoch == terminal.fence.fenced_writer_epoch
-                    && source.incarnation == stage.source_incarnation
-                    && source.log_epoch == stage.source_log_epoch
-                    && source.checkpoint == Some(stage.checkpoint)
-                    && source.checkpoint_transfer_fence.as_deref() == Some(&terminal.fence)
-                    && stage.intent.source == authority
-                    && stage.intent.capture == capture
-                    && stage.intent.name == source.name
-                    && stage.intent.org == source.org
-                    && stage.intent.operation == selection.stage_operation
-                    && stage.intent.destination == selection.stage_operation
-                    && stage.staged_manifest_sha256.as_deref()
-                        == Some(selection.staged_manifest_sha256.as_str())
-                    && stage
-                        .intent
-                        .classic_migration
-                        .is_some_and(|migration| migration.destination == selection.destination)
-            })
+        let terminal = selection
+            .source_terminal(&source, authority, capture)
             .ok_or_else(conflict)?;
-        let scratch = directory
+        if !directory
             .deployment(&selection.stage_operation.to_string())
             .await?
-            .ok_or_else(conflict)?;
-        if !scratch
-            .checkpoint_transfer_bootstrap
-            .as_deref()
-            .is_some_and(|bootstrap| {
-                &bootstrap.terminal == terminal
-                    && bootstrap.ciphertext_sha256 == selection.ciphertext_sha256
-            })
+            .is_some_and(|scratch| selection.matches_scratch(&scratch, terminal))
         {
             return Err(conflict());
         }
@@ -260,4 +297,122 @@ fn conflict() -> Anomaly {
         "rtdb.multi/classic-destination",
         "The request differs from the sealed Classic migration",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_directory::{
+        CellMedia, Checkpoint, CheckpointStage, CheckpointStageIntent, CheckpointTransferBootstrap,
+        CheckpointTransferFence, ClassicMigration, ClassicMigrationSource,
+    };
+    use rtdb_types::{Timestamp, TxId};
+
+    #[test]
+    fn named_classic_tenant_selects_its_separate_deterministic_scratch() {
+        let mut source = DeploymentRecord::new("tenant-orders", "cell", vec![], 0);
+        let authority = source.id.parse().unwrap();
+        let attempt = Uuid::new_v4();
+        let capture = Uuid::new_v4();
+        source.lifecycle = Lifecycle::Restoring;
+        source.epoch = 9;
+        source.log_epoch = 2;
+        let checkpoint = Checkpoint {
+            block: 1,
+            boundary: 5,
+            source: 6,
+            system_time: 12,
+            root_sha256: Some([1; 32]),
+        };
+        source.checkpoint = Some(checkpoint);
+        let stage = CheckpointStage {
+            intent: CheckpointStageIntent {
+                operation: attempt,
+                source: authority,
+                capture,
+                source_manifest_sha256: "original".into(),
+                destination: attempt,
+                name: scratch_name(attempt),
+                org: source.org.clone(),
+                classic_migration: Some(ClassicMigration {
+                    source: ClassicMigrationSource {
+                        incarnation: source.incarnation,
+                        log_epoch: source.log_epoch,
+                        writer_epoch: 8,
+                    },
+                    destination: authority,
+                }),
+            },
+            source_incarnation: source.incarnation,
+            source_log_epoch: source.log_epoch,
+            checkpoint,
+            media: CellMedia {
+                objects: [2; 32],
+                keys: "keys".into(),
+            },
+            transfer_only: true,
+            staged_manifest_sha256: Some("verified-stage".into()),
+        };
+        let fence = CheckpointTransferFence {
+            destination: stage.clone(),
+            source_writer_epoch: 8,
+            fenced_writer_epoch: 9,
+            drained_source_through: Some(6),
+        };
+        let terminal = CheckpointTransferTerminal {
+            fence: fence.clone(),
+            replica_through: 5,
+            source_through: 6,
+            basis: TransactionKey {
+                tx_id: TxId(6),
+                system_time: Timestamp(12),
+            },
+            placed_debt: None,
+            replica_sha256: None,
+            lifetime_floors_sha256: [3; 32],
+        };
+        source.checkpoint_transfer_fence = Some(Box::new(fence.clone()));
+        source.checkpoint_transfer_terminal = Some(Box::new(terminal.clone()));
+        let mut scratch =
+            crate::admin::installation_record(attempt, &scratch_name(attempt), "cell").unwrap();
+        scratch.lifecycle = Lifecycle::Restoring;
+        scratch.checkpoint_stage = Some(Box::new(stage));
+        scratch.checkpoint_transfer_fence = Some(Box::new(fence));
+        scratch.checkpoint_transfer_bootstrap = Some(Box::new(CheckpointTransferBootstrap {
+            terminal: terminal.clone(),
+            ciphertext_sha256: [4; 32],
+        }));
+        let selection = Selection {
+            destination: authority,
+            stage_operation: attempt,
+            staged_manifest_sha256: "verified-stage".into(),
+            ciphertext_sha256: [4; 32],
+            command_id: [5; 16],
+            command_digest: [6; 32],
+            original_receipt_table: None,
+        };
+
+        assert_eq!(source.name, "tenant-orders");
+        assert_ne!(source.name, scratch.name);
+        assert_eq!(
+            selection.source_terminal(&source, authority, capture),
+            Some(&terminal)
+        );
+        assert!(selection.matches_scratch(&scratch, &terminal));
+        assert!(
+            selection
+                .source_terminal(&source, attempt, capture)
+                .is_none()
+        );
+        scratch.name = source.name.clone();
+        assert!(!selection.matches_scratch(&scratch, &terminal));
+        let wrong = source.checkpoint_transfer_terminal.as_mut().unwrap();
+        wrong.fence.destination.intent.name = source.name.clone();
+        source.checkpoint_transfer_fence = Some(Box::new(wrong.fence.clone()));
+        assert!(
+            selection
+                .source_terminal(&source, authority, capture)
+                .is_none()
+        );
+    }
 }
