@@ -149,8 +149,36 @@ pub enum EventOp {
     Redacted,
 }
 
+/// Position within the partition history. The enclosing catalog or replica
+/// record authenticates the history and partition to which this belongs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct EventPosition {
+    pub transaction: crate::TxId,
+    pub ordinal: u64,
+}
+
+impl EventPosition {
+    pub const WIDTH: i32 = 16;
+
+    pub fn to_bytes(self) -> [u8; Self::WIDTH as usize] {
+        let mut bytes = [0; Self::WIDTH as usize];
+        bytes[..8].copy_from_slice(&self.transaction.0.to_be_bytes());
+        bytes[8..].copy_from_slice(&self.ordinal.to_be_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: [u8; Self::WIDTH as usize]) -> Self {
+        let (transaction, ordinal) = bytes.split_first_chunk::<8>().expect("fixed position width");
+        Self {
+            transaction: crate::TxId(i64::from_be_bytes(*transaction)),
+            ordinal: u64::from_be_bytes(ordinal.try_into().expect("fixed ordinal width")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHeader {
+    pub position: Option<EventPosition>,
     pub iid: Iid,
     pub system_from: Timestamp,
     pub commit_position: u32,
@@ -159,12 +187,16 @@ pub struct EventHeader {
 }
 
 impl EventHeader {
-    pub fn system_position(self) -> (Timestamp, u32) {
-        (self.system_from, self.commit_position)
+    pub fn precedence(self) -> (Timestamp, i128) {
+        let order = self.position.map_or_else(
+            || i128::MIN + i128::from(self.commit_position),
+            |position| (i128::from(position.transaction.0) << 64) | i128::from(position.ordinal),
+        );
+        (self.system_from, order)
     }
 
     pub fn version(self) -> RowVersion {
-        RowVersion { iid: self.iid, system_from: self.system_from, commit_position: self.commit_position }
+        RowVersion { iid: self.iid, system_from: self.system_from, position: self.position, commit_position: self.commit_position }
     }
 }
 
@@ -173,6 +205,7 @@ impl EventHeader {
 pub struct RowVersion {
     pub iid: Iid,
     pub system_from: Timestamp,
+    pub position: Option<EventPosition>,
     pub commit_position: u32,
 }
 

@@ -462,7 +462,7 @@ fn persisted_leaf_stops_on_an_iid_error_during_order_validation() {
 }
 
 fn event(entity: u32, system: i64, source: &'static str) -> EventRow<&'static str> {
-    EventRow { header: EventHeader { commit_position: 0, iid: iid(entity), system_from: Timestamp(system), valid_time: Interval::ALL, op: EventOp::Put }, source }
+    EventRow { header: EventHeader { position: None, commit_position: 0, iid: iid(entity), system_from: Timestamp(system), valid_time: Interval::ALL, op: EventOp::Put }, source }
 }
 
 #[test]

@@ -25,6 +25,9 @@ pub struct CatalogCut {
     pub through: ReplicaPosition,
 }
 
+/// Maximum charge of an inline compacted-primary catalog claim.
+pub const CATALOG_PRIMARY_PATH_BYTES: usize = 4096;
+
 /// Identifies the provider namespace within which object versions are meaningful.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct S3ObjectNamespace {

@@ -197,6 +197,7 @@ impl PreparedQuery {
 
     /// Opens the query with one row of a bound Arrow batch.
     pub async fn execute_arrow_columns(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>) -> Result<QueryCursor> {
+        let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
             Box::pin(self.open_arrow(context, batch, row, types, text, Batching::Columns))
@@ -222,6 +223,7 @@ impl PreparedQuery {
     pub async fn execute_parameter_projection(
         &self, context: Arc<QueryContext>, arguments: &OwnedBatch, types: &[LogicalType], text: Option<&str>,
     ) -> Result<Option<QueryCursor>> {
+        let context = context.with_plaintext();
         measured_open(Arc::clone(&context), Box::pin(async { self.open_parameter_projection(context, arguments, types, text) })).await
     }
 
@@ -301,6 +303,7 @@ impl PreparedQuery {
     }
 
     async fn open(&self, context: Arc<QueryContext>, parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
+        let context = context.with_plaintext();
         let retention = Arc::clone(&context);
         let open = stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || {
             Box::pin(self.open_retained(context, parameters, text, batching))
@@ -310,6 +313,7 @@ impl PreparedQuery {
 
     async fn open_retained(&self, context: Arc<QueryContext>, mut parameters: Vec<Value>, text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         if parameters.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
+        let context = context.reopen_sql_snapshot(&self.settings, rtdb_expr::Parameters::Values(&parameters)).await?;
         self.check_dependencies(&context)?;
         let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
             bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
@@ -317,7 +321,7 @@ impl PreparedQuery {
         let temporary = context.memory.reserve(bound)?;
         let schema = self.emit_result_schema(&context, &parameter_types(&self.relation, &parameters, EmissionMode::ArrowFields))?;
         parameters.iter_mut().try_for_each(rtdb_columnar::admit_execution_value)?;
-        let context = context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&parameters))?;
+        let context = self.expose_snapshot_token(context.apply_settings(&self.settings, rtdb_expr::Parameters::Values(&parameters))?)?;
         self.open_bound(context, schema, text, batching, move |memory| {
             let types = parameter_types(&self.relation, &parameters, EmissionMode::Execution);
             let result = BoundParameters::new(parameters, types, memory);
@@ -328,19 +332,38 @@ impl PreparedQuery {
 
     async fn open_arrow(&self, context: Arc<QueryContext>, batch: OwnedBatch, row: usize, types: &[LogicalType], text: Option<&str>, batching: Batching) -> Result<QueryCursor> {
         if types.len() < self.required_parameter_count { return Err(invalid("missing-parameter", "Query has fewer parameters than its prepared plan")); }
-        self.check_dependencies(&context)?;
         let bound = types.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, ty| {
             ty.retained_bytes()?.checked_mul(8).and_then(|size| bytes.checked_add(size))
                 .ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
         })?;
         let temporary = context.memory.reserve(bound)?;
-        let schema = self.emit_result_schema(&context, &arrow_parameter_types(&self.relation, types, EmissionMode::ArrowFields))?;
         let execution_types = arrow_parameter_types(&self.relation, types, EmissionMode::Execution);
         let mut parameters = BoundParameters::from_arrow(batch, row, execution_types, &context.memory)?;
+        let context = context.reopen_sql_snapshot(&self.settings, parameters.evaluator()).await?;
+        self.check_dependencies(&context)?;
+        let schema = self.emit_result_schema(&context, &arrow_parameter_types(&self.relation, types, EmissionMode::ArrowFields))?;
         drop(temporary);
-        let context = context.apply_settings(&self.settings, parameters.evaluator())?;
+        let context = self.expose_snapshot_token(context.apply_settings(&self.settings, parameters.evaluator())?)?;
         parameters.use_execution_budget(&context.memory);
         self.open_bound(context, schema, text, batching, |_| Ok(parameters)).await
+    }
+
+    fn expose_snapshot_token(&self, context: Arc<QueryContext>) -> Result<Arc<QueryContext>> {
+        fn requests_token(relation: &Relation) -> bool {
+            relation.expressions().into_iter().any(|expression| {
+                let mut found = false;
+                expression.visit(&mut |expression| {
+                    found |= matches!(expression, Expr::Call { name, .. } if name == "snapshot_token");
+                });
+                found
+            }) || relation.children().into_iter().any(|child| requests_token(child))
+        }
+        if context.snapshot_token().is_none() && context.snapshot_tokens.is_some() && requests_token(&self.relation)
+            && let Some(token) = context.issue_snapshot_token()?
+        {
+            return context.with_exact_snapshot_token(token);
+        }
+        Ok(context)
     }
 
     fn check_dependencies(&self, context: &QueryContext) -> Result<()> {
@@ -436,13 +459,12 @@ impl PreparedQuery {
 
 async fn measured_open<T>(context: Arc<QueryContext>, mut open: std::pin::Pin<Box<impl std::future::Future<Output = Result<T>>>>) -> Result<T> {
     let counter = context.query_cpu.clone();
-    let lease = context.catalog.read_lease();
-    let mut task = std::pin::pin!(rtdb_storage::IoRegion::retaining(context, rtdb_storage::IoRegion::leased(lease, async {
+    let mut task = std::pin::pin!(context.reading(async {
         match counter {
             Some(counter) => crate::query_cpu::measure(counter, open.as_mut()).await,
             None => open.await,
         }
-    })));
+    }));
     std::future::poll_fn(|context| {
         stacker::maybe_grow(512 * 1024, 2 * 1024 * 1024, || task.as_mut().poll(context))
     }).await
@@ -712,9 +734,10 @@ impl QueryCursor {
         if retained > reservation.bytes() { return Err(invalid("row-reservation", "Owned rows exceed their memory reservation")); }
         let runtime_schema = RuntimeSchema::fixed(&schema, &context.memory)?;
         let sample = sample.or_else(|| Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query)));
-        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child(), sample, trace: None, query_span: None, plan_reservation: None })
+        Ok(Self { schema: Arc::clone(&runtime_schema), runtime_schema, input: Some(QueryInput::Rows(Box::new(OwnedRows { rows: rows.into_iter(), reservation }))), context: context.execution_child().with_plaintext(), sample, trace: None, query_span: None, plan_reservation: None })
     }
     pub fn schema(&self) -> &Schema { self.schema.schema() }
+    pub fn context(&self) -> &Arc<QueryContext> { &self.context }
     /// Batch fields derived from this execution's pinned catalog, before any rows are read.
     /// The advertised result fields remain available through `schema`.
     pub fn runtime_schema(&self) -> &Schema { self.runtime_schema.schema() }
@@ -723,12 +746,21 @@ impl QueryCursor {
     /// Encodes one batch before returning to the transport. The encoder must
     /// return detached wire data and must not retain the borrowed Arrow buffers.
     pub async fn encode_next_batch<T>(&mut self, encode: impl FnOnce(&OwnedBatch) -> T) -> Result<Option<T>> {
-        if matches!(self.input, Some(QueryInput::Ordered(_))) {
-            return ENCODING_ORDERED_BATCH.scope((), async {
+        let answer = if matches!(self.input, Some(QueryInput::Ordered(_))) {
+            ENCODING_ORDERED_BATCH.scope((), async {
                 self.next_batch().await.map(|batch| batch.as_ref().map(encode))
-            }).await;
-        }
-        self.next_batch().await.map(|batch| batch.as_ref().map(encode))
+            }).await?
+        } else {
+            self.next_batch().await?.as_ref().map(encode)
+        };
+        self.delivery_grant().await?;
+        Ok(answer)
+    }
+
+    /// Rechecks the units behind batches retained by a caller after a pull or encoding.
+    pub fn delivery_grant(&self) -> impl Future<Output = Result<rtdb_storage::sealing::PlaintextDelivery>> + Send + use<> {
+        let context = Arc::clone(&self.context);
+        async move { context.delivery_grant().await }
     }
 
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
@@ -738,7 +770,6 @@ impl QueryCursor {
         if let Some(trace) = &mut self.trace { trace.start(); }
         let started = std::time::Instant::now();
         let retention = self.context.clone();
-        let lease = self.context.catalog.read_lease();
         let counter = self.context.query_cpu.clone();
         let pull = async {
             let mut pull = std::pin::pin!(self.pull_batch());
@@ -747,23 +778,22 @@ impl QueryCursor {
                 None => owner.run_until_cancelled(token.run_until_cancelled(pull)).await,
             }
         };
-        let result = rtdb_storage::IoRegion::retaining(retention, rtdb_storage::IoRegion::leased(lease, pull)).await.flatten().ok_or_else(cancelled);
+        let result = retention.reading(async { pull.await.flatten().ok_or_else(cancelled)? }).await;
         let result = result.and_then(|batch| {
             if let Some(id) = self.context.catalog.owned_identity() {
-                if let Ok(Some(page)) = &batch {
+                if let Some(page) = &batch {
                     for row in 0..page.batch().num_rows() {
                         crate::owned_row_revision(page.batch(), row, id, &self.context.memory)?;
                     }
                 }
             }
-            if self.context.has_owned_read_guard() || self.context.catalog.owned_identity().is_some() {
-                self.context.check_cancelled()?;
-            }
+            self.context.catalog.check_view_lease()?;
+            self.context.check_cancelled()?;
             Ok(batch)
         });
         match result {
-            Ok(Ok(batch)) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
-            Ok(Err(error)) | Err(error) => { self.input = None; self.record_error(); Err(error) }
+            Ok(batch) => { if let Some(trace) = &mut self.trace { trace.completed(started.elapsed(), batch.as_ref().map(|batch| batch.batch().num_rows())); } if batch.is_none() { self.input = None; } Ok(batch) }
+            Err(error) => { self.input = None; self.record_error(); Err(error) }
         }
     }
     fn record_error(&self) { if let Some(observer) = &self.context.execution_observer { observer.record_error(ExecutionError::Query); } }

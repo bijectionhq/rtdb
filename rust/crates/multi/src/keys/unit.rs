@@ -3,20 +3,18 @@
 use std::{
     fs::{self, File},
     io::ErrorKind,
-    ops::Range,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use bytes::Bytes;
 use ring::digest::{Context, SHA256, digest};
-use rtdb_storage::{Error, IoRegion, ObjectKey, RetainedBytes};
+use rtdb_storage::{Error, IoRegion, ObjectKey, sealing::ObjectCipher};
 use rtdb_types::{Anomaly, Result};
 
 use crate::cipher::Cipher;
 
-use super::{FramedObject, KEY_BYTES, KeyService, LocalKeyService, journal::key_error};
+use super::{KEY_BYTES, KeyService, LocalKeyService, UnitOperation, UnitOutput, journal::key_error};
 
 pub(super) const SLOT_PREFIX: &str = "unit-";
 const NAMESPACE_CLOSED: &[u8] = b"RTDB-unit-namespace-closed-v1";
@@ -32,7 +30,7 @@ impl UnitScope {
         residence: &[u8],
     ) -> Self {
         let mut digest = Context::new(&SHA256);
-        digest.update(b"rtdb.multi/unit-scope/v1\0");
+        digest.update(b"rtdb.multi/unit-scope/v2\0");
         digest.update(placement.deployment.as_bytes());
         digest.update(placement.incarnation.as_bytes());
         digest.update(placement.group.as_bytes());
@@ -43,15 +41,42 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
-    fn namespace(self) -> String {
+    pub(super) fn namespace(self) -> String {
         format!("{SLOT_PREFIX}{}", hex(&self.0))
     }
 
-    fn slot(self, object: &ObjectKey) -> UnitSlot {
+    pub(super) fn archive(id: &str) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/archive-unit-scope/v1\0");
+        digest.update(id.as_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
+    pub(crate) fn replay_objects(provider: [u8; 32], residence: &str, log_epoch: i32) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/replay-object-scope/v1\0");
+        digest.update(&provider);
+        digest.update(&log_epoch.to_be_bytes());
+        digest.update(residence.as_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
+    pub(crate) fn ordered_index(residence: &str, index: &str, generation: u64) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/ordered-index-key-scope/v1\0");
+        digest.update(residence.as_bytes());
+        digest.update(b"\0");
+        digest.update(index.as_bytes());
+        digest.update(b"\0");
+        digest.update(&generation.to_be_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
+    pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {
             scope: self,
-            name: hex(name.as_ref()),
+            digest: name.as_ref().try_into().expect("SHA-256 width"),
         }
     }
 }
@@ -66,64 +91,13 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 pub struct UnitSlot {
-    scope: UnitScope,
-    name: String,
+    pub(super) scope: UnitScope,
+    pub(super) digest: [u8; 32],
 }
 
 impl UnitSlot {
     pub(super) fn id(&self) -> String {
-        format!("{}-{}", self.scope.namespace(), self.name)
-    }
-}
-
-pub enum UnitOperation {
-    Seal(Bytes),
-    Open(Bytes),
-    OpenRetained(RetainedBytes),
-    Header(Bytes),
-    Frames(FramedObject, Range<usize>, Bytes),
-}
-
-impl UnitOperation {
-    pub(super) fn provisions(&self) -> bool {
-        matches!(self, Self::Seal(_))
-    }
-
-    pub(crate) fn apply(self, key: &Cipher, name: &ObjectKey) -> rtdb_storage::Result<UnitOutput> {
-        match self {
-            Self::Seal(body) => key.seal_object(name, &body).map(UnitOutput::Bytes),
-            Self::Open(sealed) => key.open_object(name, &sealed).map(UnitOutput::Bytes),
-            Self::OpenRetained(sealed) => key
-                .open_object(name, sealed.as_slice())
-                .map(UnitOutput::Bytes),
-            Self::Header(sealed) => {
-                FramedObject::open_header(key, name, &sealed).map(UnitOutput::Header)
-            }
-            Self::Frames(layout, frames, sealed) => layout
-                .open_frames(key, name, frames, &sealed)
-                .map(UnitOutput::Bytes),
-        }
-    }
-}
-
-pub enum UnitOutput {
-    Bytes(Bytes),
-    Header(FramedObject),
-}
-
-impl UnitOutput {
-    pub(crate) fn bytes(self) -> rtdb_storage::Result<Bytes> {
-        match self {
-            Self::Bytes(bytes) => Ok(bytes),
-            Self::Header(_) => Err(Error::Task("Expected unit bytes".into())),
-        }
-    }
-
-    pub(crate) fn header(self) -> rtdb_storage::Result<FramedObject> {
-        match self {
-            Self::Header(header) => Ok(header),
-            Self::Bytes(_) => Err(Error::Task("Expected a sealed unit header".into())),
-        }
+        format!("{}-{}", self.scope.namespace(), hex(&self.digest))
     }
 }
 
@@ -193,6 +167,15 @@ impl UnitLedger {
     }
 }
 
+#[async_trait::async_trait]
+impl ObjectCipher for UnitLedger {
+    fn delivery_deadline(&self) -> Option<Instant> { self.deadline }
+
+    async fn operate(&self, name: &ObjectKey, operation: UnitOperation) -> rtdb_storage::Result<UnitOutput> {
+        UnitLedger::operate(self, name, operation).await
+    }
+}
+
 pub(super) fn unsupported() -> Anomaly {
     Anomaly::unsupported(
         "rtdb.multi/unit-key-authority",
@@ -244,34 +227,63 @@ impl LocalKeyService {
         let result = io
             .run_blocking(move || {
                 let vault = service.archive_vault().map_err(key_error)?;
-                let scope = vault.path(&slot.scope.namespace()).map_err(key_error)?;
-                let _gate = File::options()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(scope.with_extension("lock"))
-                    .map_err(super::io)
-                    .map_err(key_error)?;
-                _gate.lock_shared().map_err(super::io).map_err(key_error)?;
-                if local_scope_closed(&scope).map_err(key_error)? {
-                    return Err(Error::ErasedUnderView);
+                if matches!(operation, UnitOperation::Grant) {
+                    let custody = Arc::new(vault.hold_local_unit_delivery(&slot)?);
+                    return Ok(UnitOutput::HeldGrant { until: None, custody });
                 }
-                let path = vault.path(&slot.id()).map_err(key_error)?;
-                let _lock = vault.lock_key(&path).map_err(key_error)?;
-                if Instant::now() >= deadline {
-                    return Err(expired());
-                }
-                let material = vault
-                    .read_or_create_key(&path, operation.provisions())
-                    .map_err(key_error)?;
-                with_material(material, deadline, |key| operation.apply(key, &name))
+                vault.with_local_slot(&slot, operation.provisions(), deadline, |material| {
+                    with_material(material, deadline, |key| operation.apply(key, &name))
+                })
             })
             .await;
         if Instant::now() >= deadline {
             return Err(expired());
         }
         result
+    }
+
+    pub(super) fn hold_local_unit_delivery(&self, slot: &UnitSlot) -> rtdb_storage::Result<(File, File)> {
+        let scope = self.path(&slot.scope.namespace()).map_err(key_error)?;
+        let scope_hold = self.lock_key_shared(&scope).map_err(key_error)?;
+        if local_scope_closed(&scope).map_err(key_error)? {
+            return Err(Error::ErasedUnderView);
+        }
+        let path = self.path(&slot.id()).map_err(key_error)?;
+        let slot_hold = self.lock_key_shared(&path).map_err(key_error)?;
+        let mut material = self.read_or_create_key(&path, false).map_err(key_error)?;
+        material.fill(0);
+        Ok((scope_hold, slot_hold))
+    }
+
+    pub(super) fn with_local_slot<T>(
+        &self,
+        slot: &UnitSlot,
+        provision: bool,
+        deadline: Instant,
+        operation: impl FnOnce([u8; KEY_BYTES]) -> rtdb_storage::Result<T>,
+    ) -> rtdb_storage::Result<T> {
+        let scope = self.path(&slot.scope.namespace()).map_err(key_error)?;
+        let gate = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(scope.with_extension("lock"))
+            .map_err(super::io)
+            .map_err(key_error)?;
+        gate.lock_shared().map_err(super::io).map_err(key_error)?;
+        if local_scope_closed(&scope).map_err(key_error)? {
+            return Err(Error::ErasedUnderView);
+        }
+        let path = self.path(&slot.id()).map_err(key_error)?;
+        let _lock = self.lock_key(&path).map_err(key_error)?;
+        if Instant::now() >= deadline {
+            return Err(expired());
+        }
+        let material = self
+            .read_or_create_key(&path, provision)
+            .map_err(key_error)?;
+        operation(material)
     }
 
     pub(super) async fn withdraw_local_scope(
@@ -314,7 +326,8 @@ impl LocalKeyService {
             };
             Ok(complete())
         })
-        .await?
+        .await??;
+        Ok(())
     }
 
     pub(super) async fn withdraw_local_unit(
@@ -334,13 +347,15 @@ impl LocalKeyService {
             };
             Ok(complete())
         })
-        .await?
+        .await??;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use crate::store::EncryptingStore;
     use rtdb_storage::{MemoryStore, ObjectStore};
     use uuid::Uuid;
@@ -363,8 +378,8 @@ mod tests {
         let original_media: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         let successor_media: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         let original =
-            EncryptingStore::with_units(Arc::clone(&original_media), original_ledger.clone());
-        let successor = EncryptingStore::with_units(Arc::clone(&successor_media), successor_ledger);
+            EncryptingStore::with_units(Arc::clone(&original_media), Arc::new(original_ledger.clone()));
+        let successor = EncryptingStore::with_units(Arc::clone(&successor_media), Arc::new(successor_ledger));
         let erased = ObjectKey::new("tables/docs/data/l00-rc-b00.arrow")?;
         let survivor = ObjectKey::new("tables/docs/data/l00-rc-b01.arrow")?;
         let body = Bytes::from_static(b"retained document");
@@ -382,7 +397,7 @@ mod tests {
             original_scope,
             Arc::clone(&io),
         );
-        let reopened = EncryptingStore::with_units(original_media, reopened);
+        let reopened = EncryptingStore::with_units(original_media, Arc::new(reopened));
         assert!(matches!(
             reopened.get(&erased).await,
             Err(Error::ErasedUnderView)

@@ -32,6 +32,34 @@ impl VisitMut for ParsedSettings {
 
 impl ParsedSettings {
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    /// Extracts the exact snapshot selector before table and column binding.
+    pub(crate) fn snapshot_selector(&self) -> Result<QuerySettings> {
+        fn selector(value: &ast::Expr) -> Result<SettingValue> {
+            match value {
+                ast::Expr::Nested(value) | ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr: value } => selector(value),
+                ast::Expr::Value(value) => match &value.value {
+                    ast::Value::Placeholder(slot) => {
+                        let index = slot.strip_prefix('$').and_then(|slot| slot.parse::<usize>().ok())
+                            .and_then(|slot| slot.checked_sub(1)).ok_or_else(|| crate::bind::error("Invalid snapshot argument"))?;
+                        Ok(SettingValue::Parameter { index })
+                    }
+                    literal => Ok(SettingValue::Literal(crate::types::literal(literal)?)),
+                },
+                _ => Err(crate::bind::error("The snapshot token requires a string, parameter or null")),
+            }
+        }
+        let Some(token) = self.entries.iter().rev().find_map(|setting| match setting {
+            ParsedSetting::Token(value) => Some(value),
+            _ => None,
+        }) else { return Ok(QuerySettings::default()); };
+        let conflict = || SettingValue::Literal(Value::Null);
+        Ok(QuerySettings {
+            snapshot_token: Some(selector(token)?),
+            clock_time: self.entries.iter().any(|setting| matches!(setting, ParsedSetting::Clock(_))).then(conflict),
+            snapshot_time: self.entries.iter().any(|setting| matches!(setting, ParsedSetting::Time(_))).then(conflict),
+        })
+    }
+
     pub fn bind(self, context: &mut Context<'_>) -> Result<(QuerySettings, Option<TemporalExtent>, Option<TemporalExtent>)> {
         let mut settings = QuerySettings::default();
         let (mut valid, mut system) = (None, None);
@@ -43,7 +71,9 @@ impl ParsedSettings {
                     Some(text) => SettingValue::TimestampLiteral(text), None => context.setting_value(&value)?,
                 }),
                 ParsedSetting::Token(value) => settings.snapshot_token = Some(context.setting_value(&value)?),
-                ParsedSetting::Time(value) => settings.snapshot_time = Some(context.setting_value(&value)?),
+                ParsedSetting::Time(value) => settings.snapshot_time = Some(match clock_timestamp_literal(&value)? {
+                    Some(text) => SettingValue::TimestampLiteral(text), None => context.setting_value(&value)?,
+                }),
             }
         }
         Ok((settings, valid, system))

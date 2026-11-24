@@ -417,6 +417,15 @@ variant TxMessage : SourceMessage {
     -- Acceptance-relative Root writes retain those columns when their validity offsets are placed at the ordered system time.
     -- Root publication and fork admission count the Arrow document rows against the same effect limits as row writes.
     -- A held fork of an exact Root publication orders its new world registration with the Root section and owner controls.
+    -- Original replay admits a copied overlay fork only after replaying the selected
+    -- Held writer's actual clock publication. Its source receipt binds the exact
+    -- writer pin, Root basis, accepted reading and physical transaction. If the
+    -- retained archive extends further, that media end has its own source receipt.
+    -- A Held child may publish over one frozen writer and its original Root.
+    -- The child owns separate pins for both preserved media and has an independent
+    -- local journal. Reads resolve the child's shadow, then the frozen writer's
+    -- shadow, then the held Root. A tombstone stops resolution in either writer.
+    -- Forks from a publication that would freeze two writers are unavailable.
     -- The fork inherits the archived publication's clock while Root witnesses validate at ordering.
     -- A reviewed Proposal landing must consume an offered Root clock slot before any of its effects can publish.
     -- The slot's reading binds the Root writes, ordered predicates and landing outcome.
@@ -775,6 +784,7 @@ config {
 -- Local archive copies and forks retain their maintenance witness through completion of admitted provider work.
 -- Other admission failures end startup with the provider error.
 -- The replication driver consumes the admitted cursor for that same log and boundary.
+-- Coordinated native local startup checks the selected checkpoint's live and nascent primary inventory while its recovery gate is held.
 -- In the Rust partition owner, a query captures the catalog and its installed replica cut in the same partition value.
 -- Ordinary recovery with a matching journal boundary seeds the cut after the driver opens its replica tail.
 -- The driver advances the cut through delivered records after pending block adoption and resolution read-back buffers have drained.
@@ -2100,12 +2110,12 @@ open question "How should operator-selected skipped transactions be represented 
     -- Each ordered source transaction carries the raw append observation and the greatest such observation through its predecessor.
     -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
     -- New transaction metadata is stored in finite-lived rows outside durable transaction-result history.
-    -- Placed intake retains submitted bytes through installation of their replica outcome.
-    -- Intake release follows the applied source prefix even when the holder receives no further submissions.
-    -- Ordered erasures remove eligible payloads from later reads and compaction products without changing the transaction coordinate.
-    -- A placed outcome record contains exactly one put naming the current attempt.
-    -- A deployment admitted to the versioned outcome format may also carry bounded erasures of distinct expired outcomes.
-    -- Read-back rejects erasure of the current attempt, an extra outcome, and any multi-row outcome in the original format.
+    -- Placed intake is provisional until the installed receiver durably reserves the scoped slot and its settlement capacity.
+    -- Applied source progress retires provisional intake bytes, while unresolved receiver obligations remain charged.
+    -- The receiver orders exactly one terminal witness with the effect, refusal or fence for the original slot.
+    -- Exact retry redeems that position, and a fence that wins excludes subsequent copies at that receiver.
+    -- Ordered erasures remove eligible terminal evidence without changing the decision coordinate or restoring issuance authority.
+    -- Read-back rejects a foreign binding, a duplicate terminal decision and erasure of unresolved receiver debt.
     -- Physical retirement also requires successor coverage and release or revocation of each earlier immutable copy.
     -- Its transaction ID is the source position and its system time is smoothed against the resolved head.
     -- The skip takes effect before decoding transaction operations and uses the ordinary append, read-back and apply pipeline.

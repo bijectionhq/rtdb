@@ -28,7 +28,7 @@ fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_releas
     for precision in [i32::MIN, 0, 1, 256, i32::MAX] {
         let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap());
         let declared = StructFields::from([("v".into(), value.logical_type())]);
-        let events = [StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+        let events = [StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("v".into(), value)])), recency: None }];
         if precision < 3 { assert!(IndexBatch::from_events(&events, &declared, &memory).is_err()); }
         let copied = IndexBatch::copy_events_with_put_schema(&events, &declared, &memory).unwrap();
@@ -93,7 +93,7 @@ fn events_appended_by_reference_and_by_value_stage_as_one_tables_rows() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
     let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
-    let event = |id| StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
+    let event = |id| StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: key(0).system_time, valid_time: Interval::ALL, operation: StoredOperation::Put(document(id, id)), recency: None };
     tx.append_to(&table(), event(1)).unwrap();
     tx.append(table(), event(2)).unwrap();
     tx.append_to(&table(), event(3)).unwrap();
@@ -112,7 +112,7 @@ fn staged_predecessors_and_own_writes_are_each_scanned_once() {
     let mut own = TransactionBuffer::new(base, key(2), Arc::clone(&budget)).unwrap();
     own.put(table(), document(2, 2), Interval::ALL).unwrap();
     assert_eq!(rows(&own.snapshot().unwrap()), 3);
-    assert_eq!(rows(&state.open_snapshot(Some(key(0).system_time))), 1);
+    assert_eq!(rows(&state.open_snapshot(Some(key(0).tx_id))), 1);
     assert_eq!(state.value().live().block_row_count(), 1);
     state.apply(&staged).unwrap();
     state.apply(&own.stage().unwrap()).unwrap();
@@ -124,15 +124,27 @@ fn cached_snapshot_rebuilds_only_when_a_newer_basis_is_demanded() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 24);
     state.apply(&stage(&state, &budget, 0)).unwrap();
-    let held = state.open_snapshot(Some(key(0).system_time));
+    let held = state.open_snapshot(Some(key(0).tx_id));
     state.apply(&stage(&state, &budget, 1)).unwrap();
-    let reused = state.open_snapshot(Some(key(0).system_time));
+    let reused = state.open_snapshot(Some(key(0).tx_id));
     assert_eq!(rows(&reused), 1);
     assert!(Arc::ptr_eq(&held.segments(&table())[0], &reused.segments(&table())[0]));
-    let fresh = state.open_snapshot(Some(key(1).system_time));
+    let fresh = state.open_snapshot(Some(key(1).tx_id));
     assert_eq!(rows(&fresh), 2);
     assert_eq!(fresh.tx_basis(), Some(key(1)));
     assert_eq!(rows(&held), 1);
+}
+
+#[test]
+fn cached_snapshot_minimum_is_the_transaction_position_even_when_system_times_tie() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let first = key(0);
+    let second = TransactionKey { system_time: first.system_time, ..key(1) };
+    state.apply(&StagedWrite::new(first, None, state.snapshot().block_index(), Default::default()).unwrap()).unwrap();
+    let held = state.open_snapshot(Some(first.tx_id));
+    state.apply(&StagedWrite::new(second, Some(first), held.block_index(), Default::default()).unwrap()).unwrap();
+    assert_eq!(state.open_snapshot(Some(second.tx_id)).tx_basis(), Some(second));
+    assert_eq!(held.tx_basis(), Some(first));
 }
 
 #[test]
@@ -189,7 +201,7 @@ fn retained_snapshots_resolve_their_trie_rows_after_discard_and_rollover() {
     let budget = MemoryBudget::new(1 << 24);
     let table = table();
     state.apply(&stage(&state, &budget, 0)).unwrap();
-    let pinned = state.open_snapshot(Some(key(0).system_time));
+    let pinned = state.open_snapshot(Some(key(0).tx_id));
 
     let mut tx = TransactionBuffer::new(
         state.resolving_snapshot(&[]).unwrap(), key(1), Arc::clone(&budget),
@@ -206,7 +218,7 @@ fn retained_snapshots_resolve_their_trie_rows_after_discard_and_rollover() {
     let table_blocks = prepared.table_blocks(&tries, Timestamp(101)).unwrap();
     state.adopt_block(prepared, durable, &table_blocks, &tries, Timestamp(101)).unwrap();
     state.apply(&stage(&state, &budget, 1)).unwrap();
-    let next = state.open_snapshot(Some(key(1).system_time));
+    let next = state.open_snapshot(Some(key(1).tx_id));
     drop(state);
 
     for (snapshot, expected) in [(pinned, vec![0]), (discarded, vec![42, 0]), (next, vec![1])] {
@@ -254,8 +266,8 @@ fn empty_declared_table_is_visible_to_later_staged_transactions() {
     assert!(!state.open_snapshot(None).tables().contains(&table()));
     assert!(!state.open_snapshot(None).contains_table(&table()));
     state.apply(&staged).unwrap();
-    assert!(state.open_snapshot(Some(key(0).system_time)).tables().contains(&table()));
-    assert!(state.open_snapshot(Some(key(0).system_time)).contains_table(&table()));
+    assert!(state.open_snapshot(Some(key(0).tx_id)).tables().contains(&table()));
+    assert!(state.open_snapshot(Some(key(0).tx_id)).contains_table(&table()));
 }
 
 #[test]
@@ -268,7 +280,7 @@ fn put_omitting_a_declared_column_preserves_its_null_field() {
 
     let staged = tx.stage().unwrap();
     state.apply(&staged).unwrap();
-    let snapshot = state.open_snapshot(Some(key(0).system_time));
+    let snapshot = state.open_snapshot(Some(key(0).tx_id));
     assert_eq!(snapshot.column_types(&table())["v"], LogicalType::Null);
     let events = snapshot.segments(&table())[0].ordered_events().unwrap();
     assert_eq!(events[0].source.event().unwrap().operation, StoredOperation::Put(StructFields::from([
@@ -285,7 +297,7 @@ fn declared_document_types_do_not_make_written_columns_nullable() {
     let error = "error".to_owned();
     tx.declare_document_types(&table(), [(&error, &LogicalType::Scalar(ScalarType::Transit).maybe())]).unwrap();
     state.apply(&tx.stage().unwrap()).unwrap();
-    let types = state.open_snapshot(Some(key(0).system_time)).segments(&table())[0].column_types().clone();
+    let types = state.open_snapshot(Some(key(0).tx_id)).segments(&table())[0].column_types().clone();
     assert_eq!(types, StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64)), ("error".into(), LogicalType::Scalar(ScalarType::Transit).maybe())]));
 }
 
@@ -301,8 +313,8 @@ fn table_membership_includes_seeded_empty_catalogs_and_keeps_its_captured_genera
     let budget = MemoryBudget::new(1 << 24);
     state.apply(&stage(&state, &budget, 0)).unwrap();
     assert!(!before.contains_table(&table()));
-    assert!(state.open_snapshot(Some(key(0).system_time)).contains_table(&table()));
-    assert!(!state.open_snapshot(Some(key(0).system_time)).contains_table(&TableRef::new("missing", "docs")));
+    assert!(state.open_snapshot(Some(key(0).tx_id)).contains_table(&table()));
+    assert!(!state.open_snapshot(Some(key(0).tx_id)).contains_table(&TableRef::new("missing", "docs")));
 }
 
 #[test]

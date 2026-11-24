@@ -150,6 +150,10 @@ impl PrefixedStore {
 
 #[async_trait]
 impl ObjectStore for PrefixedStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        self.bucket.s3_publication_address(&self.full(key).ok()?)
+    }
+    fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.full(key).is_ok_and(|key| self.bucket.supports_scan_ranges(&key)) }
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool {
         self.full(key).is_ok_and(|key| self.bucket.supports_observed_scan_ranges(&key))
@@ -256,6 +260,7 @@ impl ReferencingStore {
 
 #[async_trait]
 impl ObjectStore for ReferencingStore {
+    fn permits_shared_read_cache(&self) -> bool { self.own.permits_shared_read_cache() && self.bucket.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.own.supports_scan_ranges(key) && self.base.objects.get(key.as_str()).is_none_or(|owner| {
             self::key(&format!("{owner}/{key}")).is_ok_and(|key| self.bucket.supports_scan_ranges(&key))
         }) }
@@ -354,7 +359,10 @@ pub async fn holds(bucket: &dyn ObjectStore, store: &str, name: &str) -> Result<
 pub async fn stores(bucket: &dyn ObjectStore, prefix: &str) -> Result<Vec<String>> {
     let strip = format!("{prefix}/");
     let versions: BTreeSet<String> = bucket.list(Some(&key(prefix)?)).await.map_err(storage)?.into_iter()
-        .filter_map(|object| object.key.as_str().strip_prefix(&strip).and_then(|rest| rest.split_once('/')).map(|(version, _)| version.to_owned())).collect();
+        .filter_map(|object| {
+            let (version, _) = object.key.as_str().strip_prefix(&strip)?.split_once('/')?;
+            (version != crate::archive::stage::STAGED_INVENTORY_DIRECTORY).then(|| version.to_owned())
+        }).collect();
     Ok(versions.into_iter().map(|version| format!("{prefix}/{version}")).collect())
 }
 

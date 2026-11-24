@@ -1,0 +1,91 @@
+{
+  "summary": "Admission of the invocation nonce and ordered durable decision and visibility frontiers.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "replay_prior_probe": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "find": "    expected == observed && visible >= -1 && decided >= visible\n}",
+          "replace": "    visible >= -1 && decided >= visible\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "function": "valid_reply",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "replay_prior_probe_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "find": "valid == (expected == observed && visible >= -1 && decided >= visible)",
+          "replace": "valid == (visible >= -1 && decided >= visible)"
+        },
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "find": "    expected == observed && visible >= -1 && decided >= visible\n}",
+          "replace": "    visible >= -1 && decided >= visible\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/read_index_evidence/laws.rs",
+          "function": "a_prior_invocation_cannot_vote",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "trust_uninstalled_exposure": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "find": "    expected == observed && visible >= -1 && decided >= visible\n}",
+          "replace": "    expected == observed && visible >= -1\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "function": "valid_reply",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "trust_uninstalled_exposure_with_weakened_contract": {
+      "mutate": [
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "find": "valid == (expected == observed && visible >= -1 && decided >= visible)",
+          "replace": "valid == (expected == observed && visible >= -1)"
+        },
+        {
+          "file": "rust/crates/logkeeper/src/client/read_index_evidence.rs",
+          "find": "    expected == observed && visible >= -1 && decided >= visible\n}",
+          "replace": "    expected == observed && visible >= -1\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/read_index_evidence/laws.rs",
+          "function": "exposure_cannot_lead_decision_installation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

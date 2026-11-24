@@ -142,13 +142,13 @@ Existing installed journals require a cutover to a freshly installed stream for 
 ### Clean checkpoint and erasure commit interface
 
 The installed custodian's erasure coordinator accepts an operation identity, custody domain and exact incumbent grant.
-Its custody adapter closes new copy and serving admissions and drains writes, including unfinished appends and offloaded writes.
+Its custody adapter quiesces the incumbent writer, including unfinished appends and offloaded writes, and reconciles outstanding copy admissions.
 The adapter retains that fence through restart until the attempt has a durable resolution.
 Ordinary checkpoint maintenance must leave the erasure preparation and its provider allocation to this authority.
 
 The adapter orders a preparation and stages a clean successor at the quiesced journal head.
 The coordinator provisions the next journal key and checks the whole cut, including its history fingerprint, against the current head.
-It checks the preparation against the selected base, cut, incumbent grant, root and allocation before using the installed custodian credential to publish.
+It checks the preparation against the selected base, cut, incumbent grant, root and allocation before reopening the exact successor through the provider.
 An ordinary checkpoint ends at the native block boundary before the upload record.
 A clean successor must account for the upload and any later records through the quiesced head.
 Its recovery metadata must let replay start at that head and recognize the selected catalog as confirmed without reopening older catalogs or records.
@@ -159,23 +159,20 @@ A replacement opens that manifest under the exact chosen checkpoint and reconcil
 Provider closure verification establishes availability and integrity.
 The producer is responsible for determining which objects contain the targeted history and ensuring their exclusion.
 
-The incumbent sends Logkeeper's `RotateKey { grant, checkpoint }` using the request identity persisted with the erasure preparation.
+The custodian sends Logkeeper's `PublishAndRotate { grant, checkpoint }` using the request identity retained with the erasure preparation. Its certified decision selects the clean root, rotates the payload key and closes prior root and replay admissions together.
 The accepted result gives the next writer epoch and key generation and a held recovery basis with an empty suffix at the checkpoint cut.
 An intervening append changes the head and the journal refuses rotation.
 A retry of an uncertain outcome reuses the exact command and its original receipt horizon.
 If that horizon is exhausted, custody must reconcile the operation before admitting a fresh attempt.
 
-The coordinator checks both durable recovery slot attestations against the exact clean checkpoint and the successor suffix generation.
-Once issued, those attestations must keep any older recovery root from becoming selectable, including after a torn write, restart or cohort repair.
-The custody authority consumes the checked evidence and makes the erasure receipt and the old generation's irrevocable expiry one durable result.
-Its deadline is positive and at most 120 seconds from committed time.
-Existing holds keep their entitlement through that deadline, and an old view requiring revoked material then receives `rtdb/erased-under-view`.
-The authority covers offloaded record bodies, retained plaintext and dependent storage in the custody domain.
+The coordinator verifies the receipt and its signed evidence of both durable slot readbacks from each voter in the accepting quorum.
+An old view may continue work under its original lease. Existing decoded data cannot renew delivery beyond the lease that authorized its provider read.
+The custody authority must persist the exact destruction obligations and later record completed drain and physical destruction evidence.
+An old view requiring a revoked key receives `rtdb/erased-under-view`.
+A fixed deadline requires an authority that bounds the drain and original-provider destruction under its installed clock and fault premises. The current provider profile retains the 120-second operational target.
+The coordinator authenticates a fixed reservation before requesting rotation. The reservation binds the prepared attempt and retiring inventory. The independently authenticated commitment adds the exact ordered switch. Destruction evidence carries the drain time and provider disposition, and can report a missed fixed deadline.
 
-The coordinator and its native acceptance tests exercise real Logkeeper application decisions and local journal encryption.
-The tests supply the clean root, admission fence, slot evidence and commit authority through a custody double.
-Live activation requires production implementations for those operations, including authenticated evidence from both recoverable slots and a qualified key service with atomic commit and expiry.
-The local scheduled vault demonstrates key-operation expiry and needs a qualified clock, idle revocation and custody-wide grant handling before it can provide this deadline.
+The coordinator fixture supplies a staged root and a custody commit. Logkeeper's separate voter test exercises torn-slot recovery and authenticated slot evidence. Production SQL integration still needs the survivor producer, custody-wide working plaintext and egress drain, and the provider deadline and destruction authority.
 
 ### Queue reclamation inside the current writer's prefix
 

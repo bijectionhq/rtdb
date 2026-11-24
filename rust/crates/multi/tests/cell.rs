@@ -519,7 +519,7 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
         stream: scope.clone(), write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     let keys = cell.keys();
-    let key = keys.key(&deployment.key_id()).await.unwrap();
+    keys.key(&deployment.key_id()).await.unwrap();
     let placed = PlacedAttemptScope::new(&scope, 1).unwrap().issue()
         .identify(SourcePosition(3), Some("owner")).unwrap();
     let body = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(1)),
@@ -534,7 +534,7 @@ async fn acceptance_audit_matches_one_exact_entry_after_quorum_recovery() {
         }),
     };
     let broadcast = rtdb_logkeeper::open_writer(stream.clone(), 1, Default::default()).await.unwrap();
-    let writer = rtdb_multi::logs::SealedLog::new(broadcast, &key, &deployment.replica_seal_scope()).unwrap();
+    let writer = rtdb_multi::logs::SealedLog::new(broadcast, &keys, &deployment.key_id(), &deployment.replica_seal_scope(), rtdb_storage::IoRegion::new()).await.unwrap();
     let cutoff = Timestamp(150);
     let staging = Timestamp(120);
     assert!(writer.maximum_guarded_append_bytes().is_some());
@@ -796,8 +796,8 @@ async fn an_engine_pin_without_a_compatible_destination_prevents_cell_move_fenci
     let mut west = Cell::start_in("west", map.clone(), 0).await;
     west.add_node_with_engine(Some("next-image".into())).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 23)").await.unwrap();
@@ -1191,8 +1191,7 @@ async fn placed_attempt_outcomes_keep_their_exact_identity_through_a_checkpoint(
         stream, write_quorum: 2, maximum_message_bytes: 4 << 20,
     };
     let replica = rtdb_logkeeper::open_reader(config.clone(), Default::default()).await.unwrap();
-    let material = cell.keys().existing(&record.key_id()).await.unwrap();
-    let replica = rtdb_multi::logs::SealedLog::new(replica, &material, &record.replica_seal_scope()).unwrap();
+    let replica = rtdb_multi::logs::SealedLog::new(replica, &cell.keys(), &record.key_id(), &record.replica_seal_scope(), rtdb_storage::IoRegion::new()).await.unwrap();
     let mut tail = replica.tail(LogOffset(-1)).await.unwrap();
     let outcomes = tokio::time::timeout(Duration::from_secs(5), async {
         let mut outcomes = Vec::new();
@@ -2010,6 +2009,7 @@ async fn parked_checkpoint_keeps_serving_and_recapturing_after_original_packs_go
         directory: &cell.directory,
         storage: &storage,
         keys: &keys,
+        broker: None,
         maximum_deployments: 1,
     };
     let to = admin::CellHandle {
@@ -2017,6 +2017,7 @@ async fn parked_checkpoint_keeps_serving_and_recapturing_after_original_packs_go
         directory: &destination.directory,
         storage: &destination.storage(),
         keys: &destination.keys(),
+        broker: None,
         maximum_deployments: 1,
     };
     let intent = rtdb_directory::CellTransferIntent {
@@ -2248,6 +2249,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
         directory: &cell.directory,
         storage: &storage,
         keys: &cell.keys(),
+        broker: None,
         maximum_deployments: 1,
     };
     let to = admin::CellHandle {
@@ -2255,6 +2257,7 @@ async fn restoring_the_current_archive_preserves_the_ordered_tail_and_authority(
         directory: &destination.directory,
         storage: &destination.storage(),
         keys: &destination.keys(),
+        broker: None,
         maximum_deployments: 1,
     };
     let intent = rtdb_directory::CellTransferIntent {
@@ -3167,6 +3170,14 @@ impl KeyService for InterruptedInstall {
     async fn key(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.key(deployment).await }
     async fn existing(&self, deployment: &str) -> rtdb_types::Result<[u8; 32]> { self.keys.existing(deployment).await }
     async fn existing_key(&self, deployment: &str) -> rtdb_types::Result<Option<[u8; 32]>> { self.keys.existing_key(deployment).await }
+    fn retain_deployment_delivery(&self, id: String, material: &[u8; 32])
+        -> rtdb_types::Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
+    {
+        self.keys.retain_deployment_delivery(id, material)
+    }
+    async fn grant_deployment_key(&self, deployment: &str, binding: [u8; 32]) -> rtdb_storage::Result<rtdb_multi::keys::UnitOutput> {
+        self.keys.grant_deployment_key(deployment, binding).await
+    }
     async fn copy(&self, from: &str, to: &str) -> rtdb_types::Result<()> { self.keys.copy(from, to).await }
     async fn destroy(&self, deployment: &str) -> rtdb_types::Result<()> { self.keys.destroy(deployment).await }
     async fn validate_install(&self, deployment: &str, key: &[u8; 32]) -> rtdb_types::Result<()> { self.keys.validate_install(deployment, key).await }
@@ -3202,8 +3213,8 @@ async fn exercise_interrupted_cell_move(east: Option<CellStorage>, west: Option<
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
@@ -3300,7 +3311,7 @@ async fn a_deployment_moves_cells_with_its_unflushed_tail_and_its_old_gateway_fo
     let west = Cell::start_in("west", map.clone(), 1).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
     fn handle<'a>(name: &'a str, cell: &'a Cell, storage: &'a rtdb_multi::deployment::CellStorage, keys: &'a rtdb_multi::keys::LocalKeyService, maximum_deployments: usize) -> admin::CellHandle<'a> {
-        admin::CellHandle { name, directory: &cell.directory, storage, keys, maximum_deployments }
+        admin::CellHandle { name, directory: &cell.directory, storage, keys, broker: None, maximum_deployments }
     }
     let (placed, _) = admin::create_in_cells(map.as_ref(), &[handle("east", &east, &east_storage, &east_keys, 10), handle("west", &west, &west_storage, &west_keys, 0)], "shop", "acme", 3).await.unwrap();
     assert_eq!(placed, "east", "a deployment goes to a cell with room");
@@ -3424,6 +3435,7 @@ async fn a_recovering_subscriber_keeps_its_suffix_through_a_concurrent_trim() {
         .map(|path| (path, directory.deployment_changes().unwrap()));
     let mut cell = Cell::start_with_directory(directory.clone()).await;
     let deployment = admin::create_deployment(directory.as_ref(), "shop", "acme", 3).await.unwrap();
+    admin::set_linearizable_reads(directory.as_ref(), "shop", true).await.unwrap();
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
     cell.node(0).agent.flush("shop").await.unwrap();
@@ -4094,7 +4106,7 @@ async fn a_held_reader_keeps_the_cut_of_its_captured_catalog() {
     client.simple_query("INSERT INTO docs (_id, v) VALUES (1, 17)").await.unwrap();
     let holder = cell.holder("shop").await.unwrap();
     let node = cell.node(holder).server.node();
-    let basis = rtdb_node::QueryBasis { snapshot: node.snapshot_basis().unwrap(), snapshot_time: None,
+    let basis = rtdb_node::QueryBasis { snapshot: node.snapshot_basis().unwrap(), replica_capture: None, resume_token: None, has_await_floor: false, snapshot_time: None,
         current_time: node.query_instant(), timezone: "UTC".into() };
     let cancellation = tokio_util::sync::CancellationToken::new();
     let capture = node.query_context("shop", &basis, &Reader, &cancellation).await.unwrap();
@@ -4312,13 +4324,13 @@ async fn a_fork_at_a_time_after_the_checkpoint_holds_the_tail_up_to_it() {
     let then = rtdb_types::Timestamp(chrono::DateTime::parse_from_str(&written, "%Y-%m-%d %H:%M:%S%.f%:z").unwrap().timestamp_micros());
     for id in 5..7 { client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES ({id}, 1)")).await.unwrap(); }
 
-    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
+    assert!(admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "too-early", None, rtdb_types::Timestamp(0), Duration::from_secs(3600), 4 << 20).await.is_err(),
         "a time before the checkpoint is a past block's");
-    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", then, Duration::from_secs(3600), 4 << 20).await.unwrap();
+    admin::fork_at_time(&cell.directory, &cell.storage(), &cell.keys(), "shop", "shop-then", None, then, Duration::from_secs(3600), 4 << 20).await.unwrap();
     admin::fork_time_into(
         &cell.directory, &cell.storage(), &cell.keys(), "shop",
         admin::ForkDestination { name: "shop-external-then", org: Some("recipient-org"), hosted_task: None },
-        then, Duration::from_secs(3600), 4 << 20,
+        None, then, Duration::from_secs(3600), 4 << 20,
     ).await.unwrap();
     let external = connect_eventually(&cell, "shop-external-then").await;
     assert_eq!(values(&external, "SELECT _id FROM orders").await, ["0", "1", "2", "3", "4"]);
@@ -4444,7 +4456,7 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
     let east = Cell::start_in("east", map.clone(), 1).await;
     let west = Cell::start_in("west", map.clone(), 0).await;
     let (east_storage, west_storage, east_keys, west_keys) = (east.storage(), west.storage(), east.keys(), west.keys());
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
     let deployment = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap().1;
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();
@@ -4473,7 +4485,7 @@ async fn an_unsafe_cell_move_leaves_the_source_live() {
         (&west_storage, &aliased_keys, "rtdb.multi/shared-cell-keys"),
         (&west_storage, &west_keys, "rtdb.multi/key-conflict"),
     ] {
-        let to = admin::CellHandle { name: "west", directory: &west.directory, storage, keys, maximum_deployments: 10 };
+        let to = admin::CellHandle { name: "west", directory: &west.directory, storage, keys, broker: None, maximum_deployments: 10 };
         let error = admin::move_cell(map.as_ref(), &from, &to, "shop", 4 << 20, None).await.unwrap_err();
         assert_eq!(error.code, expected);
         let after = east.directory.deployment(&deployment.id).await.unwrap().unwrap();
@@ -4507,8 +4519,8 @@ async fn exercise_conflicting_copy(managed: bool) {
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     if managed {
         admin::set_linearizable_reads(east.directory.as_ref(), "shop", true).await.unwrap();
@@ -4651,8 +4663,8 @@ async fn exercise_interrupted_replacement(case: Replacement) {
     let (east_storage, west_storage) = (east.storage(), west.storage());
     let east_keys = east.keys();
     let west_keys = InterruptedInstall { keys: west.keys(), failed: Default::default() };
-    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, maximum_deployments: 10 };
-    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, maximum_deployments: 10 };
+    let from = admin::CellHandle { name: "east", directory: &east.directory, storage: &east_storage, keys: &east_keys, broker: None, maximum_deployments: 10 };
+    let to = admin::CellHandle { name: "west", directory: &west.directory, storage: &west_storage, keys: &west_keys, broker: None, maximum_deployments: 10 };
     let (_, original) = admin::create_in_cells(map.as_ref(), std::slice::from_ref(&from), "shop", "acme", 3).await.unwrap();
     let client = east.connect("shop").await;
     client.simple_query("INSERT INTO orders (_id, total) VALUES (1, 10)").await.unwrap();

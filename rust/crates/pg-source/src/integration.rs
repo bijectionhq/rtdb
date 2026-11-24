@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::Value;
-use crate::{Remote, SourceConfig, SslMode, snapshot::SnapshotReader, stream::ChangeStream, wire::Connection};
+use crate::{ConfirmationState, Remote, SourceConfig, SslMode, snapshot::SnapshotReader, stream::ChangeStream, wire::Connection};
 
 #[tokio::test]
 #[ignore = "requires an explicitly configured PostgreSQL 17+ server with wal_level=logical and replication credentials"]
@@ -29,7 +29,8 @@ async fn exported_snapshot_and_copyboth_preserve_concurrent_updates_and_full_toa
     let mut stream = ChangeStream::open(&remote, &config, start, Arc::clone(&memory)).await.unwrap();
     let changed = tokio::time::timeout(Duration::from_secs(20), async { loop { if let Some(transaction) = stream.read().await.unwrap().transaction { break transaction; } } }).await.unwrap();
     assert!(changed.lsn > start); assert_eq!(change_cell(&changed, "value"), Value::Utf8("after".into())); assert_eq!(change_cell(&changed, "toast"), toast);
-    stream.acknowledge(changed.lsn).await.unwrap();
+    let feedback = ConfirmationState::new(changed.lsn, Some(changed.lsn)).acknowledgement();
+    stream.acknowledge(&feedback).await.unwrap();
     drop(stream);
     wait_for_slot_release(&mut control, &slot).await;
     let mut resumed = ChangeStream::open(&remote, &config, changed.lsn, Arc::clone(&memory)).await.unwrap();
@@ -87,7 +88,7 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     let blocks = BlockStore::new(store, Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), rtdb_replication::BlockDiscovery::List).await.unwrap();
     let partition = Arc::clone(&recovered.partition); let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(rtdb_tx::ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
+    let resolve = Arc::new(rtdb_tx::ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
     let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() }, logs, Arc::clone(&blocks), recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
     let replica_job = tokio::spawn(driver.run()); wait_for(|| matches!(handle.status().role, Role::Leading(_))).await;
     let mut control = Connection::open(&remote, false, Arc::clone(&memory)).await.unwrap();
@@ -139,7 +140,7 @@ async fn native_source_recovers_confirmed_local_journal_transactions_before_the_
         let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0), Default::default()).await.unwrap();
         let partition = recovered.partition.clone();
         let progress = ProgressMonitor::new(recovered.progress.clone());
-        let resolve = Arc::new(rtdb_tx::ResolveContext { write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: memory.clone(), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
+        let resolve = Arc::new(rtdb_tx::ResolveContext { decision_clock: None, write_event_origins: false, placed_receipt_retirement: false, owned_witness_scope: None, world_constraints: None, database: "cdc".into(), storage: cache, memory: memory.clone(), query_options: Default::default(), scan_accelerators: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Authority), execution_observer: None, tracer: None });
         let (handle, driver) = ReplicationDriver::new(ReplicationConfig { external_source: true, ..Default::default() },
             logs, blocks, recovered, progress, resolve, Arc::new(Effects), CancellationToken::new()).unwrap();
         let replication = tokio::spawn(driver.run());

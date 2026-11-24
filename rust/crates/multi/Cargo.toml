@@ -16,6 +16,7 @@ dynamodb = ["rtdb-directory/dynamodb", "dep:aws-config", "dep:aws-sdk-dynamodb"]
 s3-key-vault = ["dep:aws-config", "dep:aws-sdk-s3"]
 
 [dependencies]
+arrow-array.workspace = true
 aws-config = { version = "=1.13.0", optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }

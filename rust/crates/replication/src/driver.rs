@@ -10,7 +10,7 @@ use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::Da
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
 use rtdb_storage::{log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -149,18 +149,41 @@ impl ReplicationHandle {
         Ok(position)
     }
 }
+/// The applied resume token that this term can recover from its synced local history.
+pub struct RecoverableExternalToken(Arc<[u8]>);
+
+impl RecoverableExternalToken {
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+}
+
 #[derive(Clone)]
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
 impl TermHandle {
     pub fn term(&self) -> Term { self.term }
     /// The applied resume token covered by the store and the retained durable journal.
-    pub fn recoverable_external_token(&self) -> Option<Arc<[u8]>> {
+    pub fn recoverable_external_token(&self) -> Option<RecoverableExternalToken> {
         if self.handle.logs.retains_recovery_history() && self.handle.status.borrow().role == Role::Leading(self.term) {
-            self.handle.progress.current().external_token
+            self.handle.progress.current().external_token.map(RecoverableExternalToken)
         } else {
             None
         }
     }
+    /// Obtains the adopted source token only once the hosted recovery owner has installed its root.
+    pub async fn recoverable_external_checkpoint(&self) -> Option<RecoverableExternalToken> {
+        let catalog = {
+            let status = self.handle.status.borrow();
+            if status.role != Role::Leading(self.term) { return None; }
+            status.adopted_block.clone()?
+        };
+        let bytes = catalog.external_source_token()?;
+        if !self.handle.logs.confirms_recovery_checkpoint(&catalog).await
+            || self.handle.status.borrow().role != Role::Leading(self.term)
+        {
+            return None;
+        }
+        Some(RecoverableExternalToken(Arc::from(bytes)))
+    }
+
     /// Replaces a quiescent catalog and returns after its new block has been adopted in this term.
     /// The caller must exclusively operate the database with compaction and GC disabled.
     /// A failed receipt never permits deletion of the old catalog's files.
@@ -313,6 +336,8 @@ struct LeaderState {
     held: VecDeque<AdmittedReplica>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
     waiting_strict_source: Option<SourceInput>,
+    awaiting_placed: Option<SourceInput>,
+    settling_placed: bool,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
     compactor_reset: Option<CompactorReset>,
@@ -323,12 +348,14 @@ struct SourceInput {
     position: SourcePosition,
     log_time: Timestamp,
     work: SourceWork,
+    reservation: Option<PlacedReservation>,
     _decode_charge: Arc<MemoryReservation>,
 }
 
 enum SourceWork {
     Resolve(SourceTransaction),
     Skip(SourceMessage),
+    Fence,
 }
 
 struct AppliedTrieRemoval {
@@ -342,6 +369,7 @@ impl LeaderState {
     fn resolver_mut(&mut self) -> Result<&mut TxResolver> { self.resolver.as_mut().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn can_poll_source(&self) -> bool {
         self.recovery_write.is_none() && self.cycle.accepting() && !self.pending_strict_write()
+            && self.awaiting_placed.is_none() && !self.settling_placed
     }
     fn pending_strict_write(&self) -> bool {
         self.pending.front().is_some_and(|pending| matches!(&pending.body,
@@ -388,6 +416,14 @@ pub struct ReplicationDriver {
     leader: Option<LeaderState>, commands: mpsc::Receiver<Command>, status: watch::Sender<DriverStatus>, flush_timer: FlushTimer,
     required_append_bytes: Option<u64>,
     deferred_cut: bool,
+    placed_slot: Option<OrderedPlaced>,
+}
+
+#[derive(Clone, Copy)]
+struct OrderedPlaced {
+    reservation: PlacedReservation,
+    term: Term,
+    reserved_at: ReplicaPosition,
 }
 impl ReplicationDriver {
     pub fn new(config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, recovered: RecoveredPartition, progress: Arc<ProgressMonitor>, resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken) -> Result<(ReplicationHandle, Self)> {
@@ -427,7 +463,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, required_append_bytes: None, deferred_cut: false }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -470,6 +506,7 @@ impl ReplicationDriver {
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
         self.historical_confirmations = history.unwrap_or_default();
         if self.cancellation.is_cancelled() { return Ok(()); }
+        self.require_transferred_debt(self.read_position)?;
         self.update_installed_prefix()?;
         self.progress.driver_initialized(self.restart.take())?;
         self.replica_tail = Some(tail);
@@ -480,12 +517,14 @@ impl ReplicationDriver {
         capacity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
+            self.drive_placed_slot()?;
             self.prepare_polls();
             enum Event { ReplicaBatch(Box<dyn LogTail>, Result<TailPoll>), Replica, SourceBatch(Box<dyn LogTail>, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>), Capacity }
             let ready_replica = self.replica_head.is_some() || !self.replica_batch.is_empty();
             let waiting_for_checkpoint = self.waiting_for_checkpoint();
+            let placed_open = self.placed_slot.is_some();
             let accept_commands = self.leader.as_ref().is_none_or(|leader| {
-                (!waiting_for_checkpoint && leader.accepting_commands()) || leader.deferred_commands.len() < 128
+                (!waiting_for_checkpoint && !placed_open && leader.accepting_commands()) || leader.deferred_commands.len() < 128
             });
             let check_capacity = waiting_for_checkpoint && self.pending_block.is_none()
                 && self.leader.as_ref().is_some_and(|leader| leader.confirmed && leader.accepting());
@@ -495,8 +534,8 @@ impl ReplicationDriver {
             let mut empty_production = None;
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
-                    let ready_source = !waiting_for_checkpoint && leader.ready_source();
-                    let ready_deferred = !waiting_for_checkpoint && leader.accepting_commands() && !leader.deferred_commands.is_empty();
+                    let ready_source = !waiting_for_checkpoint && !placed_open && leader.ready_source();
+                    let ready_deferred = !waiting_for_checkpoint && !placed_open && leader.accepting_commands() && !leader.deferred_commands.is_empty();
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
                 }
                 None => (&mut empty_poll, &mut empty_job, &mut empty_resolution, &mut empty_production, false, false),
@@ -698,7 +737,7 @@ impl ReplicationDriver {
                 self.replica_poll = Some(start_poll(tail, timeout));
             }
         }
-        if !self.waiting_for_checkpoint() && let Some(leader) = &mut self.leader {
+        if !self.waiting_for_checkpoint() && self.placed_slot.is_none() && let Some(leader) = &mut self.leader {
             if leader.can_poll_source() && leader.waiting_strict_source.is_none()
                 && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
                 if let Some(tail) = leader.source_tail.take() { leader.source_poll = Some(start_poll(tail, self.config.assertion_interval)); }
@@ -708,6 +747,11 @@ impl ReplicationDriver {
     /// A journal that fences writer terms promotes its grant holder only after an empty read, so every record of
     /// an earlier term has been admitted before the new term's sequence-zero record can open it.
     async fn lead_after_empty_read(&mut self) -> Result<()> {
+        if self.logs.placed_transfer().is_some_and(|transfer|
+            self.read_position.after_offset(self.logs.replica_epoch) < transfer.through)
+        {
+            return Ok(());
+        }
         if !self.logs.fences_writer_terms() { return self.start_claim(); }
         if !self.config.may_lead || self.leader.is_some() || !self.logs.holds_writer_grant().await? { return Ok(()); }
         let term = self.fence.claim_term()?;
@@ -717,11 +761,16 @@ impl ReplicationDriver {
         Ok(())
     }
     fn start_claim(&mut self) -> Result<()> {
+        if self.logs.placed_transfer().is_some_and(|transfer|
+            self.read_position.after_offset(self.logs.replica_epoch) < transfer.through)
+        {
+            return Ok(());
+        }
         // Promotion waits for the next empty read instead of appending a claim.
         if self.logs.fences_writer_terms() { return Ok(()); }
         if !self.config.may_lead || self.leader.is_some() || self.claim.is_some() || self.claiming.is_some() { return Ok(()); }
         let term = self.fence.claim_term()?;
-        let envelope = ReplicaEnvelope { term, term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        let envelope = ReplicaEnvelope { term, term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None, ..Default::default() }) };
         let logs = Arc::clone(&self.logs);
         let clock = Arc::clone(&self.clock);
         let block = self.partition.value().live().block_index();
@@ -780,7 +829,7 @@ impl ReplicationDriver {
         let job = pump.with_heartbeat(self.config.idle_heartbeat).run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
+            pending: VecDeque::new(), source_tail, source_poll: None, source_batch: VecDeque::new(), source_head: None, waiting_strict_source: None, awaiting_placed: None, settling_placed: false, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None, trie_removals: Vec::new() });
         if produce_inherited {
             self.produce_pending()?;
         }
@@ -889,6 +938,9 @@ impl ReplicationDriver {
                     return Err(error);
                 }
                 // The protobuf body can be omitted or too new for this reader to recognize.
+                if self.logs.is_copied_replica_position(position) {
+                    return Err(invalid("The held transfer contains an unrecognized replica frame"));
+                }
                 self.recognized_prefix = false;
                 self.read_position = position;
                 self.complete_trie_removals();
@@ -919,12 +971,27 @@ impl ReplicationDriver {
                 self.apply_admitted(record).await?;
             }
         }
+        self.require_transferred_debt(position)?;
         self.read_position = position;
         self.update_installed_prefix()?;
         self.publish_status(self.role());
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
     }
+    fn require_transferred_debt(&self, position: ReplicaPosition) -> Result<()> {
+        let Some(transfer) = self.logs.placed_transfer() else { return Ok(()); };
+        if position.after_offset(self.logs.replica_epoch) != transfer.through {
+            return Ok(());
+        }
+        match (self.placed_slot, transfer.debt.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(slot), Some(debt)) if debt.term == slot.term.0
+                && debt.reserved_at == slot.reserved_at.after_offset(self.logs.replica_epoch)
+                && PlacedReservation::decode(&debt.reservation)? == slot.reservation => Ok(()),
+            _ => Err(invalid("The installed transfer differs from its sealed placed debt census")),
+        }
+    }
+
     fn own_pending_tx_at(&self, term: Term, sequence: Option<TermSequence>) -> Option<&PendingWrite> {
         let leader = self.leader.as_ref().filter(|leader| leader.term == term)?;
         leader.pending_tx_at(sequence).map(|(pending, _)| pending.as_ref())
@@ -1012,7 +1079,8 @@ impl ReplicationDriver {
     }
 
     async fn apply_admitted(&mut self, record: AdmittedReplica) -> Result<()> {
-        if matches!(&record.envelope.message, ReplicaBody::NoOp(message) if message.src_msg_id.is_none()) { return Ok(()); }
+        if matches!(&record.envelope.message, ReplicaBody::NoOp(message)
+            if message.src_msg_id.is_none() && message.placed_slot_reservation.is_none()) { return Ok(()); }
         if let Some(leader) = &mut self.leader {
             if leader.resolution.is_some() {
                 let bytes = leader.held_bytes.checked_add(record.retained_bytes()).ok_or_else(|| invalid("Resolution read-back buffer size overflow"))?;
@@ -1076,6 +1144,7 @@ impl ReplicationDriver {
             if self.stale(&record) { self.complete_control(&record); continue; }
             match &record.envelope.message {
                 ReplicaBody::ResolvedTx(message) => {
+                    let placed = self.check_placed_terminal(record.envelope.term, message)?;
                     let leading = self.leader.is_some();
                     let own = self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term);
                     if own {
@@ -1103,9 +1172,6 @@ impl ReplicationDriver {
                         };
                         if let Some(leader) = &mut self.leader {
                             complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Transaction(result)));
-                            if message.acceptance_stage.is_some() && leader.cycle.is_full(self.config.rows_per_block) {
-                                self.cut().await?;
-                            }
                         }
                     } else {
                         if leading {
@@ -1122,8 +1188,31 @@ impl ReplicationDriver {
                         let source = message.src_msg_id.map(SourcePosition).unwrap_or_else(|| if self.config.external_source { self.progress.current().source_position } else { SourcePosition(result.tx_key().tx_id.0) });
                         self.progress.applied(Some(source), Some(AppliedTransaction::new(Arc::new(result), placed_attempt)), message.external_source_token.clone())?;
                     }
+                    if placed {
+                        let fenced = self.placed_slot.is_some_and(|slot| slot.term != record.envelope.term);
+                        self.placed_slot = None;
+                        if let Some(leader) = &mut self.leader {
+                            leader.settling_placed = false;
+                            if fenced {
+                                // The predecessor's source may still be buffered in a
+                                // same-process term change. Start beyond the ordered fence.
+                                leader.source_head = None;
+                                leader.source_batch.clear();
+                                leader.source_poll = None;
+                                leader.source_tail = Some(self.logs.source_tail(self.progress.current().source_position).await?);
+                            }
+                        }
+                    }
+                    if own && (placed || message.acceptance_stage.is_some())
+                        && self.leader.as_ref().is_some_and(|leader| leader.cycle.is_full(self.config.rows_per_block) || self.deferred_cut)
+                    {
+                        self.cut().await?;
+                    }
                 }
                 ReplicaBody::TriesAdded(message) => {
+                    if self.placed_slot.is_some() && message.source_msg_id.is_some() {
+                        return Err(invalid("Source progress bypassed an open placed receiver slot"));
+                    }
                     if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff)
                         && message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0
                     {
@@ -1133,6 +1222,9 @@ impl ReplicationDriver {
                     self.complete_control(&record);
                 }
                 ReplicaBody::ArtefactsAdded(message) => {
+                    if self.placed_slot.is_some() && message.source_msg_id.is_some() {
+                        return Err(invalid("Source progress bypassed an open placed receiver slot"));
+                    }
                     if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
                         if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
                             self.partition.add_artefacts_at(&table, artefact_entries(&message.entries), record.metadata.timestamp);
@@ -1142,6 +1234,9 @@ impl ReplicationDriver {
                     self.complete_control(&record);
                 }
                 ReplicaBody::ArtefactsRemoved(message) => {
+                    if self.placed_slot.is_some() && message.source_msg_id.is_some() {
+                        return Err(invalid("Source progress bypassed an open placed receiver slot"));
+                    }
                     if message.storage_version == Some(self.logs.storage_version.0) && message.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0 {
                         if let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) {
                             let entries = artefact_entries(&message.entries);
@@ -1156,6 +1251,9 @@ impl ReplicationDriver {
                     self.complete_control(&record);
                 }
                 ReplicaBody::BlockBoundary(_) => {
+                    if self.placed_slot.is_some() {
+                        return Err(invalid("A checkpoint boundary cannot abandon an open receiver slot"));
+                    }
                     let prepared = self.partition.prepare_block()?;
                     self.pending_block = Some(PendingBlock::new(ReplicaRecord::clone(&record), prepared, self.config.pending_block_records, self.config.pending_block_bytes)?);
                     if let Some(leader) = &mut self.leader { leader.cycle = BlockCycle::Cut; }
@@ -1163,7 +1261,36 @@ impl ReplicationDriver {
                     if self.leader.is_some() { self.produce_pending()?; }
                 }
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
-                ReplicaBody::NoOp(message) => { self.progress.applied(message.src_msg_id.map(SourcePosition), None, None)?; self.complete_control(&record); }
+                ReplicaBody::NoOp(message) => {
+                    if let Some(wire) = message.placed_slot_reservation.as_deref() {
+                        if message.src_msg_id.is_some() || self.placed_slot.is_some() {
+                            return Err(invalid("Placed receiver reservations must occupy a fresh control position"));
+                        }
+                        let reservation = PlacedReservation::decode(wire)?;
+                        if reservation.attempt.position() <= self.progress.current().source_position
+                            || (!self.logs.is_copied_replica_position(record.metadata.position)
+                                && self.resolve.owned_witness_scope.is_some_and(|scope| !scope.same_history(reservation.attempt.scope())))
+                        {
+                            return Err(invalid("Placed receiver reservation has a foreign history or source position"));
+                        }
+                        if let Some(leader) = &self.leader
+                            && leader.term == record.envelope.term
+                            && leader.awaiting_placed.as_ref().and_then(|source| source.reservation) != Some(reservation)
+                        {
+                            return Err(invalid("Read-back changed the writer's original placed reservation"));
+                        }
+                        self.progress.reserved(reservation)?;
+                        self.placed_slot = Some(OrderedPlaced {
+                            reservation, term: record.envelope.term, reserved_at: record.metadata.position,
+                        });
+                    } else {
+                        if self.placed_slot.is_some() && message.src_msg_id.is_some() {
+                            return Err(invalid("Source progress bypassed an open placed receiver slot"));
+                        }
+                        self.progress.applied(message.src_msg_id.map(SourcePosition), None, None)?;
+                    }
+                    self.complete_control(&record);
+                }
                 ReplicaBody::TriesDeleted(message) => {
                     if self.compaction_replay_cutoff.is_none_or(|cutoff| record.metadata.position > cutoff) {
                         let table = legacy_table_ref(message.table_name.as_deref().unwrap_or_default())?;
@@ -1307,7 +1434,7 @@ impl ReplicationDriver {
         if leader.waiting_strict_source.is_some() {
             if !leader.ready_source() { return Ok(()); }
             let source = leader.waiting_strict_source.take().expect("checked for a waiting strict source");
-            return self.begin_source_resolution(source);
+            return self.admit_source(source);
         }
         let (LogRecord { metadata, payload, .. }, decode_reservation) = if let Some(head) = leader.source_head {
             let tail = leader.source_tail.as_deref_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
@@ -1324,7 +1451,6 @@ impl ReplicationDriver {
             None => self.resolve.memory.reserve(source_decode_bound(payload.len())?)?,
         };
         let message = SourceMessage::decode(&payload)?;
-        drop(payload);
         let durable = self.partition.snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
@@ -1337,15 +1463,21 @@ impl ReplicationDriver {
                 } else {
                     SourceWork::Resolve(SourceTransaction::decode(&message, &self.resolve.memory)?)
                 };
-                let source = SourceInput { position, log_time: metadata.timestamp, work, _decode_charge: decode_charge };
+                let original = match &work {
+                    SourceWork::Resolve(request) => request.placed_attempt(position)?,
+                    SourceWork::Skip(message) => SourceTransaction::skipped_attempt(message, position)?,
+                    SourceWork::Fence => unreachable!("only recovery constructs a placed fence"),
+                };
+                let reservation = original.map(|attempt| PlacedReservation::new(attempt, metadata.timestamp, &payload));
+                let source = SourceInput { position, log_time: metadata.timestamp, work, reservation, _decode_charge: decode_charge };
                 // Keep this position as the source head until every previously queued replica
                 // write has been read back. In particular, none can still be offloading a body.
-                if matches!(&source.work, SourceWork::Resolve(request) if request.requires_durable_predecessor())
+                if (reservation.is_some() || matches!(&source.work, SourceWork::Resolve(request) if request.requires_durable_predecessor()))
                     && !leader.drained_for_strict_source()
                 {
                     leader.waiting_strict_source = Some(source);
                 } else {
-                    self.begin_source_resolution(source)?;
+                    self.admit_source(source)?;
                 }
                 None
             }
@@ -1390,18 +1522,79 @@ impl ReplicationDriver {
                 let expected = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
                 leader.resolver_mut()?.advance_source(position)?;
                 if message.expected_block_idx == Some(expected) { self.cut().await?; }
-                else { leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0) })), block, None, &self.resolve.memory)?; }
+                else { leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0), ..Default::default() })), block, None, &self.resolve.memory)?; }
                 None
             }
             None => {
                 leader.resolver_mut()?.advance_source(position)?;
-                leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0) })), block, None, &self.resolve.memory)?;
+                leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(position.0), ..Default::default() })), block, None, &self.resolve.memory)?;
                 None
             }
         };
         if let Some(resolved) = resolved { self.enqueue_resolved(resolved, None).await?; }
         Ok(())
     }
+    fn admit_source(&mut self, source: SourceInput) -> Result<()> {
+        let Some(reservation) = source.reservation else { return self.begin_source_resolution(source); };
+        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+        if self.placed_slot.is_some() || leader.awaiting_placed.is_some()
+            || self.resolve.owned_witness_scope != Some(reservation.attempt.scope())
+        {
+            return Err(invalid("Cannot reserve a placed attempt for another receiver"));
+        }
+        let record = ReplicaBody::NoOp(proto::NoOp {
+            src_msg_id: None,
+            placed_slot_reservation: Some(reservation.encode()),
+        });
+        leader.enqueue(WriteBody::Message(record), self.partition.value().live().block_index(), None, &self.resolve.memory)?;
+        leader.awaiting_placed = Some(source);
+        Ok(())
+    }
+
+    fn drive_placed_slot(&mut self) -> Result<()> {
+        let Some(slot) = self.placed_slot else { return Ok(()); };
+        let Some(leader) = &mut self.leader else { return Ok(()); };
+        if !leader.confirmed || leader.settling_placed || leader.resolution.is_some()
+            || !leader.drained_for_strict_source() || self.pending_block.is_some()
+        {
+            return Ok(());
+        }
+        let source = if slot.term == leader.term {
+            leader.awaiting_placed.take()
+                .filter(|source| source.reservation == Some(slot.reservation))
+                .ok_or_else(|| invalid("The installed reservation differs from the writer's original input"))?
+        } else {
+            if slot.term >= leader.term || leader.awaiting_placed.is_some() {
+                return Err(invalid("Only a successor of the installed receiver can close its lost input"));
+            }
+            SourceInput {
+                position: slot.reservation.attempt.position(),
+                log_time: slot.reservation.submitted_at,
+                work: SourceWork::Fence,
+                reservation: Some(slot.reservation),
+                _decode_charge: self.resolve.memory.reserve(1024)?,
+            }
+        };
+        leader.settling_placed = true;
+        self.begin_source_resolution(source)
+    }
+
+    fn check_placed_terminal(&self, term: Term, message: &proto::ResolvedTx) -> Result<bool> {
+        let terminal = message.placed_slot_terminal.as_deref().map(PlacedTerminal::decode).transpose()?;
+        let attempt = message.placed_attempt.as_deref().map(rtdb_format::envelope::decode_replica_outcome_attempt)
+            .transpose()?.map(|(attempt, _)| attempt);
+        match (self.placed_slot, terminal, attempt) {
+            (None, None, None) => Ok(false),
+            (Some(slot), Some(terminal), Some(attempt))
+                if slot.reservation.attempt == attempt && slot.reservation.commitment == terminal.commitment
+                    && message.tx_id == Some(attempt.position().0) && message.src_msg_id == message.tx_id
+                    && message.committed.is_some()
+                    && ((!terminal.fenced && slot.term == term)
+                        || (terminal.fenced && slot.term < term && message.committed == Some(false))) => Ok(true),
+            _ => Err(invalid("Placed receiver decision has no exact original reservation")),
+        }
+    }
+
     fn begin_source_resolution(&mut self, source: SourceInput) -> Result<()> {
         let durable = self.partition.snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
@@ -1411,10 +1604,25 @@ impl ReplicationDriver {
         let maximum_inline_bytes = self.logs.replica_guarded_append_limit();
         let maximum_timed_original_bytes = self.logs.replica_timed_original_append_limit();
         leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
-            let SourceInput { position, log_time, work, _decode_charge } = source;
+            let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
             let result = match work {
-                SourceWork::Resolve(request) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
-                    Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,
+                SourceWork::Resolve(mut request) => {
+                    let prepared = request.prepare_proposal_generation(|| durable.clone(), &context).await;
+                    match prepared {
+                        Ok(_) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
+                            Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,
+                        Err(error) if error.is_caller_error() => resolver.resolve_source_abort(
+                            durable, position, log_time, reservation.map(|slot| slot.attempt), &context, error, false,
+                        ).await,
+                        Err(error) => Err(error),
+                    }
+                }
+                SourceWork::Fence => {
+                    let Some(reservation) = reservation else {
+                        return (resolver, Err(invalid("Placed fence lost its original slot")));
+                    };
+                    resolver.resolve_placed_fence(durable, reservation.attempt, log_time, &context).await
+                }
                 SourceWork::Skip(mut message) => async {
                     let attempt = SourceTransaction::skipped_attempt(&message, position)?;
                     if let SourceMessage::Protobuf(SourceBody::Tx(tx)) = &mut message {
@@ -1424,8 +1632,7 @@ impl ReplicationDriver {
                         tx.replay_submission = None;
                         tx.placed_attempt_seed = None;
                     }
-                    let digits = position.0.to_string();
-                    let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
+                    let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::skipped_tx_key(position))?;
                     let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
                     let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
                     context.storage.object_store().put(&key, payload).await?;
@@ -1446,11 +1653,28 @@ impl ReplicationDriver {
         } else { None };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         leader.cycle.resolved(resolved.writes().row_count()?)?;
-        leader.enqueue(WriteBody::Resolved(resolved, search_delta), self.partition.value().live().block_index(), completion, &self.resolve.memory)?;
-        if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+        let block = self.partition.value().live().block_index();
+        if let Some(attempt) = resolved.placed_attempt() {
+            let slot = self.placed_slot.filter(|slot| slot.reservation.attempt == attempt)
+                .ok_or_else(|| invalid("Placed resolution lost its original receiver reservation"))?;
+            if !leader.settling_placed || completion.is_some() {
+                return Err(invalid("Placed resolution bypassed receiver settlement"));
+            }
+            let terminal = PlacedTerminal { commitment: slot.reservation.commitment, fenced: slot.term < leader.term };
+            let write = PendingWrite::placed(WriteBody::Resolved(resolved, search_delta), block, terminal, &self.resolve.memory)?;
+            leader.appender.enqueue(Arc::clone(&write))?;
+            leader.pending.push_back(write);
+        } else {
+            leader.enqueue(WriteBody::Resolved(resolved, search_delta), block, completion, &self.resolve.memory)?;
+            if !strict && leader.cycle.is_full(self.config.rows_per_block) { self.cut().await?; }
+        }
         Ok(())
     }
     async fn cut(&mut self) -> Result<()> {
+        if self.placed_slot.is_some() || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
+            self.deferred_cut = true;
+            return Ok(());
+        }
         if let Some(boundary) = self.adopted_boundary() {
             match self.logs.available_append_capacity().await {
                 Ok(Some(capacity)) if boundary > capacity.published_through => {
@@ -1468,6 +1692,9 @@ impl ReplicationDriver {
     }
 
     fn enqueue_checkpoint_cut(&mut self) -> Result<()> {
+        if self.placed_slot.is_some() || self.leader.as_ref().is_some_and(|leader| leader.awaiting_placed.is_some()) {
+            return Ok(());
+        }
         self.deferred_cut = false;
         let block = self.partition.value().live().block_index();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
@@ -1481,7 +1708,7 @@ impl ReplicationDriver {
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
-        let waiting_for_checkpoint = self.waiting_for_checkpoint();
+        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some();
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }

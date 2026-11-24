@@ -66,6 +66,9 @@ message ResolvedTx {
     // committed attempt. Both travel with its effect through journal recovery.
     AcceptanceStage acceptance_stage = 11;
     bytes search_delta = 12;
+
+    // Exact reserved input commitment, prefixed with the terminal kind.
+    bytes placed_slot_terminal = 13;
 }
 
 message AcceptanceStage {
@@ -86,6 +89,9 @@ message BlockBoundary {
 
 message NoOp {
     int64 src_msg_id = 1;
+
+    // A placed receiver's reservation does not advance applied source progress.
+    bytes placed_slot_reservation = 2;
 }
 
 // Stands in for a message the log declined for its size: the encoded message is in the

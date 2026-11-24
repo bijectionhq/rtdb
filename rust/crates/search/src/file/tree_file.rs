@@ -145,7 +145,7 @@ pub(super) fn write(writer: &mut Writer<impl Write>, mut fields: Vec<(Table, Str
             fields.push((Table::TokenSequences, Table::TokenSequences.array(vec![
                 sequences.column(0).clone(), sequences.column(1).clone(),
                 list(Arc::new(arrow_array::StringArray::from(Vec::<&str>::new())), std::iter::repeat_n(0, end - start), item)?,
-                sequences.column(3).clone(), sequences.column(4).clone(),
+                sequences.column(3).clone(), sequences.column(4).clone(), sequences.column(5).clone(),
             ])?));
         }
         let page = writer.page(fields)?;
@@ -407,7 +407,7 @@ pub(crate) struct LogicalDocument {
     pub field: usize,
     pub revision: TextRevision,
     pub tokens: arrow_array::StringArray,
-    pub position: (Timestamp, u32),
+    pub position: super::SearchPosition,
 }
 
 impl TreeFile {
@@ -579,7 +579,7 @@ impl TreeFile {
             let start = lower_bound(keys.len(), |row| keys.value(row) < iid.as_slice());
             let end = lower_bound(keys.len(), |row| keys.value(row) <= iid.as_slice());
             for row in start..end {
-                found.push(super::KeyedEvent { system_from: bounds[0].value(row), valid_from: bounds[1].value(row),
+                found.push(super::KeyedEvent { position: super::read_event_position(events.column(6).as_ref(), row), system_from: bounds[0].value(row), valid_from: bounds[1].value(row),
                     valid_to: bounds[2].value(row), op: super::op_of(operations.value(row))? });
             }
         }
@@ -638,7 +638,7 @@ impl TreeFile {
                 for row in start..end {
                     let document = docs.value(row);
                     found.entry(iid).or_default().push(PackedEvent {
-                        header: EventHeader { iid, system_from: Timestamp(bounds[0].value(row)), commit_position: locations[0].value(row),
+                        header: EventHeader { position: super::read_event_position(events.column(6).as_ref(), row), iid, system_from: Timestamp(bounds[0].value(row)), commit_position: locations[0].value(row),
                             valid_time: Interval::from_micros(bounds[1].value(row), bounds[2].value(row))?, op: super::op_of(operations.value(row))? },
                         member: locations[1].value(row), page: locations[2].value(row), row: locations[3].value(row),
                         document: (document < super::NULL_DOC).then_some(document),
@@ -678,13 +678,14 @@ impl TreeFile {
                     field: fields.value(row) as usize, revision: revisions.value(row).try_into().map_err(fault)?,
                     tokens: tokens.value(row).as_string::<i32>().clone(),
                     position: (Timestamp(sequences.column(3).as_primitive::<Int64Type>().value(row)),
+                        super::read_event_position(sequences.column(5).as_ref(), row),
                         sequences.column(4).as_primitive::<UInt32Type>().value(row)) });
             }
         }
         Ok(documents)
     }
 
-    pub(crate) async fn erases(&self, memory: &Arc<rtdb_types::MemoryBudget>) -> Result<(BTreeMap<Iid, (Timestamp, u32)>, Arc<rtdb_types::MemoryReservation>)> {
+    pub(crate) async fn erases(&self, memory: &Arc<rtdb_types::MemoryBudget>) -> Result<(BTreeMap<Iid, super::SearchPosition>, Arc<rtdb_types::MemoryReservation>)> {
         let mut erases = BTreeMap::new();
         let mut charge = memory.reserve(4096)?;
         for batch in self.all(ERASES).await? {
@@ -696,7 +697,7 @@ impl TreeFile {
             let times = rows.column(1).as_primitive::<Int64Type>();
             let positions = rows.column(2).as_primitive::<UInt32Type>();
             for row in 0..rows.len() {
-                if erases.insert(Iid::from_slice(iids.value(row))?, (Timestamp(times.value(row)), positions.value(row))).is_some() {
+                if erases.insert(Iid::from_slice(iids.value(row))?, (Timestamp(times.value(row)), super::read_event_position(rows.column(3).as_ref(), row), positions.value(row))).is_some() {
                     return Err(corrupt("Search file repeats an erase witness"));
                 }
             }
@@ -741,7 +742,7 @@ mod tests {
         let columns = ["body".to_owned()];
         let mut rows: Vec<_> = (0..8192).map(|id| {
             let identity = EntityId::Integer(id);
-            super::super::SearchRow { iid: identity.iid().0, identity: Some(identity), system_from: 1, valid_from: 0,
+            super::super::SearchRow { position: None, iid: identity.iid().0, identity: Some(identity), system_from: 1, valid_from: 0,
                 valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(if id % 2 == 0 { "report audit audit" }
                     else { "report audit about the library" }))] }
         }).collect();
@@ -787,12 +788,22 @@ mod tests {
     async fn a_pack_authenticates_inline_routes_and_finds_versions_in_both_members() {
         let columns = ["body".to_owned()];
         let row = |iid, system_from, op, value: Option<&str>| super::super::SearchRow {
+            position: None,
             identity: None, iid: [iid; 16], system_from, valid_from: 0, valid_to: i64::MAX,
             op, values: vec![value.map(tokens)],
         };
         let mut file = tempfile::tempfile().unwrap();
+        let newer = super::super::SearchRow {
+            position: Some(rtdb_types::EventPosition { transaction: rtdb_types::TxId(10), ordinal: 0 }),
+            ..row(1, 2, EventOp::Delete, None)
+        };
+        let older = super::super::SearchRow {
+            position: Some(rtdb_types::EventPosition { transaction: rtdb_types::TxId(9), ordinal: 0 }),
+            ..row(1, 2, EventOp::Put, Some("audit report"))
+        };
+        let expected = [newer.position, older.position];
         let members = [
-            vec![Ok(vec![row(1, 3, EventOp::Delete, None)]), Ok(vec![row(1, 2, EventOp::Put, Some("audit report"))])],
+            vec![Ok(vec![newer]), Ok(vec![older])],
             vec![Ok(vec![row(9, 2, EventOp::Put, Some("separate report"))])],
         ];
         super::super::write_versioned_group(&columns, members, "pack", 1, None, &mut file, None, PACKED_FORMAT_VERSION).unwrap();
@@ -818,8 +829,9 @@ mod tests {
         assert_eq!(versions.len(), 2);
         let first = &versions[&first];
         assert_eq!(first.iter().map(|event| (event.header.system_from, event.member, event.page, event.row)).collect::<Vec<_>>(),
-            [(Timestamp(3), 0, 0, 0), (Timestamp(2), 0, 1, 0)]);
-        assert_eq!(first.iter().map(|event| event.document.is_some()).collect::<Vec<_>>(), [false, true]);
+            [(Timestamp(2), 0, 0, 0), (Timestamp(2), 0, 1, 0)]);
+        assert_eq!(first.iter().map(|event| event.header.position).collect::<Vec<_>>(), expected);
+        assert_eq!(first.iter().map(|event| event.document.is_some()).collect::<Vec<_>>(), [false, false]);
         let second = &versions[&second][0];
         assert_eq!((second.member, second.page, second.row), (1, 0, 0));
     }
@@ -827,7 +839,7 @@ mod tests {
     #[test]
     fn format_eleven_can_be_read_with_the_arrow_search_api() {
         let columns = ["body".to_owned()];
-        let row = super::super::SearchRow { identity: None, iid: [7; 16], system_from: 1, valid_from: 0,
+        let row = super::super::SearchRow { position: None, identity: None, iid: [7; 16], system_from: 1, valid_from: 0,
             valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens("one two one"))] };
         let mut bytes = Vec::new();
         super::super::write_versioned_group(&columns, [[Ok(vec![row])]], "legacy", 42, None, &mut bytes, None,

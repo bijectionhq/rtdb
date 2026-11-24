@@ -49,12 +49,20 @@ ObservedStep(event) ==
       [] kind = "receipt-clock" -> ObserveReceiptClock(cut) /\ authority'.receiptClock = epoch
       [] kind = "collect-receipt" -> CollectReceipt /\ authority.receiptClock = cut
       [] kind = "redeem-receipt" -> RedeemReceipt(publication, outcome)
+      [] kind = "certify-decision" -> CertifyDecision(cut)
+      [] kind = "publish-decision" -> PublishDecision(epoch, cut)
+      [] kind = "ack-commit" -> AcknowledgeCommit(cut)
+      [] kind = "install-recovery-fence" -> InstallRecoveryFence(cut)
       [] kind = "change-loglet" -> ChangeLoglet /\ authority'.loglet = epoch
       [] kind = "read-index" -> ConfirmReadIndex(epoch, cut)
       [] kind = "capture-fresh" -> CaptureFresh(cut) /\ authority.indexFor = epoch
       [] kind = "acknowledge" -> Acknowledge(cut)
       [] kind = "prepare-erasure" -> PrepareErasure /\ publication = "old"
       [] kind = "arm-erasure" -> ArmErasure /\ checkpoint = cut /\ publication = "old"
+      [] kind = "admit-transport-answer" -> AdmitTransportAnswer /\ authority'.delivery.deadline = cut /\ publication = "old"
+      [] kind = "handoff-transport-answer" -> HandoffTransportAnswer(outcome = "complete") /\ authority.delivery.time = cut /\ publication = "old"
+      [] kind = "advance-transport-time" -> AdvanceTransportTime /\ authority'.delivery.time = cut /\ publication = "old"
+      [] kind = "refuse-transport-answer" -> RefuseTransportAnswer /\ authority.delivery.time = cut /\ publication = "old"
       [] kind = "revoke-key" -> RevokeKey /\ publication = "old"
       [] kind = "read-old-cache" -> ReadOldCachedPage(outcome) /\ query = cut /\ publication = "old"
       [] OTHER -> FALSE
@@ -70,8 +78,10 @@ Complete ==
     /\ source = {} /\ forkCopy = Needs(fork)
     /\ (~ExtendAuthorities \/
         /\ authority.confirmed = 1 /\ ~authority.retained /\ authority.clockRegressed
+        /\ authority.acknowledged = 1 /\ authority.activationFloor = 1
+        /\ authority.recoveryFence = 1 /\ authority.deletion = "old"
         /\ authority.redemption = "expired" /\ authority.captured = 1
-        /\ authority.cacheResult = "erased-under-view")
+        /\ authority.cacheResult = "erased-under-view" /\ authority.delivery.state = "refused")
     /\ IF DisposalEffectsOnly
         THEN phase = "disposing" /\ fork = 0
         ELSE phase = "disposed" /\ firstRecord = 2 /\ fork = 1

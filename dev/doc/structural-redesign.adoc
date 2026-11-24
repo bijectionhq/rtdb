@@ -7,7 +7,13 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Owner decisions
 
-* A client-supplied system time may not lead the source log's append time (tolerance zero).
+* A client-supplied system time may equal or follow the preceding system time and cannot lead the authenticated source-log append observation for the original request (tolerance zero).
+* An await token establishes a causal lower bound.
+  A system-time cap filters the chosen prefix, and a fresh admission can include later corrections below that cap.
+  An issued exact snapshot token identifies the same applied cut on every successful re-admission under current authorization, retention and custody.
+  A placed SQL token seals the original owner, partition position, physical generation, historical cap and clock interpretation.
+  A reopened node can serve the identical installed cut or its retained exact checkpoint.
+  An advanced head with the same historical timestamp never substitutes for the captured position.
 * A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
   SNAP-1 and DUR-1 are amended accordingly.
 * An erasure reaches forks that retain shared custody of that history.
@@ -17,14 +23,50 @@ The second review's Multi serving and custody boundaries extend that design.
 
 == Coordinates
 
-Commit order uses the ordered transaction position.
-The exact append-clock reading is a separate observation.
-Temporal SQL uses a strictly increasing system-time projection, which can advance by one chronon when an append-clock reading ties or regresses.
-A client-supplied ordinary system time is bounded by the append-clock observation.
-Reclamation uses a monotone catalog generation recorded by the residence ledger.
-Node-local monotonic durations only expire the holds of readers that stop renewing them.
-Receipt expiry uses the highest append-clock observation installed in the current history.
+A decision's identity and serialization order use its authenticated history, partition and position.
+Operation ordinals preserve the original order within each decision.
+Temporal SQL system time is nondecreasing and may tie.
+An automatic assignment uses the maximum of the previous system time and the original append observation, or the append observation at genesis.
+A corrected external hint retains its provenance and follows the same explicit bound if admitted as system time.
+Resolve SQL precedence inside a selected positional cut, filtering by system and valid time, and resolve equal system times by position and ordinal.
+Equal-time overwritten events remain identifiable at their positional cuts.
+A superseded equal-time event has no positive-length SQL system-time interval.
+The installed clock authority independently samples a durable monotone frontier, including while application histories are idle.
+A successor preserves its clock domain's frontier and fences the old authority.
+Live judgments require freshly certified evidence in the correct domain.
+The receiver binds its decision observation to the original predecessor, attempt, temporal terms, effects and outcome at the ordering step.
+Replay preserves that evidence.
+SQL CURRENT_TIMESTAMP uses the recorded query or decision clock.
+Physical acceptance requires certified bounds and timely original evidence from the journal's promised event.
+A copied record and a subsequent clock reading carry no original vote.
+Catalog admission uses a monotone floor recorded by the residence ledger.
+Physical reclamation requires a grant from the storage owner.
+Expiry closes issuance. Retained operations keep their dependencies until drain or an enforced bound through their last possible access.
+Receipt deadlines use the installed decision clock.
 Erasure starts at publication of the erasing generation and uses the custody authority's bounded grant clock.
+
+== Reclamation and recovery guarantees
+
+GC-1::
+An admitted read or fork holds every physical publication reachable from its admitted scope at the original basis for the promised lifetime, subject to ordered erasure.
+In-flight operations keep their dependencies through their final use and provider drain.
+A published recovery root holds its complete dependencies and required replay suffix.
+A packed member holds the physical pack that supplies it.
+
+GC-2::
+Only the physical owner may grant deletion of an immutable provider publication.
+In one ordered decision it consumes retirement evidence, establishes that the publication has no eligible dependencies, and permanently excludes new references or a late publication that could re-establish the dependency.
+The grant names the exact provider version or terminal creation identity and remains valid through retry and owner replacement.
+
+DUR-2::
+Every selectable recovery path authenticates a complete checkpoint and sufficient committed replay under the current recovery authority.
+Replacing a path preserves reconstruction of the acknowledged history within the supported fault model and fences superseded dependencies.
+A pointer in a fenced journal range confers no access to a detached payload, including when that journal returns or is restored.
+
+LIVE-2::
+Each retired physical publication becomes eligible after its last dependency drains and future use is fenced.
+Fair collection and eventual provider settlement or conclusive absence reclaim it while unrelated holds survive or excluded historical journals are unavailable.
+Media disposal has independent evidence.
 
 == Mechanisms
 
@@ -33,13 +75,24 @@ Erasure starts at publication of the erasing generation and uses the custody aut
 |Tension |Replacement |Deleted
 
 |System time as a physical clock
-|An ordinary client time is admitted only when it advances the head and does not exceed the log append time.
-An owned append witness compares against the exact log observation and uses the ordered system-time projection.
-An external source's commit time is clamped to the node clock.
-|Unbounded future client times and the resulting overflow cliff.
+|The ordered receiver validates positions and judges expiry on one certified clock observation, with equality at the deadline refusing.
+It materializes bounded acceptance-relative terms before validating the actual candidate.
+Funded service turns can bind a successful acceptance to an advertised grid reading in its half-open window.
+A missed window settles only upon original decision evidence or proven exclusion.
+|Successor smoothing, head-derived time reservations and system time as a deadline input.
+
+|Historical read re-admission
+|An issued exact token binds the stable database, history and partition roster, applied positions including empty cuts, catalog, ancestry, interpretation and authorized scope, temporal selectors, query clock and timezone.
+A reader acquires the corresponding hold before opening storage.
+Re-admission waits for that exact prefix or refuses, including if an await requirement is beyond the cut.
+A captured vector retains the consistency of its issuing read.
+The token carries no grant of access or retention.
+The original winner remains identifiable through compaction, recovery and erasure.
+Applicable custody can withhold that winner's bytes and cannot substitute an earlier winner.
+|Timestamp-vector snapshot tokens and lower-bound-plus-cap resumption.
 
 |History retention and privacy erasure
-|History collection retires data below a cut protected by the residence ledger.
+|History collection withdraws publications and grants deletion when no admitted scope reaches their physical identities.
 Privacy erasure prepares readable successors, then publishes them and arms bounded key revocation within the affected custody domain.
 Recovery and compactor reset start from held recovery roots.
 |Permanent L0 retention, `reset_to_l0`, live recovery data sharing a destruction deadline without a successor.
@@ -50,17 +103,18 @@ Dependent forks retain scoped key grants.
 Independent exports own fresh keys.
 |Convergence based on independently generated ciphertext, copied keys in independent custody.
 
-|Volatile intake positions and durable transaction identity
-|An intake receipt names an epoch-qualified attempt.
-A checkpointed replica outcome binds the attempt to an applied causal basis.
-Placed clients redeem opaque receipts scoped to the authenticated principal and deployment history.
-Closing an epoch establishes negative outcomes only after the successor installs the recovered prefix.
-|Public reuse of volatile source offsets.
+|Placed receiver admission and decision
+|A provisional intake token names an offer.
+Covered work begins when the receiver durably reserves the original scoped attempt slot and its settlement capacity.
+The installed receiver orders the effect, refusal or fence with its exact terminal witness.
+Once applied, that witness yields a causal basis under the original principal and lineage.
+The receiver keeps unresolved obligations charged across receipt expiry and transfers them at a writable succession.
+|Volatile admission, window-based settlement and public reuse of source offsets.
 
 |Directory leases, idle cost and fresh reads
-|The installed loglet confirms its writer epoch and supplies an on-demand read index.
-A fresh reader waits for that prefix to apply.
-|Directory authority over log serving, periodic freshness writes.
+|The active journal quorum supplies a certified decision cut on demand.
+The serving attachment holds and applies the exact selected cut before capture.
+|Directory authority over log serving, speculative payload-tip sampling and periodic freshness writes.
 
 |Search relevance and optional acceleration
 |Two-argument scores use only the document and query.
@@ -69,8 +123,9 @@ Corpus-relative scores take the corpus statistics as arguments.
 
 |No reference authority
 |One linearizable residence ledger per database: the Multi directory record, or a conditional-write object in classic deployments.
-Readers hold a catalog generation by compare-and-swap before opening storage and renew while they read.
-The collector advances a floor below every live hold and recovery root and deletes only objects retired at or below it.
+Readers register the exact manifest scope before opening storage.
+The catalog floor controls admission to advertised history.
+The physical owner checks reachability and orders deletion against new references at the same ledger head.
 |`garbage_lifetime`, the fixed read lease and its collector wait, the reaper grace and wall-clock release stamps, the unbounded in-process registry.
 
 |Positional names
@@ -78,8 +133,13 @@ The collector advances a floor below every live hold and recovery root and delet
 |The reset fence against running collection.
 
 |System state in user tables
-|An engine-owned receipt map keyed by database, principal and key, holding a body digest; the resolver answers a duplicate with the original outcome and a mismatched body with `rtdb/idempotency-conflict`.
-Receipts and transaction metadata expire by log time and are removed physically.
+|The RTDB retry key binds a transaction in its registered receiver scope of database and authenticated principal.
+The resolver compares its transaction body digest, replays the original outcome within the receipt window and reports `rtdb/idempotency-conflict` for a changed body.
+Application intent lookup and labelled command comparison belong to the application or its kernel adapter.
+For an owned publication, the deciding history orders the slot witness and guarded decision with the effects.
+Repair preserves the original position and applies current custody masks.
+A successor installs authenticated exclusion and transfer evidence before admitting inherited work.
+The installed decision clock governs receipt expiry, readback and physical collection. Closed execution uses its independent slot fence.
 |`public.rtdb_idempotency_keys` and its SQL guard.
 
 |Proofs versus composition
@@ -109,57 +169,105 @@ Each remaining increment has a design and handoff note in link:../../verificatio
 |Landed; an input digest is unnecessary while an epoch separates every reset
 
 |4
-|Residence ledger with holds and collection floor; delete the timer stack.
+|Residence ledger with holds and an admission floor; delete the timer stack.
 |Multi, native local storage, and classic S3, Azure and GCS storage enforce a catalog admission floor and retry trie retirement from installed receipts.
 Classic remote holds use conditional writes and finish after admitted provider work drains.
-Compaction on coordinated storage holds its live inputs through provider drain.
+Compaction and stored artefact builds on coordinated storage hold their input catalogs through provider drain.
 Query and fragment admission on coordinated storage uses the catalog hold without sampling tip currency.
 Hosted exact trie and replica-payload releases use their installed authority without reaper grace.
-Abandoned remote hold recovery, renewal, full recovery-root integration and timer removal remain open.
+The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
+The approved reachability contract replaces the cutoff for deletion.
+For hosted and versioned Classic S3 loose compacted primary files with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
+Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
+Abandoned remote hold recovery, renewal, full recovery-root integration and the remaining search, fork and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.
 |Multi binds checkpoint metadata and startup suffix holds.
-Pending archive captures protect their journal interval until archive publication or expiry.
+Coordinated native local startup retains its recovery media through checkpoint discovery and cursor admission under the same filesystem gate used by trie and metadata deletion.
+Startup and compactor reset share the primary inventory check for missing or wrong-length data and metadata files.
+Pending archive suffix pins protect their certified journal interval until archive publication or expiry.
 Recovery can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
 Enrolled terminal storage can retire loose files with a write witness and an installed release.
-Opted-in versioned S3 deployments retire exact oversized replica payloads after a certified directory cut and fsync-backed trim from every known physical journal.
-Normal readers hold those payloads through provider drain.
+The existing versioned S3 payload collector still waits for the known physical journals to trim. The approved contract requires brokered recovery exclusion and drain before independent payload settlement.
+Normal readers register bounded replay holds and retain delivered pointers through provider drain. Archive and transfer reads require an admitted region covering the certified pointer's position.
+The offload retirement record binds the certified sealed frame digest and original replica position to the observed physical publication.
+Installed journal delivery resolves the one payload authenticated at its replica position through the serving lease and unit-key owner.
+Directory-managed serving writes publish detached bodies through the replay broker. Serving tails and ranges redeem the committed reference through the broker under a durable replay ticket.
+The broker verifies the committed position without opening the sealed journal frame and holds its own admission through delivery and drain. It opens only the detached object namespace and unit-key vault.
+Archive suffix capture, terminal transfer replay and timestamp-fork reads redeem their detached references through the same broker.
+Checkpoint transfer seeds detached bodies through a separate transfer credential and binds the destination provider publication into the re-sealed pointer.
+Cross-cell handoff retains the original replay interval and republishes each detached body under the destination broker before seeding its journal.
+The hosted configuration gives the broker distinct object and key custody and grants ordinary workers scoped RPC access.
+Independent payload settlement still requires complete installed references and a recovery dependency fence.
+Installed checkpoint preparations publish the names of their immutable destination members and manifest to the journal.
+Inline appends without new provider dependencies publish an empty reference set.
+Installed upload, trie, artefact and detached-body appends resolve their dependencies against the admitted replay catalog and attest the observed S3 publication addresses.
+Unidentified provider addresses or unknown record types keep the journal fence closed.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
 The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
-Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a readable newer pack.
+Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a successor root that matches the published checkpoint digest.
 Full recovery closures, terminal coverage for other mixed packs and live provider qualification remain open.
 
 |6
 |Sealing and the key ledger for every durable unit.
 |Installed serving objects and independently copied checkpoint members, including their manifests and preparation records, use per-publication slots in the local or S3 key vault.
 Installed replay opens detached payloads under the original serving slot.
-Local checkpoint and serving-prefix retirement fence and withdraw every vault slot in the retired namespace, including slots from interrupted writes.
-S3 checkpoint retirement withdraws its listed slots.
-S3 serving-prefix slot census and retirement, directory-managed and classic stores, and archive and transfer coverage remain open.
+Local and S3 checkpoint and serving-prefix retirement fence and withdraw the vault namespace census, including slots registered before interrupted writes.
+Local and S3 checkpoint captures and ordered transfer manifests, segments, and detached payloads hold independent slots within their capture or destination authority.
+Classic object roots may enroll a separate key vault for local and built-in remote providers.
+Classic local source and replica logs use independent publication slots under their enrolled log lineages.
+Coordinated Classic trie retirement withdraws slots behind its exact release authority.
+Primary and replay stages keep their members and manifest in a separate destination inventory with independent slots. Transfer activation opens that inventory, writes its verified serving closure and withdraws the stage namespace through the original vault after directory activation. Detached replay bodies stay with the credential-separated broker.
+Directory-managed replica journal frames use independently registered slots. A cross-cell move or transfer seed verifies the source pages and reseals them at their original offsets under destination slots. Directory trim persists the certified frame census before truncation and withdraws those slots under the exact directory grant. Residence disposal also sweeps orphan slots.
+Classic Kafka database logs seal frames before enqueueing and use the original vault lineage bound to the broker topic ID. The vault records the exact frame at each acknowledged offset and retires recorded slots below a confirmed broker floor.
+Classic offline repair-anchor reclamation withdraws the exact sealed local-log frame slots before overwriting their ciphertext and preserves the replica boundary.
+Directory-managed ordered-index pages use per-page slots in their admitted generation. The index custodian withdraws the entire generation, including unplaced slots, before ciphertext collection.
+Other live directory serving objects and per-unit retirement outside coordinated releases remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.
 |The operation-only local archive broker persists scheduled capture-key revocation and attests physical settlement on the original media.
 Installed serving reads enforce their journal lease through body delivery, and installed payload cryptography bounds each provider operation.
 Installed recovery opens independently sealed checkpoint closures before their publication, then serves and replays from the selected closure.
-SQL erasure still requires ordered closure of affected admissions, a complete survivor rebuild and retiring-key census, bounded plaintext drain, and evidenced provider destruction.
+The installed journal orders clean checkpoint publication, key rotation, and old-root and replay admission closure together. Its accepting quorum reads back both durable voter slots and the installed RTDB custodian verifies the signed evidence before it asks for a deadline.
+Plaintext delivery inherits the originating object read lease and cannot extend it through a separate key check.
+The coordinator distinguishes the current provider's 120-second operational target from a signed fixed commitment. A fixed request requires an authenticated deadline reservation before the switch. The original authority's separate destruction evidence binds the switch, retiring inventory, completed drain, and provider disposition.
+Production SQL erasure still requires a complete survivor rebuild and retiring-key census, bounded plaintext and egress drain, and evidenced provider destruction.
 
 |8
 |Transaction metadata retention.
 |Ordered expiry, historical transaction projection and receipt compaction landed.
 New recovery checkpoints omit covered receipt tries, placed intake releases applied records, and new native skip diagnostics omit receipt fields.
-Opted-in hosted directory deployments can retire exact loose receipt L0 versions after a successor and settled journal trim.
-Retirement of every earlier copy remains open.
+Directory deployments can retire loose receipt L0 through their custodian after successor publication and certified replay exclusion.
+An exact record erase co-orders erasure of transaction metadata explicitly associated with that record.
+Classic local repair-base maintenance settles covered log payloads and skip diagnostics, and pack retirement accepts an independent successor that omits covered receipt members.
+New held-world suffixes authenticate exact business effects before leaving receipt state with its original authority. Held checkpoint reads open only business members of the authenticated manifest.
+Classic S3 can settle an exact compacted receipt version bound to an installed release and the publication recorded by compaction.
+Active installed grants submit receipt trie publications with their exact installed removal. The S3 consumer verifies the successor and asks the journal for an exact object fence before withdrawing the key slot and settling the version or terminal publication.
+The v3 suffix cutover requires exact copied-payload evidence and reset installations. The reaper requires both the target and release publication and leaves unbound copies outside its grant.
+Installed checkpoint and replay producers submit the S3 allocation references used by the fence.
+Active files remain pending when any selected dependency lacks a complete reference or the provider lacks an exact publication witness.
+Quiet histories depend on the ordered clock work in T4.
 
 |9
 |Capabilities, the composed residence model and trace validation, extended as each increment lands.
-|Fresh snapshot capture retains the exact read index through capture, and hosted exact removal consumes a lineage deletion grant.
-The shared model and replay cover the R1–R8 authority transitions in a bounded residence.
-Multi records scoped native observations for diagnostic validation.
-Full storage-read and recovery-acknowledgement capability coverage, cross-owner native replay and execution evidence remain open.
+|Catalog holds bind pool residence and physical cut through queries, compaction and stored artefact builds.
+Checkpoint discovery at startup and coordinated Classic checkpoint loads carry their existing recovery holds into provider drain.
+Local and remote object stores, the disk cache, S3 inventory, local journals and remote vault discovery bind their opened owner and exact target at I/O admission.
+PostgreSQL rows and COPY, Flight statements and materialized Flight actions carry delivery grants for the originating unit, deployment or archive keys.
+Local vault locks retain exact custody through delivery, and remote key providers drain bounded grants after fencing.
+PostgreSQL and Flight enforce the original answer cutoff on socket writes and flushes, including on gateway egress.
+A multiplexed Flight connection retains its earliest protected cutoff and closes at that deadline.
+Held-world replies carry the original replay dependencies across the archive worker.
+Hosted PostgreSQL feedback follows the exact published recovery root.
+The bounded replay includes quorum publication before acknowledgement, recovery exclusion before deletion, and refusal of a paused answer at its transport deadline.
+Native replay joins portable T1 decisions to the applied catalog and frontend answer, and checks the covering decision for directory checkpoint publication.
+It correlates broker reads with both replay holds, checkpoint publication and trim with dependent version removal, and installed receipt removal with the exact journal fence.
+General T2 reachability and recovery exclusion and execution evidence remain open.
+Cross-host cutoff checks rely on a consistent wall-clock domain, and remote vault settlement retains its clock-rate margin.
 |===
 
 == Placed serving and search
@@ -180,9 +288,43 @@ The deployment remains pinned to a compatible release.
 Receipt compaction removes erased payloads from successor tries.
 Earlier physical copies remain subject to the custody of their source logs, replica logs, checkpoints and archives.
 See link:../../verification/redesign/R8-metadata-retention.md[receipt retention and custody].
-Native logkeepers persist the active ensemble after recovery and supply an on-demand read index from its durable quorum.
-An implicit read on a linearizable subscriber waits for the read-index bound to be applied before it captures its time basis.
-The gateway retries a subscriber refusal on the holder when the command is still unanswered and the backend reports an idle transaction state.
+=== Certified decisions and fresh reads
+
+A placed append receipt names an exact decided prefix of the authoritative history.
+The fenced writer obtains durable payload votes, then installs the decision certificate on a quorum of distinct physical journals in the active configuration before releasing the append receipt.
+Each vote binds the original configuration, journal and exact digest of the recoverable prefix.
+A certificate binds the certified predecessor and the admission evidence for the suffix.
+A synchronous transaction reply also requires application of the exact batch and outcome.
+Provisional intake receipts only name an attempt.
+
+A fresh read probes the active configuration with a fresh invocation nonce and selects the greatest compatible installed certificate from a quorum.
+It covers every cut installed on a quorum before invocation, including when a reply was lost, and every earlier completed fresh read in the same history.
+If its probe or a supplied proof establishes quorum installation, capture may proceed.
+Otherwise the reader writes back the same certificate to a quorum, accepting an attested extension while keeping the selected cut fixed.
+Uncertified staged bytes above the selection add no read dependency.
+
+Holder and subscriber use the same freshness contract.
+The serving attachment acquires protection for the original checkpoint and suffix, waits for same-history application and captures catalog and data at the selected cut.
+Freshness is retryably unavailable when authority, quorum installation, custody or exact application cannot be established.
+With a stable active quorum, recoverable data and sufficient apply and query service, a reader can serve without the writer or silent journals.
+Gateway routing may refresh and retry a replay-safe unpinned read within the same history before output, preserving its audience and causal constraints.
+A transaction or explicit basis keeps its original cut.
+
+The predecessor seals on its own quorum, fencing old votes and returning durable decisions in the same local order.
+Recovery preserves compatible certificates and potentially chosen ordinary values from sealed accepted evidence.
+Before activation a successor quorum installs the recovered prefix and its usable recovery closure.
+An authenticated handoff binds both configurations, including disjoint rosters.
+Trim retains decision and dependency evidence or a certified covering checkpoint.
+
+Strict physical admission has a separate settlement rule and uses the same decision installation.
+Acceptance requires original durable votes from distinct journals of the recorded roster whose authenticated post-sync upper samples, under the installed clock bound, are strictly before the exclusive cutoff.
+Copies and later samples carry no original vote.
+An accepted guarded tip is certified and installed before transfer or visibility.
+Recovery fences original issuance and can exclude the attempt only with durable evidence that too few original voters could have qualified.
+Missing samples, silence and clock advance leave the attempt unknown when acceptance and exclusion are both possible.
+The guarded slot stays exclusive and successor activation waits for settlement.
+An active reader may still serve the earlier certified cut.
+Publication, application and reply follow original eligibility and have separate service requirements.
 The native scoring contract is specified in link:fts.allium[Full-text search].
 
 === Ranked cutoff at ties

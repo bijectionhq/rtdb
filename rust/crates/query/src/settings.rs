@@ -4,6 +4,43 @@ use rtdb_plan::{QuerySettings, SettingValue};
 use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, Value};
 use crate::{CatalogSnapshot, QueryContext, invalid};
 
+#[async_trait::async_trait]
+pub trait SnapshotAdmission: Send + Sync {
+    async fn reopen(&self, token: &str, current: &QueryContext) -> Result<SqlSnapshotView>;
+}
+
+pub type SnapshotTokenIssuer = dyn Fn(SqlSnapshotView) -> Result<String> + Send + Sync;
+
+/// Exactly the catalog and interpretation admitted for the original execution.
+/// Session and request owners are installed afresh when redeeming this view.
+#[derive(Clone)]
+pub struct SqlSnapshotView {
+    pub catalog: CatalogSnapshot,
+    pub current_time: Instant,
+    pub timezone: String,
+}
+
+impl SqlSnapshotView {
+    pub fn database(&self) -> &str { &self.catalog.default_database }
+
+    pub fn retained_bytes(&self) -> Result<usize> {
+        self.timezone.capacity().checked_add(catalog_bound(&self.catalog)?).ok_or_else(size_error)
+    }
+
+    pub fn from_exact_partition(
+        current: &QueryContext, snapshot: rtdb_index::Snapshot, current_time: Instant,
+    ) -> Result<Self> {
+        let mut catalog = current.catalog.clone();
+        let database = Arc::make_mut(&mut catalog.databases).get_mut(&catalog.default_database)
+            .filter(|database| database.partitions.len() == 1)
+            .ok_or_else(|| invalid("snapshot-scope", "An exact partition must replace one admitted partition"))?;
+        database.partitions[0] = snapshot;
+        // Resolve all file grants again for the replacement partition.
+        catalog.reset_sql_snapshot_view();
+        Ok(Self { catalog, current_time, timezone: current.timezone.clone() })
+    }
+}
+
 pub(crate) struct ReadBasis {
     times: Option<TimeBasis>,
     snapshot_time: Option<Timestamp>,
@@ -36,10 +73,68 @@ impl QueryContext {
     pub fn with_read_options(self: Arc<Self>, times: &TimeBasis, snapshot_time: Option<Timestamp>, clock_fallback: impl Into<rtdb_types::Instant>) -> Result<Arc<Self>> {
         let charge = self.memory.reserve(basis_bound(times)?.checked_add(catalog_bound(&self.catalog)?).ok_or_else(size_error)?)?;
         let times = times.clone();
-        let token = Some(rtdb_format::basis::encode_time_basis(&times));
+        let token = None;
         let mut context = self.execution_child();
         Arc::get_mut(&mut context).ok_or_else(|| invalid("settings-owner", "New context is unexpectedly shared"))?.read_basis = Some(Arc::new(ReadBasis { times: Some(times), snapshot_time, clock_fallback: clock_fallback.into(), token, _reservation: charge }));
         Ok(context)
+    }
+
+    pub fn with_snapshot_token_issuer(mut self: Arc<Self>, issuer: Arc<SnapshotTokenIssuer>) -> Arc<Self> {
+        Arc::make_mut(&mut self).snapshot_tokens = Some(issuer);
+        self
+    }
+
+    pub fn with_snapshot_admission(mut self: Arc<Self>, admission: Arc<dyn SnapshotAdmission>) -> Arc<Self> {
+        Arc::make_mut(&mut self).snapshot_admission = Some(admission);
+        self
+    }
+
+    pub fn with_snapshot_view(mut self: Arc<Self>, mut view: SqlSnapshotView, token: String) -> Result<Arc<Self>> {
+        view.catalog.runtime = self.catalog.runtime.clone();
+        let context = Arc::make_mut(&mut self);
+        context.catalog = view.catalog;
+        context.current_time = view.current_time;
+        context.timezone = view.timezone;
+        self.with_exact_snapshot_token(token)
+    }
+
+    pub async fn reopen_sql_snapshot(self: Arc<Self>, settings: &QuerySettings, parameters: rtdb_expr::Parameters<'_>) -> Result<Arc<Self>> {
+        let Some(setting) = &settings.snapshot_token else { return Ok(self); };
+        match setting_value(setting, parameters)? {
+            Value::Null | Value::Undefined => Ok(self),
+            Value::Utf8(token) if self.snapshot_token() == Some(token) => Ok(self),
+            Value::Utf8(token) => {
+                if self.snapshot_token().is_some() || settings.clock_time.is_some() || settings.snapshot_time.is_some() {
+                    return Err(invalid("snapshot-scope", "An exact snapshot fixes its catalog, clock and system ceiling"));
+                }
+                let admission = self.snapshot_admission.as_ref().ok_or_else(|| invalid("snapshot-unretained", "No SQL snapshot owner is installed"))?;
+                let view = admission.reopen(token, &self).await?;
+                self.with_snapshot_view(view, token.to_owned())
+            }
+            _ => Err(invalid("invalid-snapshot-token", "SNAPSHOT_TOKEN requires a string or null")),
+        }
+    }
+
+    pub fn issue_snapshot_token(&self) -> Result<Option<String>> {
+        if let Some(token) = self.snapshot_token() { return Ok(Some(token.to_owned())); }
+        let Some(issuer) = &self.snapshot_tokens else { return Ok(None); };
+        self.check_cancelled()?;
+        let mut catalog = self.catalog.clone();
+        catalog.runtime = None;
+        catalog.fragmenter = None;
+        catalog.fragment_residence = None;
+        issuer(SqlSnapshotView { catalog, current_time: self.current_time, timezone: self.timezone.clone() }).map(Some)
+    }
+
+    pub fn with_exact_snapshot_token(mut self: Arc<Self>, token: String) -> Result<Arc<Self>> {
+        let charge = self.memory.reserve(token.len().checked_add(256).ok_or_else(size_error)?)?;
+        let current_time = self.current_time;
+        let caps = captured_caps(&self.catalog);
+        Arc::make_mut(&mut self).read_basis = Some(Arc::new(ReadBasis {
+            times: caps, snapshot_time: None, clock_fallback: current_time,
+            token: Some(token), _reservation: charge,
+        }));
+        Ok(self)
     }
 
     /// Reuses the captured store generation and lease while lowering one owned read's system cap.
@@ -66,7 +161,7 @@ impl QueryContext {
         context.current_time = system_time.into();
         context.cancellation = cancellation.child_token();
         context.read_basis = Some(Arc::new(ReadBasis {
-            token: Some(rtdb_format::basis::encode_time_basis(&times)),
+            token: None,
             times: Some(times), snapshot_time: Some(system_time), clock_fallback: system_time.into(),
             _reservation: charge,
         }));
@@ -94,21 +189,41 @@ impl QueryContext {
         };
         let mut times = if let Some(expression) = &settings.snapshot_token {
             match setting_value(expression, parameters)? {
-                Value::Null | Value::Undefined => default_basis(&self.catalog),
-                Value::Utf8(token) => Some(rtdb_format::basis::decode_time_basis(token)?),
+                Value::Null | Value::Undefined => captured_caps(&self.catalog),
+                Value::Utf8(token) if self.snapshot_token() == Some(token) => captured_caps(&self.catalog),
+                Value::Utf8(_) => return Err(invalid("snapshot-unretained", "SNAPSHOT_TOKEN must be readmitted before binding")),
                 _ => return Err(invalid("invalid-snapshot-token", "SNAPSHOT_TOKEN requires a string or null")),
             }
         } else if let Some(basis) = &self.read_basis { basis.times.clone() }
         else { captured_caps(&self.catalog) };
         validate_basis(times.as_ref(), &self.catalog)?;
-        let snapshot_time = self.read_basis.as_ref().and_then(|basis| basis.snapshot_time);
+        let requested_cap = match &settings.snapshot_time {
+            Some(SettingValue::TimestampLiteral(text)) =>
+                Some(rtdb_types::parse_sql_timestamp_instant(text, &self.timezone)?.as_micros()?),
+            Some(expression) => match setting_value(expression, parameters)? {
+                Value::Null | Value::Undefined => None,
+                value => Some(rtdb_expr::timestamp_micros(value, &self.timezone)?),
+            },
+            None => None,
+        };
+        if self.snapshot_token().is_some() && requested_cap.is_some() {
+            return Err(invalid("snapshot-scope", "An exact snapshot fixes its system ceiling"));
+        }
+        let option_cap = self.read_basis.as_ref().and_then(|basis| basis.snapshot_time);
+        let snapshot_time = match (option_cap, requested_cap) {
+            (Some(option), Some(requested)) => Some(option.min(requested)),
+            (option, requested) => option.or(requested),
+        };
         if let Some(cap) = snapshot_time { times = times.map(|times| times.capped_at(cap.into())); }
-        let token = times.as_ref().map(rtdb_format::basis::encode_time_basis);
+        if self.snapshot_token().is_some() && current_time != self.current_time {
+            return Err(invalid("snapshot-scope", "A readmitted snapshot fixes its original query clock"));
+        }
+        let token = self.snapshot_token().map(str::to_owned);
         let mut catalog = self.catalog.clone();
         for (name, database) in Arc::make_mut(&mut catalog.databases) {
             for (index, partition) in database.partitions.iter_mut().enumerate() {
                 let cap = times.as_ref().and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten().map(|time| time.as_micros()).transpose()?;
-                let visible = cap.zip(partition.tx_basis()).map(|(cap, head)| cap.min(head.system_time));
+                let visible = cap.or(snapshot_time).zip(partition.tx_basis()).map(|(cap, head)| cap.min(head.system_time));
                 *partition = partition.clone().with_system_time_cap(visible)?;
             }
         }
@@ -128,14 +243,6 @@ fn setting_value<'a>(expression: &'a SettingValue, parameters: rtdb_expr::Parame
         SettingValue::TimestampLiteral(_) => Err(invalid("invalid-setting-value", "An unadmitted timestamp literal requires CLOCK_TIME resolution")),
         SettingValue::Unevaluated { .. } => Err(invalid("invalid-setting-value", "Query settings resolve literals and parameters, not scalar expressions")),
     }
-}
-
-fn default_basis(catalog: &CatalogSnapshot) -> Option<TimeBasis> {
-    let databases: BTreeMap<_, _> = catalog.databases.iter().filter_map(|(name, database)| {
-        let times: Vec<_> = database.partitions.iter().map(|snapshot| snapshot.tx_basis().map(|key| key.system_time.into())).collect();
-        times.iter().any(Option::is_some).then(|| (name.clone(), times))
-    }).collect();
-    (!databases.is_empty()).then_some(TimeBasis { databases })
 }
 
 fn captured_caps(catalog: &CatalogSnapshot) -> Option<TimeBasis> {

@@ -67,6 +67,7 @@ pub(crate) struct AudienceSession {
 pub(crate) struct Session {
     pub id: String,
     pub caller: Arc<Caller>,
+    pub fresh_replica: bool,
     placement: Option<Placement>,
     state: Mutex<SessionState>,
     _reservation: Arc<MemoryReservation>,
@@ -74,10 +75,10 @@ pub(crate) struct Session {
     audience: Option<AudienceSession>,
 }
 impl Session {
-    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, audience: Option<AudienceSession>, reservation: Arc<MemoryReservation>) -> Self {
+    pub fn new(id: String, caller: Arc<Caller>, local: Option<&Arc<Database>>, fresh_replica: bool, audience: Option<AudienceSession>, reservation: Arc<MemoryReservation>) -> Self {
         let placement = local.map(|database| Placement { name: database.name().into(), attachment: Arc::downgrade(database) });
         Self {
-            id, caller, placement,
+            id, caller, placement, fresh_replica,
             state: Mutex::new(SessionState::Open { connections: BTreeMap::new(), catalog: None, audience_generation: 0, audience_read: None }),
             _reservation: reservation,
             audience,

@@ -1,0 +1,31 @@
+{
+  "summary": "The installed clock's production transition requires an advancing elapsed observation, admits takeover only at expiry, and refuses future and expired samples.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 6,
+  "controls": {
+    "refresh_a_stalled_clock": {
+      "mutate": [{
+        "file": "rust/crates/directory/src/receiver_clock_step.rs",
+        "find": "    observed > previous && (same_publisher || observed >= expires)",
+        "replace": "    observed >= previous && (same_publisher || observed >= expires)"
+      }],
+      "expect": [{"file": "rust/crates/directory/src/receiver_clock_step.rs", "function": "advances_frontier", "category": "postcondition not satisfied"}]
+    },
+    "permit_early_takeover": {
+      "mutate": [{
+        "file": "rust/crates/directory/src/receiver_clock_step.rs",
+        "find": "    observed > previous && (same_publisher || observed >= expires)",
+        "replace": "    observed > previous"
+      }],
+      "expect": [{"file": "rust/crates/directory/src/receiver_clock_step.rs", "function": "advances_frontier", "category": "postcondition not satisfied"}]
+    },
+    "admit_an_expired_sample": {
+      "mutate": [{
+        "file": "rust/crates/directory/src/receiver_clock_step.rs",
+        "find": "    instant <= elapsed && elapsed < expires",
+        "replace": "    instant <= elapsed && elapsed <= expires"
+      }],
+      "expect": [{"file": "rust/crates/directory/src/receiver_clock_step.rs", "function": "sample_is_fresh", "category": "postcondition not satisfied"}]
+    }
+  }
+}

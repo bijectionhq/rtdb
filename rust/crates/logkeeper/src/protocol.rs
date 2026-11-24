@@ -2,6 +2,7 @@
 //! A client sends `Request`s and receives `Response`s carrying the same id, in any order.
 //! One connection multiplexes every stream; a server decides a connection's mutations in arrival order.
 
+use crate::decision::{DecisionCertificate, DecisionInstallation, DecisionVote, DecisionVoteRequest, Handoff, HandoffCertificate, StableDecision};
 use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -134,6 +135,8 @@ pub(crate) struct Seal {
     pub stream: String,
     #[prost(uint64, tag = "2")]
     pub epoch: u64,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub nonce: Bytes,
 }
 
 /// Committed entries only; `wait_ms` long-polls when none are available at `from_lsn`.
@@ -184,6 +187,8 @@ pub(crate) struct Overwrite {
     pub commit_lsn: i64,
     #[prost(bytes = "bytes", tag = "7")]
     pub activate_ensemble: Bytes,
+    #[prost(bool, tag = "8")]
+    pub certified: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -194,6 +199,8 @@ pub(crate) struct Commit {
     pub epoch: u64,
     #[prost(sint64, tag = "3")]
     pub commit_lsn: i64,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub ensemble: Bytes,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -231,6 +238,61 @@ pub(crate) struct LogletCheck {
     pub epoch: u64,
     #[prost(bytes = "bytes", tag = "3")]
     pub ensemble: Bytes,
+    #[prost(bool, tag = "4")]
+    pub certified: bool,
+    #[prost(message, optional, tag = "5")]
+    pub handoff: Option<HandoffCertificate>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ReadIndexRequest {
+    #[prost(message, optional, tag = "1")]
+    pub loglet: Option<LogletCheck>,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub nonce: Bytes,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReadIndexReply {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub nonce: Bytes,
+    #[prost(sint64, tag = "2")]
+    pub decided: i64,
+    #[prost(sint64, tag = "3")]
+    pub visible: i64,
+    #[prost(message, optional, tag = "4")]
+    pub certificate: Option<DecisionCertificate>,
+    #[prost(message, optional, tag = "5")]
+    pub stability: Option<StableDecision>,
+    #[prost(bytes = "bytes", tag = "6")]
+    pub key: Bytes,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub signature: Bytes,
+    #[prost(message, optional, tag = "8")]
+    pub handoff: Option<HandoffCertificate>,
+}
+
+impl ReadIndexReply {
+    fn signing_bytes(&self, check: &LogletCheck) -> Vec<u8> {
+        let mut reply = self.clone();
+        reply.signature = Bytes::new();
+        let mut bytes = b"rtdb.logkeeper/read-index/v1".to_vec();
+        check.encode_length_delimited(&mut bytes).expect("Vec has capacity");
+        reply.encode_length_delimited(&mut bytes).expect("Vec has capacity");
+        bytes
+    }
+
+    pub(crate) fn sign(&mut self, check: &LogletCheck, signer: &rtdb_storage::attestation::SigningKey) {
+        self.key = Bytes::copy_from_slice(&signer.public_key());
+        self.signature = Bytes::copy_from_slice(&signer.sign(&self.signing_bytes(check)));
+    }
+
+    pub(crate) fn verifies(&self, check: &LogletCheck, journal: &str) -> bool {
+        let Ok(key) = <&[u8; 32]>::try_from(self.key.as_ref()) else { return false; };
+        let Ok(signature) = <&[u8; 64]>::try_from(self.signature.as_ref()) else { return false; };
+        crate::attestation::journal_id(key).to_string() == journal
+            && rtdb_storage::attestation::verifies(key, &self.signing_bytes(check), signature)
+    }
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -260,12 +322,19 @@ pub(crate) struct DigestPage {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub(crate) struct Identify {}
+pub(crate) struct Identify {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub nonce: Bytes,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct JournalIdentity {
     #[prost(string, tag = "1")]
     pub journal: String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub public_key: Bytes,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub signature: Bytes,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
@@ -282,6 +351,8 @@ pub(crate) enum RequestBody {
     Overwrite(Overwrite),
     #[prost(message, tag = "7")]
     Commit(Commit),
+    #[prost(message, tag = "33")]
+    Publish(Commit),
     #[prost(message, tag = "8")]
     Trim(Trim),
     #[prost(message, tag = "9")]
@@ -296,8 +367,8 @@ pub(crate) enum RequestBody {
     CheckSynced(Check),
     #[prost(message, tag = "14")]
     ActivateLoglet(LogletCheck),
-    #[prost(message, tag = "15")]
-    ReadIndex(LogletCheck),
+    #[prost(message, tag = "32")]
+    ReadIndex(ReadIndexRequest),
     #[prost(message, tag = "16")]
     Identify(Identify),
     #[prost(message, tag = "18")]
@@ -307,13 +378,21 @@ pub(crate) enum RequestBody {
     AppendObserved(Append),
     #[prost(message, tag = "30")]
     TrimDurable(Trim),
+    #[prost(message, tag = "34")]
+    VoteDecision(DecisionVoteRequest),
+    #[prost(message, tag = "35")]
+    InstallDecision(DecisionCertificate),
+    #[prost(message, tag = "36")]
+    PublishDecision(StableDecision),
+    #[prost(message, tag = "37")]
+    ExportHandoff(Handoff),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 30, 31")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 18, 30, 31, 32, 33, 34, 35, 36, 37")]
     pub body: Option<RequestBody>,
     #[prost(string, tag = "17")]
     pub target_journal: String,
@@ -354,6 +433,37 @@ pub struct Sealed {
     pub runs: Vec<EpochRun>,
     #[prost(bool, tag = "7")]
     pub guarded_tail: bool,
+    #[prost(message, optional, tag = "8")]
+    pub certificate: Option<DecisionCertificate>,
+    #[prost(message, optional, tag = "9")]
+    pub stability: Option<StableDecision>,
+    #[prost(bytes = "bytes", tag = "10")]
+    pub key: Bytes,
+    #[prost(bytes = "bytes", tag = "11")]
+    pub signature: Bytes,
+}
+
+impl Sealed {
+    fn signing_bytes(&self, request: &Seal) -> Vec<u8> {
+        let mut reply = self.clone();
+        reply.signature = Bytes::new();
+        let mut bytes = b"rtdb.logkeeper/sealed-prefix/v1".to_vec();
+        request.encode_length_delimited(&mut bytes).expect("Vec has capacity");
+        reply.encode_length_delimited(&mut bytes).expect("Vec has capacity");
+        bytes
+    }
+
+    pub(crate) fn sign(&mut self, request: &Seal, signer: &rtdb_storage::attestation::SigningKey) {
+        self.key = Bytes::copy_from_slice(&signer.public_key());
+        self.signature = Bytes::copy_from_slice(&signer.sign(&self.signing_bytes(request)));
+    }
+
+    pub(crate) fn verifies(&self, request: &Seal, journal: &str) -> bool {
+        let Ok(key) = <&[u8; 32]>::try_from(self.key.as_ref()) else { return false; };
+        let Ok(signature) = <&[u8; 64]>::try_from(self.signature.as_ref()) else { return false; };
+        crate::attestation::journal_id(key).to_string() == journal
+            && rtdb_storage::attestation::verifies(key, &self.signing_bytes(request), signature)
+    }
 }
 
 /// A read at or below `trim_lsn` returns no entries; the client reports the trimmed range.
@@ -414,13 +524,19 @@ pub enum ResponseBody {
     JournalIdentity(JournalIdentity),
     #[prost(message, tag = "9")]
     AuthorityConfirmed(AuthorityConfirmed),
+    #[prost(message, tag = "10")]
+    ReadIndex(ReadIndexReply),
+    #[prost(message, tag = "11")]
+    DecisionVote(DecisionVote),
+    #[prost(message, tag = "12")]
+    DecisionInstallation(DecisionInstallation),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
     pub body: Option<ResponseBody>,
 }
 
@@ -500,6 +616,8 @@ fn authority_confirmation_and_durable_trim_use_disjoint_requests() {
             stream: "scope".into(),
             epoch: 8,
             ensemble: Bytes::from_static(&[42; 32]),
+            certified: false,
+            handoff: None,
         }),
     };
     let decoded = Request::decode(confirm.encode_to_vec().as_slice()).unwrap();

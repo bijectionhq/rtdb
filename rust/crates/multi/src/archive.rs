@@ -81,11 +81,13 @@ use crate::{
 
 pub(crate) mod stage;
 mod reader;
+mod inventory_identity;
 pub use stage::stage_checkpoint;
 pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod replica_artifact;
 mod replica_suffix;
+pub(crate) use replica_suffix::reseal_live_journal;
 mod replay_handoff;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
 mod read_world;
@@ -386,6 +388,10 @@ impl ArchivedCheckpoint {
         let plaintext = self.archive_cipher.open_frames(name, layout, frames.clone(), archived.value).await?;
         layout.seal_frames(&self.serving_cipher, name, frames.start, &plaintext, &mut value)?;
         Ok(ObjectObservation { value: value.into(), version: archived.version })
+    }
+
+    pub(crate) fn contains_original(&self, name: &ObjectKey) -> bool {
+        self.objects.contains_key(name)
     }
 
     pub(crate) async fn matches_original(&self, name: &ObjectKey, original: &Bytes) -> rtdb_storage::Result<bool> {
@@ -810,11 +816,15 @@ impl ArchivedObject {
     }
 
     fn matches_sealed(&self, name: &ObjectKey, sealed: &[u8]) -> bool {
-        sealed.len() as u64 == self.bytes && self.name == name.as_str() && digest(sealed) == self.sha256
+        use inventory_identity::matches_bytes;
+
+        sealed.len() as u64 == self.bytes
+            && matches_bytes(name.as_str().as_bytes(), self.name.as_bytes())
+            && matches_bytes(digest(sealed).as_bytes(), self.sha256.as_bytes())
             && self.frame_header_sha256.as_ref().is_none_or(|expected|
                 crate::cipher::object::framed(name)
                     && sealed.get(..crate::cipher::object::SEALED_HEADER_BYTES)
-                        .is_some_and(|header| digest(header) == *expected))
+                        .is_some_and(|header| matches_bytes(digest(header).as_bytes(), expected.as_bytes())))
     }
 
     fn is_legacy_trie(&self, name: &ObjectKey) -> bool {
@@ -884,6 +894,12 @@ impl Capture {
         prefix: &str,
         cipher: &Arc<dyn ArchiveKey>,
     ) -> Result<()> {
+        self.verify_members(bucket, prefix, cipher, false).await.map(drop)
+    }
+
+    async fn verify_members(
+        &self, bucket: Arc<dyn ObjectStore>, prefix: &str, cipher: &Arc<dyn ArchiveKey>, held: bool,
+    ) -> Result<CheckpointObjects> {
         let mut bytes = 0u64;
         let objects = self.objects.iter()
             .map(|object| {
@@ -898,17 +914,17 @@ impl Capture {
             objects: objects.iter().map(|(name, object)| (name.clone(), (*object).clone())).collect(),
             cipher: Arc::clone(cipher),
         };
-        let closure = checkpoint_objects(&plaintext, &self.point, self.format).await?;
-        if objects.len() != self.objects.len() || objects.keys().ne(closure.keys()) {
+        let closure = checkpoint_objects_at_view(&plaintext, &self.point, self.format, held).await?;
+        if objects.len() != self.objects.len() || (!held && objects.keys().ne(closure.keys())) {
             return Err(inconsistent(
                 "The archive object list differs from the checkpoint closure",
             ));
         }
-        for name in objects.keys() {
+        for (name, expected) in &closure {
             let bytes = plaintext.get(name).await?;
-            require_bound_metadata(closure[name], &bytes)?;
+            require_bound_metadata(*expected, &bytes)?;
         }
-        Ok(())
+        Ok(closure)
     }
 }
 
@@ -1071,9 +1087,21 @@ async fn verified_archive(
     keys: &dyn KeyService,
     region: Arc<IoRegion>,
 ) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
+    verified_archive_at_view(bucket, point, manifest, keys, region, false).await
+}
+
+async fn verified_held_archive(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService, region: Arc<IoRegion>,
+) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
+    verified_archive_at_view(bucket, point, manifest, keys, region, true).await
+}
+
+async fn verified_archive_at_view(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService, region: Arc<IoRegion>, held: bool,
+) -> Result<(Capture, Arc<dyn ArchiveKey>)> {
     let prefix = format!("checkpoint-captures/{}/{}", point.deployment, point.operation);
     let metadata = PrefixedStore::new(bucket.clone(), &prefix);
-    let capture = read::<Capture>(&metadata, &key("capture.json")?).await?
+    let mut capture = read::<Capture>(&metadata, &key("capture.json")?).await?
         .ok_or_else(|| unavailable("The captured manifest is unavailable"))?;
     if &capture.point != point
         || capture.manifest_sha256()? != manifest
@@ -1082,7 +1110,12 @@ async fn verified_archive(
         return Err(inconsistent("The archive differs from its accepted capture"));
     }
     let cipher = archive_key(keys, point, region).await?;
-    capture.verify(bucket, &prefix, &cipher).await?;
+    if held {
+        let members = capture.verify_members(bucket, &prefix, &cipher, true).await?;
+        capture.objects.retain(|object| key(&object.name).is_ok_and(|name| members.contains_key(&name)));
+    } else {
+        capture.verify(bucket, &prefix, &cipher).await?;
+    }
     Ok((capture, cipher))
 }
 
@@ -1168,6 +1201,7 @@ pub async fn retain_serving_replay(
                     if current.serving_replay_capture != Some(operation) {
                         current.serving_replay_capture = Some(operation);
                         current.recovery_manifest_sha256 = Some(digest);
+                        current.checkpoint_decision = None;
                     }
                     Ok(())
                 }).await?;
@@ -1245,17 +1279,26 @@ fn require_bound_metadata(expected: Option<[u8; 32]>, bytes: &[u8]) -> Result<()
 }
 
 async fn checkpoint_objects(plaintext: &dyn ObjectStore, point: &CapturePoint, contents: CheckpointContents) -> Result<CheckpointObjects> {
+    checkpoint_objects_at_view(plaintext, point, contents, false).await
+}
+
+async fn checkpoint_objects_at_view(plaintext: &dyn ObjectStore, point: &CapturePoint, contents: CheckpointContents, held: bool) -> Result<CheckpointObjects> {
     let catalog_key = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&catalog_key).await?)?;
     verify_cut(&catalog, point.checkpoint, StorageEpoch(point.log_epoch))?;
-    catalog_objects(plaintext, &catalog, contents).await
+    catalog_objects_at_view(plaintext, &catalog, contents, held).await
 }
 
 async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents) -> Result<CheckpointObjects> {
+    catalog_objects_at_view(plaintext, catalog, contents, false).await
+}
+
+async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents, held: bool) -> Result<CheckpointObjects> {
     let block = catalog.block_index();
     let root_digest = catalog.publication_sha256().ok_or_else(|| inconsistent("Checkpoint root bytes were not observed"))?;
     let mut closure = BTreeMap::from([(key(&block_key(block)?)?, Some(root_digest))]);
     for table in catalog.table_entries()? {
+        if held && table.table.stores_expiring_transaction_metadata() { continue; }
         let path = key(&table.slug.block_key(block)?)?;
         let bytes = plaintext.get_fresh(&path).await?;
         let observed = publication_digest(&bytes);
@@ -2126,7 +2169,7 @@ pub(crate) async fn stage_checkpoint_transfer(
 /// stage under the original source installation's recovery authority.
 pub(crate) async fn issue_checkpoint_transfer(
     directory: Arc<dyn Directory>, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
-    selector: StageSelector, hosted_task: Option<rtdb_directory::HostedTask>,
+    selector: StageSelector, broker: Option<&crate::replay_broker::Client>, hosted_task: Option<rtdb_directory::HostedTask>,
 ) -> Result<rtdb_directory::CheckpointTransferTerminal> {
     let (source, capture, org) = selector.source.as_ref()
         .ok_or_else(|| inconsistent("Terminal transfer requires authenticated source authority"))?;
@@ -2168,13 +2211,14 @@ pub(crate) async fn issue_checkpoint_transfer(
     let fence = directory.fence_checkpoint_transfer(&rtdb_directory::CheckpointTransferSelection {
         stage, source_version, destination_version,
     }).await?;
-    seal_checkpoint_transfer(directory.as_ref(), storage, archive, keys, hosted_task.as_ref(), &fence).await
+    seal_checkpoint_transfer(directory.as_ref(), storage, archive, keys, broker, hosted_task.as_ref(), &fence).await
 }
 
 /// Complete an already ordered source transfer fence. The result is a
 /// retained source receipt, and does not activate or release either residence.
 pub(crate) async fn seal_checkpoint_transfer(
     directory: &dyn Directory, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
+    broker: Option<&crate::replay_broker::Client>,
     hosted_task: Option<&rtdb_directory::HostedTask>,
     fence: &rtdb_directory::CheckpointTransferFence,
 ) -> Result<rtdb_directory::CheckpointTransferTerminal> {
@@ -2200,9 +2244,9 @@ pub(crate) async fn seal_checkpoint_transfer(
     let memory = rtdb_columnar::MemoryBudget::new(node.execution_memory_bytes);
     let cache = rtdb_storage::cache::CacheBudget::new(node.cache_bytes);
     let cancellation = tokio_util::sync::CancellationToken::new();
-    let (basis, source_through, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
+    let (basis, terminal, lifetime_floors_sha256, replica_sha256) = replica_suffix::with_terminal_source(
         directory, storage, keys, hosted_task, fence, sealed, None,
-        |_, source_io| async move {
+        |_, source_region, source_io| async move {
             let first = stage.checkpoint.boundary.checked_add(1)
                 .ok_or_else(|| inconsistent("The checkpoint has no replica successor"))?;
             let certificate = if sealed >= first {
@@ -2216,24 +2260,25 @@ pub(crate) async fn seal_checkpoint_transfer(
             let replica_sha256 = certificate.as_ref().map(|certificate|
                 certificate.digest_bytes().ok_or_else(|| inconsistent("The terminal interval has no canonical digest"))
             ).transpose()?;
-            let (basis, source_through, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
+            let (basis, terminal, lifetime_floors_sha256) = read_world::with_registered_capture_replay(
                 directory, archive, keys, hosted_task,
                 read_world::CaptureSelection {
                     deployment: intent.source, capture: intent.capture,
                     manifest: &intent.source_manifest_sha256, suffix: None, expected_basis: None, require_replay: false,
                 },
                 CheckpointReadResources { node: &node, memory: &memory, cache, cancellation: &cancellation },
-                Some(read_world::TerminalReplay { storage, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
-                |context, basis, source_through| async move {
-                    let source_through = source_through.ok_or_else(|| inconsistent("Terminal replay produced no source coordinate"))?;
-                    Ok((basis, source_through, archive_lifetime_floors_digest(context, basis).await?))
+                Some(read_world::TerminalReplay { broker, source_region, source_io, fence, stream: &stream, certificate: certificate.as_ref(), through: sealed }),
+                |context, basis, terminal| async move {
+                    let terminal = terminal.ok_or_else(|| inconsistent("Terminal replay produced no source census"))?;
+                    Ok((basis, terminal, archive_lifetime_floors_digest(context, basis).await?))
                 },
             ).await?;
-            Ok((basis, source_through, lifetime_floors_sha256, replica_sha256))
+            Ok((basis, terminal, lifetime_floors_sha256, replica_sha256))
         },
     ).await?;
     directory.record_checkpoint_transfer_terminal(&rtdb_directory::CheckpointTransferTerminal {
-        fence: fence.clone(), replica_through: sealed, source_through, basis,
+        fence: fence.clone(), replica_through: sealed, source_through: terminal.source_through, basis,
+        placed_debt: terminal.placed_debt,
         replica_sha256, lifetime_floors_sha256,
     }).await
 }
@@ -2389,6 +2434,7 @@ pub(crate) async fn restore_checkpoint(
         record.lifecycle = recovery.previous_lifecycle;
         record.compaction_replay_cutoff = Some(cutoff.0);
         record.recovery_manifest_sha256 = None;
+        record.checkpoint_decision = None;
         record.serving_replay_capture = record.serving_replay_capture.map(|_| operation);
         record.checkpoint_repair_receipts.insert(operation, recovery.clone());
         Ok(())
@@ -3156,7 +3202,7 @@ mod tests {
             Err(Error::ConflictingObject(_))));
         keys.withdraw_archive_key(id).await?;
         assert!(matches!(store.get_range(&name, range.start as u64..range.end as u64).await,
-            Err(Error::PermissionDenied { .. })));
+            Err(Error::ErasedUnderView)));
         Ok(())
     }
 

@@ -5,10 +5,10 @@ use std::sync::Arc;
 use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, CatalogCut, LogicalType, OwnedRelation, Result, TableRef, Timestamp, TransactionKey};
 
-use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
+use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, TrieState, absent_type};
 
 #[derive(Clone)]
-struct CatalogRead { _permit: Arc<dyn Send + Sync> }
+struct CatalogRead { permit: Arc<dyn std::any::Any + Send + Sync> }
 
 impl std::fmt::Debug for CatalogRead {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,6 +26,7 @@ pub struct Snapshot {
     system_time_cap: Option<Timestamp>,
     catalog_cut: Option<CatalogCut>,
     catalog_read: Option<CatalogRead>,
+    certified_read: Option<Arc<rtdb_types::residence_trace::CertifiedRead>>,
 }
 
 /// Routing coordinates carried by the captured catalog and its applied event
@@ -52,7 +53,7 @@ impl OwnedRoutingInventory {
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, certified_read: None }
     }
     pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
         self.catalog_cut = catalog_cut;
@@ -61,14 +62,43 @@ impl Snapshot {
     /// Returns the conservative installed prefix captured with this physical catalog.
     /// Callers must also bind the opened database and residence before comparing cuts across nodes.
     pub fn catalog_cut(&self) -> Option<CatalogCut> { self.catalog_cut }
+    /// Complete paths for compacted primary tries in this captured catalog.
+    /// An oversized inventory must retain the conservative scope.
+    pub fn compacted_primary_paths(&self) -> Option<Arc<[String]>> {
+        let mut paths = Vec::new();
+        let mut bytes = 0usize;
+        for table in self.trie_catalog.tables() {
+            let entry = self.table_catalog.entry(table)?;
+            for trie in self.trie_catalog.iter_tries(table).filter(|trie| trie.key.level() > 0 && trie.state == TrieState::Live) {
+                for path in [entry.slug.data_key(&trie.key), entry.slug.metadata_key(&trie.key)] {
+                    bytes = bytes.checked_add(path.len().checked_mul(6)?.checked_add(16)?)?;
+                    if bytes > rtdb_types::CATALOG_PRIMARY_PATH_BYTES {
+                        return None;
+                    }
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        Some(paths.into())
+    }
+
     /// Transfers the store's captured catalog registration into this snapshot and its clones.
-    pub fn with_catalog_read(mut self, permit: Arc<dyn Send + Sync>) -> Self {
-        self.catalog_read = Some(CatalogRead { _permit: permit });
+    pub fn with_catalog_read(mut self, permit: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self.catalog_read = Some(CatalogRead { permit });
         self
     }
     /// Clones the storage registration that was attached when the catalog was captured.
-    pub fn catalog_read_permit(&self) -> Option<Arc<dyn Send + Sync>> {
-        self.catalog_read.as_ref().map(|read| Arc::clone(&read._permit))
+    pub fn catalog_read_permit<T: std::any::Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        Arc::clone(&self.catalog_read.as_ref()?.permit).downcast().ok()
+    }
+    pub fn with_certified_read(mut self, read: Arc<rtdb_types::residence_trace::CertifiedRead>) -> Self {
+        self.certified_read = Some(read);
+        self
+    }
+    pub fn certified_read(&self) -> Option<&Arc<rtdb_types::residence_trace::CertifiedRead>> {
+        self.certified_read.as_ref()
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     pub fn serving_search<T: std::any::Any>(&self) -> Option<&T> { self.durable.search.as_ref()?.get() }

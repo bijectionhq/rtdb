@@ -1,40 +1,48 @@
-# R4 · Residence ledger, reader holds and the collection floor
+# R4 · Residence ledger, reader holds and deletion grants
 
 ## Goal
 
 Replace every timer that today stands in for knowing who still reads a file with one linearizable record per database.
 After R4, a file is deleted only when the ledger proves no admitted reader, recovery root or fork can need it.
 
-## Converged design
+## Approved design
 
-All three designers proposed the same mechanism; differences are noted inline.
+The residence ledger orders eligible roots, admissions, retirement and deletion grants under one physical owner.
+Multi uses the directory and lineage authority.
+Classic uses a conditional-write head or a synchronized filesystem ledger in one lock domain.
+The current authority and irreversible exclusions survive restore outside the data being restored.
 
-- **The ledger.** One record per database residence holding: the published catalog generation (head), the collection floor `F`, reader holds `(holder, generation, ticket, expiry)`, recovery roots (R5) and, later, the key catalog (R6).
-  - Multi: the deployment's directory record, updated by compare-and-swap. The peer's `catalog_readers` map (below) is the start of it.
-  - Classic: an object in the database's own store written with conditional writes (put-if-absent for a chain of `ledger/<seq>` objects, or If-Match on one head object), and an atomic link or rename on a local filesystem.
-    Designers differed only in layout (one head object, a sequence chain, or a head object plus one hold object per follower); pick one and record why.
-- **Admission.** Before opening storage, a reader CASes a hold on the generation of the catalog it captured.
-  The CAS succeeds only if that generation is at or above `F` and is not revoked by an erasure (R7).
-  A follower that is behind the log tip can still serve an explicit basis it has applied, because admission needs the ledger, not the tip.
-- **Renewal and self-fencing.** Holders renew every `R`.
-  Before each provider request a reader checks its own monotonic deadline (last renewal start + `T` − margin); this reuses the shape of today's `ReadLease` check in `storage/src/io_region.rs`.
-  Leader-local readers take the same holds through an in-process fast path.
-- **Expiry.** The collector drops a hold only after it has observed the same ticket unchanged across two sweeps a local monotonic `T` apart.
-- **Deletion rule (generation cutoff).** A retired object with retirement generation `r` is deletable iff `r ≤ min(head, every live hold's generation, every recovery root)` in a single ledger observation, and the collector advances `F` by CAS conditioned on that observation's version.
-  Generation cutoff was preferred over exact dependency tracking: it needs no inventory, and bounded handle lifetimes bound the extra retention.
-  `verification/lean/ResidenceReaderRetention.lean` already proves both policies safe and compares them.
+The writer and replay installer publish complete immutable dependency manifests at each eligible cut.
+Manifest edges bind the original basis and scope, including inherited layers, catalog and routing evidence, artefacts, replay coverage and the openable custody needed to use them.
+A physical leaf names the owner, namespace, allocation incarnation, provider key and its immutable version or terminal creation identity.
+A pack is one physical leaf. Each member that depends on it keeps its edge.
+Keep explicit exhaustion so an incomplete or stale inventory supplies no negative evidence.
+
+The authority orders claims from current publications, advertised historical scopes, holds, forks, in-flight work, recovery roots, and staging or transfer work.
+Register the exact scope before storage I/O, and acquire additional coverage before expanding it.
+The catalog floor governs admission to advertised history.
+Closing issuance or renewal preserves already admitted work through drain.
+An abandoned hold requires positive drain evidence or an enforced bound through the last possible provider access, including clock uncertainty.
+
+The physical owner consumes the retirement receipt, checks zero reachability and closes new references in the same ordered decision that persists the grant.
+The grant names one immutable publication.
+Ambiguous writes retain their staging edges until reconciled or fenced.
+An old authentic manifest cannot re-admit a granted publication.
+Retries consume the same grant and settle only on exact removal, terminal replacement or conclusive absence.
+The [Lean comparison](../lean/ResidenceReaderRetention.lean) explains why an unrelated earlier hold supplies no deletion evidence and must not block eligibility.
 
 ## Invariants
 
-- **G1.** No object reachable from an admitted hold's generation or a live recovery root is deleted.
-- **G2.** Every delete is authorized against one ledger version, and the authorization stays valid until the provider delete (names never repeat after R3).
+- **GC-1.** Admitted reads, forks, recovery roots and operations retain their complete dependency scopes through their promised lifetimes and drain.
+- **GC-2.** The physical owner's ordered grant binds the exact immutable publication, establishes absence of eligible dependencies, and excludes later references and late publication.
+- **LIVE-2.** Fair collection and eventual provider settlement reclaim each retired publication after its final dependency and fence, including during unrelated holds.
 
 ## What R4 deletes
 
 - `GarbageConfig::garbage_lifetime` and the system-time arithmetic in `TrieCollector::default_garbage_as_of` (`maintenance/src/gc.rs`).
 - The fixed read lease and its tip-anchored currency: `storage/src/{read_lease,lease_decision}.rs`, `node/src/read_currency.rs`, `Database::read_lease`, and the collector's first-observed wait (`TrieCollector::leased_out`). Keep the per-request check in `IoRegion`, re-anchored on the hold.
 - The unbounded in-process registry in `index/src/partition.rs` (`Retention::readers`), or reduce it to a cache of ledger holds.
-- Multi's reaper grace and wall-clock release stamps (`multi/src/store.rs` releases, `multi/src/main.rs` `--grace` check), once releases are authorized by the floor.
+- Multi's reaper grace and wall-clock release stamps (`multi/src/store.rs` releases, `multi/src/main.rs` `--grace` check), once each release has deletion authority independent of its timestamp.
 
 ## State on main (2026-11-21)
 
@@ -82,7 +90,7 @@ A coordinated hold through hosted term placement and live-provider qualification
 
 1. Start by reading the peer's `CatalogReaders` and `ResidenceRetirement.tla`, and the last day of commits touching `multi/src`, `directory/src` and `maintenance/src/gc.rs`. If a peer session is mid-way, coordinate through the programme rather than branching the design.
 2. Define the ledger operations once, as a small trait both deployments implement (admit hold, renew, release, observe, advance floor), and implement it for Multi on the directory and for classic on conditional writes. Avoid making classic depend on the whole `Directory` trait.
-3. Move the trie collector to the floor rule; then delete the lease, the first-observed map and `garbage_lifetime` in the same change, so no two mechanisms coexist.
+3. Move physical retirement behind the grant owner, then remove each timer when the corresponding admission and recovery paths are covered.
 4. Thread the hold through `QueryContext` where the read lease is today (`CatalogSnapshot::read_lease`, cursor `IoRegion::leased`), and through served scan fragments (`Node::scan_fragment`).
 5. Classic conditional writes: check each provider adapter (`storage/src/remote.rs`, local store) supports the primitive you choose; record any provider without it as unsupported rather than emulating it.
 
@@ -98,7 +106,7 @@ Each physical effect needs a release decision tied to the authority that admits 
 | Trie compaction output | Hosted retirement plans carry observed provider versions for witnessed loose files. The collector records an installed removal receipt and advances the admission floor before queueing file releases. A successor can retry an incomplete handoff from the pending plan. | Couple the installed receipt, every dependency hold, the admission floor and the provider identity in one certificate. [Collector](../../rust/crates/maintenance/src/gc.rs) · [Intent and receipt](../../rust/crates/maintenance/src/retirement_intent.rs) |
 | Classic trie and block collection | Native local storage serializes reader ticket admission and the durable floor, and checks the installed receipt before physical trie deletion. Trie collection also uses the lease window and snapshot registry. The block collector uses an installed snapshot and configured retention. | Extend the classic ledger to qualified remote stores and the independent block and artefact collection paths. [Storage contract](../../rust/crates/storage/src/object_store.rs) · [Collectors](../../rust/crates/maintenance/src/gc.rs) |
 | Multi loose and packed objects | Hosted exact settlement handles witnessed loose trie files and fully released checkpoint metadata packs. The local path eraser runs under the volume maintenance witness and the directory lineage reservation. The simulator can exercise its missing-reference control only on a memory store. | Extend the contract to L0-bearing packs, old path-only releases and unversioned providers. [Reaper](../../rust/crates/multi/src/store.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) |
-| Derived artefacts and ordered pages | The artefact lane retires definition files and unused builds. Hosted ordered pages have a separate directory-backed lifecycle and reaper. | Bind artefact retirement and repair to an exact publication, prove the last shared member is covered, and show how ordered-page scopes refine the residence ledger. [Artefact lane](../../rust/crates/maintenance/src/artefact.rs) · [Ordered pages](../../rust/crates/multi/src/ordered_index_storage.rs) |
+| Derived artefacts and ordered pages | Stored artefact builds and their fallback builds hold their captured input catalog through provider drain. The artefact lane retires definition files and unused builds. Hosted ordered pages have a separate directory-backed lifecycle and reaper. | Bind artefact retirement and repair to an exact publication, prove the last shared member is covered, and show how ordered-page scopes refine the residence ledger. [Artefact lane](../../rust/crates/maintenance/src/artefact.rs) · [Ordered pages](../../rust/crates/multi/src/ordered_index_storage.rs) |
 | Captures, moves and installation disposal | The lifecycle paths use captured archive and installation identities, and the disposal code inventories provider objects. | Prove each lifecycle fence covers every affected reader, recovery and fork dependency, including provider work outstanding when the route changes. [Capture retirement](../../rust/crates/multi/src/archive/retirement.rs) · [Installation disposal](../../rust/crates/multi/src/admin.rs) |
 
 ### Local trie release records
@@ -122,7 +130,9 @@ An exclusive compactor reset resumes admission at the installed cut of its newly
 Classic S3, Azure and GCS use one conditional-write head under the classic storage root for reader registration, release and floor advancement.
 The head makes registration and floor advancement one decision and avoids deriving current admission from a possibly stale list of ticket objects.
 Every successful update advances the sequence, including a cancellation that fences a registration with a lost reply.
-The collector checks the stored receipt and the floor in the same residence before deleting immutable trie paths.
+The current classic grant owner checks the stored receipt and uses the conservative cutoff until the complete dependency census is wired.
+A pending decision keeps the intent available for retry.
+Multi queues scoped releases and the provider consumes the existing exact lineage grant.
 A provider request retains its ticket through cancellation and releases it on drain.
 An abandoned ticket without drain evidence remains in the ledger.
 Independent maintenance and complete recovery-root retention still require custody and settlement integration.

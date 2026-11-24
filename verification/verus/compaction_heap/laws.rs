@@ -9,12 +9,12 @@ verus! {
 pub fn an_equal_iid_prefers_the_later_system_time(iid: u128, earlier: i64, later: i64)
     requires earlier < later,
 {
-    let chosen = precedes((iid, later, 0, 0, 0, 0), (iid, earlier, u32::MAX, 0, 0, 0));
+    let chosen = precedes((iid, later, 0, 0, 0, 0), (iid, earlier, i128::MAX, 0, 0, 0));
     let tie = precedes((iid, later, 0, 0, 0, 0), (iid, later, 0, 0, 0, 0));
     assert(chosen && !tie);
 }
 
-pub fn equal_commit_times_prefer_the_later_assertion(iid: u128, time: i64, earlier: u32, later: u32)
+pub fn equal_commit_times_prefer_the_later_assertion(iid: u128, time: i64, earlier: i128, later: i128)
     requires earlier < later,
 {
     let chosen = precedes((iid, time, later, 1, 1, 1), (iid, time, earlier, 0, 0, 0));
@@ -22,7 +22,7 @@ pub fn equal_commit_times_prefer_the_later_assertion(iid: u128, time: i64, earli
     assert(chosen && !reverse);
 }
 
-pub fn equal_assertions_prefer_the_earlier_scan_source(iid: u128, time: i64, position: u32, first: usize, last: usize)
+pub fn equal_assertions_prefer_the_earlier_scan_source(iid: u128, time: i64, position: i128, first: usize, last: usize)
     requires first < last,
 {
     let chosen = precedes((iid, time, position, first, usize::MAX, usize::MAX), (iid, time, position, last, 0, 0));

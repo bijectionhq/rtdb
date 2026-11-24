@@ -22,6 +22,7 @@ impl ObservedStore {
 }
 #[async_trait]
 impl ObjectStore for ObservedStore {
+    fn permits_shared_read_cache(&self) -> bool { true }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         self.heads.fetch_add(1, Ordering::SeqCst);
         self.inner.head(key).await

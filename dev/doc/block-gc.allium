@@ -11,18 +11,23 @@
 -- trie_catalog.clj). Followers do not reference them during online query
 -- execution, so a concurrent delete by the leader cannot break a running
 -- read path. As a result this collector needs NO replica-log coordination —
--- the leader just DELETEs its garbage and moves on.
+-- the leader checks the storage owner's startup hold and repair anchor before deleting old metadata.
+-- Coordinated native startup retains a shared recovery gate while choosing a checkpoint and admitting the replica cursor.
+-- Native metadata collection needs exclusive access to that gate through unlink.
 --
 -- Multi records a logical release first. For a versioned or enrolled terminal S3 block pack,
 -- the release names the owned pack and the exact publication observed for the member.
 -- The physical owner verifies a newer published pack in the same store,
 -- checks every member against mature releases for that publication, and retains
 -- checkpoint metadata at or above an active startup or capture floor.
--- The terminal collector reads the index under the pack's strong entity tag and retires it through a conditional tombstone.
+-- The terminal collector reads the index under the pack's strong entity tag.
+-- It authenticates the successor root under the successor pack's tag and checks the digest against the directory before authorizing a conditional tombstone.
 -- A covered pack must contain only checkpoint metadata. An ordinary hosted
 -- release by path can withdraw a reference but cannot erase an owned pack.
 -- On local Multi storage, the reaper may retire a mixed pack below the published checkpoint under the replay archive handoff in rtdb-multi.allium.
--- Its old checkpoint boundary lies within an excluded replica prefix and every L0 member has an authenticated copy under independent archive custody.
+-- Its old checkpoint boundary lies within an excluded replica prefix.
+-- Each ordinary L0 member has an authenticated copy under independent archive custody.
+-- A covered receipt L0 may instead be absent from the successor's complete replay manifest.
 --
 -- Offloaded replica-message payloads (`oversized/b{idx}-{uuid}.binpb`, see db.allium's OversizedMessage) belong to the durable history of each record that references them.
 -- A follower can fetch such a payload while applying a record from a block whose catalog files have already been collected.

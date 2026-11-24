@@ -72,16 +72,32 @@ impl OwnedBatch {
 
     pub fn with_appended_column(&self, field: arrow_schema::Field, column: arrow_array::ArrayRef,
         reservation: Arc<MemoryReservation>) -> Result<Self> {
-        if column.get_array_memory_size() > reservation.bytes() {
-            return Err(Anomaly::incorrect("rtdb/undersized-reservation", "Appended column exceeds its reservation"));
+        self.with_inserted_column(self.batch.num_columns(), field, column, reservation)
+    }
+
+    pub fn with_inserted_column(&self, index: usize, field: arrow_schema::Field,
+        column: arrow_array::ArrayRef, reservation: Arc<MemoryReservation>) -> Result<Self> {
+        if index > self.batch.num_columns() || column.get_array_memory_size() > reservation.bytes() {
+            return Err(Anomaly::incorrect("rtdb/batch-column", "Inserted column is outside its batch or reservation"));
         }
         let schema = self.batch.schema();
         let mut fields = schema.fields().to_vec();
-        fields.push(Arc::new(field));
+        fields.insert(index, Arc::new(field));
         let mut columns = self.batch.columns().to_vec();
-        columns.push(make_array(attach_data(column.to_data(), &reservation)?));
+        columns.insert(index, make_array(attach_data(column.to_data(), &reservation)?));
         let schema = Arc::new(arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone()));
         let batch = RecordBatch::try_new(schema, columns).map_err(super::arrow_error)?;
+        Ok(Self { batch, reservation: Arc::clone(&self.reservation) })
+    }
+
+    pub fn with_replaced_column(&self, index: usize, column: arrow_array::ArrayRef,
+        reservation: Arc<MemoryReservation>) -> Result<Self> {
+        if index >= self.batch.num_columns() || column.get_array_memory_size() > reservation.bytes() {
+            return Err(Anomaly::incorrect("rtdb/batch-column", "Replacement column is outside its batch or reservation"));
+        }
+        let mut columns = self.batch.columns().to_vec();
+        columns[index] = make_array(attach_data(column.to_data(), &reservation)?);
+        let batch = RecordBatch::try_new(self.batch.schema(), columns).map_err(super::arrow_error)?;
         Ok(Self { batch, reservation: Arc::clone(&self.reservation) })
     }
 

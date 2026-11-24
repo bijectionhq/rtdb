@@ -9,7 +9,41 @@ mod provider_task;
 tokio::task_local! {
     static RETAINED_OWNER: Arc<dyn Send + Sync>;
     static READ_LEASE: Arc<ReadLease>;
+    static HELD_VIEW: Arc<HeldView>;
     static AUDIENCE_OBJECT_READ: ();
+}
+
+/// Registrations covering the physical catalogs used by one execution.
+pub struct HeldView {
+    _owners: Arc<[Arc<dyn Send + Sync>]>,
+}
+
+impl HeldView {
+    pub fn new(catalog: Arc<dyn Send + Sync>, registrations: Vec<Arc<crate::cache::HeldCatalogRead>>) -> Self {
+        let owners = std::iter::once(catalog).chain(registrations.into_iter().map(|hold| hold as Arc<dyn Send + Sync>)).collect();
+        Self { _owners: owners }
+    }
+
+    /// Carries a recovery registration issued by the owner of the opened storage residence.
+    pub fn recovery(registration: Arc<dyn Send + Sync>) -> Arc<Self> {
+        Arc::new(Self { _owners: Arc::from([registration]) })
+    }
+
+    /// Acquires the serving hold before reading files selected from the captured catalog.
+    pub async fn catalog(
+        store: &dyn crate::ObjectStore, owner: Arc<dyn Send + Sync>, cut: Option<rtdb_types::CatalogCut>,
+        compacted_primary: Option<Arc<[String]>>,
+    ) -> rtdb_types::Result<Arc<Self>> {
+        let registration = match compacted_primary {
+            Some(paths) => store.retain_catalog_with_primary(cut, paths).await?,
+            None => store.retain_catalog(cut).await?,
+        };
+        if store.defers_trie_releases() && registration.is_none() {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-held",
+                "The coordinated storage owner returned no catalog hold"));
+        }
+        Ok(Arc::new(Self { _owners: std::iter::once(owner).chain(registration).collect() }))
+    }
 }
 
 pub struct IoRegion {
@@ -50,6 +84,39 @@ impl IoRegion {
         }}; }
         scope_io_owner!(RETAINED_OWNER, owner, work; combine).await
     }
+    /// Carries a held view into both synchronous and provider-backed reads in this execution.
+    pub fn reading<F: std::future::Future>(view: Arc<HeldView>, work: F) -> impl std::future::Future<Output = F::Output> {
+        macro_rules! combine { ($parent:ident, $view:ident) => {{
+            if Arc::ptr_eq(&$parent, &$view) { $view } else {
+                Arc::new(HeldView { _owners: Arc::from([$parent as Arc<dyn Send + Sync>, $view]) })
+            }
+        }}; }
+        scope_io_owner!(HELD_VIEW, view, work; combine)
+    }
+
+    /// Transfers this read's held authority before spawning work that may admit reads of its own.
+    pub fn inherit_reading<F: std::future::Future>(work: F) -> impl std::future::Future<Output = F::Output> {
+        let view = HELD_VIEW.try_with(Arc::clone).ok();
+        let work = crate::sealing::PlaintextView::inherit(Self::leased(None, work));
+        async move {
+            match view {
+                Some(view) => Self::reading(view, work).await,
+                None => work.await,
+            }
+        }
+    }
+
+    /// Classic recovery selects a checkpoint while holding the storage owner's deletion gate.
+    /// Hosted callers supply their directory-issued registration through `reading`.
+    pub async fn reading_recovery<T>(
+        store: &dyn crate::ObjectStore, work: impl std::future::Future<Output = rtdb_types::Result<T>>,
+    ) -> rtdb_types::Result<T> {
+        match store.local_maintenance_store().filter(|store| crate::ObjectStore::defers_trie_releases(*store)) {
+            Some(store) => Self::reading(HeldView::recovery(store.hold_recovery_open().await?), work).await,
+            None => work.await,
+        }
+    }
+
     /// Checks the lease when each provider operation is admitted while polling the work.
     /// A nested lease narrows the one in scope where `leased` is called.
     /// Returns the work itself or its scoped future, so a lease adds no copy of the work to the caller's future.
@@ -63,6 +130,10 @@ impl IoRegion {
         };
         Either::Left(READ_LEASE.scope(lease, work))
     }
+    pub(crate) fn current_read_lease() -> Option<Arc<ReadLease>> {
+        READ_LEASE.try_with(Arc::clone).ok()
+    }
+
     /// Selects the dedicated provider read transport within an audience object read.
     pub async fn audience_object_read<T>(work: impl std::future::Future<Output = T>) -> T {
         AUDIENCE_OBJECT_READ.scope((), work).await
@@ -103,7 +174,11 @@ impl IoRegion {
         let lease = if self.parent.is_none() { READ_LEASE.try_with(Arc::clone).ok() } else { None };
         if let Some(lease) = &lease { lease.check()?; }
         let mut admission = self.parent.as_ref().map(|parent| parent.admit()).transpose()?
-            .unwrap_or_else(|| IoAdmission { tokens: Vec::new(), lifetimes: retain_admitted_owner!(RETAINED_OWNER).into_iter().collect(), lease });
+            .unwrap_or_else(|| {
+                let mut lifetimes: Vec<Arc<dyn Send + Sync>> = retain_admitted_owner!(RETAINED_OWNER).into_iter().collect();
+                if let Ok(view) = HELD_VIEW.try_with(Arc::clone) { lifetimes.push(view); }
+                IoAdmission { tokens: Vec::new(), lifetimes, lease }
+            });
         admission.tokens.push(self.tasks.token());
         admission.lifetimes.extend(self.lifetime.iter().cloned());
         Ok(admission)
@@ -120,6 +195,49 @@ impl IoRegion {
     pub async fn run_blocking<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         self.run(work).await
     }
+    /// The provider admits one raw read under the opened residence and its exact target.
+    /// The caller can supply a catalog or recovery view for dependencies between requests.
+    pub(crate) async fn read<T, O, A>(
+        &self, owner: Arc<O>, target: A, work: impl FnOnce(&O, &A) -> Result<T> + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        O: Send + Sync + ?Sized + 'static,
+        A: Send + Sync + 'static,
+    {
+        let selection = Arc::new((owner, target));
+        let view = HeldView::recovery(selection.clone());
+        Self::reading(view, self.run(move || work(&selection.0, &selection.1))).await
+    }
+
+    pub(crate) fn admit_read<O, A>(&self, owner: Arc<O>, target: A) -> Result<IoAdmission>
+    where
+        O: Send + Sync + ?Sized + 'static,
+        A: Send + Sync + 'static,
+    {
+        let mut operation = self.admit()?;
+        operation.lifetimes.push(HeldView::recovery(Arc::new((owner, target))));
+        Ok(operation)
+    }
+
+    /// Admits a provider read of the selected object, range, or prefix.
+    #[cfg(feature = "remote")]
+    pub async fn read_async<T, O, A, F>(
+        &self, owner: Arc<O>, target: A, work: impl FnOnce(Arc<O>, A) -> F + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        O: Send + Sync + ?Sized + 'static,
+        A: Clone + Send + Sync + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let selection = Arc::new((owner, target));
+        let view = HeldView::recovery(selection.clone());
+        Self::reading(view, self.run_async(async move {
+            work(selection.0.clone(), selection.1.clone()).await
+        })).await
+    }
+
     pub(crate) async fn run<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         let operation = self.admit()?;
         Self::run_admitted(operation, work).await
@@ -152,6 +270,7 @@ impl IoRegion {
     async fn run_async_admitted_unclassified<T: Send + 'static>(operation: IoAdmission, work: impl std::future::Future<Output = Result<T>> + Send + 'static) -> Result<T> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let audience = Self::requires_audience_transport();
+        let work = Self::inherit_reading(work);
         // Verus checks the shared captures with contract adapters for the coroutine blocks.
         macro_rules! spawn {
             ($worker:ident; $captures:tt => $body:block) => { tokio::spawn(async move $body) };
@@ -188,6 +307,35 @@ mod tests {
     }
     impl Drop for HeldDrop {
         fn drop(&mut self) { self.entered.take().unwrap().send(()).unwrap(); self.release.recv().unwrap(); }
+    }
+
+    #[tokio::test]
+    async fn raw_read_retains_its_opened_provider_and_exact_target_after_cancellation() {
+        let region = IoRegion::new();
+        let owner = Arc::new(String::from("root"));
+        let ownership = Arc::downgrade(&owner);
+        let key = crate::ObjectKey::new("blocks/b00.binpb").unwrap();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let read = {
+            let region = region.clone();
+            tokio::spawn(async move {
+                region.read(owner, key, move |root, key| {
+                    assert_eq!(root.as_str(), "root");
+                    assert_eq!(key.as_str(), "blocks/b00.binpb");
+                    entered.send(()).unwrap();
+                    finished.recv().unwrap();
+                    Ok(())
+                }).await
+            })
+        };
+        started.await.unwrap();
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        assert!(ownership.upgrade().is_some());
+        finish.send(()).unwrap();
+        region.close_and_wait().await;
+        assert!(ownership.upgrade().is_none());
     }
 
     #[tokio::test]

@@ -98,7 +98,7 @@ impl Allocation<'_> {
         let raw = LocalStore::open_in(&self.archive.root, self.region())?;
         Ok(Arc::new(crate::store::EncryptingStore::with_units(
             Arc::new(raw),
-            ledger,
+            Arc::new(ledger),
         )))
     }
 

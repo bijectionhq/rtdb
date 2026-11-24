@@ -17,82 +17,87 @@ use uuid::Uuid;
 
 use super::{
     ArchiveKey, CapturePoint, URL_SAFE_NO_PAD, capture_receipt, checkpoint_storage_root, encode, inconsistent, read_object, require_capture_open,
-    unavailable, verified_archive, verify_cut,
+    unavailable, verified_archive, verified_held_archive, verify_cut,
 };
-use super::replica_artifact::{CertifiedSegments, PayloadBytes, ReplicaArtifact, require_chain};
+use super::replica_artifact::{CertifiedSegments, ReplicaArtifact, extend_payload, require_chain};
 use super::stage::{RegionPublication, with_region};
 use crate::{
     admin::{administration_stream, update_installation},
-    cipher::Cipher,
     deployment::CellStorage,
     keys::KeyService,
     reference::{PrefixedStore, key},
-    store::{EncryptingStore, ROOT_MARKER},
+    replay_broker::{Client, History, admits_position},
 };
-use rtdb_storage::{IoRegion, ObjectStore};
+use rtdb_storage::{IoRegion, ObjectStore, log::ReplicaPayload};
 
 pub(crate) const MAX_SEGMENT_BYTES: usize = 8 << 20;
 pub(crate) const MAX_SEGMENT_ENTRIES: usize = 4096;
 const FORMAT: &[u8] = b"rtdb.replica-suffix.v1\0";
 
 pub(super) struct ServingPayloads<'a> {
-    record: &'a DeploymentRecord,
-    storage: &'a CellStorage,
-    keys: &'a dyn KeyService,
-    io: Arc<IoRegion>,
+    history: History,
+    ticket: Uuid,
+    interval: [i64; 2],
+    broker: Option<&'a Client>,
     memory: &'a Arc<MemoryBudget>,
-    store: tokio::sync::OnceCell<EncryptingStore>,
 }
 
 impl<'a> ServingPayloads<'a> {
     pub(super) fn new(
-        record: &'a DeploymentRecord, storage: &'a CellStorage, keys: &'a dyn KeyService,
-        io: Arc<IoRegion>, memory: &'a Arc<MemoryBudget>,
-    ) -> Self {
-        Self { record, storage, keys, io, memory, store: tokio::sync::OnceCell::new() }
-    }
-
-    pub(super) async fn read(&self, envelope: &ReplicaEnvelope) -> Result<PayloadBytes> {
-        let name = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
-            .ok_or_else(suffix_unavailable)?;
-        let store = self.store.get_or_try_init(|| async {
-            let material = self.keys.existing_key(&self.record.key_id()).await?
-                .ok_or_else(suffix_unavailable)?;
-            let bucket = self.storage.bucket(Arc::clone(&self.io)).await?;
-            if self.record.storage_namespaces.is_some() {
-                let objects = crate::deployment::existing_storage_namespace(bucket.as_ref()).await?
-                    .ok_or_else(suffix_unavailable)?;
-                crate::deployment::require_storage_namespaces(self.record, rtdb_directory::StorageNamespaces {
-                    objects, keys: self.keys.namespace_id().await?,
-                })?;
-            }
-            let root = format!("{}/{}", self.record.storage_prefix(), checkpoint_storage_root()?);
-            let files = PrefixedStore::new(bucket, root);
-            let owner = files.observe_fresh_exact(&key(ROOT_MARKER)?, self.record.id.len()).await?;
-            if owner.value.as_ref() != self.record.id.as_bytes() {
-                return Err(suffix_unavailable());
-            }
-            EncryptingStore::new(Arc::new(files), &material)
-        }).await?;
-        PayloadBytes::read(store, &key(&name)?, self.memory).await
-    }
-
-    pub(super) async fn resolve_verified(&self, envelope: &ReplicaEnvelope) -> Result<(ReplicaEnvelope, PayloadBytes)> {
-        let ReplicaBody::OversizedMessage(reference) = &envelope.message else { return Err(suffix_unavailable()); };
-        if self.record.storage_namespaces.is_none() || reference.payload_sha256.as_ref().is_none_or(|digest| digest.len() != 32) {
+        record: &DeploymentRecord, ticket: Uuid, proof: &JournalDigest,
+        broker: Option<&'a Client>, memory: &'a Arc<MemoryBudget>,
+    ) -> Result<Self> {
+        let [first, through] = proof.interval;
+        if first < 0 || through < first || proof.stream != record.stream("replica")
+            || proof.digest_bytes().is_none()
+            || !record.storage_regions.get(&ticket).is_some_and(|hold| {
+                admits_position(hold, first) && admits_position(hold, through)
+            })
+        {
             return Err(suffix_unavailable());
         }
-        let body = self.read(envelope).await?;
-        let resolved = envelope.unwrap_payload(&body.bytes)?;
+        Ok(Self { history: History::of(record)?, ticket, interval: proof.interval, broker, memory })
+    }
+
+    pub(super) async fn resolve_verified(
+        &self, position: i64, frame: &[u8], envelope: &ReplicaEnvelope,
+    ) -> Result<(ReplicaEnvelope, ReplicaPayload)> {
+        require_payload_digest(envelope)?;
+        if !(self.interval[0]..=self.interval[1]).contains(&position) {
+            return Err(suffix_unavailable());
+        }
+        let broker = self.broker.ok_or_else(suffix_unavailable)?;
+        let body = broker.read(self.history, self.ticket, position, frame, self.memory).await?;
+        let resolved = envelope.unwrap_payload(body.as_ref())?;
         Ok((resolved, body))
     }
+}
+
+pub(super) fn require_payload_digest(envelope: &ReplicaEnvelope) -> Result<()> {
+    if !matches!(&envelope.message,
+        ReplicaBody::OversizedMessage(reference) if reference.payload_sha256.as_ref().is_some_and(|digest| digest.len() == 32))
+    {
+        return Err(suffix_unavailable());
+    }
+    Ok(())
 }
 
 pub(super) async fn read_base_catalog(
     bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
     io: Arc<IoRegion>,
 ) -> Result<(BlockCatalog, Arc<dyn ArchiveKey>)> {
-    let (base, cipher) = verified_archive(bucket.clone(), point, manifest, keys, io).await?;
+    read_base_catalog_at_view(bucket, point, manifest, keys, io, true).await
+}
+
+async fn read_base_catalog_at_view(
+    bucket: Arc<dyn ObjectStore>, point: &CapturePoint, manifest: &str, keys: &dyn KeyService,
+    io: Arc<IoRegion>, held: bool,
+) -> Result<(BlockCatalog, Arc<dyn ArchiveKey>)> {
+    let (base, cipher) = if held {
+        verified_held_archive(Arc::clone(&bucket), point, manifest, keys, io).await?
+    } else {
+        verified_archive(Arc::clone(&bucket), point, manifest, keys, io).await?
+    };
     let root = key(&block_key(BlockIndex(point.checkpoint.block))?)?;
     let root_object = base.objects.iter().find(|object| object.name == root.as_str())
         .ok_or_else(|| inconsistent("The suffix capture omitted its root catalog"))?;
@@ -107,11 +112,11 @@ pub(super) async fn read_base_catalog(
 /// journal cut inside a previously quorum-certified applied interval.
 pub(crate) async fn find_held_publication(
     stream: &rtdb_logkeeper::StreamConfig, proof: &JournalDigest,
-    record: &DeploymentRecord, storage: &CellStorage, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
-    base: &BlockCatalog, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
+    record: &DeploymentRecord, broker: Option<&Client>, keys: &dyn KeyService, cut: &rtdb_node::OwnedForkCut,
+    base: &BlockCatalog, region: Uuid, io: Arc<IoRegion>, memory: &Arc<MemoryBudget>,
 ) -> Result<(TransactionKey, i64, i64)> {
-    let cipher = TerminalReplicaCipher::open(record, keys).await?;
-    let payloads = ServingPayloads::new(record, storage, keys, io, memory);
+    let cipher = TerminalReplicaCipher::open(record, keys, Arc::clone(&io)).await?;
+    let payloads = ServingPayloads::new(record, region, proof, broker, memory)?;
     let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, proof)?;
     let log_epoch = StorageEpoch(record.log_epoch);
     let mut fence = rtdb_replication::TermFence::from_catalog(base)?;
@@ -121,12 +126,12 @@ pub(crate) async fn find_held_publication(
         if selected.is_some() {
             continue;
         }
-        cipher.open_page(&mut entries)?;
+        cipher.open_page(&mut entries).await?;
         for entry in entries {
             let Some(envelope) = admit_record(&entry, &mut fence, &mut writer, record.epoch)? else { continue; };
             let _payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                let (resolved, body) = payloads.resolve_verified(&envelope).await?;
+                let (resolved, body) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
                 _payload = body;
                 resolved
             } else {
@@ -153,7 +158,7 @@ pub(crate) async fn find_held_publication(
 }
 
 pub(crate) async fn capture(
-    directory: Arc<dyn Directory>, storage: &CellStorage, archive: &CellStorage, keys: &dyn KeyService,
+    directory: Arc<dyn Directory>, archive: &CellStorage, keys: &dyn KeyService, broker: Option<&Client>,
     hosted_task: Option<&HostedTask>, deployment: Uuid, pin_id: Uuid,
     selected: CheckpointSuffixPin, memory: &Arc<MemoryBudget>,
 ) -> Result<String> {
@@ -169,7 +174,10 @@ pub(crate) async fn capture(
             async move {
                 let (point, pin) = admit(&record, archive, deployment, pin_id, selected)?;
                 let bucket = archive.bucket(Arc::clone(&io)).await?;
-                let (catalog, cipher) = read_base_catalog(Arc::clone(&bucket), &point, &pin.manifest_sha256, keys, Arc::clone(&io)).await?;
+                let held = pin.custody == CheckpointSuffixCustody::World;
+                let (catalog, cipher) = read_base_catalog_at_view(
+                    Arc::clone(&bucket), &point, &pin.manifest_sha256, keys, Arc::clone(&io), held,
+                ).await?;
                 let stream_name = record.stream("replica");
                 let artifact = suffix_artifact(bucket.as_ref(), cipher, deployment, pin_id, pin, &stream_name)?;
 
@@ -184,8 +192,8 @@ pub(crate) async fn capture(
                     let remaining = pin.expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
                     let materialize = async {
                         let _pages = memory.reserve(32 << 20)?;
-                        let cipher = TerminalReplicaCipher::open(&record, keys).await?;
-                        let payloads = ServingPayloads::new(&record, storage, keys, io, memory);
+                        let cipher = TerminalReplicaCipher::open(&record, keys, Arc::clone(&io)).await?;
+                        let payloads = ServingPayloads::new(&record, region, &certificate, broker, memory)?;
                         let mut segments = CertifiedSegments::new(rtdb_logkeeper::CertifiedRangeReader::new(&stream, &certificate)?);
                         let mut progress = SuffixProgress::new(pin, &catalog)?;
                         let mut chain = artifact.chain();
@@ -196,17 +204,58 @@ pub(crate) async fn capture(
                             // interval proof must also match before sealing the manifest.
                             let segment = rtdb_logkeeper::certify_committed_range(&stream, first, through).await?;
                             rtdb_logkeeper::verify_certified_range(&segment, &entries)?;
-                            cipher.open_page(&mut entries)?;
-                            artifact.put_segment(&entries, &mut chain).await?;
-                            for entry in entries {
-                                let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
-                                if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                                    let (resolved, payload) = payloads.resolve_verified(&envelope).await?;
-                                    progress.apply(resolved, pin, |_| Ok(()))?;
-                                    artifact.put_payload(entry.lsn, &payload.bytes, &mut chain).await?;
+                            cipher.open_page(&mut entries).await?;
+                            let mut detached = Vec::new();
+                            for entry in &mut entries {
+                                let Some(envelope) = progress.admit(entry, pin)? else {
+                                    if held {
+                                        // The original digest and ordering remain authenticated.
+                                        // Fenced frames do not contribute any replay effects.
+                                        let mut envelope = ReplicaFrame::decode(&entry.payload)?
+                                            .into_envelope().ok_or_else(suffix_unavailable)?;
+                                        envelope.message = ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() });
+                                        entry.payload = envelope.encode().into();
+                                    }
+                                    continue;
+                                };
+                                let (mut resolved, payload) = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                                    let (resolved, payload) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
+                                    (resolved, Some(payload))
                                 } else {
-                                    progress.apply(envelope, pin, |_| Ok(()))?;
+                                    (envelope, None)
+                                };
+                                let mut stripped_reservation = false;
+                                if held {
+                                    if let ReplicaBody::NoOp(noop) = &mut resolved.message {
+                                        stripped_reservation = noop.placed_slot_reservation.take().is_some();
+                                    }
+                                    if let ReplicaBody::ResolvedTx(message) = &mut resolved.message {
+                                        rtdb_replication::project_held_replica(
+                                            message, progress.tx, BlockIndex(progress.replay.installed.block), memory,
+                                        )?;
+                                    }
                                 }
+                                if let Some(payload) = payload {
+                                    let projected;
+                                    let body = if held {
+                                        projected = resolved.encode();
+                                        entry.payload = resolved.offloaded(
+                                            CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(pin.checkpoint.block),
+                                            "archive".into(), &projected,
+                                        ).encode().into();
+                                        projected.as_slice()
+                                    } else {
+                                        payload.as_ref()
+                                    };
+                                    detached.push((entry.lsn, artifact.write_payload(entry.lsn, body).await?));
+                                } else if stripped_reservation || held && matches!(&resolved.message, ReplicaBody::ResolvedTx(_)) {
+                                    entry.payload = resolved.encode().into();
+                                }
+                                progress.apply(resolved, pin, |_| Ok(()))?;
+                            }
+                            artifact.put_segment(&entries, &mut chain).await?;
+                            for (offset, digest) in detached {
+                                extend_payload(&mut chain, offset, &digest);
                             }
                         }
                         progress.finish(pin)?;
@@ -283,12 +332,16 @@ pub(super) async fn apply_archived(
             let Some(envelope) = progress.admit(&entry, pin)? else { continue; };
             let payload;
             let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
+                require_payload_digest(&envelope)?;
                 payload = artifact.read_payload(entry.lsn, &mut chain, memory).await?;
                 envelope.unwrap_payload(&payload.bytes)?
             } else {
                 envelope
             };
-            progress.apply(envelope, pin, |message| recovered.apply_archived_transaction(message, memory))?;
+            progress.apply(envelope, pin, |message| match pin.custody {
+                CheckpointSuffixCustody::World => recovered.apply_held_transaction(message, memory),
+                _ => recovered.apply_archived_transaction(message, memory),
+            })?;
         }
     }
     progress.finish(pin)?;
@@ -315,9 +368,13 @@ fn suffix_artifact<'a>(
     identity.expires_at_ms = 0;
     identity.writer_epoch = 0;
     identity.archive_sha256 = None;
+    let (version, domain): (_, &'static [u8]) = match pin.custody {
+        CheckpointSuffixCustody::Capture => ("v3", b"RTDB checkpoint suffix segments v3\0"),
+        _ => ("v3", b"RTDB held business suffix segments v3\0"),
+    };
     ReplicaArtifact::new(
-        bucket, cipher, format!("{}/v2", archive_prefix(deployment, suffix, pin)),
-        encode(&(stream, identity))?, b"RTDB checkpoint suffix segments v2\0",
+        bucket, cipher, format!("{}/{version}", archive_prefix(deployment, suffix, pin)),
+        encode(&(stream, identity))?, domain,
     )
 }
 
@@ -334,33 +391,119 @@ fn archive_digest(expected: &str) -> Result<[u8; 32]> {
     decoded.try_into().map_err(|_| suffix_unavailable())
 }
 
-pub(super) struct TerminalReplicaCipher {
-    cipher: Cipher,
-    scope: String,
-}
+pub(super) struct TerminalReplicaCipher(crate::logs::JournalUnits);
 
 impl TerminalReplicaCipher {
-    pub(super) async fn open(source: &DeploymentRecord, keys: &dyn KeyService) -> Result<Self> {
-        let material = keys.existing_key(&source.key_id()).await?.ok_or_else(suffix_unavailable)?;
-        Ok(Self { cipher: Cipher::new(&material)?, scope: source.replica_seal_scope() })
+    pub(super) async fn open(source: &DeploymentRecord, keys: &dyn KeyService, io: Arc<IoRegion>) -> Result<Self> {
+        Ok(Self(crate::logs::JournalUnits::open(keys, &source.key_id(), &source.replica_seal_scope(), io).await?))
     }
 
-    pub(super) fn open_page(&self, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
+    pub(super) async fn open_page(&self, entries: &mut [ArchivedReplicaEntry]) -> Result<()> {
         for entry in entries {
             // The copy is resealed later; keep the digest its original voters retain.
             rtdb_logkeeper::retain_original_entry_digest(entry);
-            entry.payload = self.cipher.open(&self.scope, &entry.payload)?;
+            entry.payload = self.0.decrypt(entry.payload.clone()).await?;
         }
         Ok(())
     }
 }
 
+/// Copies one sealed source history into a different residence and key vault.
+pub(crate) async fn reseal_live_journal(
+    from: &crate::admin::CellHandle<'_>, source: &DeploymentRecord, source_stream: &rtdb_logkeeper::StreamConfig,
+    to: &crate::admin::CellHandle<'_>, target: &DeploymentRecord, target_stream: &rtdb_logkeeper::StreamConfig,
+    task: Option<&HostedTask>,
+) -> Result<()> {
+    use rtdb_logkeeper::{bootstrap_committed_page, certify_committed_range, seal_recover_bounds, verify_certified_range};
+    use rtdb_storage::log::LogOffset;
+
+    let (trim, through) = seal_recover_bounds(source_stream, source.epoch).await?;
+    let trim = LogOffset(source.replica_anchor.as_ref().map_or(trim.0, |anchor| anchor.interval[1].max(trim.0)));
+    let first = LogOffset(trim.0.checked_add(1).ok_or_else(suffix_unavailable)?);
+    if trim > through { return Err(suffix_unavailable()); }
+    if first > through {
+        return bootstrap_committed_page(target_stream, source.epoch, trim, first, &[], true).await;
+    }
+
+    with_region(
+        from.directory.as_ref(), from.keys, &source.id, from.storage, task, None, None,
+        |current| {
+            if current.lifecycle != Lifecycle::Moving || current.holder.is_some()
+                || current.epoch != source.epoch || current.log_epoch != source.log_epoch
+                || current.storage_prefix() != source.storage_prefix()
+                || current.cell_transfer != source.cell_transfer
+            {
+                return Err(suffix_unavailable());
+            }
+            Ok(Some(crate::hosted_recovery::replay_start(current, trim.0)?))
+        },
+        |current, region, io| async move {
+            let source_cipher = TerminalReplicaCipher::open(&current, from.keys, Arc::clone(&io)).await?;
+            let target_units = crate::logs::JournalUnits::open(
+                to.keys, &target.key_id(), &target.replica_seal_scope(), io,
+            ).await?;
+            let certificate = certify_committed_range(source_stream, first.0, through.0).await?;
+            let memory = MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes);
+            let _pages = memory.reserve(32 << 20)?;
+            let payloads = ServingPayloads::new(&current, region, &certificate, from.broker, &memory)?;
+            let cursor = rtdb_logkeeper::CertifiedRangeReader::new(source_stream, &certificate)?;
+            let mut segments = CertifiedSegments::new(cursor);
+            while let Some(mut entries) = segments.next().await? {
+                let first = entries.first().ok_or_else(suffix_unavailable)?.lsn;
+                let last = entries.last().ok_or_else(suffix_unavailable)?.lsn;
+                let page = certify_committed_range(source_stream, first, last).await?;
+                verify_certified_range(&page, &entries)?;
+                source_cipher.open_page(&mut entries).await?;
+                for entry in &mut entries {
+                    if ReplicaFrame::has_external_payload(&entry.payload)? {
+                        let envelope = ReplicaEnvelope::decode(&entry.payload)?.ok_or_else(suffix_unavailable)?;
+                        let relative = envelope.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?
+                            .ok_or_else(suffix_unavailable)?;
+                        let object = key(&relative)?;
+                        let (resolved, body) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
+                        let body = Bytes::from_owner(body);
+                        let broker = to.broker.ok_or_else(suffix_unavailable)?;
+                        let publication = broker.copy(target, entry.lsn, &object, body.clone()).await?;
+                        entry.payload = target_payload_proxy(&envelope, &resolved, &body, publication)?;
+                    }
+                    entry.payload = target_units.seed(entry.lsn, entry.payload.clone()).await?;
+                }
+                bootstrap_committed_page(target_stream, source.epoch, trim, LogOffset(first), &entries, last == through.0).await?;
+                let chosen = certify_committed_range(target_stream, first, last).await?;
+                verify_certified_range(&chosen, &entries)?;
+            }
+            Ok(())
+        },
+    ).await
+}
+
+pub(super) fn target_payload_proxy(
+    original: &ReplicaEnvelope, resolved: &ReplicaEnvelope, body: &[u8],
+    publication: Option<rtdb_types::PhysicalObjectVersion>,
+) -> Result<bytes::Bytes> {
+    let rtdb_format::envelope::ReplicaBody::OversizedMessage(reference) = &original.message else {
+        return Err(inconsistent("The target payload has no certified reference"));
+    };
+    let id = reference.payload_id.clone().ok_or_else(|| inconsistent("The target payload has no object identity"))?;
+    let mut proxy = resolved.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(reference.block_index.unwrap_or_default()), id, body);
+    if let Some(publication) = publication {
+        proxy.bind_offload_publication(publication)?;
+    }
+    Ok(proxy.encode().into())
+}
+
 /// Exact replay coordinates retained while the terminal interval is read in
 /// bounded segments. The recovered partition owns the application term fence.
+pub(super) struct TerminalReplayFrontier {
+    pub source_through: i64,
+    pub placed_debt: Option<rtdb_types::PlacedTransferDebt>,
+}
+
 pub(super) struct TerminalReplayProgress {
     writer_epoch: Option<u64>,
     last_offset: i64,
     replay: LogicalReplay,
+    placed: Option<rtdb_types::PlacedTransferDebt>,
 }
 
 impl TerminalReplayProgress {
@@ -373,6 +516,7 @@ impl TerminalReplayProgress {
         Ok(Self {
             writer_epoch: None, last_offset: checkpoint.boundary,
             replay: LogicalReplay::new(checkpoint, fence.destination.source_log_epoch, catalog),
+            placed: None,
         })
     }
 
@@ -395,12 +539,49 @@ impl TerminalReplayProgress {
         match envelope.message {
             ReplicaBody::ResolvedTx(message) => {
                 let next = self.replay.transaction_source(message.src_msg_id)?;
+                match (self.placed.as_ref(), message.placed_slot_terminal.as_deref(), message.placed_attempt.as_deref()) {
+                    (None, None, None) => (),
+                    (Some(debt), Some(terminal), Some(attempt)) => {
+                        let term = rtdb_types::Term(debt.term);
+                        let reserved = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
+                        let terminal = rtdb_types::PlacedTerminal::decode(terminal)?;
+                        let (attempt, _) = rtdb_format::envelope::decode_replica_outcome_attempt(attempt)?;
+                        if attempt != reserved.attempt || terminal.commitment != reserved.commitment
+                            || message.tx_id != Some(attempt.position().0) || message.src_msg_id != message.tx_id
+                            || message.committed.is_none()
+                            || if terminal.fenced { envelope.term <= term || message.committed != Some(false) }
+                               else { envelope.term != term }
+                        {
+                            return Err(suffix_unavailable());
+                        }
+                    }
+                    _ => return Err(suffix_unavailable()),
+                }
                 recovered.apply_archived_transaction(&message, memory)?;
+                self.placed = None;
                 self.replay.source = next;
             }
+            ReplicaBody::NoOp(noop) if noop.placed_slot_reservation.is_some() => {
+                if self.placed.is_some() || noop.src_msg_id.is_some() || self.replay.pending.is_some() {
+                    return Err(suffix_unavailable());
+                }
+                let reserved = rtdb_types::PlacedReservation::decode(
+                    noop.placed_slot_reservation.as_deref().ok_or_else(suffix_unavailable)?,
+                )?;
+                if self.replay.source_offset(reserved.attempt.position().0)? <= self.replay.source {
+                    return Err(suffix_unavailable());
+                }
+                self.placed = Some(rtdb_types::PlacedTransferDebt {
+                    term: envelope.term.0, reserved_at: self.last_offset, reservation: reserved.encode(),
+                });
+            }
             control => {
+                let control = ReplayControl::read(&control)?;
+                if self.placed.is_some() && !matches!(control, ReplayControl::Advance(None)) {
+                    return Err(suffix_unavailable());
+                }
                 let prior = self.replay.source;
-                self.replay.apply_control(ReplayControl::read(&control)?)?;
+                self.replay.apply_control(control)?;
                 if self.replay.source > prior {
                     recovered.progress.source_position =
                         SourcePosition::from_epoch_offset(self.replay.epoch, self.replay.source)?;
@@ -410,9 +591,9 @@ impl TerminalReplayProgress {
         Ok(())
     }
 
-    pub(super) fn finish(self, through: i64) -> Result<i64> {
+    pub(super) fn finish(self, through: i64) -> Result<TerminalReplayFrontier> {
         if self.last_offset != through { return Err(suffix_unavailable()); }
-        Ok(self.replay.source)
+        Ok(TerminalReplayFrontier { source_through: self.replay.source, placed_debt: self.placed })
     }
 }
 
@@ -421,7 +602,7 @@ pub(super) async fn with_terminal_source<T, F, Fut>(
     fence: &CheckpointTransferFence, through: i64, expected: Option<&CheckpointTransferTerminal>, run: F,
 ) -> Result<T>
 where
-    F: FnOnce(DeploymentRecord, Arc<IoRegion>) -> Fut,
+    F: FnOnce(DeploymentRecord, Uuid, Arc<IoRegion>) -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
     let stage = &fence.destination;
@@ -429,7 +610,7 @@ where
     Box::pin(with_region(
         directory, keys, &deployment, storage, hosted_task, Some((stage.intent.capture, None)), None,
         |source| terminal_replay_floor(source, fence, through, expected),
-        |source, _, io| run(source, io),
+        run,
     )).await
 }
 
@@ -456,11 +637,11 @@ fn terminal_replay_floor(
 
 /// Reopen the original certified source interval without accumulating its raw bytes.
 pub(super) async fn replay_certified_terminal(
-    source: &DeploymentRecord, storage: &CellStorage, io: Arc<IoRegion>,
+    source: &DeploymentRecord, broker: Option<&Client>, region: Uuid, io: Arc<IoRegion>,
     keys: &dyn KeyService, stream: &rtdb_logkeeper::StreamConfig,
     certificate: Option<&JournalDigest>, fence: &rtdb_directory::CheckpointTransferFence, through: i64,
     recovered: &mut rtdb_replication::RecoveredPartition, memory: &Arc<rtdb_columnar::MemoryBudget>,
-) -> Result<i64> {
+) -> Result<TerminalReplayFrontier> {
     let mut progress = TerminalReplayProgress::new(fence, recovered)?;
     let first = fence.destination.checkpoint.boundary.checked_add(1).ok_or_else(suffix_unavailable)?;
     if stream.stream != source.stream("replica") {
@@ -468,20 +649,20 @@ pub(super) async fn replay_certified_terminal(
     }
     if let Some(certificate) = certificate {
         if certificate.interval != [first, through] { return Err(suffix_unavailable()); }
-        let cipher = TerminalReplicaCipher::open(source, keys).await?;
-        let payloads = ServingPayloads::new(source, storage, keys, io, memory);
+        let cipher = TerminalReplicaCipher::open(source, keys, Arc::clone(&io)).await?;
+        let payloads = ServingPayloads::new(source, region, certificate, broker, memory)?;
         let mut pages = rtdb_logkeeper::CertifiedRangeReader::new(stream, certificate)?;
         while let Some(mut entries) = pages.next_page().await? {
             let bytes = entries.iter().try_fold(0usize, |total, entry|
                 total.checked_add(entry.payload.len().saturating_mul(2).saturating_add(64))
                     .ok_or_else(suffix_unavailable))?;
             let _charge = memory.reserve(bytes)?;
-            cipher.open_page(&mut entries)?;
+            cipher.open_page(&mut entries).await?;
             for entry in entries {
                 let Some(envelope) = progress.admit(&entry, fence, recovered)? else { continue; };
                 let _payload;
                 let envelope = if matches!(&envelope.message, ReplicaBody::OversizedMessage(_)) {
-                    let (resolved, body) = payloads.resolve_verified(&envelope).await?;
+                    let (resolved, body) = payloads.resolve_verified(entry.lsn, &entry.payload, &envelope).await?;
                     _payload = body;
                     resolved
                 } else {
@@ -749,7 +930,7 @@ pub(super) fn transfer_control(
     };
     Ok(Some(ReplicaEnvelope {
         term: envelope.term, term_sequence: envelope.term_sequence,
-        message: ReplicaBody::NoOp(NoOp { src_msg_id }),
+        message: ReplicaBody::NoOp(NoOp { src_msg_id, ..Default::default() }),
     }.encode().into()))
 }
 
@@ -767,6 +948,9 @@ pub(super) fn admit_record(
     let admitted = fence.admit(envelope.term, envelope.term_sequence)?;
     if admitted.opens_term() && !matches!(&envelope.message,
         ReplicaBody::NoOp(noop) if noop.src_msg_id.is_none())
+        && !matches!(&envelope.message, ReplicaBody::ResolvedTx(tx)
+            if tx.placed_slot_terminal.as_deref().and_then(|wire| rtdb_types::PlacedTerminal::decode(wire).ok())
+                .is_some_and(|terminal| terminal.fenced))
     {
         return Err(suffix_unavailable());
     }
@@ -776,6 +960,7 @@ pub(super) fn admit_record(
 
 #[cfg(test)]
 mod custody_tests {
+    use crate::store::{EncryptingStore, ROOT_MARKER};
     use rtdb_directory::{Checkpoint, CheckpointCapture, JournalAnchor, MemberId, MemoryDirectory};
     use rtdb_format::log::proto::OversizedMessage;
     use rtdb_replication::{TermFence, TermPosition};
@@ -794,7 +979,7 @@ mod custody_tests {
             admit_record(&entry, &mut fence, &mut writer, 3)
         };
         let offloaded = || ReplicaBody::OversizedMessage(OversizedMessage::default());
-        let claim = || ReplicaBody::NoOp(NoOp { src_msg_id: None });
+        let claim = || ReplicaBody::NoOp(NoOp { src_msg_id: None, ..Default::default() });
         assert!(admit(1, 1, 1, offloaded())?.is_none());
         assert!(admit(2, 5, 1, offloaded())?.is_none());
         assert!(admit(2, 7, 2, offloaded())?.is_none());
@@ -807,37 +992,22 @@ mod custody_tests {
     }
 
     #[tokio::test]
-    async fn new_custody_requires_the_serving_body_bound_to_the_certified_frame() -> Result<()> {
-        let location = tempfile::tempdir().unwrap();
-        let storage = CellStorage::Local { root: location.path().join("serving") };
-        let keys = crate::keys::LocalKeyService::new(&location.path().join("keys"))?;
-        let io = IoRegion::new();
-        let bucket = storage.bucket(Arc::clone(&io)).await?;
+    async fn archived_replay_requires_a_broker_for_detached_bodies() -> Result<()> {
         let mut record = DeploymentRecord::new("source", "acme", Vec::new(), now_ms());
-        record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await?);
-        let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
-        let files = PrefixedStore::new(bucket, root);
-        files.put(&key(ROOT_MARKER)?, Bytes::copy_from_slice(record.id.as_bytes())).await?;
-        let material = keys.key(&record.key_id()).await?;
-        let objects = EncryptingStore::new(Arc::new(files), &material)?;
         let memory = MemoryBudget::new(1 << 20);
-        let payloads = ServingPayloads::new(&record, &storage, &keys, io, &memory);
+        let region = Uuid::new_v4();
+        record.storage_regions.insert(region, rtdb_directory::StorageRegion::ReplicaReplay {
+            first_required: 9, through: 9, custody: rtdb_directory::ReplayCustody::Local,
+        });
+        let proof = JournalDigest::from_digest_bytes(record.stream("replica"), [9, 9], [7; 32]);
+        assert!(ServingPayloads::new(&record, Uuid::new_v4(), &proof, None, &memory).is_err());
+        let payloads = ServingPayloads::new(&record, region, &proof, None, &memory)?;
         let original = ReplicaEnvelope {
-            term: Term(2), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(17) }),
+            term: Term(2), term_sequence: Some(TermSequence(1)), message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(17), ..Default::default() }),
         };
         let body = original.encode();
-        let proxy = original.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "payload".into(), &body);
-        let path = key(&proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap())?;
-        assert!(payloads.resolve_verified(&proxy).await.is_err());
-        let wrong = ReplicaEnvelope { message: ReplicaBody::NoOp(NoOp { src_msg_id: Some(18) }), ..original.clone() };
-        objects.put(&path, wrong.encode().into()).await?;
-        assert_eq!(payloads.resolve_verified(&proxy).await.err().unwrap().code, "rtdb.format/oversized-payload-mismatch");
-        objects.delete(&path).await?;
-        objects.put(&path, body.into()).await?;
-        assert_eq!(payloads.resolve_verified(&proxy).await?.0, original);
-        let mut legacy = proxy;
-        if let ReplicaBody::OversizedMessage(reference) = &mut legacy.message { reference.payload_sha256 = None; }
-        assert!(payloads.resolve_verified(&legacy).await.is_err());
+        let pointer = original.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "payload".into(), &body);
+        assert!(payloads.resolve_verified(9, &pointer.encode(), &pointer).await.is_err());
         Ok(())
     }
 
@@ -873,13 +1043,11 @@ mod custody_tests {
         let source_root = format!("{}/{}", source.storage_prefix(), checkpoint_storage_root()?);
         let source_files = PrefixedStore::new(Arc::clone(&bucket), source_root);
         source_files.put(&key(ROOT_MARKER)?, Bytes::copy_from_slice(source.id.as_bytes())).await?;
-        let source_objects = Arc::new(EncryptingStore::new(Arc::new(source_files), &source_key)?);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let (journal, journal_id) = rtdb_logkeeper::PreparedJournal::open_for_member(
             rtdb_logkeeper::ServerOptions { data_dir: location.path().join("journal"), fsync: true, cache_bytes: 1 << 20 },
-            Uuid::new_v4().to_string(),
         ).await?;
         let stream = rtdb_logkeeper::StreamConfig {
             servers: vec![rtdb_logkeeper::JournalEndpoint::Member { address: address.clone(), journal: journal_id.clone() }],
@@ -896,7 +1064,7 @@ mod custody_tests {
         let cancellation = CancellationToken::new();
         let server = tokio::spawn(journal.serve(listener, cancellation.clone()));
         let writer = rtdb_logkeeper::open_writer(stream.clone(), 1, cancellation.clone()).await?;
-        let writer = crate::logs::SealedLog::new(writer, &source_key, &source.replica_seal_scope())?;
+        let writer = crate::logs::SealedLog::new(writer, keys.as_ref(), &source.key_id(), &source.replica_seal_scope(), IoRegion::new()).await?;
         let claim = |term| ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(0)),
             message: ReplicaBody::NoOp(NoOp::default()) };
         writer.enqueue(claim(1).encode().into(), Timestamp(10)).await?.durable().await?;
@@ -904,7 +1072,7 @@ mod custody_tests {
         let large_transaction = |id, time, term| -> Result<ReplicaEnvelope> {
             use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
             use rtdb_types::{EntityId, Interval, LogicalType, ScalarType, StructFields, Value};
-            let row = StoredEvent {
+            let row = StoredEvent { position: None,
                 origin: None,
                 entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(time),
                 commit_position: 0, valid_time: Interval::ALL, recency: None,
@@ -928,17 +1096,10 @@ mod custody_tests {
         let earlier_body = Bytes::from(earlier.encode());
         let earlier_proxy = earlier.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), Uuid::new_v4().to_string(), &earlier_body);
         let earlier_path = key(&earlier_proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap())?;
-        source_objects.put(&earlier_path, earlier_body.clone()).await?;
-        writer.enqueue(earlier_proxy.encode().into(), Timestamp(20)).await?.durable().await?;
-        let writer = rtdb_logkeeper::open_writer(stream.clone(), 2, cancellation.clone()).await?;
-        let writer = crate::logs::SealedLog::new(writer, &source_key, &source.replica_seal_scope())?;
-        writer.enqueue(claim(2).encode().into(), Timestamp(21)).await?.durable().await?;
         let later = large_transaction(terminal_source, 30, 2)?;
         let later_body = Bytes::from(later.encode());
         let later_proxy = later.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), Uuid::new_v4().to_string(), &later_body);
         let later_path = key(&later_proxy.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.unwrap())?;
-        source_objects.put(&later_path, later_body.clone()).await?;
-        writer.enqueue(later_proxy.encode().into(), Timestamp(30)).await?.durable().await?;
         assert!(earlier_body.len() + later_body.len() > MAX_SEGMENT_BYTES);
 
         let catalog = BlockCatalog::from_proto(block_proto::Block {
@@ -957,7 +1118,7 @@ mod custody_tests {
                 root_sha256: Some(rtdb_format::catalog::publication_digest(&root_bytes)) },
         };
         let archive_key = keys.key(&archive_key_id(&point)).await?;
-        let sealed = Cipher::new(&archive_key)?.seal_deterministic(root.as_str(), &root_bytes)?;
+        let sealed = crate::cipher::Cipher::new(&archive_key)?.seal_deterministic(root.as_str(), &root_bytes)?;
         let captured = Capture {
             point: point.clone(), format: rtdb_format::catalog::CheckpointContents::Replay,
             objects: vec![ArchivedObject { name: root.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None }],
@@ -976,7 +1137,20 @@ mod custody_tests {
             checkpoint: point.checkpoint, automatic_fork: false, world_replay: None, media_bound: true,
             manifest_sha256: Some(manifest.clone()), remote_disposal: None,
         });
+        source.holder = Some(MemberId::fresh());
         let source = directory.create_deployment(source).await?;
+        let broker_tasks = tokio_util::task::TaskTracker::new();
+        let broker_media = CellStorage::Local { root: location.path().join("replay-bodies") };
+        let broker_keys = Arc::new(crate::keys::LocalKeyService::new(&location.path().join("replay-keys"))?);
+        let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone())?;
+        let history = History::of(&source)?;
+        broker.publish(history, source.epoch, &earlier_path, earlier_body.clone()).await?;
+        writer.enqueue(earlier_proxy.encode().into(), Timestamp(20)).await?.durable().await?;
+        let writer = rtdb_logkeeper::open_writer(stream.clone(), 2, cancellation.clone()).await?;
+        let writer = crate::logs::SealedLog::new(writer, keys.as_ref(), &source.key_id(), &source.replica_seal_scope(), IoRegion::new()).await?;
+        writer.enqueue(claim(2).encode().into(), Timestamp(21)).await?.durable().await?;
+        broker.publish(history, source.epoch, &later_path, later_body.clone()).await?;
+        writer.enqueue(later_proxy.encode().into(), Timestamp(30)).await?.durable().await?;
         let operation = Uuid::new_v4();
         let destination = Uuid::new_v4();
         let stage = Box::pin(stage_checkpoint_transfer(directory.clone(), &archive, &storage, keys.as_ref(), CheckpointStageIntent {
@@ -987,24 +1161,25 @@ mod custody_tests {
             destination, operation, manifest_sha256: stage.staged_manifest_sha256.clone().unwrap(),
             source: Some((deployment, capture, source.org.clone())), transfer_only: true,
         };
-        let terminal = Box::pin(issue_checkpoint_transfer(directory.clone(), &storage, &archive, keys.as_ref(), selector.clone(), None)).await?;
+        let terminal = Box::pin(issue_checkpoint_transfer(directory.clone(), &storage, &archive, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
         assert_eq!(terminal.replica_through, 3);
         assert_eq!(terminal.source_through, terminal_source);
         assert!(directory.deployment(&source.id).await?.unwrap().storage_regions.is_empty());
 
-        source_objects.delete(&later_path).await?;
-        source_objects.put(&later_path, earlier_body.clone()).await?;
-        let changed = Box::pin(verify_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), None)).await;
-        assert_eq!(changed.err().unwrap().code, "rtdb.format/oversized-payload-mismatch");
-        source_objects.delete(&later_path).await?;
-        source_objects.put(&later_path, later_body.clone()).await?;
-        let bootstrap = Box::pin(verify_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), None)).await?;
+        let files = PrefixedStore::new(broker_media.bucket(IoRegion::new()).await?, crate::replay_broker::residence(&source));
+        let sealed = files.get_fresh(&later_path).await?;
+        files.delete(&later_path).await?;
+        files.put(&later_path, Bytes::from_static(b"invalid detached body")).await?;
+        assert!(Box::pin(verify_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await.is_err());
+        files.delete(&later_path).await?;
+        files.put(&later_path, sealed).await?;
+        let bootstrap = Box::pin(verify_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
         assert_eq!(bootstrap.terminal, terminal);
-        source_objects.delete(&earlier_path).await?;
-        source_objects.delete(&later_path).await?;
+        files.delete(&earlier_path).await?;
+        files.delete(&later_path).await?;
         keys.destroy(&source.key_id()).await?;
-        let seeded = Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), None)).await?;
-        let retry = Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), None)).await?;
+        let seeded = Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
+        let retry = Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
         assert_eq!(seeded, retry);
         let target = directory.deployment(&destination.to_string()).await?.unwrap();
         let target_root = format!("{}/{}", target.storage_prefix(), checkpoint_storage_root()?);
@@ -1013,11 +1188,11 @@ mod custody_tests {
         let target_files = PrefixedStore::new(Arc::clone(&bucket), target_root);
         let foreign = key(&rtdb_format::keys::oversized_key(BlockIndex(1), "unadmitted")?)?;
         target_files.put(&foreign, Bytes::from_static(b"unrelated")).await?;
-        assert!(Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), None)).await.is_err());
+        assert!(Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await.is_err());
         target_files.delete(&foreign).await?;
-        let activated = Box::pin(activate_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector, None)).await?;
+        let activated = Box::pin(activate_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector, Some(&broker), None)).await?;
         assert_eq!(activated.replica, seeded);
-        drop(directory);
+        drop((broker, directory));
 
         let target_objects = Arc::new(EncryptingStore::new(Arc::new(target_files), &target_key)?);
         let memory = MemoryBudget::new(256 << 20);
@@ -1033,7 +1208,8 @@ mod custody_tests {
             let rtdb_directory::Cas::Applied(holder) = directory.replace_deployment(holder, version).await? else {
                 panic!("the transfer holder lost its placement");
             };
-            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), custody: ReplayCustody::Local, tasks: Default::default() });
+            let broker = Client::standalone(directory.clone(), broker_media.clone(), &storage, broker_keys.clone(), broker_tasks.clone())?;
+            let holdings = Arc::new(RecoveryHolds { directory: directory.clone(), keys: keys.clone(), broker: Some(broker), custody: ReplayCustody::Local, tasks: Default::default() });
             let factory = LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Default::default(), holdings);
             let config = holder_config(&holder, seeded.journals.clone(), &storage, Role::Holder);
             let Some(database_config::Log::OtherLog(config)) = config.log else { panic!("target did not use Logkeeper"); };

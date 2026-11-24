@@ -7,7 +7,7 @@ use arrow_array::{Array, RecordBatch, StructArray, UnionArray};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_execution_value};
 use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owned_event_batch, keyed_put_batch};
 use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
-use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, Value};
+use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
 
@@ -402,7 +402,10 @@ impl LiveTable {
             if batch.view().has_entity_keys() && !batch.is_empty() {
                 let mut previous = if self.last_system_time == Some(system_time) && self.row_count > 0 {
                     let header = self.header(self.row_count - 1)?;
-                    (header.system_from == system_time).then_some(header.commit_position)
+                    (header.system_from == system_time
+                        && header.position.map(|position| position.transaction)
+                            == batch.headers.0[0].position.map(|position| position.transaction))
+                        .then_some(header.commit_position)
                 } else {
                     None
                 };
@@ -464,9 +467,11 @@ impl LiveTable {
         let empty = IndexBatch::copy_events_with_put_schema(&[], &self.column_types, memory)?;
         let include_origins = self.chunks.iter().any(|(_, batch)| batch.view().has_origin_column());
         let mut schema = empty.arrow().schema();
-        if include_origins {
+        let include_positions = self.chunks.iter().any(|(_, batch)| batch.view().has_position_column());
+        if include_origins || include_positions {
             let mut fields = schema.fields().to_vec();
-            fields.push(Arc::new(rtdb_format::data::event_origin_field()));
+            if include_origins { fields.push(Arc::new(rtdb_format::data::event_origin_field())); }
+            if include_positions { fields.push(Arc::new(rtdb_format::data::event_position_field())); }
             schema = Arc::new(arrow_schema::Schema::new(fields));
         }
         let sources = self.chunks.iter().all(|(_, batch)| batch.arrow().schema() == schema)
@@ -578,14 +583,35 @@ impl StagedWrite {
 
     /// Attach sealed application tables to the order-assigned transaction metadata.
     /// Their system clock and predecessor were fixed before the source ID was assigned.
-    pub fn install_prepared_generation(&mut self, prepared: Self) -> Result<()> {
+    pub fn install_prepared_generation(&mut self, mut prepared: Self, memory: &Arc<MemoryBudget>) -> Result<()> {
         if prepared.predecessor != self.predecessor || prepared.block_index != self.block_index
             || prepared.tx_key.system_time != self.tx_key.system_time
             || prepared.tables.keys().any(|table| self.tables.contains_key(table))
         {
             return Err(invalid("Prepared generation differs from the ordered transaction"));
         }
+        let effect_count = prepared.row_count()?;
+        prepared.rebind_positions(self.tx_key.tx_id, 0, memory)?;
+        self.rebind_positions(self.tx_key.tx_id, effect_count, memory)?;
         self.tables.extend(prepared.tables);
+        Ok(())
+    }
+
+    fn rebind_positions(&mut self, transaction: TxId, shift: u64, memory: &Arc<MemoryBudget>) -> Result<()> {
+        let original = self.tx_key.tx_id;
+        for write in self.tables.values_mut() {
+            let Some(batch) = &write.batch else { continue; };
+            if batch.is_empty() { continue; }
+            let _positions = memory.reserve(batch.len().checked_mul(32).ok_or_else(|| invalid("Event positions exceed memory"))?)?;
+            let positions = batch.headers.0.iter().map(|header| {
+                let position = header.position.filter(|position| position.transaction == original)
+                    .ok_or_else(|| invalid("Prepared event has another original order"))?;
+                let ordinal = position.ordinal.checked_add(shift).ok_or_else(|| invalid("Event ordinal exhausted"))?;
+                Ok(EventPosition { transaction, ordinal })
+            }).collect::<Result<Vec<_>>>()?;
+            let rebound = rtdb_format::data::append_event_positions(&batch.owned, positions, memory)?;
+            write.batch = Some(IndexBatch::from_owned(rebound)?);
+        }
         Ok(())
     }
 
@@ -768,6 +794,7 @@ pub struct TransactionBuffer {
     budget: Arc<MemoryBudget>,
     tables: BTreeMap<TableRef, PendingTable>,
     owned_positions: Option<OwnedCommitPositions>,
+    next_event_ordinal: u64,
     /// Each table's transaction segment as last read, with the events and declarations it holds; a read appends only what was written since.
     segments: std::sync::Mutex<BTreeMap<TableRef, (Arc<LiveTable>, WritePosition, StructFields<LogicalType>)>>,
 }
@@ -775,7 +802,7 @@ pub struct TransactionBuffer {
 impl TransactionBuffer {
     pub fn new(base: Snapshot, tx_key: TransactionKey, budget: Arc<MemoryBudget>) -> Result<Self> {
         StagedWrite::new(tx_key, base.tx_basis(), base.block_index(), BTreeMap::new())?;
-        Ok(Self { base, tx_key, budget, tables: BTreeMap::new(), owned_positions: None, segments: Default::default() })
+        Ok(Self { base, tx_key, budget, tables: BTreeMap::new(), owned_positions: None, next_event_ordinal: 0, segments: Default::default() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
     pub fn retain_owned_positions(&mut self) -> Result<()> {
@@ -827,14 +854,39 @@ impl TransactionBuffer {
     }
     pub fn put(&mut self, table: TableRef, document: StructFields<Value>, valid_time: Interval) -> Result<()> {
         let id = document.get("_id").ok_or_else(|| invalid("Put document has no _id"))?.entity_id()?;
-        self.append(table, StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
+        self.append(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Put(document), recency: None })
     }
     pub fn delete(&mut self, table: TableRef, id: &EntityId, valid_time: Interval) -> Result<()> {
-        self.append(table, StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Delete, recency: None })
+        self.append(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time, operation: StoredOperation::Delete, recency: None })
     }
     pub fn erase(&mut self, table: TableRef, id: &EntityId) -> Result<()> {
-        self.append(table, StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
+        self.append(table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from: self.tx_key.system_time, valid_time: Interval::ALL, operation: StoredOperation::Erase, recency: None })
     }
+    pub fn puts_metadata_unit(&self, table: &TableRef, iid: Iid, key: Option<&[u8]>) -> Result<bool> {
+        let Some(pending) = self.tables.get(table) else { return Ok(false); };
+        let mut put = false;
+        for event in &pending.events {
+            if event.iid != iid || event.entity_key.as_deref() != key { continue; }
+            match &event.operation {
+                StoredOperation::Erase => return Ok(false),
+                StoredOperation::Put(_) => put = true,
+                _ => {}
+            }
+        }
+        for (_, batch) in &pending.batches {
+            for row in 0..batch.len() {
+                let header = batch.header(row)?;
+                if header.iid != iid || batch.view().entity_key(row)? != key { continue; }
+                match header.op {
+                    EventOp::Erase => return Ok(false),
+                    EventOp::Put => put = true,
+                    _ => {}
+                }
+            }
+        }
+        Ok(put)
+    }
+
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.append_to(&table, event).map(drop) }
     /// As `append`, copying the table reference only for the table's first write.
     pub fn append_to(&mut self, table: &TableRef, event: StoredEvent) -> Result<Option<NonZeroU32>> {
@@ -889,8 +941,8 @@ impl TransactionBuffer {
             return Err(invalid("The transaction event has the wrong physical entity-key layout"));
         }
         if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
-        if event.commit_position != 0 {
-            return Err(invalid("The transaction buffer assigns owned commit positions"));
+        if event.commit_position != 0 || event.position.is_some() {
+            return Err(invalid("The transaction buffer assigns commit and event positions"));
         }
         if let StoredOperation::Put(document) = &mut event.operation { document.values_mut().try_for_each(Value::admit_object_dates)?; }
         let document_bytes = match &event.operation { StoredOperation::Put(document) => Value::document_retained_bytes(document)?, _ => 0 };
@@ -899,10 +951,14 @@ impl TransactionBuffer {
             .ok_or_else(|| invalid("Transaction event size overflow"))?;
         let reservation = self.budget.reserve(bytes)?;
         if !self.tables.contains_key(table) { self.tables.insert(table.clone(), PendingTable::default()); }
+        let ordinal = self.next_event_ordinal;
+        let next = ordinal.checked_add(1).ok_or_else(|| invalid("Event ordinal exhausted"))?;
         event.commit_position = position;
+        event.position = Some(EventPosition { transaction: self.tx_key.tx_id, ordinal });
         let pending = self.tables.get_mut(table).ok_or_else(|| invalid("Transaction table write disappeared"))?;
         pending.events.push(event);
         pending.reservations.push(reservation);
+        self.next_event_ordinal = next;
         Ok(())
     }
     fn next_owned_position(&self, table: &TableRef) -> Result<Option<u32>> {
@@ -954,8 +1010,15 @@ impl TransactionBuffer {
     }
 
     fn append_batch_inner(&mut self, table: &TableRef, batch: OwnedBatch) -> Result<()> {
-        let batch = IndexBatch::from_owned(batch)?;
-        if batch.is_empty() { return Ok(()); }
+        let rows = batch.batch().num_rows();
+        if rows == 0 { return Ok(()); }
+        if batch.batch().schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_ok() {
+            return Err(invalid("The transaction buffer assigns Arrow event positions"));
+        }
+        let start = self.next_event_ordinal;
+        let end = start.checked_add(rows as u64).ok_or_else(|| invalid("Event ordinal exhausted"))?;
+        let positions = (start..end).map(|ordinal| EventPosition { transaction: self.tx_key.tx_id, ordinal });
+        let batch = IndexBatch::from_owned(rtdb_format::data::append_event_positions(&batch, positions, &self.budget)?)?;
         if !batch.has_system_time(self.tx_key.system_time) {
             return Err(invalid("Transaction batch has another system time"));
         }
@@ -977,6 +1040,7 @@ impl TransactionBuffer {
         }
         pending.batches.push((pending.events.len(), batch));
         pending.reservations.push(reservation);
+        self.next_event_ordinal = end;
         Ok(())
     }
 
@@ -1027,7 +1091,7 @@ fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtd
 fn block_pages_preserve_order_and_layout_across_live_batches() {
     let memory = MemoryBudget::new(32 << 20);
     let table = TableRef::new("public", "docs");
-    let rows = |start, time, text| (start..start + 2).map(|id| StoredEvent {
+    let rows = |start, time, text| (start..start + 2).map(|id| StoredEvent { position: None,
         origin: None,
         commit_position: 0,
         entity_key: None,
@@ -1064,7 +1128,7 @@ fn evolving_live_layouts_flush_with_column_bounded_scratch() {
     let make_event = |id, value| {
         let mut document = StructFields::from([("_id".into(), Value::I64(id)), ("value".into(), value)]);
         for column in 0..6 { document.insert(format!("payload_{column}"), Value::Binary(vec![id as u8; 1 << 17])); }
-        StoredEvent {
+        StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,
@@ -1098,7 +1162,7 @@ fn event_batches_build_wide_document_columns_with_bounded_scratch() {
     let events = (0..100).map(|id| {
         let mut doc = StructFields::from([("_id".into(), Value::I64(id))]);
         for key in 0..10 { doc.insert(format!("field_{id}_{key}"), Value::I64(id + key)); }
-        StoredEvent {
+        StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,
@@ -1121,7 +1185,7 @@ fn event_batches_build_wide_document_columns_with_bounded_scratch() {
 #[test]
 fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index() {
     let memory = MemoryBudget::new(16 << 20);
-    let events = (0..1024).map(|id| StoredEvent {
+    let events = (0..1024).map(|id| StoredEvent { position: None,
         origin: None,
         commit_position: 0,
         entity_key: None,
@@ -1147,7 +1211,7 @@ fn a_denied_append_keeps_the_transaction_schema_and_budget_unchanged() {
     let memory = MemoryBudget::new(1 << 20);
     let table = TableRef::new("public", "docs");
     let system_from = Timestamp(10);
-    let event = StoredEvent {
+    let event = StoredEvent { position: None,
         origin: None,
         commit_position: 0,
         entity_key: None,
@@ -1174,7 +1238,7 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
     let memory = MemoryBudget::new(1 << 20);
     let table = TableRef::new("public", "docs");
     let write = |id, system_from| {
-        let event = StoredEvent {
+        let event = StoredEvent { position: None,
             origin: None,
             commit_position: 0,
             entity_key: None,
@@ -1265,10 +1329,10 @@ mod chunk_tests {
             ("_id", Arc::new(arrow_array::StringArray::from(vec!["place"])) as arrow_array::ArrayRef),
             ("location", Arc::new(arrow_array::BinaryArray::from_iter_values([b"location"]))),
         ]).unwrap();
-        let header = EventHeader { commit_position: 0, iid: id.iid(), system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put };
+        let header = EventHeader { position: None, commit_position: 0, iid: id.iid(), system_from: key.system_time, valid_time: Interval::ALL, op: EventOp::Put };
         let overlay = rtdb_types::OwnedRelation::new("locations").unwrap()
             .in_world(Iid([1; 16])).unwrap().table("owner");
-        let shadow = || StoredEvent {
+        let shadow = || StoredEvent { position: None,
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: key.system_time, valid_time: Interval::ALL,
@@ -1285,7 +1349,7 @@ mod chunk_tests {
         let put = transaction.append_owned_put(
             &table, Arc::new(StructArray::from(row)), header, &id.handle_bytes(), None,
         ).unwrap();
-        let delete = transaction.append_to(&table, StoredEvent {
+        let delete = transaction.append_to(&table, StoredEvent { position: None,
             origin: None,
             commit_position: 0, entity_key: Some(id.handle_bytes().into()), iid: id.iid(),
             system_from: key.system_time, valid_time: Interval::ALL,
@@ -1313,7 +1377,7 @@ mod chunk_tests {
         let table = TableRef::new("public", "docs");
         let mut live = LiveTable::new(table, BlockIndex(0), TrieConfig::default());
         for id in 0..10_000i64 {
-            let event = StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id)), ("v".into(), Value::F64(id as f64))])), recency: None };
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap())), Timestamp(id)).unwrap();
         }
@@ -1324,7 +1388,7 @@ mod chunk_tests {
     }
 
     fn put(id: i64, memory: &Arc<MemoryBudget>) -> TableWrite {
-        let event = StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+        let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(id).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
             operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(id))])), recency: None };
         TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&[event], &StructFields::new(), memory).unwrap()))
     }
@@ -1336,7 +1400,7 @@ mod chunk_tests {
         for tx in 0..128i64 {
             let events = (tx * 64..tx * 64 + 64).map(|n| {
                 let id = match (n - tx * 64) % 3 { 0 => Value::I16(n as i16), 1 => Value::I32(n as i32), _ => Value::I64(n) };
-                StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
+                StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::Integer(n).iid(), system_from: Timestamp(tx), valid_time: Interval::ALL,
                     operation: StoredOperation::Put(StructFields::from([("_id".into(), id), ("sku".into(), Value::Utf8(format!("sku-{n}")))])), recency: None }
             }).collect::<Vec<_>>();
             live = live.append(&TableWrite::new(StructFields::new(), Some(IndexBatch::copy_events(&events, &StructFields::new(), &memory).unwrap())), Timestamp(tx)).unwrap();
@@ -1377,7 +1441,7 @@ mod chunk_tests {
         let mut live = LiveIndex::new(BlockIndex(0), None, TrieConfig::default());
         for id in 0..1000i64 {
             let key = format!("{id:032x}/0");
-            let event = StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
+            let event = StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: EntityId::String(key.clone()).iid(), system_from: Timestamp(id), valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::Utf8(key))])), recency: None };
             let batch = IndexBatch::copy_events(&[event], &StructFields::new(), &memory).unwrap();
             let write = TableWrite::new(StructFields::new(), Some(batch));

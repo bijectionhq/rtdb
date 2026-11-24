@@ -45,7 +45,7 @@ impl JournalKey {
 
 pub(super) fn key_error(error: Anomaly) -> Error {
     match error.code.as_ref() {
-        "rtdb.multi/key-destroyed" | "rtdb.multi/archive-revoked" => Error::ErasedUnderView,
+        "rtdb.multi/key-destroyed" | "rtdb.multi/archive-revoked" | "rtdb/erased-under-view" => Error::ErasedUnderView,
         _ => Error::Remote { key: "journal payload key".into(), message: error.to_string() },
     }
 }
@@ -83,7 +83,7 @@ impl LocalKeyService {
         tokio::time::timeout_at(deadline.into(), async {
             let vault = io.run_blocking(move || service.archive_vault().map_err(key_error)).await?;
             let id = key.id();
-            let handle = LocalArchiveKey { vault, id: id.clone(), region: Arc::clone(io) };
+            let handle = LocalArchiveKey { unit_vault: vault.clone(), vault, id: id.clone(), region: Arc::clone(io) };
             let result = handle.operate_with(
                 move |material| {
                     if Instant::now() >= deadline { return Err(unit::expired().into()); }

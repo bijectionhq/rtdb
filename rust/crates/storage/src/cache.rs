@@ -224,7 +224,30 @@ fn reserve_from(memory: &Arc<MemoryBudget>, bytes: usize) -> Result<Arc<MemoryRe
 /// What a view's entry retains beyond the view: its node, two copies of its key and its index slots.
 fn view_overhead(key: &ObjectKey) -> usize { key.as_str().len().saturating_mul(2).saturating_add(2 * std::mem::size_of::<Node>() + 256) }
 
+/// A catalog registration issued by the storage owner for one buffer-pool residence.
+pub struct HeldCatalogRead {
+    residence: Arc<()>,
+    cut: Option<rtdb_types::CatalogCut>,
+    registration: Option<Arc<dyn Send + Sync>>,
+    compacted_primary_paths: Option<Arc<[String]>>,
+}
+
+impl HeldCatalogRead {
+    pub fn is_registered(&self) -> bool { self.registration.is_some() }
+
+    fn covers(&self, cut: Option<rtdb_types::CatalogCut>) -> bool {
+        match (self.cut, cut) {
+            (Some(held), Some(cut)) => held.storage_version == cut.storage_version
+                && held.storage_epoch == cut.storage_epoch && held.replica_epoch == cut.replica_epoch
+                && held.through <= cut.through,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+}
+
 pub struct BufferPool {
+    residence: Arc<()>,
     store: Arc<dyn ObjectStore>,
     budget: Arc<CacheBudget>,
     memory: Arc<MemoryBudget>,
@@ -274,7 +297,7 @@ impl BufferPool {
     fn open(store: Arc<dyn ObjectStore>, budget: Arc<CacheBudget>, metadata: Option<Arc<MemoryBudget>>) -> Self {
         let id = budget.pools.fetch_add(1, Ordering::Relaxed);
         let memory = budget.memory.scope();
-        Self { store, budget, memory, id, metadata, scan_timing: ScanTiming::default() }
+        Self { residence: Arc::new(()), store, budget, memory, id, metadata, scan_timing: ScanTiming::default() }
     }
 
     /// Charges the bookkeeping of retained objects to `metadata`, and their bytes and every view to `budget`.
@@ -298,6 +321,32 @@ impl BufferPool {
     pub fn pool_retained_bytes(&self) -> usize { self.memory.used_bytes() }
 
     pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
+
+    pub async fn hold_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        self.hold_catalog_with_primary(cut, None).await
+    }
+
+    pub async fn hold_catalog_with_primary(&self, cut: Option<rtdb_types::CatalogCut>, paths: Option<Arc<[String]>>)
+        -> rtdb_types::Result<Arc<HeldCatalogRead>> {
+        let registration = match &paths {
+            Some(paths) => self.store.retain_catalog_with_primary(cut, Arc::clone(paths)).await?,
+            None => self.store.retain_catalog(cut).await?,
+        };
+        if self.store.defers_trie_releases() && registration.is_none() {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.query/catalog-not-held",
+                "The coordinated storage provider returned no catalog hold"));
+        }
+        Ok(Arc::new(HeldCatalogRead { residence: Arc::clone(&self.residence), cut, registration, compacted_primary_paths: paths }))
+    }
+
+    pub fn holds_catalog(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>) -> bool {
+        self.holds_catalog_with_primary(held, cut, None)
+    }
+
+    pub fn holds_catalog_with_primary(&self, held: &HeldCatalogRead, cut: Option<rtdb_types::CatalogCut>, paths: Option<&[String]>) -> bool {
+        Arc::ptr_eq(&self.residence, &held.residence) && held.covers(cut)
+            && held.compacted_primary_paths.as_deref().is_none_or(|held_paths| held.cut == cut && paths == Some(held_paths))
+    }
 
     fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         self.budget.reserve(&self.memory, bytes)
@@ -457,6 +506,12 @@ impl BufferPool {
     /// Concurrent fetches of a key share one load; cancellation releases that caller's wait.
     /// An empty entry is removed when its last fetcher fails or is cancelled.
     pub async fn get(&self, key: &ObjectKey) -> Result<CacheLease> {
+        if !self.store.permits_shared_read_cache() {
+            let size = self.store.head(key).await?.size;
+            let size = usize::try_from(size).map_err(|_| self.budget.limit_error(usize::MAX))?;
+            let allocation = self.fetch_whole(key, size, |bytes| self.reserve(bytes)).await?;
+            return Ok(CacheLease { allocation, range: 0..size });
+        }
         let mut cleanup = EmptyEntryCleanup { pool: self, key, armed: true };
         let allocation = {
             let entry = self.entry(key)?;
@@ -480,12 +535,13 @@ impl BufferPool {
     /// Reserves `bytes` from the pool's budget for a view about to be decoded, evicting idle entries to make room.
     /// None where the view would take more than an eighth of the budget, or does not fit once nothing idle is left.
     pub fn admit(&self, bytes: usize) -> Option<Arc<MemoryReservation>> {
-        if bytes > self.budget.limit_bytes() / 8 { return None; }
+        if !self.store.permits_shared_read_cache() || bytes > self.budget.limit_bytes() / 8 { return None; }
         self.reserve(bytes).ok()
     }
 
     /// Holds `value` as `view` of the object in place of any it held; false, holding nothing, where its bookkeeping does not fit.
     pub fn insert_view<T: Cached>(&self, key: &ObjectKey, view: View, value: Arc<T>) -> bool {
+        if !self.store.permits_shared_read_cache() { return false; }
         let Ok(overhead) = self.reserve(view_overhead(key)) else { return false };
         let value = Value::View { value, in_use: in_use_of::<T>, _overhead: overhead };
         let replaced = self.budget.lru.lock().insert(self.id, key, Slot::View(view), value);
@@ -516,6 +572,23 @@ mod fairness_tests {
     use super::*;
     use crate::MemoryStore;
     use bytes::Bytes;
+
+    #[tokio::test]
+    async fn a_held_catalog_cannot_cross_a_pool_or_cover_an_older_cut() {
+        use rtdb_types::{CatalogCut, ReplicaPosition, StorageEpoch, StorageVersion};
+
+        let store = Arc::new(MemoryStore::default());
+        let budget = CacheBudget::new(100);
+        let first = BufferPool::with_budget(store.clone(), budget.clone());
+        let second = BufferPool::with_budget(store, budget);
+        let cut = CatalogCut { storage_version: StorageVersion(6), storage_epoch: StorageEpoch(1),
+            replica_epoch: StorageEpoch(3), through: ReplicaPosition(10) };
+        let held = first.hold_catalog(Some(cut)).await.unwrap();
+        assert!(first.holds_catalog(&held, Some(cut)));
+        assert!(!second.holds_catalog(&held, Some(cut)));
+        assert!(!first.holds_catalog(&held, Some(CatalogCut { through: ReplicaPosition(9), ..cut })));
+        assert!(!first.holds_catalog(&held, Some(CatalogCut { storage_epoch: StorageEpoch(2), ..cut })));
+    }
 
     #[tokio::test]
     async fn one_pools_idle_entries_cannot_starve_another_pool_sharing_its_budget() {

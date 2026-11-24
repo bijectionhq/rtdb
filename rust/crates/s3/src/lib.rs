@@ -197,6 +197,8 @@ impl S3Config {
         if cell && io.publication_journal().is_some() {
             return Err(Anomaly::incorrect("xtdb.aws/managed-uploads", "Managed cell publications require S3 inventory support"));
         }
+        #[cfg(feature = "versioning")]
+        let classic_inventory = (!cell).then(|| self.authorized_inventory(prefix.clone(), &authorization)).transpose()?;
         let (endpoint, virtual_hosted) = self.endpoint_addressing()?;
         let mut builder = AmazonS3Builder::from_env().with_bucket_name(&self.bucket)
             .with_virtual_hosted_style_request(virtual_hosted)
@@ -224,7 +226,11 @@ impl S3Config {
         };
         let client = build_client(ordinary)?;
         if !cell {
-            return Ok(Arc::new(RemoteStore::new_in(client, Some(prefix), io).with_catalog_ledger()?));
+            let store = RemoteStore::new_in(client, Some(prefix), io).with_catalog_ledger()?;
+            #[cfg(feature = "versioning")]
+            let store = store.with_s3_versioning(namespace)
+                .with_classic_versions(Arc::new(classic_inventory.expect("Classic inventory")));
+            return Ok(Arc::new(store));
         }
         #[cfg(feature = "versioning")]
         let store = match uploads {

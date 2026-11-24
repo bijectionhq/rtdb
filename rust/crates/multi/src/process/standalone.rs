@@ -20,7 +20,7 @@ use tokio_rustls::rustls::{
     self,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use super::{NodeSettings, io, start_node};
@@ -34,12 +34,14 @@ use crate::keys::{KeyService, LocalKeyService};
 use crate::lease::{LeaseOptions, MemberLease, Registration};
 
 pub const STANDALONE_PROTOCOL: u32 = 2;
-const AUTHORITY_FORMAT: u32 = 1;
+const AUTHORITY_FORMAT: u32 = 2;
 const AUTHORITY: &str = "authority.json";
 const DIRECTORY: &str = "directory";
 const JOURNAL: &str = "journal";
 const KEYS: &str = "keys";
 const OBJECTS: &str = "objects";
+const REPLAY_OBJECTS: &str = "replay-objects";
+const REPLAY_KEYS: &str = "replay-keys";
 const CACHE: &str = "cache";
 const LOOPBACK: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
 
@@ -64,13 +66,11 @@ pub async fn initialize_standalone(root: &Path, name: &str, id: Uuid) -> Result<
     }
 
     let mut record = installation_record(id, name, "standalone")?;
-    for directory in [DIRECTORY, JOURNAL, KEYS, OBJECTS] {
+    for directory in [DIRECTORY, JOURNAL, KEYS, OBJECTS, REPLAY_OBJECTS, REPLAY_KEYS] {
         private_mkdir(&root.join(directory))?;
     }
 
-    let candidate = MemberId::fresh();
-    let (journal, journal_id) =
-        PreparedJournal::open_for_member(journal_options(root), candidate.0).await?;
+    let (journal, journal_id) = PreparedJournal::open_for_member(journal_options(root)).await?;
     let journal_id = MemberId(journal_id);
     record.ensemble = vec![journal_id.clone()];
 
@@ -203,10 +203,20 @@ pub async fn serve_standalone(
     let journal_stop = CancellationToken::new();
     let journal_task = tokio::spawn(journal.serve_local(listener, journal_stop.clone()));
     let lease_task = tokio::spawn(Arc::clone(&lease).run(journal_stop.clone()));
+    let broker_tasks = TaskTracker::new();
     let outcome = async {
         let storage = CellStorage::Local {
             root: settings.root.join(OBJECTS),
         };
+        let payload_root = settings.root.join(REPLAY_OBJECTS);
+        let key_root = settings.root.join(REPLAY_KEYS);
+        private_directory(&payload_root)?;
+        private_directory(&key_root)?;
+        let mut agent = AgentOptions::new(storage.clone());
+        agent.replay_broker = Some(crate::replay_broker::Client::standalone(
+            Arc::clone(&directory), CellStorage::Local { root: payload_root }, &storage,
+            Arc::new(LocalKeyService::new(key_root)?), broker_tasks.clone(),
+        )?);
         let mut node = start_node(
             Arc::clone(&directory),
             NodeSettings {
@@ -217,7 +227,7 @@ pub async fn serve_standalone(
                 hosted_task: None,
                 advertise_host: None,
                 availability_zone: "local".into(),
-                agent: AgentOptions::new(storage.clone()),
+                agent,
                 lease: LeaseOptions::default(),
                 pool: MemberPool::General,
                 claim_wait: Duration::from_millis(20),
@@ -282,6 +292,8 @@ pub async fn serve_standalone(
         }
     };
     journal_stop.cancel();
+    broker_tasks.close();
+    broker_tasks.wait().await;
     let _ = lease_task.await;
     result.and(lease.retire().await)
 }

@@ -96,6 +96,8 @@ See [R7](R7-eraser.md#verification) for the remaining provider obligations.
 An active-loglet read index is constructed in the quorum client after validating the selected ensemble, stream and epoch.
 Fresh implicit session bases keep the protected index alive through partition capture and check that the attachment still names the same database.
 The installed journal continues to supply its own ordered barrier and retained cut.
+PostgreSQL feedback consumes an acknowledgement permit derived from its checkpoint and recoverable applied extent.
+The local replication term issues an opaque replay token only when its logs retain synced history and its store syncs checkpoints.
 The provider adapter for directory-managed exact removal accepts a grant derived from the durable authorized lineage state, including on retry.
 These values are passive evidence, while the existing journal, partition and directory remain the owners of their decisions.
 Rust compile-fail documentation covers minting a fabricated index and retirement grant.
@@ -110,11 +112,84 @@ Multi can record native observations into one new JSONL file per process via `RT
 Run `python3 verification/residence_trace.py TRACE.jsonl` to check exact retirement and trim correlations, catalog admission floors, read-index identities, scoped replay holds, scheduled archive revocation evidence and observed inline attempt outcomes.
 The sink records decision observations after the owning path returns or observes authority, so directory revision orders catalog CAS observations.
 The production and simulation owners can use the same sink when they run the same Multi machinery.
+The existing native concurrent recovery and trim fixture now supplies a second capture to this checker and a changed-journal negative control.
 The native checker validates correlations within a capture, while composed replay consumes an explicitly projected bounded history.
 Native events can be missing after cancellation, ambiguous responses, opaque or offloaded outcomes, process failure or later enablement.
 Use separate files for separate processes and keep diagnostic capture disabled when measuring strict timing.
 
 Remaining capability boundaries include mandatory held views at every storage and memory answer, current per-unit grants at every cache release, full recovery-closure evidence at every upstream acknowledgement, and general provider deletion through one exact authority.
 The authored projection abstracts plurality of held views, receipt identities and slots, network races, provider timing, and reconstruction from manifest contents.
-Cross-process trace reconstruction, observation of every runtime linearization point, configured-provider evidence and deepest-plan bounded-stack replay remain open.
+The native runner also includes the existing thousand-conjunct fixture on the production worker stack.
+Cross-process trace reconstruction, observation of every runtime linearization point, configured-provider evidence and execution of the worker-stack fixture remain open.
 The expanded model, replay controls and Rust changes have source review only.
+
+## Round 3 continuation
+
+The storage pool issues an opaque catalog registration bound to its physical cut and pool residence.
+Query entry points verify that authority before opening or advancing a cursor, returning an in-memory answer, or sending a delegated or direct owned answer.
+Provider admission retains the held catalogs and registered owner through I/O drain.
+Prepared audience queries reuse their registration on the same pool and within its admitted scope.
+
+A shared byte or decoded-page cache requires an explicit opt-in by the underlying object owner.
+Encrypted and captured object stores use fresh owner-mediated reads, and coordinated raw providers can cache ciphertext below decryption.
+Plaintext held by an individual cursor or other execution retains an inventory of its originating key authorities.
+Each delivery grant also observes the original read lease.
+
+A hosted PostgreSQL confirmation can advance from the locally adopted checkpoint only after the live recovery owner confirms its identical root and replica boundary.
+Directory-managed journals require the installed manifest, active writer scope and usable replay start.
+Installed journals compare the selected durable checkpoint against the current writer grant.
+The feedback driver retries the checkpoint comparison as publication advances.
+The early feedback path continues to require synced local source, replica, and object recovery.
+
+The shared bounded model now requires a matching certificate with a publication quorum before acknowledgement or a fresh decision at the successor cut.
+A successor loglet retains the installed decision floor.
+Trimming and exact deletion require an installed recovery fence after replacement publication and older replay drain.
+The native checker joins observed checkpoint, trim and offloaded-object retirement decisions by scope, revision, root, manifest and journal anchor.
+It also checks that each logged receipt follows the observed covering quorum publication for the same stream, epoch and ensemble.
+Directory-managed fresh answers carry the portable T1 decision fingerprint through the probe nonce, the applied catalog capture and frontend delivery.
+The native checker also joins the checkpoint publisher to its covering certified decision and from the checkpoint to the installed recovery closure.
+Inherited loglet prefixes without a portable decision carry no certified-answer observation.
+The full native capture still needs the general T2 reachability census and recovery exclusion across owners, and traces that connect per-use key and held-view authority to answer delivery.
+The new model, controls and native joins have source review only.
+
+
+### Native authority follow-through
+
+Compaction and stored artefact builders register the captured catalog and, where the inputs belong to its live census, its compacted-primary paths. Coordinated Classic checkpoint loads hold the recovery deletion gate across discovery and manifest reads. Hosted startup and admitted archive reads carry their existing residence registration through I/O admission. Installed primary reset uses a conservative catalog registration because its manifest includes superseded inputs.
+
+A cursor tracks the exact slots consulted by the immutable-unit cipher across opening, pulls and local buffering.
+Local, remote and disk-cache object discovery admits the exact key or prefix under the opened provider.
+S3 inventory admits version checks, listings, terminal metadata and conditional publication ranges under the provider's scope.
+Local journals admit file discovery, range pulls and replay probes with the file path and selected offset or interval.
+S3 and DynamoDB key-vault discovery carry the opened vault and exact point or scan prefix and cursor.
+The admission retains these scopes through the individual operation.
+Selecting a catalog, checkpoint or recovery dependency retains the corresponding authority across requests.
+
+The grant follows PostgreSQL rows and COPY chunks through flushing and Flight statements and encoded action replies to stream handoff.
+Directory-managed serving and staged replay confirm the original deployment vault entry.
+Archive grants confirm the capture authority and the exact object or replay-record slot.
+Held-world requests carry the caller's delivery scope to the archive worker and attach the keys that produced its replayed in-memory snapshot.
+The worker retains custody through the reply channel, and Flight checks the originating keys again on transport handoff.
+Classic and Local Multi vaults hold shared key locks while writing an answer.
+Withdrawal and scheduling serialize on the corresponding exclusive locks.
+Remote S3 and DynamoDB providers still drain after fencing.
+Their 30-second grant and 60-second drain assume that the reader's monotonic clock advances at least half as fast as the settling owner's clock.
+T4 publishes a directory-backed receiver frontier for ordered observations.
+Answer delivery freezes each grant's earliest monotonic and wall-clock cutoff.
+Every PostgreSQL socket write and flush checks that cutoff after protocol encoding, including when it resumes inside a buffered write.
+Private PostgreSQL frames carry the original exclusive wall cutoff through each gateway, and the outer gateway consumes that stamp before releasing the corresponding frame.
+Flight carries one cutoff for a protected routed response and refuses any frame whose live grant ends sooner.
+HTTP/2 and TLS can retain accepted Flight data beyond a body poll, so the connection writer enforces its earliest protected cutoff through closure.
+A gateway imports the sender's absolute cutoff and fixes a local monotonic ceiling on receipt.
+Cross-host enforcement assumes a consistent wall-clock domain with a bound on skew.
+Remote provider settlement still requires the existing clock-rate margin.
+The composed model distinguishes admission, partial handoff, time advancing while transport is paused, and refusal at expiry.
+Its negative control permits a socket write at the cutoff and violates the live-write invariant.
+
+Native observations retain the directory's recorded primary path census, exact eligible paths at admission closure, and the applied directory revision and physical journals of a settled trim. The joined checker binds a detached payload version removal to the same retirement, physical publication, frame dependency and installed trim scope. The new detached broker admits its own exact position hold before reading and retains it through provider drain. The checker joins that admission to the origin replay ticket and records the certified sealed frame. These changes have source review only.
+
+
+Installed receipt reclamation emits the ordered journal's withdrawal position and exact provider path and publication fingerprints.
+The provider trace joins those fingerprints with the placement and withdrawal position before validating physical removal.
+This covers installed receipt publications for which the runtime can obtain an exact object fence.
+The complete T2 replay requires the full reachable-publication census and a recovery exclusion that can settle the detached version independently of physical trim. The broker serves normal tails and ranges. Administrative and transfer access and hosted credential provisioning remain relevant to closing the full recovery inventory.

@@ -20,13 +20,13 @@ use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{
-    Array, BooleanArray, Float64Array, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, Int64Array,
+    Array, BooleanArray, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray, StructArray, UInt8Array, UInt32Array, Int64Array,
     cast::AsArray, types::{Int64Type, UInt8Type},
 };
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::Schema;
 use rtdb_text::{Corpus, Query, RankScorer, Scorer, stored_length};
-use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
+use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp};
 use sha2::{Digest, Sha256};
 
 use crate::rank_windows::document_range;
@@ -57,6 +57,7 @@ const NULL_DOC: u32 = u32::MAX - 1;
 /// Rows arrive as the data file holds them: IID ascending, then system time descending.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchRow {
+    pub position: Option<EventPosition>,
     /// Full entity identity on every owned effect, including delete and erase.
     pub identity: Option<EntityId>,
     pub iid: [u8; 16],
@@ -66,6 +67,29 @@ pub struct SearchRow {
     pub op: EventOp,
     /// Parallel to the file's columns: `None` where the column is null or absent, and otherwise the tokens of its UTF-8 value, none for a value of another type.
     pub values: Vec<Option<Vec<String>>>,
+}
+
+pub(crate) type SearchPosition = (Timestamp, Option<EventPosition>, u32);
+
+pub(crate) fn search_position(header: EventHeader) -> SearchPosition {
+    (header.system_from, header.position, header.commit_position)
+}
+
+fn event_positions(positions: impl IntoIterator<Item = Option<EventPosition>>) -> Result<FixedSizeBinaryArray> {
+    let positions = positions.into_iter();
+    let mut array = arrow_array::builder::FixedSizeBinaryBuilder::with_capacity(positions.size_hint().0, EventPosition::WIDTH);
+    for position in positions {
+        match position {
+            Some(position) => array.append_value(position.to_bytes()).map_err(fault)?,
+            None => array.append_null(),
+        }
+    }
+    Ok(array.finish())
+}
+
+fn read_event_position(array: &dyn Array, row: usize) -> Option<EventPosition> {
+    let array = array.as_any().downcast_ref::<FixedSizeBinaryArray>().expect("search event position layout");
+    array.is_valid(row).then(|| EventPosition::from_bytes(array.value(row).try_into().expect("search event position width")))
 }
 
 pub(crate) struct IndexedRow<'a> {
@@ -87,7 +111,7 @@ impl SearchPage for Vec<SearchRow> {
     fn row(&self, row: usize, columns: &[String]) -> Result<IndexedRow<'_>> {
         let row = &self[row];
         if row.values.len() != columns.len() { return Err(fault("Search row values do not cover the definition's columns")); }
-        let header = EventHeader {
+        let header = EventHeader { position: row.position,
             iid: Iid(row.iid), system_from: Timestamp(row.system_from), commit_position: 0,
             valid_time: Interval::from_micros(row.valid_from, row.valid_to)?, op: row.op,
         };
@@ -143,11 +167,11 @@ pub struct DocMatch { pub doc: u32, pub iid: [u8; 16], pub member: u32 }
 
 /// An event of the file's data, as another file's documents are cut by it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeyedEvent { pub system_from: i64, pub valid_from: i64, pub valid_to: i64, pub op: EventOp }
+pub struct KeyedEvent { pub position: Option<EventPosition>, pub system_from: i64, pub valid_from: i64, pub valid_to: i64, pub op: EventOp }
 
 impl From<rtdb_types::EventHeader> for KeyedEvent {
     fn from(header: rtdb_types::EventHeader) -> Self {
-        Self { system_from: header.system_from.0, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0, op: header.op }
+        Self { position: header.position, system_from: header.system_from.0, valid_from: header.valid_time.lower().0, valid_to: header.valid_time.upper().0, op: header.op }
     }
 }
 
@@ -855,7 +879,7 @@ mod tests {
         TemporalBounds { valid_time: Interval::from_micros(valid, valid + 1).unwrap(), system_time: Interval::from_micros(system, system + 1).unwrap() }
     }
     fn row(id: u8, system_from: i64, title: &str, body: &str) -> SearchRow {
-        SearchRow { identity: None, iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(title)), Some(tokens(body))] }
+        SearchRow { position: None, identity: None, iid: [id; 16], system_from, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![Some(tokens(title)), Some(tokens(body))] }
     }
     fn columns() -> Vec<String> { vec!["title".into(), "body".into()] }
     fn rows() -> Vec<SearchRow> {
@@ -903,7 +927,7 @@ mod tests {
     fn published_runs_keep_exact_lengths_and_definition_identity() {
         let columns = vec!["body".to_string()];
         let tokens = vec!["term".to_string(); 79];
-        let row = SearchRow { identity: None, iid: [1; 16], system_from: 1, valid_from: 1, valid_to: 10, op: EventOp::Put, values: vec![Some(tokens)] };
+        let row = SearchRow { position: None, identity: None, iid: [1; 16], system_from: 1, valid_from: 1, valid_to: 10, op: EventOp::Put, values: vec![Some(tokens)] };
         let mut bytes = Vec::new();
         write_versioned_group(&columns, [[Ok(vec![row])]], "owned-file", 13, None, &mut bytes, None, FORMAT_VERSION).unwrap();
         let file = SearchFile::open(bytes, &columns).unwrap();
@@ -919,7 +943,7 @@ mod tests {
     fn an_owned_run_round_trips_its_full_typed_identity() {
         let columns = vec!["body".to_string()];
         let id = EntityId::String("complete-id".into());
-        let row = SearchRow { identity: Some(id.clone()), iid: id.iid().0, system_from: 1, valid_from: 1, valid_to: 10,
+        let row = SearchRow { position: None, identity: Some(id.clone()), iid: id.iid().0, system_from: 1, valid_from: 1, valid_to: 10,
             op: EventOp::Put, values: vec![Some(tokens("invoice"))] };
         let bytes = build_search_file(&columns, &[row], "owned-run").unwrap();
         let file = SearchFile::open(bytes, &columns).unwrap();
@@ -934,6 +958,7 @@ mod tests {
         let iid = text.iid().0;
         let uuid = EntityId::Uuid(iid);
         let event = |identity, system_from, op, values| SearchRow {
+            position: None,
             identity: Some(identity), iid, system_from, valid_from: 0, valid_to: i64::MAX,
             op, values: vec![values],
         };
@@ -1016,7 +1041,7 @@ mod tests {
         assert_eq!((run(&file, 0).is_some(), run(&file, 1), run(&file, 2), run(&file, 3).is_some()), (true, None, None, true));
         assert!(file.matches("body", &Query::parse("deleted"), at(1, 35)).unwrap().is_empty());
         assert_eq!(file.matches("body", &Query::parse("deleted"), at(1, 15)).unwrap().len(), 1);
-        assert_eq!(file.events(&[2; 16]).unwrap(), [KeyedEvent { system_from: 30, valid_from: 0, valid_to: i64::MAX, op: EventOp::Delete }, KeyedEvent { system_from: 10, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put }]);
+        assert_eq!(file.events(&[2; 16]).unwrap(), [KeyedEvent { position: None, system_from: 30, valid_from: 0, valid_to: i64::MAX, op: EventOp::Delete }, KeyedEvent { position: None, system_from: 10, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put }]);
         assert!(file.events(&[7; 16]).unwrap().is_empty());
     }
 
@@ -1064,7 +1089,7 @@ mod tests {
         (0..count).map(|index| {
             let body: Vec<String> = (0..1 + next() % 12).map(|_| words[next() % words.len()].to_string()).collect();
             let value = match index % 17 { 0 => None, 1 => Some(Vec::new()), _ => Some(body) };
-            SearchRow { identity: None, iid: [(index / 20) as u8; 16], system_from: 1_000_000 - index as i64, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![None, value] }
+            SearchRow { position: None, identity: None, iid: [(index / 20) as u8; 16], system_from: 1_000_000 - index as i64, valid_from: 0, valid_to: i64::MAX, op: EventOp::Put, values: vec![None, value] }
         }).collect()
     }
 
@@ -1195,6 +1220,22 @@ mod tests {
     }
 
     #[test]
+    fn search_bundles_keep_same_time_rows_at_distinct_positions() {
+        let columns = columns();
+        let rows = [8, 7].map(|id| SearchRow {
+            position: Some(EventPosition { transaction: rtdb_types::TxId(id), ordinal: 0 }),
+            ..row(1, 100, "tied", "search")
+        });
+        for format in [TANTIVY_FORMAT_VERSION, LEGACY_FORMAT_VERSION, FORMAT_VERSION] {
+            let mut bytes = Vec::new();
+            write_versioned_group(&columns, [[Ok(rows.to_vec())]], "positions", 1, None, &mut bytes, None, format).unwrap();
+            let file = SearchFile::open(bytes, &columns).unwrap();
+            let events = file.events(&[1; 16]).unwrap();
+            assert_eq!(events.iter().map(|event| event.position).collect::<Vec<_>>(), rows.iter().map(|row| row.position).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn posting_access_checks_only_the_arrow_batches_for_requested_terms() {
         let indexed = [String::from("body")];
         let row = SearchRow {
@@ -1272,7 +1313,7 @@ mod tests {
         let columns = ["body".to_owned()];
         let mut rows: Vec<_> = (0..8192).map(|id| {
             let identity = EntityId::Integer(id);
-            SearchRow { iid: identity.iid().0, identity: Some(identity),
+            SearchRow { position: None, iid: identity.iid().0, identity: Some(identity),
                 values: vec![Some(tokens(&format!("invoice document{id}")))], ..row(0, 1, "", "") }
         }).collect();
         rows.sort_unstable_by_key(|row| row.iid);
@@ -1323,7 +1364,7 @@ mod tests {
         let columns = ["body".to_owned()];
         let mut rows: Vec<_> = (0..16_384).map(|id| {
             let identity = EntityId::Integer(id);
-            SearchRow { iid: identity.iid().0, identity: Some(identity),
+            SearchRow { position: None, iid: identity.iid().0, identity: Some(identity),
                 values: vec![Some(tokens(&format!("invoice document{id}")))], ..row(0, 1, "", "") }
         }).collect();
         rows.sort_unstable_by_key(|row| row.iid);

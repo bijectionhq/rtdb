@@ -32,7 +32,7 @@ pub(crate) struct FileRelease {
 }
 
 impl FileRelease {
-    async fn queue(&self, store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<()> {
+    async fn submit(&self, store: &dyn ObjectStore, receipt: &ObjectKey, contents: Bytes) -> Result<bool> {
         let _permit = self.slots.acquire().await.map_err(crate::invalid)?;
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         store.release_trie_files(receipt, contents).await
@@ -186,13 +186,10 @@ impl PendingRetirement {
     }
 
     async fn release_intent(&self, store: &dyn ObjectStore, installed: ReplicaPosition, release: &FileRelease) -> Result<()> {
-        let cut = CatalogCut { through: installed, ..self.plan.selected };
-        if store.advance_catalog_floor(cut).await? {
-            if store.defers_trie_releases() {
-                release.queue(store, &self.receipt, self.receipt_bytes(installed)).await?;
-            }
-            store.delete(&self.intent).await?;
+        if store.defers_trie_releases() && !release.submit(store, &self.receipt, self.receipt_bytes(installed)).await? {
+            return Ok(());
         }
+        store.delete(&self.intent).await?;
         Ok(())
     }
 }

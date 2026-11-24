@@ -120,6 +120,7 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let holds = Arc::new(crate::recovery_holds::RecoveryHolds {
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
+        broker: settings.agent.replay_broker.clone(),
         custody: if local_witnesses.is_some() { rtdb_directory::ReplayCustody::Local }
             else { rtdb_directory::ReplayCustody::Hosted { owner: settings.hosted_task.clone() } },
         tasks: storage_regions.clone(),
@@ -145,7 +146,6 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
             }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
         });
     let storage = Arc::new(crate::store::CellStoreFactory {
-        replica_payload_reclamation: settings.agent.replica_payload_reclamation,
         directory: Arc::clone(&directory),
         keys: Arc::clone(&settings.keys),
         storage_namespaces,
@@ -155,7 +155,11 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
         storage_regions: storage_regions.clone(),
         local_witnesses,
     });
+    let receiver_clock = crate::receiver_clock::ReceiverClock::new(Arc::clone(&directory), storage_namespaces.objects);
+    let decision_clock: Arc<dyn rtdb_node::DecisionClock> = receiver_clock.clone();
+    let publish_clock = settings.pool == rtdb_directory::MemberPool::General;
     let placed = PlacedOptions {
+        decision_clock: Some(decision_clock),
         log_factories: vec![
             (LOGKEEPER_LOG_TYPE.into(), LogkeeperLogFactory::new(MAXIMUM_LOG_MESSAGE_BYTES, Arc::clone(&writers), holds)),
             (crate::journal::hosted::LOG_TYPE.into(), Arc::new(crate::journal::hosted::Logs {
@@ -206,6 +210,14 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     let lease_cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
     tasks.spawn(driver.run());
+    if publish_clock {
+        let cancellation = lease_cancellation.clone();
+        tasks.spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(io)?;
+            runtime.block_on(receiver_clock.publish(cancellation));
+            Ok(())
+        });
+    }
     { let lease = Arc::clone(&lease); let cancellation = lease_cancellation.clone(); tasks.spawn(async move { lease.run(cancellation).await; Ok(()) }); }
     { let agent = Arc::clone(&agent); let cancellation = cancellation.clone(); tasks.spawn(async move { agent.run(cancellation).await; Ok(()) }); }
     tasks.spawn(crate::control::serve_with_pgwire(
@@ -360,7 +372,7 @@ pub async fn start_logkeeper(directory: Arc<dyn Directory>, settings: LogkeeperS
         data_dir: settings.data_dir,
         fsync: settings.fsync,
         cache_bytes: settings.cache_bytes,
-    }, MemberId::fresh().0).await?;
+    }).await?;
     if !uuid::Uuid::parse_str(&identity).is_ok_and(|id| !id.is_nil() && id.to_string() == identity) {
         return Err(Anomaly::incorrect("rtdb.multi/logkeeper-identity", "The retained journal member ID is invalid"));
     }

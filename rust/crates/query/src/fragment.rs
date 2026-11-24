@@ -8,7 +8,6 @@ use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{Scan, TemporalFilter};
-use rtdb_storage::IoRegion;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, TableRef, TemporalBounds, Timestamp, TransactionKey, Value};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -260,7 +259,7 @@ pub async fn evaluate_fragment_retained(context: Arc<QueryContext>, fragment: &S
     let cancellation = context.cancellation.clone();
     let owner = context.owner_cancellation.clone();
     let work = owner.run_until_cancelled(cancellation.run_until_cancelled(evaluate_retained_fragment(Arc::clone(&context), fragment)));
-    IoRegion::retaining(context, work).await.flatten().ok_or_else(cancelled)?
+    context.reading(async { work.await.flatten().ok_or_else(cancelled)? }).await
 }
 
 async fn evaluate_retained_fragment(context: Arc<QueryContext>, fragment: &ScanFragment) -> Result<FragmentBytes> {

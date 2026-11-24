@@ -6,7 +6,7 @@ use vstd::multiset::Multiset;
 use vstd::prelude::*;
 
 pub(super) type Head = (usize, usize);
-pub(super) type Key = (u128, i64, u32, usize, usize, usize);
+pub(super) type Key = (u128, i64, i128, usize, usize, usize);
 
 #[cfg(verus_keep_ghost)]
 verus! {

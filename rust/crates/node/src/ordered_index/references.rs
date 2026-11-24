@@ -13,10 +13,10 @@ use super::{
     format_error,
     key::{AtomRef, Bucket, arrow},
     postings::{KeyBatch, ProjectedKeys, Tuple},
-    tree::{Address, Key, KeyRef, Measure, MeasureDomain, Pointer},
+    tree::{Address, IndexRevision, Key, KeyRef, Measure, MeasureDomain, Pointer},
 };
 
-type Reference = (Option<Timestamp>, Option<Arc<Pointer>>);
+type Reference = (Option<IndexRevision>, Option<Arc<Pointer>>);
 
 fn fields() -> Vec<Field> {
     vec![
@@ -34,10 +34,12 @@ fn fields() -> Vec<Field> {
         Field::new("measure_count", DataType::UInt64, true),
         Field::new("measure_domain", DataType::FixedSizeBinary(3), true),
         Field::new("measure_sum", DataType::FixedSizeBinary(32), true),
+        Field::new("revision_transaction", DataType::Int64, true),
+        Field::new("fence_transaction", DataType::Int64, true),
     ]
 }
 
-pub(super) fn encode(references: &[(Option<Timestamp>, Option<&Pointer>)]) -> Result<RecordBatch> {
+pub(super) fn encode(references: &[(Option<IndexRevision>, Option<&Pointer>)]) -> Result<RecordBatch> {
     let width = references
         .iter()
         .filter_map(|(_, pointer)| *pointer)
@@ -50,6 +52,8 @@ pub(super) fn encode(references: &[(Option<Timestamp>, Option<&Pointer>)]) -> Re
         .unwrap_or(0);
     let rows = references.len().saturating_mul(2);
     let mut revisions = Vec::with_capacity(rows);
+    let mut revision_transactions = Vec::with_capacity(rows);
+    let mut fence_transactions = Vec::with_capacity(rows);
     let mut digests = StringBuilder::with_capacity(rows, 64 * rows);
     let mut generations = Vec::with_capacity(rows);
     let mut sizes = Vec::with_capacity(rows);
@@ -79,11 +83,12 @@ pub(super) fn encode(references: &[(Option<Timestamp>, Option<&Pointer>)]) -> Re
                     ),
                     Some(KeyRef::Row(iid)) => (1, None, None, Some(iid), None, Tuple::Nulls(width)),
                     Some(KeyRef::Revision(time)) => {
-                        (2, None, None, None, Some(time.0), Tuple::Nulls(width))
+                        (2, None, None, None, Some(time), Tuple::Nulls(width))
                     }
                     None => (3, None, None, None, None, Tuple::Nulls(width)),
                 };
-            revisions.push(revision.map(|time| time.0));
+            revisions.push(revision.map(|revision| revision.time.0));
+            revision_transactions.push(revision.map(|revision| revision.transaction));
             digests.append_option(pointer.map(|pointer| pointer.digest.as_str()));
             generations.push(pointer.map(|pointer| pointer.generation));
             sizes.push(pointer.map(|pointer| pointer.size as u64));
@@ -98,7 +103,8 @@ pub(super) fn encode(references: &[(Option<Timestamp>, Option<&Pointer>)]) -> Re
                 iids.append_null();
             }
             addresses.append_option(address.map(|address| address.key));
-            times.push(time);
+            times.push(time.map(|revision| revision.time.0));
+            fence_transactions.push(time.map(|revision| revision.transaction));
             measure_counts.push(pointer.map(|pointer| pointer.measure.count));
             if let Some(pointer) = pointer {
                 measure_domains.append_value(measure_domain_bytes(pointer.measure.domain)).map_err(format_error)?;
@@ -125,6 +131,8 @@ pub(super) fn encode(references: &[(Option<Timestamp>, Option<&Pointer>)]) -> Re
         Arc::new(UInt64Array::from(measure_counts)),
         Arc::new(measure_domains.finish()),
         Arc::new(measure_sums.finish()),
+        Arc::new(Int64Array::from(revision_transactions)),
+        Arc::new(Int64Array::from(fence_transactions)),
     ];
     let keys = KeyBatch::build_with_prefix(&keys, fields(), arrays)?;
     Ok(keys.batch().clone())
@@ -159,6 +167,18 @@ pub(super) fn decode(
     let measure_counts = arrow::<UInt64Array>(columns[11].as_ref())?;
     let measure_domains = arrow::<FixedSizeBinaryArray>(columns[12].as_ref())?;
     let measure_sums = arrow::<FixedSizeBinaryArray>(columns[13].as_ref())?;
+    let revision_transactions = arrow::<Int64Array>(columns[14].as_ref())?;
+    let fence_transactions = arrow::<Int64Array>(columns[15].as_ref())?;
+    let revision_key = |time: &Int64Array, transaction: &Int64Array, row| -> Result<_> {
+        match (time.is_null(row), transaction.is_null(row)) {
+            (true, true) => Ok(None),
+            (false, false) => Ok(Some(IndexRevision {
+                time: Timestamp(time.value(row)),
+                transaction: transaction.value(row),
+            })),
+            _ => Err(invalid()),
+        }
+    };
     let measure = |row| -> Result<_> {
         match (measure_counts.is_null(row), measure_domains.is_null(row), measure_sums.is_null(row)) {
             (true, true, true) => Ok(None),
@@ -176,7 +196,7 @@ pub(super) fn decode(
             _ => Err(invalid()),
         }
     };
-    let revision = |row| (!revisions.is_null(row)).then(|| Timestamp(revisions.value(row)));
+    let revision = |row| revision_key(revisions, revision_transactions, row);
     let identity = |row| -> Result<_> {
         Ok((
             (!digests.is_null(row)).then(|| digests.value(row)),
@@ -211,7 +231,7 @@ pub(super) fn decode(
             (None, true) => None,
             _ => return Err(invalid()),
         };
-        let time = (!times.is_null(row)).then(|| Timestamp(times.value(row)));
+        let time = revision_key(times, fence_transactions, row)?;
         let empty = || tuple.view().iter().all(|cell| cell == AtomRef::Null);
         match (kinds.value(row), bucket, address, time) {
             (0, Some(bucket), Some(address), None) if tuple.view().len() != 0 => {
@@ -230,9 +250,9 @@ pub(super) fn decode(
     (0..rows)
         .step_by(2)
         .map(|row| {
-            let time = revision(row);
+            let time = revision(row)?;
             let address = identity(row)?;
-            if time != revision(row + 1) || address != identity(row + 1)? {
+            if time != revision(row + 1)? || address != identity(row + 1)? {
                 return Err(invalid());
             }
             match (address, key(row)?, key(row + 1)?) {

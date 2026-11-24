@@ -473,6 +473,7 @@ fn append(view: Route, grant: Grant, class: AppendClass, payload: Bytes) -> Requ
         view,
         Principal::Worker(grant.enrollment),
         Command::Append {
+            references: None,
             grant,
             class,
             expected_next: view.head.next_lsn,
@@ -528,7 +529,7 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
     };
     let read = execute(
         &worker,
-        request(route(&worker).await, principal, Command::Barrier { grant }),
+        request(route(&worker).await, principal, Command::Barrier),
     )
     .await;
     let Outcome::Barrier { read, .. } = read.receipt.outcome.unwrap() else {
@@ -549,6 +550,7 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
         },
     };
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: selected.cut,
         root: selected.root,
         source: grant,
@@ -640,7 +642,7 @@ async fn withdrawn_worker_disposal_and_trim(automatic_disposal: bool) {
     }
 
     assert_eq!(
-        custody(Command::PrepareCheckpoint { preparation }).await,
+        custody(Command::PrepareCheckpoint { preparation, references: None }).await,
         Ok(Outcome::CheckpointPrepared(preparation)),
     );
     assert_eq!(
@@ -767,7 +769,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
     let lost_request = request(
         route(&old).await,
         Principal::Worker(incumbent.enrollment),
-        Command::Barrier { grant: incumbent },
+        Command::Barrier,
     );
     discard_reply(&authority.workers[0], &installed, lost_request.clone()).await;
     let resent = execute(&old, lost_request.clone()).await;
@@ -788,7 +790,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
     let read_request = request(
         route(&old).await,
         Principal::Worker(incumbent.enrollment),
-        Command::Barrier { grant: incumbent },
+        Command::Barrier,
     );
     let admitted = execute(&old, read_request.clone()).await;
     let Outcome::Barrier { read, .. } = admitted.receipt.outcome.unwrap() else {
@@ -900,6 +902,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
         [appended, maintained]
     );
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: exact.cut,
         root: exact.root,
         source: replacement,
@@ -914,7 +917,7 @@ async fn funded_control_reconciles_lost_appends_and_releases_lost_reads_through_
             request(
                 view,
                 Principal::Custodian,
-                Command::PrepareCheckpoint { preparation }
+                Command::PrepareCheckpoint { preparation, references: None }
             )
         )
         .await

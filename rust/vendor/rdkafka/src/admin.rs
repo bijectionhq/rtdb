@@ -89,6 +89,51 @@ impl<C: ClientContext> AdminClient<C> {
         Ok(rx)
     }
 
+    /// Resolves the broker's immutable identity for one named topic.
+    pub async fn topic_id(&self, topic: &str, opts: &AdminOptions) -> KafkaResult<[u8; 16]> {
+        let invalid = || KafkaError::AdminOpCreation("describe topics returned no topic identity".into());
+        let reply = {
+            let topic_c = CString::new(topic)?;
+            let mut names = [topic_c.as_ptr()];
+            let topics = unsafe {
+                NativePtr::<rdsys::rd_kafka_TopicCollection_t>::from_ptr(
+                    rdsys::rd_kafka_TopicCollection_of_topic_names(names.as_mut_ptr(), names.len())
+                )
+            }.ok_or_else(invalid)?;
+            let (options, reply) = opts.to_native(self.client.native_ptr(), &mut ErrBuf::new())?;
+            unsafe {
+                rdsys::rd_kafka_DescribeTopics(self.client.native_ptr(), topics.ptr(), options.ptr(), self.queue.ptr());
+            }
+            reply
+        };
+
+        let event = reply.await.map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let result = unsafe { rdsys::rd_kafka_event_DescribeTopics_result(event.ptr()) };
+        if result.is_null() { return Err(invalid()); }
+        let mut count = 0;
+        let topics = unsafe { rdsys::rd_kafka_DescribeTopics_result_topics(result, &mut count) };
+        if count != 1 || topics.is_null() { return Err(invalid()); }
+        let described = unsafe { *topics };
+        if described.is_null() { return Err(invalid()); }
+        let name = unsafe { rdsys::rd_kafka_TopicDescription_name(described) };
+        if name.is_null() || unsafe { CStr::from_ptr(name) }.to_bytes() != topic.as_bytes() { return Err(invalid()); }
+        let error = unsafe { rdsys::rd_kafka_TopicDescription_error(described) };
+        if !error.is_null() {
+            let code = unsafe { rdsys::rd_kafka_error_code(error) };
+            if code.is_error() { return Err(KafkaError::AdminOp(code.into())); }
+        }
+        let id = unsafe { rdsys::rd_kafka_TopicDescription_topic_id(described) };
+        if id.is_null() { return Err(invalid()); }
+        let high = unsafe { rdsys::rd_kafka_Uuid_most_significant_bits(id) };
+        let low = unsafe { rdsys::rd_kafka_Uuid_least_significant_bits(id) };
+        if high == 0 && low == 0 { return Err(invalid()); }
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&high.to_be_bytes());
+        bytes[8..].copy_from_slice(&low.to_be_bytes());
+        Ok(bytes)
+    }
+
     /// Deletes the named topics.
     ///
     /// Note that while the API supports deleting multiple topics at once, it is
@@ -475,6 +520,11 @@ impl NativeEvent {
 //
 // ********** ADMIN OPTIONS **********
 //
+
+unsafe impl KafkaDrop for rdsys::rd_kafka_TopicCollection_t {
+    const TYPE: &'static str = "topic collection";
+    const DROP: unsafe extern "C" fn(*mut Self) = rdsys::rd_kafka_TopicCollection_destroy;
+}
 
 /// Options for an admin API request.
 #[derive(Default)]

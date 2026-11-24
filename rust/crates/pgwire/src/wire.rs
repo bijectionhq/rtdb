@@ -6,6 +6,14 @@ use rtdb_types::{Anomaly, PgType, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{network, protocol};
 
+pub(crate) fn delivery_error(error: Anomaly) -> Anomaly {
+    if matches!(error.code.as_str(), "rtdb.storage/plaintext-delivery-expired" | "rtdb.storage/read-lease-expired") {
+        network(error.message.as_deref().unwrap_or("The plaintext delivery grant expired"))
+    } else {
+        error
+    }
+}
+
 pub(crate) const STARTUP_LIMIT: usize = 10_000;
 /// ErrorResponse field carrying a placement interruption code in every detail format.
 pub const ANOMALY_CODE_FIELD: u8 = b'y';
@@ -31,14 +39,27 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Column { pub name: String, pub ty: PgType, pub format: Format }
-pub(crate) struct Writer<W> { output: W, memory: Arc<MemoryBudget> }
+pub(crate) struct Writer<W> { output: W, memory: Arc<MemoryBudget>, gateway: bool }
 impl<W: AsyncWrite + Unpin> Writer<W> {
-    pub fn new(output: W, memory: Arc<MemoryBudget>) -> Self { Self { output, memory } }
+    pub fn new(output: W, memory: Arc<MemoryBudget>) -> Self { Self { output, memory, gateway: false } }
+    pub fn through_gateway(mut self, enabled: bool) -> Self { self.gateway = enabled; self }
     pub async fn raw(&mut self, bytes: &[u8]) -> Result<()> { self.output.write_all(bytes).await.map_err(network)?; self.flush().await }
     pub async fn flush(&mut self) -> Result<()> { self.output.flush().await.map_err(network) }
     pub async fn send(&mut self, tag: u8, body: &[u8]) -> Result<()> {
         let length = i32::try_from(body.len().checked_add(4).ok_or_else(|| protocol("Output message too large"))?).map_err(|_| protocol("Output message too large"))?;
-        self.output.write_u8(tag).await.map_err(network)?; self.output.write_i32(length).await.map_err(network)?; self.output.write_all(body).await.map_err(network)?; Ok(())
+        if self.gateway && let Some(deadline) = rtdb_query::current_delivery_deadline() {
+            let cutoff = deadline.wire_nanos().ok_or_else(|| network("The answer deadline cannot be relayed"))?;
+            let mut stamp = [0; 9];
+            stamp[0] = crate::GATEWAY_ANSWER_DEADLINE_KIND;
+            stamp[1..].copy_from_slice(&cutoff.to_be_bytes());
+            self.packet(crate::GATEWAY_SESSION_STATE_TAG, 13, &stamp).await?;
+        }
+        self.packet(tag, length, body).await
+    }
+    async fn packet(&mut self, tag: u8, length: i32, body: &[u8]) -> Result<()> {
+        self.output.write_u8(tag).await.map_err(network)?;
+        self.output.write_i32(length).await.map_err(network)?;
+        self.output.write_all(body).await.map_err(network)
     }
     pub async fn empty(&mut self, tag: u8) -> Result<()> { self.send(tag, &[]).await }
     pub async fn string(&mut self, tag: u8, text: &str) -> Result<()> { self.record(tag, text.len() + 1, |bytes| cstring(bytes, text)).await }
@@ -85,12 +106,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         self.record(b'T', bound, |bytes| { count(bytes, columns.len())?; for column in columns { let ty = if column.ty == PgType::Default { fallback } else { column.ty }; let descriptor = ty.descriptor(); cstring(bytes, &column.name)?; bytes.extend_from_slice(&0i32.to_be_bytes()); bytes.extend_from_slice(&0i16.to_be_bytes()); bytes.extend_from_slice(&descriptor.oid.to_be_bytes()); bytes.extend_from_slice(&descriptor.length.to_be_bytes()); bytes.extend_from_slice(&(-1i32).to_be_bytes()); bytes.extend_from_slice(&column.format.code().to_be_bytes()); } Ok(()) }).await
     }
     /// Writes a data row whose column count and cells, each a length then its bytes, `body` already holds.
-    pub async fn row_body(&mut self, body: &[u8]) -> Result<()> {
-        let length = body.len().checked_add(4).and_then(|length| i32::try_from(length).ok()).ok_or_else(|| protocol("Row message too large"))?;
-        self.output.write_u8(b'D').await.map_err(network)?;
-        self.output.write_i32(length).await.map_err(network)?;
-        self.output.write_all(body).await.map_err(network)
-    }
+    pub async fn row_body(&mut self, body: &[u8]) -> Result<()> { self.send(b'D', body).await }
     pub async fn row(&mut self, values: &[Option<EncodedValue>]) -> Result<()> {
         let length = values.iter().try_fold(6usize, |n, value| n.checked_add(4 + value.as_ref().map_or(0, |value| value.as_slice().len())).ok_or_else(|| protocol("Row message too large")))?;
         self.output.write_u8(b'D').await.map_err(network)?; self.output.write_i32(i32::try_from(length).map_err(|_| protocol("Row message too large"))?).await.map_err(network)?;

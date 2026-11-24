@@ -16,7 +16,7 @@ The decoded comparison has the same relation, identity, check intent and exact s
 Each world publication replaces one 32-byte zero reservation in its prepared request with the submitted fingerprint, preserving the prefix and suffix.
 In `DecideHeldWorlds.v1` and `SwitchPreparedProposal.v1` the slot begins after the one-byte flags, optional 16-byte clock-slot hold and eight-byte deadline.
 The prepared Proposal switch uses the same decoder and requires the clock offer and Root kind 6.
-In `PublishHeldWorldRetention.v3` it follows the 22-byte attempt identity after the hold, system revision, child, expiry and deadline.
+In `PublishHeldWorldRetention.v3` it follows the 22-byte attempt identity after the hold, system revision, child, one-byte clock mode, expiry and deadline.
 In `PublishWorldCut.v1` and `DecideWorldCut.v1` it follows the 22-byte attempt identity after the hold, world, pin, previous hold, capture, suffix, expiry, deadline and clock mode with any mode operand.
 The action decoder reads the same 32 bytes and continues at the first byte after the slot.
 

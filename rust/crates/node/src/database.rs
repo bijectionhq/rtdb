@@ -91,20 +91,59 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
+    pub(crate) fn replica_read_deployment(&self) -> Option<uuid::Uuid> {
+        self.replica_read_index.as_ref()?.deployment()
+    }
+
+    pub(crate) fn has_replica_read_index(&self) -> bool {
+        self.replica_read_index.is_some()
+    }
+
     pub async fn confirm_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<()> {
-        self.with_confirmed_replica(cancellation, |_| Ok(())).await
+        if let Some(index) = &self.replica_read_index {
+            self.confirm_replica_cut(index.as_ref(), cancellation).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn capture_replica_snapshot(&self, cancellation: &CancellationToken) -> Result<rtdb_index::Snapshot> {
-        self.with_confirmed_replica(cancellation, |confirmed| {
-            let snapshot = self.partition.snapshot();
-            if confirmed.is_some_and(|position| !snapshot.catalog_cut().is_some_and(|cut| {
-                cut.replica_epoch == self.logs.replica_epoch && cut.through >= position
-            })) {
-                return Err(self.replica_behind());
+        let Some(index) = &self.replica_read_index else { return Ok(self.partition.snapshot()); };
+        // The reader can sample again if apply already passed its selection.
+        // Each retry is a fresh confirmation within the original invocation.
+        for _ in 0..3 {
+            let (barrier, position) = self.confirm_replica_cut(index.as_ref(), cancellation).await?;
+            let snapshot = match position {
+                Some(through) => self.partition.published_snapshot(CatalogCut {
+                    storage_version: self.logs.storage_version,
+                    storage_epoch: self.logs.storage_epoch,
+                    replica_epoch: self.logs.replica_epoch,
+                    through,
+                }),
+                None => Some(self.partition.snapshot()).filter(|snapshot| {
+                    snapshot.catalog_cut().is_none() && snapshot.tx_basis().is_none()
+                }),
+            };
+            if let Some(snapshot) = snapshot {
+                return tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/operation-cancelled", "Operation was cancelled")),
+                    _ = self.cancellation.cancelled() => Err(self.replica_behind()),
+                    retained = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage) => {
+                        let retained = retained.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+                        if let Some(read) = &barrier.certified_read {
+                            if retained.catalog_cut().is_none_or(|cut| cut.through.after_offset(cut.replica_epoch) != read.through) {
+                                return Err(self.replica_behind());
+                            }
+                            read.observe("certified-catalog-capture");
+                            Ok(retained.with_certified_read(read.clone()))
+                        } else {
+                            Ok(retained)
+                        }
+                    }
+                };
             }
-            Ok(snapshot)
-        }).await
+        }
+        Err(self.replica_behind())
     }
 
     fn replica_behind(&self) -> Anomaly {
@@ -112,24 +151,25 @@ impl Database {
             format!("This replica of {} could not establish a fresh snapshot", self.name))
     }
 
-    async fn with_confirmed_replica<T>(&self, cancellation: &CancellationToken,
-        capture: impl FnOnce(Option<ReplicaPosition>) -> Result<T>,
-    ) -> Result<T> {
-        let Some(read_index) = &self.replica_read_index else { return capture(None); };
+    async fn confirm_replica_cut(&self, read_index: &dyn ReplicaReadIndex, cancellation: &CancellationToken)
+        -> Result<(crate::ProtectedReadIndex, Option<ReplicaPosition>)>
+    {
         let confirm = async {
-            let barrier = read_index.protect().await.map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
-            let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?;
-            let confirmed = (barrier.offset.0 != -1).then_some(position);
             let mut status = self.watch_status();
+            let applied = status.borrow().installed.map_or(-1, |prefix| {
+                prefix.replica.after_offset(self.logs.replica_epoch)
+            });
+            let barrier = read_index.protect(rtdb_storage::log::LogOffset(applied)).await
+                .map_err(|error| self.replica_behind().with_context("cause", error.code.into()))?;
+            let confirmed = if barrier.offset.0 == -1 { None } else {
+                Some(ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, barrier.offset.0)?)
+            };
             let applied = status.wait_for(|status| status.role == Role::Stopped
                 || confirmed.is_none_or(|position| status.installed.is_some_and(|prefix| prefix.replica >= position)));
             let status = tokio::time::timeout(barrier.wait, applied).await
                 .map_err(|_| self.replica_behind())?.map_err(|_| self.replica_behind())?;
             if status.role == Role::Stopped { return Err(self.replica_behind()); }
-            drop(status);
-            let captured = capture(confirmed);
-            drop(barrier);
-            captured
+            Ok((barrier, confirmed))
         };
         tokio::select! {
             biased;
@@ -264,6 +304,7 @@ pub(crate) struct DatabaseFactory {
     pub memory: Arc<MemoryBudget>,
     pub cache: Arc<CacheBudget>,
     pub clock: Arc<dyn Clock>,
+    pub decision_clock: Option<Arc<dyn rtdb_tx::DecisionClock>>,
     pub authorization: Arc<dyn TransactionAuthorization>,
     pub observer: Arc<dyn CollectionObserver>,
     pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
@@ -315,6 +356,8 @@ impl DatabaseFactory {
         let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let checkpoint_metadata = resources.checkpoint_metadata.take();
+        let recovery_storage = Arc::clone(&resources.store);
+        let local_recovery = recovery_storage.local_maintenance_store().filter(|store| store.defers_trie_releases());
         let assembly = async {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
@@ -331,7 +374,8 @@ impl DatabaseFactory {
                 return Err(Anomaly::fault("rtdb.node/checkpoint-await-cut", "The opened checkpoint does not establish its await-token cut"));
             }
             let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
-                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
+                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?
+                .with_placed_transfer(opened_logs.placed_transfer)?;
             let recovered = if self.options.replication.enabled {
                 blocks.recover_for_replay(recovered, &logs, self.options.trie, self.clock.now(), &cancellation).await?
             } else {
@@ -348,12 +392,14 @@ impl DatabaseFactory {
                 }
                 recovered.with_source_floor(logs.source_floor()?)
             };
+            logs.install_replica_reference_source(recovered.block.clone(), self.options.file_size_target)?;
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let event_history = !read_only && self.options.artefact_threads != 0
                 && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
+                decision_clock: self.decision_clock.clone(),
                 write_event_origins: event_history,
                 placed_receipt_retirement: matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { placed_receipt_retirement: true, .. }),
                 owned_witness_scope: match &opened_logs.await_authority {
@@ -442,10 +488,17 @@ impl DatabaseFactory {
                 artefacts: artefact_drivers, live_artefacts, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         };
-        let opened = match checkpoint_metadata {
-            Some(hold) => IoRegion::retaining(hold, assembly).await,
-            None => assembly.await,
-        };
+        let opened = async {
+            let hold = match (checkpoint_metadata, local_recovery) {
+                (Some(hold), _) => Some(hold),
+                (None, Some(store)) => Some(store.hold_recovery_open().await?),
+                (None, None) => None,
+            };
+            match hold {
+                Some(hold) => IoRegion::reading(rtdb_storage::HeldView::recovery(hold), assembly).await,
+                None => assembly.await,
+            }
+        }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
     }

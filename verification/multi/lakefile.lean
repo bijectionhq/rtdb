@@ -4,7 +4,7 @@ open Lake DSL
 package «rtdb-multi-recovery»
 
 require logkeeper from git
-  "https://github.com/bijectionhq/logkeeper.git" @ "a5d21eb92bb468f12c1cf3a56f1c2011fc09947b" / "verification/lean"
+  "https://github.com/bijectionhq/logkeeper.git" @ "11caa64b52d77ab741553aa0e0599f85e68961d0" / "verification/lean"
 
 lean_lib OrderedModels where
   srcDir := "lean"

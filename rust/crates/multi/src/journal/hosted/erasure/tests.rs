@@ -1,7 +1,11 @@
 use std::sync::Mutex;
 
 use bytes::Bytes;
-use ordered_logkeeper::ordered::{AppendClass, Custody, Hold, Limits, Refusal, State, Window};
+use ordered_logkeeper::ordered::{
+    AppendClass, Custody, Hold, Limits, Refusal, State, Window,
+    replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
+    service::wire::Signature,
+};
 use rtdb_storage::IoRegion;
 
 use super::*;
@@ -13,7 +17,7 @@ struct Journal {
     state: State,
     preparing: Option<CheckpointPreparation>,
     lose_rotation_reply: bool,
-    append_after_publish: bool,
+    append_before_switch: bool,
 }
 
 struct CustodyFixture {
@@ -50,6 +54,7 @@ impl Journal {
                 expected_next,
                 timestamp: 1,
                 payload,
+                references: None,
             },
         )
         .outcome
@@ -128,7 +133,7 @@ impl Fixture {
             state,
             preparing: None,
             lose_rotation_reply: false,
-            append_after_publish: false,
+            append_before_switch: false,
         };
         let directory = tempfile::tempdir().unwrap();
         let keys = LocalKeyService::new(directory.path())?;
@@ -148,9 +153,8 @@ impl Fixture {
                 Ok(Outcome::Appended(_))
             ));
         }
-        let Ok(Outcome::Barrier { read: view, .. }) = journal
-            .apply(worker, Command::Barrier { grant: incumbent })
-            .outcome
+        let Ok(Outcome::Barrier { read: view, .. }) =
+            journal.apply(worker, Command::Barrier).outcome
         else {
             panic!("view admission failed");
         };
@@ -170,6 +174,7 @@ impl Fixture {
                 operation: Uuid::new_v4(),
                 custody_domain: Uuid::new_v4(),
                 incumbent,
+                timing: ErasureTiming::OperationalTarget,
             },
             view,
             io,
@@ -183,6 +188,7 @@ impl Fixture {
             &self.custody.keys,
             &self.custody,
             self.erasure,
+            None,
         )
         .await
     }
@@ -217,17 +223,10 @@ impl ErasureJournal for CustodyFixture {
         })
     }
 
-    async fn publish(&self, checkpoint: Checkpoint) -> Result<()> {
+    async fn reopen(&self, _: Checkpoint) -> Result<()> {
         let mut journal = self.journal.lock().unwrap();
-        let incumbent = journal.preparing.unwrap().source;
-        assert_eq!(
-            journal
-                .apply(Principal::Custodian, Command::Publish { checkpoint })
-                .outcome,
-            Ok(Outcome::Published(checkpoint))
-        );
-        journal.preparing = None;
-        if journal.append_after_publish {
+        if std::mem::take(&mut journal.append_before_switch) {
+            let incumbent = journal.preparing.unwrap().source;
             assert!(matches!(
                 journal.append(incumbent, Bytes::from_static(b"old suffix")),
                 Ok(Outcome::Appended(_))
@@ -236,7 +235,7 @@ impl ErasureJournal for CustodyFixture {
         Ok(())
     }
 
-    async fn execute(&self, request: &Request) -> Result<Receipt> {
+    async fn execute(&self, request: &Request) -> Result<Decision> {
         let mut journal = self.journal.lock().unwrap();
         let position = journal.state.position() + 1;
         let time = journal.state.time();
@@ -244,10 +243,65 @@ impl ErasureJournal for CustodyFixture {
             .state
             .apply(position, time, request.clone())
             .unwrap();
+        let rotation = match receipt.outcome {
+            Ok(Outcome::Granted { grant, recovery }) => {
+                journal.preparing = None;
+                // This fixture supplies structural evidence. The installed journal
+                // verifies the transport issuer before returning the actual decision.
+                let mut images = [
+                    SlotImage {
+                        generation: 2,
+                        digest: [2; 32],
+                    },
+                    SlotImage {
+                        generation: 3,
+                        digest: [3; 32],
+                    },
+                ];
+                if let Some(index) = self.stale_slot {
+                    images[index].digest = [0; 32];
+                }
+                if self.duplicate_slot {
+                    images[1] = images[0];
+                }
+                Some(SignedRotationSlots {
+                    evidence: RotationSlots {
+                        group: [1; 32],
+                        cohort_size: 3,
+                        ballot: Ballot {
+                            round: 1,
+                            nonce: Uuid::from_u128(1),
+                        },
+                        prefix: [6; 32],
+                        position,
+                        checkpoint: recovery.checkpoint,
+                        key_generation: grant.key_generation,
+                        voters: [1, 2]
+                            .map(|id| VoterSlots {
+                                voter: Uuid::from_u128(id),
+                                slots: SlotPair {
+                                    selected: 1,
+                                    images,
+                                },
+                            })
+                            .into(),
+                    },
+                    signature: Signature {
+                        issuer: [5; 32],
+                        proof: [7; 64],
+                    },
+                })
+            }
+            _ => None,
+        };
         if std::mem::take(&mut journal.lose_rotation_reply) {
             return Err(lost_reply());
         }
-        Ok(receipt)
+        Ok(Decision {
+            receipt,
+            barrier: None,
+            rotation,
+        })
     }
 }
 
@@ -277,6 +331,7 @@ impl ErasureCustody for CustodyFixture {
             },
         };
         let preparation = CheckpointPreparation {
+            erasure: true,
             checkpoint: cut,
             root: checkpoint.root,
             source: erasure.incumbent,
@@ -285,16 +340,21 @@ impl ErasureCustody for CustodyFixture {
             usable_bytes: 64,
             descriptor: [5; 32],
         };
-        assert_eq!(
-            journal
-                .apply(
-                    Principal::Custodian,
-                    Command::PrepareCheckpoint { preparation }
-                )
-                .outcome,
-            Ok(Outcome::CheckpointPrepared(preparation))
-        );
-        journal.preparing = Some(preparation);
+        if !self.use_boundary {
+            assert_eq!(
+                journal
+                    .apply(
+                        Principal::Custodian,
+                        Command::PrepareCheckpoint {
+                            preparation,
+                            references: None
+                        }
+                    )
+                    .outcome,
+                Ok(Outcome::CheckpointPrepared(preparation))
+            );
+            journal.preparing = Some(preparation);
+        }
         let prepared = PreparedErasure {
             erasure,
             checkpoint,
@@ -304,27 +364,6 @@ impl ErasureCustody for CustodyFixture {
         Ok(ErasureProgress::Prepared(prepared))
     }
 
-    async fn recovery_slots(
-        &self,
-        prepared: PreparedErasure,
-        successor: WriterAdmission,
-    ) -> Result<[RecoverySlot; 2]> {
-        let mut slots = [RecoverySlotId::A, RecoverySlotId::B].map(|id| RecoverySlot {
-            id,
-            placement: prepared.erasure.placement,
-            durable_image: [6; 32],
-            checkpoint: prepared.checkpoint,
-            suffix_key_generation: successor.grant.key_generation,
-        });
-        if let Some(index) = self.stale_slot {
-            slots[index].checkpoint.root = [1; 32];
-        }
-        if self.duplicate_slot {
-            slots[1] = slots[0];
-        }
-        Ok(slots)
-    }
-
     async fn commit_and_arm(&self, ready: CleanRecoverySlots) -> Result<ErasureCommit> {
         let prepared = ready.prepared();
         let old_key = JournalKey::new(
@@ -332,7 +371,7 @@ impl ErasureCustody for CustodyFixture {
             prepared.erasure.incumbent.key_generation,
         );
         let now = rtdb_directory::now_ms();
-        let due = now + MAX_REVOCATION_DELAY_MS as i64;
+        let due = now + OPERATIONAL_TARGET_MS as i64;
         if self.revoke_early {
             self.keys.withdraw_archive_key(&old_key.id()).await?;
         } else {
@@ -341,7 +380,9 @@ impl ErasureCustody for CustodyFixture {
         let commit = ErasureCommit {
             prepared,
             committed_at_ms: now as u64,
-            deadline_ms: due as u64,
+            deadline: ErasureDeadline::Target { at_ms: due as u64 },
+            retiring_inventory: [10; 32],
+            switch_evidence: ready.binding(),
         };
         *self.attempt.lock().unwrap() = Some(ErasureProgress::Committed(commit));
         if self.lose_commit_reply {
@@ -396,7 +437,7 @@ async fn exact_head_rotation_survives_lost_rotation_and_commit_replies() -> Resu
 }
 
 #[tokio::test]
-async fn an_ordinary_boundary_cut_and_an_append_after_publication_prevent_rotation() -> Result<()> {
+async fn an_ordinary_boundary_cut_and_a_racing_append_prevent_the_switch() -> Result<()> {
     let mut boundary = Fixture::new().await?;
     boundary.custody.use_boundary = true;
     let failure = boundary.commit().await.unwrap_err();
@@ -419,13 +460,13 @@ async fn an_ordinary_boundary_cut_and_an_append_after_publication_prevent_rotati
         .journal
         .get_mut()
         .unwrap()
-        .append_after_publish = true;
+        .append_before_switch = true;
     assert_eq!(
         racing.commit().await.unwrap_err().code,
         "rtdb.multi/ordered-stale-grant"
     );
     let journal = racing.custody.journal.get_mut().unwrap();
-    assert_eq!(journal.state.checkpoint().cut.next_lsn, 3);
+    assert_eq!(journal.state.checkpoint().cut.next_lsn, 0);
     assert_eq!(journal.state.head().next_lsn, 4);
     assert_eq!(
         journal.state.writer_state().grant,
@@ -516,7 +557,7 @@ async fn old_generation_appends_are_fenced_and_the_successor_suffix_opens() -> R
 async fn arming_preserves_the_held_view_and_early_withdrawal_breaks_it() -> Result<()> {
     let fixture = Fixture::new().await?;
     let commit = fixture.commit().await?;
-    assert!((rtdb_directory::now_ms() as u64) < commit.deadline_ms);
+    assert!((rtdb_directory::now_ms() as u64) < commit.deadline.at_ms());
     assert_eq!(
         fixture.open_held_view().await?,
         Bytes::from_static(b"erased history")
@@ -536,10 +577,93 @@ async fn arming_preserves_the_held_view_and_early_withdrawal_breaks_it() -> Resu
     let mut weakened = Fixture::new().await?;
     weakened.custody.revoke_early = true;
     let commit = weakened.commit().await?;
-    assert!((rtdb_directory::now_ms() as u64) < commit.deadline_ms);
+    assert!((rtdb_directory::now_ms() as u64) < commit.deadline.at_ms());
     assert_eq!(
         weakened.open_held_view().await.unwrap_err().code,
         "rtdb/erased-under-view"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> Result<()> {
+    use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    let mut fixture = Fixture::new().await?;
+    let signer = Ed25519KeyPair::from_seed_unchecked(&[4; 32]).unwrap();
+    let authority = CustodyEvidence::new(signer.public_key().as_ref().try_into().unwrap())?;
+    let sign = |bytes: &[u8]| signer.sign(bytes).as_ref().try_into().unwrap();
+    let mut commit = fixture.commit().await?;
+    let committed = commit.committed_at_ms;
+    let by_ms = committed + 10;
+    commit.prepared.erasure.timing = ErasureTiming::Fixed { before_ms: by_ms };
+    let mut reservation = DeadlineReservation {
+        by_ms,
+        retiring_inventory: commit.retiring_inventory,
+        signature: [0; 64],
+    };
+    reservation.signature = sign(&reservation.signing_bytes(commit.prepared));
+    authority.verify_reservation(commit.prepared, reservation)?;
+    assert!(
+        authority
+            .verify_reservation(
+                commit.prepared,
+                DeadlineReservation {
+                    retiring_inventory: [9; 32],
+                    ..reservation
+                }
+            )
+            .is_err()
+    );
+
+    commit.deadline = ErasureDeadline::Enforced {
+        by_ms,
+        signature: [0; 64],
+    };
+    commit.deadline = ErasureDeadline::Enforced {
+        by_ms,
+        signature: sign(&commit.signing_bytes()),
+    };
+    validate_commit(
+        commit.prepared,
+        commit,
+        Some(commit.switch_evidence),
+        Some(&authority),
+    )?;
+    let other_switch = ErasureCommit {
+        switch_evidence: [9; 32],
+        ..commit
+    };
+    assert!(validate_commit(other_switch.prepared, other_switch, None, Some(&authority)).is_err());
+
+    let mut destruction = DestructionEvidence {
+        drain_observed_at_ms: committed + 1,
+        destroyed_at_ms: by_ms + 1,
+        disposition: [12; 32],
+        signature: [0; 64],
+    };
+    destruction.signature = sign(&destruction.signing_bytes(&commit));
+    authority.verify_destruction(commit, &destruction)?;
+    assert_eq!(destruction.fixed_deadline_met(&commit), Some(false));
+    assert!(
+        authority
+            .verify_destruction(other_switch, &destruction)
+            .is_err()
+    );
+    destruction.drain_observed_at_ms = destruction.destroyed_at_ms + 1;
+    destruction.signature = sign(&destruction.signing_bytes(&commit));
+    assert!(authority.verify_destruction(commit, &destruction).is_err());
+
+    let journal = fixture.custody.journal.get_mut().unwrap();
+    let head = journal.state.head();
+    fixture.erasure.timing = commit.prepared.erasure.timing;
+    assert_eq!(
+        fixture.commit().await.unwrap_err().code,
+        "rtdb.multi/fixed-erasure-authority"
+    );
+    assert_eq!(
+        fixture.custody.journal.get_mut().unwrap().state.head(),
+        head
     );
     Ok(())
 }

@@ -1129,6 +1129,7 @@ mod tests {
 
         let columns = vec!["body".to_string()];
         let row = |id: u8, body: &str| crate::SearchRow {
+            position: None,
             identity: None, iid: [id; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
             op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens(body))],
         };
@@ -1172,13 +1173,14 @@ mod tests {
         assert!(may_be_visible(10, 100, 5, 30, at(35, 29)));
     }
 
-    fn event(system_from: i64, valid_from: i64, valid_to: i64, op: rtdb_types::EventOp) -> crate::file::KeyedEvent { crate::file::KeyedEvent { system_from, valid_from, valid_to, op } }
+    fn event(system_from: i64, valid_from: i64, valid_to: i64, op: rtdb_types::EventOp) -> crate::file::KeyedEvent { crate::file::KeyedEvent { position: None, system_from, valid_from, valid_to, op } }
 
     #[test]
     fn an_intervening_write_in_another_file_does_not_hide_the_later_match() {
         let columns = ["body".to_string()];
         let iid = [1; 16];
         let row = |system_from, valid_to, text: &str| crate::SearchRow {
+            position: None,
             identity: None, iid, system_from, valid_from: 0, valid_to, op: rtdb_types::EventOp::Put,
             values: vec![Some(rtdb_text::tokens(text))],
         };

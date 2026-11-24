@@ -67,4 +67,6 @@ WitnessesCoverInstalledPrefix == witnesses = Prefix(applied)
 LookupNamesExactAttempt == lookup[1] = lookup[2]
 NeverRecoversWitness == ~(restored /\ witnesses # {})
 
+\* PlacedReceiverSlots models reservation, fencing and succession.
+
 ===============================================================================

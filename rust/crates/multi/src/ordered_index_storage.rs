@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use rtdb_directory::{Cas, DeploymentRecord, Directory, LegacyIndexPages, Lifecycle, OrderedIndexCatalog, OrderedIndexStorage, StoragePublication, StorageRegion};
 use rtdb_format::keys::ORDERED_INDEX_ROOT;
 use rtdb_storage::{
-    Error, ObjectKey, ObjectStore,
+    Error, IoRegion, ObjectKey, ObjectStore,
     object_store::{IndexPageLifecycle, IndexPageScope},
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::admin::update_installation;
 use crate::deployment::CellStorage;
+use crate::keys::{KeyService, UnitScope};
 
 const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -242,6 +243,37 @@ fn page_key(name: &str) -> Option<(&str, Option<u64>)> {
     Some((index, Some(u64::from_str_radix(generation, 16).ok()?)))
 }
 
+pub(crate) fn page_generation(name: &str) -> Option<(&str, u64)> {
+    let id = below(name, ORDERED_INDEX_ROOT)?;
+    let (index, rest) = id.split_once('/')?;
+    definition(&name[..ORDERED_INDEX_ROOT.len() + 1 + index.len()])?;
+    let (generation, page) = rest.strip_prefix("generations/")?.split_once('/')?;
+    if generation.len() != 16 || !page.starts_with("pages/") {
+        return None;
+    }
+    let generation = u64::from_str_radix(generation, 16).ok()?;
+    Some((index, generation))
+}
+
+fn retained_key_scope(residence: &str, index: &str, generation: u64) -> Result<UnitScope> {
+    let (_, definition) = index.rsplit_once(&format!("/{ORDERED_INDEX_ROOT}/"))
+        .filter(|(_, definition)| !definition.contains('/'))
+        .ok_or_else(closed_scope)?;
+    Ok(UnitScope::ordered_index(residence, definition, generation))
+}
+
+pub(crate) async fn withdraw_residence_keys(keys: &dyn KeyService, record: &DeploymentRecord) -> Result<()> {
+    let residence = record.storage_prefix();
+    let io = IoRegion::new();
+    for (index, state) in &record.ordered_indexes {
+        if below(index, &residence).is_none() { continue; }
+        for &generation in state.generations.keys() {
+            keys.withdraw_unit_scope(retained_key_scope(&residence, index, generation)?, &io).await?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn require_page_publication(
     record: &DeploymentRecord, region: Uuid, key: &ObjectKey,
 ) -> Result<()> {
@@ -358,7 +390,7 @@ async fn discover_dropped_definitions(
 
 pub(crate) async fn reap(
     directory: &dyn Directory, storage: &CellStorage, bucket: &dyn ObjectStore,
-    record: &DeploymentRecord,
+    record: &DeploymentRecord, keys: &dyn KeyService,
 ) -> Result<()> {
     if untracked_regions_open(record) {
         return Ok(());
@@ -414,6 +446,7 @@ pub(crate) async fn reap(
         }).await?;
     }
     let record = &refreshed;
+    let io = IoRegion::new();
     for (index, generation) in ready_generations(record) {
         let prefix = match generation {
             Some(generation) => ObjectKey::new(format!("{index}/generations/{generation:016x}"))?,
@@ -424,6 +457,11 @@ pub(crate) async fn reap(
             for (_, _, publication) in &publications {
                 inventory.abort_publication(&ObjectKey::new(publication.key.clone())?, &publication.upload_id).await?;
             }
+        }
+        if let Some(generation) = generation {
+            keys.withdraw_unit_scope(retained_key_scope(&residence, &index, generation)?, &io).await?;
+        }
+        if let Some(inventory) = &inventory {
             inventory.purge(&prefix).await?;
         } else {
             for object in bucket.list(Some(&prefix)).await? {
@@ -481,7 +519,7 @@ fn publications_under(record: &DeploymentRecord, prefix: &ObjectKey) -> Result<V
 #[cfg(test)]
 mod tests {
     use rtdb_directory::{MemberId, MemoryDirectory};
-    use rtdb_storage::{IoRegion, MemoryStore};
+    use rtdb_storage::MemoryStore;
 
     use super::*;
 
@@ -507,6 +545,14 @@ mod tests {
         let unregistered = ObjectKey::new(format!("{store}/{index}/generations/0000000000000001/pages/orphan")).unwrap();
         let bucket = MemoryStore::default();
         let storage = CellStorage::Local { root: std::path::PathBuf::new() };
+        let vault = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyService> = Arc::new(crate::keys::LocalKeyService::new(vault.path()).unwrap());
+        let logical = ObjectKey::new(format!("{index}/generations/0000000000000000/pages/unpublished")).unwrap();
+        let (definition, generation) = page_generation(logical.as_str()).unwrap();
+        let ledger = crate::keys::UnitLedger::new(Arc::clone(&keys),
+            UnitScope::ordered_index(&record.storage_prefix(), definition, generation), IoRegion::new());
+        let sealed = ledger.operate(&logical, crate::keys::UnitOperation::Seal(bytes::Bytes::from_static(b"abandoned page")))
+            .await.unwrap().bytes().unwrap();
 
         let permit = lifecycle.retain(old).await.unwrap();
         let _replacement = lifecycle.retain(next).await.unwrap();
@@ -540,11 +586,12 @@ mod tests {
         before_cutover.storage_regions.insert(Uuid::new_v4(), StorageRegion::Local {
             archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
-        reap(directory.as_ref(), &storage, &bucket, &before_cutover).await.unwrap();
+        reap(directory.as_ref(), &storage, &bucket, &before_cutover, keys.as_ref()).await.unwrap();
         assert!(bucket.head(&unregistered).await.is_ok());
 
-        reap(directory.as_ref(), &storage, &bucket, &closed).await.unwrap();
+        reap(directory.as_ref(), &storage, &bucket, &closed, keys.as_ref()).await.unwrap();
         assert!(bucket.head(&old_key).await.is_ok());
+        assert!(ledger.operate(&logical, crate::keys::UnitOperation::Open(sealed.clone())).await.is_ok());
         assert!(matches!(bucket.head(&unregistered).await, Err(Error::MissingObject(_))));
 
         complete.send(()).unwrap();
@@ -557,7 +604,8 @@ mod tests {
             ready.as_ref().unwrap().clone()
         };
         assert!(lifecycle.retain(old).await.is_err());
-        reap(directory.as_ref(), &storage, &bucket, &reaped).await.unwrap();
+        reap(directory.as_ref(), &storage, &bucket, &reaped, keys.as_ref()).await.unwrap();
+        assert!(matches!(ledger.operate(&logical, crate::keys::UnitOperation::Open(sealed)).await, Err(Error::ErasedUnderView)));
         assert!(matches!(bucket.head(&old_key).await, Err(Error::MissingObject(_))));
         assert!(bucket.head(&new_key).await.is_ok());
         let acknowledged = directory.deployment(&record.id).await.unwrap().unwrap();
@@ -591,6 +639,8 @@ mod tests {
         let retained = ObjectKey::new(format!("{store}/{active}/generations/0000000000000000/pages/retained")).unwrap();
         let bucket = MemoryStore::default();
         let storage = CellStorage::Local { root: std::path::PathBuf::new() };
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path()).unwrap();
         for key in [&legacy, &scoped, &retained] {
             bucket.put(key, "indexed data".as_bytes().into()).await.unwrap();
         }
@@ -601,7 +651,7 @@ mod tests {
         let stale = IndexPageScope { index: &dropped, generation: 0 };
         assert!(indexes.retain(stale).await.is_err());
 
-        reap(directory.as_ref(), &storage, &bucket, &captured).await.unwrap();
+        reap(directory.as_ref(), &storage, &bucket, &captured, &keys).await.unwrap();
         for key in [&legacy, &scoped] {
             assert!(matches!(bucket.head(key).await, Err(Error::MissingObject(_))));
         }
@@ -621,7 +671,7 @@ mod tests {
         bucket.put(&replacement_key, "new layout".as_bytes().into()).await.unwrap();
         let changed = directory.deployment(&record.id).await.unwrap().unwrap();
         assert!(!changed.ordered_index_catalogs[&store].prior_prefixes_discovered);
-        reap(directory.as_ref(), &storage, &bucket, &changed).await.unwrap();
+        reap(directory.as_ref(), &storage, &bucket, &changed, &keys).await.unwrap();
         assert!(matches!(bucket.head(&retained).await, Err(Error::MissingObject(_))));
         assert!(bucket.head(&replacement_key).await.is_ok());
         drop(permit);

@@ -37,7 +37,7 @@ impl PgIndexer for DirectMirror {
                 }
                 RowKind::Delete => (Interval::new(system_from, Timestamp::MAX)?, StoredOperation::Delete),
             };
-            target.append(operation.table.clone(), StoredEvent { origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from, valid_time, operation: operation_value, recency: None })?;
+            target.append(operation.table.clone(), StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(), system_from, valid_time, operation: operation_value, recency: None })?;
             if index % 64 == 63 { tokio::task::yield_now().await; }
         }
         Ok(())
@@ -67,7 +67,7 @@ impl PgIndexer for DirectMirror {
                             return Err(Anomaly::incorrect("xtdb.postgres/invalid-explicit-valid-time", "_valid_to requires _valid_from"));
                         }
                         let valid_time = Interval::new(lower.unwrap_or(system_from), upper.unwrap_or(Timestamp::MAX))?;
-                        headers.push(EventHeader { commit_position: 0, iid, system_from, valid_time, op: EventOp::Put });
+                        headers.push(EventHeader { position: None, commit_position: 0, iid, system_from, valid_time, op: EventOp::Put });
                         if row % 64 == 63 { tokio::task::yield_now().await; }
                     }
                     let (fields, columns): (Vec<_>, Vec<_>) = batch.schema_ref().fields().iter().zip(batch.columns())
@@ -81,7 +81,7 @@ impl PgIndexer for DirectMirror {
                     for row in 0..batch.num_rows() {
                         let iid = read_cell(batch, id, row, memory, |value| Ok(value.entity_id()?.iid()))?;
                         let valid_time = Interval::new(system_from, Timestamp::MAX)?;
-                        target.append(operation.table.clone(), StoredEvent {
+                        target.append(operation.table.clone(), StoredEvent { position: None,
                             origin: None,
                             commit_position: 0,
                             entity_key: None, iid, system_from, valid_time, operation: StoredOperation::Delete, recency: None,

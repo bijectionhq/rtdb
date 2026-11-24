@@ -10,7 +10,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_storage::{IoRegion, ObjectKey, cache::BufferPool, object_store::IndexPageScope};
-use rtdb_types::{Iid, Interval, Result, Timestamp};
+use rtdb_types::{EventHeader, Iid, Interval, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -83,6 +83,28 @@ impl Ord for Address {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(super) struct IndexRevision {
+    pub time: Timestamp,
+    pub transaction: i64,
+}
+
+impl IndexRevision {
+    const MIN: Self = Self { time: Timestamp::MIN, transaction: i64::MIN };
+    pub const MAX: Self = Self::through_time(Timestamp::MAX);
+
+    pub const fn through_time(time: Timestamp) -> Self {
+        Self { time, transaction: i64::MAX }
+    }
+
+    pub fn of_event(event: EventHeader) -> Self {
+        Self {
+            time: event.system_from,
+            transaction: event.position.map_or(i64::MIN, |position| position.transaction.0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) enum Key {
     Posting {
@@ -91,7 +113,7 @@ pub(super) enum Key {
         address: Address,
     },
     Row(Address),
-    Revision(Timestamp),
+    Revision(IndexRevision),
 }
 
 impl Key {
@@ -121,7 +143,7 @@ impl Key {
 pub(super) enum KeyRef<'a> {
     Posting(Bucket, Tuple<'a>, AddressRef<'a>),
     Row(AddressRef<'a>),
-    Revision(Timestamp),
+    Revision(IndexRevision),
 }
 
 impl KeyRef<'_> {
@@ -456,8 +478,8 @@ impl Leaf {
         let mut leaf = Self {
             postings,
             metadata,
-            first: Key::Revision(Timestamp::MIN),
-            last: Key::Revision(Timestamp::MIN),
+            first: Key::Revision(IndexRevision::MIN),
+            last: Key::Revision(IndexRevision::MIN),
         };
         if leaf.len() == 0
             || leaf.len() > FANOUT
@@ -545,7 +567,7 @@ const ARROW_LEAF_HEADER: [u8; 16] = {
 
 #[derive(Serialize, Deserialize)]
 enum StoredPage {
-    Revisions(Vec<(Timestamp, Option<Arc<Pointer>>)>),
+    Revisions(Vec<(IndexRevision, Option<Arc<Pointer>>)>),
     Branch(Vec<Arc<Pointer>>),
 }
 
@@ -627,7 +649,7 @@ impl Tree {
 
     async fn admitted<T>(&self, work: impl Future<Output = T>) -> T {
         match &self.permit {
-            Some(permit) => IoRegion::retaining(permit.clone(), work).await,
+            Some(permit) => IoRegion::reading(rtdb_storage::HeldView::recovery(permit.clone()), work).await,
             None => work.await,
         }
     }
@@ -1175,7 +1197,7 @@ fn decode(bytes: Bytes, generation: i64, memory: &Arc<MemoryReservation>) -> Res
                         Ok(Entry {
                             key: Key::Revision(
                                 time.ok_or_else(|| {
-                                    format_error("Revision entry omitted its time")
+                                    format_error("Revision entry omitted its order")
                                 })?,
                             ),
                             item: Item::Revision(root),
@@ -1450,7 +1472,7 @@ mod count_tests {
         let cancel = CancellationToken::new();
         let tree = Tree::new(&storage, &directory, &memory, 0).await?;
         let edits = (0..150)
-            .map(|n| (Key::Revision(Timestamp(n)), Some(Item::Revision(None))))
+            .map(|n| (Key::Revision(IndexRevision::through_time(Timestamp(n))), Some(Item::Revision(None))))
             .collect();
         let root = tree.edit(None, edits).await?.expect("must create a tree");
         let pointer = tree
@@ -1461,7 +1483,7 @@ mod count_tests {
         let root = Some(Link::Stored(pointer));
         for n in [0, 1, 63, 64, 127, 128, 149, 150, 200] {
             let before =
-                |key: KeyRef<'_>| matches!(key, KeyRef::Revision(time) if time < Timestamp(n));
+                |key: KeyRef<'_>| matches!(key, KeyRef::Revision(revision) if revision.time < Timestamp(n));
             assert_eq!(
                 reopened.rank(&root, before, &cancel).await?,
                 n.min(150) as u64

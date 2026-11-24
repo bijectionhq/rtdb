@@ -27,7 +27,7 @@ enum SuffixCut<'a> {
     Tip(TransactionKey),
     HeldPublication(
         &'a rtdb_node::OwnedForkCut, &'a dyn crate::keys::KeyService,
-        &'a BlockCatalog, Arc<rtdb_storage::IoRegion>,
+        &'a BlockCatalog, uuid::Uuid, Arc<rtdb_storage::IoRegion>,
     ),
 }
 
@@ -54,6 +54,7 @@ pub struct AgentOptions {
     pub installed_journal_manifest: Option<std::path::PathBuf>,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
+    pub replay_broker: Option<crate::replay_broker::Client>,
     pub replica_payload_reclamation: bool,
     /// How long an activation may take to reach a confirmed leadership before it is abandoned.
     pub activation_timeout: Duration,
@@ -88,7 +89,7 @@ pub struct S3WriteRole { pub arn: String, pub sts_endpoint: Option<String>, pub 
 
 impl AgentOptions {
     pub fn new(storage: CellStorage) -> Self {
-        Self { audience_journal_port: None, storage, installed_journal_manifest: None, world_archive: None, s3_write_role: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
+        Self { audience_journal_port: None, storage, installed_journal_manifest: None, world_archive: None, s3_write_role: None, replay_broker: None, replica_payload_reclamation: false, activation_timeout: Duration::from_secs(30), activations_per_second: NonZeroUsize::new(200).unwrap(),
             watch_interval: Duration::from_millis(250), clean_after_idle: Duration::from_secs(60), park_after: None, resident_idle_after: None, min_residency: Duration::ZERO,
             unsubscribe_after: Duration::from_secs(60), max_active: None, quarantine_after: 2, compaction_worker: false, max_tail_rows: None, snapshot_lifetime: SNAPSHOT_LIFETIME,
             fragments: crate::fragments::FragmentOptions::default() }
@@ -268,6 +269,10 @@ pub struct NodeAgent {
 }
 
 impl NodeAgent {
+    pub(crate) fn replay_broker(&self) -> Option<&crate::replay_broker::Client> {
+        self.options.replay_broker.as_ref()
+    }
+
     pub(crate) fn new(directory: Arc<dyn Directory>, keys: Arc<dyn crate::keys::KeyService>, node: Node, lease: Arc<MemberLease>, address: String, flight_endpoint: Option<String>, options: AgentOptions, storage_namespaces: rtdb_directory::StorageNamespaces, writers: crate::logs::Writers, ordered: Arc<crate::journal::hosted::Routes>, ordered_releases: tokio_util::task::TaskTracker, secret: Option<Arc<crate::capability::CellSecret>>) -> Arc<Self> {
         Arc::new(Self { directory, keys, node, lease, address, flight_endpoint, options, storage_namespaces, secret, warming: Mutex::new(BTreeSet::new()), holdings: Mutex::new(BTreeMap::new()), writers, ordered, ordered_releases, subscriptions: Mutex::new(BTreeMap::new()), turns: Mutex::new(HashMap::new()), activations: Default::default(), resident_deadlines: Mutex::default(), memory_relief: Default::default(), fragments_read: Mutex::new(BTreeMap::new()) })
     }
@@ -518,6 +523,64 @@ impl NodeAgent {
             Ok(Response::OrderedHeld { epoch, address, proof })
         } else {
             Ok(response)
+        }
+    }
+
+    async fn subscribe_ordered_fresh(
+        &self, name: &str, scope: ordered_logkeeper::ordered::Placement,
+        enrollment: ordered_logkeeper::ordered::Enrollment, epoch: u64,
+    ) -> Result<Response> {
+        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/ordered-reader",
+            "The enrolled reader cannot open this ordered basis");
+        let secret = self.secret.as_ref().ok_or_else(unavailable)?;
+        let placement = self.ordered.by_name(name).filter(|placement| placement.worker.placement() == scope)
+            .ok_or_else(unavailable)?;
+        if !matches!(placement.worker.authority(), crate::journal::Authority::Worker { enrollment: own } if own == enrollment) {
+            return Err(unavailable());
+        }
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let route = placement.worker.route().await?;
+        if route.writer.epoch != epoch || route.writer.grant.is_some_and(|grant| grant.enrollment == enrollment) {
+            return Err(unavailable());
+        }
+        let response = || {
+            let flight = self.flight_endpoint.clone();
+            let proof = secret.sign_route(&control::ordered_read_binding(
+                name, scope, enrollment, epoch, &self.address, flight.as_deref(),
+            ));
+            Response::OrderedRead { address: self.address.clone(), flight, proof }
+        };
+        if let Some(current) = self.subscriptions.lock().get_mut(name).filter(|current| current.database.upgrade()
+            .and_then(|database| ordered_reader(&database)).is_some_and(|parts| parts == (scope, epoch, enrollment)))
+        {
+            current.last_touch = Instant::now();
+            return Ok(response());
+        }
+        if self.execution_memory_pressured() || !self.activations.lock().admit(Instant::now(), self.options.activations_per_second) {
+            return Err(unavailable());
+        }
+        self.stop_running(name).await;
+        let (configuration, recovery) = placement.reader_configuration(&route, &self.keys, &self.ordered_releases).await?;
+        let opened = async {
+            let database = self.node.database_or_attach(name.to_owned(), configuration).await?.ok_or_else(unavailable)?;
+            self.await_ordered_cut(&database, placement.worker.log_epoch(), recovery.scope().through).await?;
+            placement.worker.read_lease(recovery.scope(), epoch).await?;
+            Ok::<_, Anomaly>(database)
+        }.await;
+        match opened {
+            Ok(database) => {
+                let opened = Instant::now();
+                self.subscriptions.lock().insert(name.into(), LocalSubscription {
+                    id: placement.record.id.clone(), database: Arc::downgrade(&database), last_touch: opened,
+                    opened, role: Role::Subscriber, fragments: false,
+                });
+                Ok(response())
+            }
+            Err(error) => {
+                self.stop_running(name).await;
+                Err(error)
+            }
         }
     }
 
@@ -812,11 +875,11 @@ impl NodeAgent {
     pub(crate) async fn pin_held_fork_suffix(
         &self, name: &str, deployment: uuid::Uuid,
         capture: uuid::Uuid, cut: &rtdb_node::OwnedForkCut, keys: &dyn crate::keys::KeyService,
-        base: &BlockCatalog, io: Arc<rtdb_storage::IoRegion>, expires_at_ms: i64,
+        base: &BlockCatalog, region: uuid::Uuid, io: Arc<rtdb_storage::IoRegion>, expires_at_ms: i64,
     ) -> Result<(uuid::Uuid, CheckpointSuffixPin)> {
         self.pin_suffix_at(
             name, deployment, uuid::Uuid::new_v4(), capture,
-            SuffixCut::HeldPublication(cut, keys, base, io), expires_at_ms,
+            SuffixCut::HeldPublication(cut, keys, base, region, io), expires_at_ms,
         ).await
     }
 
@@ -935,10 +998,10 @@ impl NodeAgent {
             // Discovery streams the quorum-certified applied interval. Its
             // target is the original held publication, not the driver tip.
             let _charge = self.node.memory().reserve(32 << 20)?;
-            let SuffixCut::HeldPublication(cut, keys, base, io) = &cutoff else { return Err(unavailable()); };
+            let SuffixCut::HeldPublication(cut, keys, base, region, io) = &cutoff else { return Err(unavailable()); };
             let (basis, replica, source) = crate::archive::find_held_publication(
-                &stream, &proof, &record, &self.options.storage, *keys, cut,
-                base, Arc::clone(io), self.node.memory(),
+                &stream, &proof, &record, self.replay_broker(), *keys, cut,
+                base, *region, Arc::clone(io), self.node.memory(),
             ).await?;
             if source <= checkpoint.source || source > source_through || replica > replica_through {
                 return Err(unavailable());
@@ -1340,6 +1403,13 @@ impl NodeAgent {
         let mut record = self.directory.deployment(id).await?.ok_or_else(&deposed)?;
         let log_epoch = StorageEpoch(record.log_epoch);
         let Some(checkpoint) = checkpoint_for_block(block, log_epoch) else { return Ok(None); };
+        let writer = self.writers.lock().get(id).and_then(std::sync::Weak::upgrade).ok_or_else(&deposed)?;
+        // The adopted catalog names this exact replica boundary. A signed read
+        // index proves the log prefix covering it has reached stable publication.
+        let covered = writer.read_index(epoch).await?;
+        if covered.through().0 < checkpoint.boundary || covered.stream() != record.stream("replica") {
+            return Err(Anomaly::fault("rtdb.multi/checkpoint-decision", "The adopted checkpoint is outside the durable replica decision"));
+        }
         let mut manifest = None;
         for _ in 0..8 {
             if record.epoch != epoch || record.holder.as_ref() != Some(&member) || record.log_epoch != log_epoch.0 {
@@ -1364,6 +1434,11 @@ impl NodeAgent {
             let mut next = record.clone();
             next.checkpoint = Some(checkpoint);
             next.recovery_manifest_sha256 = Some(digest);
+            next.checkpoint_decision = covered.decision().map(|proof| Box::new(rtdb_directory::CheckpointDecision {
+                checkpoint,
+                manifest: digest,
+                stable: prost::Message::encode_to_vec(proof),
+            }));
             match self.directory.replace_deployment(next, record.version).await? {
                 Cas::Applied(stored) => {
                     crate::residence_trace::record("publish-checkpoint", || serde_json::json!({
@@ -1371,6 +1446,7 @@ impl NodeAgent {
                         "revision": stored.version, "writer_epoch": stored.epoch, "epoch": stored.log_epoch,
                         "stream": stored.stream("replica"), "block": checkpoint.block, "through": checkpoint.boundary,
                         "root": checkpoint.root_sha256, "manifest": digest,
+                        "decision": covered.decision().map(|proof| proof.certificate.statement.fingerprint()),
                     }));
                     return Ok(Some((stored, checkpoint)));
                 }
@@ -1399,7 +1475,7 @@ impl NodeAgent {
         let Some(plan) = ReplicaTrimPlan::new(record, checkpoint.boundary, trimmed_through, now_ms()) else { return; };
         let Ok(members) = self.members().await else { return };
         let Ok(Some(grant)) = Box::pin(plan.authorize(self.directory.as_ref(), &members, &self.options.storage, self.keys.as_ref(), self.options.replica_payload_reclamation)).await else { return; };
-        if let Ok(through) = grant.apply(self.directory.as_ref()).await
+        if let Ok(through) = grant.apply(self.directory.as_ref(), self.keys.as_ref()).await
             && let Some(holding) = self.holdings.lock().get_mut(name).filter(|holding| holding.id == current.id && holding.epoch == epoch)
         {
             holding.trimmed_through = Some(through);
@@ -1579,13 +1655,21 @@ impl NodeAgent {
             self.members().await.ok()
         } else { None };
         for (name, id, last_touch, opened, snapshot, fragments) in subscribed {
-            let wanted = match self.directory.deployment(&id).await {
-                Ok(Some(record)) if record.lifecycle == Lifecycle::Live => snapshot || fragments
-                    || (record.read_width > 1 && reader_members.as_ref().is_none_or(|members| {
-                        crate::deployment::read_replicas(&record, members, now_ms()).iter().any(|member| member.id == me)
-                    })),
-                Ok(_) => false,
-                Err(_) => true,
+            let wanted = if let Some(placement) = self.ordered.by_name(&name) {
+                let local = self.node.catalog().database(&name).ok().and_then(|database| ordered_reader(&database));
+                match placement.worker.route().await {
+                    Ok(route) => local.is_some_and(|(scope, epoch, _)| scope == route.placement && epoch == route.writer.epoch),
+                    Err(error) => error.category != AnomalyCategory::Forbidden,
+                }
+            } else {
+                match self.directory.deployment(&id).await {
+                    Ok(Some(record)) if record.lifecycle == Lifecycle::Live => snapshot || fragments
+                        || (record.read_width > 1 && reader_members.as_ref().is_none_or(|members| {
+                            crate::deployment::read_replicas(&record, members, now_ms()).iter().any(|member| member.id == me)
+                        })),
+                    Ok(_) => false,
+                    Err(_) => true,
+                }
             };
             // A snapshot closes before the reaper's grace could erase what it reads.
             let expired = snapshot && opened.elapsed() >= self.options.snapshot_lifetime;
@@ -1645,6 +1729,8 @@ impl NodeAgent {
             }
             let retirement = placement.retire_unheld_checkpoint(&self.keys);
             let _ = tokio::time::timeout(self.options.activation_timeout, retirement).await;
+            let receipts = placement.settle_serving_receipts(&self.options.storage, &self.keys);
+            let _ = tokio::time::timeout(self.options.activation_timeout, receipts).await;
             let serving = placement.retire_serving_prefixes(&self.options.storage, &self.keys);
             let _ = tokio::time::timeout(self.options.activation_timeout, serving).await;
         }
@@ -1710,6 +1796,15 @@ fn stale_handoff(name: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/stale-handoff", format!("The requested holding of {name} has changed"))
 }
 
+fn ordered_reader(database: &Database) -> Option<(
+    ordered_logkeeper::ordered::Placement, u64, ordered_logkeeper::ordered::Enrollment,
+)> {
+    use rtdb_format::database::proto::database_config;
+    let Some(database_config::Log::OtherLog(config)) = &database.configuration().log else { return None; };
+    if config.type_url.rsplit('/').next() != Some(crate::journal::hosted::LOG_TYPE) { return None; }
+    crate::journal::hosted::reader_attachment(config).ok().flatten()
+}
+
 fn checkpoint_timeout(name: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/checkpoint-timeout", format!("The checkpoint for {name} was not published in time"))
 }
@@ -1743,6 +1838,8 @@ impl Handler for NodeAgent {
                 .ok_or_else(|| Anomaly::incorrect("rtdb.multi/no-flight-endpoint", "The holder does not have a Flight SQL endpoint")),
             Request::Subscribe { name } => self.subscribe(&name).await,
             Request::SubscribeFresh { name } => self.subscribe_for(&name, SubscriptionUse::FreshQuery).await,
+            Request::SubscribeOrderedFresh { name, placement, enrollment, epoch } =>
+                self.subscribe_ordered_fresh(&name, placement, enrollment, epoch).await,
             Request::Snapshot { name } => self.snapshot(&name).await,
             Request::Flush { name } => match self.require_directory_route(&name) {
                 Ok(()) => self.flush(&name).await,

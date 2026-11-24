@@ -52,7 +52,7 @@ Corpus-relative queries derive their statistics from the applicable admitted row
 ## Operation-only capture revocation
 
 The local archive broker gives checkpoint readers and exporters key operations under the original capture authority.
-The same key protects the captured root and its archived replica suffix.
+Each captured object and archived replica segment uses a separate slot, bound to the common capture authority.
 An independent stage reseals the verified plaintext with its own installation key.
 The broker orders irreversible vault closure against every active cryptographic operation.
 The directory publishes the revocation observation after that closure has completed.
@@ -72,17 +72,23 @@ Qualification of a bounded real-time deadline additionally requires an authorita
 
 An installed Logkeeper grant identifies the journal payload key generation.
 Chosen replay uses that generation and reports `rtdb/erased-under-view` when the required key is durably revoked.
-The Logkeeper rotation compares the exact writer grant, exact published checkpoint and journal head.
-RTDB owns the clean successor, the evidence for all selectable roots, the ordered erasure commit, and the deadline checks for held material.
-The installed custodian's coordinator checks the exact prepared and published head, validates the rotation receipt, and requires both recovery slots to attest the clean root and successor suffix generation before it calls the custody commit authority.
-The custody adapter owns the durable admission fence, construction and staging of the clean closure, recovery slot attestations, and the atomic commit and expiry.
+The custodian orders the exact prepared clean checkpoint, incumbent grant and journal head in one Logkeeper decision.
+The same decision selects the clean checkpoint, rotates the payload key generation, and closes new admissions below the erasure replay floor and on the previous recovery roots.
+The ordinary checkpoint publisher skips an erasure preparation.
+The erasure coordinator reopens the staged checkpoint through its provider, checks the rotation receipt, and verifies the installed Logkeeper client's signed proof that both recovery slots on each voter in an accepting quorum were read back.
+The custody adapter owns staging and verifying a complete survivor closure, draining plaintext and egress and enforcing a deadline backed by evidenced destruction of the retiring key slots.
+The current provider profile keeps the 120-second operational target.
 The native tests exercise the coordinator with Logkeeper application decisions and a local vault under an injected custody adapter.
 Installed serving reads carry the journal-issued lease through provider access and check it again before returning a body.
 Detached replica objects inherit the servicing lease for cryptography and open in the original writer's key namespace.
+The detached replay broker registers uploads before accepting a body and retains that region until provider operations join.
+S3 and DynamoDB namespace withdrawal fences new unit grants, waits out the provider and delivery window, then settles the registered unit material. The wait covers existing bounded grants from these vaults.
 Installed log and object key operations have a local monotonic time limit.
 These bounds cover the key operations and affected storage responses; decoded pages, query results, and other working copies require their own drain evidence.
 Independent checkpoint member slots allow a staged successor to open with no dependency on the prior writer or checkpoint allocation's object keys.
-The SQL path still needs an authority that closes admission for the exact target census, rewrites the complete survivor closure, attests the two recovery slots, and confirms destruction after the drain.
+Retained plaintext delivery grants inherit the original object read lease, including when a key owner could still answer.
+A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
+The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring inventory and latest destruction time. The fixed commitment binds the same inventory and deadline to the authenticated switch. The original authority reports destruction with separate signed evidence of the completed drain and provider disposition. A late disposition is recorded as a missed fixed deadline. A pending provider result does not furnish a disposition.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

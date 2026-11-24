@@ -40,8 +40,7 @@ pub async fn read_hosted_control_point(
     };
     let table_binding = context.catalog.table(&catalog)?.ok_or_else(unavailable)?;
     let mut columns = vec!["_valid_from", "_valid_to"];
-    let stamped_receipt = include_payload && table.table == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE
-        && table_binding.columns.contains_key(rtdb_types::HOSTED_RECEIPT_TX_ID);
+    let stamped_receipt = include_payload && table.table == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE;
     if stamped_receipt {
         columns.push(rtdb_types::HOSTED_RECEIPT_TX_ID);
     }
@@ -100,11 +99,7 @@ pub async fn read_hosted_control_point(
         }
         let revision = owned_row_revision(data, 0, id, &context.memory)?;
         if stamped_receipt {
-            receipt_tx_id = match column(rtdb_types::HOSTED_RECEIPT_TX_ID)? {
-                Value::I64(id) if id >= 0 => Some(id),
-                Value::Null | Value::Undefined => None,
-                _ => return Err(unavailable()),
-            };
+            receipt_tx_id = Some(crate::owned_receipt_transaction(data, 0)?.0);
         }
         row = Some((batch, revision));
     }

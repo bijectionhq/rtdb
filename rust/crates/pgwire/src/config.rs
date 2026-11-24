@@ -35,6 +35,7 @@ pub const GATEWAY_SQL_PREPARE_KIND: u8 = 3;
 pub const GATEWAY_NAMED_PARSE_KIND: u8 = 4;
 pub const GATEWAY_KEY_KIND: u8 = 5;
 pub const GATEWAY_KEY_CONFIRM_KIND: u8 = 6;
+pub const GATEWAY_ANSWER_DEADLINE_KIND: u8 = 9;
 pub const GATEWAY_SETTINGS_PARAMETER: &str = "rtdb.gateway_settings";
 pub const GATEWAY_REPLICA_READ_PARAMETER: &str = "rtdb.gateway_replica_read";
 pub const REQUIRED_INSTALLATION_PARAMETER: &str = "rtdb.require_installation";

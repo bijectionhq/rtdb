@@ -3167,7 +3167,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=a5d21eb92bb468f12c1cf3a56f1c2011fc09947b#a5d21eb92bb468f12c1cf3a56f1c2011fc09947b"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=aaa73a0fcb50618baf6c13537d8cda4639fe438e#aaa73a0fcb50618baf6c13537d8cda4639fe438e"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -4872,6 +4872,7 @@ dependencies = [
 name = "rtdb-multi"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
  "arrow-flight",
  "async-trait",
  "aws-config",
@@ -5307,6 +5308,7 @@ name = "rtdb-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "fs2",
  "futures",
@@ -5315,9 +5317,11 @@ dependencies = [
  "object_store",
  "parking_lot",
  "percent-encoding",
+ "ring",
  "rtdb-columnar",
  "rtdb-format",
  "rtdb-types",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

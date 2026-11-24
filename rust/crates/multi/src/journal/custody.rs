@@ -4,11 +4,12 @@ mod local;
 
 use super::InstalledJournal;
 use crate::keys::{KeyService, UnitLedger, UnitScope};
-use crate::store::EncryptingStore;
+use crate::store::{EncryptingStore, exact_retirement::installed_object_name};
 use async_trait::async_trait;
 use bytes::Bytes;
 use ordered_logkeeper::ordered::{
-    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, Placement, service::Route,
+    Checkpoint, CheckpointPreparation, Custody, Cut, Fingerprint, Grant, MAX_OBJECT_REFERENCES,
+    ObjectName, Placement, service::Route,
 };
 use ring::digest::{SHA256, digest};
 use rtdb_directory::Checkpoint as RtdbCheckpoint;
@@ -79,6 +80,7 @@ impl Preparation {
             bytes.copy_from_slice(&field.to_be_bytes());
         }
         Ok(CheckpointPreparation {
+            erasure: false,
             checkpoint: self.through,
             root,
             source: self.writer,
@@ -188,7 +190,7 @@ impl CheckpointCustody {
     }
 
     fn remote_store(&self, custody: Custody) -> EncryptingStore {
-        EncryptingStore::with_units(Arc::clone(&self.bucket), self.ledger(custody, Arc::clone(&self.io)))
+        EncryptingStore::with_units(Arc::clone(&self.bucket), Arc::new(self.ledger(custody, Arc::clone(&self.io))))
     }
 
     async fn reader(&self, custody: Custody) -> Result<Arc<dyn ObjectStore>> {
@@ -306,19 +308,41 @@ impl CheckpointCustody {
         reservation: &Reservation,
         origin: Preparation,
         source: &dyn ObjectStore,
-    ) -> Result<()> {
+    ) -> Result<Vec<ObjectName>> {
         self.require_provider(reservation.custody)?;
         let budget = Self::copy_budget(reservation)?;
         // A permanent size refusal must precede the first provider effect
         // and the ordered binding of a reservation to a source.
-        let _ = crate::archive::ordered_checkpoint_sources(
+        let members = crate::archive::ordered_checkpoint_sources(
             source,
             origin.checkpoint,
             self.epoch,
             budget,
         )
         .await?;
-        Ok(())
+        let mut references = Vec::with_capacity(members.len().saturating_add(2));
+        let custody = reservation.custody;
+        references.push(self.object_name(&self.intent(custody)?)?);
+        references.push(self.object_name(&self.manifest(custody)?)?);
+        for member in members {
+            references.push(self.object_name(&self.member(custody, &member.name)?)?);
+        }
+        references.sort_unstable();
+        references.dedup();
+        if references.len() > MAX_OBJECT_REFERENCES {
+            return Err(invalid("The checkpoint closure exceeds the journal's object reference bound"));
+        }
+        Ok(references)
+    }
+
+    fn object_name(&self, key: &ObjectKey) -> Result<ObjectName> {
+        if let Some((namespace, name)) = self.bucket.s3_publication_address(key) {
+            return installed_object_name(&namespace, &name);
+        }
+        if self.local.is_some() {
+            return Ok(fingerprint(&serde_json::to_vec(&("local-checkpoint", self.provider, key.as_str())).map_err(serialization)?));
+        }
+        Err(invalid("The checkpoint archive cannot identify an immutable allocation"))
     }
 
     pub(crate) async fn prepared(
@@ -517,13 +541,11 @@ impl CheckpointCustody {
             for logical in selected.members.keys() {
                 let key = self.member(chosen.custody, &ObjectKey::new(logical.as_str())?)?;
                 effects.fence_create_only(&key, token).await?;
-                ledger.withdraw(&key).await?;
             }
             effects.fence_create_only(&preparation, token).await?;
-            ledger.withdraw(&preparation).await?;
             effects.fence_create_only(&root, token).await?;
         }
-        ledger.withdraw(&root).await?;
+        ledger.withdraw_scope().await?;
         if !effects.confirms(&preparation, token).await? {
             return Err(invalid("The provider has not fenced the preparation"));
         }
@@ -630,6 +652,11 @@ impl ExactStore {
 
 #[async_trait]
 impl ObjectStore for ExactStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        let (_, physical) = self.member(key).ok()?;
+        self.bucket.s3_publication_address(&physical)
+    }
+    fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
         Ok(self.observe_head(key).await?.value)
     }

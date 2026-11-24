@@ -1,4 +1,4 @@
-use rtdb_directory::{DeploymentRecord, Directory, Lifecycle};
+use rtdb_directory::{Checkpoint, DeploymentRecord, Directory, Lifecycle};
 use rtdb_format::{catalog::BlockCatalog, keys::{TrieKey, block_key}};
 use rtdb_s3::{NeverVersionedRetirement, ObservedTerminalObject};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
@@ -114,26 +114,39 @@ async fn covered_pack(
     let mut has_l0 = false;
     for (name, entry) in &index.entries {
         if checkpoint_metadata_block(name) == Some(block) { continue; }
-        if !is_block_l0(name, block) || entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
-        let original = pack.read_member(entry).await?;
-        if !archive.matches_original(&key(name)?, &original).await? { return Ok(None); }
+        if !is_block_l0(name, block) { return Ok(None); }
         has_l0 = true;
+        let object = key(name)?;
+        if rtdb_format::keys::is_receipt_l0_file(name) && !archive.contains_original(&object) {
+            // A complete successor does not need receipt L0 after compaction covers it.
+            continue;
+        }
+        if entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
+        let original = pack.read_member(entry).await?;
+        if !archive.matches_original(&object, &original).await? { return Ok(None); }
     }
     Ok(has_l0.then_some(boundary))
 }
 
 pub(super) async fn terminal_pack_index(
-    provider: &NeverVersionedRetirement<'_>, key: &ObjectKey, expected: Option<&TerminalObjectPublication>,
+    provider: &NeverVersionedRetirement<'_>, key: &ObjectKey, expected: &TerminalObjectPublication,
 ) -> Result<Option<PackIndex>> {
     let Some(observed) = ObservedPack::terminal(provider, key).await? else { return Ok(None); };
     let PackStorage::Terminal { publication, .. } = &observed.storage else { return Ok(None); };
-    if expected.is_some_and(|expected| publication.allocation() != expected.allocation
+    if publication.allocation() != expected.allocation
         || publication.target().namespace != expected.namespace || publication.target().key != expected.key
-        || publication.target().condition != S3TombstoneCondition::Matches(expected.etag.clone()))
+        || publication.target().condition != S3TombstoneCondition::Matches(expected.etag.clone())
     {
         return Ok(None);
     }
     Ok(Some(observed.index))
+}
+
+pub(super) async fn terminal_checkpoint_matches(
+    provider: &NeverVersionedRetirement<'_>, key: &ObjectKey, checkpoint: Checkpoint, cipher: &Cipher,
+) -> Result<bool> {
+    let Some(pack) = ObservedPack::terminal(provider, key).await? else { return Ok(false); };
+    pack.checkpoint_matches(checkpoint, cipher).await
 }
 
 struct ObservedPack<'a> {
@@ -161,6 +174,16 @@ impl<'a> ObservedPack<'a> {
             result => result?,
         };
         Ok(Some(Self { key, index, storage: PackStorage::Terminal { retirement, publication } }))
+    }
+
+    async fn checkpoint_matches(&self, checkpoint: Checkpoint, cipher: &Cipher) -> Result<bool> {
+        let Some(digest) = checkpoint.root_sha256 else { return Ok(false); };
+        let root = block_key(BlockIndex(checkpoint.block))?;
+        let Some(entry) = self.index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
+            else { return Ok(false); };
+        let sealed = self.read_member(entry).await?;
+        let catalog = BlockCatalog::decode(&cipher.open(&root, &sealed)?)?;
+        Ok(catalog.block_index().0 == checkpoint.block && catalog.publication_sha256() == Some(digest))
     }
 
     async fn read_member(&self, entry: &PackEntry) -> Result<bytes::Bytes> {

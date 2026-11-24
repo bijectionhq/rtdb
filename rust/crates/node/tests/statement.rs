@@ -550,28 +550,17 @@ async fn unsigned_stored_aggregate_outputs_open_signed_and_keep_declared_setter_
 }
 
 #[tokio::test]
-async fn shared_prepared_query_rebinds_clock_and_snapshot_settings_for_every_execution() {
+async fn prepared_query_refuses_a_snapshot_token_without_its_owner() {
     let memory = MemoryBudget::new(1 << 27);
-    let state = PartitionState::empty(rtdb_trie::TrieConfig::new(32, 32).unwrap()).unwrap();
-    write(&state, 100, Value::Utf8("old".into()), &memory);
-    write(&state, 200, Value::Utf8("new".into()), &memory);
-    let context = context(Some(&state), &memory);
-    let statement = PreparedSql::prepare("SETTING SNAPSHOT_TOKEN=?, CLOCK_TIME=? SELECT v,CURRENT_TIMESTAMP,SNAPSHOT_TOKEN FROM docs", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    assert_eq!(statement.parameter_count(), 2);
-    for (time, value) in [(150, "old"), (200, "new")] {
-        let basis = rtdb_types::TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(Timestamp(time).into())])]) };
-        let token = rtdb_format::basis::encode_time_basis(&basis);
-        let clock = Value::Timestamp { value: time + 1000, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
-        let mut cursor = statement.open_query(Arc::clone(&context), vec![Value::Utf8(token.clone()), clock.clone()]).await.unwrap();
-        let page = cursor.next_batch().await.unwrap().unwrap();
-        let row = page.batch().schema().fields().iter().zip(page.batch().columns()).map(|(field, array)| read_value(field, array.as_ref(), 0).unwrap()).collect::<Vec<_>>();
-        assert_eq!(row, [Value::Utf8(value.into()), clock, Value::Utf8(token)]);
-    }
-    assert_eq!(context.current_time, Timestamp(100).into());
+    let context = context(None, &memory);
+    let statement = PreparedSql::prepare("SETTING SNAPSHOT_TOKEN=? SELECT CURRENT_TIMESTAMP", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    assert_eq!(statement.parameter_count(), 1);
+    let failure = statement.open_query(Arc::clone(&context), vec![Value::Utf8("unavailable".into())]).await.err().unwrap();
+    assert_eq!(failure.code, "rtdb.query/snapshot-unretained");
 }
 
 #[test]
-fn prepared_settings_validate_typed_literals_even_when_snapshot_time_is_not_applied() {
+fn prepared_settings_validate_typed_snapshot_time_literals() {
     let context = context(None, &MemoryBudget::new(1 << 24));
     let error = PreparedSql::prepare("SETTING SNAPSHOT_TIME=TIMESTAMP 'bad' SELECT 1", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
     assert_eq!(error.code, "xtdb/sql-error");
