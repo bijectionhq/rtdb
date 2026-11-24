@@ -123,16 +123,21 @@ struct Column {
     postings: BTreeMap<String, PostingBuilder>,
 }
 
+pub(super) struct QueryBatches {
+    pub(super) pages: Vec<RecordBatch>,
+    pub(super) reservation: Arc<MemoryReservation>,
+}
+
 enum Output<W> {
     File(Writer<W>),
-    Batches(Vec<RecordBatch>),
+    Batches(QueryBatches),
 }
 
 impl<W: Write> Output<W> {
     fn page(&mut self, tables: impl IntoIterator<Item = (Table, StructArray)>) -> Result<()> {
         match self {
             Self::File(writer) => { writer.page(tables)?; }
-            Self::Batches(pages) => pages.push(record(FORMAT_VERSION, tables)?),
+            Self::Batches(batches) => batches.pages.push(record(FORMAT_VERSION, tables)?),
         }
         Ok(())
     }
@@ -506,12 +511,13 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 }
 
 pub(super) fn query_batches<I: SearchPage>(columns: &[String], pages: impl IntoIterator<Item = Result<I>>,
-    ceiling: Option<i64>, reservation: Arc<MemoryReservation>) -> Result<Vec<RecordBatch>> {
-    let builder = build_group(columns, [pages], ceiling, Some(reservation), FORMAT_VERSION, BuildMode::Combined)?;
-    let mut output = Output::<std::io::Sink>::Batches(Vec::new());
+    ceiling: Option<i64>, reservation: Arc<MemoryReservation>) -> Result<QueryBatches> {
+    let mut builder = build_group(columns, [pages], ceiling, Some(reservation), FORMAT_VERSION, BuildMode::Combined)?;
+    let reservation = builder.reservation.take().expect("Query build owns its reservation");
+    let mut output = Output::<std::io::Sink>::Batches(QueryBatches { pages: Vec::new(), reservation });
     builder.finish(columns, None, "built", &mut output)?;
-    let Output::Batches(pages) = output else { unreachable!() };
-    Ok(pages)
+    let Output::Batches(batches) = output else { unreachable!() };
+    Ok(batches)
 }
 
 fn build_group<P, I>(
