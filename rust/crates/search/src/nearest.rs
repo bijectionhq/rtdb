@@ -371,8 +371,6 @@ async fn rank_rows(
     shadows: Option<&BTreeSet<EntityId>>, ordinal: usize, window: &mut NearestWindow,
     sealed: Option<(&str, Timestamp)>,
 ) -> Result<()> {
-    let mut seen = BTreeSet::new();
-    let mut identities = context.memory.reserve(0)?;
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         let schema = batch.schema_ref();
@@ -390,9 +388,6 @@ async fn rank_rows(
                 let id = protected.canonical();
                 if is_shadowed(id) { continue; }
                 protected.require(context, owner, &partition.relation, valid, batch, row).await?;
-                let charge = Arc::get_mut(&mut identities).expect("exclusive candidate identity reservation");
-                charge.grow_to(charge.bytes().saturating_add(id.owned_payload_bytes()).saturating_add(192))?;
-                if !seen.insert(id.into_owned()) { return Err(crate::rank_family::unavailable()); }
                 Some(id)
             } else { None };
             let mut cells = [None; MAX_NEAREST_FILTERS];
