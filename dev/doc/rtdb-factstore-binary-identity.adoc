@@ -96,8 +96,28 @@ The v2 receiver has no hex carrier reader.
 The shared-carrier retirement caller submits its current carrier check, erase and create-only receipt through `DecideHosted.v4` with its installed writer checks.
 The live admission verifies the complete Binary carrier and ciphertext, its original ordered membership and the later unit fence against the same predecessor before applying the erase and receipt together.
 Original replay still uses its archive admission.
-The sealed search inventory caller invokes the protected-carrier page against `fact_sealed_search_unit_rows`, outside the protected-carrier page's installed relation scope even in v1.
-The paired integration needs a scoped inventory read before publishing the live retirement path.
+
+== Sealed search unit inventory
+
+The installed hosted writer discovers `rtdb.owned.ReadHeldSealedSearchUnitRows.v1` through Flight `ListActions`.
+Use the original unscoped Root hold for that authenticated session and placed writer epoch.
+RTDB confirms the live provider and the held `bj_installation` authority, rejects the Original source fence and destination restore markers, and checks the provider frontiers again before release.
+The installed relation is `fact_sealed_search_unit_rows` with the v1 owned declaration `{"fields":[]}`, explicit validity, and no lifetime.
+Its physical rows have only the text identity `<unit alias>/<derived search relation>/<opaque row ID>`.
+
+The request is the 16-byte held Root handle, the relation name with its existing big-endian u16 byte length, and one Arrow record with Utf8 `prefix`, nullable Utf8 `after` and non-null Int64 `limit` (1 to 64).
+Send exactly the 64 lowercase ASCII hexadecimal characters of the Original 32-byte unit alias followed by `/` as `prefix`.
+Send a typed Utf8 null for the first `after` and the full last returned inventory ID as the exclusive bound on each next page.
+The reply has one Utf8 `_id` column in strictly increasing text order, including a Utf8 schema on an empty page.
+The reply's present and valid coordinates both equal the held Root system time.
+The existing `rtdb.owned.identity_more` metadata is `1` while another page is available and `0` on completion.
+An `rtdb.owned.range_witness` nonce appears only on completion, including an empty terminal page, and binds the original hold and the inventory relation's full event frontier.
+
+In Bijection, point `READ_HELD_SEARCH_UNIT_ROWS` at the new action and use it from `HeldRead::sealed_search_unit_page`.
+In `FactSnapshot::sealed_unit_rows`, preserve the exact suffix after the first relation delimiter and require the terminal range witness from the same hold.
+Carry that witness with the inventory evidence into the originating hosted decision using the existing range witness path.
+The ordered writer compares every derived erase and per-relation revocation marker with that unit’s inventory at the original predecessor.
+The same decision orders or checks the unit fence and publishes the registered receipt.
 
 == Unique window replies
 
