@@ -129,6 +129,7 @@ The native reset regression keeps the old files with a catalog reader held acros
 [Verus](../verus/reset_retirement/proof.rs) checks the production adoption predicate and [TLC](../tla/ResetRetirement.tla) checks the bounded restart and release protocol.
 The L0-inventory reset still depends on the original L0 inputs, and those files stay outside automatic collection.
 
+Startup checks fresh root and table bytes and verifies the required primary extents before consuming the suffix. Exact held business views omit the receipt tables. Native local startup holds its storage recovery gate across discovery and cursor admission. Retained local repair enrollment verifies the detached primary extents before installing the anchor.
 Snapshot export verifies the retained primary inventory under a catalog hold. The plan carries that hold into every copy and publishes the root after its members.
 
 ## Retained checkpoint reset

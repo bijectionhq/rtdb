@@ -270,6 +270,7 @@ impl BlockStore {
                 return Err(invalid("The held checkpoint does not match its exact published root"));
             }
             let tables = self.load_tables_at_view(&block, true).await?;
+            self.verify_primary_inventory_at_view(&block, &tables, true).await?;
             self.restore(config, source_floor, now, BlockDiscovery::AtPublished(checkpoint), Some(checkpoint), Some((block, tables)), true)
         }).await
     }
@@ -423,11 +424,16 @@ impl BlockStore {
 
     pub(crate) async fn load_fresh_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let key = ObjectKey::new(block_key(index)?)?;
-        let size = usize::try_from(self.store.head_fresh(&key).await?.size)
-            .map_err(|_| invalid("Checkpoint root exceeds addressable memory"))?;
-        let read = self.memory.reserve(size)?;
-        let bytes = rtdb_storage::IoRegion::retaining(read.clone(), self.store.get_fresh_exact(&key, size)).await?;
+        let (bytes, _read) = self.read_checkpoint_metadata(&key).await?;
         self.decode_catalog(index, &bytes)
+    }
+
+    async fn read_checkpoint_metadata(&self, key: &ObjectKey) -> Result<(Bytes, Arc<MemoryReservation>)> {
+        let size = usize::try_from(self.store.head_fresh(key).await?.size)
+            .map_err(|_| invalid("Checkpoint metadata exceeds addressable memory"))?;
+        let read = self.memory.reserve(size)?;
+        let bytes = IoRegion::retaining(read.clone(), self.store.get_fresh_exact(key, size)).await?;
+        Ok((bytes, read))
     }
 
     fn decode_catalog(&self, index: BlockIndex, bytes: &[u8]) -> Result<BlockCatalog> {
@@ -501,7 +507,7 @@ impl BlockStore {
     }
 
     async fn load_checkpoint(&self, index: BlockIndex, published: Option<PublishedCheckpoint>, root_sha256: Option<[u8; 32]>) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
-        let block = if root_sha256.is_some() { self.load_fresh_catalog(index).await? } else { self.load_catalog(index).await? };
+        let block = self.load_fresh_catalog(index).await?;
         if root_sha256.is_some_and(|expected| block.publication_sha256() != Some(expected)) {
             return Err(invalid("The stored checkpoint root does not match the directory receipt"));
         }
@@ -509,9 +515,7 @@ impl BlockStore {
             return Err(invalid("The stored checkpoint does not match or advance the admitted checkpoint in its replica journal"));
         }
         let tables = self.load_tables(&block).await?;
-        if self.store.local_maintenance_store().is_some_and(|local| local.defers_trie_releases()) {
-            self.verify_primary_inventory(&block, &tables).await?;
-        }
+        self.verify_primary_inventory(&block, &tables).await?;
         Ok((block, tables))
     }
 
@@ -519,9 +523,16 @@ impl BlockStore {
     pub async fn verify_primary_inventory(&self, root: &BlockCatalog,
         tables: &BTreeMap<rtdb_types::TableRef, TableBlock>,
     ) -> Result<()> {
+        self.verify_primary_inventory_at_view(root, tables, false).await
+    }
+
+    async fn verify_primary_inventory_at_view(&self, root: &BlockCatalog,
+        tables: &BTreeMap<rtdb_types::TableRef, TableBlock>, held: bool,
+    ) -> Result<()> {
         let invalid_extent = |key| Anomaly::fault("rtdb.replication/checkpoint-primary-extent",
             format!("The checkpoint primary file has the wrong length: {key}"));
         for entry in root.table_entries()? {
+            if held && entry.table.stores_expiring_transaction_metadata() { continue; }
             let table = tables.get(&entry.table).ok_or_else(|| invalid("The checkpoint has no table block"))?;
             for trie in table.trie_details() {
                 for path in trie.checkpoint_files(&entry.slug, CheckpointContents::Primary)? {
@@ -547,12 +558,12 @@ impl BlockStore {
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
             if held && entry.table.stores_expiring_transaction_metadata() { continue; }
-            let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
-            if !block.matches_table_block(entry.oid, &rtdb_format::catalog::publication_digest(lease.as_slice())) {
+            let (bytes, _read) = self.read_checkpoint_metadata(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
+            if !block.matches_table_block(entry.oid, &rtdb_format::catalog::publication_digest(&bytes)) {
                 return Err(invalid(format!("The stored table block for {} does not match its checkpoint manifest", entry.table.schema_and_table())));
             }
-            let reservation = self.reserve_decode(lease.as_slice().len())?;
-            tables.insert(entry.table, TableBlock::decode_reserved(lease.as_slice(), reservation)?);
+            let reservation = self.reserve_decode(bytes.len())?;
+            tables.insert(entry.table, TableBlock::decode_reserved(&bytes, reservation)?);
         }
         Ok(tables)
     }

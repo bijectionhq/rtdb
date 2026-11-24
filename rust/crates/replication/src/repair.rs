@@ -131,6 +131,7 @@ impl RetainRepairBase {
         let (base, tables) = base_blocks.load(self.base.block).await?;
         require_root(&base, self.base)?;
         require_offline_lifetime_admission(&base)?;
+        base_blocks.verify_primary_inventory(&base, &tables).await?;
         for entry in base.table_entries()? {
             cancelled(cancellation)?;
             let table = tables.get(&entry.table).ok_or_else(|| invalid("The base has no bound table block"))?;

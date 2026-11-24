@@ -193,13 +193,13 @@ Governed worlds share the selected root and frozen ancestor inventory between ad
 Classic remote catalog holds under the original key vault can settle an abandoned reader when the same locked filesystem proves the attachment has ended. Missing witnesses keep the remote hold.
 Allocated Classic S3 search runs with exact version evidence use the same catalog and physical settlement grant as compacted primaries.
 Hosted maintenance accepts only exact physical grants and no longer withdraws inherited references from path-only grace records. Those references retain custody until there is an exact ordered withdrawal.
-Abandoned unsealed or foreign-vault remote holds, renewal across other entry points, full recovery-root integration, remote Classic staging, legacy search seal retirement, and uncoordinated timers remain open.
+Unsealed and foreign-vault remote holds stay in custody without a verifiable drain witness. Renewal across other entry points, full recovery-root integration, remote Classic staging, legacy search seal retirement, and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.
 |Multi binds checkpoint metadata and startup suffix holds.
 Coordinated native local startup retains its recovery media through checkpoint discovery and cursor admission under the same filesystem gate used by trie and metadata deletion.
-Startup, snapshot export and compactor reset share the primary inventory check for missing or wrong-length files. A coordinated export keeps its source catalog hold through the last provider copy.
+Standalone and hosted startup check fresh root and table bytes and verify every required primary extent before admitting the checkpoint. Exact held business views verify the same inventory without opening the receipt tables. Snapshot export, retained local repair enrollment and compactor reset reuse the primary check. A coordinated export keeps its source catalog hold through the last provider copy.
 Pending archive suffix pins protect their certified journal interval until archive publication or expiry.
 Recovery checks the plaintext extents declared by a checkpoint for its trie data and active search runs. It can verify members of the same pack against a shared fresh provider observation.
 Hosted storage collects covered exact versions and supports isolated terminal S3 enrollment.
