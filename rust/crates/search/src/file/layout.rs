@@ -312,10 +312,14 @@ impl<W: Write> Writer<W> {
 
     pub(super) fn page(&mut self, populated: impl IntoIterator<Item = (Table, StructArray)>) -> Result<PageRef> {
         let batch = record(self.format, populated)?;
+        self.write_batch(&batch)
+    }
+
+    pub(super) fn write_batch(&mut self, batch: &RecordBatch) -> Result<PageRef> {
         let output = self.writer.get_mut();
         let start = output.position;
         output.captured = 0;
-        self.writer.write(&batch).map_err(fault)?;
+        self.writer.write(batch).map_err(fault)?;
         let output = self.writer.get_mut();
         if output.captured != 8 || output.prefix[..4] != [0xff; 4] {
             return Err(fault("Search Arrow batch has no continuation marker"));

@@ -234,7 +234,7 @@ impl Manifest {
         if doc >= self.documents { return Err(missing()); }
         let (page, row) = self.run_at(doc);
         let keys = page.runs.column(2).as_binary::<i32>();
-        if keys.is_null(row) { return Err(missing()); }
+        if row >= keys.len() || keys.is_null(row) { return Err(missing()); }
         let offsets = keys.value_offsets();
         let start = offsets[row] as usize;
         Ok(keys.values().slice_with_length(start, offsets[row + 1] as usize - start))

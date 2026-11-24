@@ -540,9 +540,11 @@ contract SearchCorrectness {
     @invariant SearchFilesFromTheSnapshot
         -- A scan reads the search files its snapshot's catalog records, and those its node builds from the snapshot's data files, and no others.
         -- A node keeps recorded files by object key, and the files it builds by data-file key and columns, each naming immutable bytes, and uses one only while the database's storage is the one it was read through, so a kept file is never stale.
-        -- A recorded file the object store holds on this node's disk, its local store or disk cache, is mapped from there rather than read into memory, so the files kept open are bounded by disk and only the pages a query reads are resident.
-        -- A file read into memory holds its buffer-pool lease, so when the pool refuses a read for want of room, the node drops the files it keeps that way and reads again.
-        -- In-memory Tantivy conversion serves the Arrow batches built by the transcode.
+        -- A recorded Arrow file in the node's local store or disk cache is mapped from disk and its pages can be loaded on demand.
+        -- A reader backed by the original bytes in memory holds its buffer-pool lease, so when the pool refuses a read for want of room, the node drops the files it keeps that way and reads again.
+        -- A recorded Tantivy bundle can serve the checked Arrow batches from its conversion when the budget admits their retention.
+        -- The retained batches and their Arrow slices keep their allocation charges.
+        -- When retention is declined, the conversion writes the batches to a temporary Arrow file and serves them from its mapping.
         -- An Arrow map converted from a Tantivy bundle under a prepaid query budget retains its allocation charge until the map is released.
 }
 

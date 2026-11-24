@@ -15,7 +15,7 @@ use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Instant, Result};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchAccelerator, SearchArtefacts, SearchDefinition, SearchFile, definitions_in};
+use crate::{SearchAccelerator, SearchArtefacts, SearchDefinition, SearchFile, definitions_in, file::CatalogBacking};
 
 /// Entries are evicted least recently used first, once the weight of the rest exceeds the limit.
 struct Bounded<K, V> { entries: BTreeMap<K, (V, u64, usize)>, clock: u64, weight: usize, limit: usize }
@@ -470,6 +470,7 @@ pub struct SearchRuntime {
     trees: Mutex<Bounded<OpenedTreeKey, OpenedTree>>,
     routing: Mutex<Bounded<crate::accelerate::routing::RoutingKey, Arc<crate::accelerate::routing::TableRouting>>>,
     file_admission: Arc<MemoryBudget>,
+    legacy_residency: Arc<MemoryBudget>,
     serving_admission: Arc<MemoryBudget>,
     serving_gaps: std::sync::atomic::AtomicU64,
     logical_run_reads: std::sync::atomic::AtomicU64,
@@ -489,7 +490,8 @@ pub struct SearchRuntime {
 
 impl SearchRuntime {
     /// `file_bytes` weights retained recorded files by whole-object or remote metadata size.
-    /// Locally built files have half the allowance and mapped compatibility files have 32 times the allowance.
+    /// Locally built files have half the allowance, and local mappings and detached conversions have 32 times the allowance.
+    /// Heap-resident compatibility batches have a separate byte admission limit of `file_bytes`.
     /// The format 14 page cache has one quarter of the allowance, and the opened tree cache has eight times the allowance for roots and mapped objects.
     /// Compatibility conversion and exact tree views share a separate allowance of `file_bytes`.
     pub fn new(file_bytes: usize) -> Arc<Self> {
@@ -515,10 +517,11 @@ impl SearchRuntime {
     }
 
     fn with_admission(file_bytes: usize, write_format: i32, file_admission: Arc<MemoryBudget>) -> Arc<Self> {
+        let legacy_residency = if file_bytes == 0 { Arc::clone(&file_admission) } else { MemoryBudget::new(file_bytes) };
         Arc::new(Self { write_format, search_pages: Arc::new(crate::file::PageCache::new(file_bytes / 4)),
             trees: Mutex::new(Bounded::new(file_bytes.saturating_mul(8))),
             routing: Mutex::new(Bounded::new(file_bytes / 16)),
-            file_admission, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
+            file_admission, legacy_residency, serving_admission: MemoryBudget::new(LIVE_POSTING_BYTES.min(file_bytes)), serving_gaps: Default::default(),
             logical_run_reads: Default::default(),
             definitions: Mutex::new(Bounded::new(256)), live: Mutex::new(Bounded::new(LIVE_POSTING_BYTES)),
             files: Mutex::new(Bounded::new(file_bytes)), built: Mutex::new(Bounded::new(file_bytes / 2)),
@@ -709,8 +712,10 @@ impl SearchRuntime {
     async fn open_file(&self, database: &str, storage: &Arc<BufferPool>, key: &rtdb_storage::ObjectKey,
         columns: &[String], locator: Option<&crate::file::FooterLocator>, repairing: bool) -> std::result::Result<Arc<SearchFile>, FileError> {
         let cache_key = (database.to_string(), key.as_str().to_string());
-        let share = !repairing && storage.prepaid_metadata_budget().is_none();
-        let scratch = storage.prepaid_metadata_budget().unwrap_or(&self.file_admission);
+        let prepaid = storage.prepaid_metadata_budget();
+        let share = !repairing && prepaid.is_none();
+        let scratch = prepaid.unwrap_or(&self.file_admission);
+        let retained = (!repairing).then(|| prepaid.unwrap_or(&self.legacy_residency));
         if share {
             for kept in [&self.mapped, &self.files] {
                 if let Some((pool, file)) = kept.lock().get(&cache_key) {
@@ -725,9 +730,15 @@ impl SearchRuntime {
         if let Some(local) = local.map_err(unavailable)? {
             let size = usize::try_from(local.file().metadata().map_err(|error| FileError::Unavailable(rtdb_types::Anomaly::fault("rtdb.search/file", error.to_string())))?.len()).unwrap_or(usize::MAX);
             let source = crate::Source::mapped(local).map_err(FileError::Corrupt)?;
-            let (file, mapped_bytes) = SearchFile::open_catalog(source, columns, locator, scratch).await.map_err(FileError::from_anomaly)?;
+            let (file, backing) = SearchFile::open_catalog(source, columns, locator, scratch, retained).await.map_err(FileError::from_anomaly)?;
             let file = Arc::new(file);
-            if share { self.mapped.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), mapped_bytes.unwrap_or(size)); }
+            if share {
+                let weight = match backing {
+                    CatalogBacking::Original => size,
+                    CatalogBacking::Batches(bytes) | CatalogBacking::Map(bytes) => bytes,
+                };
+                self.mapped.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), weight);
+            }
             return Ok(file);
         }
         if let Some(locator) = ranged {
@@ -754,10 +765,13 @@ impl SearchRuntime {
             Err(error) => return Err(unavailable(error)),
         };
         let size = lease.as_slice().len();
-        let (file, mapped_bytes) = SearchFile::open_catalog(lease.into(), columns, locator, scratch).await.map_err(FileError::from_anomaly)?;
+        let (file, backing) = SearchFile::open_catalog(lease.into(), columns, locator, scratch, retained).await.map_err(FileError::from_anomaly)?;
         let file = Arc::new(file);
         if share {
-            let (cache, weight) = mapped_bytes.map_or((&self.files, size), |bytes| (&self.mapped, bytes));
+            let (cache, weight) = match backing {
+                CatalogBacking::Original => (&self.files, size),
+                CatalogBacking::Batches(bytes) | CatalogBacking::Map(bytes) => (&self.mapped, bytes),
+            };
             cache.lock().insert(cache_key, (Arc::downgrade(storage), Arc::clone(&file)), weight);
         }
         Ok(file)
@@ -1062,6 +1076,45 @@ mod tests {
         runtime.forget_file("xtdb", &key);
         assert!(matches!(runtime.file("xtdb", &pool, &key, &columns).await, Err(FileError::Missing)));
         store.close_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn recorded_tantivy_batches_are_cached_and_repair_keeps_its_fresh_mapped_read() {
+        use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore};
+        let store = Arc::new(MemoryStore::default());
+        let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
+        let columns = vec!["body".to_string()];
+        let row = crate::SearchRow { position: None, identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
+            op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens("an overdue invoice"))] };
+        let key = ObjectKey::new("tables/docs/artefacts/l01-rc-b00/search/docs~a2f11-v1.bin").unwrap();
+        let mut bundle = Vec::new();
+        crate::file::write_versioned_group(&columns, [[Ok(vec![row])]], "job", 1, None, &mut bundle, None, crate::file::TANTIVY_FORMAT_VERSION).unwrap();
+        store.put(&key, bundle.into()).await.unwrap();
+
+        let runtime = SearchRuntime::new(1 << 20);
+        let file = runtime.file("xtdb", &pool, &key, &columns).await.unwrap();
+        assert_eq!(file.metadata_bytes(), 0);
+        let charge = runtime.legacy_residency.used_bytes();
+        assert!(charge > 0);
+        assert_eq!(runtime.file_admission.used_bytes(), 0);
+        assert!(Arc::ptr_eq(&file, &runtime.file("xtdb", &pool, &key, &columns).await.unwrap()));
+
+        let repair = runtime.file_for_repair("xtdb", &pool, &key, &columns, None).await.unwrap();
+        assert!(repair.metadata_bytes() > 0);
+        assert!(repair.matches_artefact("job", 1));
+        repair.verify().unwrap();
+        assert_eq!(runtime.legacy_residency.used_bytes(), charge);
+        let scratch = runtime.file_admission.reserve(runtime.file_admission.limit_bytes()).unwrap();
+        assert!(matches!(runtime.file_for_repair("xtdb", &pool, &key, &columns, None).await,
+            Err(FileError::Unavailable(error)) if error.code == "rtdb/memory-budget-exceeded"));
+        drop(scratch);
+
+        store.delete(&key).await.unwrap();
+        pool.invalidate(&key).await.unwrap();
+        assert!(matches!(runtime.file_for_repair("xtdb", &pool, &key, &columns, None).await, Err(FileError::Missing)));
+        runtime.forget_file("xtdb", &key);
+        drop(file);
+        assert_eq!(runtime.legacy_residency.used_bytes(), 0);
     }
 
     #[tokio::test]

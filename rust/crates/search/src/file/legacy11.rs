@@ -727,22 +727,15 @@ impl SearchFile {
 
 pub(super) fn decode_batches(bytes: bytes::Bytes, columns: &[String]) -> Result<Vec<arrow_array::RecordBatch>> {
     let mut pages = Vec::new();
-    transcode(bytes, columns, None, |tables| {
-        pages.push(super::layout::record(super::LEGACY_FORMAT_VERSION, tables)?);
+    transcode(bytes, columns, None, |batch| {
+        pages.push(batch);
         Ok(())
     })?;
     Ok(pages)
 }
 
-pub(super) fn decode_to(bytes: bytes::Bytes, columns: &[String], output: impl Write,
-    memory: Option<&Arc<rtdb_columnar::MemoryBudget>>) -> Result<()> {
-    let mut writer = super::layout::Writer::new(output, super::LEGACY_FORMAT_VERSION)?;
-    transcode(bytes, columns, memory, |tables| writer.page(tables).map(|_| ()))?;
-    writer.finish()
-}
-
-fn transcode(bytes: bytes::Bytes, columns: &[String], memory: Option<&Arc<rtdb_columnar::MemoryBudget>>,
-    mut page: impl FnMut(Vec<(super::layout::Table, arrow_array::StructArray)>) -> Result<()>) -> Result<()> {
+pub(super) fn transcode(bytes: bytes::Bytes, columns: &[String], memory: Option<&Arc<rtdb_columnar::MemoryBudget>>,
+    mut write_batch: impl FnMut(arrow_array::RecordBatch) -> Result<()>) -> Result<()> {
     use arrow_array::{ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array, builder::StringBuilder};
     use tantivy::{DocSet, postings::Postings as _};
     use super::{LEGACY_FORMAT_VERSION, layout::{Table, item_of, list}, postings::{POSTING_TERMS, PostingBuilder, posting_table}, write::{Events, Runs}};
@@ -758,6 +751,7 @@ fn transcode(bytes: bytes::Bytes, columns: &[String], memory: Option<&Arc<rtdb_c
         .saturating_add(usize::try_from(tokens).unwrap_or(usize::MAX).saturating_mul(20))
         .saturating_add(4096);
     let _scratch = memory.map(|memory| memory.reserve(bytes)).transpose()?;
+    let mut page = |tables| write_batch(super::layout::record(LEGACY_FORMAT_VERSION, tables)?);
     let header = Table::Header.array(vec![
         Arc::new(Int32Array::from(vec![LEGACY_FORMAT_VERSION])), Arc::new(Int32Array::from(vec![rtdb_text::ANALYZER_VERSION])),
         Arc::new(Int64Array::from(vec![sidecar.version])), Arc::new(FixedSizeBinaryArray::try_from_iter([sidecar.identity].iter()).map_err(fault)?),

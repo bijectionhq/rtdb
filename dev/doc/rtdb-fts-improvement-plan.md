@@ -176,7 +176,8 @@ flowchart LR
 ## Migration, publication and rollback
 
 Preserve format 11, 12 and 13 readers and keep existing artefacts through the format 14 rollout.
-The format 11 adapter stages a temporary Arrow representation in a private mapped file and charges the conversion workspace separately.
+The format 11 adapter serves checked Arrow batches directly when their retention is admitted.
+The adapter stages a temporary Arrow representation in a private mapped file when the batches cannot be retained or the lane is checking a file for repair.
 Ranked point SQL can combine format 14 sources, earlier formats and an uncovered live suffix in one frontier.
 Install compatible readers throughout a deployment before enabling format 14 publication.
 Validate complete deterministic bytes before appending the catalogue entry through the existing artefact lane.
