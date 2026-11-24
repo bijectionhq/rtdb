@@ -36,7 +36,7 @@
 - The change feed reads state transitions from SQL temporal history and uses the adopted checkpoint as a conservative coverage floor.
 - An update can produce one closed and one opened history rectangle within one system-time group.
 - Each sorted table and boundary scan keeps the first requested number of distinct system times plus one lookahead.
-- A skipped group has at least one full page of older groups in that scan and therefore cannot be in the globally first page in the requested order.
+- A skipped group has at least one full page of groups that precede it in that scan and therefore cannot be in the globally first page in the requested order.
 - Descending pagination and cross-table page overflow have no executable case yet.
 - Wave 2 needs to replace this implementation with a feed over the settled applied effects and actual retained floor, including erasure and other transitions without surviving history rectangles.
 - The SQL table functions use the existing text-score and vector-distance operators.
