@@ -538,6 +538,33 @@ impl ServingDriver for MultiServing {
             .ok_or_else(interrupted)?
     }
 
+    async fn query_workload_root(
+        &self, source: QuerySource, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        cancellation.run_until_cancelled(async {
+            let (index, generation) = self.database.lock().await.fresh_view().await?;
+            index.require_local_custody()?;
+            if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged
+                || index.has_custody_groups() || index.has_visibility_history()
+            {
+                return Err(Anomaly::unsupported("rtdb/managed-workload-read-root",
+                    "The managed Root read requires a plain main database"));
+            }
+            let at = if source.at == At::Linearizable { At::Latest } else { source.at };
+            let view = index.view(&source.branch, at, source.layer, now)?;
+            let snapshot = rtdb_query::branch_snapshot(&view, &self.memory)?;
+            self.database.lock().await.check_generation(generation).await?;
+            Ok(QueryView {
+                snapshot,
+                cut: view.cut(),
+                claim: None,
+                custody_groups: BTreeSet::new(),
+                custody_contributors: Some(BTreeSet::new()),
+                key_generation: Some(generation),
+            })
+        }).await.ok_or_else(interrupted)?
+    }
+
     async fn transact(
         &self,
         request: Transact,

@@ -75,6 +75,30 @@ impl Service {
         action: flight::Action,
     ) -> Result<Response<Output<flight::Result>>, Status> {
         let outcome = match action.r#type.as_str() {
+            CAPABILITIES if call.session.caller.principal.workload_grant().is_some() => async {
+                decode::<proto::CapabilitiesRequest>(action.body)?;
+                let database = self.require_workload_root_read(&call).await?;
+                let driver = database.serving_driver().ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
+                let mut features = vec!["managed-workload.read-root", "query", "query.linearizable"];
+                if driver.supports_query_tokens() && database.wire_tokens_supported() {
+                    features.extend(["query.track", "query.page", RECEIVER_CLOCK, APPLIED_POSITION]);
+                }
+                if driver.features().contains(&rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS) {
+                    features.push(rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS);
+                }
+                Ok(proto::CapabilitiesResponse {
+                    api: API.into(),
+                    features: features.into_iter().map(str::to_owned).collect(),
+                    limits: Some(proto::Limits {
+                        max_page_rows: MAX_PAGE_ROWS,
+                        max_change_groups: 0,
+                        max_wait_millis: MAX_WAIT.as_millis() as u64,
+                        min_key_bytes: 16,
+                        max_key_bytes: 64,
+                    }),
+                    server_time_micros: self.0.node.now().0,
+                }.encode_to_vec())
+            }.await,
             CAPABILITIES => decode::<proto::CapabilitiesRequest>(action.body).map(|_| {
                 let mut features = Vec::new();
                 if self.follower_only() {
@@ -264,6 +288,12 @@ impl Service {
                 return Err(error::unsupported("query.follower-source"));
             }
             return follower.current(&self.0.node).map_err(error::follower);
+        }
+        if call.session.caller.principal.workload_grant().is_some() {
+            if branch != rtdb_types::rtdb_v1::MAIN_BRANCH || layer != proto::Layer::Merged {
+                return Err(error::unsupported("managed-workload.read-root"));
+            }
+            return self.require_workload_root_read(call).await;
         }
         let database = self.wire_attachment(call, DatabaseAccess::Read).await?;
         if database.serving_driver().is_none() {

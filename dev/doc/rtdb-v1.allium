@@ -53,6 +53,9 @@ surface StatelessDatabase {
         -- The current authority image must match at the configured valid time and at the writer's decision time.
         -- The original writer orders closure, placement replacement and mutation in the same stream.
         -- Before a timed effect settles, the writer checks the original fence and the exclusive grant and request cutoffs again.
+        -- A separate clear Root read grant names the same exact fence and writer receipt.
+        -- Only the active local writer admits clear main Query and rechecks the authority at each frame handoff.
+        -- Continuations retain the read grant namespace and may resume with its renewed credential.
         -- Named predecessor evidence returns only the authenticated fence, writer and close at their original applied cuts.
         -- The retained result binds the original namespace, key, operation family and immutable attempt commitment.
         -- An exact retry recovers the retained result independently of the former writer's current fence.

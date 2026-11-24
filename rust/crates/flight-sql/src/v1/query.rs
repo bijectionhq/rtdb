@@ -141,6 +141,10 @@ impl Service {
             }.map_err(error::follower)?;
             return Ok((view, follower_progress(route, progress)));
         }
+        if call.session.caller.principal.workload_grant().is_some() {
+            let view = driver.query_workload_root(source, now, &call.cancellation).await.map_err(error::anomaly)?;
+            return Ok((view, None));
+        }
         let view = match visibility {
             Some(scope) => driver.query_scoped(source, request.track, now, scope, &call.cancellation).await,
             None if request.verify_ranked_artefacts => driver.query_ranked_artefacts(&call.database, source, now, &call.cancellation).await,
@@ -241,6 +245,12 @@ impl Service {
             let generation = generation.ok_or_else(|| error::unavailable("The follower cut has no readable generation"))?;
             return route.reader.check_delivery(_basis, generation, self.0.node.now(), &call.cancellation).await.map_err(error::follower);
         }
+        if call.session.caller.principal.workload_grant().is_some() {
+            let admitted = self.require_workload_root_read(call).await?;
+            if !std::ptr::eq(admitted.as_ref(), database) || !groups.is_empty() {
+                return Err(error::unsupported("managed-workload.read-root"));
+            }
+        }
         check_read_delivery(call, database, generation, groups).await
     }
 
@@ -259,6 +269,16 @@ impl Service {
         let selection = source.at.as_ref().and_then(|at| at.selection.as_ref());
         if source.at.is_some() && selection.is_none() {
             return Err(error::incorrect("Empty At selector"));
+        }
+        let workload = call.session.caller.principal.workload_grant();
+        if workload.is_some() && (
+            !matches!(selection, Some(Selection::Exactly(_) | Selection::Linearizable(_) | Selection::AtLeast(_)))
+                || request.custody_release_evidence
+                || request.require_clear_rank_input
+                || request.verify_ranked_artefacts
+                || request.ranked_ivf.is_some()
+        ) {
+            return Err(error::unsupported("managed-workload.read-root"));
         }
         if self.follower_only() {
             if matches!(selection, Some(Selection::Linearizable(_) | Selection::AsOfMicros(_))) {
@@ -334,7 +354,16 @@ impl Service {
         });
         let request_hash = {
             let _encoding = request.ranked_ivf.as_ref().map(|ranked| call.reserve(ranked.encoded_len())).transpose()?;
-            fingerprint(&request)
+            let request_hash = fingerprint(&request);
+            if let Some(grant) = workload {
+                let mut hash = Sha256::new();
+                hash.update(b"rtdb.v1/workload-root-query\0");
+                hash.update(grant.receipt_namespace());
+                hash.update(request_hash);
+                hash.finalize().into()
+            } else {
+                request_hash
+            }
         };
         let ranked_ivf = request.ranked_ivf.take().map(read_ranked_ivf).transpose()?;
         let (limit, after) = match &request.page {
@@ -386,7 +415,7 @@ impl Service {
                 (context, clock)
             } else {
                 let clock = if exact { cut } else { clock };
-                let context = if self.follower_only() {
+                let context = if self.follower_only() || workload.is_some() {
                     let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
                     self.scoped_wire_context(call, snapshot, clock)?.with_wire_cut(cut, clock.into())
                 } else {

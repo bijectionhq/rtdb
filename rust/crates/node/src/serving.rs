@@ -229,6 +229,13 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb/managed-workload", "The attachment has no managed workload writer"))
     }
 
+    async fn query_workload_root(
+        &self, _source: QuerySource, _now: Timestamp, _cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/managed-workload-read-root",
+            "The attachment has no clear managed Root read authority"))
+    }
+
     async fn transact_scoped(&self, _request: Transact, _scope: ServingScope,
                              _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(visibility::unsupported())

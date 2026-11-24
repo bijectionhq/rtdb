@@ -70,6 +70,10 @@ impl CallKind {
         matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities)
     }
 
+    fn allows_workload_root_read(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities)
+    }
+
     fn allows_workload_grant(self) -> bool {
         matches!(self, Self::Handshake | Self::ManagedCreate | Self::ManagedWorkload | Self::TxStatus)
     }
@@ -309,7 +313,12 @@ impl Service {
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
             if let Some(grant) = principal.workload_grant() {
-                if !kind.allows_workload_grant()
+                let allowed = if grant.is_root_reader() {
+                    kind.allows_workload_root_read()
+                } else {
+                    kind.allows_workload_grant()
+                };
+                if !allowed
                     || matches!(kind, CallKind::ManagedCreate) && grant.is_assignment()
                     || matches!(kind, CallKind::ManagedWorkload | CallKind::TxStatus) && !grant.is_assignment()
                     || audience.is_some()
@@ -774,6 +783,18 @@ mod tests {
         }
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate, CallKind::ManagedWorkload, CallKind::TxStatus] {
             assert!(!kind.serves_assigned_follower());
+        }
+    }
+
+    #[test]
+    fn workload_root_reader_has_a_read_only_allowlist() {
+        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities] {
+            assert!(kind.allows_workload_root_read());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup,
+            CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedWorkload,
+            CallKind::ManagedCreate, CallKind::TxStatus] {
+            assert!(!kind.allows_workload_root_read());
         }
     }
 

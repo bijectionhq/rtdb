@@ -147,6 +147,11 @@ impl VerifiedWorkloadGrant {
 
     pub fn is_assignment(&self) -> bool { matches!(self.permission, Permission::Assignment { .. }) }
 
+    pub fn is_root_reader(&self) -> bool {
+        matches!(&self.permission, Permission::Assignment { authority, .. }
+            if matches!(authority.as_ref(), Authority::ReadRoot { .. }))
+    }
+
     pub fn receipt_namespace(&self) -> [u8; 32] {
         self.receipt_namespace
     }

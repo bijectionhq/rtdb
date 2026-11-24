@@ -132,6 +132,8 @@ Converting a fixed-profile authority row requires an explicit installation trans
 | `installation_intent`, `previous`, `next`
 | `claim-writer`
 | `fence`
+| `read-root`
+| `fence`, `writer`
 | `write`
 | `fence`, `writer`
 | `close-writer`
@@ -186,7 +188,11 @@ Write uses the same key in the outer action and embedded `TransactRequest`.
 It admits main-branch puts, deletes and table declarations on data relations.
 Each arm must preserve the configured authority relation.
 The exact workload credential uses the named evidence actions for its control reads.
-Generic data queries, branch control, custody and erasure require their own admission routes.
+The separate `read-root` grant admits Capabilities and Query on a plain original main database through the active local Multi writer.
+It supports merged Exactly, AtLeast and Linearizable cuts and binds page continuations to the stable read grant namespace.
+Each emitted frame checks the current fence, original writer receipt, attachment and expiry.
+The query catalog contains only the selected original database.
+Changes, branch control, custody, protected row visibility, ranked queries and erasure need separate admission.
 
 Freeze the exact protobuf request body before the first positive submission and retain it with the namespace, key and family.
 The attempt digest is SHA-256 of the ASCII bytes `rtdb.v1/managed-workload-attempt`, a single zero byte, and that frozen body.

@@ -94,6 +94,10 @@ pub enum Authority {
     ClaimWriter {
         fence: Fence,
     },
+    ReadRoot {
+        fence: Fence,
+        writer: Applied,
+    },
     Write {
         fence: Fence,
         writer: Applied,
@@ -159,7 +163,7 @@ impl Authority {
                     }
             }
             Self::ClaimWriter { fence } => held(fence),
-            Self::Write { fence, writer } => held(fence) && applied(writer),
+            Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => held(fence) && applied(writer),
             Self::CloseWriter {
                 fence,
                 writer,
@@ -249,6 +253,7 @@ pub enum Operation {
         family: Family,
     },
     Observe(Fence),
+    ReadRoot { fence: Fence, writer: Applied },
     Predecessor(Predecessor),
 }
 
@@ -295,6 +300,15 @@ impl Request {
                     return Err(super::unknown_receipt());
                 }
                 Ok(Prepared::Answer(Reply::Receipt(replay(&stored.receipt))))
+            }
+            Operation::ReadRoot { fence, writer } => {
+                let authority = Authority::ReadRoot { fence: fence.clone(), writer: writer.clone() };
+                if !authority.valid(state.index.head().basis.incarnation()) {
+                    return Err(denied());
+                }
+                self.point.check_current(state, now, &authority)?;
+                let evidence = self.point.writer(state, fence, writer, now)?;
+                Ok(Prepared::Answer(Reply::Placement(evidence)))
             }
             Operation::Observe(fence) => {
                 let evidence = self.point.fence(state, fence, now)?;
@@ -552,7 +566,9 @@ impl Point {
                 }
             },
             Authority::ClaimWriter { fence } => self.fence(state, fence, now)?.applied,
-            Authority::Write { fence, writer } | Authority::CloseWriter { fence, writer, .. } => {
+            Authority::ReadRoot { fence, writer }
+            | Authority::Write { fence, writer }
+            | Authority::CloseWriter { fence, writer, .. } => {
                 self.fence(state, fence, now)?;
                 self.writer(state, fence, writer, now)?.applied
             }

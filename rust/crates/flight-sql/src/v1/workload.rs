@@ -14,6 +14,28 @@ use tonic::Status;
 use super::{Call, Service, check_key, decode, error, proto, transact};
 
 impl Service {
+    pub(super) async fn require_workload_root_read(&self, call: &Call) -> Result<Arc<Database>, Status> {
+        let (database, grant) = self.managed_workload_attachment(call)?;
+        let driver = database.serving_driver().ok_or_else(denied)?;
+        let (authority, point, expires_at) = grant
+            .assignment(&call.database, driver.incarnation(), self.0.node.now())
+            .map_err(error::anomaly)?;
+        let Authority::ReadRoot { fence, writer } = authority else { return Err(denied()); };
+        let reply = driver.managed_workload(
+            workload::Request {
+                point: point.clone(),
+                namespace: grant.receipt_namespace(),
+                expires_at,
+                operation: Operation::ReadRoot { fence: fence.clone(), writer: writer.clone() },
+            },
+            &call.cancellation,
+        ).await.map_err(error::anomaly)?;
+        if !matches!(reply, workload::Reply::Placement(_)) { return Err(denied()); }
+        self.check_attachment(call, &database)?;
+        grant.assignment(&call.database, driver.incarnation(), self.0.node.now()).map_err(error::anomaly)?;
+        Ok(database)
+    }
+
     pub(super) async fn managed_workload_action(
         &self,
         call: &Call,
