@@ -2992,7 +2992,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=b185475fc84c869895523f51644895435bc8cc95#b185475fc84c869895523f51644895435bc8cc95"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8#c6531760536758526f7a5b77daaffc6bba51fcb8"
 dependencies = [
  "bytes",
 ]
@@ -3174,13 +3174,13 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=b185475fc84c869895523f51644895435bc8cc95#b185475fc84c869895523f51644895435bc8cc95"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8#c6531760536758526f7a5b77daaffc6bba51fcb8"
 dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=b185475fc84c869895523f51644895435bc8cc95)",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8)",
  "libc",
  "parking_lot",
  "prost",
