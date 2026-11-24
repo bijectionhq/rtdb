@@ -545,7 +545,7 @@ impl NodeAgent {
         }
         let response = || {
             let flight = self.flight_endpoint.clone();
-            let proof = secret.sign_route(&control::ordered_read_binding(
+            let proof = secret.sign_route(&crate::control::ordered_read_binding(
                 name, scope, enrollment, epoch, &self.address, flight.as_deref(),
             ));
             Response::OrderedRead { address: self.address.clone(), flight, proof }
