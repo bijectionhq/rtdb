@@ -113,6 +113,47 @@ impl HeldVectorOverlay {
     fn shadowed(&self, partition: usize) -> Option<&BTreeSet<EntityId>> {
         self.shadows.get(&partition)
     }
+
+    pub fn contains_shadow(&self, partition: usize, id: &EntityId) -> bool {
+        self.shadows.get(&partition).is_some_and(|ids| ids.contains(id))
+    }
+
+    /// Shadow an identity with one stored world row, or with its absence.
+    /// The row's vector and filter cells use the partition's stored columns.
+    pub fn shadow_row(
+        &mut self, partition: usize, selected: &NearestPartition, id: EntityId, row: Option<&RecordBatch>,
+    ) -> Result<()> {
+        let Some(row) = row.filter(|row| row.num_rows() != 0) else {
+            return self.shadow_components(partition, id, None, vec![None; selected.filters.len()]);
+        };
+        let schema = row.schema_ref();
+        let vector = match schema.column_with_name(&selected.vector) {
+            Some((column, field)) => read_vector(field, row.column(column).as_ref(), 0)?,
+            None => None,
+        };
+        let filters = selected.filters.iter().map(|name| match schema.column_with_name(name) {
+            Some((column, field)) => Ok(rtdb_columnar::binary_cell(field, row.column(column).as_ref(), 0)?
+                .map(<[u8]>::to_vec)),
+            None => Ok(None),
+        }).collect::<Result<Vec<_>>>()?;
+        self.shadow_components(partition, id, vector, filters)
+    }
+
+    fn shadow_components(
+        &mut self, partition: usize, id: EntityId, vector: Option<Vec<f64>>, filters: Vec<Option<Vec<u8>>>,
+    ) -> Result<()> {
+        let bytes = identity_charge(&id)
+            .saturating_add(vector.as_ref().map_or(0, |vector| vector.len() * 8))
+            .saturating_add(filters.iter().flatten().map(Vec::len).sum::<usize>())
+            .saturating_add(256);
+        let retained = Arc::get_mut(&mut self._retained).expect("exclusive overlay reservation");
+        retained.grow_to(retained.bytes().saturating_add(bytes))?;
+        if !self.shadows.entry(partition).or_default().insert(id.clone()) {
+            return Err(overlay_invalid());
+        }
+        self.rows.push((partition, id, vector, filters));
+        Ok(())
+    }
 }
 
 struct NearestHit {

@@ -347,6 +347,9 @@ pub(crate) const SEARCH_HELD_WORLD_V2: &str = "rtdb.owned.SearchHeldWorld.v2";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const NEAREST_HELD_OWNED_V1: &str = "rtdb.owned.NearestHeld.v1";
 pub(crate) const HYBRID_HELD_OWNED_V1: &str = "rtdb.owned.HybridHeld.v1";
+pub(crate) const NEAREST_HELD_WORLD_V1: &str = "rtdb.owned.NearestHeldWorld.v1";
+pub(crate) const NEAREST_HELD_WORLD_AT_V1: &str = "rtdb.owned.NearestHeldWorldAt.v1";
+pub(crate) const NEAREST_HELD_WORLD_PARENT_AT_V1: &str = "rtdb.owned.NearestHeldWorldParentAt.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -3793,6 +3796,85 @@ impl Service {
             ).map_err(status)?;
         }
         Ok(overlay)
+    }
+
+    /// `NearestHeldWorld.v1`, `NearestHeldWorldAt.v1` and `NearestHeldWorldParentAt.v1`:
+    /// the SearchHeldWorld prefixes followed by the NearestHeld.v1 frame.
+    pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
+        let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
+            let (mode, rest) = request.split_first().ok_or_else(|| invalid("Missing historical world nearest selector"))?;
+            let parent_only = match *mode {
+                0 => true,
+                1 => false,
+                _ => return Err(invalid("Invalid historical world nearest selector")),
+            };
+            let (system, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Missing historical world nearest system revision"))?;
+            (Some((Timestamp(i64::from_be_bytes(*system)), parent_only)), rest)
+        } else { (None, request) };
+        let (parent_at, request) = if matches!(mode, WorldHistoricalRead::EarlierParent) {
+            let (system, rest) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing earlier parent nearest revision"))?;
+            (Some(Timestamp(i64::from_be_bytes(*system))), rest)
+        } else { (None, request) };
+        let (valid, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Missing held world nearest valid instant"))?;
+        let valid = Timestamp(i64::from_be_bytes(*valid));
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_world_resource(call, &handle)?;
+        let (overlay, staged_scope, request) = if matches!(mode, WorldHistoricalRead::Current) {
+            let (length, request) = request.split_first_chunk::<4>()
+                .ok_or_else(|| invalid("Held world nearest has no overlay length"))?;
+            let (ipc, request) = request.split_at_checked(u32::from_be_bytes(*length) as usize)
+                .ok_or_else(|| invalid("Held world nearest has a truncated overlay"))?;
+            if ipc.is_empty() {
+                (None, None, request)
+            } else {
+                if held.snapshot.clock_mode() != rtdb_types::WorldClockMode::Proposal
+                    || valid != held.snapshot.present()
+                {
+                    return Err(invalid("Staged world nearest requires live Proposal validity"));
+                }
+                self.hosted_control_policy(call)?;
+                let scope = self.hosted_control_scope(call).await?;
+                (Some(request_batch(call, ipc)?), Some(scope), request)
+            }
+        } else {
+            (None, None, request)
+        };
+        let nearest = owned_nearest_request(call, request)?;
+        if !nearest.observe {
+            return Err(Status::failed_precondition("Nearest requires evidence for every selected world partition"));
+        }
+        let relations = nearest.partitions.iter().map(|partition| partition.relation.clone()).collect::<Vec<_>>();
+        let domain = match mode {
+            WorldHistoricalRead::Current => b"rtdb.owned.nearest.world.v1\0".as_slice(),
+            WorldHistoricalRead::EarlierEffective => b"rtdb.owned.nearest.world-at.v1\0".as_slice(),
+            WorldHistoricalRead::EarlierParent => b"rtdb.owned.nearest.world-parent-at.v1\0".as_slice(),
+        };
+        let scope = owned_rank_scope(domain, body, "");
+        let overlay = overlay.as_ref()
+            .map(|input| self.nearest_shadows(&nearest, input.batch()))
+            .transpose()?;
+        let partitions = nearest.partitions.clone();
+        let query = nearest.query.clone();
+        let (page, witnesses) = if let Some(system) = parent_at {
+            held.snapshot.nearest_parent_at(partitions, query, valid, system).await
+        } else if let Some((system, parent_only)) = earlier {
+            held.snapshot.nearest_at(partitions, query, valid, system, parent_only).await
+        } else {
+            held.snapshot.nearest(partitions, query, valid, overlay).await
+        }.map_err(status)?;
+        if witnesses.len() != relations.len() { return Err(Status::internal("Incomplete retained nearest evidence")); }
+        if let Some(scope) = staged_scope {
+            if witnesses.iter().any(|witness| !witness.matches_scope(scope)) {
+                return Err(Status::failed_precondition("Staged nearest did not retain its original placed corpus"));
+            }
+        }
+        let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
+        let present = parent_at.or_else(|| earlier.map(|(system, _)| system)).unwrap_or_else(|| held.snapshot.present());
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid)?;
+        for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
+        Ok(reply)
     }
 
     pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {

@@ -235,6 +235,18 @@ enum ArchiveRead {
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
         reply: oneshot::Sender<Result<rtdb_node::OwnedSearchBatch>>,
     },
+    Nearest {
+        partitions: Vec<rtdb_node::nearest::NearestPartition>,
+        frontiers: Vec<i64>,
+        query: rtdb_node::nearest::NearestQuery,
+        overlay: Option<rtdb_node::nearest::HeldVectorOverlay>,
+        ancestor_schemas: Option<Vec<rtdb_types::OwnedSchema>>,
+        ancestor_system: Option<Timestamp>,
+        valid: Timestamp,
+        parent_at: Option<(Timestamp, Vec<(OwnedRelation, rtdb_types::OwnedSchema)>)>,
+        guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
+        reply: oneshot::Sender<Result<rtdb_node::OwnedSearchBatch>>,
+    },
     SearchColumns {
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
         frontiers: Vec<i64>,
@@ -1116,6 +1128,165 @@ impl HeldCheckpointWorld {
         }
         guard()?;
         Ok(corpus)
+    }
+
+    pub async fn nearest(
+        &self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, staged: Option<rtdb_node::nearest::HeldVectorOverlay>,
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
+        if staged.is_some() && (self.clock_mode() != WorldClockMode::Proposal || valid != self.present().system_time) {
+            return Err(OwnedWorld::unavailable());
+        }
+        self.nearest_on_cut(partitions, query, valid, None, None, staged).await
+    }
+
+    pub async fn nearest_at(
+        &self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, system: Timestamp, parent_only: bool,
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
+        self.nearest_on_cut(partitions, query, valid, Some((system, parent_only)), None, None).await
+    }
+
+    pub async fn nearest_parent_at(
+        &self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, system: Timestamp,
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
+        self.nearest_on_cut(partitions, query, valid, None, Some(system), None).await
+    }
+
+    /// The exact cosine ranking of the effective world view at one cut. Local
+    /// world rows shadow their retained parent rows, as in the text search
+    /// corpus, before the archived parent is ranked.
+    async fn nearest_on_cut(
+        &self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
+        staged: Option<rtdb_node::nearest::HeldVectorOverlay>,
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
+        self.check()?;
+        if !(1..=32).contains(&partitions.len())
+            || partitions.iter().map(|partition| &partition.relation).collect::<std::collections::BTreeSet<_>>().len() != partitions.len()
+            || partitions.iter().any(|partition| partition.filters.len() != query.filter_count())
+        {
+            return Err(OwnedWorld::unavailable());
+        }
+        Interval::at(valid)?;
+        let relations = partitions.iter().map(|partition| partition.relation.clone()).collect::<Vec<_>>();
+        if let Some((system, parent_only)) = earlier {
+            if (parent_only && system != self.parent_basis().system_time)
+                || (!parent_only && !self.clock_mode().is_writable() && self.ancestor().is_none())
+                || relations.iter().any(|relation| self.open.record.schemas.relation(relation)
+                    .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+            {
+                return Err(OwnedWorld::unavailable());
+            }
+            self.require_accepted_archive_scope(&relations).await?;
+        }
+        let guard = self.open.snapshot.relation_release_guard(relations.iter())?;
+        let witnesses = if earlier.is_some() || parent_at.is_some() {
+            let mut witnesses = Vec::with_capacity(relations.len());
+            for relation in &relations {
+                witnesses.push(self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?);
+            }
+            witnesses
+        } else {
+            self.open.snapshot.world_relation_witnesses(self.open.record.id, relations.iter()).await?
+        };
+        let frontiers = witnesses.iter().map(OwnedWorldWitness::purge_frontier).collect::<Vec<_>>();
+        let parent_at = if let Some(system) = parent_at {
+            if system > self.parent_basis().system_time || frontiers.iter().any(|frontier| *frontier != 0) {
+                return Err(OwnedWorld::unavailable());
+            }
+            let schemas = relations.iter().map(|relation| {
+                Ok((relation.clone(), self.historical_parent_schema(relation)?.clone()))
+            }).collect::<Result<Vec<_>>>()?;
+            Some((system, schemas))
+        } else { None };
+        let ancestor_system = self.frozen_system(earlier.filter(|(_, parent_only)| !parent_only).map(|(system, _)| system));
+        let ancestor_schemas = if self.ancestor().is_some() && parent_at.is_none()
+            && !earlier.is_some_and(|(_, parent_only)| parent_only)
+        {
+            if frontiers.iter().any(|frontier| *frontier != 0) {
+                return Err(OwnedWorld::unavailable());
+            }
+            Some(relations.iter().map(|relation| self.historical_parent_schema(relation).cloned())
+                .collect::<Result<Vec<_>>>()?)
+        } else {
+            None
+        };
+        let historical = parent_at.is_some();
+        let writable = self.clock_mode().is_writable();
+        let use_overlay = writable && !historical
+            && !earlier.is_some_and(|(system, parent_only)| parent_only || self.uses_frozen_overlay(Some(system)));
+        let overlay = if use_overlay {
+            let shadows = match staged {
+                Some(staged) => staged,
+                None => rtdb_node::nearest::HeldVectorOverlay::new(&self.memory)?,
+            };
+            Some(self.nearest_overlay(&partitions, valid, shadows, &guard, earlier.map(|(system, _)| system)).await?)
+        } else {
+            None
+        };
+        let (reply, result) = oneshot::channel();
+        self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Nearest {
+            partitions, frontiers, query, overlay,
+            ancestor_schemas, ancestor_system, valid, parent_at, guard: Arc::clone(&guard), reply,
+        })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
+        let page = self.cancellation.run_until_cancelled(result).await
+            .ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())??;
+        self.check()?;
+        guard()?;
+        Ok((page, witnesses))
+    }
+
+    /// Shadow every local world identity with its local row, mirroring
+    /// `search_overlay`: typed tombstones mask the archived row.
+    async fn nearest_overlay(
+        &self, partitions: &[rtdb_node::nearest::NearestPartition], valid: Timestamp,
+        mut shadows: rtdb_node::nearest::HeldVectorOverlay,
+        guard: &Arc<dyn Fn() -> Result<()> + Send + Sync>, system: Option<Timestamp>,
+    ) -> Result<rtdb_node::nearest::HeldVectorOverlay> {
+        let mut remaining = 4096usize;
+        for (partition, selected) in partitions.iter().enumerate() {
+            let relation = &selected.relation;
+            let cut = if let Some(system) = system {
+                Some(self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?)
+            } else {
+                None
+            };
+            let mut after = None;
+            loop {
+                guard()?;
+                let candidates = if let Some(cut) = &cut {
+                    cut.overlay_identities(valid, after.as_deref(), 128).await?
+                } else {
+                    self.open.snapshot.world_identity_candidates(
+                        self.open.record.id, relation, valid, after.as_deref(), 128,
+                    ).await?
+                };
+                if cut.is_some() {
+                    remaining = remaining.checked_sub(candidates.keys.len()).ok_or_else(OwnedWorld::unavailable)?;
+                }
+                for key in &candidates.keys {
+                    let id = EntityId::String(key.clone());
+                    if shadows.contains_shadow(partition, &id) { continue; }
+                    if let Some(cut) = &cut {
+                        let shadow = cut.shadow(&id, valid).await?;
+                        let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?
+                            .ok_or_else(OwnedWorld::unavailable)?;
+                        let row = fact.into_shadow(self.open.record.id)?;
+                        shadows.shadow_row(partition, selected, id, row.as_ref().map(|fact| &fact.row))?;
+                    } else {
+                        let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
+                        let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
+                        shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row))?;
+                    }
+                }
+                if candidates.keys.len() < 128 { break; }
+                after = Some(candidates.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
+            }
+        }
+        guard()?;
+        Ok(shadows)
     }
 
     async fn search_columns(
@@ -2115,6 +2286,29 @@ impl<'a> InheritedRelation<'a> {
         }
     }
 
+    async fn nearest_shadows(
+        &self, selected: &rtdb_node::nearest::NearestPartition, partition: usize, valid: Timestamp,
+        shadows: &mut rtdb_node::nearest::HeldVectorOverlay, remaining: &mut usize,
+    ) -> Result<()> {
+        let unavailable = OwnedWorld::unavailable;
+        let instant = Interval::at(valid)?;
+        let mut cursor = None;
+        loop {
+            let after = cursor.as_ref().map(|(key, _): &(String, Arc<MemoryReservation>)| key.as_str());
+            let page = self.overlay_identity_page(valid, after, 128).await?;
+            *remaining = remaining.checked_sub(page.keys.len()).ok_or_else(unavailable)?;
+            for key in &page.keys {
+                let id = EntityId::String(key.clone());
+                if shadows.contains_shadow(partition, &id) { continue; }
+                let shadow = self.resolve_shadow(&id, instant).await?.ok_or_else(unavailable)?;
+                shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row))?;
+            }
+            if !page.more { return Ok(()); }
+            let key = page.keys.last().ok_or_else(unavailable)?;
+            cursor = Some((key.clone(), self.memory.reserve(key.len())?));
+        }
+    }
+
     async fn boundaries(&self, id: &EntityId, valid: Interval) -> Result<Vec<Timestamp>> {
         let root_boundaries = rtdb_query::open_owned_valid_boundaries(
             Arc::clone(&self.root), self.owner, self.relation, id, valid, self.root.current_time.as_micros()?,
@@ -2818,6 +3012,58 @@ pub(crate) async fn open_held_checkpoint_world(
                                             overlay
                                         };
                                         let page = rtdb_node::rank_owned_overlay_batch(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
+                                        guard()?;
+                                        Ok(page)
+                                    };
+                                    let response = tokio::select! {
+                                        _ = scope.cancelled() => break,
+                                        _ = reply.closed() => continue,
+                                        result = scoped_read!(read) => result,
+                                    };
+                                    send_archive_answer(&plaintext, reply, response).await;
+                                }
+                                ArchiveRead::Nearest { partitions, frontiers, query, overlay, ancestor_schemas, ancestor_system, valid, parent_at, guard, mut reply } => {
+                                    let read = async {
+                                        guard()?;
+                                        check_archive_coverage(&context, &owner,
+                                            partitions.iter().map(|partition| &partition.relation).zip(frontiers))?;
+                                        let scoped = Arc::clone(&context).with_owned_read_guard(Arc::clone(&guard));
+                                        let scoped = if let Some((system, schemas)) = parent_at {
+                                            exact_historical_parent_context(scoped, &owner, system, &schemas).await?
+                                        } else { scoped };
+                                        let overlay = if let Some(schemas) = ancestor_schemas {
+                                            let ancestors = frozen_prefix(&ancestors, ancestor_system);
+                                            let shadows = with_frozen_writers(
+                                                archive, deployment, ancestors,
+                                                CheckpointReadResources {
+                                                    node: &archive.options, memory, cache: Arc::clone(&ancestor_cache), cancellation: scope,
+                                                },
+                                                Vec::new(),
+                                                |archived| {
+                                                    let archived = archived.into_iter().map(|layer|
+                                                        layer.with_owned_read_guard(Arc::clone(&guard))).collect::<Vec<_>>();
+                                                    let (root, owner, partitions) = (&scoped, &owner, &partitions);
+                                                    async move {
+                                                        let mut shadows = match overlay {
+                                                            Some(shadows) => shadows,
+                                                            None => rtdb_node::nearest::HeldVectorOverlay::new(memory)?,
+                                                        };
+                                                        let mut remaining = 4096;
+                                                        for (index, (selected, schema)) in partitions.iter().zip(schemas).enumerate() {
+                                                            let inherited = InheritedRelation::open(
+                                                                Arc::clone(root), archived.clone(), owner, &selected.relation, ancestors, &schema, memory,
+                                                            ).await?.at(ancestor_system).await?;
+                                                            inherited.nearest_shadows(selected, index, valid, &mut shadows, &mut remaining).await?;
+                                                        }
+                                                        Ok(shadows)
+                                                    }
+                                                },
+                                            ).await?;
+                                            Some(shadows)
+                                        } else {
+                                            overlay
+                                        };
+                                        let page = rtdb_node::nearest::owned_nearest_batch(scoped, &owner, &partitions, &query, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)
                                     };

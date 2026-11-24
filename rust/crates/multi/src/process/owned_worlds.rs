@@ -189,6 +189,24 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>> {
         Box::pin(HeldCheckpointWorld::ranked_search_at(self, partitions, query, offset, limit, valid, system, parent_only))
     }
+    fn nearest<'a>(
+        &'a self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, staged: Option<rtdb_node::nearest::HeldVectorOverlay>,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>> {
+        Box::pin(HeldCheckpointWorld::nearest(self, partitions, query, valid, staged))
+    }
+    fn nearest_at<'a>(
+        &'a self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, system: Timestamp, parent_only: bool,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>> {
+        Box::pin(HeldCheckpointWorld::nearest_at(self, partitions, query, valid, system, parent_only))
+    }
+    fn nearest_parent_at<'a>(
+        &'a self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>> {
+        Box::pin(HeldCheckpointWorld::nearest_parent_at(self, partitions, query, valid, system))
+    }
     fn range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>> {

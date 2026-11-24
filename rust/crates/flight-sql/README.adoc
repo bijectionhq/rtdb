@@ -730,6 +730,15 @@ The indexed branch limits the overlay to 4,096 shadow keys and 8 MiB of text, an
 The ranked reply carries the world present, requested valid instant, exact total and one held condition per partition, including for an empty result.
 Conditions validate the original archive pin and whole-corpus purge frontiers, plus the local relation touch frontier for writable worlds.
 
+`rtdb.owned.NearestHeldWorld.v1`, `rtdb.owned.NearestHeldWorldAt.v1` and `rtdb.owned.NearestHeldWorldParentAt.v1` rank the effective world view by exact cosine distance.
+Their prefixes are those of SearchHeldWorld.v2, SearchHeldWorldAt.v1 and SearchHeldWorldParentAt.v1: the 16-byte world handle, then for the At variant a selector byte (0 for the parent only, 1 for the effective world) and a big-endian i64 system revision, for the ParentAt variant a big-endian i64 system revision, then a big-endian i64 valid instant, and for the current variant a big-endian u32 overlay length and the optional overlay.
+The NearestHeld.v1 frame follows unchanged from its filter count to the probe, and the evidence flag must be one.
+A nonempty overlay uses the NearestHeld.v1 staged layout and requires the installed placed writer and the live Proposal's present as the valid instant.
+Local world rows, including tombstones, shadow the archived parent rows with the same identity, and frozen ancestor writers shadow the parent as in the world text search.
+The archived parent is ranked with the same filters, window, scan bound and anomalies as NearestHeld.v1.
+`rtdb.owned.search_scope` is the lowercase hex SHA-256 of the complete request body under the domain tags `rtdb.owned.nearest.world.v1`, `rtdb.owned.nearest.world-at.v1` and `rtdb.owned.nearest.world-parent-at.v1`, each terminated by a zero byte.
+The reply has the NearestHeld.v1 columns, carries the selected system revision (or the world present) and the requested valid instant, and one held world condition per partition.
+
 `rtdb.owned.RetainReplayedWorld.v5` retains a provisional world on the held restore writer.
 Each Held ancestor carries the original selected publication transaction and the separately protected archive end transaction.
 `rtdb.owned.PreflightHeldWorldAt.v2` and `rtdb.owned.SelectHeldWorldAsOf.v2` return the selected transaction ID, its SQL history time, the logical clock reading, and the world mode.

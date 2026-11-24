@@ -170,6 +170,19 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp, parent_only: bool,
     ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
+    /// Exact cosine neighbours of the effective world view (`NearestHeldWorld.v1`).
+    fn nearest<'a>(
+        &'a self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, staged: Option<rtdb_node::nearest::HeldVectorOverlay>,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
+    fn nearest_at<'a>(
+        &'a self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, system: Timestamp, parent_only: bool,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
+    fn nearest_parent_at<'a>(
+        &'a self, partitions: Vec<rtdb_node::nearest::NearestPartition>, query: rtdb_node::nearest::NearestQuery,
+        valid: Timestamp, system: Timestamp,
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
     fn range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
