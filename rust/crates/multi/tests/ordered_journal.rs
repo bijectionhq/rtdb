@@ -1960,6 +1960,15 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
     use rtdb_multi::journal::cell::{InstalledCell, Role};
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    struct Worker(Option<process::RunningNode>);
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if let Some(node) = &self.0 {
+                node.stop_renewing();
+            }
+        }
+    }
+
     let authority = Authority::new(Uuid::new_v4(), 2 << 20, 24 << 20, 32);
     let root = authority.data.path();
     let mut cohort = authority.cohort("runtime", None);
@@ -2022,7 +2031,7 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
 
     let node_settings = || {
         let mut agent = AgentOptions::new(storage.clone());
-        agent.installed_cell = Some(cell_file.clone());
+        agent.installed_cell = Some(cell.clone());
         agent.watch_interval = Duration::from_millis(50);
         process::NodeSettings {
             configuration: rtdb_server::config::NodeConfiguration::from_yaml(&format!(
@@ -2047,7 +2056,7 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
     };
     drop(control_port);
     drop(pgwire_port);
-    let node = process::start_node(directory.clone(), node_settings()).await.unwrap();
+    let mut node = Worker(Some(process::start_node(directory.clone(), node_settings()).await.unwrap()));
 
     let lifecycle = Identity::new(root, "lifecycle", &authority.issuer);
     let credentials: Credentials = serde_json::from_value(lifecycle.credentials.clone()).unwrap();
@@ -2114,17 +2123,20 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
     assert_eq!(lifecycle("install", &token, "empty", empty, true).await["outcome"], "refused");
 
     for (name, total) in [("alpha", 12), ("bravo", 34)] {
-        common::connect(&address, name).await.simple_query(
-            &format!("INSERT INTO orders (_id, total) VALUES (1, {total})"),
-        ).await.unwrap();
+        let client = common::connect(&address, name).await;
+        assert_eq!(common::values(&client, "SELECT 1").await, vec!["1"]);
+        client.simple_query(&format!("INSERT INTO orders (_id, total) VALUES (1, {total})"))
+            .await.unwrap();
     }
-    node.shutdown().await.unwrap();
+    assert_eq!(lifecycle("schedule_disposal", &disposal_token, "alpha", deployments[0], true).await["outcome"], "deferred");
+    node.0.take().unwrap().shutdown().await.unwrap();
     cohort.voters[0].stop().await;
     cohort.voters[0].stop = CancellationToken::new();
     cohort.voters[0].start();
     let voter = cohort.voters[0].address;
     eventually(async || TcpStream::connect(voter).await.ok()).await;
-    let replacement = process::start_node(directory.clone(), node_settings()).await.unwrap();
+    cohort.voters[1].stop().await;
+    let mut replacement = Worker(Some(process::start_node(directory.clone(), node_settings()).await.unwrap()));
     for (name, total) in [("alpha", "12"), ("bravo", "34")] {
         let result = common::connect(&address, name).await.simple_query("SELECT total FROM orders").await.unwrap();
         let values: Vec<_> = result.iter().filter_map(|message| match message {
@@ -2134,7 +2146,7 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
         assert_eq!(values, vec![total]);
     }
 
-    replacement.shutdown().await.unwrap();
+    replacement.0.take().unwrap().shutdown().await.unwrap();
     stop.cancel();
     gateway.await.unwrap().unwrap();
     installation.await.unwrap().unwrap();

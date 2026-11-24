@@ -61,7 +61,7 @@ pub struct AgentOptions {
     pub audience_journal_port: Option<u16>,
     pub storage: CellStorage,
     pub installed_journal_manifest: Option<std::path::PathBuf>,
-    pub installed_cell: Option<std::path::PathBuf>,
+    pub installed_cell: Option<Arc<crate::journal::cell::InstalledCell>>,
     pub world_archive: Option<CellStorage>,
     pub s3_write_role: Option<S3WriteRole>,
     pub replay_broker: Option<crate::replay_broker::Client>,

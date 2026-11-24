@@ -613,6 +613,8 @@ contract LogService {
     @invariant FreshJournalReadConsumesAnInvocation
         -- The journal admits a fresh barrier under the exact enrolled worker identity at its chosen head.
         -- The chosen read result authenticates the exact placement, reader enrollment, invocation and applied cut.
+        -- An empty journal's read cut selects an empty catalog with no transaction basis.
+        -- A published empty catalog names the exact replica floor and the current storage version and epoch.
         -- The receiving database applies the protected cut before the fresh read can proceed.
         -- Every read is a fresh admission under a new invocation, and the journal never replays an earlier read's result.
         -- A reader that loses a read's outcome releases it by invocation identity, and that release settles once the invocation can no longer be admitted.

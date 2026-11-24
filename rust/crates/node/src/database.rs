@@ -154,9 +154,19 @@ impl Database {
                     replica_epoch: self.logs.replica_epoch,
                     through,
                 }),
-                None => Some(self.partition.snapshot()).filter(|snapshot| {
-                    crate::read_selection::empty_catalog_matches_cut(snapshot.catalog_cut(), snapshot.tx_basis())
-                }),
+                None => {
+                    let floor = CatalogCut {
+                        storage_version: self.logs.storage_version,
+                        storage_epoch: self.logs.storage_epoch,
+                        replica_epoch: self.logs.replica_epoch,
+                        through: self.logs.replica_floor()?,
+                    };
+                    self.partition.published_snapshot(floor)
+                        .filter(|snapshot| snapshot.tx_basis().is_none())
+                        .or_else(|| Some(self.partition.snapshot()).filter(|snapshot| {
+                            crate::read_selection::empty_catalog_matches_cut(snapshot.catalog_cut(), snapshot.tx_basis())
+                        }))
+                }
             };
             if let Some(snapshot) = snapshot {
                 return tokio::select! {

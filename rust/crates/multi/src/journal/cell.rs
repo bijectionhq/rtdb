@@ -29,7 +29,7 @@ use crate::{
     keys::{JournalKey, KeyService},
 };
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledCell {
     pub cell: String,
@@ -50,7 +50,7 @@ pub struct InstalledCell {
     credentials: CredentialFiles,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Voter {
     voter: Uuid,
@@ -61,7 +61,7 @@ struct Voter {
     receipt_key: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Worker {
     worker: Uuid,
@@ -70,7 +70,7 @@ struct Worker {
     pgwire: String,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CredentialFiles {
     administrator: Option<PemFiles>,
@@ -79,7 +79,7 @@ struct CredentialFiles {
     custodian: Option<PemFiles>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PemFiles {
     certificate: PathBuf,

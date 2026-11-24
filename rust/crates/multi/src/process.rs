@@ -71,8 +71,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
     }
     let ordered = Arc::new(match (&settings.agent.installed_journal_manifest, &settings.agent.installed_cell) {
         (Some(_), Some(_)) => return Err(Anomaly::incorrect("rtdb.multi/installed-cell", "Choose one installed journal configuration")),
-        (None, Some(path)) => crate::journal::hosted::Routes::runtime(
-            crate::journal::cell::InstalledCell::read(path)?, settings.agent.storage.clone(),
+        (None, Some(cell)) => crate::journal::hosted::Routes::runtime(
+            Arc::clone(cell), settings.agent.storage.clone(),
         )?,
         (Some(path), None) => crate::journal::hosted::Routes::read(path, &settings.agent.storage, settings.agent.replay_broker.as_ref())?,
         (None, None) => crate::journal::hosted::Routes::default(),

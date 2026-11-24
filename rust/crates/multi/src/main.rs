@@ -33,7 +33,7 @@ Usage: rtdb-multi --build-info\n\
        rtdb-multi ordered-archive-identity --archive-root PATH --archive-prefix PREFIX\n\
        rtdb-multi prepare-ordered-deployment --route FILE --name NAME --org ORG --keys PATH [--directory DIR]\n\
        rtdb-multi logkeeper --directory DIR --listen ADDR --data PATH [--advertise-host HOST] [--zone ZONE] [--cache-bytes BYTES] [--no-fsync] [--audience-authority UUID/TURNS --audience-authority-listen ADDR]\n\
-       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH --keys PATH --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
+       rtdb-multi node [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --storage-root PATH [--keys PATH] --cache PATH [--archive-root PATH] [--config FILE] [--control ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --audience-journal-port PORT] [--advertise-host HOST] [--zone ZONE] [--engine-version VERSION] [--ecs-cluster ARN] [--park-after SECONDS] [--resident-idle-after SECONDS] [--min-residency SECONDS] [--max-active N] [--activations-per-second N] [--s3-write-role ARN] [--sts-endpoint URL] [--s3-compat-write-policy] [--replay-broker HOST:PORT --replay-broker-name DNS --replay-broker-ca FILE --replay-broker-token-file FILE] [--max-tail-rows N] [--isolation | --compaction-worker] [--no-local-compaction] [--memory-limit BYTES] [--cell-secret FILE]\n\
        rtdb-multi init-storage --storage-root PATH --keys PATH\n\
        rtdb-multi enroll-terminal-storage --storage-root URL --qualification FILE\n\
        rtdb-multi gateway [--directory DIR] [--installed-journals FILE | --installed-cell FILE] --listen ADDR [--flight-listen ADDR] [--flight-audience UUID/TURNS --flight-audience-listen ADDR --flight-audience-holder-port PORT] [--config FILE] [--cell NAME --cell-map ADDR] [--cell-secret FILE] [--max-connections N] [--max-connections-per-deployment N] [--max-buffered-bytes BYTES]\n\
@@ -545,11 +545,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             }
             let audience = configuration.flight_sql.as_ref().is_some_and(|flight| flight.audience.is_some());
             let installed_journals = arguments.optional("installed-journals").map(PathBuf::from);
-            let installed_cell = arguments.optional("installed-cell").map(PathBuf::from);
-            let runtime_cell = installed_cell.as_deref().map(rtdb_multi::journal::cell::InstalledCell::read).transpose()?;
-            let keys = match &runtime_cell {
-                Some(cell) => cell.keys.as_str(),
-                None => arguments.required("keys")?,
+            let installed_cell = arguments.optional("installed-cell")
+                .map(|path| rtdb_multi::journal::cell::InstalledCell::read(std::path::Path::new(path))).transpose()?;
+            let keys = match &installed_cell {
+                Some(cell) => cell.keys.clone(),
+                None => arguments.required("keys")?.to_owned(),
             };
             let directory: Arc<dyn rtdb_directory::Directory> = match arguments.optional("directory") {
                 Some(directory) => open_directory(directory, audience && arguments.present("audience-journal-port")).await?,
@@ -591,7 +591,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
                 agent, lease: LeaseOptions::default(), claim_wait: Duration::from_millis(2),
                 pool: if arguments.present("isolation") { rtdb_directory::MemberPool::Isolation } else if arguments.present("compaction-worker") { rtdb_directory::MemberPool::Compaction } else { rtdb_directory::MemberPool::General },
                 local_compaction: !arguments.present("no-local-compaction"), capabilities: cell_secret(&arguments)?,
-                keys: key_service(keys).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
+                keys: key_service(&keys).await?, cache_dir: PathBuf::from(arguments.required("cache")?),
             }).await?;
             eprintln!("node {} serving pgwire on {}, control on {}", node.lease.id(), node.pgwire_address, node.control_address);
             cancellation.cancelled().await;
