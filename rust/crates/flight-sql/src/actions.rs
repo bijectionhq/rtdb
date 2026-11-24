@@ -110,6 +110,24 @@ impl Service {
                     _ => return Err(Status::permission_denied("The reserved Flight session only admits audience observations")),
                 }
             }
+            use crate::owned_actions::{
+                COMMIT_ORDERED_V1, COMMIT_OWNED_V1, COMMIT_OWNED_V2, COMMIT_OWNED_V3, COMMIT_OWNED_V4,
+                CommitFormat, SPATIAL_HELD_OWNED_V1, SPATIAL_HELD_OWNED_V2, SPATIAL_HELD_OWNED_V3,
+                SPATIAL_OPEN_OWNED, SPATIAL_RANK_OPEN_OWNED, SPATIAL_RANK_OPEN_OWNED_V2, SpatialHeldWire,
+            };
+            // Sharing the await site keeps duplicate handler futures off the worker stack.
+            let spatial_wire = match action_type {
+                SPATIAL_OPEN_OWNED => Some(SpatialHeldWire::Open),
+                SPATIAL_RANK_OPEN_OWNED => Some(SpatialHeldWire::RankOpen),
+                SPATIAL_RANK_OPEN_OWNED_V2 => Some(SpatialHeldWire::RankWindow),
+                SPATIAL_HELD_OWNED_V1 => Some(SpatialHeldWire::V1),
+                SPATIAL_HELD_OWNED_V2 => Some(SpatialHeldWire::V2),
+                SPATIAL_HELD_OWNED_V3 => Some(SpatialHeldWire::V3),
+                _ => None,
+            };
+            if let Some(wire) = spatial_wire {
+                return Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, wire).await?)]);
+            }
             match action_type {
                 crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
                 crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
@@ -132,30 +150,27 @@ impl Service {
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 => Ok(vec![Ok(Box::pin(self.read_held_root_catalog_action(&call, &action.body)).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V1 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
-                crate::owned_actions::COMMIT_OWNED_V1 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Single).await?)]),
-                crate::owned_actions::COMMIT_OWNED_V2 => Ok(vec![Ok(self.commit_owned_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped).await?)]),
-                crate::owned_actions::COMMIT_OWNED_V3 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped, false).await?)]),
-                crate::owned_actions::COMMIT_ORDERED_V1 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Ordered, false).await?)]),
-                crate::owned_actions::COMMIT_OWNED_V4 => Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, crate::owned_actions::CommitFormat::Grouped, true).await?)]),
+                COMMIT_OWNED_V1 | COMMIT_OWNED_V2 => {
+                    let format = if action_type == COMMIT_OWNED_V1 { CommitFormat::Single } else { CommitFormat::Grouped };
+                    Ok(vec![Ok(self.commit_owned_action(&call, &action.body, format).await?)])
+                }
+                COMMIT_OWNED_V3 | COMMIT_ORDERED_V1 | COMMIT_OWNED_V4 => {
+                    let format = if action_type == COMMIT_ORDERED_V1 { CommitFormat::Ordered } else { CommitFormat::Grouped };
+                    Ok(vec![Ok(self.commit_owned_witnessed_action(&call, &action.body, format, action_type == COMMIT_OWNED_V4).await?)])
+                }
                 crate::owned_actions::COMMIT_OWNED_V7 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::SPATIAL_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::Open).await?)]),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
                     let ranked = action.r#type == crate::owned_actions::SPATIAL_RANK_NEXT_OWNED;
                     Ok(vec![Ok(self.next_spatial_owned_action(&call, &action.body, ranked).await?)])
                 }
-                crate::owned_actions::SPATIAL_RANK_OPEN_OWNED => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::RankOpen).await?)]),
-                crate::owned_actions::SPATIAL_RANK_OPEN_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::RankWindow).await?)]),
                 crate::owned_actions::SPATIAL_CLOSE_OWNED => {
                     self.close_spatial_owned_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::SPATIAL_HELD_OWNED_V1 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V1).await?)]),
-                crate::owned_actions::SPATIAL_HELD_OWNED_V2 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V2).await?)]),
-                crate::owned_actions::SPATIAL_HELD_OWNED_V3 => Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, crate::owned_actions::SpatialHeldWire::V3).await?)]),
                 PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),

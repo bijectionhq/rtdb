@@ -2377,13 +2377,13 @@ impl OwnedReadSession {
     ) -> Result<(rtdb_spatial::Page, Option<OwnedRangeWitness>)> {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
-        let work = async {
+        let work = Box::pin(async {
             if let Some(prepared) = prepared {
                 rtdb_spatial::read_prepared(Arc::clone(&context), &self.owner, relation, path, prepared, request, projection).await
             } else {
                 rtdb_spatial::read_held(Arc::clone(&context), &self.owner, relation, path, request, projection).await
             }
-        };
+        });
         let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
@@ -2397,11 +2397,11 @@ impl OwnedReadSession {
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
         let limit = request.limit;
-        let work = async {
+        let work = Box::pin(async {
             let ranking = rtdb_spatial::PreparedNearest::prepare(Arc::clone(&context), &self.owner, relation, path, request, after_radius).await?;
             let page = ranking.page(Arc::clone(&context), &self.owner, None, limit, projection).await?;
             Ok::<_, Anomaly>((ranking, page))
-        };
+        });
         let (ranking, page) = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
@@ -2418,7 +2418,7 @@ impl OwnedReadSession {
         self.admit_read().await?;
         let relation = held.ranking.relation();
         let context = self.relation_context(relation)?;
-        let work = held.ranking.page(Arc::clone(&context), &self.owner, Some(after), limit, projection);
+        let work = Box::pin(held.ranking.page(Arc::clone(&context), &self.owner, Some(after), limit, projection));
         let page = context.reading(work).await?;
         let witness = if observe { self.relation_witness(relation)? } else { None };
         self.check_relation(relation)?;
