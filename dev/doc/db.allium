@@ -389,6 +389,10 @@ variant Detach : DbOp {
 -- Messages on the source log. Written by clients, by the leader (flush-block), and by the block upload and the compactor (tries-added).
 -- An append retains its encoded record for as long as the log holds those bytes.
 -- The encoder releases temporary memory before handing the record to the log.
+-- A writable native local log collects ready appends in queue order within a byte budget and collection deadline.
+-- A frame above the byte budget occupies its own batch.
+-- A successful flush makes the batch's records visible and completes their append receipts.
+-- Reopening checks each frame in order and reports an incomplete final frame at its offset.
 
 entity SourceMessage {
     msg_id: MessageId
@@ -2120,6 +2124,7 @@ open question "How should operator-selected skipped transactions be represented 
     -- The resolver establishes the original placed outcome from the unmodified source record.
     -- Each ordered source transaction carries the raw append observation and the greatest such observation through its predecessor.
     -- The receipt clock advances atomically with the transaction outcome in the replica record and is restored at checkpoint recovery.
+    -- The native resolver carries the receipt clock with its resolved head and consults transaction history for the initial recovered predecessor.
     -- New transaction metadata is stored in finite-lived rows outside durable transaction-result history.
     -- Placed intake is provisional until the installed receiver durably reserves the scoped slot and its settlement capacity.
     -- Applied source progress retires provisional intake bytes, while unresolved receiver obligations remain charged.

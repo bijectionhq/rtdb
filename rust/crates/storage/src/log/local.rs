@@ -8,7 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -22,6 +22,8 @@ const RETIRED_SEALED_SEPARATOR: u8 = 0x1b;
 pub(super) fn is_record_separator(byte: u8) -> bool {
     matches!(byte, RECORD_SEPARATOR | RETIRED_SEPARATOR | SEALED_SEPARATOR | RETIRED_SEALED_SEPARATOR)
 }
+const APPEND_BATCH_BYTES: usize = 256 * 1024;
+const APPEND_BATCH_TIME: Duration = Duration::from_millis(1);
 const MAXIMUM_POLL_RECORDS: usize = 1024;
 const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
@@ -31,6 +33,13 @@ pub struct LocalLogOptions {
 }
 
 struct Queued { payload: Bytes, timestamp: Timestamp, durable: oneshot::Sender<Result<LogMetadata>> }
+
+impl Queued {
+    fn frame_bytes(&self, sealed: bool) -> usize {
+        self.payload.len() + (HEADER_BYTES + TRAILER_BYTES) as usize
+            + if sealed { LOG_SEAL_OVERHEAD } else { 0 }
+    }
+}
 
 pub struct LocalLog {
     path: Arc<PathBuf>,
@@ -279,10 +288,12 @@ impl Writer {
     fn append(&mut self, records: &[Queued]) -> Result<Vec<LogMetadata>> {
         let start = self.file.seek(SeekFrom::End(0)).map_err(|error| Error::io(self.path.as_ref(), error))?;
         let result = (|| {
+            let sealed = self.keys.is_some();
+            let mut bytes = Vec::with_capacity(records.iter().map(|record| record.frame_bytes(sealed)).sum());
             let mut metadata = Vec::with_capacity(records.len());
+            let mut offset = start;
             for record in records {
                 let timestamp = self.timestamps.timestamp(&record.payload, record.timestamp)?;
-                let offset = self.file.stream_position().map_err(|error| Error::io(self.path.as_ref(), error))?;
                 let payload = match &self.keys {
                     Some(keys) => keys.seal_record(offset as i64, timestamp.0, &record.payload)?,
                     None => record.payload.clone(),
@@ -290,15 +301,15 @@ impl Writer {
                 let end = offset.checked_add(HEADER_BYTES + payload.len() as u64 + TRAILER_BYTES)
                     .filter(|end| *end < 1 << 48)
                     .ok_or_else(|| corrupt(&self.path, offset, "local log offset space exhausted"))?;
-                let mut bytes = Vec::with_capacity((end - offset) as usize);
-                bytes.push(if self.keys.is_some() { SEALED_SEPARATOR } else { RECORD_SEPARATOR });
+                bytes.push(if sealed { SEALED_SEPARATOR } else { RECORD_SEPARATOR });
                 bytes.extend_from_slice(&(payload.len() as i32).to_be_bytes());
                 bytes.extend_from_slice(&timestamp.0.to_be_bytes());
                 bytes.extend_from_slice(&payload);
                 bytes.extend_from_slice(&(offset as i64).to_be_bytes());
-                self.file.write_all(&bytes).map_err(|error| Error::io(self.path.as_ref(), error))?;
                 metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp });
+                offset = end;
             }
+            self.file.write_all(&bytes).map_err(|error| Error::io(self.path.as_ref(), error))?;
             crate::sync_file(&self.file).map_err(|error| Error::io(self.path.as_ref(), error))?;
             Ok(metadata)
         })();
@@ -313,17 +324,17 @@ impl Writer {
 
 impl LocalLogDriver {
     pub async fn run(mut self, shutdown: CancellationToken) -> Result<()> {
+        let mut next = None;
         loop {
             let first = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => break,
-                record = self.queue.recv() => match record { Some(record) => record, None => break },
+                record = async { match next.take() { Some(record) => Some(record), None => self.queue.recv().await } } =>
+                    match record { Some(record) => record, None => break },
             };
-            let mut records = vec![first];
-            while records.len() < 10 {
-                match self.queue.try_recv() { Ok(record) => records.push(record), Err(_) => break }
-            }
             let mut writer = self.writer.take().ok_or_else(|| Error::Closed("local writer unavailable".into()))?;
+            let (records, deferred) = self.ready_batch(first, writer.keys.is_some(), Instant::now() + APPEND_BATCH_TIME);
+            next = deferred;
             let joined = tokio::task::spawn_blocking(move || {
                 let result = writer.append(&records);
                 (writer, records, result)
@@ -332,7 +343,7 @@ impl LocalLogDriver {
                 Ok(result) => result,
                 Err(error) => {
                     self.progress.fail(error.to_string());
-                    self.reject_pending(error.to_string());
+                    self.reject_pending(next, error.to_string());
                     return Err(Error::Task(error.to_string()));
                 }
             };
@@ -346,18 +357,34 @@ impl LocalLogDriver {
                     let reason = error.to_string();
                     self.progress.fail(reason.clone());
                     for record in records { let _ = record.durable.send(Err(Error::Closed(reason.clone()))); }
-                    self.reject_pending(reason);
+                    self.reject_pending(next, reason);
                     return Err(error);
                 }
             }
         }
-        self.reject_pending("local log shutdown before append".into());
+        self.reject_pending(next, "local log shutdown before append".into());
         self.progress.close();
         Ok(())
     }
 
-    fn reject_pending(&mut self, reason: String) {
+    fn ready_batch(&mut self, first: Queued, sealed: bool, deadline: Instant) -> (Vec<Queued>, Option<Queued>) {
+        let mut bytes = first.frame_bytes(sealed);
+        let mut records = vec![first];
+        while bytes < APPEND_BATCH_BYTES && Instant::now() < deadline {
+            let Ok(record) = self.queue.try_recv() else { break; };
+            let size = record.frame_bytes(sealed);
+            if size > APPEND_BATCH_BYTES - bytes {
+                return (records, Some(record));
+            }
+            records.push(record);
+            bytes += size;
+        }
+        (records, None)
+    }
+
+    fn reject_pending(&mut self, deferred: Option<Queued>, reason: String) {
         self.queue.close();
+        if let Some(record) = deferred { let _ = record.durable.send(Err(Error::Closed(reason.clone()))); }
         while let Ok(record) = self.queue.try_recv() { let _ = record.durable.send(Err(Error::Closed(reason.clone()))); }
     }
 }
@@ -567,6 +594,76 @@ mod tests {
         assert_eq!(records[0].payload, body);
         shutdown.cancel();
         writer.await.unwrap()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_append_batch_defers_the_first_frame_that_exceeds_its_byte_budget() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, mut driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions {
+            maximum_message_bytes: APPEND_BATCH_BYTES,
+            queue_capacity: 3,
+        })?;
+        let size = APPEND_BATCH_BYTES / 2;
+        let _first = log.enqueue(Bytes::from(vec![1; size]), Timestamp(1)).await?;
+        let _second = log.enqueue(Bytes::from(vec![2; size]), Timestamp(2)).await?;
+        let _third = log.enqueue(Bytes::from_static(b"last"), Timestamp(3)).await?;
+        let first_record = driver.queue.try_recv().unwrap();
+        let (batch, deferred) = driver.ready_batch(first_record, false, Instant::now() + Duration::from_secs(5));
+        assert_eq!(batch.len(), 1);
+        assert_eq!(deferred.unwrap().timestamp, Timestamp(2));
+        assert_eq!(driver.queue.try_recv().unwrap().timestamp, Timestamp(3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_append_batch_drains_ready_frames_until_its_deadline() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let (log, mut driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions {
+            maximum_message_bytes: 1024,
+            queue_capacity: 16,
+        })?;
+        let mut receipts = Vec::new();
+        for time in 0..16 {
+            receipts.push(log.enqueue(Bytes::from_static(b"frame"), Timestamp(time)).await?);
+        }
+        let first = driver.queue.try_recv().unwrap();
+        let (mut expired, deferred) = driver.ready_batch(first, false, Instant::now());
+        assert_eq!(expired.len(), 1);
+        assert!(deferred.is_none());
+
+        let (ready, deferred) = driver.ready_batch(expired.pop().unwrap(), false, Instant::now() + Duration::from_secs(5));
+        assert!(deferred.is_none());
+        assert_eq!(ready.iter().map(|record| record.timestamp.0).collect::<Vec<_>>(), (0..16).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_append_batch_reopen_reads_a_complete_prefix_and_rejects_a_torn_frame() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 3 };
+        let (_, mut driver) = LocalLog::open(&path, options())?;
+        let mut writer = driver.writer.take().unwrap();
+        let record = |payload: &'static [u8], time| Queued {
+            payload: Bytes::from_static(payload), timestamp: Timestamp(time), durable: oneshot::channel().0,
+        };
+        let committed = writer.append(&[record(b"acknowledged", 1)])?[0];
+        let metadata = writer.append(&[record(b"complete", 2), record(b"torn", 3), record(b"absent", 4)])?;
+        writer.file.set_len(metadata[1].offset.0 as u64 + HEADER_BYTES + 2)
+            .map_err(|error| Error::io(&path, error))?;
+        drop(writer);
+        assert!(matches!(LocalLog::open(&path, options()), Err(Error::CorruptLog { offset, .. })
+            if offset == metadata[1].offset.0 as u64));
+
+        let file = OpenOptions::new().write(true).open(&path).map_err(|error| Error::io(&path, error))?;
+        file.set_len(metadata[1].offset.0 as u64).map_err(|error| Error::io(&path, error))?;
+        drop(file);
+        let (reopened, _driver) = LocalLog::open(&path, options())?;
+        assert_eq!(reopened.latest()?, metadata[0].offset);
+        let records = reopened.read_range(committed.offset, metadata[1].offset).await?;
+        assert_eq!(records.iter().map(|record| record.payload.as_ref()).collect::<Vec<_>>(),
+            [b"acknowledged".as_slice(), b"complete".as_slice()]);
         Ok(())
     }
 

@@ -25,13 +25,18 @@ impl RetentionClock {
 
 impl OpenTransaction<'_> {
     /// The predecessor belongs to this installed history, including any staged transactions.
-    pub(super) async fn observe_retention_clock(&self, appended: Timestamp) -> Result<RetentionClock> {
-        let snapshot = self.buffer.base_snapshot();
-        let Some(predecessor) = snapshot.tx_basis() else {
-            return Ok(RetentionClock::observe(None, self.decision.map_or(appended, |sample| sample.instant)));
+    pub(super) async fn observe_retention_clock(&self, appended: Timestamp, resolved_receipt_time: Option<Timestamp>) -> Result<RetentionClock> {
+        let previous = if let Some(time) = resolved_receipt_time {
+            Some(time)
+        } else {
+            let snapshot = self.buffer.base_snapshot();
+            if let Some(predecessor) = snapshot.tx_basis() {
+                let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
+                installed_receipt_time(context, predecessor).await?
+            } else {
+                None
+            }
         };
-        let context = self.context.query_context(snapshot, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let previous = installed_receipt_time(context, predecessor).await?;
         Ok(match self.decision {
             Some(sample) => RetentionClock { time: sample.instant, previous },
             None => RetentionClock::observe(previous, appended),

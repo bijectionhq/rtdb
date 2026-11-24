@@ -228,8 +228,13 @@ pub struct WriterPublication<'a> {
     pub maximum_timed_original_bytes: Option<usize>,
 }
 
+struct ResolvedHead {
+    key: TransactionKey,
+    receipt_time: Option<Timestamp>,
+}
+
 pub struct TxResolver {
-    resolved_head: Option<TransactionKey>,
+    resolved_head: Option<ResolvedHead>,
     source_position: SourcePosition,
     external_token: Option<Vec<u8>>,
     queue: VecDeque<Arc<ResolvedTx>>,
@@ -241,9 +246,10 @@ impl TxResolver {
     pub fn new(seed: Option<TransactionKey>, source_position: SourcePosition, external_token: Option<Vec<u8>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let token_reservation = memory.reserve(external_token.as_ref().map_or(0, Vec::capacity).checked_add(512).ok_or_else(overflow)?)?;
         let queue_reservation = memory.reserve(128)?;
-        Ok(Self { resolved_head: seed, source_position, external_token, queue: VecDeque::new(), memory: Arc::clone(memory), token_reservation, queue_reservation })
+        Ok(Self { resolved_head: seed.map(|key| ResolvedHead { key, receipt_time: None }), source_position, external_token, queue: VecDeque::new(), memory: Arc::clone(memory), token_reservation, queue_reservation })
     }
-    pub fn resolved_head(&self) -> Option<TransactionKey> { self.resolved_head }
+    pub fn resolved_head(&self) -> Option<TransactionKey> { self.resolved_head.as_ref().map(|head| head.key) }
+    fn latest_receipt_time(&self) -> Option<Timestamp> { self.resolved_head.as_ref().and_then(|head| head.receipt_time) }
     pub fn source_position(&self) -> SourcePosition { self.source_position }
     pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
     pub fn staged_rows(&self) -> Result<u64> { self.queue.iter().try_fold(0u64, |rows, tx| rows.checked_add(tx.writes.row_count()?).ok_or_else(overflow)) }
@@ -264,7 +270,7 @@ impl TxResolver {
     pub fn resolving_snapshot(&self, durable: Snapshot) -> Result<Snapshot> {
         let writes = self.queue.iter().map(|tx| Arc::clone(&tx.writes)).collect::<Vec<_>>();
         let snapshot = durable.with_staged(&writes)?;
-        if snapshot.tx_basis() != self.resolved_head { return Err(Anomaly::fault("rtdb.tx/resolved-basis", "Resolver head differs from durable and staged snapshots")); }
+        if snapshot.tx_basis() != self.resolved_head() { return Err(Anomaly::fault("rtdb.tx/resolved-basis", "Resolver head differs from durable and staged snapshots")); }
         Ok(snapshot)
     }
 
@@ -290,7 +296,7 @@ impl TxResolver {
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
         let error = crate::RetainedAnomaly::new(reason, &context.memory)?;
         let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
-        let clock = tx.observe_retention_clock(log_time).await?;
+        let clock = tx.observe_retention_clock(log_time, self.latest_receipt_time()).await?;
         let receipt_time = clock.time;
         if !fenced { tx.retire_expired_receipts(clock).await?; }
         tx.write_result(&result, None, Some(log_time), receipt_time)?;
@@ -301,7 +307,8 @@ impl TxResolver {
         let input = attempt.map_or(ResolvedInput::Position(position), |attempt| ResolvedInput::Placed {
             attempt, retirement: context.placed_receipt_retirement,
         });
-        self.stage(tx.buffer.stage()?, result, input, None, None, context)
+        let resolved = ResolvedTx::new(tx.buffer.stage()?, result, input, None, None, context)?;
+        self.stage_resolved(resolved, receipt_time)
     }
 
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -357,7 +364,7 @@ impl TxResolver {
             let observed = decision.ok_or_else(|| Anomaly::incorrect(
                 "rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable",
             ))?;
-            crate::system_time::clock_slot_time(slot, self.resolved_head, log_time, observed)
+            crate::system_time::clock_slot_time(slot, self.resolved_head(), log_time, observed)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"))
         }).transpose();
         let key = TransactionKey {
@@ -386,7 +393,7 @@ impl TxResolver {
             Some(SourceGuard::Replay(replay)) => Some(replay),
             _ => None,
         };
-        let clock = tx.observe_retention_clock(log_time).await?;
+        let clock = tx.observe_retention_clock(log_time, self.latest_receipt_time()).await?;
         let receipt_time = clock.time;
         let bounded_receipt = if let Some(SourceGuard::Bounded(retry)) = &request.guard {
             let scope = retry::RetryScope::new(attempt.map(PlacedAttempt::scope));
@@ -559,14 +566,14 @@ impl TxResolver {
             resolved = tx.finish_source(result, input, log_time, clock, &[], None).await?;
         }
         context.check_cancelled()?;
-        self.stage_resolved(resolved)
+        self.stage_resolved(resolved, receipt_time)
     }
 
     pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
         context.check_cancelled()?;
         let durable = rtdb_query::retain_catalog_snapshot(durable, &context.storage).await?;
         let base = self.resolving_snapshot(durable)?;
-        let id = self.resolved_head.map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
+        let id = self.resolved_head().map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
         let system_time = system_time.filter(|requested| crate::system_time::admits_historical_time(
             self.previous_system_time(), requested.0, now.0,
         )).unwrap_or_else(|| self.history_time(now));
@@ -581,11 +588,13 @@ impl TxResolver {
                 (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, user_metadata)
             }
         };
-        let clock = tx.observe_retention_clock(now).await?;
+        let clock = tx.observe_retention_clock(now, self.latest_receipt_time()).await?;
         tx.retire_expired_receipts(clock).await?;
         tx.write_result(&result, metadata.as_ref(), None, clock.time)?;
         context.check_cancelled()?;
-        self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(self.source_position), token, None, context)
+        let input = ResolvedInput::Position(self.source_position);
+        let resolved = ResolvedTx::new(tx.buffer.stage()?, result, input, token, None, context)?;
+        self.stage_resolved(resolved, clock.time)
     }
 
     pub async fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
@@ -599,12 +608,14 @@ impl TxResolver {
         };
         let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
         let mut tx = OpenTransaction::new(base, key, &options, context)?;
-        let clock = tx.observe_retention_clock(log_time).await?;
+        let clock = tx.observe_retention_clock(log_time, self.latest_receipt_time()).await?;
         let receipt_time = clock.time;
         tx.retire_expired_receipts(clock).await?;
         tx.write_result(&result, None, Some(log_time), receipt_time)?;
         context.check_cancelled()?;
-        self.stage(tx.buffer.stage()?, result, ResolvedInput::Position(position), None, operation, context)
+        let input = ResolvedInput::Position(position);
+        let resolved = ResolvedTx::new(tx.buffer.stage()?, result, input, None, operation, context)?;
+        self.stage_resolved(resolved, receipt_time)
     }
 
     fn history_time(&self, appended: Timestamp) -> Timestamp {
@@ -621,18 +632,14 @@ impl TxResolver {
             .ok_or_else(|| Anomaly::incorrect("xtdb/time-overflow", "Timestamp has no following chronon"))
     }
 
-    fn previous_system_time(&self) -> Option<i64> { self.resolved_head.map(|key| key.system_time.0) }
+    fn previous_system_time(&self) -> Option<i64> { self.resolved_head().map(|key| key.system_time.0) }
 
-    fn stage(&mut self, writes: StagedWrite, result: TransactionResult, input: ResolvedInput, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
-        self.stage_resolved(ResolvedTx::new(writes, result, input, token, db_op, context)?)
-    }
-
-    fn stage_resolved(&mut self, resolved: ResolvedTx) -> Result<Arc<ResolvedTx>> {
+    fn stage_resolved(&mut self, resolved: ResolvedTx, receipt_time: Timestamp) -> Result<Arc<ResolvedTx>> {
         let position = resolved.source_position();
         if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
         let key = resolved.result.tx_key();
         match control_order::source_order(
-            resolved.placed_attempt().is_some(), position.0, self.resolved_head.map(|head| head.tx_id.0), key.tx_id.0,
+            resolved.placed_attempt().is_some(), position.0, self.resolved_head().map(|head| head.tx_id.0), key.tx_id.0,
         ) {
             control_order::SourceOrder::PlacedPositionMismatch =>
                 return Err(Anomaly::fault("rtdb.tx/placed-attempt-position", "A placed attempt must match its transaction result")),
@@ -652,7 +659,7 @@ impl TxResolver {
         }
         let resolved = Arc::new(resolved);
         self.queue.push_back(Arc::clone(&resolved));
-        self.resolved_head = Some(key);
+        self.resolved_head = Some(ResolvedHead { key, receipt_time: Some(receipt_time) });
         self.source_position = position;
         if let Some(token) = &resolved.external_token {
             self.external_token = Some(token.clone());
@@ -3134,8 +3141,10 @@ impl<'a> OpenTransaction<'a> {
             Some(id.handle_bytes().into())
         };
         if self.snapshot()?.contains_table(table) {
-            let _ = self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
-            if create_only && self.read_owned_revision(owner, relation, id, valid).await?.is_some() {
+            let existing = self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
+            if create_only && existing.is_some()
+                && self.read_owned_revision(owner, relation, id, valid).await?.is_some()
+            {
                 return Err(insert_exists());
             }
         }

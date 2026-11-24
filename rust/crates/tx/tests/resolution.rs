@@ -554,6 +554,50 @@ async fn owned_commit_checks_deadline_and_exact_point_before_mutation() {
 }
 
 #[tokio::test]
+async fn resolving_owned_batch_checks_prior_writes_and_keeps_its_receipt_clock_on_recovery() {
+    use rtdb_types::OwnedRelation;
+
+    let context = context();
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let relation = OwnedRelation::new("batched_commits").unwrap();
+    let create = |from, until| SourceTransaction::new(vec![TxOp::OwnedInsertDocs {
+        relation: relation.clone(),
+        documents: Documents::new(vec![document(7)], &context.memory).unwrap(),
+        valid_from: Some(Timestamp(from)),
+        valid_to: Some(Timestamp(until)),
+    }], SubmitOptions { user: Some("owner".into()), ..SubmitOptions::default() }, &context.memory).unwrap();
+    let receipt_time = |resolved: &rtdb_tx::ResolvedTx| {
+        let history = &resolved.writes().tables()[&TableRef::new("xt", "txs")];
+        let StoredOperation::Put(row) = history.batch().unwrap().view().read_event(0).unwrap().operation else {
+            panic!("expected transaction result row");
+        };
+        row["receipt_time"].clone()
+    };
+
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(state.snapshot(), SourcePosition(0), Timestamp(100), create(0, 10), &context).await.unwrap();
+    let duplicate = resolver.resolve_source(state.snapshot(), SourcePosition(1), Timestamp(99), create(5, 15), &context).await.unwrap();
+    let adjacent = resolver.resolve_source(state.snapshot(), SourcePosition(2), Timestamp(98), create(10, 20), &context).await.unwrap();
+    assert!(first.result().committed());
+    assert_eq!(duplicate.result().error().unwrap().code, "rtdb.tx/exists");
+    assert!(!duplicate.writes().tables().contains_key(&relation.table("owner")));
+    assert!(adjacent.result().committed());
+    assert!(matches!(receipt_time(&first), Value::Timestamp { value: 100, .. }));
+    assert_eq!(receipt_time(&duplicate), receipt_time(&first));
+    assert_eq!(receipt_time(&adjacent), receipt_time(&first));
+    assert_eq!(state.snapshot().tx_basis(), None);
+
+    while let Some(resolved) = resolver.take_head() {
+        state.apply(resolved.writes()).unwrap();
+    }
+    let mut recovered = TxResolver::new(Some(adjacent.result().tx_key()), SourcePosition(2), None, &context.memory).unwrap();
+    let next = recovered.resolve_source(state.snapshot(), SourcePosition(3), Timestamp(97),
+        request(vec![], &context), &context).await.unwrap();
+    assert!(next.result().committed());
+    assert_eq!(receipt_time(&next), receipt_time(&first));
+}
+
+#[tokio::test]
 async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let captured = state.value().snapshot();
@@ -580,6 +624,7 @@ async fn staged_snapshot_requires_the_predecessor_and_block_of_each_overlay() {
     let after_apply = resolver.resolving_snapshot(state.value().snapshot()).unwrap();
     assert_eq!(after_apply.tx_basis(), before_apply.tx_basis());
     assert_eq!(after_apply.iter_segments(&table()).count(), 2);
+    assert!(Arc::ptr_eq(&before_apply.segments(&table())[0], &after_apply.segments(&table())[0]));
     assert_eq!(state.value().snapshot().tx_basis(), Some(first.result().tx_key()));
     assert!(!captured.contains_table(&table()));
 }

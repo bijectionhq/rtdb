@@ -9,6 +9,11 @@ The drain includes queued reads whose caller futures have been cancelled.
 `LocalLog`, `MemoryLog`, and their cursors are passive capabilities.
 The progress channel is a monitor carrying the current tip or terminal failure.
 
+A writable local log groups ready appends in queue order within a byte budget and collection deadline.
+A frame larger than the batch budget occupies its own batch.
+The writer flushes the complete batch before advancing the visible tip or completing any append receipt.
+The batch uses the ordinary record framing, so reopening validates each frame and reports a torn final frame at its byte offset.
+
 A memory tail returns up to 1,024 consecutive records per poll.
 The total payload is limited to the greater of 128 MiB and the maximum accepted message size.
 The next poll resumes after the last delivered record.

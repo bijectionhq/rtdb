@@ -582,6 +582,7 @@ pub struct StagedWrite {
     predecessor: Option<TransactionKey>,
     block_index: BlockIndex,
     tables: BTreeMap<TableRef, TableWrite>,
+    segments: OnceLock<BTreeMap<TableRef, Arc<LiveTable>>>,
 }
 impl StagedWrite {
     pub fn new(tx_key: TransactionKey, predecessor: Option<TransactionKey>, block_index: BlockIndex, tables: BTreeMap<TableRef, TableWrite>) -> Result<Self> {
@@ -600,13 +601,23 @@ impl StagedWrite {
                 }
             }
         }
-        Ok(Self { tx_key, predecessor, block_index, tables })
+        Ok(Self { tx_key, predecessor, block_index, tables, segments: OnceLock::new() })
     }
     pub fn tx_key(&self) -> TransactionKey { self.tx_key }
     pub fn predecessor(&self) -> Option<TransactionKey> { self.predecessor }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
     pub fn tables(&self) -> &BTreeMap<TableRef, TableWrite> { &self.tables }
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
+
+    pub(crate) fn staged_segments(&self) -> Result<&BTreeMap<TableRef, Arc<LiveTable>>> {
+        if let Some(segments) = self.segments.get() { return Ok(segments); }
+        let segments = self.tables.iter().map(|(table, write)| {
+            let segment = LiveTable::new(table.clone(), self.block_index, TrieConfig::default())
+                .append(write, self.tx_key.system_time)?;
+            Ok((table.clone(), Arc::new(segment)))
+        }).collect::<Result<_>>()?;
+        Ok(self.segments.get_or_init(|| segments))
+    }
 
     /// Attach sealed application tables to the order-assigned transaction metadata.
     /// Both stages belong to the same assigned source transaction and durable predecessor.
@@ -618,6 +629,7 @@ impl StagedWrite {
             return Err(invalid("Prepared generation differs from the ordered transaction"));
         }
         let effect_count = prepared.row_count()?;
+        self.segments.take();
         self.shift_event_ordinals(effect_count, memory)?;
         self.tables.extend(prepared.tables);
         Ok(())
@@ -642,6 +654,7 @@ impl StagedWrite {
     }
 
     pub fn assign_event_origins(mut self, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        self.segments.take();
         let commit = rtdb_types::EventOrigin::new_commit();
         let block = self.block_index;
         let mut first = 0u64;

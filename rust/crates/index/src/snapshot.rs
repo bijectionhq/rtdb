@@ -2,7 +2,6 @@ use rtdb_types::StructFields;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use rtdb_trie::TrieConfig;
 use rtdb_types::{Anomaly, BlockIndex, CatalogCheckpoint, CatalogCut, LogicalType, OwnedRelation, ReplicaPosition, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, TrieState, absent_type};
@@ -264,11 +263,12 @@ impl Snapshot {
             if write.predecessor() != next.basis || write.block_index() != self.block_index() {
                 return Err(Anomaly::incorrect("rtdb.index/overlay-order", "Staged overlay does not follow the snapshot basis and block"));
             }
-            for (table, delta) in write.tables() {
-                let segment = LiveTable::new(table.clone(), write.block_index(), TrieConfig::default()).append(delta, write.tx_key().system_time)?;
-                next.layered.entry(table.clone()).or_default().push(Arc::new(segment));
+            for (table, segment) in write.staged_segments()? {
+                next.layered.entry(table.clone()).or_default().push(Arc::clone(segment));
             }
-            next.table_catalog = Arc::new(next.table_catalog.with_entries_for(write.tables().keys().cloned())?);
+            if write.tables().keys().any(|table| next.table_catalog.entry(table).is_none()) {
+                next.table_catalog = Arc::new(next.table_catalog.with_entries_for(write.tables().keys().cloned())?);
+            }
             next.basis = Some(write.tx_key());
             next.system_time_cap = Some(write.tx_key().system_time);
         }

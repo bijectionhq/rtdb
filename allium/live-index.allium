@@ -32,6 +32,7 @@
 --   The resolver compares every inherited link and the appended parent edge with the accepted predecessor before it can publish the child.
 --   Row-based operations carry homogeneous floating-point lists as typed Arrow component buffers.
 --   Staged rows ARE read, by the transactions resolving behind them (read-your-writes), and that stays within the discipline only because the reader is the same owner — the term's own coroutine.
+--   Native resolving snapshots reuse the immutable index segment of each staged write until its read-back.
 --   Nothing else may read staged rows.
 --
 -- A hosted Proposal landing prepares private immutable table segments from its complete admitted footprint at the offered clock.
