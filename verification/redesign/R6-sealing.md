@@ -93,3 +93,6 @@ Hosted retirement authenticates each selected pack member under its serving slot
 The lineage grant binds the resulting withdrawal plan by digest.
 A versioned provider census checks both loose aliases and pack members at every data version.
 The owner reopens that plan after a restart and withdraws its slots after the exact provider settlement.
+A hosted pack attempt links its registered member slots before admitting physical provider writes.
+An admitted attempt keeps its first upload identity across retries.
+The original region owner aborts that upload before withdrawing any unsubmitted or rejected member slots.

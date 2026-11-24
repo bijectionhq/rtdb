@@ -640,10 +640,81 @@ struct DirectoryPublications {
     owner: PublicationOwner,
 }
 
+impl DirectoryPublications {
+    async fn attach_pack(&self, pack: &ObjectKey, root: &str, body: &[u8]) -> rtdb_storage::Result<Option<Uuid>> {
+        let index = crate::packing::read_pack_index_with(pack, body.len() as u64, 16 << 20, |range| {
+            let bytes = body.get(range.start as usize..range.end as usize)
+                .ok_or_else(|| Error::ConflictingObject(pack.to_string())).map(Bytes::copy_from_slice);
+            std::future::ready(bytes)
+        }).await?;
+        let members: Vec<_> = index.entries.into_iter().filter_map(|(name, extent)| {
+            let start = usize::try_from(extent.offset).ok()?;
+            let end = start.checked_add(rtdb_types::ServingPublication::BYTES)?;
+            if extent.length < rtdb_types::ServingPublication::BYTES as u64 { return None; }
+            let unit = rtdb_types::ServingPublication::from_prefix(body.get(start..end)?)?;
+            Some((name, unit))
+        }).collect();
+        let fresh = Uuid::new_v4();
+        for _ in 0..8 {
+            let mut record = self.directory.deployment(&self.deployment).await
+                .map_err(|error| publication_error(pack, error))?
+                .ok_or_else(|| Error::Closed("The pack residence is absent".into()))?;
+            let origin = UnitScope::publication_origin(&record.storage_prefix());
+            require_publication_key(&record, None, pack).map_err(|error| publication_error(pack, error))?;
+            let Some(StorageRegion::Remote { archive: None, closed: false, publications, .. }) =
+                record.storage_regions.get_mut(&self.region)
+            else { return Err(Error::Closed("The pack publication region is closed".into())); };
+            let mut attached = None;
+            let mut participants = Vec::new();
+            for (name, unit) in &members {
+                if unit.origin != origin { continue; }
+                let Some(member) = publications.get(&unit.attempt) else { continue; };
+                if member.unit.as_ref().is_none_or(|(logical, expected)| logical != name || expected != unit)
+                    || member.key != format!("{root}/{name}") || !member.upload_id.is_empty() || member.rejected
+                {
+                    return Err(Error::Closed("A pack member has a different admitted attempt".into()));
+                }
+                if let Some(chosen) = member.container {
+                    if attached.is_some_and(|prior| prior != chosen) {
+                        return Err(Error::Closed("Pack members already belong to different uploads".into()));
+                    }
+                    attached = Some(chosen);
+                }
+                participants.push(unit.attempt);
+            }
+            if participants.is_empty() { return Ok(None); }
+            if let Some(attempt) = attached {
+                if publications.get(&attempt).is_none_or(|record| record.key != pack.as_str() || record.rejected)
+                    || participants.iter().any(|id| publications[id].container != Some(attempt))
+                    || publications.iter().any(|(id, member)| member.unit.is_some()
+                        && member.container == Some(attempt) && !participants.contains(id))
+                {
+                    return Err(Error::Closed("A previous attempt already owns this pack member set".into()));
+                }
+                return Ok(Some(attempt));
+            }
+            for id in participants {
+                publications.get_mut(&id).expect("member was observed").container = Some(fresh);
+            }
+            publications.insert(fresh, StoragePublication {
+                key: pack.to_string(), upload_id: String::new(), unit: None,
+                rejected: false, container: Some(fresh),
+            });
+            let version = record.version;
+            if let Cas::Applied(_) = self.directory.replace_deployment(record, version).await
+                .map_err(|error| publication_error(pack, error))?
+            {
+                return Ok(Some(fresh));
+            }
+        }
+        Err(publication_error(pack, storage_region_error("The pack attempt inventory kept changing")))
+    }
+}
+
 #[async_trait]
 impl PublicationJournal for DirectoryPublications {
     async fn allocate_unit(&self, key: &ObjectKey, logical: &ObjectKey, unit: rtdb_types::ServingPublication) -> rtdb_storage::Result<()> {
-        if !matches!(self.owner, PublicationOwner::Serving) || crate::packing::packed(logical.as_str()) { return Ok(()); }
+        if !matches!(self.owner, PublicationOwner::Serving) { return Ok(()); }
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
             if unit.origin != UnitScope::publication_origin(&record.storage_prefix())
                 || self.writer_epoch.is_some_and(|epoch| record.epoch != epoch)
@@ -652,7 +723,7 @@ impl PublicationJournal for DirectoryPublications {
             require_publication_key(record, None, key)?;
             let Some(StorageRegion::Remote { archive: None, closed: false, publications, .. }) = record.storage_regions.get_mut(&self.region)
                 else { return Err(storage_region_error("The serving attempt has no open storage region")); };
-            let publication = StoragePublication { key: key.to_string(), upload_id: String::new(), unit: Some((logical.to_string(), unit)), rejected: false };
+            let publication = StoragePublication { key: key.to_string(), upload_id: String::new(), unit: Some((logical.to_string(), unit)), rejected: false, container: None };
             match publications.entry(unit.attempt) {
                 std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(publication); },
                 std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &publication => (),
@@ -664,6 +735,9 @@ impl PublicationJournal for DirectoryPublications {
 
     async fn unit_attempt(&self, key: &ObjectKey, body: &[u8]) -> rtdb_storage::Result<Option<Uuid>> {
         if !matches!(self.owner, PublicationOwner::Serving) { return Ok(None); }
+        if let Some((root, _)) = key.as_str().rsplit_once(&format!("/{}/", crate::packing::PACK_DIRECTORY)) {
+            return self.attach_pack(key, root, body).await;
+        }
         let Some(unit) = rtdb_types::ServingPublication::from_prefix(body).filter(|unit| *unit != rtdb_types::ServingPublication::ARCHIVE)
             else { return Ok(None); };
         let Some(record) = self.directory.deployment(&self.deployment).await.map_err(|error| publication_error(key, error))?
@@ -672,7 +746,8 @@ impl PublicationJournal for DirectoryPublications {
         let Some(StorageRegion::Remote { publications, .. }) = record.storage_regions.get(&self.region)
             else { return Err(Error::Closed("The serving attempt's publication region is absent".into())); };
         match publications.get(&unit.attempt) {
-            Some(record) if record.key == key.as_str() && record.unit.as_ref().is_some_and(|(_, admitted)| *admitted == unit) =>
+            Some(record) if record.key == key.as_str() && record.container.is_none()
+                && !record.rejected && record.unit.as_ref().is_some_and(|(_, admitted)| *admitted == unit) =>
                 Ok(Some(unit.attempt)),
             // Raw relocations carry the slot of an already selected publication.
             None => Ok(None),
@@ -680,14 +755,30 @@ impl PublicationJournal for DirectoryPublications {
         }
     }
 
+    async fn active_unit_upload(&self, key: &ObjectKey, attempt: Uuid) -> rtdb_storage::Result<Option<String>> {
+        let record = self.directory.deployment(&self.deployment).await.map_err(|error| publication_error(key, error))?
+            .ok_or_else(|| Error::Closed("The serving attempt's residence is absent".into()))?;
+        let Some(StorageRegion::Remote { publications, closed: false, .. }) = record.storage_regions.get(&self.region)
+            else { return Err(Error::Closed("The serving attempt's region is closed".into())); };
+        let publication = publications.get(&attempt).filter(|publication| publication.key == key.as_str() && !publication.rejected)
+            .ok_or_else(|| Error::Closed("The serving attempt is unavailable".into()))?;
+        Ok((!publication.upload_id.is_empty()).then(|| publication.upload_id.clone()))
+    }
+
     async fn unit_outcome(&self, key: &ObjectKey, attempt: Uuid, upload: &str, published: bool) -> rtdb_storage::Result<()> {
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
             let Some(StorageRegion::Remote { publications, .. }) = record.storage_regions.get_mut(&self.region) else { return Ok(()); };
             if let Some(publication) = publications.get_mut(&attempt) {
-                if publication.key != key.as_str() || publication.upload_id != upload || publication.unit.is_none() {
+                if publication.key != key.as_str() || publication.upload_id != upload
+                    || (publication.unit.is_none() && publication.container != Some(attempt))
+                {
                     return Err(storage_region_error("The publication receipt identifies another serving attempt"));
                 }
-                if published { publications.remove(&attempt); } else { publication.rejected = true; }
+                if published {
+                    publications.retain(|id, retained| *id != attempt && retained.container != Some(attempt));
+                } else {
+                    publication.rejected = true;
+                }
             }
             Ok(())
         }).await.map(drop).map_err(|error| publication_error(key, error))
@@ -697,7 +788,7 @@ impl PublicationJournal for DirectoryPublications {
         if attempt.is_nil() || upload.is_empty() {
             return Err(publication_error(key, storage_region_error("The provider upload has no identity")));
         }
-        let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned(), unit: None, rejected: false };
+        let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned(), unit: None, rejected: false, container: None };
         crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
             let accepts_writes = match &self.owner {
                 PublicationOwner::Serving => matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined),
@@ -752,8 +843,9 @@ impl PublicationJournal for DirectoryPublications {
             };
             match publications.entry(attempt) {
                 std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(publication.clone()); }
-                std::collections::btree_map::Entry::Occupied(mut entry) if entry.get().unit.is_some() && !entry.get().rejected
-                    && entry.get().key == key.as_str() && (entry.get().upload_id.is_empty() || entry.get().upload_id == upload) => {
+                std::collections::btree_map::Entry::Occupied(mut entry) if (entry.get().unit.is_some() || entry.get().container == Some(attempt))
+                    && !entry.get().rejected && entry.get().key == key.as_str()
+                    && (entry.get().upload_id.is_empty() || entry.get().upload_id == upload) => {
                     entry.get_mut().upload_id = upload.to_owned();
                 }
                 std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &publication => {}
@@ -771,8 +863,8 @@ impl PublicationJournal for DirectoryPublications {
             let Some(StorageRegion::Remote { publications, .. }) = record.storage_regions.get_mut(&self.region)
             else { return Ok(()); };
             match publications.get(&attempt) {
-                Some(retained) if retained.unit.is_some() && !submitted && retained.key == key.as_str()
-                    && (retained.upload_id.is_empty() || retained.upload_id == upload) => return Ok(()),
+                Some(retained) if !submitted && retained.key == key.as_str()
+                    && (retained.unit.is_some() || retained.container == Some(attempt)) => return Ok(()),
                 Some(retained) if retained.key != key.as_str() || retained.upload_id != upload => {
                     return Err(publication_error(key, storage_region_error("The publication identifies another object")));
                 }
@@ -916,41 +1008,95 @@ async fn abort_remote_publications(
     }
     let inventory = CellStorage::s3_inventory(config).await?;
     for (&attempt, publication) in publications {
-        let key = ObjectKey::new(publication.key.clone())?;
+        let key = ObjectKey::new(&publication.key)?;
         if attempt.is_nil() { return Err(unrecognized()); }
         require_publication_key(record, operation, &key)?;
-        if !publication.upload_id.is_empty() {
-            inventory.abort_publication(&key, &publication.upload_id).await?;
-        }
-        if let Some((logical, unit)) = &publication.unit {
-            let logical = ObjectKey::new(logical)?;
-            let original = record.storage_namespaces.ok_or_else(unrecognized)?;
-            if operation.is_some() || unit.attempt != attempt || unit.origin != UnitScope::publication_origin(&record.storage_prefix())
-                || !key.as_str().ends_with(&format!("/{logical}")) || keys.namespace_id().await? != original.keys
+
+        if let Some(container) = publication.container.filter(|container| *container != attempt) {
+            if publication.unit.is_none() || !publication.upload_id.is_empty()
+                || publications.get(&container).is_none_or(|pack| pack.unit.is_some() || pack.container != Some(container))
             {
                 return Err(unrecognized());
             }
-            if publication.upload_id.is_empty() || publication.rejected {
-                let slot = UnitScope::directory_publication_slot(&record.org, &record.lineage, *unit, &logical);
-                keys.withdraw_unit_key(slot, &IoRegion::new()).await?;
-            } else {
-                // A lost completion may have selected this ciphertext. Keep
-                // the slot and its fenced attempt until exact readback.
-                let bucket = serving.bucket(IoRegion::new()).await?;
-                let selected = match bucket.observe_range(&key, 0..rtdb_types::ServingPublication::BYTES as u64).await {
-                    Ok(prefix) => rtdb_types::ServingPublication::from_prefix(&prefix.value) == Some(*unit),
-                    Err(Error::MissingObject(_)) => false,
+            continue;
+        }
+        if !publication.upload_id.is_empty() {
+            inventory.abort_publication(&key, &publication.upload_id).await?;
+        }
+        let members = if publication.container == Some(attempt) {
+            let Some((root, _)) = key.as_str().rsplit_once(&format!("/{}/", crate::packing::PACK_DIRECTORY))
+                else { return Err(unrecognized()); };
+            let mut members = Vec::new();
+            for (&id, member) in publications.iter().filter(|(id, member)| **id != attempt && member.container == Some(attempt)) {
+                let (logical, unit) = member.unit.as_ref().ok_or_else(unrecognized)?;
+                if member.key != format!("{root}/{logical}") || !member.upload_id.is_empty() || unit.attempt != id {
+                    return Err(unrecognized());
+                }
+                members.push((ObjectKey::new(logical)?, *unit));
+            }
+            if members.is_empty() || publication.unit.is_some() { return Err(unrecognized()); }
+            members
+        } else if let Some((logical, unit)) = &publication.unit {
+            let logical = ObjectKey::new(logical)?;
+            if unit.attempt != attempt || !key.as_str().ends_with(&format!("/{logical}")) {
+                return Err(unrecognized());
+            }
+            vec![(logical, *unit)]
+        } else {
+            if publication.upload_id.is_empty() { return Err(unrecognized()); }
+            continue;
+        };
+
+        let namespace = record.storage_namespaces.ok_or_else(unrecognized)?;
+        let origin = UnitScope::publication_origin(&record.storage_prefix());
+        if operation.is_some() || members.iter().any(|(_, unit)| unit.origin != origin)
+            || keys.namespace_id().await? != namespace.keys
+        {
+            return Err(unrecognized());
+        }
+
+        let io = IoRegion::new();
+        if publication.upload_id.is_empty() || publication.rejected {
+            for (logical, unit) in members {
+                let slot = UnitScope::directory_publication_slot(&record.org, &record.lineage, unit, &logical);
+                keys.withdraw_unit_key(slot, &io).await?;
+            }
+        } else {
+            let bucket = serving.bucket(Arc::clone(&io)).await?;
+            let sealing = directory_publications(keys, record, io)?;
+            let pack = if publication.container.is_some() {
+                match replay_retirement::ObservedPack::raw(bucket.as_ref(), &key).await {
+                    Ok(pack) => Some(pack),
+                    Err(Error::MissingObject(_)) => return Err(orphan_outcome_pending()),
                     Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            };
+            let header_bytes = (rtdb_types::ServingPublication::BYTES + crate::cipher::object::SEALED_HEADER_BYTES) as u64;
+            for (logical, unit) in members {
+                let header = if let Some(pack) = &pack {
+                    let entry = pack.index.entries.get(logical.as_str()).filter(|entry| entry.length >= header_bytes)
+                        .ok_or_else(orphan_outcome_pending)?;
+                    pack.read_range(entry.offset..entry.offset + header_bytes).await?
+                } else {
+                    match bucket.observe_range(&key, 0..header_bytes).await {
+                        Ok(header) => header.value,
+                        Err(Error::MissingObject(_)) => return Err(orphan_outcome_pending()),
+                        Err(error) => return Err(error.into()),
+                    }
                 };
-                if !selected {
-                    return Err(storage_region_error("The fenced serving attempt has an unresolved publication outcome"));
+                if sealing.header(&logical, header).await?.1 != unit {
+                    return Err(orphan_outcome_pending());
                 }
             }
-        } else if publication.upload_id.is_empty() {
-            return Err(unrecognized());
         }
     }
     Ok(())
+}
+
+fn orphan_outcome_pending() -> Anomaly {
+    storage_region_error("The fenced serving attempt has an unresolved publication outcome")
 }
 
 fn require_publication_key(record: &DeploymentRecord, operation: Option<Uuid>, key: &ObjectKey) -> Result<()> {
@@ -2691,6 +2837,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pack_members_follow_the_exact_provider_attempt() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let region = Uuid::new_v4();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.storage_regions.insert(region, StorageRegion::Remote {
+            tracks_ordered_index_pages: false, checkpoint_metadata_from: None, checkpoint_replay_from: None,
+            archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: None,
+            owner: None, closed: false, publications: BTreeMap::new(),
+        });
+        let record = directory.create_deployment(record).await.unwrap();
+        let journal = DirectoryPublications {
+            directory: directory.clone(), deployment: record.id.clone(), region,
+            writer_epoch: None, owner: PublicationOwner::Serving,
+        };
+        let root = format!("{}/v06", record.storage_prefix());
+        let group = key(&format!("{root}/~packs/b00.pack"));
+        let other = key(&format!("{root}/~packs/b01.pack"));
+        let mut members = BTreeMap::new();
+        for name in ["blocks/b00.binpb", "tables/abc/blocks/b00.binpb"] {
+            let unit = rtdb_types::ServingPublication {
+                origin: UnitScope::publication_origin(&record.storage_prefix()), attempt: Uuid::new_v4(),
+            };
+            journal.allocate_unit(&key(&format!("{root}/{name}")), &key(name), unit).await.unwrap();
+            members.insert(name.to_owned(), Bytes::copy_from_slice(&unit.prefix()));
+        }
+        let (bytes, _) = crate::packing::encode_pack(&members, vec![], 0);
+        let attempt = journal.unit_attempt(&group, &bytes).await.unwrap().unwrap();
+        assert_eq!(journal.unit_attempt(&group, &bytes).await.unwrap(), Some(attempt));
+        assert!(journal.unit_attempt(&other, &bytes).await.is_err());
+        journal.admit(&group, attempt, "exact-upload").await.unwrap();
+        assert_eq!(journal.active_unit_upload(&group, attempt).await.unwrap().as_deref(), Some("exact-upload"));
+        assert!(journal.admit(&group, attempt, "second-upload").await.is_err());
+        journal.unit_outcome(&group, attempt, "exact-upload", true).await.unwrap();
+        let current = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(matches!(&current.storage_regions[&region], StorageRegion::Remote { publications, .. } if publications.is_empty()));
+    }
+
+    #[tokio::test]
     async fn a_compactors_store_refuses_outputs_after_disposal_is_ordered() {
         let directory = rtdb_directory::MemoryDirectory::new();
         let installation = directory.create_deployment(DeploymentRecord::new("shop", "acme", vec![], 0)).await.unwrap();
@@ -2833,7 +3017,7 @@ mod tests {
             archive_source: None,
             tracks_ordered_index_pages: true,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
-            archive: None, checkpoint_suffix: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned(), unit: None, rejected: false })]),
+            archive: None, checkpoint_suffix: None, repair_archive: None, owner: None, closed: false, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned(), unit: None, rejected: false, container: None })]),
         });
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
         release_region(directory.as_ref(), &record.id, region, false).await.unwrap();
@@ -2843,7 +3027,7 @@ mod tests {
             archive_source: None,
             tracks_ordered_index_pages: true,
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
-            archive: None, checkpoint_suffix: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned(), unit: None, rejected: false })]),
+            archive: None, checkpoint_suffix: None, repair_archive: None, owner: None, closed: true, publications: BTreeMap::from([(attempt, StoragePublication { key: object.to_string(), upload_id: "upload".to_owned(), unit: None, rejected: false, container: None })]),
         });
     }
 

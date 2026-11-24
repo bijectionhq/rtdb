@@ -266,7 +266,9 @@ The region owner closes admission and fences the upload before withdrawing defin
 A lost selection response keeps its attempt until the owner can authenticate the publication.
 Hosted mixed and metadata-only packs bind an authenticated last-slot census to the exact provider grant.
 The versioned census checks loose aliases and historical pack members at their immutable provider versions.
-Packed and local unpublished attempts and negative settlement of ambiguous uploads remain open.
+Hosted pack members bind their registered slots to one durable physical pack attempt before its upload.
+The retirement owner fences that exact upload and settles the members together.
+Local unpublished attempts and negative settlement of ambiguous uploads remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

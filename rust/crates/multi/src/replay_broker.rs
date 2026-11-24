@@ -1044,7 +1044,7 @@ impl PublicationJournal for BrokerUpload {
         if key != &self.physical || attempt.is_nil() || upload.is_empty() {
             return Err(rtdb_storage::Error::Task("The detached upload has another provider identity".into()));
         }
-        let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned(), unit: None, rejected: false };
+        let publication = StoragePublication { key: key.to_string(), upload_id: upload.to_owned(), unit: None, rejected: false, container: None };
         crate::admin::update_installation(self.directory.as_ref(), &self.history.deployment.to_string(), |record| {
             require_publication(self.history, self.route, record, &self.logical)?;
             let Some(StorageRegion::ReplicaPublication { key, closed: false, publications, draft, .. }) =

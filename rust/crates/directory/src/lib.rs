@@ -832,6 +832,7 @@ pub struct StoragePublication {
     pub upload_id: String,
     pub unit: Option<(String, rtdb_types::ServingPublication)>,
     pub rejected: bool,
+    pub container: Option<uuid::Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

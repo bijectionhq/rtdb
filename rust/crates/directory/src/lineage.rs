@@ -576,7 +576,7 @@ mod tests {
             archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: Some(capture),
             tracks_ordered_index_pages: true, checkpoint_metadata_from: Some(checkpoint.block), checkpoint_replay_from: None,
             owner: None, closed: false, publications: BTreeMap::from([(Uuid::new_v4(), crate::StoragePublication {
-                key: object, upload_id: "prepared-pack".into(), unit: None, rejected: false,
+                key: object, upload_id: "prepared-pack".into(), unit: None, rejected: false, container: None,
             })]),
         });
         assert!(state.authorize_exact_owned(&uploading, &retirement).is_err());
@@ -631,7 +631,7 @@ mod tests {
             archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: Some(capture),
             tracks_ordered_index_pages: true, checkpoint_metadata_from: None, checkpoint_replay_from: None,
             owner: None, closed: false, publications: BTreeMap::from([(Uuid::new_v4(), crate::StoragePublication {
-                key: target.clone(), upload_id: "admitted".into(), unit: None, rejected: false,
+                key: target.clone(), upload_id: "admitted".into(), unit: None, rejected: false, container: None,
             })]),
         });
         let state = LineageState::default().changed(LineageChange::ReserveRetirement {

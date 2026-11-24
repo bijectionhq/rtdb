@@ -39,6 +39,9 @@ pub trait PublicationJournal: Send + Sync {
     async fn unit_attempt(&self, _key: &ObjectKey, _body: &[u8]) -> Result<Option<uuid::Uuid>> {
         Ok(None)
     }
+    async fn active_unit_upload(&self, _key: &ObjectKey, _attempt: uuid::Uuid) -> Result<Option<String>> {
+        Ok(None)
+    }
     async fn unit_outcome(&self, _key: &ObjectKey, _attempt: uuid::Uuid, _upload: &str, _published: bool) -> Result<()> {
         Ok(())
     }
@@ -671,6 +674,17 @@ impl RemoteObjects {
         let unit = journal.unit_attempt(key, &bytes).await?;
         let attempt = unit.unwrap_or_else(uuid::Uuid::new_v4);
         let path = self.path(key);
+        if let Some(unit) = unit
+            && let Some(chosen) = journal.active_unit_upload(key, unit).await?
+        {
+            return match self.publication_confirmed(key, unit).await? {
+                PublicationResult::Published { version, etag } => {
+                    journal.unit_outcome(key, unit, &chosen, true).await?;
+                    Ok(ProviderPublication { version, etag })
+                }
+                PublicationResult::Conflict => Err(Error::Closed("The original serving upload still owns this attempt".into())),
+            };
+        }
         let upload = uploads.reserve(&path, attempt).await?;
         if let Err(error) = journal.admit(key, attempt, &upload).await {
             uploads.abort(&path, &upload).await?;
