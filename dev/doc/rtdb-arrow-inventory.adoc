@@ -121,6 +121,7 @@ See link:../../rust/crates/query/src/cursor.rs[results], link:../../rust/crates/
 == Held world point and overlay reads
 
 * Point reads retain the selected Arrow fields after the complete identity and revision check.
+* Held unique selectors borrow the Binary key from their selector batch, and the point reply writes its witness nonce and IPC into one funded buffer.
 * The Flight point response uses the active value leg as each field's concrete result type.
 * Overlay text reads use the shadow's field-presence marker and the selected text cell.
 * Held history takes its validity boundaries from the timestamp columns.

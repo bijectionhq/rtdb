@@ -19,7 +19,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration}
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use prost::Message;
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, entity_id_type, read_entity_id, selected_cell, try_entity_id_array};
@@ -5925,16 +5925,32 @@ impl Service {
         }
     }
 
-    fn owned_point_reply(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>) -> Result<ActionResult, Status> {
-        self.encode_owned_point_reply(self.memory(), schema, batch, present, valid, revision, None, OwnedReplyFormat::Unary)
-            .map(OwnedIpcReply::into_unary)
-    }
-
     fn encode_owned_point_reply(
         &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
         present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
         reply_format: OwnedReplyFormat<'_>,
     ) -> Result<OwnedIpcReply, Status> {
+        Self::with_owned_point_page(memory, schema, batch, present, valid, revision, until, |schema, batch| {
+            let stream = match reply_format {
+                OwnedReplyFormat::Selection(selection) => {
+                    let maximum = self.0.config.maximum_message_bytes.min(crate::config::AUDIENCE_REPLY_BYTES);
+                    if let Some(reply) = selection.point(memory, schema, batch, maximum)? {
+                        return Ok(OwnedIpcReply::Unary(reply));
+                    }
+                    false
+                }
+                OwnedReplyFormat::Unary => false,
+                OwnedReplyFormat::StreamV1 => true,
+            };
+            self.encode_owned_stream_reply(memory, schema, batch.map(std::slice::from_ref).unwrap_or_default(), stream)
+        })
+    }
+
+    fn with_owned_point_page<T>(
+        memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
+        present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
+        finish: impl FnOnce(&SchemaRef, Option<&RecordBatch>) -> Result<T, Status>,
+    ) -> Result<T, Status> {
         let _metadata = memory.reserve(wire::schema_bound(schema)?).map_err(status)?;
         let mut metadata = schema.metadata().clone();
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
@@ -5969,18 +5985,7 @@ impl Service {
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))
             .transpose().map_err(arrow)?;
-        let stream = match reply_format {
-            OwnedReplyFormat::Selection(selection) => {
-                let maximum = self.0.config.maximum_message_bytes.min(crate::config::AUDIENCE_REPLY_BYTES);
-                if let Some(reply) = selection.point(memory, &schema, batch.as_ref(), maximum)? {
-                    return Ok(OwnedIpcReply::Unary(reply));
-                }
-                false
-            }
-            OwnedReplyFormat::Unary => false,
-            OwnedReplyFormat::StreamV1 => true,
-        };
-        self.encode_owned_stream_reply(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default(), stream)
+        finish(&schema, batch.as_ref())
     }
 
     fn encode_owned_stream_reply(
