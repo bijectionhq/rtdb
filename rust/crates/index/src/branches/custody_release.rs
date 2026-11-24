@@ -31,6 +31,7 @@ pub struct CustodyReleaseRegistration {
     pub group: CustodyGroupId,
     pub original: [u8; 32],
     pub occurrence: [u8; 32],
+    pub carrier_receipt_sha256: [u8; 32],
     pub part: CustodyResponsePart,
     pub expires_at: Timestamp,
 }
@@ -110,15 +111,23 @@ impl BranchIndex {
             .contains(&[0; 16])
             || part.ordinal.get() == u64::MAX
             || registration.expires_at.0 <= 0
+            || registration.carrier_receipt_sha256 == [0; 32]
             || group
                 .original
                 .as_ref()
                 .map(|original| original.commitment(registration.group))
                 != Some(registration.original)
-            || !group.has_occurrence(registration.group, registration.occurrence)
+            || group.occurrence(registration.group, registration.occurrence).is_none()
         {
             return Err(release_conflict());
         }
+        Ok(())
+    }
+
+    pub fn check_custody_carrier_receipt(&self, registration: CustodyReleaseRegistration, receipt: Basis) -> Result<()> {
+        self.check_custody_release_input(registration)?;
+        let occurrence = self.custody[&registration.group].occurrence(registration.group, registration.occurrence);
+        if !occurrence.is_some_and(|occurrence| occurrence.written == receipt) { return Err(release_conflict()); }
         Ok(())
     }
 

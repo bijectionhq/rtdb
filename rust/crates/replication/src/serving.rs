@@ -5,7 +5,7 @@ use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord, TrustedCustodyRelease};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, SourcePosition, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
@@ -145,6 +145,17 @@ impl NativeServingHandle {
         let scope = request.scope.clone();
         let bytes = cancellation.run_until_cancelled(self.source_authority.seal(request)).await
             .ok_or_else(interrupted)??;
+        self.submit_admitted(bytes, scope, cancellation).await
+    }
+
+    pub async fn submit_custody_release(&self, command: TrustedCustodyRelease, cancellation: &CancellationToken) -> Result<Receipt> {
+        if !self.is_compatible() { return Err(incompatible()); }
+        let bytes = cancellation.run_until_cancelled(self.source_authority.seal_release(command)).await
+            .ok_or_else(interrupted)??;
+        self.submit_admitted(bytes, None, cancellation).await
+    }
+
+    async fn submit_admitted(&self, bytes: Bytes, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
         let message = SourceMessage::Protobuf(SourceBody::ServingTransact(bytes));
         let position = self.replication.submit_serving_source(&message, cancellation).await?;
         self.replication.await_source(position, cancellation).await.map_err(|error| {
@@ -302,7 +313,8 @@ impl NativeServing {
 
     pub(crate) fn request_pending<C>(&self, request: &NativeRequest<C>) -> bool {
         self.pipeline.as_ref().is_some_and(|pipeline| {
-            pipeline.is_deciding(&request.transaction.key, request.scope.as_ref().map(|scope| scope.receipt_namespace))
+            pipeline.is_deciding(&request.transaction.key,
+                request.transaction.receipt_namespace(request.scope.as_ref().map(|scope| scope.receipt_namespace)))
         })
     }
 

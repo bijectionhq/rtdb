@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact};
+use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyRelease};
 use rtdb_types::{
     Anomaly, AnomalyCategory, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -175,6 +175,7 @@ impl ServingDriver for MultiServing {
         mut request: Transact,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
+        if request.contains_response_release() { return Err(crate::serving::custody_release::release_unavailable()); }
         cancellation
             .run_until_cancelled(async {
                 if request.uses_custody() && self.features().contains(&ROW_CUSTODY) {
@@ -200,6 +201,20 @@ impl ServingDriver for MultiServing {
             let (index, generation) = self.database.lock().await.fresh_view().await?;
             self.database.lock().await.check_generation(generation).await?;
             Ok(index)
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn submit_custody_release(&self, command: TrustedCustodyRelease, cancellation: &CancellationToken) -> Result<Receipt> {
+        cancellation.run_until_cancelled(self.writes.transact(command.into_request())).await.ok_or_else(interrupted)?
+    }
+
+    async fn check_custody_release_delivery(&self, groups: &BTreeSet<CustodyGroupId>, writer: &CustodyWriterFence,
+                                            cancellation: &CancellationToken) -> Result<()> {
+        cancellation.run_until_cancelled(async {
+            let vault = self.tokens.custody_vault();
+            for &group in groups { vault.check_readable(group).await?; }
+            let index = self.current_custody(cancellation).await?;
+            crate::serving::custody_release::check_release_cut(&index, writer, groups)
         }).await.ok_or_else(interrupted)?
     }
 

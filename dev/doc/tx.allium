@@ -1794,6 +1794,8 @@ surface ConnectionLifecycle {
 -- A reserved destination and its link remain in the revocation inventory until the group's permanent denial.
 -- The latest revoked inventory keeps the first revocation basis and its digest.
 -- Authenticated release phase effects use the same order as revocation and hold their own receipt namespace.
+-- Default source intake authenticates the internal command and private namespace before reconstructing its canonical request.
+-- Both writers evaluate the observed original writer's exact version as an ordered release requirement.
 -- A promoted release requires positive durable disposal from the original carrier journal, while a private release can be durably cancelled.
 -- The terminal retains the original registration and evidence after checkpoint and trim.
 -- The original ordered revocation time fixes the key retirement deadline and destruction waits for the admitted release holds to drain.
