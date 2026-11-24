@@ -48,7 +48,6 @@ pub(super) async fn reap(
     bucket: &dyn ObjectStore,
     record: &DeploymentRecord,
     references: &References,
-    threshold: i64,
 ) -> Result<usize> {
     let store = format!("{}/{}", record.storage_prefix(), archive::checkpoint_storage_root()?);
     if !Base::load(bucket, &store).await?.objects.is_empty() { return Ok(0); }
@@ -76,7 +75,7 @@ pub(super) async fn reap(
         let mut erased = 0;
         for (block, pack) in candidates {
             let observed = ObservedPack::raw(bucket, &pack).await?;
-            let Some(boundary) = covered_pack(&observed, block, threshold, record.log_epoch, &cipher, &archive).await?
+            let Some(boundary) = covered_pack(&observed, block, record.log_epoch, &cipher, &archive).await?
                 else { continue; };
             if !crate::checkpoint_retention::replay_archive_covers_pack(block, checkpoint.block, boundary,
                 anchor.interval[0], anchor.interval[1], checkpoint.boundary)
@@ -96,11 +95,10 @@ pub(super) async fn reap(
 }
 
 async fn covered_pack(
-    pack: &ObservedPack<'_>, block: i64, threshold: i64, log_epoch: i32,
+    pack: &ObservedPack<'_>, block: i64, log_epoch: i32,
     cipher: &Cipher, archive: &ArchivedCheckpoint,
 ) -> Result<Option<i64>> {
     let index = &pack.index;
-    if index.written_at_ms.is_none_or(|written| written > threshold) { return Ok(None); }
     let root = block_key(BlockIndex(block))?;
     let Some(entry) = index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
         else { return Ok(None); };
@@ -111,21 +109,27 @@ async fn covered_pack(
     let boundary = boundary.after_offset(StorageEpoch(log_epoch));
     if boundary < 0 { return Ok(None); }
 
-    let mut has_l0 = false;
+    // The successor replaces the old root and provides the same plaintext
+    // for each remaining pack member. The exact pack, not any one member,
+    // is the deletion unit.
+    let mut has_replay_member = false;
     for (name, entry) in &index.entries {
         if checkpoint_metadata_block(name) == Some(block) { continue; }
-        if !is_block_l0(name, block) { return Ok(None); }
-        has_l0 = true;
+        has_replay_member = true;
         let object = key(name)?;
-        if rtdb_format::keys::is_receipt_l0_file(name) && !archive.contains_original(&object) {
+        if is_block_l0(name, block) && rtdb_format::keys::is_receipt_l0_file(name)
+            && !archive.contains_original(&object)
+        {
             // A complete successor does not need receipt L0 after compaction covers it.
             continue;
         }
-        if entry.length > MAXIMUM_MEMBER_BYTES { return Ok(None); }
+        if !archive.contains_original(&object) || entry.length > MAXIMUM_MEMBER_BYTES {
+            return Ok(None);
+        }
         let original = pack.read_member(entry).await?;
         if !archive.matches_original(&object, &original).await? { return Ok(None); }
     }
-    Ok(has_l0.then_some(boundary))
+    Ok(has_replay_member.then_some(boundary))
 }
 
 pub(super) async fn terminal_pack_index(

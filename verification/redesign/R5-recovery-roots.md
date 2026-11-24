@@ -162,8 +162,12 @@ The [copy proofs](../lean/CheckpointCopyEvidence.lean) cover inventory agreement
 The existing handoff adopts the independent framed archive for the same parked checkpoint, while the original pack stays immutable.
 A parked complete repair can promote a framed replay archive of the same independently authenticated cut.
 Later captures can read those inputs from an admitted archive after their original packs disappear.
-The local Multi reaper can erase older original block packs for a parked root once it verifies their exact L0 members in the independent archive of the published checkpoint.
-It holds the local maintenance lock, lineage reservation and archive region while verifying the pack and unlinking it.
+The local and hosted Multi reapers can retire older original block packs for a parked root after verifying independent archive coverage.
+For a mixed pack, the exact provider publication is the deletion unit.
+Each member outside the replaced checkpoint metadata must have matching plaintext in the authenticated successor archive, or be a receipt L0 member covered by the receipt retirement rule.
+The parked selection closes generic fork admission. The lineage reservation protects an in-progress fork, and its published references protect the original pack.
+Age is no longer a condition of this replay-pack grant.
+The local reaper holds the maintenance lock, lineage reservation and archive region while verifying and unlinking the pack. Hosted retirement uses the same lineage authority with exact version settlement or enrolled terminal tombstone evidence.
 It requires drained storage and catalog readers, no declared descendant references, and a certified replica prefix that passes the old boundary while retaining the published boundary.
 Only the physical original pack is erased, so the archive continues to serve the logical L0 descriptors.
 An in-place restore of an archive-backed installation must adopt a complete replay capture.

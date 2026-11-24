@@ -8,13 +8,14 @@ use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PhysicalObjectVersion, Result, S3TombstoneTarget};
 use uuid::Uuid;
 
-use super::{ObservedPack, PackStorage, covered_pack, eligible, is_block_l0};
+use super::{ObservedPack, PackStorage, covered_pack, eligible};
 use crate::archive;
 use crate::cipher::Cipher;
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
 use crate::packing::{PACK_DIRECTORY, block_pack, pack_block};
 use crate::reference::{Base, References, key};
+use crate::store::checkpoint_metadata_block;
 use crate::store::exact_retirement::{settle, tombstones::{TombstoneJournal, retire}};
 
 enum Publication<'a> {
@@ -45,13 +46,13 @@ impl<'a> ReplayRetirement<'a> {
 
 pub(in crate::store) async fn reap_hosted(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
-    bucket: &dyn ObjectStore, provider: &VersionedInventory, candidate: &DeploymentRecord, threshold: i64,
+    bucket: &dyn ObjectStore, provider: &VersionedInventory, candidate: &DeploymentRecord,
 ) -> Result<()> {
     let lineage = &candidate.lineage;
     let mut state = crate::store::recover_hosted_lineage(directory, lineage).await?;
     if let Some(retirement) = state.retirement() {
         if ReplayRetirement::from_work(&retirement.work).is_some_and(|work| work.deployment == candidate.id) {
-            finish(directory, storage, keys, task, bucket, provider, lineage, &state, retirement, threshold).await?;
+            finish(directory, storage, keys, task, bucket, provider, lineage, &state, retirement).await?;
         }
         return Ok(());
     }
@@ -72,9 +73,7 @@ pub(in crate::store) async fn reap_hosted(
         let Some(block) = pack.key.as_str().strip_prefix(&prefix).and_then(pack_block) else { continue; };
         if block >= checkpoint.block || references.has_declared_reference(&pack.key) { continue; }
         let Some(observed) = observe_pack(bucket, terminal.as_ref(), &pack.key).await? else { continue; };
-        if observed.index.written_at_ms.is_none_or(|written| written > threshold)
-            || !observed.index.entries.keys().any(|name| is_block_l0(name, block))
-        {
+        if observed.index.entries.keys().all(|name| checkpoint_metadata_block(name) == Some(block)) {
             continue;
         }
         let work = match observed.storage {
@@ -98,7 +97,7 @@ pub(in crate::store) async fn reap_hosted(
         let reserved = directory.change_lineage(lineage, LineageChange::ReserveRetirement {
             retirement: retirement.clone(), observed_references: state.reference_revision(), generation: state.retirement_generation(),
         }).await?;
-        if finish(directory, storage, keys, task, bucket, provider, lineage, &reserved, &retirement, threshold).await? {
+        if finish(directory, storage, keys, task, bucket, provider, lineage, &reserved, &retirement).await? {
             return Ok(());
         }
         state = directory.lineage_state(lineage).await?;
@@ -110,14 +109,14 @@ pub(in crate::store) async fn reap_hosted(
 async fn finish(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
     bucket: &dyn ObjectStore, provider: &VersionedInventory, lineage: &str, state: &LineageState,
-    retirement: &LineageRetirement, threshold: i64,
+    retirement: &LineageRetirement,
 ) -> Result<bool> {
     let ReplayRetirement { deployment, .. } = ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
     let authorized;
     let grant = if let Some(grant) = state.exact_retirement_grant(retirement) {
         grant
     } else {
-        let prepared = authorize(directory, storage, keys, task, bucket, provider, lineage, retirement, threshold).await;
+        let prepared = authorize(directory, storage, keys, task, bucket, provider, lineage, retirement).await;
         authorized = directory.lineage_state(lineage).await?;
         if authorized.retirement() != Some(retirement) { return prepared.map(|()| false); }
         let Some(grant) = authorized.exact_retirement_grant(retirement) else {
@@ -160,7 +159,7 @@ async fn erase_granted(directory: &dyn Directory, provider: &VersionedInventory,
 async fn authorize(
     directory: &dyn Directory, storage: &CellStorage, keys: &dyn KeyService, task: &HostedTask,
     bucket: &dyn ObjectStore, provider: &VersionedInventory, lineage: &str,
-    retirement: &LineageRetirement, threshold: i64,
+    retirement: &LineageRetirement,
 ) -> Result<()> {
     let ReplayRetirement { deployment, target, publication, capture, checkpoint } =
         ReplayRetirement::from_work(&retirement.work).ok_or_else(changed)?;
@@ -205,7 +204,7 @@ async fn authorize(
             _ => false,
         };
         if !same { return Ok(()); }
-        let Some(boundary) = covered_pack(&observed, block, threshold, record.log_epoch, &cipher, &archive).await?
+        let Some(boundary) = covered_pack(&observed, block, record.log_epoch, &cipher, &archive).await?
             else { return Ok(()); };
         if !crate::checkpoint_retention::replay_archive_covers_pack(block, checkpoint.block, boundary,
             anchor.interval[0], anchor.interval[1], checkpoint.boundary)

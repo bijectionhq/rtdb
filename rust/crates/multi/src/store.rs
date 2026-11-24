@@ -1646,7 +1646,7 @@ pub async fn run_reaper(
                                         }
                                         if let (Some(keys), Some(task)) = (keys.as_deref(), hosted_task.as_ref())
                                             && let Err(error) = replay_retirement::reap_hosted(
-                                                directory.as_ref(), &storage, keys, task, bucket.as_ref(), &provider, record, threshold,
+                                                directory.as_ref(), &storage, keys, task, bucket.as_ref(), &provider, record,
                                             ).await
                                         {
                                             eprintln!("Original replay packs for {} are pending: {}", record.id, error.code);
@@ -1825,7 +1825,7 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
         let mut reaped = reap_path_releases(bucket.as_ref(), record, now_ms, grace, ReleaseSweep::Local(&references)).await?;
         if let Some(keys) = keys.filter(|_| replay_retirement::eligible(record)) {
-            reaped.erased += replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references, threshold).await?;
+            reaped.erased += replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references).await?;
         }
         Ok(reaped)
     }.await;
