@@ -548,13 +548,16 @@ impl SegmentCompactor {
     async fn execute_job(&self, job: &CompactionJob, snapshot: Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<TriesAdded> {
         let entry = snapshot.table_catalog().entry(&job.table).cloned().ok_or_else(|| crate::invalid("Compaction table has no recorded slug"))?;
         let mut retained_data = primary_data_budget(&self.memory);
+        let mut retained_metadata = self.memory.scope_with_limit(RETAINED_INPUT_METADATA_BYTES.min(self.memory.limit_bytes() / 8));
         let (directory, mut outputs) = loop {
             let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
-            match self.merge_inputs(job, &entry.slug, directory.path(), &retained_data, cancellation).await {
-                Err(error) if retained_data.peak_bytes() > 0 && error.code == "rtdb/memory-budget-exceeded" => {
+            match self.merge_inputs(job, &entry.slug, directory.path(), &retained_data, &retained_metadata, cancellation).await {
+                Err(error) if error.code == "rtdb/memory-budget-exceeded"
+                    && (retained_data.peak_bytes() > 0 || retained_metadata.peak_bytes() > 0) => {
                     if cancellation.is_cancelled() { return Err(crate::closed()); }
                     directory.close().map_err(crate::invalid)?;
                     retained_data = self.memory.scope_with_limit(0);
+                    retained_metadata = self.memory.scope_with_limit(0);
                 }
                 result => break (directory, result?),
             }
@@ -589,10 +592,9 @@ impl SegmentCompactor {
     }
 
     async fn merge_inputs(&self, job: &CompactionJob, slug: &rtdb_format::keys::TableSlug, directory: &Path,
-        retained_data: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<Vec<MergeOutput>> {
+        retained_data: &Arc<MemoryBudget>, retained_metadata: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<Vec<MergeOutput>> {
         let mut inputs = Vec::new();
         let mut metadata = Vec::new();
-        let retained_metadata = self.memory.scope_with_limit(RETAINED_INPUT_METADATA_BYTES.min(self.memory.limit_bytes() / 8));
         let mut input_bytes = 0u64;
         for (index, key) in job.inputs.iter().enumerate() {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
@@ -608,7 +610,7 @@ impl SegmentCompactor {
             let data = PrimaryData::stored(self.store.as_ref(), &data_key, directory.join(format!("input-{index}.arrow")),
                 data_size, &self.memory, retained_data, cancellation).await?;
             metadata.push(open_metadata(self.store.as_ref(), &meta_key, &directory.join(format!("meta-{index}.arrow")),
-                metadata_size, &self.memory, &retained_metadata, cancellation).await?);
+                metadata_size, &self.memory, retained_metadata, cancellation).await?);
             let data = data.read(&self.memory, cancellation, Ok)?;
             inputs.push(InputSegment { key: key.clone(), data });
         }
