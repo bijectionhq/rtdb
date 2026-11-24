@@ -102,7 +102,7 @@ def verus_errors(output, directory):
     )
 
 
-def verify_verus(args, scratch, areas=None):
+def verify_verus(args, scratch, areas=None, required_functions=None):
     for manifest in sorted((ROOT / "verification/verus").glob("*/area.json")):
         area = manifest.parent.relative_to(ROOT)
         if areas is not None and area.name not in areas:
@@ -129,11 +129,27 @@ def verify_verus(args, scratch, areas=None):
             if control:
                 for mutation in control["mutate"]:
                     replace_once(directory / mutation["file"], mutation["find"], mutation["replace"])
+            required = (required_functions or {}).get(area.name, {}) if control is None else {}
+            for name, file in required.items():
+                function = name.split("::")[-1]
+                if Path(file) not in paths or not re.search(rf"\bfn\s+{re.escape(function)}\b", (directory / file).read_text()):
+                    raise ValueError(f"{case}: {name} has no captured owner at {file}")
+            timing = ["--time"] if required else []
             output = run_case(
-                [args.verus, "--output-json", "--multiple-errors", "5", *config["flags"], str(harness)],
+                [args.verus, "--output-json", "--multiple-errors", "5", *timing, *config["flags"], str(harness)],
                 directory, args.evidence, case,
             )
-            result = json.loads(output.stdout)["verification-results"]
+            report = json.loads(output.stdout)
+            if required:
+                checked = {
+                    function["function"]
+                    for module in report["times-ms"]["smt"]["smt-run-module-times"]
+                    for function in module["function-breakdown"]
+                    if function["success"] and function["mode:"] in {"exec", "proof"}
+                }
+                if missing := required.keys() - checked:
+                    raise ValueError(f"{case}: exported functions lack solver evidence: {sorted(missing)}")
+            result = report["verification-results"]
             expected = sorted(
                 (item["file"], item["function"], item["category"])
                 for item in (control or {}).get("expect", [])
