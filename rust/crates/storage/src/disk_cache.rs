@@ -352,6 +352,7 @@ impl ObjectStore for DiskCachedStore {
         self.cache.invalidate(&self.key(key)?)?;
         Ok(())
     }
+    fn supports_directory_page_release(&self) -> bool { self.remote.supports_directory_page_release() }
     async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;

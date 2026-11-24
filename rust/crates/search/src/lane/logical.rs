@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, fs::File, io::{BufWriter, Read}, path::Path, sync::Arc};
 
 use arrow_array::Array;
-use rtdb_format::cow_tree::page_key;
 use rtdb_format::term_directory;
 use rtdb_format::log::proto::{SourceReceipt, TermDirectoryRoot};
 use rtdb_query::ObjectPageStore;
@@ -381,7 +380,7 @@ impl SearchBuilder {
                 edits.apply(&pages, base.as_ref(), &self.memory).await
             };
             match incremental.await {
-                Ok((root, _)) => Some(root),
+                Ok(root) => Some(root),
                 Err(error) if super::is_search_gap(&error, cancellation) => None,
                 Err(error) => return Err(error),
             }
@@ -394,13 +393,7 @@ impl SearchBuilder {
                 for run in before.iter().copied().filter(|run| !is_replaced(run)) {
                     self.collect_term_edits(&entry.slug, columns, run, &mut edits, false, cancellation).await?;
                 }
-                let (root, written) = edits.apply(&pages, None, &self.memory).await?;
-                if current.is_some() {
-                    for digest in written {
-                        self.storage.invalidate(&ObjectKey::new(page_key(&pages.prefix, digest))?).await?;
-                    }
-                }
-                root
+                edits.apply(&pages, None, &self.memory).await?
             }
         };
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }

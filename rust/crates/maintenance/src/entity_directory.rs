@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{
-    cow_tree::{self, Edit, NoSummary},
+    cow_tree::{self, Edit, NoSummary, PageGeneration},
     data::EventBatch,
     entity_directory::{self, LogicalEvent},
     keys::TrieKey,
@@ -182,7 +182,7 @@ impl EntityDirectoryBuilder {
             edits.into_values().collect(),
             &NoSummary,
             &self.memory,
-            Some(through.0),
+            Some(PageGeneration::Block(through)),
         )
         .await?;
         let root =
@@ -321,7 +321,7 @@ impl ArtefactBuilder for EntityDirectoryBuilder {
         _: u64,
         cancellation: &CancellationToken,
     ) -> Result<Vec<ArtefactRecord>> {
-        if table.is_owned_event_data() || TableRef::owned_schema(&table.schema) {
+        if !self.store.supports_directory_page_release() || table.is_owned_event_data() || TableRef::owned_schema(&table.schema) {
             return Ok(Vec::new());
         }
         match self.advance(value, table, trie, path, cancellation).await {

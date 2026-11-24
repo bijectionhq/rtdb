@@ -213,6 +213,7 @@ impl TrieCollector {
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         use rtdb_format::{cow_tree, entity_directory, log::proto::EntityDirectoryChange};
         let Some((publisher, version, epoch)) = &self.directory else { return Ok(()); };
+        if !self.store.supports_directory_page_release() { return Ok(()); }
         let table = &entry.table;
         let catalog = collection.current().trie_catalog();
         let retired = catalog.retired_entity_directories(table).map(|receipt| Ok((receipt, receipt.reference()?)))
@@ -253,7 +254,8 @@ impl TrieCollector {
         let prefix = entity_directory::prefix(&entry.slug);
         let pages = rtdb_storage::cow_pages::FreshPages { store: self.store.as_ref(), prefix: &prefix };
         let mut reachable = BTreeSet::new();
-        for root in &held {
+        let leased = retired.iter().map(|(_, root)| root).filter(|root| !eligible.contains(&root.digest));
+        for root in held.iter().chain(leased) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             if !reachable.contains(&root.digest) {
                 reachable.extend(cow_tree::reachable(&pages, root).await?);
@@ -283,8 +285,8 @@ impl TrieCollector {
         Ok(())
     }
 
-    /// Term-directory pages have no retirement ledger, so collection marks every page a held root reaches and sweeps the rest of the prefix.
-    /// A page a writer has uploaded but not yet published survives because it is swept only after the reader lease from its first sighting.
+    // Each build writes fresh digests, so a sweep candidate cannot acquire a new reference through a rebuild of the same rows.
+    // The reader lease gives newly uploaded pages time to become reachable through the published root.
     async fn collect_term_directory_pages(&self, entry: &TableEntry, collection: &rtdb_index::TrieCollection,
         cut: Option<CatalogCut>, cancellation: &CancellationToken) -> Result<()> {
         use rtdb_format::{cow_tree, term_directory};

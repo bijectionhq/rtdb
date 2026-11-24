@@ -1577,12 +1577,15 @@ fn permits_release(record: &DeploymentRecord, store: &str, release: &GarbageReco
 #[async_trait]
 impl ObjectStore for GarbageStore {
     fn permits_shared_read_cache(&self) -> bool { self.inner.permits_shared_read_cache() }
+    fn supports_directory_page_release(&self) -> bool {
+        self.catalog_readers.is_none() || self.requires_search_publication
+    }
     async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { self.delete(key).await?; return Ok(true); };
         let Some(cut) = cut else { return Ok(false); };
-        let Some(publication) = self.retirement_publication(key).await? else {
-            return Ok(matches!(self.inner.head_fresh(key).await, Err(Error::MissingObject(_))));
-        };
+        let Some(publication) = self.retirement_publication(key).await? else { return Ok(false); };
+        let published = publication.clone().into();
+        if !self.permits_search_release(key, Some(&published), Some(cut)).await? { return Ok(false); }
         let (floor, allowed) = readers.close_admission(cut, &[None]).await?;
         if !allowed[0] { return Ok(false); }
         match publication {

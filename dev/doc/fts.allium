@@ -201,6 +201,7 @@ rule SearchJobRuns {
     -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
     -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.
     -- Its immutable pages authenticate rows and carry the maximum unit term score of each subtree.
+    -- Each term-directory build gives newly written pages identities unique to the attempt.
     -- A run addition or replacement can publish updated rows in the same ordered change as its run receipt, under a compare-and-set on the expected directory root and active run identities.
     -- The accepted term directory and its active run set are checkpointed together.
     -- The lane can rebuild a directory from the authenticated term summaries of the active runs.

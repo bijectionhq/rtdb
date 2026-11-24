@@ -90,6 +90,7 @@ The search writer takes these statistics from the run's Arrow term table and ran
 Each directory branch carries the largest unit score bound of its descendants.
 
 An update writes immutable pages for the affected paths and publishes the root together with the run addition or replacement.
+Each write attempt gives its new pages distinct digests, including when a rebuild produces the same rows, so a concurrent sweep of older pages cannot remove the rebuilt directory.
 Adoption compares the expected root and active run identities.
 A change from an older writer invalidates routing for its generation until the lane rebuilds it from the active runs.
 The checkpoint stores the active roots.
@@ -118,8 +119,11 @@ The same table checkpoint records the directory receipt, the hosted writer epoch
 The receipt's row count includes each retained event and one frontier row per erased entity.
 Each update names the expected predecessor root in the ordered catalog.
 An immutable directory page is addressed by its content digest, and a later seal reuses the untouched subtrees.
+A seal advances the entity directory only on stores that can release retired directory pages.
+The per-trie history sidecar can still be sealed on stores without directory-page release.
 Checkpoint replay archives include every page reachable from the active root and keep the live primary payloads.
-Collection protects the pages reached by installed checkpoints and captured readers while hosted releases also respect fork and archive holds.
+Collection protects pages reached by installed checkpoints, captured readers, and retired roots whose reader lease is still open.
+Hosted releases also require immutable provider evidence and clearance of fork and archive holds.
 
 ## Query execution
 

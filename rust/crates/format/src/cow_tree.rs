@@ -15,8 +15,9 @@ use arrow_ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Result};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 pub const MAX_LEAF_ROWS: usize = 2048;
 pub const MAX_FANOUT: usize = 64;
@@ -24,6 +25,12 @@ const MAX_HEIGHT: u8 = 64;
 const MAX_PAGE_BYTES: u64 = 128 << 20;
 const PAGE_GENERATION: &str = "rtdb.cow-tree.generation";
 const ROOT_MAGIC: &[u8; 8] = b"RTDBCOW1";
+
+#[derive(Clone, Copy, Debug)]
+pub enum PageGeneration {
+    Block(BlockIndex),
+    Attempt(Uuid),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PageDigest(pub [u8; 32]);
@@ -160,7 +167,7 @@ fn binary<'a>(values: impl Iterator<Item = &'a [u8]>) -> BinaryArray {
     builder.finish()
 }
 
-fn encode(page: &Page, height: u8, generation: Option<i64>) -> Result<Bytes> {
+fn encode(page: &Page, height: u8, generation: Option<PageGeneration>) -> Result<Bytes> {
     let columns: Vec<Arc<dyn Array>> = match page {
         Page::Leaf(rows) => vec![
             Arc::new(binary(rows.iter().map(|row| row.key.as_slice()))),
@@ -186,7 +193,10 @@ fn encode(page: &Page, height: u8, generation: Option<i64>) -> Result<Bytes> {
     };
     let schema = match generation {
         Some(generation) => Arc::new(schema(height).as_ref().clone().with_metadata(
-            std::collections::HashMap::from([(PAGE_GENERATION.to_owned(), generation.to_string())]),
+            std::collections::HashMap::from([(PAGE_GENERATION.to_owned(), match generation {
+                PageGeneration::Block(block) => block.0.to_string(),
+                PageGeneration::Attempt(attempt) => attempt.to_string(),
+            })]),
         )),
         None => Arc::clone(schema(height)),
     };
@@ -210,7 +220,7 @@ fn decode(bytes: &Bytes, height: u8) -> Result<Page> {
                 || !actual
                     .metadata()
                     .get(PAGE_GENERATION)
-                    .is_some_and(|generation| generation.parse::<i64>().is_ok())))
+                    .is_some_and(|generation| generation.parse::<i64>().is_ok() || Uuid::parse_str(generation).is_ok())))
     {
         return Err(invalid("Unexpected Arrow page layout"));
     }
@@ -349,7 +359,7 @@ struct Writer<'a> {
     summary: &'a dyn Summary,
     memory: &'a Arc<MemoryBudget>,
     written: BTreeSet<PageDigest>,
-    generation: Option<i64>,
+    generation: Option<PageGeneration>,
 }
 
 impl Writer<'_> {
@@ -533,14 +543,14 @@ pub async fn apply(
     apply_with_generation(store, base, edits, summary, memory, None).await
 }
 
-/// The seal's generation prevents a later edit from recreating a digest after its retirement.
+/// The generation distinguishes rewritten pages from pages with identical rows in earlier generations.
 pub async fn apply_with_generation(
     store: &dyn PageStore,
     base: Option<&RootRef>,
     edits: Vec<Edit>,
     summary: &dyn Summary,
     memory: &Arc<MemoryBudget>,
-    generation: Option<i64>,
+    generation: Option<PageGeneration>,
 ) -> Result<(Option<RootRef>, Vec<PageDigest>)> {
     if edits.is_empty() {
         return Ok((base.cloned(), Vec::new()));
@@ -907,7 +917,7 @@ mod tests {
             (0..MAX_LEAF_ROWS + 1).map(put).collect(),
             &NoSummary,
             &memory,
-            Some(1),
+            Some(PageGeneration::Block(BlockIndex(1))),
         )
         .await
         .unwrap();
@@ -921,7 +931,7 @@ mod tests {
             })],
             &NoSummary,
             &memory,
-            Some(2),
+            Some(PageGeneration::Block(BlockIndex(2))),
         )
         .await
         .unwrap();

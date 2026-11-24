@@ -278,6 +278,8 @@ pub trait ObjectStore: Send + Sync {
         self.delete(key).await?;
         Ok(true)
     }
+    /// Whether this store has a release path for directory pages it writes.
+    fn supports_directory_page_release(&self) -> bool { !self.defers_trie_releases() }
     async fn release_entity_directory_page(&self, key: &ObjectKey, _cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         if self.defers_trie_releases() { return Ok(false); }
         self.delete(key).await?;
@@ -721,6 +723,8 @@ impl ObjectStore for LocalStore {
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         crate::classic_retirement::retire_search_run(self, key, publication, cut, None).await
     }
+
+    fn supports_directory_page_release(&self) -> bool { true }
 
     async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         crate::classic_retirement::retire_search_run(self, key, None, cut, None).await

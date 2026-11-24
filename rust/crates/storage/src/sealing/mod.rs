@@ -395,6 +395,7 @@ impl ObjectStore for EncryptingStore {
         self.inner.settle_classic_trie(key, version).await
     }
 
+    fn supports_directory_page_release(&self) -> bool { self.inner.supports_directory_page_release() }
     async fn release_entity_directory_page(&self, key: &ObjectKey, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
         self.inner.release_entity_directory_page(key, cut).await
     }

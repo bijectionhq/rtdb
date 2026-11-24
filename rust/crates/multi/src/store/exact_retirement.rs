@@ -1131,6 +1131,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn hosted_directory_page_release_requires_publication_and_drained_holds() {
+        use std::sync::Arc;
+        use rtdb_directory::{ArchiveSourceHold, MemberId};
+        use rtdb_format::{cow_tree::{PageDigest, page_key}, entity_directory, keys::TableSlug, term_directory};
+        use tokio_util::task::TaskTracker;
+
+        let directory = MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        let namespaces = StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let region = Uuid::new_v4();
+        record.holder = Some(MemberId::fresh());
+        record.storage_namespaces = Some(namespaces);
+        record.storage_regions.insert(region, super::super::remote_storage_region(None, None));
+        let record = directory.create_deployment(record).await.unwrap();
+        let epoch = StorageEpoch(0);
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, epoch).unwrap().key();
+        let scope = format!("{}/{root}", record.storage_prefix());
+        let bucket = Arc::new(VersionedReleaseStore::default());
+        let mut store = super::super::open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, Arc::new(|| 0)).await.unwrap();
+        Arc::get_mut(&mut store).unwrap().catalog_readers = Some(crate::catalog_readers::CatalogReaders::new(
+            directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, region, Some(record.epoch),
+        ));
+        let cut = CatalogCut { storage_version: CURRENT_STORAGE_VERSION, storage_epoch: epoch, replica_epoch: epoch, through: ReplicaPosition(0) };
+
+        let slug = TableSlug::recorded("public$docs").unwrap();
+        let pages = [entity_directory::prefix(&slug), term_directory::page_prefix(&slug)]
+            .map(|prefix| ObjectKey::new(page_key(&prefix, PageDigest([1; 32]))).unwrap());
+        let physical = pages.each_ref().map(|page| ObjectKey::new(format!("{scope}/{page}")).unwrap());
+        let releases = ObjectKey::new(format!("{scope}/{GARBAGE_DIRECTORY}")).unwrap();
+        for page in &pages {
+            assert!(!store.release_entity_directory_page(page, Some(cut)).await.unwrap());
+            store.put(page, Bytes::from_static(b"page")).await.unwrap();
+        }
+
+        let preparation = ForkPreparation { token: Uuid::new_v4(), generation: 0 };
+        directory.change_lineage(&record.lineage, LineageChange::PrepareHostedFork { preparation, task: None }).await.unwrap();
+        for page in &pages { assert!(!store.release_entity_directory_page(page, Some(cut)).await.unwrap()); }
+        directory.change_lineage(&record.lineage, LineageChange::ReleaseFork { preparation }).await.unwrap();
+
+        let archive = Uuid::new_v4();
+        let versions = physical.each_ref().map(|key| bucket.version(key));
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.storage_regions.insert(archive, StorageRegion::ReferenceRead {
+                object: None, custody: ReplayCustody::Hosted { owner: None },
+                archive_source: Some(ArchiveSourceHold::new(versions[0].namespace.clone(),
+                    versions.iter().map(|version| (version.key.clone(), version.version.clone())).collect())),
+            });
+            Ok(())
+        }).await.unwrap();
+        for page in &pages { assert!(!store.release_entity_directory_page(page, Some(cut)).await.unwrap()); }
+        crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.storage_regions.remove(&archive);
+            Ok(())
+        }).await.unwrap();
+
+        let mut child = DeploymentRecord::new("child", "acme", vec![], 0);
+        child.lineage.clone_from(&record.lineage);
+        let child = directory.create_deployment(child).await.unwrap();
+        let child_store = format!("{}/{root}", child.storage_prefix());
+        let names: BTreeSet<_> = pages.iter().map(ObjectKey::to_string).collect();
+        let base = Base { objects: names.iter().map(|name| (name.clone(), scope.clone())).collect(), ..Default::default() };
+        base.initialize(bucket.as_ref(), &child_store).await.unwrap();
+        for page in &pages { assert!(!store.release_entity_directory_page(page, Some(cut)).await.unwrap()); }
+        base.forget(bucket.as_ref(), &child_store, &names).await.unwrap();
+
+        let lineage = directory.lineage_state(&record.lineage).await.unwrap();
+        let retirement = LineageRetirement { token: Uuid::new_v4(), source: record.storage_prefix(),
+            work: RetirementWork::Local { local_volume: [1; 32] } };
+        directory.change_lineage(&record.lineage, LineageChange::ReserveRetirement {
+            retirement: retirement.clone(), observed_references: lineage.reference_revision(), generation: lineage.retirement_generation(),
+        }).await.unwrap();
+        for page in &pages { assert!(!store.release_entity_directory_page(page, Some(cut)).await.unwrap()); }
+        assert!(bucket.list(Some(&releases)).await.unwrap().is_empty());
+        directory.change_lineage(&record.lineage, LineageChange::SettleRetirement { retirement }).await.unwrap();
+
+        for page in &pages { assert!(store.release_entity_directory_page(page, Some(cut)).await.unwrap()); }
+        let mut released = BTreeSet::new();
+        for entry in bucket.list(Some(&releases)).await.unwrap() {
+            let release = serde_json::from_slice(&bucket.get(&entry.key).await.unwrap()).unwrap();
+            let StoredRelease::Exact { record, version, .. } = release else { panic!("Release must bind the provider version"); };
+            assert_eq!(record.trie_floor.unwrap().cut, cut);
+            assert_eq!(version, bucket.version(&ObjectKey::new(format!("{scope}/{}", record.key)).unwrap()));
+            released.insert(record.key);
+        }
+        assert_eq!(released, names);
+    }
+
     struct Provider {
         version: PhysicalObjectVersion,
         attempts: AtomicUsize,

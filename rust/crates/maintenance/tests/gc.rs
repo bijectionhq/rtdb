@@ -3,12 +3,13 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicI64, Ordering}};
 use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rtdb_format::{block::proto as pb, catalog::BlockCatalog, keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey, block_key, oversized_key}};
+use rtdb_format::{block::proto as pb, catalog::BlockCatalog, cow_tree::RootRef, keys::{TRIE_RETIREMENT_DIRECTORY, TrieKey, block_key, oversized_key},
+    log::proto::{ArtefactsAdded, ArtefactsRemoved, EntityDirectoryChange, EntityDirectoryRoot}};
 use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog, TrieState};
-use rtdb_maintenance::{BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TableRetirements, TrieCollector, TrieDeletionPublisher, block_is_garbage};
+use rtdb_maintenance::{ArtefactPublisher, BlockCollector, CollectionObserver, CycleWorker, GarbageConfig, TableRetirements, TrieCollector, TrieDeletionPublisher, block_is_garbage};
 use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore};
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, PhysicalObjectVersion, S3ObjectNamespace, StorageEpoch, StorageVersion, TableRef, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, CatalogCut, ReplicaPosition, Result, PhysicalObjectVersion, S3ObjectNamespace, SourcePosition, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
@@ -952,30 +953,34 @@ async fn a_search_upload_without_catalog_adoption_is_fenced_before_release() {
     assert!(state.snapshot().trie_catalog().retired_search_runs(&table).next().unwrap().released());
 }
 
+struct DirectoryPublisher(Arc<PartitionState>);
+
+#[async_trait]
+impl ArtefactPublisher for DirectoryPublisher {
+    async fn publish(&self, _: ArtefactsAdded) -> Result<SourcePosition> { unreachable!() }
+    async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> {
+        let entries = message.entries.into_iter().map(|entry| {
+            (entry.trie_key.unwrap().parse().unwrap(), entry.record.unwrap())
+        }).collect();
+        self.0.remove_artefacts(&TableRef::new("public", "docs"), entries);
+        Ok(SourcePosition(1))
+    }
+}
+
+fn adopt_directory(state: &PartitionState, table: &TableRef, through: i64, root: &RootRef, previous: Option<&RootRef>, count: usize) {
+    let mut l0 = CatalogTrie::notification(TrieKey::l0(BlockIndex(through)).unwrap(), 1, None).unwrap();
+    let receipt = EntityDirectoryRoot { root: Some(root.encode()), through_block: Some(through),
+        source_rows: Some(count as i64), allocation: Some(vec![through as u8; 16]), writer_fence: Some(1),
+        erase_frontier_digest: Some(vec![0; 32]), ..Default::default() };
+    l0.artefacts.push(EntityDirectoryChange { root: Some(receipt), replaces_root: previous.map(RootRef::encode) }.to_artefact().unwrap());
+    state.add_tries(&BTreeMap::from([(table.clone(), vec![l0])]), Timestamp(through)).unwrap();
+}
+
 #[tokio::test]
 async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_next_root() {
-    use rtdb_format::{
-        cow_tree::{self, Edit, NoSummary, RootRef, Row},
-        entity_directory,
-        log::proto::{ArtefactsAdded, ArtefactsRemoved, EntityDirectoryChange, EntityDirectoryRoot},
-    };
-    use rtdb_maintenance::ArtefactPublisher;
+    use rtdb_format::{cow_tree::{self, Edit, NoSummary, Row}, entity_directory};
     use rtdb_storage::{cache::BufferPool, cow_pages::ObjectPageStore};
-    use rtdb_types::{MemoryBudget, SourcePosition};
-
-    struct DirectoryPublisher(Arc<PartitionState>);
-
-    #[async_trait]
-    impl ArtefactPublisher for DirectoryPublisher {
-        async fn publish(&self, _: ArtefactsAdded) -> Result<SourcePosition> { unreachable!() }
-        async fn remove(&self, message: ArtefactsRemoved) -> Result<SourcePosition> {
-            let entries = message.entries.into_iter().map(|entry| {
-                (entry.trie_key.unwrap().parse().unwrap(), entry.record.unwrap())
-            }).collect();
-            self.0.remove_artefacts(&TableRef::new("public", "docs"), entries);
-            Ok(SourcePosition(1))
-        }
-    }
+    use rtdb_types::MemoryBudget;
 
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
@@ -996,17 +1001,9 @@ async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_nex
     let new_pages = cow_tree::reachable(&input, &next).await.unwrap();
 
     let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
-    let adopt = |through, root: &RootRef, previous: Option<&RootRef>| {
-        let mut l0 = CatalogTrie::notification(TrieKey::l0(BlockIndex(through)).unwrap(), 1, None).unwrap();
-        let receipt = EntityDirectoryRoot { root: Some(root.encode()), through_block: Some(through),
-            source_rows: Some(count as i64), allocation: Some(vec![through as u8; 16]), writer_fence: Some(1),
-            erase_frontier_digest: Some(vec![0; 32]), ..Default::default() };
-        l0.artefacts.push(EntityDirectoryChange { root: Some(receipt), replaces_root: previous.map(RootRef::encode) }.to_artefact().unwrap());
-        state.add_tries(&BTreeMap::from([(table.clone(), vec![l0])]), Timestamp(through)).unwrap();
-    };
-    adopt(0, &old, None);
+    adopt_directory(&state, &table, 0, &old, None, count);
     let reader = state.snapshot();
-    adopt(1, &next, Some(&old));
+    adopt_directory(&state, &table, 1, &next, Some(&old), count);
     let primary = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::new(Vec::new()) });
     let observer = Arc::new(Observer::default());
     let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), unleased(), fixed_clock()).unwrap()
@@ -1021,6 +1018,98 @@ async fn directory_collection_keeps_pages_held_by_a_reader_and_reused_by_the_nex
         assert_eq!(store.head(&ObjectKey::new(cow_tree::page_key(&input.prefix, page)).unwrap()).await.is_ok(), new_pages.contains(&page));
     }
     assert!(state.value().trie_catalog().retired_entity_directories(&table).next().is_none());
+}
+
+#[tokio::test]
+async fn directory_collection_preserves_shared_pages_until_the_newer_retired_root_lease_elapses() {
+    use rtdb_format::{cow_tree::{self, Edit, NoSummary, Row}, entity_directory};
+    use rtdb_storage::{cache::BufferPool, cow_pages::ObjectPageStore};
+    use rtdb_types::MemoryBudget;
+
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let entry = tables.entry(&table).unwrap().clone();
+    let store = Arc::new(MemoryStore::default());
+    let pages = ObjectPageStore { store: store.clone(), storage: Arc::new(BufferPool::new(store.clone(), 16 << 20)),
+        prefix: entity_directory::prefix(&entry.slug) };
+    let memory = MemoryBudget::new(16 << 20);
+    let count = cow_tree::MAX_LEAF_ROWS + 1;
+    let edit = |index: usize, value| Edit::Put(Row { key: (index as u32).to_be_bytes().to_vec(), value: vec![value] });
+    let (old, _) = cow_tree::apply(&pages, None, (0..count).map(|index| edit(index, 0)).collect(), &NoSummary, &memory).await.unwrap();
+    let old = old.unwrap();
+    let (newer, _) = cow_tree::apply(&pages, Some(&old), vec![edit(0, 1)], &NoSummary, &memory).await.unwrap();
+    let newer = newer.unwrap();
+    let (current, _) = cow_tree::apply(&pages, Some(&newer), vec![edit(count - 1, 2)], &NoSummary, &memory).await.unwrap();
+    let current = current.unwrap();
+    let old_pages = cow_tree::reachable(&pages, &old).await.unwrap();
+    let newer_pages = cow_tree::reachable(&pages, &newer).await.unwrap();
+    let current_pages = cow_tree::reachable(&pages, &current).await.unwrap();
+    let shared = old_pages.iter().find(|page| newer_pages.contains(page) && !current_pages.contains(page)).unwrap();
+    let shared = ObjectKey::new(cow_tree::page_key(&pages.prefix, *shared)).unwrap();
+    let old_root = ObjectKey::new(cow_tree::page_key(&pages.prefix, old.digest)).unwrap();
+
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    adopt_directory(&state, &table, 0, &old, None, count);
+    adopt_directory(&state, &table, 1, &newer, Some(&old), count);
+    let time = Arc::new(AtomicI64::new(0));
+    let clock = { let time = time.clone(); Arc::new(move || time.load(Ordering::Relaxed)) };
+    let primary = Arc::new(DeletedPublisher { store: store.clone(), table: entry, commits: Mutex::default() });
+    let observer = Arc::new(Observer::default());
+    let config = GarbageConfig { reader_lease: Duration::from_micros(10), ..unleased() };
+    let collector = TrieCollector::new(store.clone(), state.clone(), primary, observer.clone(), config, clock).unwrap()
+        .with_entity_directories(Arc::new(DirectoryPublisher(state.clone())), StorageVersion(6), StorageEpoch(0));
+    let cancellation = CancellationToken::new();
+    collector.collect_as_of(Timestamp(1), &cancellation).await.unwrap();
+
+    adopt_directory(&state, &table, 2, &current, Some(&newer), count);
+    time.store(10, Ordering::Relaxed);
+    collector.collect_as_of(Timestamp(2), &cancellation).await.unwrap();
+    assert!(matches!(store.head(&old_root).await, Err(rtdb_storage::Error::MissingObject(_))));
+    assert!(store.head(&shared).await.is_ok());
+
+    time.store(20, Ordering::Relaxed);
+    collector.collect_as_of(Timestamp(2), &cancellation).await.unwrap();
+    assert!(matches!(store.head(&shared).await, Err(rtdb_storage::Error::MissingObject(_))));
+    assert!(state.value().trie_catalog().retired_entity_directories(&table).next().is_none());
+    assert!(observer.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn directory_sealing_requires_page_releases_and_preserves_per_trie_history() {
+    use rtdb_format::{data::{StoredEvent, StoredOperation, build_event_batch}, entity_directory, entity_history, ipc::write_file};
+    use rtdb_maintenance::{ArtefactDatabase, ArtefactKind, EntityHistoryArtefacts};
+    use rtdb_storage::cache::BufferPool;
+    use rtdb_types::{EventOrigin, Iid, Interval, LogicalType, MemoryBudget, ScalarType, StructFields, Value};
+
+    let directory = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalStore::open(directory.path()).unwrap());
+    let coordinated = Arc::new(CatalogFloorStore { inner: local, blocked: false.into(), proposals: Mutex::default(), fail_release: Mutex::default() });
+    let stores: [(Arc<dyn ObjectStore>, bool); 2] = [(Arc::new(MemoryStore::default()), true), (coordinated, false)];
+    let table = TableRef::new("public", "docs");
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
+    let slug = tables.entry(&table).unwrap().slug.clone();
+    let value = Arc::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap());
+    let block = BlockIndex(0);
+    let trie = TrieKey::l0(block).unwrap();
+    let event = StoredEvent { position: None, origin: Some(EventOrigin::at([1; 16], 0, block)), commit_position: 0, entity_key: None,
+        iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, recency: None,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])) };
+    let fields = StructFields::from([("_id".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let batch = build_event_batch(&[event], Some(fields), None).unwrap();
+    let bytes = write_file(&batch.schema(), &[batch]).unwrap();
+    let path = directory.path().join("input.arrow");
+    std::fs::write(&path, &bytes).unwrap();
+
+    for (store, can_release) in stores {
+        let builder = EntityHistoryArtefacts.builder(ArtefactDatabase { name: "xtdb".into(), store: store.clone(),
+            storage: Arc::new(BufferPool::new(store.clone(), 16 << 20)), memory: MemoryBudget::new(16 << 20),
+            history: None, clock: Arc::new(|| Timestamp(1)) }).unwrap();
+        let records = builder.seal_serving_search(&value, &table, &trie, &path, bytes.len() as u64, &CancellationToken::new()).await.unwrap();
+        assert!(records.iter().any(|record| record.kind() == entity_history::KIND));
+        assert_eq!(records.iter().any(|record| record.kind() == entity_directory::RECORD_KIND), can_release);
+        let prefix = ObjectKey::new(entity_directory::prefix(&slug)).unwrap();
+        assert_eq!(!store.list(Some(&prefix)).await.unwrap().is_empty(), can_release);
+    }
 }
 
 #[tokio::test]

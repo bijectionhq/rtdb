@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use arrow_array::{Array, StructArray, cast::AsArray, types::UInt32Type};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::cow_tree::{self, Edit, PageDigest, PageStore, RootRef, Row, Summary};
+use rtdb_format::cow_tree::{self, Edit, PageGeneration, PageStore, RootRef, Row, Summary};
 use rtdb_text::{Query, RankScorer};
 use rtdb_types::{Anomaly, Result};
 
@@ -140,13 +140,15 @@ impl TermEdits {
     }
 
     pub async fn apply(self, store: &dyn PageStore, base: Option<&RootRef>, memory: &Arc<MemoryBudget>)
-        -> Result<(Option<RootRef>, Vec<PageDigest>)> {
+        -> Result<Option<RootRef>> {
         let Self { edits, charge: _charge, .. } = self;
         let edits = edits.into_iter().map(|(key, value)| match value {
             Some(value) => Edit::Put(Row { key, value }),
             None => Edit::Delete(key),
         }).collect();
-        cow_tree::apply(store, base, edits, &MaxUnitBound, memory).await
+        let generation = PageGeneration::Attempt(uuid::Uuid::new_v4());
+        let (root, _) = cow_tree::apply_with_generation(store, base, edits, &MaxUnitBound, memory, Some(generation)).await?;
+        Ok(root)
     }
 }
 
@@ -228,6 +230,7 @@ fn invalid(message: &str) -> Anomaly { Anomaly::fault("rtdb.search/term-director
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use rtdb_format::cow_tree::PageDigest;
     use rtdb_text::{Corpus, Scorer, unit_term_score};
 
     #[derive(Default)]
@@ -267,7 +270,7 @@ mod tests {
         ] {
             edits.record(field, term, run, Some(summary)).unwrap();
         }
-        let root = edits.apply(&pages, None, &memory).await.unwrap().0.unwrap();
+        let root = edits.apply(&pages, None, &memory).await.unwrap().unwrap();
         assert_eq!(root.summary, unit_term_score(2).to_be_bytes());
         let matching = Query::parse("\"audit report\"");
         let scoring = Query::parse("memo report audit");
@@ -297,11 +300,11 @@ mod tests {
         let mut edits = TermEdits::new(&memory).unwrap();
         edits.record(0, "report", old, Some(stats(1, 1, 1))).unwrap();
         edits.record(0, "memo", kept, Some(stats(1, 1, 1))).unwrap();
-        let before = edits.apply(&pages, None, &memory).await.unwrap().0.unwrap();
+        let before = edits.apply(&pages, None, &memory).await.unwrap().unwrap();
         let mut edits = TermEdits::new(&memory).unwrap();
         edits.record(0, "report", old, None).unwrap();
         edits.record(0, "report", replacement, Some(stats(1, 2, 2))).unwrap();
-        let after = edits.apply(&pages, Some(&before), &memory).await.unwrap().0.unwrap();
+        let after = edits.apply(&pages, Some(&before), &memory).await.unwrap().unwrap();
         assert_eq!(read_term(&pages, &before, 0, "report", &BTreeMap::from([(old, 0), (kept, 1)]), &memory)
             .await.unwrap().into_keys().collect::<Vec<_>>(), [0]);
         let active = BTreeMap::from([(replacement, 2), (kept, 1)]);
@@ -310,5 +313,27 @@ mod tests {
 
         pages.0.lock().unwrap().insert(after.digest, Bytes::from_static(b"corrupt"));
         assert!(read_term(&pages, &after, 0, "report", &active, &memory).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rebuilding_identical_terms_survives_a_sweep_of_the_previous_pages() {
+        let memory = MemoryBudget::new(8 << 20);
+        let pages = Pages::default();
+        let run = [1; 32];
+        let rebuild = || {
+            let mut edits = TermEdits::new(&memory).unwrap();
+            edits.record(0, "report", run, Some(stats(1, 1, 1))).unwrap();
+            edits.apply(&pages, None, &memory)
+        };
+
+        let abandoned = rebuild().await.unwrap().unwrap();
+        let sweep = cow_tree::reachable(&pages, &abandoned).await.unwrap();
+        let published = rebuild().await.unwrap().unwrap();
+        for digest in sweep {
+            pages.0.lock().unwrap().remove(&digest).unwrap();
+        }
+
+        let routes = read_term(&pages, &published, 0, "report", &BTreeMap::from([(run, 0)]), &memory).await.unwrap();
+        assert_eq!(routes.into_keys().collect::<Vec<_>>(), [0]);
     }
 }

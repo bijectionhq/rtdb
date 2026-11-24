@@ -2010,6 +2010,7 @@ rule ReapUnreachable {
     -- An exact trie or replica payload release can settle as soon as its durable admission and recovery checks allow it.
     -- Path and checkpoint-metadata pack releases still use the grace below.
     -- A retired logical search run carries its provider publication and the installed catalog floor before a hosted release can be recorded.
+    -- A directory page release records its observed immutable provider publication and installed catalog floor after fork and archive holds drain.
     -- Every indexed member of a hosted pack needs a mature release for the same publication.
     -- A versioned pack is erased by its exact version.
     -- An enrolled terminal pack is replaced by a conditional tombstone after an entity-tag-bound index read.
