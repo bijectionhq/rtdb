@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn both_writers_must_cover_the_returned_seek_prefix() {
-        let key = |n| (vec![n], n.to_string());
+        let key = |n: u8| (vec![n], n.to_string());
         let live = [key(1), key(3)];
         let frozen = [key(2), key(4)];
         assert_eq!(covered_edge(&live, &frozen, 2, false), Some(&live[1]));
