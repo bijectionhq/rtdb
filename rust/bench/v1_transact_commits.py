@@ -4,37 +4,34 @@
 The rtdb.v1 port of placed_commits.py. Each client commits distinct-key single-row
 `Put`s through the `rtdb.v1.Transact` DoAction and waits for its receipt. The
 benchmark reports commits per second and latency percentiles per client count, then
-checks every acknowledged key with `rtdb.v1.TxStatus`: the receipt must replay with
-the same basis, and bases must be distinct and increasing.
-
-    --mode multi    one holder, a gateway and three fsyncing Logkeepers (as placed_commits.py)
-    --mode default  one standalone node with its local log (as owned_commits.py)
+checks every acknowledged key with `rtdb.v1.TxStatus` and verifies distinct
+opaque bases. By default it starts the official `rtdb dev` binary in the
+selected mode. Use `--endpoint` for a separately prepared local topology,
+including a Multi writer backed by three durable Logkeepers.
 
 Requires PyArrow. Request bodies are hand-encoded protobuf for rust/proto/rtdb.v1.proto,
 so no generated stubs are needed.
 
-Wire assumptions to confirm against the Transact handler once it is wired (W7):
-a row's id travels as its `_id` cell, and `Put.table` names the table as `schema.table`.
 """
 
 import argparse
 import concurrent.futures
 import contextlib
+import ipaddress
 import json
 import pathlib
+import re
 import struct
-import sys
+import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
+import uuid
 
 import pyarrow as pa
 from pyarrow import flight
 
-from owned_commits import ipc, server as standalone_server
-from placed_commits import cell as multi_cell, connect as multi_connect
-
-TABLE = "public.v1_bench"
 BRANCH = "main"
 
 
@@ -70,21 +67,25 @@ def boolean(field, value):
 
 def arrow_cell(array):
     """Cell{arrow_ipc}: an Arrow IPC stream with exactly one scalar cell."""
-    return length_delimited(1, ipc(value=array))
+    batch = pa.record_batch({"value": array})
+    buffer = pa.BufferOutputStream()
+    with pa.ipc.new_stream(buffer, batch.schema) as stream:
+        stream.write_batch(batch)
+    return length_delimited(1, buffer.getvalue().to_pybytes())
 
 
-def put_op(identity, value):
+def put_op(table, identity, value):
     cells = {"_id": arrow_cell(pa.array([identity], type=pa.int64())),
              "v": arrow_cell(pa.array([value], type=pa.int64()))}
     # map<string, Cell> cells = 1: repeated entries {key = 1; value = 2}.
     row = b"".join(length_delimited(1, string(1, name) + length_delimited(2, cell))
                    for name, cell in cells.items())
-    put = string(1, BRANCH) + string(2, TABLE) + length_delimited(3, row)
+    put = string(1, BRANCH) + string(2, table) + length_delimited(3, row)
     return length_delimited(1, put)  # Op.put = 1
 
 
-def transact_request(key, identity):
-    return length_delimited(1, key) + length_delimited(5, put_op(identity, identity ^ 0x5A5A))
+def transact_request(key, table, identity):
+    return length_delimited(1, key) + length_delimited(5, put_op(table, identity, identity ^ 0x5A5A))
 
 
 def tx_status_request(key):
@@ -141,8 +142,8 @@ def receipt(body):
 
 # --- the run ---
 
-def key_for(client_id, sequence):
-    return struct.pack(">QQ", client_id, sequence)
+def key_for(trial, client_id, sequence):
+    return trial.bytes + struct.pack(">QQ", client_id, sequence)
 
 
 def action(client, options, name, body):
@@ -150,17 +151,27 @@ def action(client, options, name, body):
     return result.body.to_pybytes()
 
 
-def require_transact(client, options):
-    probe = transact_request(b"\0" * 16, 0)
-    try:
-        action(client, options, "rtdb.v1.Transact", probe)
-    except flight.FlightError as error:
-        if "unsupported" in str(error).lower() or "feature-required" in str(error):
-            raise SystemExit(f"This server does not serve rtdb.v1.Transact yet: {error}")
-        raise
+def require_transact(client, options, trial, table):
+    key = key_for(trial, 0, 0)
+    probe = transact_request(key, table, -1)
+    deadline = time.monotonic() + 45
+    while True:
+        try:
+            reply = receipt(action(client, options, "rtdb.v1.Transact", probe))
+            break
+        except flight.FlightUnavailableError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+        except flight.FlightError as error:
+            if "unsupported" in str(error).lower() or "feature-required" in str(error):
+                raise SystemExit(f"This server does not serve rtdb.v1.Transact: {error}") from error
+            raise
+    if reply["key"] != key or reply["outcome"] != "then" or not reply["basis"]:
+        raise RuntimeError(f"RTDB did not accept the v1 startup probe: {reply}")
 
 
-def measure(connect, count, seconds, warmup, rate):
+def measure(connect, trial, table, count, seconds, warmup, rate):
     start = 0.0
 
     def begin():
@@ -183,10 +194,10 @@ def measure(connect, count, seconds, warmup, rate):
                             time.sleep(delay)
                     if time.perf_counter() >= start + warmup + seconds:
                         break
-                    key = key_for(client_id + 1, sequence)
+                    key = key_for(trial, client_id + 1, sequence)
                     submitted = time.perf_counter()
                     answer = receipt(action(client, options, "rtdb.v1.Transact",
-                                            transact_request(key, (client_id << 40) | sequence)))
+                                            transact_request(key, table, (client_id << 40) | sequence)))
                     finished = time.perf_counter()
                     if answer["key"] != key or answer["outcome"] != "then" or answer["replayed"]:
                         raise AssertionError(f"Unexpected receipt {answer}")
@@ -207,8 +218,7 @@ def measure(connect, count, seconds, warmup, rate):
     latencies = sorted(latency for _, batch in results for latency in batch)
     if not latencies:
         raise RuntimeError("No measured commits")
-    bases = sorted(answer["basis"] for answer in acknowledged)
-    if len(set(bases)) != len(bases):
+    if len({answer["basis"] for answer in acknowledged if answer["basis"]}) != len(acknowledged):
         raise AssertionError("Two acknowledged commits share a basis")
     verify(connect, acknowledged)
     return dict(clients=count, seconds=seconds, offered_rate=rate, commits=len(latencies),
@@ -224,55 +234,110 @@ def verify(connect, acknowledged):
     try:
         for answer in acknowledged:
             replay = receipt(action(client, options, "rtdb.v1.TxStatus", tx_status_request(answer["key"])))
-            if not replay["replayed"] or replay["basis"] != answer["basis"] or replay["system_time"] != answer["system_time"]:
+            if replay != {**answer, "replayed": True}:
                 raise AssertionError(f"TxStatus differs for {answer['key'].hex()}: {replay} != {answer}")
     finally:
         client.close()
 
 
 @contextlib.contextmanager
-def deployment(mode, binary, data, logs):
-    data.mkdir(parents=True)
-    if mode == "multi":
-        with multi_cell(binary, data, logs) as (_, flight_port, _, holder):
-            print(f"holder pid {holder}", file=sys.stderr, flush=True)
+def native_deployment(mode, binary, data, logs):
+    command = [str(binary), "dev", "--data", str(data), "--flight-sql-port", "0"]
+    command += ["--multi"] if mode == "multi" else ["--port", "0"]
+    logs.mkdir(parents=True, exist_ok=True)
+    logfile = logs / "node.log"
+    with logfile.open("w") as log, subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT) as process:
+        try:
+            deadline = time.monotonic() + 45
+            while process.poll() is None and time.monotonic() < deadline:
+                status = logfile.read_text(errors="replace")
+                bound = re.search(r"^RTDB listeners bound: .*?\bflight_sql: Some\((127\.0\.0\.1:[0-9]+)\)",
+                                  status, re.MULTILINE)
+                if bound:
+                    break
+                time.sleep(0.05)
+            else:
+                raise RuntimeError(f"RTDB failed to listen. See {logfile}")
+            yield f"grpc://{bound.group(1)}"
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
-            def connect():
-                client, options, _ = multi_connect(flight_port)
-                return client, options
-            yield connect
-    else:
-        logs.mkdir(parents=True, exist_ok=True)
-        with (logs / "node.log").open("w") as stderr, standalone_server(binary, data, stderr) as (port, _, _):
-            def connect():
-                client = flight.FlightClient(f"grpc://127.0.0.1:{port}")
-                authorization = client.authenticate_basic_token(b"xtdb", b"commit-bench")
-                return client, flight.FlightCallOptions(timeout=30, headers=[authorization])
-            yield connect
+
+def endpoint_is_local(endpoint):
+    try:
+        url = urllib.parse.urlsplit(endpoint)
+        host = url.hostname
+        if url.scheme not in ("grpc", "grpc+tls") or not host or url.username or url.password or url.path or url.query or url.fragment:
+            return False
+        return url.port is not None and url.port > 0 and (host == "localhost" or ipaddress.ip_address(host).is_loopback)
+    except ValueError:
+        return False
+
+
+def connector(endpoint, database, user, password, ca):
+    def connect():
+        client = flight.FlightClient(endpoint, tls_root_certs=ca)
+        headers = [(b"x-xtdb-database", database.encode())] if database else []
+        try:
+            if user is not None:
+                options = flight.FlightCallOptions(timeout=30, headers=headers)
+                headers.append(client.authenticate_basic_token(user.encode(), password, options))
+            return client, flight.FlightCallOptions(timeout=30, headers=headers)
+        except BaseException:
+            client.close()
+            raise
+    return connect
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("binary", type=pathlib.Path, help="rtdb-multi for --mode multi, rtdb for --mode default")
+    parser.add_argument("binary", type=pathlib.Path, nargs="?", help="official rtdb executable")
     parser.add_argument("output", type=pathlib.Path)
+    parser.add_argument("--endpoint", help="connect to an existing local native Flight listener")
+    parser.add_argument("--database", help="exact database selector on --endpoint")
+    parser.add_argument("--user", help="Basic principal on --endpoint")
+    parser.add_argument("--password-file", type=pathlib.Path)
+    parser.add_argument("--ca-file", type=pathlib.Path)
     parser.add_argument("--mode", choices=["multi", "default"], default="multi")
     parser.add_argument("--clients", type=int, nargs="+", default=[1, 4, 16, 32, 64])
     parser.add_argument("--seconds", type=float, default=10)
     parser.add_argument("--warmup", type=float, default=2)
     parser.add_argument("--rate", type=float, help="Pace requests at this total rate per second")
     args = parser.parse_args()
+    if (args.binary is None) == (args.endpoint is None):
+        parser.error("provide the official binary or --endpoint")
+    if args.endpoint is not None and not endpoint_is_local(args.endpoint):
+        parser.error("--endpoint must name a local grpc:// or grpc+tls:// listener")
+    if args.endpoint is None and any((args.database, args.user, args.password_file, args.ca_file)):
+        parser.error("database, credentials and CA options require --endpoint")
+    if (args.user is None) != (args.password_file is None):
+        parser.error("provide --user and --password-file together")
+    password = args.password_file.read_bytes().rstrip(b"\r\n") if args.password_file else None
+    ca = args.ca_file.read_bytes() if args.ca_file else None
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / "results.jsonl").open("a") as results:
         for count in args.clients:
             with tempfile.TemporaryDirectory(dir=args.output) as scratch:
                 scratch = pathlib.Path(scratch)
-                with deployment(args.mode, args.binary, scratch / "data", args.output / f"logs-{count}") as connect:
+                deployment = (contextlib.nullcontext(args.endpoint) if args.endpoint else native_deployment(
+                    args.mode, args.binary.resolve(), scratch / "data", args.output / f"logs-{count}"))
+                with deployment as endpoint:
+                    connect = connector(endpoint, args.database, args.user, password, ca)
+                    trial = uuid.uuid4()
+                    table = f"public.v1_bench_{trial.hex}"
                     client, options = connect()
                     try:
-                        require_transact(client, options)
+                        require_transact(client, options, trial, table)
                     finally:
                         client.close()
-                    row = dict(mode=args.mode, **measure(connect, count, args.seconds, args.warmup, args.rate))
+                    row = dict(mode=args.mode, topology="existing" if args.endpoint else "native-dev",
+                               **measure(connect, trial, table, count, args.seconds, args.warmup, args.rate))
             print(json.dumps(row), flush=True)
             results.write(json.dumps(row) + "\n")
 
