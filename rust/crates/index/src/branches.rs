@@ -138,6 +138,7 @@ pub struct BranchEvent {
 pub enum WrittenVersion {
     #[default]
     Branch,
+    Custody(Option<u64>),
     Classic(TxId),
     Unpositioned,
 }
@@ -151,7 +152,7 @@ const CLASSIC_WRITTEN_BIT: u64 = 1 << 63;
 impl BranchEvent {
     pub fn written_basis(&self) -> Option<Basis> {
         match self.written {
-            WrittenVersion::Branch => Some(self.cut.basis),
+            WrittenVersion::Branch | WrittenVersion::Custody(_) => Some(self.cut.basis),
             WrittenVersion::Classic(transaction) => u64::try_from(transaction.0).ok()
                 .map(|position| Basis::new(self.cut.basis.incarnation(), CLASSIC_WRITTEN_BIT | position)),
             WrittenVersion::Unpositioned => None,
@@ -660,8 +661,8 @@ impl BranchIndex {
     pub fn apply(&mut self, effect: BranchEffect) -> Result<()> {
         let basis = self.head.basis;
         match effect {
-            BranchEffect::Write { branch, table, event } => {
-                if event.cut != self.head {
+            BranchEffect::Write { branch, table, mut event } => {
+                if event.cut != self.head || matches!(event.written, WrittenVersion::Custody(_)) {
                     return Err(Anomaly::fault("rtdb/event-cut", "Resolved event differs from the transaction cut"));
                 }
                 if let Some(group) = event.image.as_ref().and_then(|image| image.custody_group) {
@@ -669,6 +670,9 @@ impl BranchIndex {
                         branch: branch.clone(), table: table.clone(), id: event.id.clone(), written: basis,
                         valid: event.valid, ordinal: self.writes.len() as u64,
                     })?;
+                    if event.written == WrittenVersion::Branch {
+                        event.written = WrittenVersion::Custody(None);
+                    }
                 }
                 let catalog = &mut self.catalog;
                 let definitions = catalog.entry(table.clone()).or_default();

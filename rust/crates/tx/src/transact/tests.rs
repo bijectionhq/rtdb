@@ -824,6 +824,12 @@ fn derived_custody_placement_uses_the_earlier_original_in_the_accepting_arm() {
     placement.derived.as_mut().unwrap().link = [16; 16];
     let late = commit_custody(&mut state, 4, &request(4, vec![derived]));
     assert!(matches!(late.outcome, Outcome::Refused { error } if error.code == "rtdb/custody-placement"));
+    let inventory_sha256 = state.index().custody_inventory(group).unwrap().sha256;
+    let revoke = request(5, vec![Op::RevokeCustodyGroup { group, inventory_sha256 }]);
+    assert_eq!(commit_custody(&mut state, 5, &revoke).outcome, Outcome::Then);
+    assert!(state.index().custody_read_occurrence(basis(3), group, origin).is_err());
+    let retried = state.resolve(&publish, 6, Timestamp(60), &[ROW_CUSTODY], &claims()).unwrap();
+    assert!(matches!(retried, Resolution::Answer(receipt) if receipt == replay));
 }
 
 #[test]
@@ -892,6 +898,35 @@ fn custody_carrier(group: CustodyGroupId, id: i64, placement_id: CustodyPlacemen
 fn commit_custody(state: &mut TransactState, at: u64, request: &Transact) -> Receipt {
     let prepared = plan(state, request, at, at as i64 * 10, &[ROW_CUSTODY]);
     apply(state, at, prepared.record()).unwrap()
+}
+
+#[test]
+fn custody_read_contributor_follows_the_enrolled_write_through_branch_inheritance() {
+    let group = [8; 16];
+    let mut state = TransactState::new(INCARNATION);
+    let carrier = custody_carrier(group, 1, [9; 16]);
+    let Op::PlaceCustodyRow { row, .. } = &carrier else { unreachable!() };
+    let duplicate = Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row.clone()], if_absent: false };
+    assert_eq!(commit_custody(&mut state, 1, &request(1, vec![
+        Op::CreateCustodyGroup { group }, carrier, duplicate,
+    ])).outcome, Outcome::Then);
+    assert_eq!(commit_custody(&mut state, 2, &request(2, vec![fork("child", 1)])).outcome, Outcome::Then);
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    let view = state.index().view("child", At::Latest, Layer::Merged, Timestamp(20)).unwrap();
+    let table = table();
+    let history = view.history(&table, &EntityId::Integer(1));
+    assert_eq!(history.len(), 2);
+    let entry = view.custody_placements().next().unwrap();
+    let occurrence = entry.occurrence.unwrap();
+    let commitment = occurrence.commitment(group);
+    assert_eq!(view.custody_event_contributor(&table, history[0]), Some((group, commitment)));
+    assert_eq!(view.custody_event_contributor(&table, history[1]), None);
+    let (original, retained) = state.index().custody_read_occurrence(view.cut().basis, group, commitment).unwrap();
+    assert_eq!(original, commitment);
+    assert_eq!(retained.target.branch, MAIN_BRANCH);
+    assert_eq!(retained.ordinal, 1);
+    assert_eq!(state.tx_status(&retained.receipt_key).unwrap().basis, basis(1));
 }
 
 #[test]
@@ -974,6 +1009,9 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
             transport_history: [19; 16], producer: [20; 16], consumer: [21; 16], response: [22; 16], ordinal: NonZeroU64::MIN,
         },
     };
+    assert!(state.index().check_custody_carrier_receipt(registration, first.basis, &first.key).is_ok());
+    assert!(state.index().check_custody_carrier_receipt(registration, first.basis, &[31; 16]).is_err());
+    assert!(state.index().check_custody_carrier_receipt(registration, basis(1), &[1; 16]).is_err());
     let release = |phase| TrustedCustodyRelease {
         release: CustodyRelease { registration, phase },
         writer: CustodyWriterFence { table: table(), id: EntityId::Integer(99), valid_at: Timestamp(20), written: basis(1) },

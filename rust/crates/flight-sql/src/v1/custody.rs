@@ -247,11 +247,13 @@ impl Service {
                 let (original, occurrence) = index
                     .custody_read_occurrence(basis, group, commitment)
                     .map_err(error::anomaly)?;
+                let written = index.exact(occurrence.written).map_err(error::anomaly)?;
                 let receipt = driver
                     .original_custody_receipt(&occurrence.receipt_key, occurrence.written, &call.cancellation)
                     .await
                     .map_err(error::anomaly)?;
-                if receipt.key != occurrence.receipt_key || receipt.basis != occurrence.written
+                if receipt.key != occurrence.receipt_key || receipt.basis != written.basis
+                    || receipt.system_time != written.system_time
                     || matches!(receipt.outcome, Outcome::Refused { .. })
                 {
                     return Err(unavailable());
@@ -269,6 +271,11 @@ impl Service {
                     valid_from_micros: target.valid.lower().0,
                     valid_to_micros: target.valid.upper().0,
                     carrier_sha256: occurrence.carrier_sha256.to_vec(),
+                    branch: target.branch.clone(),
+                    ordinal: occurrence.ordinal,
+                    placement_id: occurrence.placement_id.to_vec(),
+                    reservation_sha256: occurrence.reservation.map(|digest| digest.to_vec()),
+                    link_sha256: occurrence.link_sha256.map(|digest| digest.to_vec()),
                 });
             }
         }

@@ -100,6 +100,12 @@ message CustodyReadContributor {
   sint64 valid_from_micros = 9;
   sint64 valid_to_micros = 10;
   bytes carrier_sha256 = 11;
+  // Physical authoring branch, including when the Query inherits the row.
+  string branch = 12;
+  uint64 ordinal = 13;
+  bytes placement_id = 14;
+  optional bytes reservation_sha256 = 15;
+  optional bytes link_sha256 = 16;
 }
 message ReceiverClockObservation {
   // A sample from the installed receiver clock. QueryTrailer.system_time_micros names the selected cut.

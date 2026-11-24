@@ -184,7 +184,7 @@ impl CustodyCarrierJournal for AttachedCustodyCarrierJournal<'_> {
         self.confirm_receipt(&observed.receipt, cancellation)
             .await?;
         let index = self.attachment.current_custody(cancellation).await?;
-        index.check_custody_carrier_receipt(registration, observed.receipt.basis)?;
+        index.check_custody_carrier_receipt(registration, observed.receipt.basis, &observed.receipt.key)?;
         Ok(observed.observation)
     }
 }

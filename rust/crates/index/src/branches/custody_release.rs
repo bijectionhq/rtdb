@@ -179,10 +179,16 @@ impl BranchIndex {
         Ok(())
     }
 
-    pub fn check_custody_carrier_receipt(&self, registration: CustodyReleaseRegistration, receipt: Basis) -> Result<()> {
+    pub fn check_custody_carrier_receipt(
+        &self, registration: CustodyReleaseRegistration, receipt: Basis, key: &[u8],
+    ) -> Result<()> {
         self.check_custody_release_input(registration)?;
         let occurrence = self.custody[&registration.group].occurrence(registration.group, registration.occurrence);
-        if !occurrence.is_some_and(|occurrence| occurrence.written == receipt) { return Err(release_conflict()); }
+        if !occurrence.is_some_and(|occurrence| {
+            occurrence.written == receipt && (occurrence.receipt_key.is_empty() || occurrence.receipt_key == key)
+        }) {
+            return Err(release_conflict());
+        }
         Ok(())
     }
 

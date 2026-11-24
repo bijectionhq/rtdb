@@ -109,6 +109,17 @@ pub struct CustodyOccurrence {
 }
 
 impl CustodyOccurrence {
+    fn matches_event(&self, group: CustodyGroupId, event: &BranchEvent) -> bool {
+        event.cut.basis == self.written
+            && event.valid == self.target.valid
+            && event.id == self.target.id
+            && event.image.as_ref().is_some_and(|image| {
+                image.custody_group == Some(group) && image.custody_payload.as_ref().is_some_and(|payload| {
+                    <[u8; 32]>::from(Sha256::digest(&payload.envelope)) == self.envelope_sha256
+                })
+            })
+    }
+
     pub fn commitment(&self, group: CustodyGroupId) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"rtdb/v1/custody-occurrence\0");
@@ -233,7 +244,23 @@ impl BranchIndex {
         if original.written > selected || occurrence.written > selected || occurrence.receipt_key.is_empty() {
             return Err(placement_conflict());
         }
+        self.local_custody_event(group, occurrence).ok_or_else(placement_conflict)?;
         Ok((original.commitment(group), occurrence))
+    }
+
+    fn local_custody_event(&self, group: CustodyGroupId, occurrence: &CustodyOccurrence) -> Option<&BranchEvent> {
+        let target = &occurrence.target;
+        let events = self.branches.get(&target.branch)?.tables.get(&target.table)?.events.get(&target.id)?;
+        let first = events.partition_point(|(_, event)| event.cut.basis < occurrence.written);
+        let at_write = events[first..].iter().map(|(_, event)| event)
+            .take_while(|event| event.cut.basis == occurrence.written);
+        if let Some(event) = at_write.clone().find(|event| event.written == WrittenVersion::Custody(Some(occurrence.ordinal))) {
+            return occurrence.matches_event(group, event).then_some(event);
+        }
+        // Older checkpoints store the occurrence ordinal without stamping it on the row.
+        let mut matches = at_write.filter(|event| event.written == WrittenVersion::Branch && occurrence.matches_event(group, event));
+        let event = matches.next()?;
+        matches.next().is_none().then_some(event)
     }
 
     pub(super) fn reserve_custody_placement(
@@ -280,6 +307,7 @@ impl BranchIndex {
             || original.written != occurrence.written
             || original.receipt_key != occurrence.receipt_key
             || original.ordinal >= occurrence.ordinal
+            || self.local_custody_event(group, original).is_none()
             || occurrence.carrier_sha256 != derived.carrier_sha256
             || occurrence.link_sha256 != Some(derived.link_sha256)
         {
@@ -325,34 +353,30 @@ impl BranchIndex {
             None
         };
         let target = &occurrence.target;
-        let matching = self.writes.last().is_some_and(|write| {
+        let matching = self.writes.len() as u64 == occurrence.ordinal && self.writes.last().is_some_and(|write| {
             write.branch == target.branch
                 && write.table == target.table
                 && write.id == target.id
                 && write.valid == Some(target.valid)
                 && write.erased_written_basis.is_none()
         });
-        let payload = self
+        let head = self.head;
+        let event = self
             .branches
-            .get(&target.branch)
-            .and_then(|branch| branch.tables.get(&target.table))
-            .and_then(|rows| rows.events.get(&target.id))
-            .and_then(|events| events.last())
-            .filter(|(_, event)| event.cut == self.head && event.valid == target.valid)
-            .and_then(|(_, event)| event.image.as_ref())
-            .filter(|image| image.custody_group == Some(group))
-            .and_then(|image| image.custody_payload.as_ref());
-        if !matching
-            || self.writes.len() as u64 != occurrence.ordinal
-            || !payload.is_some_and(|payload| {
-                <[u8; 32]>::from(Sha256::digest(&payload.envelope)) == occurrence.envelope_sha256
+            .get_mut(&target.branch)
+            .and_then(|branch| Arc::make_mut(branch).tables.get_mut(&target.table))
+            .and_then(|rows| Arc::make_mut(rows).events.get_mut(&target.id))
+            .and_then(|events| Arc::make_mut(events).last_mut())
+            .map(|(_, event)| event)
+            .filter(|event| {
+                matching && event.cut == head && event.written == WrittenVersion::Custody(None)
+                    && occurrence.matches_event(group, event)
             })
-        {
-            return Err(Anomaly::fault(
+            .ok_or_else(|| Anomaly::fault(
                 "rtdb/custody-fold",
                 "Custody activation must follow its exact protected write",
-            ));
-        }
+            ))?;
+        event.written = WrittenVersion::Custody(Some(occurrence.ordinal));
         if let Some(reservation) = derived {
             self.record_custody_reservation(group, reservation, Some(occurrence));
         } else if occurrence.reservation.is_some() {
@@ -372,15 +396,12 @@ impl BranchIndex {
 
 impl BranchView<'_> {
     pub fn custody_event_contributor(&self, table: &TableRef, event: &BranchEvent) -> Option<(CustodyGroupId, [u8; 32])> {
-        if self.index.visibility_projection { return None; }
-        let image = event.image.as_ref()?;
-        let group = image.custody_group?;
-        let payload = image.custody_payload.as_ref()?;
-        let envelope_sha256: [u8; 32] = Sha256::digest(&payload.envelope).into();
-        let mut matches = self.index.custody.get(&group)?.occurrences().filter(|occurrence| {
+        if self.index.visibility_projection || event.cut.basis > self.cut.basis { return None; }
+        let group = event.image.as_ref()?.custody_group?;
+        let mut matches = self.index.live_custody(group).ok()?.occurrences().filter(|occurrence| {
             occurrence.written == event.cut.basis && occurrence.target.table == *table
-                && occurrence.target.id == event.id && occurrence.target.valid == event.valid
-                && occurrence.envelope_sha256 == envelope_sha256
+                && occurrence.target.id == event.id
+                && self.index.local_custody_event(group, occurrence).is_some_and(|local| std::ptr::eq(local, event))
         });
         let occurrence = matches.next()?;
         if matches.next().is_some() { return None; }
