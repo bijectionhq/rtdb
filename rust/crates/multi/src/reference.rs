@@ -447,7 +447,7 @@ fn trie_block(name: &str) -> Option<i64> {
 pub async fn simulate_fork(bucket: &dyn ObjectStore, parent: &str, child: &str, at_block: Option<i64>) -> Result<()> {
     let past = match at_block { Some(block) => Some((block, block_packs(bucket, parent, block).await?, written_at_ms(bucket, parent, block).await?)), None => None };
     let wanted = |name: &str| {
-        if name.starts_with("oversized/") || crate::store::stays_in_source_residence(name) { return false; }
+        if crate::store::stays_in_source_residence(name) { return false; }
         match &past {
             None => true,
             Some((_, packs, _)) if name.starts_with(&format!("{}/", crate::packing::PACK_DIRECTORY)) => packs.contains(name),
@@ -642,6 +642,31 @@ async fn stage_object(bucket: &dyn ObjectStore, key: &ObjectKey, bytes: Bytes) -
     }
 }
 
+/// Reads one selected transfer publication before and after the body fetch.
+async fn read_transfer_source(
+    bucket: &dyn ObjectStore, source: &ObjectKey, expected: Option<&PhysicalObjectPublication>,
+) -> rtdb_storage::Result<Bytes> {
+    let owned;
+    let publication = match expected {
+        Some(expected) => expected,
+        None if bucket.s3_publication_address(source).is_none() => return bucket.get_fresh(source).await,
+        None => {
+            owned = bucket.retirement_publication(source).await?;
+            match owned.as_ref() {
+                Some(publication) => publication,
+                None => {
+                    bucket.head_fresh(source).await?;
+                    return Err(Error::ConflictingObject(source.to_string()));
+                }
+            }
+        }
+    };
+    require_publication(bucket, source, publication).await?;
+    let body = bucket.get_fresh(source).await?;
+    require_publication(bucket, source, publication).await?;
+    Ok(body)
+}
+
 /// Copies a deployment's stores from `from` in one cell's bucket to `to` in another's, resolving retained references into objects of its own.
 /// The destination builds its ordered index and retirement journal from its authoritative catalog.
 pub(crate) async fn materialize(
@@ -652,30 +677,29 @@ pub(crate) async fn materialize(
         let version = store.rsplit('/').next().expect("a store has a version").to_owned();
         let target = format!("{to}/{version}");
         let base = Base::load(from_bucket, &store).await?;
-        for name in physical_objects(from_bucket, &store).await? {
-            if crate::store::stays_in_source_residence(&name) { continue; }
+        let own: BTreeSet<_> = physical_objects(from_bucket, &store).await?.into_iter().collect();
+        for name in &own {
+            if crate::store::stays_in_source_residence(name) { continue; }
             let source = key(&format!("{store}/{name}"))?;
             let destination = key(&format!("{target}/{name}"))?;
-            let bytes = reseal(&key(&name)?, from_bucket.get(&source).await?).await?;
+            let bytes = read_transfer_source(from_bucket, &source, None).await?;
+            let bytes = reseal(&key(name)?, bytes).await?;
             stage_object(to_bucket, &destination, bytes).await?;
         }
-        for (name, owner) in base.objects {
-            if crate::store::stays_in_source_residence(&name) { continue; }
+        for (name, owner) in &base.objects {
+            if own.contains(name) || crate::store::stays_in_source_residence(name) { continue; }
             let destination = key(&format!("{target}/{name}"))?;
             let own = key(&format!("{store}/{name}"))?;
-            let bytes = match from_bucket.get(&own).await {
-                Err(Error::MissingObject(_)) => match from_bucket.get(&key(&format!("{owner}/{name}"))?).await {
-                    // Concurrent retirement materializes the reference before
-                    // removing the original, so look again in the fork.
-                    Err(Error::MissingObject(_)) => match from_bucket.get(&own).await {
-                        Err(Error::MissingObject(_)) if crate::store::garbage_released_at(&name).is_some() => continue,
-                        value => value?,
-                    },
-                    value => value?,
+            let source = key(&format!("{owner}/{name}"))?;
+            let bytes = match read_transfer_source(from_bucket, &own, None).await {
+                Err(Error::MissingObject(_)) => match read_transfer_source(from_bucket, &source, base.publications.get(name)).await {
+                    // A lineage transfer may move the exact object to the fork.
+                    Err(Error::MissingObject(_)) => read_transfer_source(from_bucket, &own, None).await?,
+                    result => result?,
                 },
-                value => value?,
+                result => result?,
             };
-            let bytes = reseal(&key(&name)?, bytes).await?;
+            let bytes = reseal(&key(name)?, bytes).await?;
             stage_object(to_bucket, &destination, bytes).await?;
         }
     }
@@ -854,7 +878,8 @@ mod tests {
         let intent = format!("{journal}/6-0-0/pending/id");
         let receipt = format!("{journal}/6-0-0/installed/id");
         put(&here, "source/v06/blocks/b00", b"catalog").await;
-        for name in [page.as_str(), manifest.as_str(), release, intent.as_str(), receipt.as_str()] {
+        let detached = "oversized/b00-opaque.binpb";
+        for name in [page.as_str(), manifest.as_str(), release, intent.as_str(), receipt.as_str(), detached] {
             put(&here, &format!("source/v06/{name}"), b"only the original store owns these bytes").await;
         }
         let source = Arc::new(PrefixedStore::new(here.clone(), "source/v06"));

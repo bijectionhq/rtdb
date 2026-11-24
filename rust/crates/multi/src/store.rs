@@ -54,7 +54,7 @@ pub(crate) fn belongs_to_ordered_index(name: &str) -> bool {
 }
 
 pub(crate) fn stays_in_source_residence(name: &str) -> bool {
-    belongs_to_ordered_index(name) || rtdb_format::keys::is_trie_retirement_object(name)
+    name.starts_with("oversized/") || belongs_to_ordered_index(name) || rtdb_format::keys::is_trie_retirement_object(name)
         || name.strip_prefix(GARBAGE_DIRECTORY)
             .is_some_and(|record| record.starts_with("/0-replica-")
                 || (record.starts_with('/') && record.ends_with(TRIE_RETIREMENT_RELEASE)))
