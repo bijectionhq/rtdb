@@ -31,7 +31,7 @@ use crate::{
 
 use super::{
     MAX_CHANGE_GROUPS, MAX_WAIT, error, head, proto,
-    query::check_custody,
+    query::check_read_delivery,
     tokens::{self, cursor_expired},
     trailer,
 };
@@ -618,7 +618,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
             let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
-            check_custody(&call, &database, &page.custody_groups).await?;
+            check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
             yield schema_frame;
@@ -652,7 +652,7 @@ impl Service {
                     ]).map_err(|error| error::map_status(Status::internal(error.to_string())))?;
                     for frame in encoder.batch(&batch, &memory).map_err(error::map_status)? {
                         let grant = context.delivery_grant().await.map_err(error::anomaly)?;
-                        check_custody(&call, &database, &page.custody_groups).await?;
+                        check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
                         service.check_attachment(&call, &database)?;
                         call.handoff(grant, cutoff).map_err(error::map_status)?;
                         yield frame;
@@ -660,7 +660,7 @@ impl Service {
                 }
             }
             let grant = context.delivery_grant().await.map_err(error::anomaly)?;
-            check_custody(&call, &database, &page.custody_groups).await?;
+            check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete });

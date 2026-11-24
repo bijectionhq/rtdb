@@ -78,6 +78,10 @@ impl Transact {
 
     pub fn uses_custody(&self) -> bool { self.ops.iter().chain(&self.otherwise).any(Op::uses_custody) }
 
+    pub fn uses_erasure(&self) -> bool {
+        self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::Erase { .. }))
+    }
+
     fn is_response_release(&self) -> bool {
         matches!(self.ops.as_slice(), [Op::CustodyRelease(_)])
             && self.otherwise.is_empty() && self.guards.is_empty()
@@ -298,6 +302,14 @@ pub struct Receipt {
     pub system_time: Timestamp,
     pub outcome: Outcome,
     pub replayed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erasure: Option<Erasure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Erasure {
+    Pending,
+    Armed { unreadable_by: Timestamp },
 }
 
 pub const TIMED_TRANSACT: &str = "timed-transact";
@@ -305,6 +317,7 @@ pub const LINEARIZABLE: &str = "linearizable";
 pub const TRANSACT_REQUIRES: &str = "transact.requires";
 pub const RELATIVE_VALID_TIME: &str = "transact.relative-valid-time";
 pub const ROW_CUSTODY: &str = "row-custody";
+pub const PHYSICAL_ERASURE: &str = "erasure";
 pub const REQUIREMENT_FAILED: &str = "rtdb/requirement-failed";
 
 #[derive(Clone, Copy)]
@@ -453,11 +466,12 @@ pub struct TransactState {
     index: BranchIndex,
     receipts: Receipts,
     pending: Option<Pending>,
+    pending_erasure: Option<TxKey>,
 }
 
 impl TransactState {
     pub fn new(incarnation: [u8; 16]) -> Self {
-        Self { index: BranchIndex::new(incarnation), receipts: BTreeMap::new(), pending: None }
+        Self { index: BranchIndex::new(incarnation), receipts: BTreeMap::new(), pending: None, pending_erasure: None }
     }
 
     pub fn index(&self) -> &BranchIndex { &self.index }
@@ -472,7 +486,19 @@ impl TransactState {
     pub fn encode_checkpoint_at(&self, basis: Basis) -> Result<Bytes> {
         if self.pending.is_some() { return Err(pending_error()); }
         let index = self.index.checkpoint_at(basis)?;
+        if self.pending_erasure.is_some() { return Err(erasure_pending()); }
         self.encode_checkpoint_index(&index)
+    }
+
+    /// Re-namespace the retained receipt coordinates along with their fold.
+    pub fn restore_in(&mut self, incarnation: [u8; 16]) -> Result<()> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        if self.pending_erasure.is_some() { return Err(erasure_pending()); }
+        self.index.restore_in(incarnation)?;
+        for stored in self.receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
+            stored.receipt.basis = Basis::new(incarnation, stored.receipt.basis.position());
+        }
+        Ok(())
     }
 
     fn encode_checkpoint_index(&self, index: &BranchIndex) -> Result<Bytes> {
@@ -489,17 +515,44 @@ impl TransactState {
         if version != RECORD_VERSION || index.head() != expected || index.exact(expected.basis)? != expected {
             return Err(invalid());
         }
-        let mut state = Self { index, receipts: BTreeMap::new(), pending: None };
+        let mut state = Self { index, receipts: BTreeMap::new(), pending: None, pending_erasure: None };
         for stored in receipts {
             let receipt = &stored.receipt;
             validate_key(&receipt.key).map_err(|_| invalid())?;
-            if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time
-                || state.receipts.entry(stored.receipt_namespace).or_default().insert(receipt.key.clone(), stored).is_some()
-            {
+            if receipt.replayed || state.index.exact(receipt.basis)?.system_time != receipt.system_time {
                 return Err(invalid());
             }
+            if receipt.erasure == Some(Erasure::Pending) && state.pending_erasure.is_some() {
+                return Err(invalid());
+            }
+            if state.store_receipt(stored).is_some() { return Err(invalid()); }
         }
         Ok(state)
+    }
+
+    fn store_receipt(&mut self, stored: StoredReceipt) -> Option<StoredReceipt> {
+        let key = stored.receipt.key.clone();
+        if stored.receipt.erasure == Some(Erasure::Pending) {
+            self.pending_erasure = Some(TxKey { namespace: stored.receipt_namespace, key: key.clone() });
+        }
+        self.receipts.entry(stored.receipt_namespace).or_default().insert(key, stored)
+    }
+
+    pub fn pending_erasure(&self) -> Option<Basis> {
+        let key = self.pending_erasure.as_ref()?;
+        self.receipts.get(&key.namespace)?.get(&key.key).map(|stored| stored.receipt.basis)
+    }
+
+    pub fn arm_erasure(&mut self, basis: Basis, unreadable_by: Timestamp) -> Result<()> {
+        let key = self.pending_erasure.as_ref().ok_or_else(invalid_record)?;
+        let receipt = &mut self.receipts.get_mut(&key.namespace)
+            .and_then(|receipts| receipts.get_mut(&key.key)).ok_or_else(invalid_record)?.receipt;
+        if receipt.basis != basis || receipt.erasure != Some(Erasure::Pending) {
+            return Err(invalid_record());
+        }
+        receipt.erasure = Some(Erasure::Armed { unreadable_by });
+        self.pending_erasure = None;
+        Ok(())
     }
 
     pub fn tx_status(&self, key: &[u8]) -> Result<Receipt> {
@@ -635,6 +688,7 @@ impl TransactState {
         };
         let receipt = Receipt {
             key: request.key.clone(), basis: cut.basis, system_time: cut.system_time, outcome, replayed: false,
+            erasure: effects.iter().any(|effect| matches!(effect, BranchEffect::Erase { .. })).then_some(Erasure::Pending),
         };
         if validation {
             Ok((Resolution::Answer(receipt), None))
@@ -742,6 +796,9 @@ impl TransactState {
                     || receipt.replayed || validate_key(&receipt.key).is_err()
                     || self.receipts.get(&tx.receipt_namespace).is_some_and(|namespace| namespace.contains_key(&receipt.key))
                     || (matches!(&receipt.outcome, Outcome::Refused { .. }) && !tx.effects.is_empty())
+                    || matches!(receipt.erasure, Some(Erasure::Armed { .. }))
+                    || (receipt.erasure == Some(Erasure::Pending)
+                        && (self.pending_erasure.is_some() || !tx.effects.iter().any(|effect| matches!(effect, BranchEffect::Erase { .. }))))
                 {
                     return Err(invalid_record());
                 }
@@ -771,6 +828,7 @@ impl TransactState {
                     .ok_or_else(invalid_record)?;
                 let mut receipt = pending.tx.receipt.clone();
                 receipt.basis = Basis::new(receipt.basis.incarnation(), position);
+                receipt.erasure = None;
                 if !matches!(receipt.outcome, Outcome::Refused { .. }) {
                     receipt.outcome = Outcome::Refused {
                         error: Anomaly::new(AnomalyCategory::Conflict, "rtdb/timed-transaction-refused",
@@ -790,11 +848,14 @@ impl TransactState {
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects { candidate.apply(effect)?; }
         self.index = candidate;
-        self.receipts.entry(receipt_namespace).or_default().insert(
-            receipt.key.clone(), StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace },
-        );
+        let previous = self.store_receipt(StoredReceipt { fingerprint, receipt: receipt.clone(), receipt_namespace });
+        debug_assert!(previous.is_none());
         Ok(receipt)
     }
+}
+
+fn erasure_pending() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement")
 }
 
 fn invalid_record() -> Anomaly {

@@ -6,7 +6,7 @@ use prost::{Message, Name};
 use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
-use rtdb_tx::transact::{TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{PHYSICAL_ERASURE, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::Timestamp;
 use tonic::{Response, Status, metadata::MetadataMap};
 
@@ -95,7 +95,9 @@ impl Service {
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
                         }
-                        if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported() {
+                        if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported()
+                            && database.serving_driver().is_none_or(|driver| driver.supports_query_tokens())
+                        {
                             for feature in ["query.track", "query.page"] {
                                 if !features.iter().any(|existing| existing == feature) {
                                     features.push(feature.into());
@@ -113,7 +115,7 @@ impl Service {
                     });
                     features.retain(|feature| admitted && matches!(feature.as_str(), ROW_VISIBILITY | "query" |
                         "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" |
-                        TIMED_TRANSACT | TRANSACT_REQUIRES | rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS | "tx-status" | "sql.history"));
+                        TIMED_TRANSACT | TRANSACT_REQUIRES | PHYSICAL_ERASURE | rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS | "tx-status" | "sql.history"));
                 }
                 proto::CapabilitiesResponse {
                     api: API.into(),

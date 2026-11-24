@@ -22,11 +22,17 @@ impl SourceAdmissionKey {
         aead::seal(&self.0, &context(incarnation), request)
     }
 
-    pub fn open(&self, incarnation: Uuid, record: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        aead::open(&self.0, &context(incarnation), record).map_err(|_| {
-            Anomaly::incorrect("rtdb/source-admission", "The source record has no valid admission authority")
-        })
+    pub fn check_envelope(record: &[u8]) -> Result<()> {
+        if aead::has_envelope(record) { Ok(()) } else { Err(invalid_source()) }
     }
+
+    pub fn open(&self, incarnation: Uuid, record: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        aead::open(&self.0, &context(incarnation), record).map_err(|_| invalid_source())
+    }
+}
+
+fn invalid_source() -> Anomaly {
+    Anomaly::incorrect("rtdb/source-admission", "The source record has no valid admission authority")
 }
 
 fn context(incarnation: Uuid) -> Vec<u8> {

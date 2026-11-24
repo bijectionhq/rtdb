@@ -1092,6 +1092,101 @@ async fn default_serving_recovers_a_lost_source_reply_and_consumes_retries_in_or
 }
 
 #[tokio::test]
+async fn classic_transaction_bookkeeping_keeps_default_v1_writes_available() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_tx::transact::Outcome;
+
+    let mut fixture = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    let driver = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let classic = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &fixture.memory).unwrap();
+        let source = fixture.handle.submit_source_encoded(classic.encode().unwrap().into_bytes(), Timestamp(100)).await.unwrap();
+        fixture.handle.await_source(source, &cancellation).await.unwrap();
+        assert!(fixture.handle.progress().current().tx_key.is_some());
+        assert!(serving.is_compatible());
+        let reply = serving.transact(serving_source_put(1), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        assert_eq!(reply.outcome, Outcome::Then);
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn classic_only_v1_read_capture_uses_the_installed_replica_catalog_and_original_iid() {
+    use rtdb_types::{EntityId, rtdb_v1::At};
+
+    let mut fixture = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let authority = NativeServingAuthority { incarnation: [7; 16], checkpoints: None };
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), authority, false).await.unwrap();
+    let driver = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let source = submit_recovery_row(&fixture.handle, &fixture.memory, 27, 100).await;
+        fixture.handle.await_source(source, &cancellation).await.unwrap();
+        let (snapshot, cut) = serving.classic_read(At::Linearizable, &cancellation).await.unwrap();
+        let replica = snapshot.catalog_cut().unwrap().through;
+        assert_eq!(cut.basis.position(), u64::try_from(replica.0).unwrap() + 1);
+        assert_eq!(cut.system_time, snapshot.tx_basis().unwrap().system_time);
+        let table = TableRef::new("public", "docs");
+        let iid = EntityId::Integer(27).iid();
+        let events = snapshot.iter_segments(&table).next().unwrap().iid_headers(iid).unwrap().collect::<Vec<_>>();
+        assert_eq!(events[0].iid, iid);
+        assert!(serving.classic_read(At::Exactly(cut.basis), &cancellation).await.is_ok());
+        let delete = SourceTransaction::new(vec![TxOp::DeleteDocs {
+            table: table.clone(),
+            ids: rtdb_tx::EntityIds::new(vec![EntityId::Integer(27)], &fixture.memory).unwrap(),
+            valid_from: Some(Timestamp(0)), valid_to: None,
+        }], SubmitOptions::default(), &fixture.memory).unwrap();
+        let next = fixture.handle.submit_source_encoded(delete.encode().unwrap().into_bytes(), Timestamp(101)).await.unwrap();
+        fixture.handle.await_source(next, &cancellation).await.unwrap();
+        let (snapshot, later) = serving.classic_read(At::Linearizable, &cancellation).await.unwrap();
+        assert!(later.basis > cut.basis);
+        assert!(snapshot.iter_segments(&table).next().unwrap().iid_headers(iid).unwrap()
+            .any(|event| event.iid == iid && event.op == rtdb_types::EventOp::Delete));
+        assert!(matches!(serving.classic_read(At::Exactly(cut.basis), &cancellation).await, Err(error) if error.code == "rtdb/cursor-expired"));
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn default_v1_reads_a_classic_checkpoint_that_predates_the_attachment() {
+    use rtdb_types::rtdb_v1::At;
+
+    let interval = Duration::from_millis(5);
+    let fixture = fixture(ReplicationConfig { assertion_interval: interval, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let running = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let source = submit_recovery_row(&fixture.handle, &fixture.memory, 41, 100).await;
+        fixture.handle.await_source(source, &cancellation).await.unwrap();
+        let flush = fixture.handle.flush().await.unwrap();
+        fixture.handle.await_source(flush, &cancellation).await.unwrap();
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    running.await.unwrap().unwrap();
+
+    let (handle, mut driver) = local_recovery_driver(fixture.source, fixture.replica, fixture.store, false, interval).await;
+    let serving = driver.attach_native_serving(handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    assert!(serving.has_classic_read());
+    let running = tokio::spawn(driver.run());
+    let (snapshot, cut) = tokio::time::timeout(Duration::from_secs(5), serving.classic_read(At::Linearizable, &cancellation))
+        .await.unwrap().unwrap();
+    let replica = snapshot.catalog_cut().unwrap().through;
+    assert!(replica >= snapshot.catalog_checkpoint().unwrap().unwrap().boundary);
+    assert_eq!(cut.basis.position(), u64::try_from(replica.0).unwrap() + 1);
+    assert!(snapshot.trie_catalog().has_current_tries(&TableRef::new("public", "docs")));
+    handle.shutdown();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn new_term_refuses_a_durable_timed_original_before_resuming_the_source() {
     use rtdb_crypt::tokens::VerifiedClaims;
     use rtdb_tx::transact::Outcome;

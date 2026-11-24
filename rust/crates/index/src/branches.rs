@@ -251,6 +251,44 @@ impl BranchIndex {
         Ok(retained)
     }
 
+    /// Import a plain checkpoint into a new incarnation, retaining each
+    /// historical position but changing the authority that can use it.
+    pub fn restore_in(&mut self, incarnation: [u8; 16]) -> Result<()> {
+        if self.has_custody_groups() {
+            return Err(Anomaly::unsupported("rtdb/restore-custody", "A protected restore needs an admitted destination custody binding"));
+        }
+        let rebase = |basis: Basis| Basis::new(incarnation, basis.position());
+        self.head.basis = rebase(self.head.basis);
+        self.erased = self.erased.map(rebase);
+        self.changed_catalog = self.changed_catalog.map(rebase);
+        self.writes = Arc::default();
+        for table in self.catalog.keys().cloned().collect::<Vec<_>>() {
+            let definitions = self.catalog.get_mut(&table).expect("listed table");
+            for (written, _) in Arc::make_mut(definitions) {
+                *written = rebase(*written);
+            }
+        }
+        for name in self.branches.keys().cloned().collect::<Vec<_>>() {
+            let branch = Arc::make_mut(self.branches.get_mut(&name).expect("listed branch"));
+            branch.created = rebase(branch.created);
+            branch.dropped = branch.dropped.map(rebase);
+            branch.changed = branch.changed.map(rebase);
+            if let Some((_, basis)) = &mut branch.base { *basis = rebase(*basis); }
+            for (written, _) in &mut branch.expiries { *written = rebase(*written); }
+            for table in branch.tables.keys().cloned().collect::<Vec<_>>() {
+                let rows = Arc::make_mut(branch.tables.get_mut(&table).expect("listed branch table"));
+                rows.erased = rows.erased.iter().map(|(id, &written)| (id.clone(), rebase(written))).collect();
+                for id in rows.events.keys().cloned().collect::<Vec<_>>() {
+                    let events = rows.events.get_mut(&id).expect("listed entity");
+                    for (_, event) in Arc::make_mut(events) {
+                        event.cut.basis = rebase(event.cut.basis);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn writes_at(&self, basis: Basis) -> Vec<BranchWrite> {
         if basis == self.head.basis { self.writes.as_ref().clone() } else { Vec::new() }
     }

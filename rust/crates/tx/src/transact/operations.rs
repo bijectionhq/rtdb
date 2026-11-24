@@ -55,6 +55,10 @@ impl Candidate<'_> {
                     }
                 }
                 Op::Erase { branch, table, ids } => {
+                    match branch {
+                        Some(branch) => self.require_write_branch(branch)?,
+                        None => self.require_unrestricted()?,
+                    }
                     let definition = self.write_definition(table)?;
                     if let Some(branch) = branch { self.view(branch, Layer::Local)?; }
                     for id in ids {

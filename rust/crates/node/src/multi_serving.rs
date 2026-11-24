@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyRelease};
+use rtdb_tx::transact::{
+    CustodyGroupId, CustodyWriterFence, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
+    ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyRelease,
+};
 use rtdb_types::{
     Anomaly, AnomalyCategory, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -62,7 +65,7 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
+        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
           "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
     }
 
@@ -81,6 +84,7 @@ impl ServingDriver for MultiServing {
                             view.claim = Some(self.tokens.issuer().await?.seal_scoped_claim(raw, &scope.labels).await?);
                         }
                         self.database.lock().await.check_generation(generation).await?;
+                        view.key_generation = Some(generation);
                         return Ok(view);
                     }
                     Err(error) if error.code == "rtdb/basis-ahead" && Instant::now() < deadline => {
@@ -112,10 +116,11 @@ impl ServingDriver for MultiServing {
             let start = Instant::now();
             loop {
                 let (index, generation) = self.database.lock().await.fresh_view().await?;
-                let page = scope.changes(&index, &request)?;
+                let mut page = scope.changes(&index, &request)?;
                 let remaining = request.wait.saturating_sub(start.elapsed());
                 if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
                     self.database.lock().await.check_generation(generation).await?;
+                    page.key_generation = Some(generation);
                     if index.has_custody_groups() {
                         return crate::serving::custody::open_changes(&index, &self.tokens.custody_vault(), page).await;
                     }
@@ -164,6 +169,7 @@ impl ServingDriver for MultiServing {
                     cut,
                     claim,
                     custody_groups,
+                    key_generation: Some(generation),
                 })
             })
             .await
@@ -188,11 +194,19 @@ impl ServingDriver for MultiServing {
     }
 
     async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
-        if groups.is_empty() { return Ok(()); }
+        self.check_read_delivery(None, groups, cancellation).await
+    }
+
+    async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        if generation.is_none() && groups.is_empty() { return Ok(()); }
         cancellation.run_until_cancelled(async {
-            let (index, generation) = self.database.lock().await.fresh_view().await?;
-            crate::serving::custody::check_delivery(&index, &self.tokens.custody_vault(), groups).await?;
-            self.database.lock().await.check_generation(generation).await
+            let mut database = self.database.lock().await;
+            if !groups.is_empty() {
+                let index = database.fresh_index().await?;
+                crate::serving::custody::check_delivery(index, &self.tokens.custody_vault(), groups).await?;
+            }
+            if let Some(generation) = generation { database.check_generation(generation).await?; }
+            Ok(())
         }).await.ok_or_else(interrupted)?
     }
 
@@ -282,7 +296,7 @@ fn changes_page(
         }
         Ok(basis.position())
     };
-    let floor = history.floor.0 - 1;
+    let floor = history.after_floor;
     let after = request.after.map(position).transpose()?.unwrap_or(0);
     if after < floor {
         return Err(Anomaly::new(
@@ -298,14 +312,14 @@ fn changes_page(
             "The change interval is inverted",
         ));
     }
-    if after > history.head.0 {
+    if after > history.through {
         return Err(Anomaly::new(
             AnomalyCategory::Unavailable,
             "rtdb/change-basis-ahead",
             "The requested basis has not applied",
         ));
     }
-    let upper = until.unwrap_or(u64::MAX).min(history.head.0);
+    let upper = until.unwrap_or(u64::MAX).min(history.through);
     let index = history.index;
     index.view(&request.branch, At::Latest, Layer::Merged, history.now)?;
     let descending = request.order == ChangeOrder::Descending;
@@ -389,8 +403,9 @@ fn changes_page(
     Ok(ChangePage {
         groups: page,
         through: Basis::new(incarnation, through),
-        complete: next.is_none() && until.is_none_or(|until| until <= history.head.0),
+        complete: next.is_none() && until.is_none_or(|until| until <= history.through),
         custody_groups: BTreeSet::new(),
+        key_generation: Some(history.generation),
     })
 }
 

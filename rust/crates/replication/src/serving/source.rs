@@ -98,6 +98,7 @@ impl SourceAuthority {
     }
 
     pub(crate) async fn open(&self, bytes: &[u8]) -> Result<Result<SourceRequest>> {
+        if let Err(error) = SourceAdmissionKey::check_envelope(bytes) { return Ok(Err(error)); }
         let key = self.key(false).await?;
         let request = (|| {
             let clear = key.open(self.incarnation, bytes)?;
@@ -150,6 +151,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncated_source_admission_is_refused_before_key_publication() {
+        let authority = SourceAuthority::new(Arc::new(MemoryStore::default()), [3; 16]);
+        assert!(matches!(authority.open(b"truncated").await.unwrap(), Err(error) if error.code == "rtdb/source-admission"));
+    }
+
+    #[tokio::test]
     async fn source_reopen_authenticates_the_canonical_request_scope_and_claim_verdict() {
         let database = Uuid::from_bytes([7; 16]);
         let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
@@ -184,6 +191,8 @@ mod tests {
         let mut changed = bytes.to_vec();
         changed[32] ^= 1;
         assert!(matches!(writer.open(&changed).await.unwrap(), Err(error) if error.code == "rtdb/source-admission"));
+        let key = writer.key(false).await.unwrap();
+        assert!(matches!(key.open(Uuid::from_bytes([8; 16]), &bytes), Err(error) if error.code == "rtdb/source-admission"));
     }
 }
 

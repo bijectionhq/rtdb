@@ -1055,6 +1055,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
         let view = state.index().view(&source.branch, at, source.layer, now)?;
         Ok(rtdb_node::serving::QueryView {
             custody_groups: Default::default(),
+            key_generation: None,
             snapshot: rtdb_query::branch_snapshot(&view, &self.memory)?,
             cut: view.cut(),
             claim: None,
@@ -1137,6 +1138,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
             through: cut.basis,
             complete: true,
             custody_groups: Default::default(),
+            key_generation: None,
         })
     }
 }

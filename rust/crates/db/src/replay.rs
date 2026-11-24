@@ -17,10 +17,35 @@ pub struct AppliedEffects {
 
 pub struct ChangeHistory<'a> {
     pub index: &'a BranchIndex,
-    pub floor: Lsn,
-    pub head: Lsn,
+    pub after_floor: u64,
+    pub through: u64,
+    pub generation: u64,
     pub groups: &'a [AppliedEffects],
     pub now: Timestamp,
+}
+
+/// A restored history occupies the positions before the new stream's suffix.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JournalCoordinates {
+    pub(crate) offset: u64,
+    pub(crate) origin: Option<RestoreOrigin>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestoreOrigin {
+    pub(crate) digest: [u8; 32],
+    pub(crate) through: u64,
+}
+
+impl JournalCoordinates {
+    pub(crate) fn position(self, lsn: Lsn) -> Result<u64> {
+        self.offset.checked_add(lsn.0).ok_or_else(|| invalid("The journal position overflows the basis"))
+    }
+
+    pub(crate) fn lsn(self, position: u64) -> Result<Lsn> {
+        position.checked_sub(self.offset).map(Lsn)
+            .ok_or_else(|| invalid("The basis precedes the journal suffix"))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -28,7 +53,14 @@ pub(crate) struct Rotation {
     pub(crate) cut: Lsn,
     pub(crate) generation: u64,
     pub(crate) committed: bool,
-    pub(crate) retirement_observed_at: Option<i64>,
+    pub(crate) retirement: Option<RetirementObservation>,
+    pub(crate) retirement_armed: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RetirementObservation {
+    pub(crate) observed_at: i64,
+    pub(crate) unreadable_by: Option<i64>,
 }
 
 pub(crate) struct Committed {
@@ -41,6 +73,7 @@ pub(crate) struct Committed {
     pub(crate) records: Vec<Record>,
     pub(crate) effects: Vec<AppliedEffects>,
     pub(crate) rotation: Option<Rotation>,
+    pub(crate) coordinates: JournalCoordinates,
 }
 
 impl Committed {
@@ -55,6 +88,7 @@ impl Committed {
             records: Vec::new(),
             effects: Vec::new(),
             rotation: None,
+            coordinates: JournalCoordinates::default(),
         }
     }
 
@@ -106,21 +140,7 @@ impl Committed {
                 .unwrap_or_else(|| Self::empty(stream, page.floor));
             for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= end) {
                 let entry = stream.decode(lsn, &bytes).await?;
-                if state.records.is_empty() {
-                    match &entry.record {
-                        Record::Checkpoint(checkpoint) => {
-                            state
-                                .install_checkpoint(stream, store, lsn, entry.epoch, checkpoint)
-                                .await?;
-                            state.generation = checkpoint.key_generation;
-                        }
-                        _ if state.floor != Lsn(1) => {
-                            return Err(invalid("The retained floor does not name a checkpoint"));
-                        }
-                        _ => {}
-                    }
-                }
-                state.apply(lsn, entry)?;
+                state.apply_entry(stream, store, lsn, entry).await?;
             }
             if state.head == end {
                 return Ok(state);
@@ -132,6 +152,27 @@ impl Committed {
             from = following;
             previous = Some(state);
         }
+    }
+
+    pub(crate) async fn apply_entry(
+        &mut self, stream: &Stream, store: &dyn ObjectStore, lsn: Lsn, entry: Entry,
+    ) -> Result<Option<Receipt>> {
+        if let Record::Checkpoint(checkpoint) = &entry.record {
+            if self.records.is_empty() || checkpoint.restore {
+                if checkpoint.restore && (self.transactions.index().head().basis.position() != 0
+                    || self.coordinates.origin.is_some() || self.rotation.is_some()
+                    || checkpoint.key_generation != self.generation
+                    || self.records.iter().any(|record| !matches!(record, Record::Lease { .. })))
+                {
+                    return Err(invalid("Restore requires a fresh deployment"));
+                }
+                self.install_checkpoint(stream, store, lsn, entry.epoch, checkpoint).await?;
+                self.generation = checkpoint.key_generation;
+            }
+        } else if self.records.is_empty() && self.floor != Lsn(1) {
+            return Err(invalid("The retained floor does not name a checkpoint"));
+        }
+        self.apply(lsn, entry)
     }
 
     pub(crate) fn apply(&mut self, lsn: Lsn, entry: Entry) -> Result<Option<Receipt>> {
@@ -155,7 +196,7 @@ impl Committed {
                     return Err(invalid("A Tx envelope must contain a resolved transaction"));
                 };
                 effects = Some(transaction.effects().to_vec());
-                receipt = self.transactions.apply(lsn.0, record)?;
+                receipt = self.transactions.apply(self.coordinates.position(lsn)?, record)?;
                 self.generation
             }
             Record::Settle { tx_lsn } => {
@@ -173,13 +214,17 @@ impl Committed {
                 effects = Some(transaction.effects().to_vec());
                 receipt = self
                     .transactions
-                    .apply(lsn.0, TransactionRecord::Settle { tx_lsn: *tx_lsn })?;
+                    .apply(self.coordinates.position(lsn)?, TransactionRecord::Settle {
+                        tx_lsn: self.coordinates.position(Lsn(*tx_lsn))?,
+                    })?;
                 self.generation
             }
             Record::Refuse { tx_lsn } => {
                 receipt = self
                     .transactions
-                    .apply(lsn.0, TransactionRecord::Refuse { tx_lsn: *tx_lsn })?;
+                    .apply(self.coordinates.position(lsn)?, TransactionRecord::Refuse {
+                        tx_lsn: self.coordinates.position(Lsn(*tx_lsn))?,
+                    })?;
                 self.generation
             }
             Record::Lease { until } => {
@@ -208,7 +253,8 @@ impl Committed {
                         cut: lsn,
                         generation: checkpoint.key_generation,
                         committed: false,
-                        retirement_observed_at: None,
+                        retirement: None,
+                        retirement_armed: false,
                     });
                 }
                 checkpoint.key_generation
@@ -232,14 +278,32 @@ impl Committed {
                 rotation.committed = true;
                 *generation
             }
-            Record::KeyRetirement { generation, rotation_lsn, observed_at } => {
+            Record::KeyRetirement { generation, rotation_lsn, observed_at, unreadable_by, armed } => {
                 let rotation = self.rotation.as_mut().filter(|rotation| {
                     rotation.committed
                         && rotation.generation == *generation
                         && rotation.cut.0.checked_add(1) == Some(*rotation_lsn)
-                        && rotation.retirement_observed_at.is_none()
                 }).ok_or_else(|| invalid("Key retirement does not match an unfenced rotation"))?;
-                rotation.retirement_observed_at = Some(*observed_at);
+                if unreadable_by.is_some_and(|deadline| deadline < *observed_at) {
+                    return Err(invalid("The key retirement deadline precedes the rotation observation"));
+                }
+                if *armed {
+                    let deadline = unreadable_by.ok_or_else(|| invalid("The armed retirement has no deadline"))?;
+                    if rotation.retirement_armed || !rotation.retirement.is_some_and(|prior| {
+                        prior.observed_at == *observed_at && prior.unreadable_by.is_none_or(|prior| prior == deadline)
+                    }) {
+                        return Err(invalid("The armed retirement changed the observed deadline"));
+                    }
+                    rotation.retirement_armed = true;
+                    if let Some(basis) = self.transactions.pending_erasure() {
+                        self.transactions.arm_erasure(basis, Timestamp(deadline))?;
+                    }
+                } else {
+                    if rotation.retirement.is_some() {
+                        return Err(invalid("The rotation already has a retirement observation"));
+                    }
+                    rotation.retirement = Some(RetirementObservation { observed_at: *observed_at, unreadable_by: *unreadable_by });
+                }
                 self.generation
             }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
@@ -285,7 +349,7 @@ impl Committed {
                 "The manifest does not belong to the retained checkpoint",
             ));
         }
-        let (header, bytes) = image
+        let (header, mut bytes) = image
             .contents()
             .payload
             .split_first_chunk::<25>()
@@ -293,17 +357,36 @@ impl Committed {
         let position = u64::from_be_bytes(header[..8].try_into().unwrap());
         let system_time = Timestamp(i64::from_be_bytes(header[8..16].try_into().unwrap()));
         let until = i64::from_be_bytes(header[16..24].try_into().unwrap());
-        if header[24] == 1 {
+        if header[24] > 3 {
+            return Err(invalid("The checkpoint has an unknown generation marker"));
+        }
+        if header[24] & 2 != 0 {
+            let (offset, rest) = bytes.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no restoration offset"))?;
+            let (digest, rest) = rest.split_first_chunk::<32>().ok_or_else(|| invalid("The checkpoint has no restoration identity"))?;
+            let (through, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("The checkpoint has no restoration cut"))?;
+            self.coordinates = JournalCoordinates {
+                offset: u64::from_be_bytes(*offset),
+                origin: Some(RestoreOrigin { digest: *digest, through: u64::from_be_bytes(*through) }),
+            };
+            bytes = rest;
+        } else if checkpoint.restore {
+            return Err(invalid("The restored checkpoint has no origin"));
+        }
+        if header[24] & 1 != 0 {
+            if checkpoint.restore { return Err(invalid("A restored checkpoint cannot stage a rotation")); }
             self.rotation = Some(Rotation {
                 cut: lsn,
                 generation: checkpoint.key_generation,
                 committed: false,
-                retirement_observed_at: None,
+                retirement: None,
+                retirement_armed: false,
             });
-        } else if header[24] != 0 {
-            return Err(invalid("The checkpoint has an unknown generation marker"));
         }
-        if position > checkpoint.through {
+        if position > self.coordinates.position(Lsn(checkpoint.through))?
+            || self.coordinates.origin.is_some_and(|origin| {
+                origin.through > position || (checkpoint.restore && origin.through != position)
+            })
+        {
             return Err(invalid("The checkpoint image extends past its cut"));
         }
         let expected = BranchCut {
@@ -319,14 +402,20 @@ impl Committed {
         transactions: &TransactState,
         until: i64,
         rotating: bool,
+        coordinates: JournalCoordinates,
     ) -> Result<Vec<u8>> {
         let cut = transactions.index().head();
         let bytes = transactions.encode_checkpoint()?;
-        let mut payload = Vec::with_capacity(25 + bytes.len());
+        let mut payload = Vec::with_capacity(25 + coordinates.origin.map_or(0, |_| 48) + bytes.len());
         payload.extend_from_slice(&cut.basis.position().to_be_bytes());
         payload.extend_from_slice(&cut.system_time.0.to_be_bytes());
         payload.extend_from_slice(&until.to_be_bytes());
-        payload.push(u8::from(rotating));
+        payload.push(u8::from(rotating) | (u8::from(coordinates.origin.is_some()) << 1));
+        if let Some(origin) = coordinates.origin {
+            payload.extend_from_slice(&coordinates.offset.to_be_bytes());
+            payload.extend_from_slice(&origin.digest);
+            payload.extend_from_slice(&origin.through.to_be_bytes());
+        }
         payload.extend_from_slice(&bytes);
         Ok(payload)
     }

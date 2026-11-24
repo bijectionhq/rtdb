@@ -1,12 +1,15 @@
 use std::{ops::AsyncFnOnce, sync::Arc};
 
 use rtdb_crypt::{Kms, Plaintext};
-use rtdb_format::journal::{Manifest, ObjectId, Pin, Record};
+use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::BranchCut;
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
 use rtdb_tx::transact::TransactState;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::replay::{Committed, JournalCoordinates, RestoreOrigin};
 
 use super::{MultiDatabase, next, no_writer};
 
@@ -70,14 +73,11 @@ impl MultiDatabase {
         let journal_head = self.state().head;
         let generation = self.state().generation;
         let writer = self.writer.as_ref().ok_or_else(no_writer)?;
-        if writer.pipeline.next_position() != next(journal_head)?.0 {
+        if writer.pipeline.next_position() != self.state().coordinates.position(next(journal_head)?)? {
             return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/export-pending-writes", "The writer is settling an admitted transaction"));
         }
         let transactions = self.durable_transactions();
         let cut = transactions.index().exact(basis)?;
-        if transactions.index().has_custody_groups() {
-            return Err(Anomaly::unsupported("rtdb/export-custody", "A protected export needs an admitted destination custody binding"));
-        }
         let checkpoint = transactions.encode_checkpoint_at(basis)?;
         let mut payload = Vec::with_capacity(EXACT_EXPORT.len() + 16 + checkpoint.len());
         payload.extend_from_slice(EXACT_EXPORT);
@@ -104,6 +104,65 @@ impl MultiDatabase {
             store: Arc::clone(&self.store),
             kms: Arc::clone(&self.stream.kms),
         })
+    }
+
+    /// Install an independent backing for an exact export. The destination's
+    /// journal and KMS own all bytes needed to recover after the append.
+    pub async fn restore_export(&mut self, export: &PinnedExport) -> Result<BranchCut> {
+        let source = export.image.id();
+        if source.database == self.options.database {
+            return Err(Anomaly::incorrect("rtdb/restore-same-deployment", "Restore needs a distinct deployment"));
+        }
+        if !export.manifest().files.is_empty() {
+            return Err(Anomaly::unsupported("rtdb/export-files", "This export needs independent destination file placement"));
+        }
+        self.refresh().await?;
+        let lease = self.authority()?;
+        let source_identity: [u8; 32] = Sha256::digest(source.to_string().as_bytes()).into();
+        let state = self.state();
+        let through = state.head;
+        let generation = state.generation;
+        let destination = self.incarnation();
+        if let Some(origin) = state.coordinates.origin
+            && origin.digest == source_identity
+        {
+            return state.transactions.index().exact(Basis::new(destination, origin.through));
+        }
+        if state.transactions.index().head().basis.position() != 0
+            || state.records.iter().any(|record| !matches!(record, Record::Lease { .. }))
+        {
+            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/restore-not-empty", "Restore needs a fresh deployment"));
+        }
+        let writer = self.writer.as_ref().ok_or_else(no_writer)?;
+        if writer.pipeline.next_position() != next(through)?.0 {
+            return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/restore-pending-writes", "The writer is settling an admitted transaction"));
+        }
+        let (_, mut transactions) = export.exact_checkpoint().await?;
+        transactions.restore_in(destination)?;
+        let cut = transactions.index().head();
+        let coordinates = JournalCoordinates {
+            offset: cut.basis.position().saturating_sub(through.0),
+            origin: Some(RestoreOrigin { digest: source_identity, through: cut.basis.position() }),
+        };
+        coordinates.position(next(next(through)?)?)?;
+        let manifest = Manifest {
+            files: Vec::new(),
+            pins: Vec::new(),
+            payload: Committed::checkpoint_payload(&transactions, lease.until, false, coordinates)?,
+        };
+        let image = self.writer.as_mut().ok_or_else(no_writer)?.objects
+            .manifest(self.stream.kms.as_ref(), generation, &manifest).await?;
+        image.put(self.store.as_ref()).await?;
+        export.check_readable().await?;
+        self.require_authority(lease)?;
+        self.append_control(lease, Record::Checkpoint(Checkpoint {
+            manifest: image.id(),
+            through: through.0,
+            key_generation: generation,
+            restore: true,
+        })).await?;
+        self.trim(lease, through).await?;
+        Ok(cut)
     }
 
     /// The destination must durably publish its independent backing before returning success.

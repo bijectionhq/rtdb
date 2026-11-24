@@ -444,7 +444,10 @@ pub(super) fn receipt(receipt: tx::Receipt) -> proto::Receipt {
             tx::Outcome::Refused { error: anomaly } => Outcome::Refused(error::detail(anomaly)),
         }),
         replayed: receipt.replayed,
-        erasure: None,
+        erasure: match receipt.erasure {
+            Some(tx::Erasure::Armed { unreadable_by }) => Some(proto::Erasure { unreadable_by_micros: unreadable_by.0 }),
+            _ => None,
+        },
     }
 }
 

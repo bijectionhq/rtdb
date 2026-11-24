@@ -275,9 +275,10 @@ impl TransactPipeline {
                     }
                     // Adopt the decided index: identical to applying the record, without re-applying it.
                     self.durable.index = after;
-                    self.durable.receipts.entry(key.namespace).or_default().insert(
-                        key.key.clone(), StoredReceipt { receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace },
-                    );
+                    let previous = self.durable.store_receipt(StoredReceipt {
+                        receipt: receipt.clone(), fingerprint, receipt_namespace: key.namespace,
+                    });
+                    debug_assert!(previous.is_none());
                     self.deciding.remove(&key);
                     released.push(receipt);
                 }
