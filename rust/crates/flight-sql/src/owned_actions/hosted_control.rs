@@ -202,12 +202,13 @@ impl Service {
                     Timestamp(0),
                     Some(revision),
                     None,
+                    None,
                 )?
             }
             None => {
                 let schema = wire::plan_schema(point.schema.schema(), call.memory())?;
                 let schema = schema.project(&fields(&schema)).map_err(arrow)?;
-                self.owned_point_reply_in(call.memory(), &schema, None, present, Timestamp(0), None, None)?
+                self.owned_point_reply_in(call.memory(), &schema, None, present, Timestamp(0), None, None, None)?
             }
         };
         held.snapshot.check().map_err(status)?;
