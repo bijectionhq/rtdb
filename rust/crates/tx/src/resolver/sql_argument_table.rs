@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, ListArray, RecordBatch, cast::AsArray};
+use arrow_array::{Array, ListArray, RecordBatch, StructArray, cast::AsArray};
 use arrow_buffer::OffsetBuffer;
 use rtdb_columnar::{MemoryReservation, OwnedBatch};
 use rtdb_plan::{ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema};
@@ -10,7 +10,8 @@ use rtdb_types::{Anomaly, Result, TableRef};
 use crate::{SqlArguments, values::BoundArgumentRow};
 
 use super::{
-    HOSTED_CAPACITY_DECLARATIONS, OpenTransaction, check_table, execute, mutation_put_batch, overflow, plain_scalar_field,
+    HOSTED_CAPACITY_DECLARATIONS, OpenTransaction, check_table, execute, mutation_put_batches, overflow,
+    plain_scalar_field, scalar_mutation_put_field,
 };
 
 impl OpenTransaction<'_> {
@@ -142,53 +143,64 @@ impl OpenTransaction<'_> {
             types: &types,
         };
         let mut cursor = execute(plan, Arc::clone(&context), Some(binding), Some(syntax)).await?;
-        let _inventory = memory.reserve(
-            page.num_rows()
-                .checked_mul(std::mem::size_of::<OwnedBatch>() * 2)
-                .ok_or_else(overflow)?,
-        )?;
-        let mut pages = Vec::new();
-        while let Some(page) = cursor.next_batch().await? {
-            if page.batch().num_rows() > 0 {
-                pages.push(page);
+        let first = loop {
+            let Some(output) = cursor.next_batch().await? else { return Ok(true); };
+            if output.batch().num_rows() != 0 {
+                break output;
             }
-        }
-        drop(cursor);
-        let Some(first) = pages.first() else {
-            return Ok(true);
         };
-        let scratch = pages.iter().try_fold(4096usize, |bytes, page| {
-            page.batch()
-                .get_array_memory_size()
-                .checked_mul(4)
-                .and_then(|size| bytes.checked_add(size))
-                .ok_or_else(overflow)
-        })?;
-        let _scratch = memory.reserve(scratch)?;
-        let output = if pages.len() == 1 {
-            first.batch().clone()
-        } else {
-            arrow_select::concat::concat_batches(first.batch().schema_ref(), pages.iter().map(OwnedBatch::batch))
-                .map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()))?
-        };
-        let Some(doc) = output.column_by_name("doc").and_then(|column| column.as_struct_opt()) else {
+        let Some(first_doc) = argument_put_document(first.batch()) else {
             return Ok(false);
         };
         // The serial writer's declarations differ between a null-only row and a populated row.
-        if !doc.fields().iter().all(|field| plain_scalar_field(field))
-            || doc
+        if !first_doc.fields().iter().all(|field| scalar_mutation_put_field(field))
+            || first_doc
                 .columns()
                 .iter()
                 .any(|column| column.null_count() != 0 && column.null_count() != column.len())
         {
             return Ok(false);
         }
-        let Some(put) = mutation_put_batch(&output, self.tx_key().system_time, memory)? else {
+
+        let mut inventory = None;
+        let mut rest = Vec::new();
+        while let Some(output) = cursor.next_batch().await? {
+            let batch = output.batch();
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let Some(doc) = argument_put_document(batch) else { return Ok(false); };
+            if batch.schema_ref() != first.batch().schema_ref()
+                || !doc.columns().iter().zip(first_doc.columns()).all(|(column, initial)| {
+                    let expected_nulls = if initial.null_count() == 0 { 0 } else { column.len() };
+                    column.null_count() == expected_nulls
+                })
+            {
+                return Ok(false);
+            }
+            if inventory.is_none() {
+                let bytes = page.num_rows().checked_mul(std::mem::size_of::<OwnedBatch>() * 2)
+                    .ok_or_else(overflow)?;
+                inventory = Some(memory.reserve(bytes)?);
+            }
+            rest.push(output);
+        }
+        drop(cursor);
+        drop(parameter);
+        let Some(put) = mutation_put_batches(first.batch(), &rest, self.tx_key().system_time, memory)? else {
             return Ok(false);
         };
+        drop(rest);
+        drop(inventory);
+        drop(first);
         self.buffer.append_batch(table, put)?;
         Ok(true)
     }
+}
+
+fn argument_put_document(batch: &RecordBatch) -> Option<&StructArray> {
+    let doc = batch.column_by_name("doc")?.as_struct_opt()?;
+    (doc.null_count() == 0).then_some(doc)
 }
 
 fn row_local_max_column(input: &Relation) -> Option<u32> {
