@@ -800,10 +800,14 @@ impl SearchRuntime {
         run: &rtdb_format::log::proto::SearchRun, error: &rtdb_types::Anomaly) {
         if !FileError::from_anomaly(error.clone()).needs_repair() { return; }
         if let Ok(id) = run.identity() {
-            let mut suspects = self.suspect_runs.lock();
-            if suspects.len() < 1024 && suspects.insert((database.to_owned(), table.clone(), id)) {
-                self.notifier(database).notify_one();
-            }
+            self.mark_run_suspect(database, table, id);
+        }
+    }
+
+    pub(crate) fn mark_run_suspect(&self, database: &str, table: &rtdb_types::TableRef, id: [u8; 32]) {
+        let mut suspects = self.suspect_runs.lock();
+        if suspects.len() < 1024 && suspects.insert((database.to_owned(), table.clone(), id)) {
+            self.notifier(database).notify_one();
         }
     }
 

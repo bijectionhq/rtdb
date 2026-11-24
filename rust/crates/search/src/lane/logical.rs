@@ -490,33 +490,7 @@ impl SearchBuilder {
                 let change = self.directory_change(&index, &definition.columns, &current, prepared, Vec::new(), cancellation).await?;
                 publish_change(publisher, storage, &index, change).await?;
             }
-            loop {
-                let snapshot = snapshots.snapshot().snapshot();
-                let mut runs = index.records(&snapshot);
-                runs.sort_unstable_by_key(|run| (run.blocks.len(), run.blocks[0]));
-                let limit = (self.memory.limit_bytes() / 8).min(128 << 20) as i64;
-                let Some(pair) = runs.windows(2).find(|pair| {
-                    pair[0].blocks.len() == pair[1].blocks.len()
-                        && pair.iter().all(|run| !needs_order_replay(run))
-                        && same_history_cut(pair[0], pair[1])
-                        && pair[0].blocks.len() * 2 <= rtdb_format::search_manifest::MAX_RUN_BLOCKS
-                        && pair[0].file_size().saturating_add(pair[1].file_size()) <= limit
-                }) else { break; };
-                let input = pair.iter().map(|run| run.digest().to_vec()).collect::<Vec<_>>();
-                let hold = self.hold_logical_input(&snapshot).await?;
-                let merged = IoRegion::reading(hold,
-                    self.merge_logical(&index, &definition.columns, &snapshot, pair, cancellation),
-                ).await;
-                let prepared = match merged {
-                    Ok(run) => run,
-                    Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
-                    Err(error) => return Err(error),
-                };
-                let identity = prepared.run.identity()?;
-                let change = self.directory_change(&index, &definition.columns, &snapshot, prepared, input, cancellation).await?;
-                publish_change(publisher, storage, &index, change).await?;
-                if !index.records(&snapshots.snapshot().snapshot()).iter().any(|run| run.identity().is_ok_and(|found| found == identity)) { break; }
-            }
+            self.merge_logical_runs(&index, &definition.columns, snapshots, publisher, storage, cancellation).await?;
             match self.repair_term_directory(&index, &definition.columns, snapshots, publisher, storage, cancellation).await {
                 Err(error) if super::is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
                 result => result?,
@@ -527,6 +501,40 @@ impl SearchBuilder {
             }
         }
         Ok(())
+    }
+
+    async fn merge_logical_runs(&self, index: &LogicalIndex, columns: &[String], snapshots: &dyn SnapshotSource,
+        publisher: &dyn ArtefactPublisher, storage: (StorageVersion, StorageEpoch), cancellation: &CancellationToken) -> Result<()> {
+        let limit = (self.memory.limit_bytes() / 8).min(128 << 20) as i64;
+        loop {
+            let snapshot = snapshots.snapshot().snapshot();
+            let mut runs = index.records(&snapshot);
+            runs.sort_unstable_by_key(|run| (run.blocks.len(), run.blocks[0]));
+            let candidates = runs.array_windows::<2>().copied().filter(|[left, right]| {
+                left.blocks.len() == right.blocks.len() && !needs_order_replay(left) && !needs_order_replay(right)
+                    && left.blocks.len() * 2 <= rtdb_format::search_manifest::MAX_RUN_BLOCKS
+                    && left.file_size().saturating_add(right.file_size()) <= limit
+                    && compatible_merge_inputs(left, right, self.history.is_some())
+            });
+            let mut adopted = false;
+            for pair in candidates {
+                let hold = self.hold_logical_input(&snapshot).await?;
+                let merged = IoRegion::reading(hold, self.merge_logical(index, columns, &snapshot, pair, cancellation)).await;
+                let prepared = match merged {
+                    Ok(Some(run)) => run,
+                    Ok(None) => continue,
+                    Err(error) if super::is_search_gap(&error, cancellation) => { self.runtime.record_serving_gap(); break; }
+                    Err(error) => return Err(error),
+                };
+                let inputs = pair.map(|run| run.digest().to_vec()).to_vec();
+                let identity = prepared.run.identity()?;
+                let change = self.directory_change(index, columns, &snapshot, prepared, inputs, cancellation).await?;
+                publish_change(publisher, storage, index, change).await?;
+                adopted = index.records(&snapshots.snapshot().snapshot()).iter().any(|run| run.identity().is_ok_and(|found| found == identity));
+                break;
+            }
+            if !adopted { return Ok(()); }
+        }
     }
 
     async fn scrub_logical(&self, index: &LogicalIndex, columns: &[String], snapshots: &dyn SnapshotSource,
@@ -631,7 +639,7 @@ impl SearchBuilder {
                         self.runtime.open_logical(&self.storage, &entry.slug, target, &definition.columns, true).await?.verify().await
                     }.await;
                     match checked {
-                        Ok(()) => return Ok(()),
+                        Ok(()) => return Ok(true),
                         Err(error) if !crate::runtime::FileError::from_anomaly(error.clone()).needs_repair() => return Err(error),
                         Err(_) => {}
                     }
@@ -669,13 +677,14 @@ impl SearchBuilder {
                 let prepared = self.store_documents(&index, &definition.columns, &entry.slug, blocks, rebuild, source_rows, contents, charge, receipt, cancellation).await?;
                 let change = self.directory_change(&index, &definition.columns, &snapshot, prepared, vec![id.to_vec()], cancellation).await?;
                 publish_change(publisher, storage, &index, change).await?;
-                if snapshots.snapshot().trie_catalog().search_runs(&table).any(|held| held.identity().is_ok_and(|held| held == id)) {
-                    return Err(fault("The search repair input is still active after publication"));
-                }
-                Ok(())
+                Ok(!snapshots.snapshot().trie_catalog().search_runs(&table).any(|held| held.identity().is_ok_and(|held| held == id)))
             }).await;
             match attempt {
-                Ok(()) => self.runtime.clear_run(&self.database, &table, id),
+                Ok(true) => self.runtime.clear_run(&self.database, &table, id),
+                Ok(false) => {
+                    self.runtime.mark_run_suspect(&self.database, &table, id);
+                    self.runtime.record_serving_gap();
+                }
                 Err(error) if super::is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
                 Err(error) => return Err(error),
             }
@@ -683,10 +692,23 @@ impl SearchBuilder {
         Ok(())
     }
 
-    async fn merge_logical(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, inputs: &[&SearchRun],
-        cancellation: &CancellationToken) -> Result<PreparedLogicalRun> {
+    async fn merge_logical(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot, inputs: [&SearchRun; 2],
+        cancellation: &CancellationToken) -> Result<Option<PreparedLogicalRun>> {
         let entry = snapshot.table_entry(&index.table).ok_or_else(|| fault("Logical merge has no table slug"))?;
-        let mut blocks = Vec::new();
+        let mut blocks = inputs.iter().flat_map(|run| run.blocks.iter().copied()).collect::<Vec<_>>();
+        blocks.sort_unstable();
+        let source_rows = inputs.iter().try_fold(0i64, |count, run| count.checked_add(run.source_rows()))
+            .ok_or_else(|| fault("Search merge source row count overflow"))?;
+        if let [Some(prior), None] | [None, Some(prior)] = inputs.map(|run| run.source_receipt.as_ref()) {
+            let Some(recovered) = self.recover_from_history(index, columns, snapshot, &blocks, None, cancellation).await? else { return Ok(None); };
+            let has_erases = inputs.iter().any(|run| run.has_erases());
+            let recovered_has_erases = !recovered.contents.erases.is_empty();
+            if recovered.receipt.source_rows() != source_rows || !recovered.receipt.extends(prior) || has_erases != recovered_has_erases {
+                return Ok(None);
+            }
+            return self.store_documents(index, columns, &entry.slug, blocks, 0, source_rows, recovered.contents, recovered.charge,
+                Some(recovered.receipt), cancellation).await.map(Some);
+        }
         let mut contents = RunContents::default();
         let bytes = inputs.iter().map(|run| run.file_size()).sum::<i64>().saturating_mul(4);
         let indexing = self.memory.reserve(indexing_allowance(bytes))?;
@@ -698,17 +720,13 @@ impl SearchBuilder {
                 let (erases, _charge) = file.erases(&self.memory).await?;
                 extend_erases(&mut contents.erases, erases);
             }
-            blocks.extend(run.blocks.iter().copied());
         }
-        let source_rows = inputs.iter().try_fold(0i64, |count, run| count.checked_add(run.source_rows()))
-            .ok_or_else(|| fault("Search merge source row count overflow"))?;
-        blocks.sort_unstable();
         let receipt = inputs[0].source_receipt.clone().map(|mut receipt| {
             receipt.blocks.clone_from(&blocks);
             receipt.source_rows = Some(source_rows);
             receipt
         });
-        self.store_documents(index, columns, &entry.slug, blocks, 0, source_rows, contents, indexing, receipt, cancellation).await
+        self.store_documents(index, columns, &entry.slug, blocks, 0, source_rows, contents, indexing, receipt, cancellation).await.map(Some)
     }
 
     async fn store_documents(&self, index: &LogicalIndex, columns: &[String], slug: &TableSlug, mut blocks: Vec<i64>, rebuild: i64, source_rows: i64,
@@ -745,11 +763,11 @@ impl SearchBuilder {
     }
 }
 
-fn same_history_cut(left: &SearchRun, right: &SearchRun) -> bool {
+fn compatible_merge_inputs(left: &SearchRun, right: &SearchRun, has_history: bool) -> bool {
     match (&left.source_receipt, &right.source_receipt) {
         (None, None) => true,
         (Some(left), Some(right)) => left.suffix_through == right.suffix_through && left.extends(right),
-        _ => false,
+        _ => has_history,
     }
 }
 
@@ -833,8 +851,156 @@ fn normalized_revisions_preserve_order_and_frequency() {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use rtdb_format::{block::proto::Block, catalog::{BlockCatalog, TableBlock}, data::{EventBatch, StoredEvent, StoredOperation, build_event_batch}, log::proto::ArtefactsRemoved};
+    use rtdb_index::{CatalogTrie, PartitionState, TableCatalog, TrieCatalog};
+    use rtdb_maintenance::{HistoryVisitor, TableHistorySource};
     use rtdb_storage::{LocalStore, MemoryStore, ObjectStore, cache::BufferPool, object_store::StoredObject};
-    use rtdb_types::MemoryBudget;
+    use rtdb_types::{LogicalType, MemoryBudget, ReplicaPosition, ScalarType, SourcePosition, StructFields, Value};
+
+    const REPLAY_THROUGH: ReplicaPosition = ReplicaPosition(17);
+    const TEST_STORAGE: (StorageVersion, StorageEpoch) = (StorageVersion(6), StorageEpoch(0));
+
+    struct TableReplay(Vec<EventBatch>);
+
+    #[async_trait::async_trait]
+    impl TableHistorySource for TableReplay {
+        async fn visit_table(&self, _: HistoryRead<'_>, visit: &mut HistoryVisitor<'_>) -> Result<Option<HistoryCoverage>> {
+            for (block, batch) in self.0.iter().enumerate() {
+                visit(BlockIndex(block as i64), HistoryRow::Stored { batch, row: 0 })?;
+            }
+            Ok(Some(HistoryCoverage::Native { lineage: "native/journal".into(), through: REPLAY_THROUGH }))
+        }
+    }
+
+    struct CatalogPublisher<'a> {
+        partition: &'a PartitionState,
+        reject_once: parking_lot::Mutex<Option<TableRef>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArtefactPublisher for CatalogPublisher<'_> {
+        async fn publish(&self, message: ArtefactsAdded) -> Result<SourcePosition> {
+            let table = rtdb_format::catalog::legacy_table_ref(message.table_name())?;
+            let reject = {
+                let mut target = self.reject_once.lock();
+                target.as_ref() == Some(&table) && target.take().is_some()
+            };
+            let mut entries = Vec::new();
+            for entry in message.entries {
+                let key = entry.trie_key().parse()?;
+                let mut record = entry.record.unwrap();
+                if reject {
+                    let mut change = SearchRunChange::from_artefact(&record)?;
+                    assert!(change.term_directory.is_some());
+                    change.replaces_directory.as_mut().unwrap()[0] ^= 0xff;
+                    record = change.to_artefact()?;
+                }
+                entries.push((key, record));
+            }
+            self.partition.add_artefacts(&table, entries);
+            Ok(SourcePosition(1))
+        }
+
+        async fn remove(&self, _: ArtefactsRemoved) -> Result<SourcePosition> {
+            unreachable!()
+        }
+    }
+
+    fn replay_builder(events: &[StoredOperation]) -> SearchBuilder {
+        let batches = events.iter().enumerate().map(|(block, operation)| {
+            let fields = matches!(operation, StoredOperation::Put(_))
+                .then(|| StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]));
+            let event = StoredEvent { position: None, origin: None, commit_position: 1, entity_key: None,
+                iid: Iid([block as u8; 16]), system_from: Timestamp(block as i64 + 1), valid_time: Interval::ALL,
+                recency: None, operation: operation.clone() };
+            EventBatch::new(build_event_batch(&[event], fields, None).unwrap()).unwrap()
+        }).collect();
+        builder(Arc::new(MemoryStore::default())).with_history(Some(Arc::new(TableReplay(batches))))
+    }
+
+    fn replay_partition(runs: &[(TableRef, SearchRun)], block_index: i64) -> PartitionState {
+        let mut tries = TrieCatalog::default();
+        let mut tables = BTreeMap::new();
+        for (table, run) in runs {
+            let mut trie = CatalogTrie::notification(TrieKey::l0(BlockIndex(run.blocks[0])).unwrap(), 1, None).unwrap();
+            trie.artefacts.push(SearchRunChange { run: Some(run.clone()), ..Default::default() }.to_artefact().unwrap());
+            tries = tries.with_tries(table.clone(), [trie], Timestamp(1)).unwrap();
+            tables.insert(table.clone(), TableBlock::from_parts(BTreeMap::new(), &StructFields::default(), block_index + 1, Vec::new()).unwrap());
+        }
+        let block = BlockCatalog::from_proto(Block { block_index: Some(block_index), boundary_replica_msg_id: Some(REPLAY_THROUGH.0),
+            table_names: tables.keys().map(TableRef::schema_and_table).collect(), ..Default::default() }).unwrap();
+        let tables = TableCatalog::load(Some(block), &tables).unwrap();
+        PartitionState::new(PartitionValue::loaded(tries, tables, Default::default()).unwrap())
+    }
+
+    fn recorded_run(index: &LogicalIndex, block: i64) -> SearchRun {
+        SearchRun { definition_id: Some(index.id.clone()), definition_version: Some(index.version),
+            blocks: vec![block], digest: Some(vec![block as u8 + 1; 32]), file_size: Some(1), locator: Some(vec![1]),
+            source_rows: Some(1), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn rejected_search_repair_stays_suspect_while_another_definition_repairs() {
+        let builder = replay_builder(&[StoredOperation::Erase]);
+        let definitions = ["a_docs", "z_docs"].map(|name| SearchDefinition { name: name.into(), table: TableRef::new("public", name),
+            columns: vec!["body".into()], version: 1, history: true });
+        let inputs = definitions.each_ref().map(|definition| {
+            let index = LogicalIndex::of(definition);
+            let run = SearchRun { has_erases: Some(true), ..recorded_run(&index, 0) };
+            (index.table, run)
+        });
+        let partition = replay_partition(&inputs, 0);
+        let [(first_table, first_run), (second_table, second_run)] = &inputs;
+        let publisher = CatalogPublisher { partition: &partition, reject_once: parking_lot::Mutex::new(Some(first_table.clone())) };
+        let cancellation = CancellationToken::new();
+        let gaps = builder.runtime.serving_gaps();
+
+        builder.repair_logical(&partition, &publisher, TEST_STORAGE, &definitions, &cancellation).await.unwrap();
+
+        let value = partition.value();
+        let catalog = value.trie_catalog();
+        assert_eq!(catalog.search_runs(first_table).next(), Some(first_run));
+        assert_eq!(catalog.retired_search_runs(first_table).count(), 1);
+        assert_ne!(catalog.search_runs(second_table).next(), Some(second_run));
+        assert_eq!(builder.runtime.serving_gaps(), gaps + 1);
+        assert_eq!(builder.runtime.suspect_runs("xtdb"), [(first_table.clone(), first_run.identity().unwrap())]);
+
+        builder.repair_logical(&partition, &publisher, TEST_STORAGE, &definitions, &cancellation).await.unwrap();
+
+        assert!(builder.runtime.suspect_runs("xtdb").is_empty());
+        assert_ne!(partition.value().trie_catalog().search_runs(first_table).next(), Some(first_run));
+    }
+
+    #[tokio::test]
+    async fn mixed_search_run_merge_replays_and_receipts_the_complete_union() {
+        let events = ["repaired text", "sealed text"].map(|body| StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8(body.into()))])));
+        let builder = replay_builder(&events);
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let prior = SourceReceipt { lineage: Some("native/journal".into()), checkpoint_boundary: Some(-1), suffix_through: Some(5),
+            table: Some(index.table.schema_and_table()), shard_range: Some(rtdb_format::search_manifest::FULL_SHARD_RANGE.to_vec()),
+            source_rows: Some(1), erase_frontier_digest: Some(Sha256::digest([]).to_vec()), blocks: vec![0], ..Default::default() };
+        let repaired = SearchRun { source_receipt: Some(prior.clone()), ..recorded_run(&index, 0) };
+        let sealed = recorded_run(&index, 1);
+        let partition = replay_partition(&[(index.table.clone(), repaired), (index.table.clone(), sealed)], 1);
+        let publisher = CatalogPublisher { partition: &partition, reject_once: parking_lot::Mutex::default() };
+        let columns = ["body".into()];
+
+        builder.merge_logical_runs(&index, &columns, &partition, &publisher, TEST_STORAGE, &CancellationToken::new()).await.unwrap();
+
+        let snapshot = partition.value().snapshot();
+        let runs = index.records(&snapshot);
+        assert_eq!(runs.len(), 1);
+        let receipt = runs[0].source_receipt.as_ref().unwrap();
+        assert!(receipt.extends(&prior));
+        assert_eq!(receipt.suffix_through(), REPLAY_THROUGH.0);
+        assert_eq!(receipt.blocks, [0, 1]);
+        assert_eq!(receipt.source_rows(), 2);
+        assert_eq!(index.term_directory(&snapshot).unwrap().runs(), 1);
+        let slug = &snapshot.table_entry(&index.table).unwrap().slug;
+        let file = builder.runtime.logical_file(&builder.storage, slug, runs[0], &columns).await.unwrap();
+        assert_eq!(file.documents().await.unwrap().into_iter().map(|doc| doc.revision).collect::<Vec<_>>(),
+            [text_revision("repaired text"), text_revision("sealed text")]);
+    }
 
     #[derive(Default)]
     struct PublicationRequired(MemoryStore);

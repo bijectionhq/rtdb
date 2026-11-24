@@ -208,6 +208,7 @@ rule SearchJobRuns {
     -- A run nominates an entity and text revision for a field, with terms and positions established by that definition's analyzer.
     -- A primary rewrite replaces the corresponding history locations while preserving the text revision's posting coverage.
     -- Replacement posting runs cover the exact union of the active receipts they supersede.
+    -- A merge with both replay-backed and L0-backed inputs verifies the full union at a pinned boundary and publishes a source receipt that extends the replay-backed input's receipt.
     -- The lane removes postings whose contributing events all precede an erase and retains postings with surviving later events.
     -- A scan uses logical negative evidence within the source extents covered by admitted runs at its pinned basis.
     -- A missing or corrupt run leaves its extent eligible for exact nomination from primary history.
@@ -261,6 +262,7 @@ rule RepairUnreadableSearchFile {
     -- Repair resolves surviving put payloads from primary data by stable event origin and checks each payload against the directory event.
     -- A source receipt binds the lineage, replica interval, table, shard, block extents, row count and erase frontier used to build the replacement.
     -- Replacement compares its extents with the expected active runs and verifies compatible source receipts before adopting the new run.
+    -- A rejected replacement whose input remains active leaves that run suspect and records a serving gap while the lane continues maintaining other definitions.
     when: SearchFileUnreadable(table, owner, definition)
 
     ensures:
