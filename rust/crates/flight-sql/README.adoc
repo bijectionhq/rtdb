@@ -913,19 +913,23 @@ World writes to a governed relation refuse until the world can account for inher
 
 === Holding a historical root publication
 
-`rtdb.owned.OpenReadAsOf.v1` takes the 16-byte fresh held read handle and a signed 64-bit big-endian requested system instant in microseconds.
+`rtdb.owned.OpenReadAsOf.v2` takes the 16-byte fresh held read handle and a signed 64-bit big-endian requested system instant in microseconds.
 Next come the publication relation prefix, a big-endian unsigned 16-bit marker byte length followed by that UTF-8 marker, and a big-endian unsigned 16-bit scope count followed by that many relation prefixes.
 The scope comprises one to 32 distinct preadmitted root relations, including the publication relation.
 Each selected relation needs a covered journal floor and head or a proven empty history.
 The marker is read at the requested system cut and business-valid instant.
 Its visible row must cover all valid time.
-The derived handle uses the marker's actual commit time, which must also be inside every selected relation's certified history.
+The derived handle uses the marker's original transaction position and history time. The highest eligible position breaks a history-time tie. Every selected relation must cover this exact cut.
 
-The response is one byte zero for a covered absent marker, or the new 16-byte handle followed by its signed 64-bit big-endian system time.
+The response is one byte zero for a covered absent marker. A successful reply carries the 16-byte handle followed by signed 64-bit big-endian history time, transaction position and query time.
 Use the handle with ReadHeldPoint.v1, ReadHeldPoint.v2, ReadHeldValidDuring.v2, ReadHeldVersions.v2, ReadHeldRange.v4, or CountHeldRange.v2 in the declared scope and CloseRead.v1 to release it.
 The default business-valid time is the selected marker time.
 The derived handle shares the original generation, lease and expiry and may serve requests after the fresh handle is closed.
 It carries no commit evidence.
+
+`rtdb.owned.ReadHeldRootCutPoint.v1` takes the held handle, signed 64-bit history time and position, and a side byte (0 before, 1 inclusive). The remaining bytes carry the clear relation and typed point with an explicit business-valid instant. It retains the original catalog, journal floor and purge checks, and narrows the scan by position on both sides. The Flight reply uses the named publication's history time on both sides.
+
+The corresponding Root path touch action `rtdb.owned.ReadHeldPathTouch.v2` places the signed 64-bit transaction position immediately after the handle. It certifies the addressed touch from the selected journal group and checks the path declaration across the two positioned reads.
 
 === Fixed-valid range observations
 

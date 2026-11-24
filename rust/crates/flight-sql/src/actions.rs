@@ -17,7 +17,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | READ_HELD_HOSTED_CONTROL_V3
         | READ_HELD_ROOT_CATALOG_V1
         | OPEN_OWNED_SCOPED_READ_V2
-        | OPEN_OWNED_READ_AS_OF_V1
+        | OPEN_OWNED_READ_AS_OF_V2
         | SEAL_HOSTED_RANGES_V1
         | VALIDATE_FRESH_HOSTED_V1
         | OPEN_FRESH_OWNED_READ_V2
@@ -53,9 +53,10 @@ fn fresh_replica_action(action: &str) -> bool {
         | HELD_OWNED_IDENTITIES_V1
         | HELD_OWNED_IDENTITIES_ALL_VALID_V1
         | HELD_OWNED_VERSIONS_V2
-        | HELD_OWNED_PATH_TOUCH_V1
+        | HELD_OWNED_PATH_TOUCH_V2
         | HELD_OWNED_HISTORICAL_POINT_V1
         | HELD_OWNED_POSITION_POINT_V1
+        | HELD_ROOT_CUT_POINT_V1
         | HELD_OWNED_VALID_DURING_V2
         | HELD_OWNED_VALID_REGION_V1
         | HELD_OWNED_POSITION_VALID_DURING_V1
@@ -162,7 +163,7 @@ impl Service {
                 }
                 crate::owned_actions::COMMIT_OWNED_V7 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V2 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
@@ -233,9 +234,10 @@ impl Service {
                 crate::owned_actions::HELD_WORLD_VERSION_V2 => self.held_world_version_action(&call, &action.body).await,
                 crate::owned_actions::HELD_WORLD_TOUCH_IMAGES_V1 => self.held_world_path_touch_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PATH_TOUCH_V1 => self.held_world_path_touch_action(&call, &action.body, false).await,
-                crate::owned_actions::HELD_OWNED_PATH_TOUCH_V1 => self.held_owned_path_touch_action(&call, &action.body).await,
+                crate::owned_actions::HELD_OWNED_PATH_TOUCH_V2 => self.held_owned_path_touch_action(&call, &action.body).await,
                 crate::owned_actions::HELD_OWNED_HISTORICAL_POINT_V1 => Ok(vec![Ok(self.held_owned_historical_point_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POSITION_POINT_V1 => Ok(vec![Ok(self.held_owned_position_point_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_ROOT_CUT_POINT_V1 => Ok(vec![Ok(self.held_root_cut_point_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_VALID_DURING_V2 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Timeline).await?)]),
                 crate::owned_actions::HELD_OWNED_VALID_REGION_V1 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Region).await?)]),
                 crate::owned_actions::HELD_OWNED_POSITION_VALID_DURING_V1 => Ok(vec![Ok(self.held_owned_valid_during_action(&call, &action.body, crate::owned_actions::ValidHistoryMode::Positioned).await?)]),

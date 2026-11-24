@@ -226,7 +226,7 @@ fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<
 
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_SCOPED_READ_V2: &str = "rtdb.owned.OpenOwnedScopedRead.v2";
-pub(crate) const OPEN_OWNED_READ_AS_OF_V1: &str = "rtdb.owned.OpenReadAsOf.v1";
+pub(crate) const OPEN_OWNED_READ_AS_OF_V2: &str = "rtdb.owned.OpenReadAsOf.v2";
 pub(crate) const OPEN_OWNED_READ_V3: &str = "rtdb.owned.OpenRead.v3";
 pub(crate) const OPEN_FRESH_OWNED_READ_V2: &str = "rtdb.owned.OpenFreshRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V5: &str = "rtdb.owned.OpenAppliedRead.v5";
@@ -236,9 +236,10 @@ pub(crate) const HELD_OWNED_FIXED_POINT_V1: &str = "rtdb.owned.ReadHeldFixedPoin
 pub(crate) const HELD_WORLD_VERSION_V2: &str = "rtdb.owned.ReadHeldWorldVersion.v2";
 pub(crate) const HELD_WORLD_TOUCH_IMAGES_V1: &str = "rtdb.owned.ReadHeldWorldTouchImages.v1";
 pub(crate) const HELD_WORLD_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldWorldPathTouch.v1";
-pub(crate) const HELD_OWNED_PATH_TOUCH_V1: &str = "rtdb.owned.ReadHeldPathTouch.v1";
+pub(crate) const HELD_OWNED_PATH_TOUCH_V2: &str = "rtdb.owned.ReadHeldPathTouch.v2";
 pub(crate) const HELD_OWNED_HISTORICAL_POINT_V1: &str = "rtdb.owned.ReadHeldHistoricalPoint.v1";
 pub(crate) const HELD_OWNED_POSITION_POINT_V1: &str = "rtdb.owned.ReadHeldPositionPoint.v1";
+pub(crate) const HELD_ROOT_CUT_POINT_V1: &str = "rtdb.owned.ReadHeldRootCutPoint.v1";
 pub(crate) const HELD_OWNED_POSITION_VALID_DURING_V1: &str = "rtdb.owned.ReadHeldPositionValidDuring.v1";
 pub(crate) const HELD_OWNED_VALID_DURING_V2: &str = "rtdb.owned.ReadHeldValidDuring.v2";
 pub(crate) const HELD_OWNED_VALID_REGION_V1: &str = "rtdb.owned.ReadHeldValidRegion.v1";
@@ -1796,7 +1797,7 @@ impl Service {
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_fresh_owned_read(deployment, required.as_ref()).await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, Some(permit), true, 0)
+        self.retain_owned_read(call, snapshot, Some(permit), 0)
     }
 
     pub(crate) async fn open_applied_owned_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1835,7 +1836,7 @@ impl Service {
             Some(minimum) => native.open_applied_owned_read(minimum).await,
             None => native.open_owned_read().await,
         }.map_err(status)?;
-        self.retain_owned_read(call, snapshot, permit, true, generation)
+        self.retain_owned_read(call, snapshot, permit, generation)
     }
 
     pub(crate) async fn open_owned_scoped_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1859,7 +1860,7 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let snapshot = original.snapshot.scope_root_read(relations).await.map_err(status)?;
-        self.retain_owned_read(call, snapshot, Some(permit), true, 0)
+        self.retain_owned_read(call, snapshot, Some(permit), 0)
     }
 
     pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -1891,22 +1892,21 @@ impl Service {
             .await.map_err(status)?;
         held.snapshot.check_relation(&publication).map_err(status)?;
         match snapshot {
-            Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), false, 0),
+            Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), 0),
             None => Ok(ActionResult { body: Bytes::from_static(&[0]) }),
         }
     }
 
-    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: Option<OwnedSemaphorePermit>, include_transaction: bool, generation: u64) -> Result<ActionResult, Status> {
+    fn retain_owned_read(&self, call: &Call, snapshot: OwnedReadSession, permit: Option<OwnedSemaphorePermit>, generation: u64) -> Result<ActionResult, Status> {
         let reservation = call.reserve(wire::add(2048, wire::add(call.session.id.len(), call.database.len())?)?)?;
         let reply_charge = call.reserve(64)?;
         let handle = Uuid::new_v4();
-        let mut reply = Vec::with_capacity(if include_transaction { 40 } else { 24 });
+        let mut reply = Vec::with_capacity(40);
         reply.extend_from_slice(handle.as_bytes());
         reply.extend_from_slice(&snapshot.system_time().0.to_be_bytes());
-        if include_transaction {
-            reply.extend_from_slice(&snapshot.present().tx_id.0.to_be_bytes());
-            reply.extend_from_slice(&snapshot.query_time().map_err(status)?.0.to_be_bytes());
-        }
+        let position = snapshot.historical_publication().unwrap_or_else(|| snapshot.present()).tx_id;
+        reply.extend_from_slice(&position.0.to_be_bytes());
+        reply.extend_from_slice(&snapshot.query_time().map_err(status)?.0.to_be_bytes());
         let held = Arc::new(OwnedReadResource {
             snapshot, owner: call.session.owner(), session: call.session.id.clone(), database: call.database.clone(),
             audience_work: rtdb_storage::audience_work::current_turn(),
@@ -2029,6 +2029,28 @@ impl Service {
         Ok(reply)
     }
 
+    pub(crate) async fn held_root_cut_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Root cut point has no hold"))?;
+        let (history, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Root cut point has no system time"))?;
+        let (position, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Root cut point has no transaction position"))?;
+        let (side, request) = request.split_first().ok_or_else(|| invalid("Root cut point has no side"))?;
+        let before = match side {
+            0 => true,
+            1 => false,
+            _ => return Err(invalid("Invalid Root cut point side")),
+        };
+        let system_time = Timestamp(i64::from_be_bytes(*history));
+        let publication = rtdb_types::TransactionKey { system_time, tx_id: rtdb_types::TxId(i64::from_be_bytes(*position)) };
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
+        let valid = valid.ok_or_else(|| invalid("Root cut point has no valid instant"))?;
+        let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
+        let reply = self.finish_owned_point(call, system_time, valid, &id, cursor, None).await?;
+        held.snapshot.check_relation(&relation).map_err(status)?;
+        Ok(reply)
+    }
+
     fn path_touch_request(
         &self, call: &Call, request: &[u8],
     ) -> Result<(Timestamp, Timestamp, OwnedRelation, OwnedRelation, EntityId, Timestamp, Arc<MemoryReservation>), Status> {
@@ -2114,13 +2136,15 @@ impl Service {
     ) -> Result<Vec<Result<ActionResult, Status>>, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned path touch has no held read handle"))?;
+        let (position, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned path touch has no transaction position"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (before, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
-        let columns = held.snapshot.path_touch_columns(&relation, &path, &id, before, group, valid).await.map_err(status)?;
+        let (_, group, relation, path, id, valid, _identity) = self.path_touch_request(call, request)?;
+        let publication = rtdb_types::TransactionKey { system_time: group, tx_id: rtdb_types::TxId(i64::from_be_bytes(*position)) };
+        let columns = held.snapshot.path_touch_columns(&relation, &path, &id, publication, valid).await.map_err(status)?;
         let mut replies = Vec::with_capacity(2);
-        for system in [before, group] {
-            let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(call.memory(), system, valid, &id, cursor, None, Some(&columns), None, |_| Ok(None)).await?;
+        for before in [true, false] {
+            let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
+            let reply = self.finish_owned_point_inner(call.memory(), group, valid, &id, cursor, None, Some(&columns), None, |_| Ok(None)).await?;
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;

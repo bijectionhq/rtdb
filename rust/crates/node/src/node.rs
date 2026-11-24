@@ -1653,7 +1653,12 @@ impl OwnedReadSession {
     }
 
     pub fn system_time(&self) -> Timestamp {
-        self.historical.as_ref().map_or(self.present.system_time, |scope| scope.system_time)
+        self.historical.as_ref().map_or(self.present.system_time, |scope| scope.publication.system_time)
+    }
+
+    /// The original publication selected by a historical Root hold.
+    pub fn historical_publication(&self) -> Option<TransactionKey> {
+        self.historical.as_ref().map(|scope| scope.publication)
     }
 
     pub fn query_time(&self) -> Result<Timestamp> { self.context.current_time.as_micros() }
@@ -2087,7 +2092,7 @@ impl OwnedReadSession {
         self.admit_access().await?;
         self.require_scoped_relation(relation)?;
         if let Some(scope) = &self.historical {
-            self.check_point_purge_floor(relation, id, scope.system_time).await?;
+            self.check_point_purge_floor(relation, id, scope.publication.system_time).await?;
         }
         if valid_at.is_none() && relation.world().is_none()
             && rtdb_query::read_owned_relation_schema(Arc::clone(&self.context), &self.owner, relation)
@@ -2828,7 +2833,7 @@ impl OwnedReadSession {
         let at_head = self.historical.is_none() && system == self.present.system_time;
         self.require_scoped_relation(relation)?;
         if let Some(scope) = &self.historical {
-            if system != scope.system_time {
+            if system != scope.publication.system_time {
                 return Err(historical_owned_read::unavailable());
             }
         } else if !at_head {

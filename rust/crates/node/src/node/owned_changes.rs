@@ -435,18 +435,52 @@ impl OwnedReadSession {
         self.merged_change_journals(relations, after, through, limit, scan).await
     }
 
-    /// Admits an exact ordinary journal touch and returns its stable declared path projection.
-    pub async fn path_touch_columns(
-        &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
-        before: Timestamp, group: Timestamp, valid: Timestamp,
-    ) -> Result<Vec<String>> {
-        if before.next()? != group || self.lifetime_point_policy(relation).await?.is_some() {
+    /// Read a clear point on one side of an exact publication in the held Root.
+    pub async fn open_root_cut_point(
+        &self, relation: &OwnedRelation, id: &EntityId, publication: TransactionKey,
+        valid: Timestamp, before: bool,
+    ) -> Result<Option<rtdb_query::QueryCursor>> {
+        let context = self.root_cut_context(relation, id, publication, before).await?;
+        let valid = Interval::at(valid)?;
+        rtdb_query::open_owned_assertion_point(context, &self.owner, relation, id, Some(valid), false).await
+    }
+
+    async fn root_cut_context(
+        &self, relation: &OwnedRelation, id: &EntityId, publication: TransactionKey, before: bool,
+    ) -> Result<Arc<rtdb_query::QueryContext>> {
+        let held = self.historical_publication().unwrap_or(self.present);
+        if !publication.at_or_before(held) {
             return Err(change_feed_uncovered());
         }
-        let page = self.merged_changes_at(std::slice::from_ref(relation), before, group, 1).await?;
-        require_path_touch(&page, relation, id, group, valid)?;
-        let prior = self.ordered_root_context(relation, before).await?;
-        let accepted = self.ordered_root_context(relation, group).await?;
+        let system = publication.system_time;
+        let context = self.position_read_context(relation, id, system, system).await?;
+        let cut = if before {
+            let previous = publication.tx_id.0.checked_sub(1).filter(|id| *id >= 0)
+                .ok_or_else(change_feed_uncovered)?;
+            TransactionKey { tx_id: TxId(previous), ..publication }
+        } else {
+            publication
+        };
+        self.certify_historical_position(relation, cut).await?;
+        context.with_owned_transaction_cut(cut, &context.cancellation)
+    }
+
+    /// Admits a touched Root address on both sides of the exact journal publication.
+    pub async fn path_touch_columns(
+        &self, relation: &OwnedRelation, path: &OwnedRelation, id: &EntityId,
+        publication: TransactionKey, valid: Timestamp,
+    ) -> Result<Vec<String>> {
+        let page = self.merged_changes_window(
+            std::slice::from_ref(relation), OwnedChangeEdge::before(publication),
+            publication.into(), 1, false,
+        ).await?;
+        require_path_touch(&page, relation, id, publication.system_time, valid)?;
+        let [commit] = page.commits.as_slice() else { return Err(change_feed_uncovered()); };
+        if commit.publication != publication || !page.is_complete() {
+            return Err(change_feed_uncovered());
+        }
+        let prior = self.root_cut_context(relation, id, publication, true).await?;
+        let accepted = self.root_cut_context(relation, id, publication, false).await?;
         crate::ordered_index::stable_owned_path_columns(&prior, &accepted, &self.owner, relation, path).await
     }
 
@@ -682,6 +716,21 @@ impl OwnedReadSession {
                 in_window(journal) && journal.next.publication.system_time == last.publication.system_time);
         }
         Ok(page)
+    }
+
+    pub(super) async fn certify_historical_position(
+        &self, relation: &OwnedRelation, cut: TransactionKey,
+    ) -> Result<()> {
+        self.check_relation(relation)?;
+        let database = self.retained_root_context().catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        if let Some(covered) = self.covered_journal(snapshot, relation, self.present.system_time).await?
+            && covered.floor.through_events != 0
+            && !covered.floor.publication.at_or_before(cut)
+        {
+            return Err(historical_owned_read::below_floor(covered.floor.publication.system_time));
+        }
+        self.check_relation(relation)
     }
 
     pub(super) async fn certify_historical_cut(

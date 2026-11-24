@@ -1,13 +1,13 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, TimeUnit, Timestamp, Value,
+    Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, TimeUnit, Timestamp, TransactionKey, Value,
 };
 
 use super::OwnedReadSession;
 
 pub(super) struct Scope {
-    pub(super) system_time: Timestamp,
+    pub(super) publication: TransactionKey,
     pub(super) relations: BTreeSet<OwnedRelation>,
     // Erasure floors and journal coverage use the original generation's head.
     pub(super) root_context: Arc<rtdb_query::QueryContext>,
@@ -69,17 +69,20 @@ impl OwnedReadSession {
             self.check_relations(&relations)?;
             return Ok(None);
         };
-        if selected > requested {
+        if !selected.at_or_before(self.present) || selected.system_time > requested {
             return Err(unavailable());
         }
-        if let Some(floor) = floor.filter(|floor| selected < *floor) {
+        if let Some(floor) = floor.filter(|floor| selected.system_time < *floor) {
             return Err(below_floor(floor));
         }
-        self.check_point_purge_floor(publication, marker, selected).await?;
+        for relation in &relations {
+            self.certify_historical_position(relation, selected).await?;
+        }
+        self.check_point_purge_floor(publication, marker, selected.system_time).await?;
         let context = self
             .context
-            .with_owned_system_cut(selected, &cancellation)?;
-        let root_context = if selected == self.present.system_time {
+            .with_owned_transaction_cut(selected, &cancellation)?;
+        let root_context = if selected == self.present {
             Arc::clone(&context)
         } else {
             self.context
@@ -97,14 +100,14 @@ impl OwnedReadSession {
             witness_scope: None,
             applied_scope: None,
             applied_preparation: None,
-            witness_until: selected,
+            witness_until: selected.system_time,
             fork_until: self.fork_until,
             cancellation,
             session_cancellation: self.session_cancellation.clone(),
             attachment: self.attachment.clone(),
             scoped_root: None,
             historical: Some(Scope {
-                system_time: selected,
+                publication: selected,
                 relations,
                 root_context,
             }),
@@ -117,14 +120,14 @@ impl OwnedReadSession {
         context: Arc<rtdb_query::QueryContext>,
         publication: &OwnedRelation,
         marker: &EntityId,
-    ) -> Result<Option<Timestamp>> {
+    ) -> Result<Option<TransactionKey>> {
         let Some(mut cursor) = rtdb_query::open_owned_point(
             context,
             &self.owner,
             publication,
             marker,
             None,
-            Some(&["_valid_from", "_valid_to"]),
+            Some(&["_valid_from", "_valid_to", rtdb_types::OWNED_EVENT_POSITION_COLUMN]),
         )
         .await?
         else {
@@ -155,7 +158,8 @@ impl OwnedReadSession {
             {
                 return Err(unavailable());
             }
-            selected = Some(committed_at);
+            let event = rtdb_query::owned_row_event_position(batch, 0)?;
+            selected = Some(TransactionKey { tx_id: event.transaction, system_time: committed_at });
         }
         Ok(selected)
     }
