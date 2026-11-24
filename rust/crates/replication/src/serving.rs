@@ -41,6 +41,7 @@ const MAX_SOURCE_REPLIES: usize = 4096;
 const FRAME_HEADER_BYTES: usize = 9;
 const LEGACY_FRAME_HEADER_BYTES: usize = 65;
 const CHECKPOINT_HEADER_BYTES: usize = 40;
+pub(crate) const SHARED_CHECKPOINT: u8 = b'S';
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches", "branch.local-layer",
@@ -90,7 +91,7 @@ pub(crate) enum NativeCheckpointImage {
 }
 
 impl NativeCheckpointImage {
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         match self { Self::Inline(bytes) => bytes, Self::Sealed(opened) => &opened.bytes }
     }
 
@@ -636,7 +637,7 @@ impl NativeServing {
 
     pub(crate) fn main_write_pending(&self) -> bool { self.shares_main && !self.pending.is_empty() }
 
-    pub(crate) fn is_shared_checkpoint(bytes: &[u8]) -> bool { bytes.get(40) == Some(&SHARED_CHECKPOINT) }
+    pub(crate) fn is_shared_checkpoint(bytes: &[u8]) -> bool { bytes.get(CHECKPOINT_HEADER_BYTES) == Some(&SHARED_CHECKPOINT) }
 
     pub(crate) fn observe_classic(&mut self, write: &StagedWrite, replica: ReplicaPosition, memory: &Arc<MemoryBudget>) -> Result<()> {
         if !classic::touches_data(write) { return Ok(()); }

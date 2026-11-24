@@ -206,7 +206,7 @@ mod tests {
     use rtdb_tx::transact::{Op, PHYSICAL_ERASURE, Resolution, Transact, TransactState};
     use rtdb_types::{EntityId, Term, TermSequence, rtdb_v1::ClaimSealer};
 
-    use crate::NativeCheckpointAuthority;
+    use crate::{NativeCheckpointAuthority, serving::SHARED_CHECKPOINT};
 
     use super::*;
 
@@ -315,13 +315,17 @@ mod tests {
         else {
             panic!("expected an erasure decision");
         };
-        fold.apply(1, erasure.into_record())?;
+        let receipt = fold
+            .apply(1, erasure.into_record())?
+            .expect("applied erasure receipt");
         let branch_cut = fold.index().head();
+        assert_eq!(receipt.basis, branch_cut.basis);
         assert_eq!(fold.pending_erasure(), Some(branch_cut.basis));
         let mut image = BytesMut::new();
         image.put_u64(1);
         image.extend_from_slice(&branch_cut.basis.to_bytes());
         image.put_i64(branch_cut.system_time.0);
+        image.put_u8(SHARED_CHECKPOINT);
         image.extend_from_slice(&fold.encode_checkpoint()?);
 
         let source_epoch = StorageEpoch(2);
