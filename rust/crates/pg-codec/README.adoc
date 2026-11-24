@@ -23,7 +23,7 @@ Negative-scale binary output reserves its expanded base-10000 representation bef
 Timestamp and date binary values use PostgreSQL's 2000 epoch.
 Millisecond date text truncates epoch milliseconds to days toward zero, including in JSON, JSON-LD and Transit output.
 Binary date output accepts day vectors; the pinned millisecond vector has no integer reader and fails with an internal-error category.
-Local timestamp output truncates submicrosecond fractions toward zero; zoned timestamp output floors them.
+Timestamp output, local and zoned, floors submicrosecond fractions, so binary sends the microsecond the text form shows.
 Numeric conversion preserves decimal coefficients without a floating-point intermediate.
 Interval text follows the pinned `Time.kt/asInterval` grammar, including ordered components, nine fractional digits, checked Java period/duration arithmetic and empty `P`/`PT` values.
 Duration text uses Java's separate case-insensitive grammar with optional plus signs and comma fractions, then enters the microsecond vector with the pinned wrapping conversion.
