@@ -826,8 +826,13 @@ impl ScanCursor {
         let fragmenter = if virtual_metadata || archive_history { None } else { execution.context.catalog.fragmenter.clone() };
         use futures::TryStreamExt;
         let _verifier_charge = execution.context.memory.reserve(database_partitions.len().saturating_mul(size_of::<ScanVerifier<'_>>()))?;
+        let ranked_projection_memory = (accelerate && scan.top_k.is_some()).then(|| {
+            let memory = &execution.context.memory;
+            memory.scope_with_limit((memory.limit_bytes() / 32).min(4 * 1024 * 1024))
+        });
         let verifiers: Vec<_> = database_partitions.iter().map(|partition| ScanVerifier {
             scan: &scan, execution: &execution, constants: &constants, pushdowns: pushdowns.clone(), partition, storage, canonical_entity_iids, counts: Default::default(),
+            ranked_projection_memory: ranked_projection_memory.as_ref(),
         }).collect();
         let query_winners = Box::pin(async {
             let Some(top) = scan.top_k.as_ref() else { return Ok(None); };
@@ -1110,7 +1115,8 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
     let search_queries = SearchQueries::default();
     let constants = &ExecutionConstants { execution, search_queries: &search_queries };
     let bounds = bounds(scan, snapshot, execution).await?;
-    let verifier = ScanVerifier { scan, execution, constants, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false, counts: Default::default() };
+    let verifier = ScanVerifier { scan, execution, constants, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false,
+        counts: Default::default(), ranked_projection_memory: None };
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
         current_time: context.current_time, cancellation: &context.cancellation,
@@ -1318,7 +1324,8 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                     let search_queries = SearchQueries::default();
                     let constants = &ExecutionConstants { execution: &self.execution, search_queries: &search_queries };
                     let verifier = ScanVerifier { scan, execution: &self.execution, constants, pushdowns: None,
-                        partition: snapshot, storage: &database.storage, canonical_entity_iids: false, counts: Default::default() };
+                        partition: snapshot, storage: &database.storage, canonical_entity_iids: false,
+                        counts: Default::default(), ranked_projection_memory: None };
                     point = verifier.point_batch(scan, bounds, &database.partitions, keys).await?;
                 }
             }
@@ -1404,7 +1411,29 @@ impl crate::columnar::BatchCursor for OrderedPayload {
 }
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
-struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, constants: &'a ExecutionConstants<'a>, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
+struct ScanVerifier<'a> {
+    scan: &'a Scan,
+    execution: &'a Execution,
+    constants: &'a ExecutionConstants<'a>,
+    pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
+    partition: &'a Snapshot,
+    storage: &'a Arc<BufferPool>,
+    canonical_entity_iids: bool,
+    counts: parking_lot::Mutex<ScanCounts>,
+    ranked_projection_memory: Option<&'a Arc<MemoryBudget>>,
+}
+
+struct RankedGather<'a> {
+    columns: &'a [rtdb_plan::ColumnId],
+    batches: &'a [crate::columnar::ColumnBatch],
+    rows: &'a [(usize, usize)],
+}
+
+impl RankedGather<'_> {
+    fn position(&self, id: rtdb_plan::ColumnId) -> Option<usize> {
+        self.columns.iter().position(|column| *column == id)
+    }
+}
 
 fn ranked_integer_id(column: &crate::columnar::Column, row: usize) -> Result<Option<i64>> {
     match column.arrow_cell(row) {
@@ -1442,7 +1471,7 @@ impl ScanVerifier<'_> {
         }
         let Some(rows) = resolved else { return Ok(None); };
         if rows.is_empty() { return Ok(Some(None)); }
-        let mut batch = match self.gather_search_rows(scan, &rows).await {
+        let mut batch = match self.gather_search_rows(scan, &rows, None).await {
             Ok(batch) => batch,
             Err(error) if error.category != rtdb_types::AnomalyCategory::Interrupted => return Ok(None),
             Err(error) => return Err(error),
@@ -1516,21 +1545,60 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         Ok(Some(iids.select_visible(&visible, memory)?))
     }
 
-    async fn gather_ranked(&self, rows: Vec<crate::ResolvedSearchRow>) -> Result<BTreeMap<Iid, crate::SnapshotRow>> {
+    async fn gather_ranked(&self, rows: Vec<crate::VerifiedRankRow>) -> Result<BTreeMap<Iid, crate::SnapshotRow>> {
         if rows.is_empty() { return Ok(BTreeMap::new()); }
         let mut scan = self.scan.clone();
         if let Some(score) = scan.top_k.as_ref().and_then(|top| top.score) {
             scan.columns.retain(|field| field.id != score);
         }
-        let batch = Arc::new(self.gather_search_rows(&scan, &rows).await?);
-        Ok(rows.into_iter().enumerate().map(|(row, resolved)| {
-            (resolved.version.iid, crate::SnapshotRow { batch: Arc::clone(&batch), row })
-        }).collect())
+        let Some(columns) = rows.iter().find_map(|row| row.projection.as_ref().map(|projection| Arc::clone(&projection.columns))) else {
+            let rows = rows.into_iter().map(|winner| winner.row).collect::<Vec<_>>();
+            return self.gather_ranked_group(&scan, &rows, None).await;
+        };
+        let _scratch = self.execution.context.memory.reserve(4096usize.saturating_add(rows.len().saturating_mul(256)))?;
+        let reusable = |row: &crate::VerifiedRankRow| {
+            row.projection.as_ref().is_some_and(|projection| projection.columns == columns)
+        };
+        let has_late_fields = scan.columns.iter().any(|field| !columns.contains(&field.id));
+        // Gather one projection per primary page, including pages shared by retained and uncopied winners.
+        let mut full_pages = BTreeMap::<_, BTreeSet<_>>::new();
+        for row in rows.iter().filter(|row| has_late_fields && !reusable(row)) {
+            if let Some((trie, page)) = row.row.location.persisted_page() {
+                full_pages.entry(trie.clone()).or_default().insert(page);
+            }
+        }
+        let mut full = Vec::new();
+        let mut reused = Vec::new();
+        let mut batches = Vec::new();
+        for winner in rows {
+            let uses_full_page = winner.row.location.persisted_page()
+                .is_some_and(|(trie, page)| full_pages.get(trie).is_some_and(|pages| pages.contains(&page)));
+            if reusable(&winner) && !uses_full_page {
+                batches.push(winner.projection.expect("A reusable winner has a projection").batch);
+                reused.push(winner.row);
+            } else {
+                full.push(winner.row);
+            }
+        }
+        let mut output = self.gather_ranked_group(&scan, &full, None).await?;
+        let picks = (0..reused.len()).map(|index| (index, 0)).collect::<Vec<_>>();
+        let projection = RankedGather { columns: &columns, batches: &batches, rows: &picks };
+        output.extend(self.gather_ranked_group(&scan, &reused, Some(&projection)).await?);
+        Ok(output)
     }
 
 }
 
 impl ScanVerifier<'_> {
+    async fn gather_ranked_group(&self, scan: &Scan, rows: &[crate::ResolvedSearchRow], reuse: Option<&RankedGather<'_>>)
+        -> Result<BTreeMap<Iid, crate::SnapshotRow>> {
+        if rows.is_empty() { return Ok(BTreeMap::new()); }
+        let batch = Arc::new(self.gather_search_rows(scan, rows, reuse).await?);
+        Ok(rows.iter().enumerate().map(|(row, resolved)| {
+            (resolved.version.iid, crate::SnapshotRow { batch: Arc::clone(&batch), row })
+        }).collect())
+    }
+
     async fn primary_ranked_rows(&self, iids: &BTreeSet<Iid>) -> Result<Vec<crate::ResolvedSearchRow>> {
         use crate::{ResolvedSearchRow, SearchRowLocation};
 
@@ -1589,7 +1657,13 @@ impl ScanVerifier<'_> {
         let position = scan.columns.iter().position(|field| field.id == column)
             .ok_or_else(|| invalid("verifier-column", "Verified column is not projected by the scan"))?;
         let id = ascending_id.and_then(|id| scan.columns.iter().position(|field| field.id == id));
-        let batch = self.gather_search_rows(&scan, &rows).await?;
+        let batch = self.gather_search_rows(&scan, &rows, None).await?;
+        let reuse = self.ranked_projection_memory.filter(|_| rows.iter().any(|row| row.location.persisted_page().is_some())).and_then(|memory| {
+            let score = self.scan.top_k.as_ref().and_then(|top| top.score);
+            let (positions, columns): (Vec<_>, Vec<_>) = scan.columns.iter().enumerate()
+                .filter(|(_, field)| Some(field.id) != score).map(|(position, field)| (position, field.id)).unzip();
+            (!positions.is_empty()).then(|| (memory, positions, Arc::<[_]>::from(columns)))
+        });
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         let mask = match predicate {
             Some(predicate) => Some(crate::columnar::predicate_mask(&batch, &predicate, &Schema::new(scan.columns)?, self.execution).await?),
@@ -1603,8 +1677,9 @@ impl ScanVerifier<'_> {
             let PutText::Utf8(text) = types.text(&batch.columns[position], position_in_batch)? else { continue; };
             let token_bytes = text.len().saturating_mul(32);
             audience_work::decode_bytes(token_bytes)?;
-            let _scratch = memory.reserve(256usize.saturating_add(token_bytes))?;
+            let scratch = memory.reserve(256usize.saturating_add(token_bytes))?;
             let score = scorer.bm25_text(text);
+            drop(scratch);
             let key = match id {
                 Some(id) => {
                     let column = &batch.columns[id];
@@ -1617,7 +1692,12 @@ impl ScanVerifier<'_> {
                 None => RankKey::integer(score, None),
             };
             if !score.is_finite() || score < 0.0 { return Ok(None); }
-            verified.push(crate::VerifiedRankRow { key, row });
+            let projection = reuse.as_ref().and_then(|(memory, positions, columns)| {
+                row.location.persisted_page()?;
+                let batch = batch.compact_ranked_projection(position_in_batch, positions, memory).ok()??;
+                Some(crate::ranking::VerifiedRankProjection { columns: Arc::clone(columns), batch })
+            });
+            verified.push(crate::VerifiedRankRow { key, row, projection });
         }
         Ok(Some(verified))
     }
@@ -1676,21 +1756,28 @@ impl ScanVerifier<'_> {
             .with_ids(ranked_ids.map(|mut ids| ids.finish())))
     }
 
-    async fn gather_search_rows(&self, scan: &Scan, rows: &[crate::ResolvedSearchRow]) -> Result<crate::columnar::ColumnBatch> {
+    async fn gather_search_rows(&self, scan: &Scan, rows: &[crate::ResolvedSearchRow], reuse: Option<&RankedGather<'_>>)
+        -> Result<crate::columnar::ColumnBatch> {
         use crate::SearchRowLocation;
         use futures::{StreamExt, TryStreamExt};
 
         let table = &scan.table.name.table;
         let memory = &self.execution.context.memory;
         let _scratch = memory.reserve(4096usize.saturating_add(rows.len().saturating_mul(768)))?;
+        let reused_position = |id| reuse.and_then(|reuse| reuse.position(id));
+        if let Some(reuse) = reuse
+            && let Some(positions) = scan.columns.iter().map(|field| reuse.position(field.id)).collect::<Option<Vec<_>>>() {
+            self.execution.context.check_cancelled()?;
+            return crate::columnar::ColumnBatch::take_rows(reuse.batches, reuse.rows, &positions, memory);
+        }
         let mut inputs = BTreeMap::<_, BTreeSet<u32>>::new();
         for row in rows {
             if let SearchRowLocation::Persisted { trie, page, .. } = &row.location {
                 inputs.entry(trie.clone()).or_default().insert(*page);
             }
         }
-        let put_columns: Vec<_> = scan.columns.iter().map(|field| field.name.clone())
-            .chain(scan.matches.iter().map(|matched| matched.column.clone())).collect();
+        let put_columns: Vec<_> = scan.columns.iter().filter(|field| reused_position(field.id).is_none()).map(|field| field.name.clone())
+            .chain(scan.matches.iter().filter(|matched| reused_position(matched.id).is_none()).map(|matched| matched.column.clone())).collect();
         let put_columns = put_columns.as_slice();
         let entry = self.partition.table_entry(table);
         let files = futures::stream::iter(inputs).map(|(trie, pages)| async move {
@@ -1750,17 +1837,23 @@ impl ScanVerifier<'_> {
             current_time: self.execution.context.current_time, cancellation: &self.execution.context.cancellation,
             constants: self.constants, verifier: self, partitions: &self.execution.context.catalog.database(database)?.partitions };
         for evaluated in &scan.matches {
+            if reused_position(evaluated.id).is_some() { continue; }
             let query = self.constants.search_query(&evaluated.query, evaluated.analyzer).await?;
             let live = if query.is_none() { None } else {
                 self.execution.context.accelerators.iter().find_map(|accelerator| accelerator.live_search_terms(&request, &evaluated.column, evaluated.analyzer))
             };
             matches.insert(evaluated.id, (&evaluated.column, query, live));
         }
-        let result = crate::columnar::gather(&resolved, &sources, &scan.columns, memory, |position| {
-            matches.get(&scan.columns[position].id).map(|(name, query, live)| {
+        let result = crate::columnar::gather_with_funded_columns(&resolved, &sources, &scan.columns, memory, |position| {
+            let id = scan.columns[position].id;
+            if let Some(reuse) = reuse && let Some(position) = reuse.position(id) {
+                let (column, charge) = crate::columnar::gather_column_rows(|index| &reuse.batches[index], reuse.rows, position, memory)?;
+                return Ok(Some((column, Some(charge))));
+            }
+            matches.get(&id).map(|(name, query, live)| {
                 resolved_match_column(name, query.as_deref().map(PreparedSearchQuery::query), &resolved, &sources, memory, |_, row, query| {
                     live_match(live.as_deref(), row, &sources, query)
-                })
+                }).map(|column| (column, None))
             }).transpose()
         })?;
         let mut counts = self.counts.lock();
@@ -2707,7 +2800,7 @@ mod tests {
         let search_queries = SearchQueries::default();
         let constants = ExecutionConstants { execution: &execution, search_queries: &search_queries };
         let verifier = ScanVerifier { scan: &scan, execution: &execution, constants: &constants, pushdowns: None,
-            partition: &snapshot, storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+            partition: &snapshot, storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
         let unavailable = Iid([0xc0; 16]);
         let candidates = CandidateIids::from_sorted(&[events[0].iid, events[1].iid, unavailable], &memory).unwrap();
         let visible = verifier.retain_visible(&candidates).await.unwrap().unwrap();
@@ -3071,7 +3164,7 @@ mod tests {
         let search_queries = SearchQueries::default();
         let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
         let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot, storage: &storage,
-            canonical_entity_iids: false, counts: Default::default() };
+            canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
         let source = snapshot.iter_segments(&table).next().unwrap().row(0).unwrap();
         let version = source.header().unwrap().version();
         let row = crate::ResolvedSearchRow { version, origin: None, location: crate::SearchRowLocation::Live(source), visibility: bounds };
@@ -3678,7 +3771,7 @@ mod tests {
         let search_queries = SearchQueries::default();
         let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
         let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
-            storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+            storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
         let point = Interval::at(Timestamp(150)).unwrap();
         let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: point, system_time: point }, memory: &memory,
@@ -3710,7 +3803,7 @@ mod tests {
         let search_queries = SearchQueries::default();
         let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
         let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
-            storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+            storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
         let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
             current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
@@ -3762,7 +3855,7 @@ mod tests {
         let search_queries = SearchQueries::default();
         let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
         let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
-            storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+            storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
         let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
             current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
@@ -3846,7 +3939,7 @@ mod tests {
             let search_queries = SearchQueries::default();
             let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
             let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: snapshot,
-                storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+                storage: &storage, canonical_entity_iids: false, counts: Default::default(), ranked_projection_memory: None };
             let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot, storage: &storage,
                 bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
                 current_time: execution.context.current_time, cancellation: &execution.context.cancellation,

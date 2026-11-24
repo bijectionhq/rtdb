@@ -773,6 +773,31 @@ impl ColumnBatch {
         self.project_keys(positions, false, memory)
     }
 
+    pub(crate) fn compact_ranked_projection(&self, row: usize, positions: &[usize], memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+        const MAX_ROW_BYTES: usize = 64 * 1024;
+        let base = positions.len().saturating_mul(std::mem::size_of::<Column>()).saturating_add(256);
+        if base > MAX_ROW_BYTES { return Ok(None); }
+        let mut reservation = memory.reserve(base)?;
+        let lease = Arc::get_mut(&mut reservation).expect("A ranked projection owns its reservation");
+        let mut columns = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let Some(Some((array, field, logical, offset))) = self.columns[position].arrow_cell(row) else { return Ok(None); };
+            if !flat(array.data_type()) { return Ok(None); }
+            let retained = lease.bytes();
+            let schema = field.size().saturating_add(logical.map_or(Ok(0), LogicalType::retained_bytes)?);
+            let bound = rtdb_columnar::estimate_copy_cell_bytes(field, array, offset)?.saturating_mul(4)
+                .saturating_add(schema.saturating_mul(8)).saturating_add(4096);
+            if retained.saturating_add(bound) > MAX_ROW_BYTES { return Ok(None); }
+            lease.grow_to(retained + bound)?;
+            // A contiguous slice could keep the IPC allocation for the entire primary page alive.
+            let array = copy_selected_cells(&[array], &[(0, offset)])?;
+            let bytes = retained.saturating_add(schema).saturating_add(array.get_array_memory_size());
+            lease.shrink_to(bytes)?;
+            columns.push(Column::Arrow { array, field: Arc::new(field.clone()), logical: logical.cloned() });
+        }
+        Ok(Some(Self::sharing(columns, 1, reservation)))
+    }
+
     pub(crate) fn compact_group_keys(&self, rows: &[(usize, usize)], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let _positions = memory.reserve(self.columns.len().checked_mul(std::mem::size_of::<usize>()).ok_or_else(size_error)?)?;
         let positions: Vec<_> = (0..self.columns.len()).collect();
@@ -1231,6 +1256,11 @@ struct Source { batch: Arc<IndexBatch>, put: StructArray }
 /// Gathers the scan's columns for rows that name their batch by its place in `sources`, in the order given.
 pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field], memory: &Arc<MemoryBudget>,
     mut derived: impl FnMut(usize) -> Result<Option<Column>>) -> Result<ColumnBatch> {
+    gather_with_funded_columns(rows, sources_in, columns, memory, |position| Ok(derived(position)?.map(|column| (column, None))))
+}
+
+pub(crate) fn gather_with_funded_columns(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBatch>], columns: &[Field],
+    memory: &Arc<MemoryBudget>, mut derived: impl FnMut(usize) -> Result<Option<(Column, Option<Arc<MemoryReservation>>)>) -> Result<ColumnBatch> {
     let mut sources: Vec<Source> = Vec::new();
     // Each batch's operation union, and the sources its put legs became, found once per batch rather than per row.
     let mut batches: Vec<(UnionArray, Vec<(i8, usize)>)> = Vec::new();
@@ -1265,10 +1295,10 @@ pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBa
     let mut reservation = memory.reserve(256)?;
     let mut output = Vec::with_capacity(columns.len());
     for (position, field) in columns.iter().enumerate() {
-        let column = if let Some(column) = derived(position)? {
-            column
+        let (column, _charge) = if let Some(derived) = derived(position)? {
+            derived
         } else {
-            match field.name.as_str() {
+            let column = match field.name.as_str() {
                 "_valid_from" => times("_valid_from", rows.iter().map(|row| row.valid_time.lower()), false),
                 "_valid_to" => times("_valid_to", rows.iter().map(|row| row.valid_time.upper()), true),
                 "_system_from" => times("_system_from", rows.iter().map(|row| row.system_time.lower()), false),
@@ -1280,7 +1310,8 @@ pub(crate) fn gather(rows: &[ResolvedRow<(u32, u32)>], sources_in: &[Arc<IndexBa
                         logical: Some(LogicalType::Scalar(rtdb_types::ScalarType::FixedSizeBinary(16))) }
                 }
                 name => stored(&sources, &cells, name)?,
-            }
+            };
+            (column, None)
         };
         let lease = Arc::get_mut(&mut reservation).ok_or_else(|| invalid("column-size", "A column page's charge is shared"))?;
         lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;

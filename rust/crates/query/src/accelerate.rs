@@ -114,7 +114,7 @@ impl<'a> ScanRequest<'a> {
         let scores = rows.iter().map(|winner| (winner.row.version.iid, winner.key.score)).collect();
         let Some(scores) = CandidateScores::from_verified(scores, self.memory)? else { return Ok(None); };
         let iids = CandidateIids::build(scores.iids.len(), scores.iter().map(|(iid, _)| iid), self.memory)?;
-        let rows = match self.verifier.gather_ranked(rows.into_iter().map(|winner| winner.row).collect()).await {
+        let rows = match self.verifier.gather_ranked(rows).await {
             Ok(rows) => rows,
             Err(error) if error.code == "rtdb/memory-budget-exceeded" => BTreeMap::new(),
             Err(error) => return Err(error),
@@ -133,7 +133,7 @@ pub trait CandidateVerifier: Send + Sync {
         _scorer: &rtdb_text::Scorer) -> Result<Option<Vec<crate::VerifiedRankRow>>> { Ok(None) }
 
     /// Gathers the scan's output columns from verified versions after ranking.
-    async fn gather_ranked(&self, _rows: Vec<ResolvedSearchRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
+    async fn gather_ranked(&self, _rows: Vec<crate::VerifiedRankRow>) -> Result<BTreeMap<Iid, SnapshotRow>> { Ok(BTreeMap::new()) }
 
     /// The IIDs whose visible version at the scan's cut satisfies every predicate of the scan, or `None` where this verifier cannot say.
     async fn retain_visible(&self, _iids: &CandidateIids) -> Result<Option<CandidateIids>> { Ok(None) }
@@ -143,6 +143,15 @@ pub trait CandidateVerifier: Send + Sync {
 pub enum SearchRowLocation {
     Persisted { trie: TrieKey, page: u32, row: u32 },
     Live(RowSource),
+}
+
+impl SearchRowLocation {
+    pub(crate) fn persisted_page(&self) -> Option<(&TrieKey, u32)> {
+        match self {
+            Self::Persisted { trie, page, .. } => Some((trie, *page)),
+            Self::Live(_) => None,
+        }
+    }
 }
 
 #[derive(Clone)]
