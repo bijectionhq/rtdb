@@ -106,7 +106,7 @@ ADBC and Flight SQL publish Arrow results.
 Compatible result fields retain their buffers and format changes are confined to the affected column.
 |The result adapter can decode bounded groups of cells for layouts that need a semantic conversion.
 Pgwire encodes PostgreSQL result cells, including nested or typed values handled by its scalar codec.
-The fragment reader can read older frames that contain serialized values.
+The fragment reader requires the same Arrow column descriptor emitted by the writer.
 See link:../../rust/crates/query/src/cursor.rs[results], link:../../rust/crates/query/src/spill.rs[spill], and link:../../rust/crates/query/src/fragment.rs[exchange].
 |===
 
