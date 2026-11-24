@@ -159,7 +159,7 @@ The directory publishes the capture and the recovery digest for its archive cust
 The capture format preserves the existing encrypted replay closure, including the original ordered inputs by logical name.
 A new capture can authenticate the exact members of a pre-framing serving pack and write the same logical contents in the current framed format.
 The copy checks publication identity and envelope size before funding the complete framed inventory.
-Each body must match its inspected publication and plaintext length, and catalog digests are checked on the plaintext.
+Each body must match its inspected publication and plaintext length. Recovery compares trie data and search run extents to those declared by the checkpoint, and checks catalog digests on the plaintext.
 The [copy proofs](../lean/CheckpointCopyEvidence.lean) cover inventory agreement and show that the ciphertext preflight admits every legacy member whose framed encoding fits.
 The existing handoff adopts the independent framed archive for the same parked checkpoint, while the original pack stays immutable.
 A parked complete repair can promote a framed replay archive of the same independently authenticated cut.

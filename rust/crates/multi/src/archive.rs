@@ -37,6 +37,7 @@ use rtdb_format::{
         block_index_from_key,
         block_key,
         StorageRoot,
+        TrieKey,
         CURRENT_STORAGE_VERSION,
     },
 };
@@ -926,7 +927,8 @@ impl Capture {
         }
         for (name, expected) in &closure {
             let bytes = plaintext.get(name).await?;
-            require_bound_metadata(*expected, &bytes)?;
+            expected.require_extent(bytes.len() as u64)?;
+            require_bound_metadata(expected.digest, &bytes)?;
         }
         Ok(closure)
     }
@@ -1261,17 +1263,44 @@ pub(crate) fn verify_cut(catalog: &BlockCatalog, checkpoint: Checkpoint, epoch: 
     Ok(())
 }
 
-type CheckpointObjects = BTreeMap<ObjectKey, Option<[u8; 32]>>;
+#[derive(Clone, Copy, Default)]
+struct CheckpointMember {
+    digest: Option<[u8; 32]>,
+    extent: Option<u64>,
+}
+
+impl CheckpointMember {
+    fn metadata(digest: [u8; 32]) -> Self {
+        Self { digest: Some(digest), extent: None }
+    }
+
+    fn bind_extent(&mut self, extent: u64) -> Result<()> {
+        if extent == 0 || self.extent.is_some_and(|prior| prior != extent) {
+            return Err(inconsistent("Checkpoint members disagree on their plaintext extent"));
+        }
+        self.extent = Some(extent);
+        Ok(())
+    }
+
+    fn require_extent(self, actual: u64) -> Result<()> {
+        if actual == 0 || self.extent.is_some_and(|extent| extent != actual) {
+            return Err(inconsistent("A checkpoint member has the wrong plaintext extent"));
+        }
+        Ok(())
+    }
+}
+
+type CheckpointObjects = BTreeMap<ObjectKey, CheckpointMember>;
 const OBSERVATION_BATCH_MEMBERS: usize = 256;
 
 async fn observe_checkpoint_batch(
-    store: &dyn ObjectStore, batch: Vec<(ObjectKey, Option<[u8; 32]>)>,
+    store: &dyn ObjectStore, batch: Vec<(ObjectKey, CheckpointMember)>,
 ) -> Result<Vec<CheckpointCopySource>> {
     let names = batch.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
     let mut heads = store.observe_heads(&names).await?;
-    batch.into_iter().map(|(name, digest)| {
+    batch.into_iter().map(|(name, member)| {
         let head = heads.remove(&name).ok_or_else(|| inconsistent("A checkpoint inventory member has no storage observation"))?;
-        CheckpointCopySource::from_head(name, digest, head)
+        CheckpointCopySource::from_head(name, member, head)
     }).collect()
 }
 
@@ -1300,7 +1329,7 @@ async fn catalog_objects(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, co
 async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCatalog, contents: CheckpointContents, held: bool) -> Result<CheckpointObjects> {
     let block = catalog.block_index();
     let root_digest = catalog.publication_sha256().ok_or_else(|| inconsistent("Checkpoint root bytes were not observed"))?;
-    let mut closure = BTreeMap::from([(key(&block_key(block)?)?, Some(root_digest))]);
+    let mut closure = BTreeMap::from([(key(&block_key(block)?)?, CheckpointMember::metadata(root_digest))]);
     for table in catalog.table_entries()? {
         if held && table.table.stores_expiring_transaction_metadata() { continue; }
         let path = key(&table.slug.block_key(block)?)?;
@@ -1310,11 +1339,27 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
             return Err(inconsistent("Checkpoint table bytes do not match the root manifest"));
         }
         let metadata = TableBlock::decode(&bytes)?;
-        if closure.insert(path, Some(observed)).is_some() {
+        if closure.insert(path, CheckpointMember::metadata(observed)).is_some() {
             return Err(inconsistent("Two checkpoint tables use the same storage path"));
         }
         for object in metadata.checkpoint_trie_files(&table, contents)? {
-            closure.entry(key(&object)?).or_insert(None);
+            closure.entry(key(&object)?).or_default();
+        }
+        for trie in metadata.trie_details() {
+            let Some(extent) = trie.data_file_size else { continue; };
+            let trie: TrieKey = trie.trie_key.as_deref().unwrap_or_default().parse()?;
+            if let Some(member) = closure.get_mut(&key(&table.slug.data_key(&trie))?) {
+                let extent = u64::try_from(extent).map_err(|_| inconsistent("A checkpoint trie has a negative extent"))?;
+                member.bind_extent(extent)?;
+            }
+        }
+        if contents == CheckpointContents::Replay {
+            for run in &metadata.as_proto().search_runs {
+                let name = key(&run.object_key(&table.slug)?)?;
+                let extent = u64::try_from(run.file_size()).map_err(|_| inconsistent("A checkpoint search run has a negative extent"))?;
+                closure.get_mut(&name).ok_or_else(|| inconsistent("A search run is missing from its checkpoint inventory"))?
+                    .bind_extent(extent)?;
+            }
         }
     }
     Ok(closure)
@@ -1340,8 +1385,9 @@ pub(crate) async fn recovery_manifest_sha256(
         if batch.is_empty() { break; }
         let members = observe_checkpoint_batch(store, batch).await?;
         let observations = futures::stream::iter(members.into_iter().map(|source| async move {
-            if source.metadata_digest.is_some() { source.read(store).await?; }
-            encode(&(source.name.as_str(), source.observed_bytes as u64, source.version, source.metadata_digest))
+            source.witness.require_extent(source.observed_bytes as u64)?;
+            if source.witness.digest.is_some() { source.read(store).await?; }
+            encode(&(source.name.as_str(), source.observed_bytes as u64, source.version, source.witness.digest))
         })).buffered(16);
         futures::pin_mut!(observations);
         while let Some(member) = observations.try_next().await? { manifest.update(&member); }
@@ -1356,7 +1402,7 @@ pub(crate) struct CheckpointCopySource {
     pub(crate) name: ObjectKey,
     pub(crate) observed_bytes: usize,
     version: Option<PhysicalObjectVersion>,
-    metadata_digest: Option<[u8; 32]>,
+    witness: CheckpointMember,
 }
 
 impl CheckpointCopySource {
@@ -1366,19 +1412,20 @@ impl CheckpointCopySource {
         metadata_digest: Option<[u8; 32]>,
     ) -> Result<Self> {
         let observed = store.observe_head(&name).await?;
-        Self::from_head(name, metadata_digest, observed)
+        Self::from_head(name, CheckpointMember { digest: metadata_digest, extent: None }, observed)
     }
 
-    fn from_head(name: ObjectKey, metadata_digest: Option<[u8; 32]>, observed: ObjectObservation<StoredObject>) -> Result<Self> {
+    fn from_head(name: ObjectKey, member: CheckpointMember, observed: ObjectObservation<StoredObject>) -> Result<Self> {
         if observed.value.key != name { return Err(inconsistent("Checkpoint storage observed a different logical member")); }
         let observed_bytes = usize::try_from(observed.value.size)
             .map_err(|_| unavailable("Checkpoint object exceeds addressable length"))?;
-        Ok(Self { name, observed_bytes, version: observed.version, metadata_digest })
+        Ok(Self { name, observed_bytes, version: observed.version, witness: member })
     }
 
     pub(crate) async fn read(&self, store: &dyn ObjectStore) -> Result<Bytes> {
         let bytes = self.read_observed(store).await?;
-        require_bound_metadata(self.metadata_digest, &bytes)?;
+        self.witness.require_extent(bytes.len() as u64)?;
+        require_bound_metadata(self.witness.digest, &bytes)?;
         Ok(bytes)
     }
 
@@ -1419,7 +1466,9 @@ pub(crate) async fn ordered_checkpoint_sources(
     let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
     verify_cut(&catalog, checkpoint, epoch)?;
     let closure = catalog_objects(store, &catalog, CheckpointContents::Replay).await?;
-    plan_checkpoint_copy(store, closure, Some(reserved)).await
+    let sources = plan_checkpoint_copy(store, closure, Some(reserved)).await?;
+    for source in &sources { source.witness.require_extent(source.observed_bytes as u64)?; }
+    Ok(sources)
 }
 
 async fn plan_checkpoint_copy(
@@ -1506,7 +1555,8 @@ pub(crate) async fn reference_fork_checkpoint(
 
     let mut base = Base::default();
     for member in &sources {
-        if member.metadata_digest.is_some() { member.read(&plaintext).await?; }
+        member.witness.require_extent(member.observed_bytes as u64)?;
+        if member.witness.digest.is_some() { member.read(&plaintext).await?; }
         let physical = source_store.physical_member(&member.name).await?;
         if base.objects.contains_key(physical.as_str()) { continue; }
         let original = key(&format!("{root}/{physical}"))?;
@@ -1545,7 +1595,7 @@ pub(crate) async fn reference_fork_checkpoint(
             }) {
                 return Err(inconsistent("The fork does not retain the selected physical inventory"));
             }
-            if member.metadata_digest.is_some() { member.read(&target).await?; }
+            if member.witness.digest.is_some() { member.read(&target).await?; }
         }
     }
     Ok(())
@@ -2000,7 +2050,8 @@ async fn capture_registered(
         if content.len() != size {
             return Err(inconsistent("Checkpoint source envelope changed during copying"));
         }
-        require_bound_metadata(source.metadata_digest, &content)?;
+        source.witness.require_extent(content.len() as u64)?;
+        require_bound_metadata(source.witness.digest, &content)?;
         drop(observed);
         let object = source.name;
         let ciphertext = archive_cipher.seal_object(&object, content).await?;
@@ -2813,7 +2864,7 @@ mod tests {
             version: Some(PhysicalObjectVersion {
                 namespace: namespace.clone(), key: physical.into(), version: version.into(),
             }),
-            metadata_digest: None,
+            witness: CheckpointMember::default(),
         };
         let pack = "cell/deployment/v06/~pack/b00.pack";
         let root_member = source("blocks/b00.binpb", pack, "a");
