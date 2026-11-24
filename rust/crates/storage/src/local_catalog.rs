@@ -4,10 +4,38 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fs2::FileExt;
-use rtdb_format::catalog::same_publication_digest;
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, ReplicaPosition, Result, StorageEpoch};
+use rtdb_format::{catalog::same_publication_digest, keys::{is_catalog_retirement_file, is_compacted_primary_file}};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CATALOG_FILE_PATH_BYTES, CatalogCut, CatalogFilePaths, ReplicaPosition, Result, StorageEpoch};
 
 use crate::{Error, repair_anchor_decision::{self, AnchorInstallation, RecoveryCollection}};
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CatalogHold {
+    pub(crate) cut: Option<CatalogCut>,
+    catalog_file_paths: Option<CatalogFilePaths>,
+}
+
+impl CatalogHold {
+    pub(super) fn new(cut: Option<CatalogCut>, paths: Option<&[String]>) -> Self {
+        let catalog_file_paths = paths.filter(|paths| {
+            cut.is_some() && paths.windows(2).all(|pair| pair[0] < pair[1])
+                && paths.iter().all(|path| is_catalog_retirement_file(path))
+                && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
+                    <= CATALOG_FILE_PATH_BYTES
+        }).map(|paths| CatalogFilePaths { members: paths.to_vec() });
+        Self { cut, catalog_file_paths }
+    }
+
+    pub(super) fn retains(&self, cut: CatalogCut, path: Option<&str>) -> bool {
+        match path {
+            Some(path) => self.catalog_file_paths.as_ref().is_none_or(|paths| {
+                paths.binary_search_by(|held| held.as_str().cmp(path)).is_ok()
+            }),
+            None => self.cut.is_none_or(|held| !covers(held, cut)),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalRepairAnchor {
@@ -31,8 +59,9 @@ impl LocalCatalogLedger {
         Self { directory: root.join(".tmp/catalog-ledger"), root, replica_epoch }
     }
 
-    pub(crate) fn retain(&self, cut: Option<CatalogCut>) -> Result<tempfile::NamedTempFile> {
+    pub(crate) fn retain(&self, cut: Option<CatalogCut>, paths: Option<&[String]>) -> Result<tempfile::NamedTempFile> {
         let _gate = self.lock()?;
+        let claim = CatalogHold::new(cut, paths);
         if cut.is_some_and(|cut| cut.replica_epoch != self.replica_epoch || !well_formed(cut))
             || self.floor()?.is_some_and(|floor| floor.replica_epoch >= self.replica_epoch
                 && !cut.is_some_and(|cut| covers(cut, floor)))
@@ -40,29 +69,59 @@ impl LocalCatalogLedger {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
                 "The captured catalog precedes the local collection floor or belongs to another journal"));
         }
+        if let Some(paths) = &claim.catalog_file_paths {
+            for name in paths.iter().filter(|name| is_compacted_primary_file(name)) {
+                if self.is_terminal(name)? {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.storage/catalog-not-current",
+                        "The captured catalog names a terminal local publication"));
+                }
+            }
+        }
         let mut ticket = tempfile::Builder::new().prefix("reader-").tempfile_in(&self.directory)
             .map_err(|error| Error::io(&self.directory, error))?;
         fs2::FileExt::lock_shared(ticket.as_file()).map_err(|error| Error::io(ticket.path(), error))?;
-        ticket.write_all(&serde_json::to_vec(&cut).map_err(invalid)?)
+        ticket.write_all(&serde_json::to_vec(&claim).map_err(invalid)?)
             .map_err(|error| Error::io(ticket.path(), error))?;
         Ok(ticket)
     }
 
-    pub(crate) fn advance(&self, cut: CatalogCut) -> Result<bool> {
+    pub(crate) fn close_admission(&self, cut: CatalogCut, paths: &[Option<&str>]) -> Result<Vec<bool>> {
         let _gate = self.lock()?;
-        if cut.replica_epoch != self.replica_epoch || !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0 {
-            return Err(invalid("Invalid local catalog floor"));
+        if cut.replica_epoch != self.replica_epoch || !well_formed(cut) || cut.through.after_offset(cut.replica_epoch) < 0
+            || paths.iter().flatten().any(|path| !is_compacted_primary_file(path))
+        {
+            return Err(invalid("Invalid local catalog retirement"));
         }
-        if let Some(prior) = self.floor()? {
-            if covers(prior, cut) {
-                self.sync_ledger()?;
-                return Ok(true);
-            }
-            let replaces_journal = same_storage(cut, prior) && cut.replica_epoch > prior.replica_epoch;
-            if !covers(cut, prior) && !replaces_journal {
-                return Err(invalid("The local catalog floor belongs to a different storage root or newer journal"));
-            }
+        let prior = self.floor()?;
+        let closed = prior.is_some_and(|prior| covers(prior, cut));
+        if !closed && prior.is_some_and(|prior| {
+            !covers(cut, prior) && !(same_storage(cut, prior) && cut.replica_epoch > prior.replica_epoch)
+        }) {
+            return Err(invalid("The local catalog floor belongs to a different storage root or newer journal"));
         }
+        let holds = self.held_catalogs()?;
+        let advance = !closed && (paths.iter().any(Option::is_some)
+            || holds.iter().all(|hold| !hold.retains(cut, None)));
+        if advance {
+            let mut next = tempfile::NamedTempFile::new_in(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
+            next.write_all(&serde_json::to_vec(&cut).map_err(invalid)?).map_err(|error| Error::io(next.path(), error))?;
+            crate::sync_file(next.as_file()).map_err(|error| Error::io(next.path(), error))?;
+            let path = self.directory.join("floor");
+            next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
+        }
+        if !closed && !advance { return Ok(vec![false; paths.len()]); }
+        self.sync_ledger()?;
+        let mut allowed = Vec::with_capacity(paths.len());
+        for path in paths {
+            let release = holds.iter().all(|hold| !hold.retains(cut, *path));
+            if release && let Some(path) = path { self.close_publication(path)?; }
+            allowed.push(release);
+        }
+        Ok(allowed)
+    }
+
+    fn held_catalogs(&self) -> Result<Vec<CatalogHold>> {
+        let mut holds = Vec::new();
         for entry in fs::read_dir(&self.directory).map_err(|error| Error::io(&self.directory, error))? {
             let path = entry.map_err(|error| Error::io(&self.directory, error))?.path();
             if !path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("reader-")) { continue; }
@@ -75,20 +134,48 @@ impl LocalCatalogLedger {
                 Ok(()) => remove_ticket(&path)?,
                 Err(error) if error.kind() == fs2::lock_contended_error().kind() => {
                     let mut bytes = Vec::new();
-                    Read::by_ref(&mut ticket).take(512).read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
-                    let held: Option<CatalogCut> = serde_json::from_slice(&bytes).map_err(invalid)?;
-                    if !held.is_some_and(|held| covers(held, cut)) { return Ok(false); }
+                    Read::by_ref(&mut ticket).take((CATALOG_FILE_PATH_BYTES + 1024) as u64)
+                        .read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
+                    holds.push(serde_json::from_slice(&bytes).map_err(invalid)?);
                 }
                 Err(error) => return Err(Error::io(&path, error).into()),
             }
         }
-        let mut next = tempfile::NamedTempFile::new_in(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
-        next.write_all(&serde_json::to_vec(&cut).map_err(invalid)?).map_err(|error| Error::io(next.path(), error))?;
-        crate::sync_file(next.as_file()).map_err(|error| Error::io(next.path(), error))?;
-        let path = self.directory.join("floor");
-        next.persist(&path).map_err(|error| Error::io(&path, error.error))?;
-        self.sync_ledger()?;
-        Ok(true)
+        Ok(holds)
+    }
+
+    /// The same gate serializes immutable creation and terminal retirement.
+    pub(crate) fn publication_gate(&self, key: &crate::ObjectKey) -> crate::Result<Option<File>> {
+        if !is_compacted_primary_file(key.as_str()) { return Ok(None); }
+        let gate = self.lock()?;
+        if self.is_terminal(key.as_str())? { return Err(Error::ConflictingObject(key.to_string())); }
+        Ok(Some(gate))
+    }
+
+    fn is_terminal(&self, key: &str) -> crate::Result<bool> {
+        let terminal = self.terminal_path(key);
+        match fs::metadata(&terminal) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(Error::io(&terminal, error)),
+        }
+    }
+
+    fn terminal_path(&self, key: &str) -> PathBuf {
+        let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+        let name: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+        self.directory.join("terminal").join(name)
+    }
+
+    fn close_publication(&self, key: &str) -> Result<()> {
+        let path = self.terminal_path(key);
+        let parent = path.parent().ok_or_else(|| invalid("Local terminal publication has no parent"))?;
+        fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+        let file = OpenOptions::new().write(true).create(true).truncate(false).open(&path)
+            .map_err(|error| Error::io(&path, error))?;
+        crate::sync_file(&file).map_err(|error| Error::io(&path, error))?;
+        crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
+        self.sync_ledger()
     }
 
     pub(crate) fn install_repair_anchor(&self, next: LocalRepairAnchor) -> Result<()> {
@@ -176,14 +263,14 @@ impl LocalCatalogLedger {
         Ok(())
     }
 
-    fn lock(&self) -> Result<File> {
+    fn lock(&self) -> crate::Result<File> {
         let path = self.directory.join("lock");
         let file = self.open_gate(&path)?;
         FileExt::lock_exclusive(&file).map_err(|error| Error::io(path, error))?;
         Ok(file)
     }
 
-    fn open_gate(&self, path: &Path) -> Result<File> {
+    fn open_gate(&self, path: &Path) -> crate::Result<File> {
         fs::create_dir_all(&self.directory).map_err(|error| Error::io(&self.directory, error))?;
         Ok(OpenOptions::new().read(true).write(true).create(true).truncate(false)
             .open(path).map_err(|error| Error::io(path, error))?)
@@ -227,4 +314,33 @@ pub(crate) fn covers(reader: CatalogCut, floor: CatalogCut) -> bool {
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::fault("rtdb.storage/catalog-ledger", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_format::keys::{CURRENT_STORAGE_VERSION, TableSlug, TrieKey};
+
+    #[test]
+    fn exact_local_close_preserves_only_the_primary_named_by_a_held_catalog() {
+        let root = tempfile::tempdir().unwrap();
+        let epoch = StorageEpoch(0);
+        let ledger = LocalCatalogLedger::new(Arc::new(root.path().to_owned()), epoch);
+        let cut = |offset| CatalogCut {
+            storage_version: CURRENT_STORAGE_VERSION,
+            storage_epoch: epoch,
+            replica_epoch: epoch,
+            through: ReplicaPosition::from_epoch_offset(epoch, offset).unwrap(),
+        };
+        let name = |block| TableSlug::recorded("public$docs").unwrap()
+            .data_key(&TrieKey::new(1, None, Vec::new(), BlockIndex(block)).unwrap());
+        let held = name(2);
+        let unrelated = name(3);
+        let registration = ledger.retain(Some(cut(7)), Some(std::slice::from_ref(&held))).unwrap();
+        assert_eq!(ledger.close_admission(cut(8), &[Some(&held), Some(&unrelated), None]).unwrap(), [false, true, false]);
+        assert!(ledger.retain(Some(cut(9)), Some(std::slice::from_ref(&unrelated))).is_err());
+        assert!(ledger.publication_gate(&crate::ObjectKey::new(unrelated).unwrap()).is_err());
+        drop(registration);
+        assert_eq!(ledger.close_admission(cut(8), &[Some(&held)]).unwrap(), [true]);
+    }
 }

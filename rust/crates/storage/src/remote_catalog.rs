@@ -2,32 +2,14 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::{Error as ProviderError, ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion, path::Path};
-use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, CatalogFilePaths, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, CatalogCut, Result};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::{IoRegion, ObjectKey, io_region::IoAdmission, local_catalog::{covers, same_storage, well_formed}};
+use crate::{IoRegion, ObjectKey, io_region::IoAdmission, local_catalog::{CatalogHold, covers, same_storage, well_formed}};
 
 const MAX_LEDGER_BYTES: usize = 1024 * 1024;
 type CatalogHolds = BTreeMap<Uuid, CatalogHold>;
-
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CatalogHold {
-    cut: Option<CatalogCut>,
-    catalog_file_paths: Option<CatalogFilePaths>,
-}
-
-impl CatalogHold {
-    fn retains(&self, cut: CatalogCut, path: Option<&str>) -> bool {
-        match path {
-            Some(path) => self.catalog_file_paths.as_ref().is_none_or(|paths| {
-                paths.binary_search_by(|held| held.as_str().cmp(path)).is_ok()
-            }),
-            None => self.cut.is_none_or(|held| !covers(held, cut)),
-        }
-    }
-}
 
 #[derive(Default)]
 struct Ledger {
@@ -50,12 +32,7 @@ impl CatalogLedger {
 
     pub async fn retain(self: &Arc<Self>, cut: Option<CatalogCut>, paths: Option<Arc<[String]>>, io: &IoRegion)
         -> Result<Arc<dyn Send + Sync>> {
-        let claim = CatalogHold { cut, catalog_file_paths: paths.as_deref().filter(|paths| {
-            cut.is_some() && paths.windows(2).all(|pair| pair[0] < pair[1])
-                && paths.iter().all(|path| rtdb_format::keys::is_catalog_retirement_file(path))
-                && paths.iter().fold(0usize, |charge, path| charge.saturating_add(path.len().saturating_mul(6).saturating_add(16)))
-                    <= rtdb_types::CATALOG_FILE_PATH_BYTES
-        }).map(|paths| CatalogFilePaths { members: paths.to_vec() }) };
+        let claim = CatalogHold::new(cut, paths.as_deref());
         let admission: IoAdmission = io.admit_read(self.clone(), self.key.clone())?;
         let ledger = Arc::clone(self);
         let (answer, result) = oneshot::channel();

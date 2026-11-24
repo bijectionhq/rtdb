@@ -546,6 +546,7 @@ impl LocalStore {
 
     async fn publish_file(&self, key: &ObjectKey, input: AdmittedFile) -> Result<()> {
         let (root, path, key) = (Arc::clone(&self.root), self.path(key), key.clone());
+        let catalog = self.catalog.clone();
         self.io.run(move || {
             let mut input = input;
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
@@ -555,6 +556,10 @@ impl LocalStore {
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             std::io::copy(&mut input.file, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
             crate::sync_file(upload.as_file()).map_err(|error| Error::io(upload.path(), error))?;
+            let _gate = match catalog.as_ref() {
+                Some(catalog) => catalog.publication_gate(&key)?,
+                None => None,
+            };
             match upload.persist_noclobber(&path) {
                 Ok(_) => (),
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -623,15 +628,31 @@ impl ObjectStore for LocalStore {
 
     async fn retain_catalog(&self, cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
         let Some(ledger) = self.catalog.clone() else { return Ok(None); };
-        Ok(Some(Arc::new(self.io.read(ledger, ("floor", cut), |ledger, &(_, cut)| Ok(ledger.retain(cut))).await??)))
+        Ok(Some(Arc::new(self.io.read(ledger, cut, |ledger, &cut| Ok(ledger.retain(cut, None))).await??)))
+    }
+
+    async fn retain_catalog_with_paths(&self, cut: Option<rtdb_types::CatalogCut>, paths: Arc<[String]>)
+        -> rtdb_types::Result<Option<Arc<dyn Send + Sync>>> {
+        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
+        Ok(Some(Arc::new(self.io.read(ledger, (cut, paths), |ledger, (cut, paths)| {
+            Ok(ledger.retain(*cut, Some(paths)))
+        }).await??)))
     }
 
     fn defers_trie_releases(&self) -> bool { self.catalog.is_some() }
     fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
-        let Some(ledger) = self.catalog.clone() else { return Ok(true); };
-        self.io.read(ledger, ("floor", installed), |ledger, &(_, installed)| Ok(ledger.advance(installed))).await?
+        Ok(self.close_classic_trie_admission(installed, &[None]).await?[0])
+    }
+
+    async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
+        let Some(ledger) = self.catalog.clone() else { return Ok(vec![false; paths.len()]); };
+        let paths = paths.iter().map(|path| path.map(str::to_owned)).collect::<Vec<_>>();
+        self.io.read(ledger, (cut, paths), |ledger, (cut, paths)| {
+            let paths = paths.iter().map(Option::as_deref).collect::<Vec<_>>();
+            Ok(ledger.close_admission(*cut, &paths))
+        }).await?
     }
 
     async fn release_trie_files(&self, receipt: &ObjectKey, contents: Bytes) -> rtdb_types::Result<bool> {
@@ -694,6 +715,7 @@ impl ObjectStore for LocalStore {
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         let (root, path, key) = (self.root.clone(), self.path(key), key.clone());
+        let catalog = self.catalog.clone();
         self.io.run(move || {
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
@@ -702,6 +724,10 @@ impl ObjectStore for LocalStore {
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             upload.write_all(&bytes).map_err(|error| Error::io(upload.path(), error))?;
             crate::sync_file(upload.as_file()).map_err(|error| Error::io(upload.path(), error))?;
+            let _gate = match catalog.as_ref() {
+                Some(catalog) => catalog.publication_gate(&key)?,
+                None => None,
+            };
             match upload.persist_noclobber(&path) {
                 Ok(_) => (),
                 Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {

@@ -180,6 +180,7 @@ Hosted exact trie, checkpoint-metadata pack and replica-payload releases use the
 The coordinated collector submits eligible trie and receipt L0 work without a reader timer. The storage owner owns the pending decision and deletion grant.
 The approved reachability contract replaces the cutoff for deletion.
 For hosted and versioned Classic S3 loose compacted primaries and trie-owned artefacts with an immutable publication witness, the coordinated receipt can release each file independently of earlier captured catalogs whose complete bounded path claims omit it. Opaque holds keep those files in custody.
+Coordinated Classic local storage grants compacted primary releases from the same bounded claims and durably closes each selected immutable name under the filesystem creation gate before settlement.
 Complete claims for other file kinds, remaining Classic providers, and all recovery roots remain open.
 Generic block and timestamp forks admit under the source lineage reservation and require the selected checkpoint's complete inventory. A same-organisation fork references its physical dependencies, including enclosing packs and the exact S3 versions or terminal publications.
 Inherited reads and source disposal recheck the original publication. The versioned reaper compares the fork's claim to its exact candidate.

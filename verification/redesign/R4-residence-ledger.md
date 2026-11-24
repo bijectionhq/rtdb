@@ -182,3 +182,14 @@ The Bijection serving bucket denies versioning, so its physical retirement needs
 
 - The classic ledger layout (head object, chain, or per-follower holds).
 - The values of `T`, `R` and the margin; the margin must still cover twice the clock-rate drift over `T` plus the longest provider request.
+
+## Classic local compacted primaries
+
+A coordinated Classic filesystem catalogs the compacted primary paths named
+by each bounded reader claim. The installed retirement receipt closes old
+catalog admission and checks those claims while retaining the local recovery
+gate. A matching or opaque hold retains that primary. An admitted catalog
+whose complete claim omits the file does not prevent settlement. Before the
+grant can withdraw keys or unlink the file, it synchronizes a terminal
+marker for its immutable name under the same filesystem lock used by file
+creation. A later admission cannot claim a terminal primary at a new cut.
