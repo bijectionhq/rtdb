@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
@@ -19,6 +19,25 @@ use crate::serving::{
     ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ROW_VISIBILITY,
     ServingDriver, ServingScope, append_change_rows,
 };
+use crate::{Database, DatabaseCatalog};
+
+pub(crate) struct MultiSqlDelivery {
+    pub(crate) catalog: Arc<DatabaseCatalog>,
+    pub(crate) attachment: Weak<Database>,
+    pub(crate) generation: Option<u64>,
+    pub(crate) groups: BTreeSet<CustodyGroupId>,
+}
+
+#[async_trait]
+impl rtdb_query::QueryDeliveryGuard for MultiSqlDelivery {
+    async fn check(&self, cancellation: &CancellationToken) -> Result<()> {
+        let attachment = self.attachment.upgrade().ok_or_else(interrupted)?;
+        self.catalog.with_current_attachment(&attachment, || Ok(()))?;
+        let driver = attachment.serving_driver().ok_or_else(interrupted)?;
+        driver.check_read_delivery(self.generation, &self.groups, cancellation).await?;
+        self.catalog.with_current_attachment(&attachment, || Ok(()))
+    }
+}
 
 pub struct MultiServing {
     database: Arc<Mutex<MultiDatabase>>,

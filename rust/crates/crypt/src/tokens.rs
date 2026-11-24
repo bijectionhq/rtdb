@@ -119,6 +119,16 @@ pub struct ExportTicket {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeploymentErasureEvidence {
+    pub catalog_basis: Basis,
+    pub deployment: Uuid,
+    pub name_sha256: [u8; 32],
+    pub terminal: u64,
+    pub generation: u64,
+    pub unreadable_by: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReceiverClockObservation {
     pub basis: Basis,
     pub system_time: Timestamp,
@@ -141,6 +151,7 @@ const MAX_CUSTODY_CONTRIBUTORS: usize = 512;
 const PAGE_BYTES: usize = Basis::WIDTH + 8 + 8 + 32;
 const EXPORT_BYTES: usize = Basis::WIDTH + 16 + 32;
 const OBSERVATION_BYTES: usize = Basis::WIDTH + 16 + 64;
+const ERASURE_EVIDENCE_BYTES: usize = Basis::WIDTH + 16 + 32 + 24;
 const SCOPED_CLAIM_DOMAIN: &[u8; 8] = b"scoped\0\x01";
 
 #[derive(Clone, Copy)]
@@ -150,6 +161,7 @@ enum Purpose {
     Export = 3,
     ReceiverClock = 4,
     CustodyRead = 5,
+    DeploymentErasure = 6,
 }
 
 impl Purpose {
@@ -164,6 +176,7 @@ impl Purpose {
             Self::Export => Anomaly::incorrect("rtdb/invalid-export", "Invalid checkpoint export ticket"),
             Self::ReceiverClock => Anomaly::incorrect("rtdb/invalid-receiver-observation", "Invalid receiver clock observation"),
             Self::CustodyRead => Anomaly::incorrect("rtdb/invalid-custody-read", "Invalid custody read proof"),
+            Self::DeploymentErasure => Anomaly::incorrect("rtdb/invalid-deployment-erasure", "Invalid deployment erasure evidence"),
         }
     }
 
@@ -174,6 +187,7 @@ impl Purpose {
             Self::Export => EXPORT_BYTES,
             Self::ReceiverClock => OBSERVATION_BYTES,
             Self::CustodyRead => CUSTODY_READ_HEADER + 48 * MAX_CUSTODY_CONTRIBUTORS,
+            Self::DeploymentErasure => ERASURE_EVIDENCE_BYTES,
         }
     }
 }
@@ -277,6 +291,44 @@ impl TokenAuthority {
             return Err(invalid());
         }
         Ok(ExportTicket { pin, basis, manifest_sha256: digest.try_into().map_err(|_| invalid())? })
+    }
+
+    pub async fn seal_deployment_erasure(&self, evidence: DeploymentErasureEvidence) -> Result<Vec<u8>> {
+        if evidence.catalog_basis.incarnation() != *self.incarnation.as_bytes()
+            || evidence.deployment.is_nil() || evidence.deployment == self.incarnation
+            || evidence.terminal == 0 || evidence.generation == 0
+        {
+            return Err(Purpose::DeploymentErasure.invalid());
+        }
+        let issuer = self.issuer().await?;
+        let mut bytes = Vec::with_capacity(ERASURE_EVIDENCE_BYTES);
+        bytes.extend_from_slice(&evidence.catalog_basis.to_bytes());
+        bytes.extend_from_slice(evidence.deployment.as_bytes());
+        bytes.extend_from_slice(&evidence.name_sha256);
+        bytes.extend_from_slice(&evidence.terminal.to_be_bytes());
+        bytes.extend_from_slice(&evidence.generation.to_be_bytes());
+        bytes.extend_from_slice(&evidence.unreadable_by.0.to_be_bytes());
+        self.seal(&issuer.key, Purpose::DeploymentErasure, &bytes).await
+    }
+
+    pub async fn open_deployment_erasure(&self, token: &[u8]) -> Result<DeploymentErasureEvidence> {
+        let (bytes, _) = self.open(Purpose::DeploymentErasure, token).await?;
+        let invalid = || Purpose::DeploymentErasure.invalid();
+        let (basis, bytes) = bytes.split_first_chunk::<{ Basis::WIDTH }>().ok_or_else(invalid)?;
+        let (deployment, bytes) = bytes.split_first_chunk::<16>().ok_or_else(invalid)?;
+        let (name_sha256, bytes) = bytes.split_first_chunk::<32>().ok_or_else(invalid)?;
+        let (terminal, bytes) = bytes.split_first_chunk::<8>().ok_or_else(invalid)?;
+        let (generation, time) = bytes.split_first_chunk::<8>().ok_or_else(invalid)?;
+        let catalog_basis = Basis::from_bytes(basis).map_err(|_| invalid())?;
+        if catalog_basis.incarnation() != *self.incarnation.as_bytes() { return Err(invalid()); }
+        Ok(DeploymentErasureEvidence {
+            catalog_basis,
+            deployment: Uuid::from_bytes(*deployment),
+            name_sha256: *name_sha256,
+            terminal: u64::from_be_bytes(*terminal),
+            generation: u64::from_be_bytes(*generation),
+            unreadable_by: Timestamp(i64::from_be_bytes(time.try_into().map_err(|_| invalid())?)),
+        })
     }
 
     pub async fn open_receiver_clock(&self, token: &[u8], session: [u8; 32]) -> Result<ReceiverClockObservation> {

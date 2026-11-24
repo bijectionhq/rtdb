@@ -372,7 +372,13 @@ pub struct QueryContext {
     pub(crate) accelerators: Arc<[Arc<dyn crate::ScanAccelerator>]>,
     pub(crate) query_cpu: Option<Arc<crate::QueryCpu>>,
     plaintext: Option<Arc<PlaintextView>>,
+    delivery_guard: Option<Arc<dyn QueryDeliveryGuard>>,
     pub(crate) spatial_refinement: bool,
+}
+
+#[async_trait::async_trait]
+pub trait QueryDeliveryGuard: Send + Sync {
+    async fn check(&self, cancellation: &CancellationToken) -> Result<()>;
 }
 
 impl QueryContext {
@@ -386,7 +392,12 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None, spatial_refinement: false }))
+        Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.child_token(), spill, execution_observer: None, tracer: None, trace_parent: None, application_name: None, operator_root: None, read_basis: None, snapshot_admission: None, snapshot_tokens: None, accelerators: Arc::from(Vec::new()), query_cpu: None, plaintext: None, delivery_guard: None, spatial_refinement: false }))
+    }
+
+    pub fn with_delivery_guard(mut self: Arc<Self>, guard: Arc<dyn QueryDeliveryGuard>) -> Arc<Self> {
+        Arc::make_mut(&mut self).delivery_guard = Some(guard);
+        self
     }
     /// Applies only to cursors opened from this context; existing cursors retain their original observer.
     pub fn with_observer(mut self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
@@ -515,6 +526,10 @@ impl QueryContext {
         let grant = self.owner_cancellation.run_until_cancelled(
             self.cancellation.run_until_cancelled(plaintext.grant()),
         ).await.flatten().ok_or_else(cancelled)??;
+        if let Some(guard) = &self.delivery_guard {
+            self.owner_cancellation.run_until_cancelled(guard.check(&self.cancellation))
+                .await.ok_or_else(cancelled)??;
+        }
         self.catalog.check_view_lease()?;
         self.check_cancelled()?;
         grant.check()?;

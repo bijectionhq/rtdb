@@ -15,11 +15,15 @@ const EXPORT: &str = "rtdb.admin.v1.ExportCheckpoint";
 const RESTORE: &str = "rtdb.admin.v1.RestoreDeployment";
 const FORK: &str = "rtdb.admin.v1.ForkDeployment";
 const CREATE: &str = "rtdb.admin.v1.CreateDeployment";
-pub(crate) const ACTIONS: [&str; 4] = [EXPORT, RESTORE, FORK, CREATE];
+const DELETE: &str = "rtdb.admin.v1.DeleteDeployment";
+pub(crate) const ACTIONS: [&str; 5] = [CREATE, DELETE, FORK, EXPORT, RESTORE];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeploymentAdminAction<'a> {
     Create {
+        deployment: &'a str,
+    },
+    Delete {
         deployment: &'a str,
     },
     Export {
@@ -46,7 +50,8 @@ pub trait DeploymentAdminAuthority: std::fmt::Debug + Send + Sync {
 
 impl Service {
     pub(crate) fn supports_admin_action(&self, call: &Call, name: &str) -> bool {
-        self.has_admin_route(call) && (name != CREATE || self.0.node.catalog().is_managed())
+        self.has_admin_route(call)
+            && (!matches!(name, CREATE | DELETE) || self.0.node.catalog().is_managed())
     }
 
     pub(crate) fn has_admin_route(&self, call: &Call) -> bool {
@@ -97,6 +102,29 @@ impl Service {
                 Ok(proto::Deployment {
                     deployment: request.deployment,
                     basis: None,
+                }
+                .encode_to_vec())
+            }
+            DELETE => {
+                let request: proto::DeleteDeploymentRequest = decode(body)?;
+                authority
+                    .authorize(
+                        principal,
+                        DeploymentAdminAction::Delete {
+                            deployment: &request.deployment,
+                        },
+                    )
+                    .map_err(error::anomaly)?;
+                let (proof, unreadable_by) = self
+                    .0
+                    .node
+                    .erase_managed_deployment(&request.deployment)
+                    .await
+                    .map_err(error::anomaly)?;
+                Ok(proto::ErasureProof {
+                    deployment: request.deployment,
+                    proof,
+                    unreadable_by_micros: unreadable_by.0,
                 }
                 .encode_to_vec())
             }

@@ -13,15 +13,17 @@ use journal_contract::{
     reference::{FileJournal, Limits},
 };
 use rtdb_columnar::MemoryBudget;
-use rtdb_crypt::{FileKms, Kms};
-use rtdb_db::{JournalBatchAppender, MultiDatabase, MultiOptions, Role, discover_nodes};
+use rtdb_crypt::{FileKms, Generation, Kms};
+use rtdb_db::{
+    DeploymentRetirement, JournalBatchAppender, MultiDatabase, MultiOptions, Role, discover_nodes,
+};
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
 use rtdb_node::{
     Clock, DatabaseStorage, LogAccess, MultiServing, NativeResources, Node, OpenedLogs,
     ResourceFactory, SystemClock, serving::ServingDriver,
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -29,6 +31,10 @@ use uuid::Uuid;
 use crate::config::NodeConfiguration;
 
 mod catalog;
+use catalog::Status;
+
+const WRITER_LEASE_MICROS: i64 = 5_000_000;
+const CLOCK_DRIFT_MICROS: i64 = 250_000;
 
 type ServingDatabases = Arc<RwLock<BTreeMap<String, Arc<MultiServing>>>>;
 
@@ -201,11 +207,16 @@ impl MultiRuntime {
         }
         let initial = databases
             .iter()
+            .filter(|(name, _)| {
+                observed
+                    .get(*name)
+                    .is_none_or(|entry| matches!(entry.status, Status::Reserved | Status::Ready))
+            })
             .map(|(name, id)| (name.clone(), *id))
             .chain(
                 observed
                     .iter()
-                    .filter(|(_, entry)| entry.ready)
+                    .filter(|(_, entry)| entry.status == Status::Ready)
                     .map(|(name, entry)| (name.clone(), entry.database)),
             )
             .collect::<BTreeMap<_, _>>();
@@ -254,11 +265,116 @@ impl MultiRuntime {
             .copied()
             .unwrap_or_else(|| self.catalog.deployment_id(name));
         let selected = self.catalog.reserve(name, id).await?;
-        self.ensure_driver(name, id).await?;
-        if !selected.ready {
+        match selected.status {
+            Status::Reserved | Status::Ready => (),
+            _ => return Err(catalog::closed()),
+        }
+        let driver = self.ensure_driver(name, id).await?;
+        if driver.deployment_retirement().await?.is_some() {
+            return Err(catalog::closed());
+        }
+        if selected.status == Status::Reserved {
             self.catalog.mark_ready(name, id).await?;
         }
         Ok(self.configuration.clone())
+    }
+
+    async fn erase(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
+        let selected = self.catalog.read().await?.remove(name).ok_or_else(|| {
+            Anomaly::new(
+                AnomalyCategory::NotFound,
+                "rtdb/unknown-deployment",
+                "The deployment is absent from the ordered catalog",
+            )
+        })?;
+        let selected = match selected.status {
+            Status::Reserved => {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Busy,
+                    "rtdb/deployment-provisioning",
+                    "The deployment is waiting for provisioning",
+                ));
+            }
+            Status::Ready => {
+                let event = self
+                    .ensure_driver(name, selected.database)
+                    .await?
+                    .retire_deployment()
+                    .await?;
+                self.record_retirement(name, event).await?
+            }
+            _ => selected,
+        };
+        let selected = self.settle_retirement(name, selected).await?;
+        self.catalog.erasure_evidence(name, selected).await
+    }
+
+    async fn record_retirement(
+        &self,
+        name: &str,
+        event: DeploymentRetirement,
+    ) -> Result<catalog::Deployment> {
+        let destroy_after = Timestamp(event.lease_until.saturating_add(CLOCK_DRIFT_MICROS));
+        self.catalog.mark_retiring(name, event, destroy_after).await
+    }
+
+    async fn settle_retirement(
+        &self,
+        name: &str,
+        entry: catalog::Deployment,
+    ) -> Result<catalog::Deployment> {
+        let Status::Retiring(retirement) = entry.status else {
+            return Ok(entry);
+        };
+        let generation = Generation {
+            database: entry.database,
+            number: retirement.generation,
+        };
+        self.kms
+            .retire(generation, retirement.destroy_after.0)
+            .await?;
+        if SystemClock.now() < retirement.destroy_after {
+            return Err(Anomaly::new(
+                AnomalyCategory::Busy,
+                "rtdb/deployment-retirement-pending",
+                "The deployment key retirement is waiting for its cutoff",
+            ));
+        }
+        self.kms.destroy(generation).await?;
+        let stream = StreamId(entry.database.as_u128());
+        match self.backends.journal.delete(stream).await {
+            Ok(()) | Err(JournalError::Deleted) | Err(JournalError::Unavailable) => (),
+            Err(error) => {
+                return Err(Anomaly::fault(
+                    "rtdb/deployment-journal-delete",
+                    error.to_string(),
+                ));
+            }
+        }
+        match self.backends.journal.head(stream).await {
+            Err(JournalError::Deleted) => (),
+            Ok(_) | Err(JournalError::Unavailable) => {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Unavailable,
+                    "rtdb/deployment-journal-delete",
+                    "The permanent journal deletion has not been observed",
+                ));
+            }
+            Err(error) => {
+                return Err(Anomaly::fault(
+                    "rtdb/deployment-journal-delete",
+                    error.to_string(),
+                ));
+            }
+        }
+        let confirmed = Timestamp(
+            SystemClock
+                .now()
+                .0
+                .saturating_add(CLOCK_DRIFT_MICROS)
+                .max(retirement.destroy_after.0),
+        );
+        self.catalog.mark_erased(name, retirement, confirmed).await
     }
 
     pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
@@ -316,35 +432,72 @@ impl MultiRuntime {
             }
         }
         for (name, entry) in rows {
-            if !entry.ready && !writer {
-                continue;
+            match self.reconcile_entry(node, &name, entry, writer).await {
+                Ok(()) => (),
+                Err(error) if retryable(&error) => (),
+                Err(error) => return Err(error),
             }
-            self.ensure_driver(&name, entry.database).await?;
-            if !entry.ready {
-                self.catalog.mark_ready(&name, entry.database).await?;
-            }
-            self.attach(node, &name).await?;
         }
         Ok(())
     }
 
-    async fn ensure_driver(&self, name: &str, id: Uuid) -> Result<()> {
+    async fn reconcile_entry(
+        &self,
+        node: &Node,
+        name: &str,
+        entry: catalog::Deployment,
+        writer: bool,
+    ) -> Result<()> {
+        match entry.status {
+            Status::Reserved if !writer => return Ok(()),
+            Status::Retiring(_) | Status::Erased { .. } => {
+                self.databases
+                    .write()
+                    .expect("Multi serving catalog")
+                    .remove(name);
+                if node.catalog().database(name).is_ok() {
+                    node.detach_local(name.to_owned()).await?;
+                }
+                if writer {
+                    self.settle_retirement(name, entry).await?;
+                }
+                return Ok(());
+            }
+            _ => (),
+        }
+        let driver = self.ensure_driver(name, entry.database).await?;
+        if let Some(event) = driver.deployment_retirement().await? {
+            if writer {
+                self.record_retirement(name, event).await?;
+            }
+            return Ok(());
+        }
+        if entry.status == Status::Reserved {
+            self.catalog.mark_ready(name, entry.database).await?;
+        }
+        self.attach(node, name).await
+    }
+
+    async fn ensure_driver(&self, name: &str, id: Uuid) -> Result<Arc<MultiServing>> {
         if let Some(driver) = self
             .databases
             .read()
             .expect("Multi serving catalog")
             .get(name)
         {
-            return check_incarnation(driver, id);
+            check_incarnation(driver, id)?;
+            return Ok(Arc::clone(driver));
         }
         let mut database = open_database(&self.backends, &self.kms, id, false).await?;
-        database.fresh_view().await?;
-        database.token_authority().issuer().await?;
+        if database.deployment_retirement().await?.is_none() {
+            database.token_authority().issuer().await?;
+        }
         let mut databases = self.databases.write().expect("Multi serving catalog");
         let driver = databases
             .entry(name.to_owned())
             .or_insert_with(|| Arc::new(MultiServing::new(database, Arc::clone(&self.memory))));
-        check_incarnation(driver, id)
+        check_incarnation(driver, id)?;
+        Ok(Arc::clone(driver))
     }
 
     async fn attach(&self, node: &Node, name: &str) -> Result<()> {
@@ -384,8 +537,8 @@ async fn open_database(
         MultiOptions {
             database: id,
             node: backends.node,
-            lease_micros: 5_000_000,
-            drift_micros: 250_000,
+            lease_micros: WRITER_LEASE_MICROS,
+            drift_micros: CLOCK_DRIFT_MICROS,
         },
         Arc::clone(&backends.journal),
         Arc::clone(&backends.store),
@@ -438,13 +591,14 @@ fn check_incarnation(driver: &MultiServing, id: Uuid) -> Result<()> {
 }
 
 fn retryable(error: &Anomaly) -> bool {
-    matches!(
-        error.category,
-        AnomalyCategory::Unavailable
-            | AnomalyCategory::Busy
-            | AnomalyCategory::Conflict
-            | AnomalyCategory::Interrupted
-    )
+    error.code == "rtdb/unknown-database"
+        || matches!(
+            error.category,
+            AnomalyCategory::Unavailable
+                | AnomalyCategory::Busy
+                | AnomalyCategory::Conflict
+                | AnomalyCategory::Interrupted
+        )
 }
 
 #[cfg(feature = "s3")]
@@ -471,6 +625,10 @@ struct ServingResources {
 impl ResourceFactory for ServingResources {
     async fn provision_managed_database(&self, name: &str) -> Result<DatabaseConfig> {
         self.runtime.provision(name).await
+    }
+
+    async fn erase_managed_database(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
+        self.runtime.erase(name).await
     }
 
     fn serving_driver(

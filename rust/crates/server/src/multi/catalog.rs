@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use rtdb_db::MultiDatabase;
+use rtdb_crypt::tokens::DeploymentErasureEvidence;
+use rtdb_db::{DeploymentRetirement, MultiDatabase};
 use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Row, Transact, Version, Window};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, Result, StructFields, TableRef, Value,
+    Anomaly, AnomalyCategory, EntityId, Result, StructFields, TableRef, Timestamp, Value,
     rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
 };
 use sha2::{Digest, Sha256};
@@ -18,8 +19,26 @@ pub(super) struct Catalog {
 #[derive(Clone, Copy)]
 pub(super) struct Deployment {
     pub database: Uuid,
-    pub ready: bool,
-    written: Basis,
+    pub status: Status,
+    pub written: Basis,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Status {
+    Reserved,
+    Ready,
+    Retiring(Retirement),
+    Erased {
+        retirement: Retirement,
+        confirmed: Timestamp,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Retirement {
+    pub terminal: u64,
+    pub generation: u64,
+    pub destroy_after: Timestamp,
 }
 
 impl Catalog {
@@ -62,7 +81,14 @@ impl Catalog {
         if entries.values().any(|entry| entry.database == database) {
             return Err(conflict());
         }
-        write(&mut control, name, database, false, Version::Absent).await?;
+        write(
+            &mut control,
+            name,
+            database,
+            Status::Reserved,
+            Version::Absent,
+        )
+        .await?;
         let selected = read(&mut control)
             .await?
             .remove(name)
@@ -78,14 +104,16 @@ impl Catalog {
             .remove(name)
             .ok_or_else(invalid_catalog)?;
         let selected = check_identity(selected, database)?;
-        if selected.ready {
-            return Ok(());
+        match selected.status {
+            Status::Ready => return Ok(()),
+            Status::Reserved => (),
+            _ => return Err(closed()),
         }
         write(
             &mut control,
             name,
             database,
-            true,
+            Status::Ready,
             Version::Written(selected.written),
         )
         .await?;
@@ -93,10 +121,99 @@ impl Catalog {
             .await?
             .remove(name)
             .ok_or_else(invalid_catalog)?;
-        if !check_identity(ready, database)?.ready {
+        if check_identity(ready, database)?.status != Status::Ready {
             return Err(conflict());
         }
         Ok(())
+    }
+
+    pub(super) async fn mark_retiring(
+        &self,
+        name: &str,
+        event: DeploymentRetirement,
+        destroy_after: Timestamp,
+    ) -> Result<Deployment> {
+        let mut control = self.database.lock().await;
+        let selected = check_identity(find(&mut control, name).await?, event.incarnation)?;
+        let retirement = Retirement {
+            terminal: event.terminal.0,
+            generation: event.generation,
+            destroy_after,
+        };
+        if selected.status == Status::Ready {
+            write(
+                &mut control,
+                name,
+                selected.database,
+                Status::Retiring(retirement),
+                Version::Written(selected.written),
+            )
+            .await?;
+        }
+        let selected = find(&mut control, name).await?;
+        match selected.status {
+            Status::Retiring(prior)
+            | Status::Erased {
+                retirement: prior, ..
+            } if prior == retirement => Ok(selected),
+            _ => Err(conflict()),
+        }
+    }
+
+    pub(super) async fn mark_erased(
+        &self,
+        name: &str,
+        retirement: Retirement,
+        confirmed: Timestamp,
+    ) -> Result<Deployment> {
+        let mut control = self.database.lock().await;
+        let selected = find(&mut control, name).await?;
+        if selected.status == Status::Retiring(retirement) {
+            write(
+                &mut control,
+                name,
+                selected.database,
+                Status::Erased {
+                    retirement,
+                    confirmed,
+                },
+                Version::Written(selected.written),
+            )
+            .await?;
+        }
+        let selected = find(&mut control, name).await?;
+        match selected.status {
+            Status::Erased {
+                retirement: prior, ..
+            } if prior == retirement => Ok(selected),
+            _ => Err(conflict()),
+        }
+    }
+
+    pub(super) async fn erasure_evidence(
+        &self,
+        name: &str,
+        selected: Deployment,
+    ) -> Result<(Vec<u8>, Timestamp)> {
+        let Status::Erased {
+            retirement,
+            confirmed,
+        } = selected.status
+        else {
+            return Err(conflict());
+        };
+        let tokens = self.database.lock().await.token_authority();
+        let proof = tokens
+            .seal_deployment_erasure(DeploymentErasureEvidence {
+                catalog_basis: selected.written,
+                deployment: selected.database,
+                name_sha256: Sha256::digest(name.as_bytes()).into(),
+                terminal: retirement.terminal,
+                generation: retirement.generation,
+                unreadable_by: confirmed,
+            })
+            .await?;
+        Ok((proof, confirmed))
     }
 }
 
@@ -135,7 +252,7 @@ async fn read(control: &mut MultiDatabase) -> Result<BTreeMap<String, Deployment
             name.clone(),
             Deployment {
                 database: Uuid::from_bytes(*database),
-                ready: *ready,
+                status: decode_status(*ready, &image.cells)?,
                 written: row.cut.basis,
             },
         );
@@ -144,21 +261,88 @@ async fn read(control: &mut MultiDatabase) -> Result<BTreeMap<String, Deployment
     Ok(entries)
 }
 
+async fn find(control: &mut MultiDatabase, name: &str) -> Result<Deployment> {
+    read(control).await?.remove(name).ok_or_else(|| {
+        Anomaly::new(
+            AnomalyCategory::NotFound,
+            "rtdb/unknown-deployment",
+            "The deployment is absent from the ordered catalog",
+        )
+    })
+}
+
+fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
+    let retirement = match (
+        cells.get("terminal"),
+        cells.get("generation"),
+        cells.get("destroy_after"),
+    ) {
+        (None, None, None) if cells.get("confirmed").is_none() => {
+            return Ok(if ready {
+                Status::Ready
+            } else {
+                Status::Reserved
+            });
+        }
+        (Some(Value::U64(terminal)), Some(Value::U64(generation)), Some(Value::I64(after)))
+            if !ready && *terminal > 0 && *generation > 0 =>
+        {
+            Retirement {
+                terminal: *terminal,
+                generation: *generation,
+                destroy_after: Timestamp(*after),
+            }
+        }
+        _ => return Err(invalid_catalog()),
+    };
+    match cells.get("confirmed") {
+        None => Ok(Status::Retiring(retirement)),
+        Some(Value::I64(confirmed)) if *confirmed >= retirement.destroy_after.0 => {
+            Ok(Status::Erased {
+                retirement,
+                confirmed: Timestamp(*confirmed),
+            })
+        }
+        _ => Err(invalid_catalog()),
+    }
+}
+
 async fn write(
     control: &mut MultiDatabase,
     name: &str,
     database: Uuid,
-    ready: bool,
+    status: Status,
     expect: Version,
 ) -> Result<()> {
     let id = EntityId::String(name.into());
-    let phase = if ready {
-        b"ready".as_slice()
-    } else {
-        b"reserve".as_slice()
+    let mut cells = StructFields::from([
+        (
+            "database".into(),
+            Cell::Value(Value::Uuid(*database.as_bytes())),
+        ),
+        (
+            "ready".into(),
+            Cell::Value(Value::Bool(status == Status::Ready)),
+        ),
+    ]);
+    let phase = match status {
+        Status::Reserved => b"reserve".to_vec(),
+        Status::Ready => b"ready".to_vec(),
+        Status::Retiring(retirement) => {
+            add_retirement(&mut cells, retirement);
+            b"retiring".to_vec()
+        }
+        Status::Erased {
+            retirement,
+            confirmed,
+        } => {
+            add_retirement(&mut cells, retirement);
+            cells.insert("confirmed".into(), Cell::Value(Value::I64(confirmed.0)));
+            [b"erased".as_slice(), &confirmed.0.to_be_bytes()].concat()
+        }
     };
     let request = Transact {
-        key: identity(phase, database, name).as_bytes().to_vec(),
+        key: identity(&phase, database, name).as_bytes().to_vec(),
         require: Vec::new(),
         window: Window::default(),
         guards: vec![Guard::Version {
@@ -177,13 +361,7 @@ async fn write(
                 custody_group: None,
                 protected_columns: Vec::new(),
                 custody_payload: None,
-                cells: StructFields::from([
-                    (
-                        "database".into(),
-                        Cell::Value(Value::Uuid(*database.as_bytes())),
-                    ),
-                    ("ready".into(), Cell::Value(Value::Bool(ready))),
-                ]),
+                cells,
             }],
             if_absent: false,
         }],
@@ -196,6 +374,29 @@ async fn write(
         Outcome::Then | Outcome::Otherwise { .. } => Ok(()),
         Outcome::Refused { error } => Err(error),
     }
+}
+
+fn add_retirement(cells: &mut StructFields<Cell>, retirement: Retirement) {
+    cells.insert(
+        "terminal".into(),
+        Cell::Value(Value::U64(retirement.terminal)),
+    );
+    cells.insert(
+        "generation".into(),
+        Cell::Value(Value::U64(retirement.generation)),
+    );
+    cells.insert(
+        "destroy_after".into(),
+        Cell::Value(Value::I64(retirement.destroy_after.0)),
+    );
+}
+
+pub(super) fn closed() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::NotFound,
+        "rtdb/deployment-retired",
+        "The deployment has permanently closed admission",
+    )
 }
 
 fn table() -> TableRef {

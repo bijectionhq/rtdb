@@ -1206,6 +1206,15 @@ impl Node {
         let database = self.database_or_attach(name, configuration).await?.ok_or_else(closed)?;
         self.catalog.with_current_attachment(&database, || Ok(()))
     }
+
+    /// Returns the durable erasure evidence after the deployment host settles its storage custody.
+    pub async fn erase_managed_deployment(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
+        self.ensure_open()?;
+        if !self.catalog.is_managed() {
+            return Err(Anomaly::unsupported("rtdb/deployment-erasure", "The runtime has no deployment erasure authority"));
+        }
+        self.factory.resources.erase_managed_database(name).await
+    }
     /// Stops running a database this node holds under a placed catalog: its driver is cancelled and its resources drained.
     /// Returns once the detach has begun; the name stays occupied until the drain completes.
     pub async fn detach_local(&self, name: String) -> Result<()> {
@@ -4361,7 +4370,11 @@ impl NativeSessionService {
             let view = driver.query(crate::serving::QuerySource {
                 branch: "main".into(), at: rtdb_types::rtdb_v1::At::AsOf(time), layer: rtdb_types::rtdb_v1::Layer::Merged,
             }, false, time, cancellation).await?;
-            return context.with_wire_snapshot(view.snapshot, view.cut.system_time, basis.current_time);
+            let guard = Arc::new(crate::multi_serving::MultiSqlDelivery {
+                catalog: Arc::clone(self.node.catalog()), attachment: Arc::downgrade(&attachment),
+                generation: view.key_generation, groups: view.custody_groups,
+            });
+            return Ok(context.with_wire_snapshot(view.snapshot, view.cut.system_time, basis.current_time)?.with_delivery_guard(guard));
         }
         let context = if let Some(token) = &basis.resume_token {
             let view = admission.restore(token, &context, cancellation).await?;

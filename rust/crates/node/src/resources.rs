@@ -149,6 +149,11 @@ pub trait ResourceFactory: Send + Sync {
         Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
     }
 
+    /// Returns the authenticated erasure evidence and the latest time of confirmed unreadability.
+    async fn erase_managed_database(&self, _name: &str) -> Result<(Vec<u8>, rtdb_types::Timestamp)> {
+        Err(Anomaly::unsupported("rtdb/deployment-erasure", "The runtime has no deployment erasure authority"))
+    }
+
     fn serving_driver(&self, _name: &str, _configuration: &DatabaseConfig, _cancellation: &CancellationToken)
         -> Result<Option<Arc<dyn crate::serving::ServingDriver>>> { Ok(None) }
     fn native_serving_authority(&self, _name: &str, _configuration: &DatabaseConfig)
