@@ -22,7 +22,7 @@ pub use admission::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, ProducedBlock, PublishedCheckpoint, RecoveredPartition};
 pub use driver::{ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
-pub use snapshot_replay::SnapshotReplay;
+pub use snapshot_replay::{ErasureTarget, SnapshotReplay, SqlErasureSource};
 pub use replay_closure::{ReplayBase, ReplayDependencySources, checkpoint_dependencies, tail_dependencies};
 pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};

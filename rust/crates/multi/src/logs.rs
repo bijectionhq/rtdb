@@ -691,7 +691,7 @@ impl Log for SealedLog {
         let hold = Arc::new(admission.hold(after, through).await?.ok_or_else(absent)?);
         let inner = self.inner.range(from, to).await?;
         let range = Box::new(SealedRange { inner, units: Arc::clone(&self.units), admission: None, protected: Some(Arc::clone(&hold)) });
-        Ok(rtdb_storage::log::ProtectedLogRange { range, hold })
+        Ok(rtdb_storage::log::ProtectedLogRange { authenticated_head: None, range, hold })
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {

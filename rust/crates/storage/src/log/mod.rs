@@ -99,6 +99,8 @@ impl LogRecord {
 
 /// An authenticated interval with a custody owner retained through answer release.
 pub struct ProtectedLogRange {
+    /// Provider-attested original history and terminal coordinate, when available.
+    pub authenticated_head: Option<[u8; 32]>,
     pub range: Box<dyn LogRange>,
     pub hold: Arc<dyn Send + Sync>,
 }

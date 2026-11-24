@@ -6,6 +6,7 @@ use ordered_logkeeper::ordered::{
     Request, RequestId,
     service::wire::{Decision, SignedRotationSlots},
 };
+use rtdb_replication::SqlErasureSource;
 use rtdb_storage::ObjectStore;
 use rtdb_types::{Anomaly, Result};
 use uuid::Uuid;
@@ -202,18 +203,35 @@ impl<'a> ErasureCoordinator<'a> {
     }
 
     /// Materializes an already rewritten SQL survivor closure in the protected
-    /// provider allocation. Its catalog must describe the exact quiesced head.
+    /// provider allocation. The protected replay supplies the original erase
+    /// effects and authenticates the exact predecessor and selected head.
     pub async fn stage_survivor(
         &self,
         erasure: Erasure,
         rotation: RequestId,
         reservation: Reservation,
         checkpoint: rtdb_directory::Checkpoint,
+        selection: &SqlErasureSource,
         source: &dyn ObjectStore,
     ) -> Result<PreparedErasure> {
         self.require_incumbent(erasure)?;
         let route = self.custodian.route().await?;
-        if route.writer.grant != Some(erasure.incumbent)
+        let epoch = self.worker.log_epoch();
+        let base_matches = match selection.checkpoint() {
+            Some(base) => base.root_sha256 == Some(route.checkpoint.root)
+                && base.boundary.after_offset(epoch).checked_add(1)
+                    .and_then(|next| u64::try_from(next).ok()) == Some(route.checkpoint.cut.next_lsn),
+            None => super::genesis(route.checkpoint),
+        };
+        let cut = selection.cut();
+        if !base_matches
+            || selection.authenticated_head() != crate::journal::head_identity(route.placement, route.head)
+            || cut.replica_epoch != epoch
+            || cut.through.after_offset(epoch) != checkpoint.boundary
+            || selection.source_position().after_offset(epoch) != checkpoint.source
+            || selection.snapshot().block_index().0 != checkpoint.block
+            || selection.snapshot().tx_basis().map(|basis| basis.system_time.0) != Some(checkpoint.system_time)
+            || route.writer.grant != Some(erasure.incumbent)
             || rotation.nonce.is_nil()
             || rotation.expires_at <= route.position.saturating_add(1)
             || route.head.next_lsn <= route.checkpoint.cut.next_lsn

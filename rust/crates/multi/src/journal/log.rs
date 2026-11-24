@@ -836,7 +836,11 @@ impl Log for JournalLog {
         let hold = range.held.as_ref()
             .ok_or_else(|| Error::Closed("The replica interval has no ordered custody hold".into()))?
             .clone();
-        Ok(rtdb_storage::log::ProtectedLogRange { range: Box::new(range), hold })
+        if Some(hold.scope().through.next_lsn) != range.end {
+            return Err(Error::Closed("The protected terminal coordinate differs from the requested interval".into()));
+        }
+        let authenticated_head = super::head_identity(self.reads.journal.placement(), hold.scope().through);
+        Ok(rtdb_storage::log::ProtectedLogRange { authenticated_head: Some(authenticated_head), range: Box::new(range), hold })
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {

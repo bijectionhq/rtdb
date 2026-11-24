@@ -27,6 +27,20 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+fn head_identity(placement: Placement, cut: Cut) -> [u8; 32] {
+    use ring::digest::{Context, SHA256};
+
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"rtdb.multi/ordered-replay-head/v1\0");
+    hash.update(placement.deployment.as_bytes());
+    hash.update(placement.incarnation.as_bytes());
+    hash.update(placement.group.as_bytes());
+    hash.update(&placement.generation.to_be_bytes());
+    hash.update(&cut.next_lsn.to_be_bytes());
+    hash.update(&cut.history);
+    hash.finish().as_ref().try_into().expect("SHA-256 width")
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledRoute {

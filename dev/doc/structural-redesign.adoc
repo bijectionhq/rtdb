@@ -247,7 +247,7 @@ The installed journal orders clean checkpoint publication, key rotation, and old
 Plaintext delivery inherits the originating object read lease and cannot extend it through a separate key check.
 An exact-head clean provider allocation binds the erasure operation, custody domain and rotation identity into its preparation and sealed manifest. Recovery opens that selected root at the chosen head without replaying an earlier upload confirmation.
 The coordinator distinguishes the current provider's 120-second operational target from a signed fixed commitment. A fixed request requires an authenticated deadline reservation before the switch. The original authority's separate destruction evidence binds the switch, retiring key inventory, closed custody roster and provider disposition. The custody owner can persist the closed roster and independently signed worker observations outside the retiring checkpoint allocation. Destruction confirmation reopens and compares those durable observations.
-Production SQL erasure still requires a complete survivor rebuild and retiring-key census, bounded plaintext and egress drain, and evidenced provider destruction.
+Protected replay extracts the committed erase effects and authenticates their exact selected head and successor staging coordinates. Production SQL still needs to generate the survivor closure, enumerate the retiring keys and all custody participants, and drive their drain and provider destruction.
 
 |8
 |Transaction metadata retention.
