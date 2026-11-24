@@ -66,7 +66,7 @@ impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
         Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new(), catalog_cut: None, catalog_read: None, read_custody: None, certified_read: None, memos: Default::default() }
     }
-    pub(crate) fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
+    pub fn with_catalog_cut(mut self, catalog_cut: Option<CatalogCut>) -> Self {
         self.catalog_cut = catalog_cut;
         self
     }

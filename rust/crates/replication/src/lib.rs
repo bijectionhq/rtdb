@@ -40,7 +40,7 @@ pub fn verify_archived_transaction(
     rtdb_tx::decode_replica(message, Some(predecessor), block, memory).map(|_| ())
 }
 pub use admission_step::{Admission, TermFence, TermPosition, Verdict};
-pub use blocks::{BlockDiscovery, BlockStore, NativeErasureCut, ProducedBlock, PublishedCheckpoint, RecoveredPartition, VerifiedNativeErasureCheckpoint};
+pub use blocks::{BlockDiscovery, BlockStore, NativeErasureCut, ProducedBlock, PublishedCheckpoint, RecoveredPartition, VerifiedNativeErasureCheckpoint, stage_live_primary};
 pub use checkpoint_admin::{DetachedDefaultCheckpoint, LocalDefaultRestoreSeed};
 pub use driver::{CommittedErasure, ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};

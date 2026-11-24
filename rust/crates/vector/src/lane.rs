@@ -1,4 +1,4 @@
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -61,21 +61,8 @@ impl ArtefactBuilder for Builder {
         let memory = Arc::clone(&self.0.memory);
         let cancel = cancellation.clone();
         let written = tokio::task::spawn_blocking(move || {
-            let mut staging = memory.reserve(0)?;
-            let mut rows = IndexedRows::new(definition.dimensions);
-            read_indexed_rows(source, &definition, &memory, &cancel, &mut rows,
-                Arc::get_mut(&mut staging).expect("generation owns its staging reservation"))?;
-            let training_bytes_per_component = size_of::<f32>() + size_of::<f64>();
-            // The directory's centroid vector grows geometrically as partitions are written.
-            let directory_bytes_per_component = 2 * size_of::<f32>();
-            let work_per_row = definition.dimensions
-                .saturating_mul(training_bytes_per_component + directory_bytes_per_component)
-                .saturating_add(384);
-            let _work = memory.reserve(16_384usize.saturating_add(rows.rows().len().saturating_mul(work_per_row)))?;
             let mut writer = std::io::BufWriter::new(std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?);
-            let written = file::write_generation(rows, &mut writer, &cancel)?;
-            std::io::Write::flush(&mut writer).map_err(fault)?;
-            Ok::<_, Anomaly>(written)
+            write_generation(source, &definition, &memory, &cancel, &mut writer)
         }).await.map_err(fault)??;
         if cancellation.is_cancelled() { return Err(kmeans::cancelled()); }
         let published_version = self.0.store.put_file_with_publication(&key, &output).await?.map(Into::into);
@@ -90,6 +77,41 @@ impl ArtefactBuilder for Builder {
             pack_members: Vec::new(),
         })
     }
+}
+
+fn write_generation(source: impl Read + Seek + Send + 'static, definition: &VectorDefinition,
+    memory: &Arc<MemoryBudget>, cancellation: &CancellationToken, writer: &mut impl Write) -> Result<file::Written> {
+    let mut staging = memory.reserve(0)?;
+    let mut rows = IndexedRows::new(definition.dimensions);
+    read_indexed_rows(source, definition, memory, cancellation, &mut rows,
+        Arc::get_mut(&mut staging).expect("generation owns its staging reservation"))?;
+    let training_bytes_per_component = size_of::<f32>() + size_of::<f64>();
+    let directory_bytes_per_component = 2 * size_of::<f32>();
+    let work_per_row = definition.dimensions
+        .saturating_mul(training_bytes_per_component + directory_bytes_per_component)
+        .saturating_add(384);
+    let _work = memory.reserve(16_384usize.saturating_add(rows.rows().len().saturating_mul(work_per_row)))?;
+    let written = file::write_generation(rows, writer, cancellation)?;
+    writer.flush().map_err(fault)?;
+    Ok(written)
+}
+
+pub fn stage_native_generation(source: std::fs::File, definition: &VectorDefinition,
+    memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<(std::fs::File, ArtefactRecord)> {
+    let mut source = source;
+    source.rewind().map_err(fault)?;
+    let mut target = std::io::BufWriter::new(tempfile::tempfile().map_err(fault)?);
+    let written = write_generation(source, definition, memory, cancellation, &mut target)?;
+    let artefact = definition.artefact();
+    let record = ArtefactRecord {
+        kind: Some(artefact.kind),
+        definition_id: Some(artefact.id),
+        definition_version: Some(artefact.version),
+        stats: Some(written.locator.encode()),
+        file_size: Some(i64::try_from(written.size).map_err(fault)?),
+        ..Default::default()
+    };
+    Ok((target.into_inner().map_err(fault)?, record))
 }
 
 /// Appends the indexable puts of a stored trie file in page order.

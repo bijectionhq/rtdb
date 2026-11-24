@@ -79,6 +79,11 @@ impl Service {
                 let mut features = Vec::new();
                 if self.follower_only() {
                     features.extend(["query", "query.track", "query.page", APPLIED_POSITION, FOLLOWER_PROGRESS].map(str::to_owned));
+                    features.extend([CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS].map(str::to_owned));
+                    #[cfg(feature = "multi")]
+                    if self.follower().is_some_and(|route| route.reader.supports_ranked_ivf()) {
+                        features.push(RANKED_IVF.into());
+                    }
                 } else if call.session.audience_source().is_none() && !call.session.fresh_replica {
                     features.extend(
                         [

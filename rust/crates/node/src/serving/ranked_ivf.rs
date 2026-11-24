@@ -93,13 +93,18 @@ impl Request {
 }
 
 pub struct Catalog {
-    pub(super) target: Target,
-    pub(super) declaration: RankedIndexDeclaration,
-    pub(super) physical: rtdb_types::CatalogCut,
-    pub(super) storage: Arc<BufferPool>,
+    pub(crate) target: Target,
+    pub(crate) declaration: RankedIndexDeclaration,
+    pub(crate) physical: rtdb_types::CatalogCut,
+    pub(crate) storage: Arc<BufferPool>,
+    pub(crate) mounted: bool,
 }
 
 impl Catalog {
+    pub fn mounted_storage(&self) -> Option<&Arc<BufferPool>> {
+        self.mounted.then_some(&self.storage)
+    }
+
     pub async fn execute(
         self,
         context: Arc<QueryContext>,
@@ -191,19 +196,24 @@ impl Catalog {
                 valid: request.valid,
                 filters: &filters,
             };
-            nearest.query(context, &query, &overlay).await
+            if self.mounted {
+                let definition = rtdb_vector::mounted_native_definition(&self.target.table, &self.target.index, &self.declaration)?;
+                nearest.query_mounted(context, &query, &overlay, &definition).await
+            } else {
+                nearest.query(context, &query, &overlay).await
+            }
         }
     }
 }
 
-pub(super) fn unsupported() -> Anomaly {
+pub(crate) fn unsupported() -> Anomaly {
     Anomaly::unsupported(
         "rtdb.vector/native-unsupported",
         format!("The route does not support {RANKED_IVF}"),
     )
 }
 
-pub(super) fn uncovered() -> Anomaly {
+pub(crate) fn uncovered() -> Anomaly {
     Anomaly::new(
         AnomalyCategory::Unavailable,
         "rtdb.vector/native-uncovered",

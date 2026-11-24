@@ -185,7 +185,7 @@ impl ServingDriver for DefaultServing {
         let view = QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
             custody_contributors: Some(BTreeSet::new()), key_generation: selected.key_generation };
         let catalog = ranked_ivf::Catalog { target: target.clone(), declaration: declaration.clone(),
-            physical: catalog_cut, storage: Arc::clone(&self.storage) };
+            physical: catalog_cut, storage: Arc::clone(&self.storage), mounted: false };
         Ok((view, catalog))
     }
 

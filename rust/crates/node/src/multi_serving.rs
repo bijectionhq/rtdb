@@ -21,6 +21,8 @@ use crate::serving::{
 };
 use crate::{Database, DatabaseCatalog};
 
+mod ranked;
+
 pub(crate) struct MultiSqlDelivery {
     pub(crate) catalog: Arc<DatabaseCatalog>,
     pub(crate) attachment: Weak<Database>,
@@ -53,6 +55,7 @@ pub struct MultiServing {
     tokens: TokenAuthority,
     memory: Arc<MemoryBudget>,
     route: Option<Arc<dyn MultiWriteRoute>>,
+    ranked_schedule: Mutex<Option<(Basis, Instant)>>,
 }
 
 pub struct MultiFollower {
@@ -69,6 +72,42 @@ pub struct MultiFollowerProgress {
 impl MultiFollower {
     pub fn matches_driver(&self, driver: &dyn ServingDriver) -> bool {
         std::ptr::addr_eq(Arc::as_ptr(&self.serving) as *const dyn ServingDriver, driver)
+    }
+
+    pub fn supports_ranked_ivf(&self) -> bool {
+        self.serving.supports_ranked_ivf()
+    }
+
+    pub async fn query_ranked_ivf(&self, source: QuerySource, target: &crate::serving::ranked_ivf::Target,
+        now: Timestamp, observe_progress: bool, cancellation: &CancellationToken,
+    ) -> Result<(QueryView, crate::serving::ranked_ivf::Catalog, Option<MultiFollowerProgress>)> {
+        if !self.supports_ranked_ivf() { return Err(crate::serving::ranked_ivf::unsupported()); }
+        let (view, catalog) = self.serving.ranked_query(source, target, now, Some(&self.owner), cancellation).await?;
+        let progress = self.progress(view.cut, observe_progress, cancellation).await?;
+        Ok((view, catalog, progress))
+    }
+
+    pub async fn query_ranked_artefacts(&self, database: &str, source: QuerySource, now: Timestamp,
+        observe_progress: bool, cancellation: &CancellationToken,
+    ) -> Result<(QueryView, Option<MultiFollowerProgress>)> {
+        let view = self.serving.ranked_artefacts(database, source, now, Some(&self.owner), cancellation).await?;
+        let progress = self.progress(view.cut, observe_progress, cancellation).await?;
+        Ok((view, progress))
+    }
+
+    async fn progress(&self, cut: BranchCut, observe: bool, cancellation: &CancellationToken)
+        -> Result<Option<MultiFollowerProgress>> {
+        if !observe { return Ok(None); }
+        cancellation.run_until_cancelled(async {
+            let mut database = self.serving.database.lock().await;
+            let (index, _) = database.follower_view(&self.owner)?;
+            let applied_position = index.applied_position(cut)?;
+            let (writer_head, writer_head_position) = database.follower_writer_head(&self.owner).await?;
+            if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
+            }
+            Ok(Some(MultiFollowerProgress { applied_position, writer_head, writer_head_position }))
+        }).await.ok_or_else(interrupted)?
     }
 
     pub async fn query(
@@ -88,14 +127,7 @@ impl MultiFollower {
                 } else { error }
             })?;
             let cut = view.cut();
-            let progress = if observe_progress {
-                let applied_position = index.applied_position(cut)?;
-                let (writer_head, writer_head_position) = self.serving.database.lock().await.follower_writer_head(&self.owner).await?;
-                if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
-                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
-                }
-                Some(MultiFollowerProgress { applied_position, writer_head, writer_head_position })
-            } else { None };
+            let progress = self.progress(cut, observe_progress, cancellation).await?;
             let snapshot = rtdb_query::branch_snapshot(&view, &self.serving.memory)?;
             Ok((QueryView {
                 snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
@@ -261,6 +293,7 @@ impl MultiServing {
             writes,
             memory,
             route: None,
+            ranked_schedule: Mutex::new(None),
         }
     }
 
@@ -379,6 +412,19 @@ impl ServingDriver for MultiServing {
     }
 
     fn supports_row_visibility(&self) -> bool { true }
+
+    fn supports_ranked_ivf(&self) -> bool { cfg!(feature = "search") }
+
+    async fn query_ranked_ivf(&self, source: QuerySource, target: &crate::serving::ranked_ivf::Target,
+        now: Timestamp, cancellation: &CancellationToken) -> Result<(QueryView, crate::serving::ranked_ivf::Catalog)> {
+        if !self.supports_ranked_ivf() { return Err(crate::serving::ranked_ivf::unsupported()); }
+        self.ranked_query(source, target, now, None, cancellation).await
+    }
+
+    async fn query_ranked_artefacts(&self, database: &str, source: QuerySource, now: Timestamp,
+        cancellation: &CancellationToken) -> Result<QueryView> {
+        self.ranked_artefacts(database, source, now, None, cancellation).await
+    }
 
     async fn query_scoped(&self, source: QuerySource, track: bool, now: Timestamp,
                           scope: &ServingScope, cancellation: &CancellationToken) -> Result<QueryView> {
@@ -860,6 +906,101 @@ mod tests {
         follower.replay_follower().await.unwrap();
         assert_eq!(follower.database.lock().await.role(), Role::Follower);
         assert!(matches!(follower.tick(&live).await.unwrap(), Role::Writer(_)));
+    }
+
+    #[cfg(feature = "search")]
+    #[tokio::test]
+    async fn multi_ivf_mounts_the_writer_catalogue_and_rebuilds_at_the_restored_basis() {
+        use crate::serving::ranked_ivf::{Request, Target};
+        use rtdb_index::branches::{RankedIndexDefinition, RankedIndexKind};
+        use rtdb_tx::transact::Declaration;
+
+        let journal = MemoryJournal::default();
+        let node = IpAddr::from([127, 0, 0, 1]);
+        let store = Arc::new(MemoryStore::default());
+        let kms = Arc::new(LocalKms::new(|| 10));
+        let memory = MemoryBudget::new(64 << 20);
+        let cancel = CancellationToken::new();
+        let open = |id| MultiDatabase::new(
+            MultiOptions { database: Uuid::from_u128(id), node, lease_micros: 100, drift_micros: 1 },
+            Arc::new(journal.handle(Identity::from_static("urn:rtdb:test:1"))),
+            store.clone(), kms.clone(), Arc::new(|| Timestamp(10)),
+        ).unwrap();
+        let proposal = open(1);
+        proposal.create().await.unwrap();
+        let writer = MultiServing::new(proposal, Arc::clone(&memory));
+        writer.tick(&BTreeSet::from([node])).await.unwrap();
+
+        let table = TableRef::new("public", "notes");
+        let mut declaration = write(1, "", None);
+        declaration.ops = vec![Op::Declare {
+            table: table.clone(),
+            change: Declaration::RankedIndex {
+                name: "notes_ivf".into(),
+                definition: RankedIndexDefinition {
+                    columns: vec!["embedding".into()],
+                    kind: RankedIndexKind::Ivf { dimensions: 2, recall_bits: 0.95f64.to_bits() },
+                },
+            },
+        }];
+        let declared = writer.transact(declaration, &cancel).await.unwrap();
+        assert_eq!(declared.outcome, Outcome::Then);
+        let target = Target { table, index: "notes_ivf".into(), generation: declared.basis.position() };
+        let mut rows = write(2, "one", None);
+        let Op::Put { rows: stored, .. } = &mut rows.ops[0] else { panic!() };
+        stored[0].valid = Some(Interval::ALL.into());
+        stored[0].cells.insert("embedding".into(), Cell::Value(Value::list(vec![Value::F32(1.0), Value::F32(0.0)])));
+        let written = writer.transact(rows, &cancel).await.unwrap();
+        assert_eq!(written.outcome, Outcome::Then);
+        let source = |basis| QuerySource { branch: MAIN_BRANCH.into(), at: At::Exactly(basis), layer: Layer::Merged };
+        assert_eq!(
+            writer.query_ranked_ivf(source(written.basis), &target, Timestamp(10), &cancel).await.err().unwrap().code,
+            "rtdb.vector/native-uncovered",
+        );
+        *writer.ranked_schedule.lock().await = Some((written.basis, Instant::now()));
+        writer.maintain_ranked_catalog(&cancel).await.unwrap();
+
+        let follower = Arc::new(MultiServing::new(open(1), Arc::clone(&memory)));
+        let assigned = follower.assign_follower().await.unwrap();
+        let (view, physical, progress) = assigned.query_ranked_ivf(
+            source(written.basis), &target, Timestamp(10), true, &cancel,
+        ).await.unwrap();
+        assert_eq!(progress.unwrap().applied_position, written.basis.position());
+        let catalog = CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
+            partitions: vec![view.snapshot], storage: physical.mounted_storage().unwrap().clone(),
+        })]), false).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), view.cut.system_time, "UTC", QueryOptions::default(), &cancel)
+            .unwrap().with_wire_cut(view.cut.system_time, view.cut.system_time.into()).unwrap();
+        let (mut cursor, count, approximate) = physical.execute(context, Request {
+            target: target.clone(), valid: Timestamp(10), k: 1, probe: vec![1.0, 0.0], filters: Vec::new(), staged: Vec::new(),
+        }).await.unwrap();
+        assert_eq!(count, 1);
+        assert!(!approximate);
+        assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+        let (ready, _) = assigned.query_ranked_artefacts("xtdb", source(written.basis), Timestamp(10), false, &cancel).await.unwrap();
+        let catalog = CatalogSnapshot::new("xtdb", std::collections::BTreeMap::from([("xtdb".into(), DatabaseSnapshot {
+            partitions: vec![ready.snapshot], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+        })]), false).unwrap();
+        let ready_sql = rtdb_sql::prepare_in("SELECT artefacts_ready FROM xt.ranked_indexes", &catalog, &Default::default(), &memory).unwrap();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), ready.cut.system_time, "UTC", QueryOptions::default(), &cancel).unwrap();
+        let mut readiness = PreparedQuery::from_prepared(ready_sql, &memory).unwrap().execute(context, Vec::new()).await.unwrap();
+        let batch = readiness.next_batch().await.unwrap().unwrap();
+        assert_eq!(rtdb_columnar::read_value(batch.batch().schema().field(0), batch.batch().column(0).as_ref(), 0).unwrap(), Value::Bool(true));
+
+        let ticket = writer.export_checkpoint(Uuid::from_u128(9), written.basis, None, &cancel).await.unwrap();
+        let export = writer.open_checkpoint_export(ticket, &cancel).await.unwrap();
+        let destination = open(2);
+        destination.create().await.unwrap();
+        let destination = MultiServing::new(destination, Arc::clone(&memory));
+        destination.tick(&BTreeSet::from([node])).await.unwrap();
+        let restored = destination.restore_checkpoint(export, &cancel).await.unwrap();
+        assert_eq!(restored.basis.incarnation(), *Uuid::from_u128(2).as_bytes());
+        assert!(destination.query_ranked_ivf(source(restored.basis), &target, Timestamp(10), &cancel).await.is_err());
+        *destination.ranked_schedule.lock().await = Some((restored.basis, Instant::now()));
+        destination.maintain_ranked_catalog(&cancel).await.unwrap();
+        let (view, _) = destination.query_ranked_ivf(source(restored.basis), &target, Timestamp(10), &cancel).await.unwrap();
+        assert_eq!(view.cut, restored);
+        assert!(destination.query_ranked_ivf(source(written.basis), &target, Timestamp(10), &cancel).await.is_err());
     }
 
     #[tokio::test]

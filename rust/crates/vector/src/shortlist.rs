@@ -121,10 +121,17 @@ impl Shortlist {
         let Some(definition) = crate::readiness::native_definition(context, table, name, declaration).await? else {
             return Ok(None);
         };
-        if probe.len() != definition.dimensions { return Ok(None); }
+        Self::open_mounted(context, bounds, &definition, probe, limit, partition).await
+    }
+
+    pub async fn open_mounted(context: &Arc<QueryContext>, bounds: TemporalBounds, definition: &VectorDefinition,
+        probe: Vec<f32>, limit: usize, partition: Option<Partition>) -> Result<Option<Self>> {
+        if !(bounds.valid_time.is_point() && bounds.system_time.is_point()) || probe.len() != definition.dimensions {
+            return Ok(None);
+        }
         let budget = Budget { max_uncovered_bytes: 0, ..Budget::default() };
         let mut opened = Vec::new();
-        let covered = crate::readiness::visit_native_generations(context, &definition, Some(bounds), |bytes, directory| {
+        let covered = crate::readiness::visit_native_generations(context, definition, Some(bounds), |bytes, directory| {
             if let Some(generation) = Opened::rank(GenerationRead::Verified(bytes), &directory, &probe, partition, &context.memory)? {
                 opened.push(generation);
             }

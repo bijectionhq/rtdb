@@ -852,7 +852,28 @@ impl MultiRuntime {
     }
 
     async fn drive_databases(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
-        drive_multi(stop, async || self.tick(node).await).await
+        let maintenance = stop.child_token();
+        let result = tokio::try_join!(
+            async {
+                let result = drive_multi(stop, async || self.tick(node).await).await;
+                maintenance.cancel();
+                result
+            },
+            drive_multi(&maintenance, async || {
+                let databases = self.databases.read().expect("Multi serving catalog")
+                    .values().cloned().collect::<Vec<_>>();
+                for driver in databases {
+                    match driver.maintain_ranked_catalog(&maintenance).await {
+                        Err(error) if !matches!(error.code.as_str(), "rtdb/no-writer" | "rtdb/interrupted") => {
+                            eprintln!("Multi ranked catalogue publication deferred: {error}");
+                        }
+                        _ => (),
+                    }
+                }
+                Ok(())
+            }),
+        );
+        result.map(|_| ())
     }
 
     async fn tick(&self, node: &Node) -> Result<()> {

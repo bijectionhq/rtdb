@@ -43,14 +43,24 @@ An unversioned record can match an unversioned read under its captured owner and
 Terminal publications need a same-read terminal observation before they can pass this check.
 An empty persisted inventory, a live tail, missing or invalid objects, unmatched cuts, and routes without this association report false.
 
-## Multi prerequisites
+## Multi publication and mount
 
-`MultiDatabase::fresh_view` supplies a committed `BranchIndex` and key generation, from which `MultiServing::query` constructs a live branch snapshot.
-The native Multi checkpoint manifest doesn't supply the selected primary trie catalogue and its artefact inventory to that Query path.
-The Multi writer needs to project the ordered native IVF declaration into its own persisted build catalogue and publish the primary tries and their funded IVF generations under the deployment's fenced writer and storage generation.
-The committed publication must bind the deployment incarnation, branch cut and clock, exact primary ownership, and per-trie generation addresses, lengths, locators and provider versions.
-The Multi reader needs an exact-cut capture of that publication, the matching storage-generation grant, and a retained catalogue read that covers primary resolution, artefact probing and delivery under Multi's retention and key authority.
-Until those dependencies are installed, Multi serves the exact branch-fold query and omits `query.ranked-ivf`.
+The Multi writer selects a settled merged-main basis and its ordered IVF declarations.
+Maintenance waits for a stable cut before staging primary level-zero tries and their IVF files with the common Arrow writers.
+The writer seals each file into its own allocation at the selected storage key generation and commits the complete manifest under its journal epoch.
+The publication binds the database incarnation, basis, system clock, declaration generations, primary owners, lengths, IVF locators and provider versions.
+The journal retains that root with its files until trim.
+Reopening an existing incarnation can recover the publication from the journal.
+Restore into a fresh incarnation rebuilds the physical catalogue from the restored fold and publishes under the destination's own epoch and key generation.
+
+An unscoped exact merged-main read mounts only a publication for its selected cut and current key generation.
+The query retains the authenticated primary and IVF bytes in a bounded read region through execution and delivery.
+Readiness validates the primary file layout and every current-trie IVF generation for the selected declaration.
+An IVF Query uses those primary tries to resolve the probed candidates at the same cut.
+Delivery checks the selected key generation and the serving attachment.
+An assigned follower mounts the publication from its locally applied prefix, and optional follower progress describes the same selected cut.
+Unpublished cuts, empty primary inventories and unreadable, mismatched or unsupported publications report false for readiness and refuse explicit IVF.
+The readiness row still describes exact SQL independently of the separately negotiated IVF execution.
 
 ## Reading the catalogue
 

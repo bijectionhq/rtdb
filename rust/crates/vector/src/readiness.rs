@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rtdb_index::{TrieState, branches::{RankedIndexDeclaration, RankedIndexKind}};
 use rtdb_query::QueryContext;
 use rtdb_storage::{ObjectKey, cache::CacheLease};
-use rtdb_types::{Result, TableRef, TemporalBounds};
+use rtdb_types::{Anomaly, Result, TableRef, TemporalBounds};
 
 use crate::{definition::{self, VectorDefinition}, file::{Directory, Locator, verified_directory}};
 
@@ -29,6 +29,30 @@ pub(crate) async fn native_definition(
         i64::try_from(declaration.position).ok() == Some(definition.generation)
             && *dimensions as usize == definition.dimensions && *recall_bits == definition.approximate.recall.to_bits()
             && column == &definition.column && partition == definition.partition.as_slice()))
+}
+
+pub fn mounted_native_definition(table: &TableRef, name: &str,
+    declaration: &RankedIndexDeclaration) -> Result<VectorDefinition> {
+    let RankedIndexKind::Ivf { dimensions, recall_bits } = declaration.definition.kind else {
+        return Err(Anomaly::fault("rtdb.vector/native-catalog", "The mounted definition is not IVF"));
+    };
+    let (column, partition) = declaration.definition.columns.split_first()
+        .ok_or_else(|| Anomaly::fault("rtdb.vector/native-catalog", "The mounted definition has no vector column"))?;
+    let generation = i64::try_from(declaration.position)
+        .map_err(|_| Anomaly::fault("rtdb.vector/native-catalog", "The mounted declaration generation exceeds the file format"))?;
+    Ok(VectorDefinition {
+        name: format!("{name}~native"),
+        table: table.clone(),
+        column: column.clone(),
+        partition: partition.to_vec(),
+        dimensions: dimensions as usize,
+        approximate: crate::Approximate::new(crate::Method::Ivf, f64::from_bits(recall_bits))?,
+        generation,
+    })
+}
+
+pub async fn mounted_native_ready(context: &Arc<QueryContext>, definition: &VectorDefinition) -> Result<bool> {
+    visit_native_generations(context, definition, None, |_, _| Ok(())).await
 }
 
 pub(crate) async fn visit_native_generations(

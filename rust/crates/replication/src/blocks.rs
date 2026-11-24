@@ -812,6 +812,33 @@ fn write_node<'a>(node: &'a TrieNode, pages: &'a BlockPages<'a>, memory: &'a Arc
     })
 }
 
+pub async fn stage_live_primary(
+    live: &rtdb_index::LiveTable, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<(CatalogTrie, std::fs::File, Bytes)> {
+    let temporary = tempfile::tempfile().map_err(io_error)?;
+    let mut writer = None;
+    let mut metadata = MetadataBuilder::new(false, false);
+    let mut retained = Vec::new();
+    let pages = live.block_pages(memory)?;
+    write_node(live.trie().root(), &pages, memory, &temporary, &mut writer, &mut metadata, &mut retained, cancellation).await?;
+    let file = writer.ok_or_else(|| invalid("Nonempty primary produced no pages"))?.finish()?;
+    let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
+    let charge = memory.reserve(metadata.serialization_bound()?)?;
+    let (metadata, summary) = metadata.finish()?;
+    let trie = CatalogTrie::notification(TrieKey::l0(live.block_index())?, size, Some(summary))?;
+    let bytes = metadata.write()?;
+    Ok((trie, file, Bytes::from_owner(PrimaryMetadata { bytes, _charge: charge })))
+}
+
+struct PrimaryMetadata {
+    bytes: Vec<u8>,
+    _charge: Arc<MemoryReservation>,
+}
+
+impl AsRef<[u8]> for PrimaryMetadata {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
 fn l0_details<'a>(block: &'a TableBlock, key: &'a str) -> impl Iterator<Item = &'a proto::TrieDetails> {
     block.trie_details().filter(move |detail| detail.trie_key.as_deref().is_some_and(|recorded| recorded.eq_ignore_ascii_case(key)))
 }

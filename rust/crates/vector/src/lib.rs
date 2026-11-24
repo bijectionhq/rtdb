@@ -15,8 +15,8 @@ mod rows;
 
 pub use accelerate::{PREDICATE, VectorAccelerator};
 pub use definition::{Approximate, DEFINITIONS, KIND, Method, VectorDefinition, definitions_in, owned_definition};
-pub use lane::VectorArtefacts;
-pub use readiness::committed_native_ready;
+pub use lane::{VectorArtefacts, stage_native_generation};
+pub use readiness::{committed_native_ready, mounted_native_definition, mounted_native_ready};
 pub use rows::Partition;
 pub use shortlist::{Budget, Cut, Round, Shortlist, declined};
 

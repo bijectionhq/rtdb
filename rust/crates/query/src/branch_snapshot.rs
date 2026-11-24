@@ -19,23 +19,32 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
 pub fn branch_snapshot_with_ranked_artefacts(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>,
 ) -> Result<Snapshot> {
-    snapshot(view, memory, ready, |image| {
-        if image.custody_payload.is_some() {
-            return Err(Anomaly::unsupported("rtdb/row-custody", "The query route has no protected value reader"));
-        }
-        Ok(image.cells.clone())
-    })
+    snapshot(view, memory, ready, None, clear_image)
+}
+
+pub fn branch_primary_snapshot(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, tables: &BTreeSet<TableRef>,
+) -> Result<Snapshot> {
+    snapshot(view, memory, &BTreeSet::new(), Some(tables), clear_image)
+}
+
+fn clear_image(image: &RowImage) -> Result<StructFields<Value>> {
+    if image.custody_payload.is_some() {
+        return Err(Anomaly::unsupported("rtdb/row-custody", "The query route has no protected value reader"));
+    }
+    Ok(image.cells.clone())
 }
 
 pub fn branch_snapshot_with(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>,
     open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
 ) -> Result<Snapshot> {
-    snapshot(view, memory, &BTreeSet::new(), open_image)
+    snapshot(view, memory, &BTreeSet::new(), None, open_image)
 }
 
 fn snapshot(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>, ready: &BTreeSet<&str>,
+    selected_tables: Option<&BTreeSet<TableRef>>,
     mut open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
 ) -> Result<Snapshot> {
     let tables = Arc::new(TableCatalog::default());
@@ -43,6 +52,7 @@ fn snapshot(
     let mut live = Arc::new(LiveIndex::new(BlockIndex(0), None, TrieConfig::default()));
     let mut events = BTreeMap::new();
     for (table, _) in view.tables() {
+        if selected_tables.is_some_and(|tables| !tables.contains(table)) { continue; }
         for id in view.ids(table) {
             for event in view.history(table, id) {
                 let target: &mut Vec<_> = events.entry(event.cut.basis).or_default();
@@ -80,17 +90,20 @@ fn snapshot(
         }
         if basis == head.basis {
             for (table, definition) in view.tables() {
+                if selected_tables.is_some_and(|tables| !tables.contains(table)) { continue; }
                 let mut columns = definition.columns.clone();
                 columns.insert(WRITTEN_BASIS_COLUMN.into(), LogicalType::Scalar(ScalarType::Binary));
                 buffer.declare_table(table.clone(), columns.keys().cloned())?;
                 buffer.declare_document_types(table, &columns)?;
             }
-            append_lineage(view, &mut buffer)?;
-            append_ordered_indexes(view, &mut buffer)?;
-            append_ranked_indexes(view, &mut buffer, ready)?;
-            append_count_constraints(view, &mut buffer)?;
-            append_custody_inventory(view, &mut buffer)?;
-            append_custody_placements(view, &mut buffer)?;
+            if selected_tables.is_none() {
+                append_lineage(view, &mut buffer)?;
+                append_ordered_indexes(view, &mut buffer)?;
+                append_ranked_indexes(view, &mut buffer, ready)?;
+                append_count_constraints(view, &mut buffer)?;
+                append_custody_inventory(view, &mut buffer)?;
+                append_custody_placements(view, &mut buffer)?;
+            }
         }
         live = Arc::new(live.apply(&buffer.stage()?)?);
     }

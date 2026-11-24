@@ -8,7 +8,7 @@ use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, FloatComponent, Iid, Interval, LogicalType, Result,
     ScalarType, TableRef, TemporalBounds, TimeUnit, Timestamp, Value,
 };
-use rtdb_vector::{Cut, Partition, Round, Shortlist};
+use rtdb_vector::{Cut, Partition, Round, Shortlist, VectorDefinition};
 
 use super::{
     HeldVectorOverlay, MAX_NEAREST_FILTERS, NearestQuery, NearestWindow, identity_charge,
@@ -30,11 +30,21 @@ impl NativeNearest<'_> {
         query: &NearestQuery,
         overlay: &HeldVectorOverlay,
     ) -> Result<(QueryCursor, usize, bool)> {
+        self.query_in(context, query, overlay, None).await
+    }
+
+    pub async fn query_mounted(&self, context: Arc<QueryContext>, query: &NearestQuery, overlay: &HeldVectorOverlay,
+        definition: &VectorDefinition) -> Result<(QueryCursor, usize, bool)> {
+        self.query_in(context, query, overlay, Some(definition)).await
+    }
+
+    async fn query_in(&self, context: Arc<QueryContext>, query: &NearestQuery, overlay: &HeldVectorOverlay,
+        mounted: Option<&VectorDefinition>) -> Result<(QueryCursor, usize, bool)> {
         if self.filters.len() != query.filter_count() {
             return Err(native_uncovered());
         }
         let context = context.with_plaintext();
-        context.reading(self.rank(&context, query, overlay)).await
+        context.reading(self.rank(&context, query, overlay, mounted)).await
     }
 
     async fn rank(
@@ -42,6 +52,7 @@ impl NativeNearest<'_> {
         context: &Arc<QueryContext>,
         query: &NearestQuery,
         overlay: &HeldVectorOverlay,
+        mounted: Option<&VectorDefinition>,
     ) -> Result<(QueryCursor, usize, bool)> {
         let database = context
             .catalog
@@ -72,18 +83,11 @@ impl NativeNearest<'_> {
             .memory
             .reserve(query.dimensions() * size_of::<f32>())?;
         let probe = rtdb_vector::unit_probe(&query.probe).ok_or_else(native_uncovered)?;
-        let Some(mut shortlist) = Shortlist::open_native(
-            context,
-            bounds,
-            self.table,
-            self.index,
-            self.declaration,
-            probe,
-            query.k,
-            partition,
-        )
-        .await?
-        else {
+        let shortlist = match mounted {
+            Some(definition) => Shortlist::open_mounted(context, bounds, definition, probe, query.k, partition).await?,
+            None => Shortlist::open_native(context, bounds, self.table, self.index, self.declaration, probe, query.k, partition).await?,
+        };
+        let Some(mut shortlist) = shortlist else {
             return Err(native_uncovered());
         };
         loop {

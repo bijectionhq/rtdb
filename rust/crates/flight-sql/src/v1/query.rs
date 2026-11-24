@@ -37,6 +37,20 @@ use super::{
     trailer,
 };
 
+#[cfg(feature = "multi")]
+fn follower_progress(route: &crate::follower::FollowerRoute, progress: Option<rtdb_node::MultiFollowerProgress>)
+    -> Option<(u64, proto::FollowerProgress)> {
+    progress.map(|progress| (progress.applied_position, proto::FollowerProgress {
+        database: route.assignment.database.clone(),
+        incarnation: route.assignment.incarnation.as_bytes().to_vec(),
+        placement_epoch: route.assignment.placement_epoch,
+        assignment: route.assignment.assignment.as_bytes().to_vec(),
+        endpoint: route.endpoint.to_string(),
+        writer_head: Some(progress.writer_head.into()),
+        writer_head_position: progress.writer_head_position,
+    }))
+}
+
 #[derive(Default)]
 pub(super) struct PlanCache(Mutex<VecDeque<(uuid::Uuid, PreparedSql)>>);
 
@@ -120,18 +134,12 @@ impl Service {
     ) -> Result<(QueryView, Option<(u64, proto::FollowerProgress)>), Status> {
         #[cfg(feature = "multi")]
         if let Some(route) = self.follower() {
-            let (view, progress) = route.reader.query(source.at, now, request.observe_applied_position, &call.cancellation)
-                .await.map_err(error::follower)?;
-            let progress = progress.map(|progress| (progress.applied_position, proto::FollowerProgress {
-                database: route.assignment.database.clone(),
-                incarnation: route.assignment.incarnation.as_bytes().to_vec(),
-                placement_epoch: route.assignment.placement_epoch,
-                assignment: route.assignment.assignment.as_bytes().to_vec(),
-                endpoint: route.endpoint.to_string(),
-                writer_head: Some(progress.writer_head.into()),
-                writer_head_position: progress.writer_head_position,
-            }));
-            return Ok((view, progress));
+            let (view, progress) = if request.verify_ranked_artefacts {
+                route.reader.query_ranked_artefacts(&call.database, source, now, request.observe_applied_position, &call.cancellation).await
+            } else {
+                route.reader.query(source.at, now, request.observe_applied_position, &call.cancellation).await
+            }.map_err(error::follower)?;
+            return Ok((view, follower_progress(route, progress)));
         }
         let view = match visibility {
             Some(scope) => driver.query_scoped(source, request.track, now, scope, &call.cancellation).await,
@@ -139,6 +147,20 @@ impl Service {
             None => driver.query(source, false, now, &call.cancellation).await,
         }.map_err(error::anomaly)?;
         Ok((view, None))
+    }
+
+    async fn ranked_view(&self, call: &Call, driver: &dyn ServingDriver, source: QuerySource,
+        target: &ranked_ivf::Target, now: Timestamp, observe: bool,
+    ) -> Result<(QueryView, ranked_ivf::Catalog, Option<(u64, proto::FollowerProgress)>), Status> {
+        #[cfg(feature = "multi")]
+        if let Some(route) = self.follower() {
+            let (view, catalog, progress) = route.reader.query_ranked_ivf(source, target, now, observe, &call.cancellation)
+                .await.map_err(error::follower)?;
+            return Ok((view, catalog, follower_progress(route, progress)));
+        }
+        let _ = observe;
+        let (view, catalog) = driver.query_ranked_ivf(source, target, now, &call.cancellation).await.map_err(error::anomaly)?;
+        Ok((view, catalog, None))
     }
 
     pub(super) async fn v1_query(
@@ -242,7 +264,7 @@ impl Service {
             if matches!(selection, Some(Selection::Linearizable(_) | Selection::AsOfMicros(_))) {
                 return Err(error::unsupported("query.follower-source"));
             }
-            if request.observe_receiver_clock || request.custody_release_evidence || request.verify_ranked_artefacts {
+            if request.observe_receiver_clock || request.custody_release_evidence {
                 return Err(error::unsupported("query.follower-authority"));
             }
         }
@@ -267,7 +289,7 @@ impl Service {
             return Err(error::unsupported(super::RANKED_ARTEFACT_READINESS));
         }
         if request.ranked_ivf.is_some() {
-            if self.follower_only() || !request.require_clear_rank_input
+            if !request.require_clear_rank_input
                 || source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || claim_layer != Layer::Merged
                 || driver.is_none_or(|driver| !driver.supports_ranked_ivf())
             {
@@ -343,15 +365,20 @@ impl Service {
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
             let (view, follower_evidence) = if let Some(ranked) = &ranked_ivf {
-                let (view, catalog) = driver.query_ranked_ivf(query_source, &ranked.target, now, &call.cancellation)
-                    .await.map_err(error::anomaly)?;
+                let (view, catalog, progress) = self.ranked_view(call, driver, query_source, &ranked.target, now, request.observe_applied_position).await?;
                 ranked_catalog = Some(catalog);
-                (view, None)
+                (view, progress)
             } else {
                 self.query_view(call, driver, query_source, visibility.as_ref(), &request, now).await?
             };
             let cut = view.cut.system_time;
-            let (context, clock) = if visibility.is_some() {
+            let mounted = ranked_catalog.as_ref().and_then(ranked_ivf::Catalog::mounted_storage);
+            let (context, clock) = if let Some(storage) = mounted {
+                let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(storage) };
+                let context = self.scoped_wire_context(call, snapshot, cut)?
+                    .with_wire_cut(cut, cut.into()).map_err(error::anomaly)?;
+                (context, cut)
+            } else if visibility.is_some() {
                 let clock = continuation.map_or(now, |page| page.clock);
                 let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
                 let context = self.scoped_wire_context(call, snapshot, clock)?

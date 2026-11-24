@@ -36,6 +36,8 @@ entity ProbePlan {
 -- An owned Root relation declares its approximate vector path with `rtdb.owned.DeclareVectorPath.v1` in the principal's `.vector-paths` catalog, with the same fields; its partition is the relation.
 -- The method name and the generation file layout participate in every artefact address.
 -- The Default shared-main projection supplies native IVF declarations to the existing generation writer.
+-- The Multi writer publishes the exact merged-main primary trie inventory and its native IVF files together under the fenced storage generation.
+-- Restore rebuilds that inventory at the destination basis under the destination writer and key generation.
 -- Native readiness at the installed exact cut reopens every current-trie file for the declared generation and validates its directory and clusters.
 -- The permitted exact SQL route reports approximate false.
 -- COSINE_DISTANCE_F32 evaluates equal-dimension float32 vectors in component order with binary64 products and sums.
@@ -88,6 +90,7 @@ entity ProbePlan {
 --
 -- An explicit ranked IVF Query selects one declared generation at a tracked clear exact cut.
 -- The reader retains the current primary catalogue paired with the native cut and opens every current-trie generation with the recorded provider identity.
+-- The Multi reader verifies the encrypted publication and retains the authenticated bytes through candidate resolution and delivery.
 -- The shortlist probes slices of the verified bytes held by that reader.
 -- The reader requires complete persisted inventory and a covered temporal point.
 -- Each round resolves the candidate IIDs at that cut, masks stored rows by complete typed identity, and filters the surviving rows and staged replacements before applying k.

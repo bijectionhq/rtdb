@@ -94,6 +94,8 @@ surface StatelessDatabase {
     @guarantee RankedIvfQuery
         -- The negotiated ranked IVF query names one table, index and declaration generation at the tracked clear exact merged-main cut.
         -- A serving reader proves the generation against its retained primary catalogue and resolves the selected candidates at that same cut.
+        -- Multi admits a writer-published catalogue for the exact incarnation, merged-main basis, clock and readable storage key generation.
+        -- An assigned follower selects the catalogue in its applied prefix and retains it through delivery.
         -- Staged masks compare complete typed identities and filters constrain the effective candidate set before the zero-offset window.
         -- The trailer carries the executed generation, scored candidate count and approximation status with the basis and claim.
         -- A route advertises ranked IVF execution when its owner can capture and retain the paired physical catalogue.
