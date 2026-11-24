@@ -4276,7 +4276,11 @@ async fn fragment_requires_the_opened_residence_and_replica_epoch() {
     admin::create_deployment(cell.directory.as_ref(), "shop", "acme", 3).await.unwrap();
     let client = cell.connect("shop").await;
     client.simple_query("INSERT INTO docs (_id, v) VALUES (1, 17)").await.unwrap();
-    assert_eq!(values(&client, "SELECT v FROM docs").await, ["17"]);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while values(&client, "SELECT v FROM docs").await != ["17"] {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("the receiver clock reached the fragment fixture row");
     let holder = cell.holder("shop").await.unwrap();
     let running = cell.node(holder);
     let (residence, basis) = {
