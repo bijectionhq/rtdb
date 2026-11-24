@@ -25,7 +25,7 @@ use crate::{ArrowDocuments, SourceTransaction, SubmitOptions, TransactionResult,
 mod hosted_control;
 mod prepared_landing;
 mod prepared_landing_basis;
-pub(crate) use prepared_landing::PreparedLanding;
+pub(crate) use prepared_landing::{PreparedLanding, is_landing as is_prepared_landing};
 mod constraint_receipt;
 mod control_order;
 mod schedule_order;
@@ -352,21 +352,19 @@ impl TxResolver {
         let selected_time = clock_request.select(self.previous_system_time(), log_time.0, default_time.0);
         let key = TransactionKey {
             tx_id: TxId(position.0),
-            system_time: match &slot_time {
-                Ok(Some(reading)) => *reading,
-                Ok(None) => Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
-                Err(_) => default_time,
-            },
+            system_time: Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
         };
+        let terms_time = slot_time.as_ref().ok().copied().flatten().unwrap_or(key.system_time);
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
         let placement = if selected_time.is_ok() && slot_time.is_ok() {
-            request.place_owned_periods(key.system_time, placed_periods)
-                .and_then(|()| request.place_proposal_keys(key.system_time, placed_periods))
+            request.place_owned_periods(terms_time, placed_periods)
+                .and_then(|()| request.place_proposal_keys(terms_time, placed_periods))
         } else {
             Ok(())
         };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+        tx.terms_time = terms_time;
         tx.decision = decision;
         tx.trace_parent = span.as_ref().map(|span| span.context());
         let replay = match &request.guard {
@@ -517,6 +515,7 @@ impl TxResolver {
         if constraint_failed && !refusal.is_empty() {
             drop(tx);
             tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+            tx.terms_time = terms_time;
             tx.decision = decision;
             tx.trace_parent = span.as_ref().map(|span| span.context());
             outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
@@ -602,6 +601,10 @@ impl TxResolver {
 
     fn history_time(&self, appended: Timestamp) -> Timestamp {
         Timestamp(crate::system_time::historical_time(self.previous_system_time(), appended.0))
+    }
+
+    pub fn prepared_publication_key(&self, position: SourcePosition, appended: Timestamp) -> Result<TransactionKey> {
+        Ok(TransactionKey { tx_id: TxId(position.0), system_time: self.owned_publication_time(appended)? })
     }
 
     fn owned_publication_time(&self, candidate: Timestamp) -> Result<Timestamp> {
@@ -712,15 +715,16 @@ pub struct OpenTransaction<'a> {
     bounded_period_writes: BTreeMap<(rtdb_types::OwnedRelation, rtdb_types::EntityId), Arc<MemoryReservation>>,
     hosted_replay: Option<crate::hosted_control::HostedReplay>,
     decision: Option<crate::DecisionObservation>,
+    terms_time: Timestamp,
 }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, decision: None })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None, unique_changes: OwnedUniqueChanges::default(), capacity_changes: OwnedCapacityChanges::default(), owned_worlds: BTreeMap::new(), timed_world_overlays: BTreeMap::new(), owned_changes: BTreeMap::new(), bounded_period_writes: BTreeMap::new(), hosted_replay: None, decision: None, terms_time: key.system_time })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
     fn decision_time(&self) -> Timestamp {
-        self.decision.map_or_else(|| self.tx_key().system_time, |sample| sample.instant)
+        self.decision.map_or(self.terms_time, |sample| sample.instant)
     }
 
     async fn finish_source(
@@ -2316,7 +2320,7 @@ impl<'a> OpenTransaction<'a> {
             Some(match (record.mode, advance_to) {
                 (WorldClockMode::Held { .. }, Some(to)) => to,
                 (WorldClockMode::Held { .. }, None) => head.next()?,
-                (WorldClockMode::Proposal, None) => self.tx_key().system_time,
+                (WorldClockMode::Proposal, None) => self.terms_time,
                 _ => return Err(OwnedWorld::unavailable()),
             })
         };
@@ -2555,7 +2559,7 @@ impl<'a> OpenTransaction<'a> {
                     self.reserve_bounded_period_write(relation, id.clone())?;
                 }
             }
-            interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?
+            interval(from.unwrap_or(self.terms_time), to.unwrap_or(Timestamp::MAX))?
         };
         let valid = selected_valid;
         self.read_owned_revision(owner, relation, id, Interval::ALL).await?;
@@ -2645,7 +2649,7 @@ impl<'a> OpenTransaction<'a> {
             } else {
                 match (record.mode, from, to) {
                     (mode, Some(from), Some(to)) if mode.is_writable() => (from, to, true),
-                    (WorldClockMode::Proposal, None, None) => (self.tx_key().system_time, Timestamp::MAX, false),
+                    (WorldClockMode::Proposal, None, None) => (self.terms_time, Timestamp::MAX, false),
                     _ => return Err(unavailable()),
                 }
             };
@@ -2697,7 +2701,7 @@ impl<'a> OpenTransaction<'a> {
             let (schema, _) = declaration.as_ref().ok_or_else(ordered_micros::invalid)?;
             Some(ordered_micros::fill(
                 documents,
-                self.tx_key().system_time,
+                self.terms_time,
                 |column| column.starts_with("p_")
                     && schema.path_column_type(column) == Some(rtdb_types::ScalarType::Binary),
                 &self.context.memory,
@@ -2761,7 +2765,7 @@ impl<'a> OpenTransaction<'a> {
             }
             if let Some(lifetime) = schema.lifetime_micros() {
                 if !create_only { return Err(lifetime_uncovered()); }
-                let created = self.tx_key().system_time;
+                let created = self.terms_time;
                 let expires = Timestamp(created.0.checked_add(lifetime).ok_or_else(overflow)?);
                 let context = self.context.query_context(self.snapshot()?, created, &self.options.default_tz, self.trace_parent)?
                     .with_accelerators(Arc::from([]));
@@ -2797,7 +2801,7 @@ impl<'a> OpenTransaction<'a> {
         let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
         let table = relation.table(owner);
         let declaration = self.read_owned_schema(owner, relation).await?;
-        let base_time = self.tx_key().system_time;
+        let base_time = self.terms_time;
         let restoring = self.hosted_replay.as_ref().map(|replay| replay.source_time());
         let mut lifetime_context = None;
         let mut lifetime_period = None;
@@ -3029,7 +3033,7 @@ impl<'a> OpenTransaction<'a> {
         let is_content = |name: &str| !matches!(name, "_valid_from" | "_valid_to");
         for (index, document) in documents.rows().iter().enumerate() {
             let iid = match iids { Some(iids) => iids[index], None => crate::source::document_id(document, &self.context.memory)?.iid() };
-            let default_from = from.unwrap_or(self.tx_key().system_time);
+            let default_from = from.unwrap_or(self.terms_time);
             let default_to = to.unwrap_or(Timestamp::MAX);
             let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
             let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);

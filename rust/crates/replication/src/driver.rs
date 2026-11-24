@@ -1607,7 +1607,13 @@ impl ReplicationDriver {
             let SourceInput { position, log_time, work, reservation, _decode_charge } = source;
             let result = match work {
                 SourceWork::Resolve(mut request) => {
-                    let prepared = request.prepare_proposal_generation(|| durable.clone(), &context).await;
+                    let prepared = async {
+                        if request.proposal_generation_reading()?.is_some() {
+                            let key = resolver.prepared_publication_key(position, log_time)?;
+                            request.prepare_proposal_generation(|| durable.clone(), key, log_time, &context).await?;
+                        }
+                        Ok::<_, Anomaly>(())
+                    }.await;
                     match prepared {
                         Ok(_) => resolver.resolve_source_for_writer(durable, position, log_time, request, &context,
                             Some(WriterPublication { clock: clock.as_ref(), maximum_inline_bytes, maximum_timed_original_bytes })).await,

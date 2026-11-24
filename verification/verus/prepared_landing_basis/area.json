@@ -1,5 +1,5 @@
 {
-  "summary": "The shipped prepared Proposal switch requires the complete original predecessor, physical catalog and assigned system time for either prepared outcome.",
+  "summary": "The shipped prepared Proposal switch requires the complete original predecessor, physical catalog and assigned source position for either prepared outcome.",
   "flags": ["--no-external-by-default"],
   "min_verified_functions": 2,
   "controls": {
@@ -15,9 +15,9 @@
       "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
       "min_verified_functions": 1
     },
-    "substitute-assigned-clock": {
-      "defect": "A prepared generation can switch with an assigned clock different from the time at which it computed effects.",
-      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_time == assigned_time\n", "replace": ""}],
+    "substitute-assigned-position": {
+      "defect": "A prepared generation can switch with an assigned source position different from the source position that owns its effects.",
+      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_position == assigned_position\n", "replace": ""}],
       "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
       "min_verified_functions": 1
     }

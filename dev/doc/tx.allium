@@ -157,7 +157,10 @@
 -- A positioned Proposal landing may use a signed Root bound adjusted by the reviewed suffix.
 -- The private Proposal slot carries the held Root's through-position and a separate receiver-clock target.
 -- A positioned receiver evaluates the half-open slot using its independent clock observation.
--- The staged history coordinate also has to fit between the previous owned coordinate and source append.
+-- The receiver derives the staged generation's event position from the admitted source command.
+-- The receiver derives its SQL history coordinate independently of the clock offer.
+-- Prepared effects and terminal metadata install only under the exact assigned source position and predecessor.
+-- The clock target must be at or before source append.
 -- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
 -- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.

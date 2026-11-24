@@ -2266,17 +2266,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_receipt_projects_the_assigned_position_after_a_gap() {
+    async fn prepared_receipt_uses_its_assigned_position_even_when_history_times_tie() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let memory = MemoryBudget::new(1 << 24);
         let table = TableRef::new("public", rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE);
         let id = EntityId::String("receipt".to_owned());
         let key = |position| TransactionKey { tx_id: TxId(position), system_time: Timestamp(10) };
-        let mut prepare = TransactionBuffer::new(state.value().snapshot(), key(0), Arc::clone(&memory)).unwrap();
-        prepare.put(table.clone(), StructFields::from([("_id".into(), id.as_value())]), Interval::ALL).unwrap();
-        let prepared = prepare.stage().unwrap();
+        let stage = |position| {
+            let mut prepare = TransactionBuffer::new(state.value().snapshot(), key(position), Arc::clone(&memory)).unwrap();
+            prepare.put(table.clone(), StructFields::from([("_id".into(), id.as_value())]), Interval::ALL).unwrap();
+            prepare.stage().unwrap()
+        };
+        state.apply(&stage(0)).unwrap();
         let mut ordered = TransactionBuffer::new(state.value().snapshot(), key(4), Arc::clone(&memory)).unwrap().stage().unwrap();
-        ordered.install_prepared_generation(prepared, &memory).unwrap();
+        assert!(ordered.install_prepared_generation(stage(3), &memory).is_err());
+        ordered.install_prepared_generation(stage(4), &memory).unwrap();
         state.apply(&ordered).unwrap();
 
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));

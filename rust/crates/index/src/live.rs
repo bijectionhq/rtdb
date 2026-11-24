@@ -582,22 +582,21 @@ impl StagedWrite {
     pub fn row_count(&self) -> Result<u64> { self.tables.values().try_fold(0u64, |count, write| count.checked_add(write.row_count() as u64).ok_or_else(|| invalid("Transaction row count overflow"))) }
 
     /// Attach sealed application tables to the order-assigned transaction metadata.
-    /// Their system clock and predecessor were fixed before the source ID was assigned.
-    pub fn install_prepared_generation(&mut self, mut prepared: Self, memory: &Arc<MemoryBudget>) -> Result<()> {
+    /// Both stages belong to the same assigned source transaction and durable predecessor.
+    pub fn install_prepared_generation(&mut self, prepared: Self, memory: &Arc<MemoryBudget>) -> Result<()> {
         if prepared.predecessor != self.predecessor || prepared.block_index != self.block_index
-            || prepared.tx_key.system_time != self.tx_key.system_time
+            || prepared.tx_key != self.tx_key
             || prepared.tables.keys().any(|table| self.tables.contains_key(table))
         {
             return Err(invalid("Prepared generation differs from the ordered transaction"));
         }
         let effect_count = prepared.row_count()?;
-        prepared.rebind_positions(self.tx_key.tx_id, 0, memory)?;
-        self.rebind_positions(self.tx_key.tx_id, effect_count, memory)?;
+        self.shift_event_ordinals(effect_count, memory)?;
         self.tables.extend(prepared.tables);
         Ok(())
     }
 
-    fn rebind_positions(&mut self, transaction: TxId, shift: u64, memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn shift_event_ordinals(&mut self, shift: u64, memory: &Arc<MemoryBudget>) -> Result<()> {
         let original = self.tx_key.tx_id;
         for write in self.tables.values_mut() {
             let Some(batch) = &write.batch else { continue; };
@@ -607,7 +606,7 @@ impl StagedWrite {
                 let position = header.position.filter(|position| position.transaction == original)
                     .ok_or_else(|| invalid("Prepared event has another original order"))?;
                 let ordinal = position.ordinal.checked_add(shift).ok_or_else(|| invalid("Event ordinal exhausted"))?;
-                Ok(EventPosition { transaction, ordinal })
+                Ok(EventPosition { transaction: original, ordinal })
             }).collect::<Result<Vec<_>>>()?;
             let rebound = rtdb_format::data::append_event_positions(&batch.owned, positions, memory)?;
             write.batch = Some(IndexBatch::from_owned(rebound)?);

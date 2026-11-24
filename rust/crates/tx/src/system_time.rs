@@ -70,16 +70,14 @@ pub fn clock_slot_reading(observed: rtdb_types::Timestamp) -> Option<rtdb_types:
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(admitted =>
-    ensures admitted == (through <= predecessor && previous_time < reading
-        && reading <= appended && reading <= observed
+    ensures admitted == (through <= predecessor && reading <= appended && reading <= observed
         && reading as int + 1000000 <= i64::MAX as int && (observed as int) < reading as int + 1000000),
 ))]
 pub(crate) fn clock_slot_admits(
-    through: i64, predecessor: i64, previous_time: i64, reading: i64, appended: i64, observed: i64,
+    through: i64, predecessor: i64, reading: i64, appended: i64, observed: i64,
 ) -> bool {
     let Some(until) = reading.checked_add(1_000_000) else { return false; };
     through <= predecessor
-        && previous_time < reading
         && reading <= appended
         && reading <= observed
         && observed < until
@@ -93,9 +91,8 @@ pub(crate) fn clock_slot_time(
     observed: rtdb_types::Timestamp,
 ) -> Option<rtdb_types::Timestamp> {
     let head = head?;
-    // The staged effects still require a distinct historical coordinate.
     clock_slot_admits(
-        slot.through.0, head.tx_id.0, head.system_time.0, slot.reading.0, appended.0, observed.0,
+        slot.through.0, head.tx_id.0, slot.reading.0, appended.0, observed.0,
     ).then_some(slot.reading)
 }
 
@@ -168,13 +165,13 @@ mod tests {
         let slot = OwnedClockSlot { through: TxId(8), reading };
         let behind = TransactionKey { tx_id: TxId(7), system_time: Timestamp(100) };
         let carried = TransactionKey { tx_id: TxId(9), system_time: Timestamp(301) };
-        let used = TransactionKey { tx_id: TxId(9), system_time: reading };
+        let later_history = TransactionKey { tx_id: TxId(9), system_time: Timestamp(600_000) };
 
         assert_eq!(clock_slot_time(slot, Some(carried), reading, reading), Some(reading));
         assert_eq!(clock_slot_time(slot, Some(behind), reading, reading), None);
         assert_eq!(clock_slot_time(slot, Some(carried), Timestamp(500_099), reading), None);
         assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(500_099)), None);
         assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(1_500_100)), None);
-        assert_eq!(clock_slot_time(slot, Some(used), reading, reading), None);
+        assert_eq!(clock_slot_time(slot, Some(later_history), reading, reading), Some(reading));
     }
 }
