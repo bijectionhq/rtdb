@@ -63,6 +63,7 @@ entity ProbePlan {
 -- An equality filter that fixes every partition column selects the clusters of that partition before any ranking.
 -- An IID scope from another accelerator small enough to rank exactly leaves the scan exact.
 -- Each generation probes its eligible clusters nearest centroid first; the recall target sets the starting probe fraction and shortlist.
+-- The directory is validated in place. The read reserves ranking scratch before retaining the eligible cluster descriptions.
 -- The shortlist keeps the nearest distinct IIDs by unit-vector distance across generations and the frontier.
 -- One funded score per distinct IID stays available for subsequent rounds, including IIDs omitted from a narrower round.
 -- The scan uses exact ranking if another distinct IID would exceed the funded score bound.
