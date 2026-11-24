@@ -153,9 +153,18 @@ impl Postings {
             }
             let rows = order.slice(start, (order.len() - start).min(BATCH_ROWS));
             let _scratch = memory.reserve(rows.len() * ROW_BYTES * 4 + (64 << 10))?;
+            let first = rows.value(0) as usize;
+            let contiguous = rows.values().iter().enumerate()
+                .all(|(index, &row)| row as usize == first + index);
             let columns = [&partitions as &dyn Array, &cells, &iids]
                 .into_iter()
-                .map(|array| arrow_select::take::take(array, &rows, None).map_err(corrupt))
+                .map(|array| {
+                    if contiguous {
+                        Ok(array.slice(first, rows.len()))
+                    } else {
+                        arrow_select::take::take(array, &rows, None).map_err(corrupt)
+                    }
+                })
                 .collect::<Result<Vec<_>>>()?;
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(corrupt)?;
             writer.write(&batch)?;

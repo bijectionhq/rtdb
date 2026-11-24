@@ -360,24 +360,28 @@ fn spatial_arrow_postings_seek_across_page_boundaries() {
     let memory = MemoryBudget::new(32 << 20);
     let partition = Partition::of([b"area".as_slice()]);
     let iid = Iid([9; 16]);
-    let mut postings = Postings::new(&memory).unwrap();
     let boundary = 16_384;
-    postings
-        .append(partition, iid, (0..=boundary + 1).rev().collect())
-        .unwrap();
-    postings
-        .append(partition, iid, vec![boundary, boundary - 1])
-        .unwrap();
-    let file = tempfile::NamedTempFile::new().unwrap();
-    let (_, digest) = postings
-        .write(
+    let write = |keys, duplicates| {
+        let mut postings = Postings::new(&memory).unwrap();
+        postings.append(partition, iid, keys).unwrap();
+        if duplicates {
+            postings.append(partition, iid, vec![boundary, boundary - 1]).unwrap();
+        }
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (_, digest) = postings.write(
             file.reopen().unwrap(),
             &tokio_util::sync::CancellationToken::new(),
-        )
-        .unwrap();
+        ).unwrap();
+        (std::fs::read(file.path()).unwrap(), digest)
+    };
+
+    let (bytes, digest) = write((0..=boundary + 1).collect(), false);
+    let (reordered, reordered_digest) = write((0..=boundary + 1).rev().collect(), true);
+    assert_eq!(bytes, reordered);
+    assert_eq!(digest, reordered_digest);
     let mut selected = Vec::new();
     checked_candidates(
-        std::fs::read(file.path()).unwrap(),
+        bytes,
         &digest,
         Some(partition),
         &[geometry::KeyRange {
