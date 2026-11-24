@@ -725,7 +725,8 @@ async fn start_disposal_custodian(
     }]));
     let cancel = CancellationToken::new();
     let service = tokio::spawn(custodian::run(custodian::Settings {
-        placements: manifest,
+        placements: Some(manifest),
+        discovery: None,
         serving: storage,
         archive,
         keys,
@@ -2101,22 +2102,7 @@ fn installed_cell_leaves_a_worker_slot_and_resolves_the_custody_manifest() {
     assert_eq!(cell.custody_manifest, Some(root.path().join("custody.json")));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
-    use rtdb_multi::journal::cell::{InstalledCell, Role};
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    struct Worker(Option<process::RunningNode>);
-    impl Drop for Worker {
-        fn drop(&mut self) {
-            if let Some(node) = &self.0 {
-                node.stop_renewing();
-            }
-        }
-    }
-
-    let authority = Authority::new(Uuid::new_v4(), 2 << 20, 24 << 20, 32);
-    let root = authority.data.path();
+fn start_runtime_voters(authority: &Authority) -> (Cohort, Value) {
     let mut cohort = authority.cohort("runtime", None);
     let management = &authority.group_spec["clients"];
     for voter in &mut cohort.voters {
@@ -2128,6 +2114,18 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
         voter.start();
     }
     let group: Value = serde_json::from_slice(&fs::read(&cohort.group).unwrap()).unwrap();
+    (cohort, group)
+}
+
+fn write_runtime_cell(
+    authority: &Authority,
+    group: &Value,
+    archive_root: &Path,
+    keys_dir: &Path,
+    control: SocketAddr,
+    pgwire: SocketAddr,
+) -> PathBuf {
+    let root = authority.data.path();
     let voters: Vec<_> = group["voters"].as_array().unwrap().iter().map(|voter| {
         let receipt: Vec<u8> = serde_json::from_value(voter["receipt_key"].clone()).unwrap();
         json!({
@@ -2138,18 +2136,6 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
         })
     }).collect();
 
-    let storage = CellStorage::Local { root: root.join("runtime-serving") };
-    let archive_root = root.join("runtime-archive");
-    let archive = CellStorage::Local { root: archive_root.clone() };
-    let keys_dir = root.join("runtime-keys");
-    let keys: Arc<dyn KeyService> = Arc::new(LocalKeyService::new(keys_dir.clone()).unwrap());
-    admin::initialize_storage(&storage, keys.as_ref()).await.unwrap();
-    admin::initialize_storage(&archive, keys.as_ref()).await.unwrap();
-
-    let control_port = reserve_port();
-    let pgwire_port = reserve_port();
-    let control = control_port.local_addr().unwrap();
-    let pgwire = pgwire_port.local_addr().unwrap();
     let cell_file = root.join("runtime-cell.json");
     let pem = |identity: &Identity| json!({
         "certificate": identity.credentials["certificate"], "key": identity.credentials["key"],
@@ -2169,6 +2155,105 @@ async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
             "worker": pem(&authority.workers[0]), "custodian": pem(&authority.custodian),
         },
     }));
+    cell_file
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custodian_discovers_a_published_runtime_journal_and_trims_it() {
+    use rtdb_multi::journal::{cell::{InstalledCell, Role}, hosted::custodian};
+
+    let authority = Authority::new(Uuid::new_v4(), 2 << 20, 24 << 20, 8);
+    let root = authority.data.path();
+    let (mut cohort, group) = start_runtime_voters(&authority);
+    let archive_root = root.join("archive");
+    let keys_dir = root.join("keys");
+    let keys: Arc<dyn KeyService> = Arc::new(LocalKeyService::new(keys_dir.clone()).unwrap());
+    let cell_file = write_runtime_cell(&authority, &group, &archive_root, &keys_dir,
+        "127.0.0.1:1".parse().unwrap(), "127.0.0.1:2".parse().unwrap());
+    let cell = InstalledCell::read(&cell_file).unwrap();
+    let directory: Arc<dyn Directory> = MemoryDirectory::new();
+    let unpublished = Uuid::new_v4();
+    directory.reserve_installed_journal(unpublished).await.unwrap();
+    let admin = cell.access(Role::Administrator).unwrap();
+    eventually(async || admin.by_deployment(unpublished).await.ok()).await;
+    let deployment = authority.placement.deployment;
+    admin.install(directory.as_ref(), keys.as_ref(), deployment, "runtime", "test").await.unwrap();
+    let selected_route = admin.by_deployment(deployment).await.unwrap().unwrap().route;
+    let route_json = serde_json::to_value(selected_route).unwrap();
+    let worker = authority.workers[0].client(&route_json);
+    let custody = authority.custodian.client(&route_json);
+    let (grant, recovery) = grant(&worker, authority.enrollments[0]).await;
+    release(&worker, recovery).await;
+    let initial = route(&custody).await;
+    let appended = execute(&worker, append(initial, grant, AppendClass::Data,
+        Bytes::from_static(b"retained by runtime custody"))).await;
+    let Outcome::Appended(record) = appended.receipt.outcome.unwrap() else {
+        panic!("the runtime journal did not append");
+    };
+    let chosen = Checkpoint {
+        cut: record.cut, root: [19; 32], manifest: [23; 32],
+        custody: Custody { allocation: Uuid::new_v4(), revision: 2, provider: [29; 32] },
+    };
+    let prepare = CheckpointPreparation {
+        erasure: false, checkpoint: chosen.cut, root: chosen.root, source: grant,
+        base: initial.checkpoint, custody: chosen.custody, usable_bytes: 64 << 20,
+        descriptor: [31; 32],
+    };
+    let mutate = async |command| execute(&custody, request(route(&custody).await,
+        Principal::Custodian, command)).await.receipt.outcome;
+    assert_eq!(mutate(Command::PrepareCheckpoint { preparation: prepare, references: None }).await,
+        Ok(Outcome::CheckpointPrepared(prepare)));
+    assert_eq!(mutate(Command::Publish { checkpoint: chosen }).await, Ok(Outcome::Published(chosen)));
+    assert_eq!(route(&custody).await.floor, initial.floor);
+
+    let cancel = CancellationToken::new();
+    let service = tokio::spawn(custodian::run(custodian::Settings {
+        placements: None,
+        discovery: Some(custodian::Discovery::new(directory, &cell).unwrap()),
+        serving: CellStorage::Local { root: root.join("serving") },
+        archive: CellStorage::Local { root: archive_root },
+        keys,
+        broker: None,
+        memory: rtdb_columnar::MemoryBudget::new(1 << 30),
+    }, cancel.clone()));
+    eventually(async || (route(&custody).await.floor == chosen.cut).then_some(())).await;
+    cancel.cancel();
+    tokio::time::timeout(DEADLINE, service).await.unwrap().unwrap().unwrap();
+    for voter in &mut cohort.voters { voter.stop().await; }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_install_serves_two_tenants_after_voter_and_worker_restart() {
+    use rtdb_multi::journal::cell::{InstalledCell, Role};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    struct Worker(Option<process::RunningNode>);
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            if let Some(node) = &self.0 {
+                node.stop_renewing();
+            }
+        }
+    }
+
+    let authority = Authority::new(Uuid::new_v4(), 2 << 20, 24 << 20, 32);
+    let root = authority.data.path();
+    let (mut cohort, group) = start_runtime_voters(&authority);
+
+    let storage = CellStorage::Local { root: root.join("runtime-serving") };
+    let archive_root = root.join("runtime-archive");
+    let archive = CellStorage::Local { root: archive_root.clone() };
+    let keys_dir = root.join("runtime-keys");
+    let keys: Arc<dyn KeyService> = Arc::new(LocalKeyService::new(keys_dir.clone()).unwrap());
+    admin::initialize_storage(&storage, keys.as_ref()).await.unwrap();
+    admin::initialize_storage(&archive, keys.as_ref()).await.unwrap();
+
+    let control_port = reserve_port();
+    let pgwire_port = reserve_port();
+    let control = control_port.local_addr().unwrap();
+    let pgwire = pgwire_port.local_addr().unwrap();
+    let cell_file = write_runtime_cell(&authority, &group, &archive_root, &keys_dir, control, pgwire);
+
     let directory: Arc<dyn Directory> = MemoryDirectory::new();
     let cell = InstalledCell::read(&cell_file).unwrap();
     let discovery = Arc::new(cell.access(Role::RouteReader).unwrap());

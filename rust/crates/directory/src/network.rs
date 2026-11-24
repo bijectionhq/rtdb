@@ -40,6 +40,7 @@ enum Op {
     SettleReferenceDisposal { permit: ReferenceDisposal, record: DeploymentRecord, expected: Version },
     ChangeLineage { lineage: String, change: LineageChange },
     ReserveInstalledJournal { id: uuid::Uuid },
+    InstalledJournalReservations,
     Deployment { id: String },
     DeploymentByName { name: String },
     Deployments,
@@ -54,7 +55,7 @@ enum Op {
 impl Op {
     /// A read may be resent after a lost connection; a write may already have applied.
     fn is_read(&self) -> bool {
-        matches!(self, Self::ReceiverClock { .. } | Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. } | Self::LineageState { .. })
+        matches!(self, Self::ReceiverClock { .. } | Self::InstalledJournalReservations | Self::Deployment { .. } | Self::DeploymentByName { .. } | Self::Deployments | Self::DeploymentsHeldBy { .. } | Self::Member { .. } | Self::Members | Self::SharedReferenceRevision { .. } | Self::LineageState { .. })
     }
 }
 
@@ -64,6 +65,7 @@ enum Reply {
     ReceiverClock(Option<crate::ReceiverClockSample>),
     ReceiverClockPublished,
     InstalledJournalReserved,
+    ReservedJournals(Vec<uuid::Uuid>),
     Deployment(DeploymentRecord),
     OptionalDeployment(Option<DeploymentRecord>),
     Deployments(Vec<DeploymentRecord>),
@@ -116,6 +118,7 @@ async fn dispatch(directory: &dyn Directory, op: Op) -> Result<Reply> {
             directory.reserve_installed_journal(id).await?;
             Reply::InstalledJournalReserved
         }
+        Op::InstalledJournalReservations => Reply::ReservedJournals(directory.installed_journal_reservations().await?),
         Op::CreateDeployment { record } => Reply::Deployment(directory.create_deployment(record).await?),
         Op::StageFork { child, preparation } => Reply::Deployment(directory.stage_fork(child, preparation).await?),
         Op::CreateFork { child, expected_parent, preparation } => Reply::Deployment(directory.publish_fork(child, expected_parent, preparation).await?),
@@ -468,6 +471,12 @@ impl Directory for RemoteDirectory {
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()> {
         match self.call(Op::ReserveInstalledJournal { id }).await? {
             Reply::InstalledJournalReserved => Ok(()),
+            other => Err(protocol(other)),
+        }
+    }
+    async fn installed_journal_reservations(&self) -> Result<Vec<uuid::Uuid>> {
+        match self.call(Op::InstalledJournalReservations).await? {
+            Reply::ReservedJournals(ids) => Ok(ids),
             other => Err(protocol(other)),
         }
     }

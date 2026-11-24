@@ -165,6 +165,13 @@ The `limits` object uses the Logkeeper group limit fields.
 A relative `custody_manifest` path resolves against the cell file.
 The optional `--archive-root` and `--keys` flags override the cell values.
 
+Pass `--directory DIR` with the gateway's durable cell directory to discover deployments installed at runtime.
+Configure the custodian's TLS pin in the voters' management trust and the cell file.
+The custodian uses reserved deployment UUIDs as discovery candidates and requires matching publication replies from a voter quorum.
+It refreshes the candidate set every thirty seconds and runs expiry disposal, trim and append-window replenishment for the discovered journals.
+Checkpoint copying, operational erasure and physical reclamation still use an explicit placement manifest with the enrolled worker route, exact paid checkpoint reservations and broker credentials.
+When both sources are configured, the manifest supplies the maintenance configuration for its deployments.
+
 For manifest-based installations, set `custody_manifest` in the cell file or pass `--installed-journals FILE` to the custodian.
 Each entry supplies the deployment, its custody route, the exact enrolled worker route that protects checkpoint copies, archive prefix and checkpoint allocations.
 The process opens the entries at startup and checks that each uses the cell archive.

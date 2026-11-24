@@ -1400,6 +1400,10 @@ pub trait Directory: Send + Sync {
     }
     /// Permanently excludes an installed journal's deployment ID from directory admission.
     async fn reserve_installed_journal(&self, id: uuid::Uuid) -> Result<()>;
+    /// Returns candidate IDs. A voter route is required to establish an installed deployment.
+    async fn installed_journal_reservations(&self) -> Result<Vec<uuid::Uuid>> {
+        Err(Anomaly::unsupported("rtdb.directory/installed-journal-reservations", "The directory does not expose installed journal reservations"))
+    }
     /// Stores a new deployment; refuses if its id or name is taken.
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord>;
     /// Reserves the child ID before hosted fork preparation can write its objects or logs.
@@ -1501,6 +1505,11 @@ pub trait Directory: Send + Sync {
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as i64).unwrap_or(0)
+}
+
+fn decode_installed_journal_id(id: &str) -> Result<uuid::Uuid> {
+    let parsed = uuid::Uuid::parse_str(id).ok().filter(|parsed| !parsed.is_nil());
+    parsed.ok_or_else(|| Anomaly::fault("rtdb.directory/installed-journal-id", "An installed journal reservation has an invalid deployment ID"))
 }
 
 fn installed_journal_id(id: uuid::Uuid) -> Result<String> {
@@ -2001,6 +2010,10 @@ impl Directory for MemoryDirectory {
         if state.installed_journals.insert(id) { self.persist(&mut state)?; }
         Ok(())
     }
+    async fn installed_journal_reservations(&self) -> Result<Vec<uuid::Uuid>> {
+        self.state()?.installed_journals.iter().map(|id| decode_installed_journal_id(id)).collect()
+    }
+
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         if record.fork_stage.is_some() { return Err(fork_stage_changed()); }
         let mut state = self.state()?;
@@ -2218,8 +2231,11 @@ mod tests {
         drop(directory);
 
         let directory = MemoryDirectory::open(&root).unwrap();
+        let id = attempted.id.parse::<uuid::Uuid>().unwrap();
         assert_eq!(directory.create_deployment(attempted).await.unwrap_err().code, "rtdb.directory/exists");
         assert!(directory.deployments().await.unwrap().is_empty());
+        directory.create_deployment(DeploymentRecord::new("ordinary", "acme", vec![], 0)).await.unwrap();
+        assert_eq!(directory.installed_journal_reservations().await.unwrap(), [id]);
         drop(directory);
         std::fs::remove_dir_all(root).unwrap();
     }

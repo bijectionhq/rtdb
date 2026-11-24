@@ -628,6 +628,8 @@ contract LogService {
 
     @invariant CellCustodyRunsIndependently
         -- The dedicated cell custodian maintains the configured deployments using their installed custody authority.
+        -- A directory reservation nominates a discovery candidate, and a matching voter majority supplies its published route.
+        -- The custodian uses that route and its custody credential to dispose expired withdrawn owners, trim the selected cut, and replenish the append window.
         -- It can discover and publish a chosen native checkpoint and advance retention when the writer grant is vacant.
         -- Its checkpoint copies carry an exact ordered worker hold for the base cut through provider completion.
         -- The installed S3 serving participants share a durable read census before reclaiming an exact publication.

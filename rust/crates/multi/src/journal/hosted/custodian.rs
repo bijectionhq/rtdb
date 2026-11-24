@@ -1,17 +1,26 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use rtdb_columnar::MemoryBudget;
-use rtdb_directory::Checkpoint;
+use rtdb_directory::{Checkpoint, Directory};
 use rtdb_types::{Anomaly, Result};
+use tokio::time::Instant;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use uuid::Uuid;
 
 use crate::{deployment::CellStorage, keys::KeyService, replay_broker::Client};
 
-use super::{Placement, Routes, WriterAdmission, invalid};
+use super::{InstalledJournal, Placement, Routes, WriterAdmission, invalid, retention::Retention};
+use crate::journal::cell::{CellAccess, InstalledCell, Role};
 use crate::journal::retention_decision::{RetentionAction, retention_actions};
 
 pub struct Settings {
-    pub placements: PathBuf,
+    pub placements: Option<PathBuf>,
+    pub discovery: Option<Discovery>,
     pub serving: CellStorage,
     pub archive: CellStorage,
     pub keys: Arc<dyn KeyService>,
@@ -19,12 +28,37 @@ pub struct Settings {
     pub memory: Arc<MemoryBudget>,
 }
 
+pub struct Discovery {
+    directory: Arc<dyn Directory>,
+    routes: CellAccess,
+}
+
+impl Discovery {
+    pub fn new(directory: Arc<dyn Directory>, cell: &Arc<InstalledCell>) -> Result<Self> {
+        Ok(Self {
+            directory,
+            routes: cell.access(Role::Custodian)?,
+        })
+    }
+}
+
+struct DiscoveredJournal {
+    journal: Arc<InstalledJournal>,
+    retention: Retention,
+}
+
 pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<()> {
-    let routes = Routes::read(
-        &settings.placements,
-        &settings.serving,
-        settings.broker.as_ref(),
-    )?;
+    let routes = settings
+        .placements
+        .as_deref()
+        .map(|path| Routes::read(path, &settings.serving, settings.broker.as_ref()))
+        .transpose()?
+        .unwrap_or_default();
+    if settings.placements.is_none() && settings.discovery.is_none() {
+        return Err(invalid(
+            "The custodian needs a placement manifest or a cell directory",
+        ));
+    }
     for placement in routes.configured.values() {
         if placement.custodian.is_none() || placement.archive != settings.archive {
             return Err(invalid(
@@ -34,6 +68,13 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
     }
 
     let releases = TaskTracker::new();
+    let configured: BTreeSet<_> = routes
+        .configured
+        .values()
+        .map(|placement| placement.worker.deployment())
+        .collect();
+    let mut discovered = BTreeMap::new();
+    let mut next_discovery = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -43,6 +84,14 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
             _ = ticker.tick() => (),
         }
         let pass = async {
+            if let Some(discovery) = &settings.discovery
+                && next_discovery <= Instant::now()
+            {
+                next_discovery = Instant::now() + Duration::from_secs(30);
+                if let Err(error) = refresh(discovery, &configured, &mut discovered).await {
+                    eprintln!("{}: {}", error.code, error.message.as_deref().unwrap_or(""));
+                }
+            }
             for (_, placement) in routes.custody_placements() {
                 maintain(
                     placement,
@@ -55,6 +104,16 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
                     Duration::from_secs(30),
                 )
                 .await;
+            }
+            for placement in discovered.values() {
+                let _ = placement
+                    .retention
+                    .dispose_withdrawn_workers(&placement.journal)
+                    .await;
+                let _ = placement
+                    .retention
+                    .retain_selected(&placement.journal, None)
+                    .await;
             }
         };
         tokio::select! {
@@ -72,6 +131,42 @@ pub async fn run(settings: Settings, cancellation: CancellationToken) -> Result<
                 "Installed custody read releases are still pending",
             )
         })
+}
+
+async fn refresh(
+    discovery: &Discovery,
+    configured: &BTreeSet<Uuid>,
+    discovered: &mut BTreeMap<Uuid, DiscoveredJournal>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let candidates = discovery.directory.installed_journal_reservations().await?;
+    let mut lookups =
+        futures::stream::iter(candidates.into_iter().filter(|id| !configured.contains(id)))
+            .map(|id| async move { (id, discovery.routes.custody_journal(id).await) })
+            .buffer_unordered(8);
+    let mut failure = None;
+    while let Some((id, result)) = lookups.next().await {
+        match result {
+            Ok(Some(journal)) => {
+                let current = discovered.entry(id).or_insert_with(|| DiscoveredJournal {
+                    journal: Arc::clone(&journal),
+                    retention: Retention::default(),
+                });
+                if current.journal.placement() != journal.placement() {
+                    current.retention = Retention::default();
+                }
+                current.journal = journal;
+            }
+            Ok(None) => {
+                discovered.remove(&id);
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 pub(crate) async fn maintain(

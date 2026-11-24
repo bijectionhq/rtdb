@@ -472,6 +472,22 @@ impl CellAccess {
         }
     }
 
+    pub(crate) async fn custody_journal(
+        &self,
+        deployment: Uuid,
+    ) -> Result<Option<Arc<super::InstalledJournal>>> {
+        self.by_deployment(deployment)
+            .await?
+            .map(|published| {
+                super::InstalledJournal::open(installed_route(
+                    published.route,
+                    Authority::Custody,
+                    self.credentials.clone(),
+                ))
+            })
+            .transpose()
+    }
+
     pub(crate) async fn gateway_placement(&self, name: &str) -> Result<Option<GatewayPlacement>> {
         let Some(published) = self.by_name(name).await? else {
             return Ok(None);

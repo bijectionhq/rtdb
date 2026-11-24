@@ -620,6 +620,28 @@ impl Directory for DynamoDirectory {
         Err(exists("Deployment", &id))
     }
 
+    async fn installed_journal_reservations(&self) -> Result<Vec<uuid::Uuid>> {
+        let mut start = None;
+        let mut reservations = Vec::new();
+        loop {
+            let page = self.client.scan().table_name(&self.tables.deployments)
+                .projection_expression("#id")
+                .filter_expression("#installed = :installed")
+                .expression_attribute_names("#id", ID)
+                .expression_attribute_names("#installed", INSTALLED_JOURNAL)
+                .expression_attribute_values(":installed", AttributeValue::Bool(true))
+                .set_exclusive_start_key(start)
+                .send().await.map_err(|error| sdk_anomaly("Scan", error))?;
+            for item in page.items() {
+                reservations.push(crate::decode_installed_journal_id(string_attribute(item, ID)?)?);
+            }
+            start = page.last_evaluated_key().filter(|key| !key.is_empty()).cloned();
+            if start.is_none() {
+                return Ok(reservations);
+            }
+        }
+    }
+
     async fn create_deployment(&self, record: DeploymentRecord) -> Result<DeploymentRecord> {
         if record.fork_stage.is_some() { return Err(fork_stage_changed()); }
         self.insert_deployment(record, Vec::new(), None).await
