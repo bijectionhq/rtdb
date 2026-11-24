@@ -770,20 +770,30 @@ pub(super) async fn visit_matches(
                     charge_bytes(&mut indexed_bytes, size, MAX_INDEXED_BYTES)?;
                     Some(storage.get_exact_cached_or(&key, size as usize, &context.memory).await.map_err(posting_read_error)?)
                 };
+                let whole = whole.as_ref();
+                let key = &key;
+                let memory = &context.memory;
                 postings::candidates(
                     root,
                     partition,
                     &region.ranges,
                     &context.memory,
                     || context.check_cancelled(),
-                    async |range: Range<u64>| {
-                        let lease = if let Some(whole) = &whole {
-                            whole.slice(range.start as usize..range.end as usize).map_err(posting_read_error)?
+                    |range: Range<u64>| {
+                        let charge = if whole.is_none() {
+                            charge_bytes(&mut indexed_bytes, range.end - range.start, MAX_INDEXED_BYTES)
                         } else {
-                            charge_bytes(&mut indexed_bytes, range.end - range.start, MAX_INDEXED_BYTES)?;
-                            storage.scan_range(&key, range, &context.memory).await.map_err(posting_read_error)?
+                            Ok(())
                         };
-                        Ok(Bytes::from_owner(lease))
+                        async move {
+                            charge?;
+                            let lease = if let Some(whole) = whole {
+                                whole.slice(range.start as usize..range.end as usize).map_err(posting_read_error)?
+                            } else {
+                                storage.scan_range(key, range, memory).await.map_err(posting_read_error)?
+                            };
+                            Ok(Bytes::from_owner(lease))
+                        }
                     },
                     |iid| candidates.insert(iid),
                 ).await

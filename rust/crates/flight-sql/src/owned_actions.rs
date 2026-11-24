@@ -27,7 +27,7 @@ use rtdb_format::ipc::OwnedStream;
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -1586,14 +1586,17 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input).await
+        self.commit_hosted_with_reads(
+            call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input, ipc_stream,
+        ).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
         funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, input: HostedDecisionInput<'_>,
-    ) -> Result<ActionResult, Status> {
+        ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
             owned_count_conditions(call, body, None, false)?

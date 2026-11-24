@@ -1,4 +1,5 @@
 use super::*;
+use arrow_array::ArrayRef;
 use arrow_flight::{FlightData, Ticket};
 use prost::Name;
 use rtdb_flight_sql::rtdb::v1::{self as v1, at::Selection};

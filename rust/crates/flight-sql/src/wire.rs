@@ -778,13 +778,13 @@ mod tests {
 
     #[test]
     fn flight_upload_accepts_lz4_and_rejects_an_understated_lz4_value_length() {
-        use arrow_ipc::CompressionType::LZ4_FRAME;
+        use arrow_ipc::CompressionType;
 
         let text = "x".repeat(4096);
         let batch = RecordBatch::try_from_iter([
             ("value", Arc::new(arrow_array::StringArray::from(vec![text.as_str()])) as ArrayRef),
         ]).unwrap();
-        let options = IpcWriteOptions::default().try_with_compression(Some(LZ4_FRAME)).unwrap();
+        let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::LZ4_FRAME)).unwrap();
         let mut tracker = DictionaryTracker::new(false);
         let (dictionaries, record) = IpcDataGenerator::default().encode(
             &batch, &mut tracker, &options, &mut CompressionContext::default(),
