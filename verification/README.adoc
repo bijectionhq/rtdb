@@ -428,3 +428,4 @@ For a running instance in consumer CI, set `RTDB_CONFORMANCE_ENDPOINT` to the Fl
 The remote case exercises discovery, SQL rows and the captured basis without writing fixtures to the target database.
 
 Run `verification/check_consumer_names.sh` to check the tracked first-party tree for consumer-specific identifiers.
+CI passes the previous or pull request base commit to check newly added lines while compatibility paths are being migrated.

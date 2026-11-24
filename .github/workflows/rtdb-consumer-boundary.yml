@@ -11,5 +11,9 @@ jobs:
   consumer-names:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: verification/check_consumer_names.sh
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v5
+        with:
+          fetch-depth: 0
+      - run: verification/check_consumer_names.sh "$BASE_COMMIT"
+        env:
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha || github.event.before }}
