@@ -4,8 +4,8 @@ namespace FencedTermAdmission
 
 def replica_read_is_empty (recordCount : Nat) : Bool := recordCount == 0
 
-def can_promote_fenced (mayLead alreadyLeading holdsGrant : Bool) : Bool :=
-  mayLead && !alreadyLeading && holdsGrant
+def may_promote (recognizedPrefix mayLead alreadyLeading holdsGrant : Bool) : Bool :=
+  recognizedPrefix && mayLead && !alreadyLeading && holdsGrant
 
 def should_start_claim (fenced mayLead alreadyLeading claimPending : Bool) : Bool :=
   !fenced && mayLead && !alreadyLeading && !claimPending
@@ -15,18 +15,18 @@ def next_term (highest : Int) : Option Int :=
 
 def initial_term_sequence (fenced : Bool) : Int := if fenced then 0 else 1
 
-def fenced_promotion (recordCount : Nat) (mayLead alreadyLeading holdsGrant : Bool)
+def fenced_promotion (recordCount : Nat) (recognizedPrefix mayLead alreadyLeading holdsGrant : Bool)
     (highest : Int) : Option (Int × Int) :=
-  if replica_read_is_empty recordCount && can_promote_fenced mayLead alreadyLeading holdsGrant then
+  if replica_read_is_empty recordCount && may_promote recognizedPrefix mayLead alreadyLeading holdsGrant then
     (next_term highest).map fun term => (term, initial_term_sequence true)
   else none
 
-theorem fenced_promotion_after_empty_read {recordCount : Nat} {mayLead alreadyLeading holdsGrant : Bool}
+theorem fenced_promotion_after_empty_read {recordCount : Nat} {recognizedPrefix mayLead alreadyLeading holdsGrant : Bool}
     {highest term sequence : Int}
-    (promoted : fenced_promotion recordCount mayLead alreadyLeading holdsGrant highest = some (term, sequence)) :
-    recordCount = 0 ∧ mayLead = true ∧ alreadyLeading = false ∧ holdsGrant = true ∧
+    (promoted : fenced_promotion recordCount recognizedPrefix mayLead alreadyLeading holdsGrant highest = some (term, sequence)) :
+    recordCount = 0 ∧ recognizedPrefix = true ∧ mayLead = true ∧ alreadyLeading = false ∧ holdsGrant = true ∧
       highest < 9223372036854775807 ∧ term = highest + 1 ∧ sequence = 0 := by
-  simp only [fenced_promotion, replica_read_is_empty, can_promote_fenced, Bool.and_eq_true,
+  simp only [fenced_promotion, replica_read_is_empty, may_promote, Bool.and_eq_true,
     Bool.not_eq_true'] at promoted
   split at promoted
   · rename_i eligible
@@ -34,7 +34,7 @@ theorem fenced_promotion_after_empty_read {recordCount : Nat} {mayLead alreadyLe
     split at promoted
     · rename_i capacity
       simp [initial_term_sequence] at promoted
-      exact ⟨beq_iff_eq.mp eligible.1, eligible.2.1.1, eligible.2.1.2, eligible.2.2,
+      exact ⟨beq_iff_eq.mp eligible.1, eligible.2.1.1.1, eligible.2.1.1.2, eligible.2.1.2, eligible.2.2,
         capacity, promoted.1.symm, promoted.2.symm⟩
     · contradiction
   · contradiction
@@ -67,7 +67,7 @@ theorem a_superseded_term_stays_fenced {boundary highest : Int} (reached : Reach
   exact (a_superseded_record_is_fenced highest arriving (Int.lt_of_lt_of_le stale monotone)).1
 
 theorem promotion_and_fencing_are_reachable :
-    fenced_promotion 0 true false true 0 = some (1, 0) ∧
+    fenced_promotion 0 true true false true 0 = some (1, 0) ∧
     Reaches 0 1 ∧ fences_superseded 1 0 = true :=
   ⟨rfl, .admit .start 1, rfl⟩
 

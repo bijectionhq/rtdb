@@ -1883,8 +1883,13 @@ def verify_fenced_replica_lean(args, scratch):
         args, scratch, models / "FencedTermAdmission.lean", "fenced-term-admission",
         {
             "promote-without-grant": (
-                "mayLead && !alreadyLeading && holdsGrant",
-                "mayLead && !alreadyLeading && (holdsGrant || !holdsGrant)",
+                "recognizedPrefix && mayLead && !alreadyLeading && holdsGrant",
+                "recognizedPrefix && mayLead && !alreadyLeading && (holdsGrant || !holdsGrant)",
+                ["fenced_promotion_after_empty_read"],
+            ),
+            "promote-after-unrecognized-prefix": (
+                "recognizedPrefix && mayLead && !alreadyLeading && holdsGrant",
+                "(recognizedPrefix || !recognizedPrefix) && mayLead && !alreadyLeading && holdsGrant",
                 ["fenced_promotion_after_empty_read"],
             ),
             "promote-after-nonempty-read": (

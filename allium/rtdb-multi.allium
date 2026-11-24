@@ -497,7 +497,7 @@ contract LogService {
         -- An installed journal route owns its session authority independently of the cell directory.
 
     @invariant InstalledReplicaPromotionFollowsEmptyRead
-        -- After an empty replica read, a following worker with leadership enabled and a positive current-grant check can promote.
+        -- After an empty replica read, a following worker with leadership enabled, a recognized replica prefix and a positive current-grant check can promote.
         -- The worker opens the successor of the highest term it has read at sequence zero.
         -- A newly delivered record below the highest observed term is fenced at admission.
 

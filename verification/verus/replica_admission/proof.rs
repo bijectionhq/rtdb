@@ -3,6 +3,8 @@
 mod laws;
 #[path = "../../../rust/crates/replication/src/promotion.rs"]
 mod promotion;
+#[path = "../../../rust/crates/replication/src/recovery_promotion.rs"]
+mod recovery_promotion;
 #[path = "../../../rust/crates/types/src/term.rs"]
 mod term_types;
 

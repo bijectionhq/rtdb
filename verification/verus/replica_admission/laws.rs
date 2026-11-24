@@ -29,7 +29,8 @@ fn a_missing_predecessor_voids_the_term(next: i64, received: i64) -> SequenceDec
 }
 
 use crate::production::TermFence;
-use crate::promotion::{can_promote_fenced, initial_term_sequence, replica_read_is_empty, should_start_claim};
+use crate::promotion::{initial_term_sequence, replica_read_is_empty, should_start_claim};
+use crate::recovery_promotion::may_promote;
 use crate::term_types::{Term, TermSequence};
 
 verus! {
@@ -44,12 +45,13 @@ pub open spec fn highest_after_admission(highest: int, arriving: int) -> int {
 
 pub open spec fn fenced_promotion(
     record_count: nat,
+    recognized_prefix: bool,
     may_lead: bool,
     already_leading: bool,
     holds_grant: bool,
     highest: int,
 ) -> Option<(int, int)> {
-    if record_count == 0 && may_lead && !already_leading && holds_grant && highest < i64::MAX {
+    if record_count == 0 && recognized_prefix && may_lead && !already_leading && holds_grant && highest < i64::MAX {
         Some((highest + 1, 0))
     } else {
         None
@@ -93,17 +95,18 @@ fn admission_preserves_the_high_water_mark(
         (match out {
             Some((term, sequence)) => Some((term.0 as int, sequence as int)),
             None => None,
-        }) == fenced_promotion(record_count as nat, may_lead, already_leading, holds_grant,
+        }) == fenced_promotion(record_count as nat, recognized_prefix, may_lead, already_leading, holds_grant,
                                fence.observed_highest() as int),
 )]
 fn fenced_promotion_after_empty_read(
     record_count: usize,
+    recognized_prefix: bool,
     may_lead: bool,
     already_leading: bool,
     holds_grant: bool,
     fence: &TermFence,
 ) -> Option<(Term, i64)> {
-    if !replica_read_is_empty(record_count) || !can_promote_fenced(may_lead, already_leading, holds_grant) {
+    if !replica_read_is_empty(record_count) || !may_promote(recognized_prefix, may_lead, already_leading, holds_grant) {
         return None;
     }
     match fence.claim_term() {

@@ -9,7 +9,9 @@
     "--verify-module",
     "promotion",
     "--verify-module",
-    "term_types"
+    "term_types",
+    "--verify-module",
+    "recovery_promotion"
   ],
   "min_verified_functions": 25,
   "controls": {
@@ -119,14 +121,37 @@
       "defect": "A worker can promote without a positive grant observation.",
       "mutate": [
         {
-          "file": "rust/crates/replication/src/promotion.rs",
-          "find": "    may_lead && !already_leading && holds_grant\n",
-          "replace": "    may_lead && !already_leading\n"
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "    recognized_prefix && may_lead && !already_leading && holds_grant\n",
+          "replace": "    recognized_prefix && may_lead && !already_leading\n"
         },
         {
-          "file": "rust/crates/replication/src/promotion.rs",
-          "find": "ensures out == (may_lead && !already_leading && holds_grant),",
-          "replace": "ensures out == (may_lead && !already_leading),"
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "can_promote == (recognized_prefix && may_lead && !already_leading && holds_grant),",
+          "replace": "can_promote == (recognized_prefix && may_lead && !already_leading),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/replica_admission/laws.rs",
+          "function": "fenced_promotion_after_empty_read",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "promote_after_unrecognized_prefix": {
+      "defect": "A worker can promote after an unrecognized replica frame.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "    recognized_prefix && may_lead && !already_leading && holds_grant\n",
+          "replace": "    may_lead && !already_leading && holds_grant\n"
+        },
+        {
+          "file": "rust/crates/replication/src/recovery_promotion.rs",
+          "find": "can_promote == (recognized_prefix && may_lead && !already_leading && holds_grant),",
+          "replace": "can_promote == (may_lead && !already_leading && holds_grant),"
         }
       ],
       "expect": [
