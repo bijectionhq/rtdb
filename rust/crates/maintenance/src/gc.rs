@@ -255,24 +255,20 @@ impl TrieCollector {
         let pages = rtdb_storage::cow_pages::FreshPages { store: self.store.as_ref(), prefix: &prefix };
         let mut reachable = BTreeSet::new();
         let leased = retired.iter().map(|(_, root)| root).filter(|root| !eligible.contains(&root.digest));
-        for root in held.iter().chain(leased) {
+        for (root, retired) in held.iter().map(|root| (root, false)).chain(leased.map(|root| (root, true))) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             if !reachable.contains(&root.digest) {
-                reachable.extend(cow_tree::reachable(&pages, root).await?);
+                // A collector that restarted sees a partly released root as newly retired.
+                let pages = if retired { cow_tree::reachable_present(&pages, root).await? } else { cow_tree::reachable(&pages, root).await? };
+                reachable.extend(pages);
             }
         }
         let mut entries = Vec::new();
         for (receipt, root) in retired.into_iter().filter(|(_, root)| eligible.contains(&root.digest)) {
-            let mut released = true;
-            for digest in cow_tree::retirement_order(&pages, &root, &reachable).await? {
-                if cancellation.is_cancelled() { return Err(crate::closed()); }
-                let key = ObjectKey::new(cow_tree::page_key(&prefix, digest))?;
-                if !self.store.release_entity_directory_page(&key, cut).await? {
-                    released = false;
-                    break;
-                }
-            }
-            if !released { continue; }
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let keys = cow_tree::retirement_order(&pages, &root, &reachable).await?.into_iter()
+                .map(|digest| ObjectKey::new(cow_tree::page_key(&prefix, digest))).collect::<std::result::Result<Vec<_>, _>>()?;
+            if self.store.release_entity_directory_pages(&keys, cut).await? < keys.len() { continue; }
             let key = TrieKey::l0(BlockIndex(receipt.through_block()))?;
             let record = EntityDirectoryChange { root: Some(receipt.clone()), replaces_root: None }.to_artefact()?;
             entries.push(ArtefactEntry { trie_key: Some(key.to_string()), record: Some(record) });
@@ -335,11 +331,10 @@ impl TrieCollector {
                 rtdb_storage::read_lease::collection_waited(observed, lease, now)
             }).collect::<Vec<_>>()
         };
-        for digest in unreachable.into_iter().take(self.config.chunk_size) {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let key = ObjectKey::new(cow_tree::page_key(&prefix, digest))?;
-            if !self.store.release_entity_directory_page(&key, cut).await? { break; }
-        }
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let keys = unreachable.into_iter().take(self.config.chunk_size)
+            .map(|digest| ObjectKey::new(cow_tree::page_key(&prefix, digest))).collect::<std::result::Result<Vec<_>, _>>()?;
+        self.store.release_entity_directory_pages(&keys, cut).await?;
         Ok(())
     }
 

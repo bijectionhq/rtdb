@@ -679,18 +679,32 @@ fn visit_page<'a, F: FnMut(Row) -> Result<bool> + Send + 'a>(
 }
 
 pub async fn reachable(store: &dyn PageStore, root: &RootRef) -> Result<Vec<PageDigest>> {
+    walk(store, root, false).await
+}
+
+/// The pages of a partly retired root that are still stored; a prior pass may have released some of its subtrees.
+pub async fn reachable_present(store: &dyn PageStore, root: &RootRef) -> Result<Vec<PageDigest>> {
+    walk(store, root, true).await
+}
+
+async fn walk(store: &dyn PageStore, root: &RootRef, skip_released: bool) -> Result<Vec<PageDigest>> {
     let mut seen = BTreeSet::new();
     let mut pending = vec![(root.clone(), None)];
     while let Some((reference, edge)) = pending.pop() {
         if !seen.insert(reference.digest) {
             continue;
         }
-        if let (Page::Branch(children), _) = load(store, &reference, edge.as_ref(), None).await? {
-            pending.extend(
+        match load(store, &reference, edge.as_ref(), None).await {
+            Ok((Page::Branch(children), _)) => pending.extend(
                 children
                     .into_iter()
                     .map(|edge| (edge.root.clone(), Some(edge))),
-            );
+            ),
+            Ok((Page::Leaf(_), _)) => {}
+            Err(error) if skip_released && error.category == AnomalyCategory::NotFound => {
+                seen.remove(&reference.digest);
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(seen.into_iter().collect())
@@ -905,6 +919,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_partly_released_root_reports_only_its_remaining_pages() {
+        let store = Pages::default();
+        let memory = MemoryBudget::new(16 << 20);
+        let (root, _) = apply(&store, None, (0..MAX_LEAF_ROWS + 1).map(put).collect(), &NoSummary, &memory).await.unwrap();
+        let root = root.unwrap();
+        let pages = reachable(&store, &root).await.unwrap();
+        let released = *pages.iter().find(|page| **page != root.digest).unwrap();
+        store.0.lock().unwrap().remove(&released);
+        assert!(reachable(&store, &root).await.is_err());
+        let present = reachable_present(&store, &root).await.unwrap();
+        assert_eq!(present, pages.into_iter().filter(|page| *page != released).collect::<Vec<_>>());
     }
 
     #[tokio::test]
