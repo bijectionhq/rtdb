@@ -15,6 +15,7 @@ rtdb-plan.workspace = true
 rtdb-text.workspace = true
 rtdb-columnar.workspace = true
 rtdb-format.workspace = true
+geometry = { package = "bijection-geometry", path = "../../vendor/bijection-geometry" }
 arrow-array.workspace = true
 arrow-schema.workspace = true
 bigdecimal.workspace = true

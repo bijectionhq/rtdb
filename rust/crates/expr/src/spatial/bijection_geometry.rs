@@ -3,12 +3,12 @@ use std::borrow::Cow;
 use geometry::{GeometryWork, Gv, Scalar, ValueView};
 use rtdb_types::Result;
 
-use crate::kernel::{geometry_error, invalid};
+use super::{geometry_error, invalid};
 
 #[derive(Clone, Copy)]
-pub(super) struct Value<'a>(&'a [u8]);
+pub struct Value<'a>(&'a [u8]);
 
-pub(super) fn decode<'a>(mut bytes: &'a [u8], work: &mut GeometryWork) -> Result<Value<'a>> {
+pub fn decode<'a>(mut bytes: &'a [u8], work: &mut GeometryWork) -> Result<Value<'a>> {
     let value = Value(bytes);
     validate(&mut bytes, 0, work)?;
     if !bytes.is_empty() {

@@ -1,6 +1,4 @@
-mod bijection_geometry;
 mod definition;
-mod kernel;
 mod lane;
 mod nearest;
 mod postings;
@@ -9,7 +7,10 @@ mod range_matches;
 mod read;
 
 pub use definition::path_geometry_encoding;
-pub use kernel::{Classification, Predicate};
+use rtdb_expr::spatial as kernel;
+#[cfg(test)]
+use rtdb_expr::spatial::bijection_geometry;
+pub use rtdb_expr::spatial::{Classification, Predicate};
 pub use lane::SpatialArtefacts;
 pub use nearest::PreparedNearest;
 pub use probe::Probe;

@@ -1,3 +1,6 @@
+#[doc(hidden)]
+pub mod bijection_geometry;
+
 use geometry::predicates::{
     self, CoverPredicate, TopologyPredicate,
     prepared::{Preparation, PreparedGeometry},
@@ -8,20 +11,20 @@ use geometry::{
 };
 use rtdb_types::{Anomaly, Result, SpatialGeometryEncoding};
 
-pub(crate) const WORK_STEPS: usize = 10_000_000;
-pub(crate) const WORK_BYTES: usize = 8 << 20;
+pub const WORK_STEPS: usize = 10_000_000;
+pub const WORK_BYTES: usize = 8 << 20;
 
-pub(crate) struct Location {
-    pub(crate) geometry: Geometry,
+pub struct Location {
+    pub geometry: Geometry,
     position_accuracy: Option<Option<f64>>,
 }
 
 impl Location {
-    pub(crate) fn is_point_geometry(&self) -> bool {
+    pub fn is_point_geometry(&self) -> bool {
         self.position_accuracy.is_none() && self.geometry.heights.is_none() && matches!(&self.geometry.coords, Coords::Point(_))
     }
 
-    pub(crate) fn decode(bytes: &[u8], work: &mut GeometryWork) -> Result<Self> {
+    pub fn decode(bytes: &[u8], work: &mut GeometryWork) -> Result<Self> {
         let Some((&tag, payload)) = bytes.split_first() else {
             return Err(invalid("Missing location encoding"));
         };
@@ -56,13 +59,13 @@ impl Location {
         })
     }
 
-    pub(crate) fn decode_stored(
+    pub fn decode_stored(
         bytes: &[u8], encoding: SpatialGeometryEncoding, work: &mut GeometryWork,
     ) -> Result<Option<Self>> {
         if encoding == SpatialGeometryEncoding::TaggedWkb {
             return Self::decode(bytes, work).map(Some);
         }
-        let value = crate::bijection_geometry::decode(bytes, work)?;
+        let value = bijection_geometry::decode(bytes, work)?;
         if matches!(value.scalar(), Scalar::Null) {
             return Ok(None);
         }
@@ -83,7 +86,7 @@ impl Location {
         Ok(Some(Self { geometry, position_accuracy: None }))
     }
 
-    pub(crate) fn keys(&self, work: &mut GeometryWork) -> Result<Vec<i64>> {
+    pub fn keys(&self, work: &mut GeometryWork) -> Result<Vec<i64>> {
         match &self.geometry.coords {
             Coords::Point(coords) => point_key(coords, self.position_accuracy.unwrap_or(Some(0.0)))
                 .map(|key| vec![key])
@@ -155,7 +158,7 @@ impl Predicate {
         }))
     }
 
-    pub(crate) fn cover_predicate(self) -> Option<CoverPredicate> {
+    pub fn cover_predicate(self) -> Option<CoverPredicate> {
         Some(match self {
             Self::All
             | Self::Topology(TopologyPredicate::Disjoint)
@@ -169,7 +172,7 @@ impl Predicate {
         })
     }
 
-    pub(crate) fn prepare_geometry(self, region: &Geometry, work: &mut GeometryWork) -> Result<PreparedGeometry> {
+    pub fn prepare_geometry(self, region: &Geometry, work: &mut GeometryWork) -> Result<PreparedGeometry> {
         let mut prepared = PreparedGeometry::new(region.clone(), Preparation::Topology, work)
             .map_err(geometry_error)?;
         if matches!(self, Self::Topology(_) | Self::WithinDistance(_) | Self::Nearest { .. }) {
@@ -181,12 +184,12 @@ impl Predicate {
         Ok(prepared)
     }
 
-    pub(crate) fn cover(self, region: &PreparedGeometry, work: &mut GeometryWork) -> Result<Option<Vec<KeyRange>>> {
+    pub fn cover(self, region: &PreparedGeometry, work: &mut GeometryWork) -> Result<Option<Vec<KeyRange>>> {
         self.cover_predicate().map(|predicate| candidate_ranges(region, predicate, work).map_err(geometry_error)).transpose()
     }
 
     // Outer option denotes eligibility; the inner value is the exact nearest distance.
-    pub(crate) fn evaluate(
+    pub fn evaluate(
         self,
         value: &Location,
         region: &Geometry,
@@ -245,7 +248,7 @@ impl Predicate {
         Ok(exact.map_err(geometry_error)?.then_some(None))
     }
 
-    pub(crate) fn validate_region(self, region: &Location) -> Result<()> {
+    pub fn validate_region(self, region: &Location) -> Result<()> {
         if matches!(self, Self::Nearest { .. })
             && !matches!(region.geometry.coords, Coords::Point(_))
         {
@@ -255,11 +258,11 @@ impl Predicate {
     }
 }
 
-pub(crate) fn invalid(message: impl Into<String>) -> Anomaly {
+pub fn invalid(message: impl Into<String>) -> Anomaly {
     Anomaly::incorrect("rtdb.spatial/invalid", message)
 }
 
-pub(crate) fn geometry_error(error: geometry::GeometryRefusal) -> Anomaly {
+pub fn geometry_error(error: geometry::GeometryRefusal) -> Anomaly {
     if error.bound.as_ref().is_some_and(|bound| {
         matches!(
             bound.kind,
