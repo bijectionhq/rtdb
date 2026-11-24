@@ -137,17 +137,28 @@ pub(crate) fn clock_slot_contains(reading: i64, observed: i64) -> bool {
     reading >= 0 && reading % CLOCK_SLOT_WIDTH == 0 && reading <= observed && observed < until
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(admitted =>
+    ensures admitted == (same_domain && earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time
+        && (earlier_seq == seq ==> earlier_epoch == epoch && earlier_time == time)),
+))]
+pub(crate) fn accepts_clock_lineage(
+    same_domain: bool, epoch: u64, earlier_epoch: u64, seq: u64, earlier_seq: u64, time: i64, earlier_time: i64,
+) -> bool {
+    same_domain && earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time
+        && (earlier_seq != seq || (earlier_epoch == epoch && earlier_time == time))
+}
+
 #[cfg(not(verus_keep_ghost))]
 pub(crate) fn clock_slot_time(
     slot: crate::OwnedClockSlot,
     head: Option<rtdb_types::TransactionKey>,
     appended: rtdb_types::Timestamp,
-    observed: rtdb_types::Timestamp,
+    observed: crate::DecisionObservation,
 ) -> Option<rtdb_types::Timestamp> {
     let head = head?;
-    clock_slot_admits(
-        slot.through.0, head.tx_id.0, slot.reading.0, appended.0, observed.0,
-    ).then_some(slot.reading)
+    (observed.covers(slot.issued) && clock_slot_reading(slot.issued.instant) == Some(slot.reading)
+        && clock_slot_admits(slot.through.0, head.tx_id.0, slot.reading.0, appended.0, observed.instant.0))
+        .then_some(slot.reading)
 }
 
 #[cfg(not(verus_keep_ghost))]
@@ -210,23 +221,29 @@ fn require_append_bound(
 mod tests {
     use rtdb_types::{Timestamp, TransactionKey, TxId};
 
-    use crate::OwnedClockSlot;
+    use crate::{DecisionObservation, OwnedClockSlot};
     use super::{clock_slot_reading, clock_slot_time};
 
     #[test]
     fn clock_slot_tests_position_and_independent_half_open_window() {
         let reading = clock_slot_reading(Timestamp(100)).unwrap();
         assert_eq!(reading, Timestamp(1_000_000));
-        let slot = OwnedClockSlot { through: TxId(8), reading };
+        let issued = DecisionObservation { domain: [3; 16], epoch: 2, sequence: 4, instant: Timestamp(100) };
+        let slot = OwnedClockSlot { through: TxId(8), reading, issued };
+        let observe = |instant| DecisionObservation { sequence: 5, instant, ..issued };
         let behind = TransactionKey { tx_id: TxId(7), system_time: Timestamp(100) };
         let carried = TransactionKey { tx_id: TxId(9), system_time: Timestamp(301) };
         let later_history = TransactionKey { tx_id: TxId(9), system_time: Timestamp(1_100_000) };
 
-        assert_eq!(clock_slot_time(slot, Some(carried), reading, reading), Some(reading));
-        assert_eq!(clock_slot_time(slot, Some(behind), reading, reading), None);
-        assert_eq!(clock_slot_time(slot, Some(carried), Timestamp(500_099), reading), None);
-        assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(500_099)), None);
-        assert_eq!(clock_slot_time(slot, Some(carried), reading, Timestamp(2_000_000)), None);
-        assert_eq!(clock_slot_time(slot, Some(later_history), reading, reading), Some(reading));
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, observe(reading)), Some(reading));
+        assert_eq!(clock_slot_time(slot, Some(behind), reading, observe(reading)), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), Timestamp(500_099), observe(reading)), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, observe(Timestamp(500_099))), None);
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, observe(Timestamp(2_000_000))), None);
+        assert_eq!(clock_slot_time(slot, Some(later_history), reading, observe(reading)), Some(reading));
+        let foreign = DecisionObservation { domain: [7; 16], ..observe(reading) };
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, foreign), None);
+        let successor = DecisionObservation { epoch: 3, ..observe(reading) };
+        assert_eq!(clock_slot_time(slot, Some(carried), reading, successor), Some(reading));
     }
 }

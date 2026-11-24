@@ -149,7 +149,7 @@ impl Service {
                 crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 => Ok(vec![Ok(Box::pin(self.confirm_hosted_source_action(&call, &action.body)).await?)]),
                 crate::owned_actions::READ_HELD_HOSTED_CONTROL_V2 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 => Ok(vec![Ok(Box::pin(self.read_held_root_catalog_action(&call, &action.body)).await?)]),
-                crate::owned_actions::OFFER_CLOCK_SLOT_V1 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
+                crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
                 COMMIT_OWNED_V1 | COMMIT_OWNED_V2 => {
                     let format = if action_type == COMMIT_OWNED_V1 { CommitFormat::Single } else { CommitFormat::Grouped };
                     Ok(vec![Ok(self.commit_owned_action(&call, &action.body, format).await?)])
@@ -402,7 +402,7 @@ fn fresh_flight_sessions_admit_only_read_actions() {
     assert!(fresh_replica_action(READ_HELD_ROOT_CATALOG_V1));
     assert!(fresh_replica_action(CLOSE_OWNED_READ_V1));
     assert!(!fresh_replica_action(OPEN_OWNED_READ_V3));
-    assert!(!fresh_replica_action(OFFER_CLOCK_SLOT_V1));
+    assert!(!fresh_replica_action(OFFER_CLOCK_SLOT_V2));
     assert!(!fresh_replica_action(COMMIT_OWNED_V7));
     assert!(fresh_replica_action(SEAL_HOSTED_RANGES_V1));
     assert!(fresh_replica_action(VALIDATE_FRESH_HOSTED_V1));

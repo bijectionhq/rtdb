@@ -1,4 +1,4 @@
-use crate::production::{clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
 use vstd::prelude::*;
 
 verus! {
@@ -134,6 +134,14 @@ pub fn an_advertised_reading_is_on_the_receiver_grid(observed: i64) {
     if let Some(reading) = next_grid_reading(observed) {
         assert(clock_slot_admits(1, 1, reading, reading, reading));
     }
+}
+
+pub fn the_offered_reading_requires_the_original_clock_lineage() {
+    assert(!accepts_clock_lineage(false, 3, 2, 8, 5, 1_100_000, 200_000));
+    assert(!accepts_clock_lineage(true, 1, 2, 8, 5, 1_100_000, 200_000));
+    assert(!accepts_clock_lineage(true, 3, 2, 4, 5, 1_100_000, 200_000));
+    assert(!accepts_clock_lineage(true, 2, 2, 5, 5, 1_100_000, 200_000));
+    assert(accepts_clock_lineage(true, 3, 2, 8, 5, 1_100_000, 200_000));
 }
 
 }

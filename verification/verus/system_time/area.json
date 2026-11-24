@@ -7,8 +7,24 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 26,
+  "min_verified_functions": 28,
   "controls": {
+    "substitute_the_receiver_clock_domain": {
+    "mutate": [
+      {
+        "file": "rust/crates/tx/src/system_time.rs",
+        "find": "    same_domain && earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time\n",
+        "replace": "    earlier_epoch <= epoch && earlier_seq <= seq && earlier_time <= time\n"
+      }
+    ],
+    "expect": [
+      {
+        "file": "rust/crates/tx/src/system_time.rs",
+        "function": "accepts_clock_lineage",
+        "category": "postcondition not satisfied"
+      }
+    ]
+  },
     "reuse_the_previous_tick": {
       "mutate": [
         {

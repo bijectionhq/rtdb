@@ -349,7 +349,7 @@ impl TxResolver {
             let observed = decision.ok_or_else(|| Anomaly::incorrect(
                 "rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable",
             ))?;
-            crate::system_time::clock_slot_time(slot, self.resolved_head, log_time, observed.instant)
+            crate::system_time::clock_slot_time(slot, self.resolved_head, log_time, observed)
                 .ok_or_else(|| Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"))
         }).transpose();
         let clock_request = match request.options.system_time {

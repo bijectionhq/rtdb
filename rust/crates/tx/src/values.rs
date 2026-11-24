@@ -1313,6 +1313,7 @@ pub enum OwnedPeriodEffect {
 pub struct OwnedClockSlot {
     pub through: TxId,
     pub reading: Timestamp,
+    pub issued: crate::DecisionObservation,
 }
 
 #[derive(Clone, Debug)]

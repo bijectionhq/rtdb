@@ -72,7 +72,7 @@ pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchP
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
-pub(crate) const OFFER_CLOCK_SLOT_V1: &str = "rtdb.owned.OfferClockSlot.v1";
+pub(crate) const OFFER_CLOCK_SLOT_V2: &str = "rtdb.owned.OfferClockSlot.v2";
 pub(crate) const COMMIT_OWNED_V1: &str = "rtdb.owned.Commit.v1";
 pub(crate) const COMMIT_OWNED_V2: &str = "rtdb.owned.Commit.v2";
 pub(crate) const COMMIT_ORDERED_V1: &str = "rtdb.owned.CommitOrdered.v1";
@@ -1044,7 +1044,10 @@ impl Service {
         if !trailing.is_empty() {
             return Err(invalid("A clock slot takes one original hold handle"));
         }
-        Ok(ActionResult { body: wire::retain(slot.reading.0.to_be_bytes().to_vec(), call.reserve(8)?) })
+        let mut body = Vec::with_capacity(48);
+        body.extend_from_slice(&slot.reading.0.to_be_bytes());
+        body.extend_from_slice(&slot.issued.encode());
+        Ok(ActionResult { body: wire::retain(body, call.reserve(48)?) })
     }
 
     async fn wait_for_clock_slot(&self, call: &Call, slot: OwnedClockSlot) -> Result<(), Status> {
@@ -1076,9 +1079,9 @@ impl Service {
         let through = cut.live().ok_or_else(|| Status::failed_precondition(
             "An ordered clock slot requires a live placed Root hold",
         ))?.tx_id;
-        let observed = original.snapshot.query_time().map_err(status)?;
-        let reading = rtdb_tx::clock_slot_reading(observed).ok_or_else(Self::clock_slot_missed)?;
-        Ok((OwnedClockSlot { through, reading }, body))
+        let issued = original.snapshot.receiver_observation().map_err(status)?;
+        let reading = rtdb_tx::clock_slot_reading(issued.instant).ok_or_else(Self::clock_slot_missed)?;
+        Ok((OwnedClockSlot { through, reading, issued }, body))
     }
 
     /// Seal only observations the original native hold actually issued.

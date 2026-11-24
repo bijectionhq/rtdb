@@ -14,6 +14,13 @@ pub struct DecisionObservation {
 impl DecisionObservation {
     pub const WIDTH: i32 = 40;
 
+    pub(crate) fn covers(self, earlier: Self) -> bool {
+        crate::system_time::accepts_clock_lineage(
+            self.domain == earlier.domain, self.epoch, earlier.epoch, self.sequence, earlier.sequence,
+            self.instant.0, earlier.instant.0,
+        )
+    }
+
     pub fn encode(self) -> [u8; Self::WIDTH as usize] {
         let mut bytes = [0; Self::WIDTH as usize];
         bytes[..16].copy_from_slice(&self.domain);
@@ -44,7 +51,7 @@ pub struct OrderedClockEvidence {
 }
 
 impl OrderedClockEvidence {
-    pub const WIDTH: i32 = DecisionObservation::WIDTH + 17;
+    pub const WIDTH: i32 = 2 * DecisionObservation::WIDTH + 17;
 
     pub fn encode(self) -> [u8; Self::WIDTH as usize] {
         let mut bytes = [0; Self::WIDTH as usize];
@@ -52,7 +59,8 @@ impl OrderedClockEvidence {
         if let Some(slot) = self.slot {
             bytes[40] = 1;
             bytes[41..49].copy_from_slice(&slot.through.0.to_be_bytes());
-            bytes[49..].copy_from_slice(&slot.reading.0.to_be_bytes());
+            bytes[49..57].copy_from_slice(&slot.reading.0.to_be_bytes());
+            bytes[57..].copy_from_slice(&slot.issued.encode());
         }
         bytes
     }
@@ -64,13 +72,15 @@ impl OrderedClockEvidence {
             0 if bytes[41..].iter().all(|byte| *byte == 0) => None,
             1 => {
                 let through = TxId(i64::from_be_bytes(bytes[41..49].try_into().map_err(|_| invalid_observation())?));
-                let reading = Timestamp(i64::from_be_bytes(bytes[49..].try_into().map_err(|_| invalid_observation())?));
-                if through.0 < 0 || through >= accepted
+                let reading = Timestamp(i64::from_be_bytes(bytes[49..57].try_into().map_err(|_| invalid_observation())?));
+                let issued = DecisionObservation::decode(&bytes[57..])?;
+                if through.0 < 0 || through >= accepted || !observation.covers(issued)
+                    || crate::system_time::clock_slot_reading(issued.instant) != Some(reading)
                     || !crate::system_time::clock_slot_contains(reading.0, observation.instant.0)
                 {
                     return Err(invalid_observation());
                 }
-                Some(OwnedClockSlot { through, reading })
+                Some(OwnedClockSlot { through, reading, issued })
             }
             _ => return Err(invalid_observation()),
         };
@@ -94,12 +104,16 @@ mod tests {
     #[test]
     fn retained_slot_keeps_the_original_target_and_cut() {
         let observation = DecisionObservation { domain: [7; 16], epoch: 3, sequence: 8, instant: Timestamp(1_200_000) };
-        let slot = OwnedClockSlot { through: TxId(5), reading: Timestamp(1_000_000) };
+        let issued = DecisionObservation { sequence: 6, instant: Timestamp(100), ..observation };
+        let slot = OwnedClockSlot { through: TxId(5), reading: Timestamp(1_000_000), issued };
         let original = OrderedClockEvidence { observation, slot: Some(slot) };
         let bytes = original.encode();
         assert_eq!(OrderedClockEvidence::decode(&bytes, TxId(6)).unwrap(), original);
         assert!(OrderedClockEvidence::decode(&bytes, slot.through).is_err());
         assert!(OrderedClockEvidence::decode(&bytes[..40], TxId(6)).is_err());
+        let mut other_domain = bytes;
+        other_domain[57..73].fill(9);
+        assert!(OrderedClockEvidence::decode(&other_domain, TxId(6)).is_err());
     }
 
     #[test]

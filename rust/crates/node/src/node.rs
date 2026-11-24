@@ -1374,6 +1374,7 @@ pub struct OwnedReadSession {
     database: String,
     owner: String,
     present: TransactionKey,
+    receiver_observation: Option<rtdb_tx::DecisionObservation>,
     witness_scope: Option<rtdb_types::PlacedAttemptScope>,
     applied_scope: Option<rtdb_types::PlacedAttemptScope>,
     applied_preparation: Option<Arc<PreparedAppliedCatalog>>,
@@ -1619,6 +1620,11 @@ impl OwnedReadSession {
     }
 
     pub fn query_time(&self) -> Result<Timestamp> { self.context.current_time.as_micros() }
+
+    pub fn receiver_observation(&self) -> Result<rtdb_tx::DecisionObservation> {
+        self.check()?;
+        self.receiver_observation.ok_or_else(hosted_source_unavailable)
+    }
 
     /// Recover clock evidence only from an attempt assertion on this original Root cut.
     pub async fn owned_attempt_observation(&self, key: TransactionKey) -> Result<Option<rtdb_tx::OrderedClockEvidence>> {
@@ -3703,7 +3709,11 @@ impl NativeSession {
                 (Some(present.system_time), CatalogReadCut::Reserved(present))
             }
         };
-        let observed = node.receiver_time().await?;
+        let receiver_observation = match &node.factory.decision_clock {
+            Some(clock) => Some(clock.observe().await?),
+            None => None,
+        };
+        let observed = receiver_observation.map_or_else(|| node.now(), |sample| sample.instant);
         let attached = attachment;
         let selected = reserved.or_else(|| replica_capture.as_ref().and_then(|capture| {
             capture.snapshot.tx_basis().map(|key| key.system_time)
@@ -3751,7 +3761,7 @@ impl NativeSession {
         }));
         context.check_cancelled()?;
         Ok(OwnedReadSession {
-            context, node, identity, database, owner, present, witness_scope, applied_scope, applied_preparation, witness_until, fork_until: witness_until,
+            context, node, identity, database, owner, present, receiver_observation, witness_scope, applied_scope, applied_preparation, witness_until, fork_until: witness_until,
             cancellation, session_cancellation, historical: None, scoped_root: None, attachment: placement, _reservation: charge,
         })
     }

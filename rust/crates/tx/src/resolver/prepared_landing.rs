@@ -73,9 +73,11 @@ impl SourceTransaction {
             Operation::Public(TxOp::OwnedClockSlot { slot }) => Some(*slot),
             _ => None,
         }).ok_or_else(invalid)?;
-        crate::system_time::clock_slot_time(slot, Some(predecessor), appended, time).ok_or_else(|| {
-            Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable")
-        })?;
+        if crate::system_time::clock_slot_reading(slot.issued.instant) != Some(time)
+            || !crate::system_time::clock_slot_admits(slot.through.0, predecessor.tx_id.0, time.0, appended.0, time.0)
+        {
+            return Err(Anomaly::incorrect("rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable"));
+        }
         operations.operations.retain(|operation| !matches!(operation, Operation::Public(TxOp::OwnedClockSlot { .. })));
         operations.place_owned_periods(time, true)?;
         operations.place_proposal_keys(time, true)?;
