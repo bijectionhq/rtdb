@@ -232,7 +232,9 @@ The retained-base reset can reconstruct the cut from a detached root and its jou
 Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a successor root that matches the published checkpoint digest.
 For parked installations an independently sealed replay archive can cover mixed packs on local and S3 storage, including enrolled terminal S3. Each carried member must match the archive's authenticated plaintext or have the existing receipt L0 coverage. Hosted S3 can also retire a pack while it has serving readers that were admitted through the same archive. In that case the archive must cover every payload member, including receipt L0. This route uses the replay fence and drain evidence.
 Enrolled terminal S3 extends the archive-covered route to active writers. The directory excludes competing uploads to the exact pack key and the conditional tombstone prevents recreation.
-Full recovery closures, versioned active-writer mixed-pack grants and live provider qualification remain open.
+Versioned S3 uses the same active-writer archive and upload fence, then installs a current object tombstone before deleting the exact old version.
+The tombstone keeps create-only writes closed after settlement.
+Full recovery closures and live provider qualification remain open.
 
 |6
 |Sealing and the key ledger for every durable unit.

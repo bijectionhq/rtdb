@@ -20,7 +20,7 @@ use crate::store::exact_retirement::{settle, tombstones::{TombstoneJournal, reti
 
 #[derive(Clone, Copy)]
 enum Publication<'a> {
-    Version(&'a PhysicalObjectVersion),
+    Version { version: &'a PhysicalObjectVersion, target: &'a S3TombstoneTarget },
     Tombstone { allocation: Uuid, target: &'a S3TombstoneTarget },
 }
 
@@ -35,8 +35,8 @@ struct ReplayRetirement<'a> {
 impl<'a> ReplayRetirement<'a> {
     fn from_work(work: &'a RetirementWork) -> Option<Self> {
         match work {
-            RetirementWork::ReplayPack { deployment, target, version, capture, checkpoint } =>
-                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint, publication: Publication::Version(version) }),
+            RetirementWork::ReplayPack { deployment, target, version, tombstone, capture, checkpoint } =>
+                Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint, publication: Publication::Version { version, target: tombstone } }),
             RetirementWork::ReplayPackTombstone { deployment, target, tombstone, allocation, capture, checkpoint } =>
                 Some(Self { deployment, target, capture: *capture, checkpoint: *checkpoint,
                     publication: Publication::Tombstone { allocation: *allocation, target: tombstone } }),
@@ -80,7 +80,6 @@ pub(in crate::store) async fn reap_hosted(
     let prefix = format!("{store}/");
     if !Base::load(bucket, &store).await?.objects.is_empty() { return Ok(()); }
     let terminal = provider.enrolled_terminal_retirement().await?;
-    if terminal.is_none() && !parked_writer_drained(candidate) { return Ok(()); }
     let deployments = directory.deployments().await?;
     let references = References::scan(bucket, &deployments).await?;
     for pack in bucket.list(Some(&key(&format!("{prefix}{PACK_DIRECTORY}"))?)).await? {
@@ -92,13 +91,10 @@ pub(in crate::store) async fn reap_hosted(
         }
         let work = match observed.storage {
             PackStorage::Raw { version: Some(version), .. } => {
-                if references.has_declared_version(&pack.key, &version)
-                    || !provider.exact_retirement_available(&pack.key, &version).await?
-                {
-                    continue;
-                }
+                if references.has_declared_version(&pack.key, &version) { continue; }
+                let Some(tombstone) = provider.versioned_retirement_target(&pack.key, &version).await? else { continue; };
                 RetirementWork::ReplayPack {
-                    deployment: candidate.id.clone(), target: pack.key.to_string(), version, capture, checkpoint,
+                    deployment: candidate.id.clone(), target: pack.key.to_string(), version, tombstone, capture, checkpoint,
                 }
             }
             PackStorage::Terminal { publication, .. } if !references.has_declared_reference(&pack.key) => RetirementWork::ReplayPackTombstone {
@@ -159,9 +155,8 @@ async fn erase_granted(directory: &dyn Directory, provider: &VersionedInventory,
     });
     crate::residence_trace::record("authorize-replay-pack", observed);
     match publication {
-        Publication::Version(version) => {
-            provider.retire_observed_version(&target, version).await?;
-            if !provider.exact_retirement_absent(&target, version).await? { return Err(changed()); }
+        Publication::Version { version, target: tombstone } => {
+            provider.retire_version_behind_tombstone(&target, version, tombstone, retirement.token).await?;
         }
         Publication::Tombstone { allocation, target: tombstone } => {
             let proof = provider.enrolled_terminal_retirement().await?
@@ -186,8 +181,7 @@ async fn authorize(
     let Some(block) = target.as_str().strip_prefix(&format!("{store}/")).and_then(pack_block)
         else { return Err(changed()); };
     let Some(record) = directory.deployment(deployment).await? else { return Ok(()); };
-    if !eligible(&record) || matches!(publication, Publication::Version(_)) && !parked_writer_drained(&record)
-        || record.lineage != lineage || record.storage_prefix() != retirement.source
+    if !eligible(&record) || record.lineage != lineage || record.storage_prefix() != retirement.source
         || record.checkpoint != Some(checkpoint) || record.serving_replay_capture != Some(capture)
         || block >= checkpoint.block || !Base::load(bucket, &store).await?.objects.is_empty()
     {
@@ -200,13 +194,13 @@ async fn authorize(
     }
     let references = References::scan(bucket, &directory.deployments().await?).await?;
     let retained = match publication {
-        Publication::Version(version) => references.has_declared_version(&target, version),
+        Publication::Version { version, .. } => references.has_declared_version(&target, version),
         Publication::Tombstone { .. } => references.has_declared_reference(&target),
     };
     if retained { return Ok(()); }
     let cipher = crate::store::directory_publications(keys, &record, IoRegion::new())?;
     let terminal = match publication {
-        Publication::Version(_) => None,
+        Publication::Version { .. } => None,
         Publication::Tombstone { allocation, .. } => {
             let Some(terminal) = provider.enrolled_terminal_retirement().await?
                 .filter(|terminal| terminal.allocation() == Some(allocation))
@@ -221,7 +215,7 @@ async fn authorize(
     archive::with_replay_archive(directory, storage, keys, &record, Some(task), |admitted, owner, archive| async move {
         let Some(observed) = observe_pack(bucket, terminal, target).await? else { return Ok(()); };
         let same = match (&publication, &observed.storage) {
-            (Publication::Version(expected), PackStorage::Raw { version, .. }) => version.as_ref() == Some(*expected),
+            (Publication::Version { version: expected, .. }, PackStorage::Raw { version, .. }) => version.as_ref() == Some(*expected),
             (Publication::Tombstone { target, allocation }, PackStorage::Terminal { publication, .. }) =>
                 publication.allocation() == *allocation && publication.target() == *target,
             _ => false,
@@ -235,8 +229,8 @@ async fn authorize(
         {
             return Ok(());
         }
-        if let Publication::Version(version) = publication
-            && !provider.exact_retirement_available(target, version).await?
+        if let Publication::Version { version, target: tombstone } = publication
+            && provider.versioned_retirement_target(target, version).await?.as_ref() != Some(tombstone)
         {
             return Ok(());
         }

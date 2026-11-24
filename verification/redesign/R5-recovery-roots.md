@@ -544,3 +544,12 @@ key. The frozen writer publication and source basis remain part of the
 ordered world certificate. An admitted archive consumer also carries its
 storage region through provider drain, so expiry of the world admission
 cannot release work that has already started reading.
+
+## Versioned mixed-pack fence
+
+The serving archive can replace every reader-visible member of an original mixed pack while a versioned S3 writer remains attached.
+The lineage grant binds the observed version and current strong ETag.
+The directory fences new uploads and excludes pending uploads of that pack key.
+The provider installs a versioned object with the retirement identity using the bound ETag.
+The writer's create-only policy excludes both overwrites and recreation behind that object.
+Settlement confirms the tombstone is current and the exact old version is absent before reopening the lineage.

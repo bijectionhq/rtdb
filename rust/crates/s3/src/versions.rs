@@ -6,8 +6,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{ChecksumAlgorithm, CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier, RequestPayer};
 use bytes::Bytes;
 use object_store::path::Path;
-use rtdb_storage::{Error, IoRegion, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, valid_object_version}};
-use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition};
+use rtdb_storage::{Error, IoRegion, ObjectKey, remote::{ClassicVersionRetirement, PublicationResult, PublicationUploads, S3_RETIREMENT_ATTRIBUTE, strong_entity_tag, valid_object_version}};
+use rtdb_types::{Anomaly, AnomalyCategory, PhysicalObjectVersion, Result, S3ObjectNamespace, S3TombstoneCondition, S3TombstoneTarget};
 
 #[path = "never_versioned.rs"]
 mod never_versioned;
@@ -42,6 +42,14 @@ enum VersionStatus {
     Absent,
     WouldExposeOlderData,
     SafeToRemove,
+}
+
+const RETIRED_VERSION_ATTRIBUTE: &str = "rtdb-retired-version";
+
+enum VersionedRetirementHead {
+    Live(String),
+    Tombstone(uuid::Uuid),
+    Changed,
 }
 
 #[async_trait::async_trait]
@@ -257,6 +265,98 @@ impl VersionedInventory {
     pub async fn retire_observed_version(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<()> {
         let path = self.observed_path(key, observed)?;
         self.retire_version_at_path(path.as_ref(), &observed.version).await
+    }
+
+    /// Captures the current ETag as well as the exact version selected by the
+    /// retirement owner. The ETag is used only for the current-object CAS.
+    pub async fn versioned_retirement_target(
+        &self, key: &ObjectKey, version: &PhysicalObjectVersion,
+    ) -> Result<Option<S3TombstoneTarget>> {
+        let path = self.observed_path(key, version)?;
+        let VersionedRetirementHead::Live(tag) = self.versioned_retirement_head(path.as_ref(), &version.version).await?
+            else { return Ok(None); };
+        Ok(Some(S3TombstoneTarget {
+            namespace: version.namespace.clone(), key: version.key.clone(), condition: S3TombstoneCondition::Matches(tag),
+        }))
+    }
+
+    /// The authorized grant closes concurrent RTDB publication admission.
+    /// A current, zero-byte S3 version keeps conditional writers fenced while
+    /// the old immutable version is deleted and after the grant settles.
+    pub async fn retire_version_behind_tombstone(
+        &self, key: &ObjectKey, version: &PhysicalObjectVersion, target: &S3TombstoneTarget, token: uuid::Uuid,
+    ) -> Result<()> {
+        let path = self.observed_path(key, version)?;
+        let S3TombstoneCondition::Matches(tag) = &target.condition else {
+            return Err(unavailable("A versioned tombstone requires a conditional entity tag"));
+        };
+        if target.namespace != version.namespace || target.key != version.key || !strong_entity_tag(tag) || token.is_nil() {
+            return Err(unavailable("The tombstone does not name the authorized versioned object"));
+        }
+        self.require_versioned().await?;
+        let path = path.to_string();
+        let (tag, version) = (tag.clone(), version.version.clone());
+        self.inspect((path, tag, version, token), |owner, (path, tag, version, token)| async move {
+            match owner.inspect_versioned_retirement_head(&path, &version).await? {
+                VersionedRetirementHead::Tombstone(prior) if prior == token => (),
+                VersionedRetirementHead::Live(observed) if observed == tag => {
+                    let reply = owner.client.put_object().bucket(&owner.namespace.bucket).key(&path)
+                        .if_match(tag).metadata(S3_RETIREMENT_ATTRIBUTE, token.simple().to_string())
+                        .metadata(RETIRED_VERSION_ATTRIBUTE, &version)
+                        .body(ByteStream::from(Bytes::new()))
+                        .set_request_payer(owner.request_payer.clone()).send().await;
+                    if !matches!(owner.inspect_versioned_retirement_head(&path, &version).await?,
+                        VersionedRetirementHead::Tombstone(prior) if prior == token)
+                    {
+                        return Err(unavailable(match reply {
+                            Ok(_) => "The versioned object tombstone was not observed".to_owned(),
+                            Err(error) => format!("Installing the versioned object tombstone failed: {error}"),
+                        }));
+                    }
+                }
+                _ => return Err(unavailable("The current object differs from the authorized version")),
+            }
+            owner.require_versioned().await?;
+            owner.retire_version_at_path(&path, &version).await?;
+            if !matches!(owner.inspect_versioned_retirement_head(&path, &version).await?,
+                VersionedRetirementHead::Tombstone(prior) if prior == token)
+            {
+                return Err(unavailable("The versioned object lost its terminal fence"));
+            }
+            Ok(())
+        }).await
+    }
+
+    async fn versioned_retirement_head(&self, path: &str, version: &str) -> Result<VersionedRetirementHead> {
+        self.inspect((path.to_owned(), version.to_owned()), |owner, (path, version)| async move {
+            owner.inspect_versioned_retirement_head(&path, &version).await
+        }).await
+    }
+
+    async fn inspect_versioned_retirement_head(&self, path: &str, version: &str) -> Result<VersionedRetirementHead> {
+        let head = match self.client.head_object().bucket(&self.namespace.bucket).key(path)
+            .set_request_payer(self.request_payer.clone()).send().await
+        {
+            Ok(head) => head,
+            Err(error) if error.as_service_error().is_some_and(|error| error.is_not_found()) =>
+                return Ok(VersionedRetirementHead::Changed),
+            Err(error) => return Err(unavailable(format!("Checking the versioned tombstone failed: {error}"))),
+        };
+        if let Some(marker) = head.metadata().and_then(|metadata| metadata.get(S3_RETIREMENT_ATTRIBUTE)) {
+            let valid = head.content_length() == Some(0)
+                && head.version_id().is_some_and(|seen| seen != version && valid_object_version(seen.as_bytes()))
+                && head.metadata().and_then(|metadata| metadata.get(RETIRED_VERSION_ATTRIBUTE)).is_some_and(|seen| seen == version);
+            return Ok(match (valid, uuid::Uuid::parse_str(marker)) {
+                (true, Ok(token)) if !token.is_nil() => VersionedRetirementHead::Tombstone(token),
+                _ => VersionedRetirementHead::Changed,
+            });
+        }
+        if head.version_id() == Some(version)
+            && let Some(tag) = head.e_tag().filter(|tag| strong_entity_tag(tag))
+        {
+            return Ok(VersionedRetirementHead::Live(tag.to_owned()));
+        }
+        Ok(VersionedRetirementHead::Changed)
     }
 
     async fn retire_version_at_path(&self, path: &str, version: &str) -> Result<()> {

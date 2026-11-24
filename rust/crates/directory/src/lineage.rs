@@ -63,16 +63,18 @@ impl LineageRetirement {
 }
 
 fn replay_pack_writes_are_fenced(owner: &DeploymentRecord, work: &RetirementWork, target: &str) -> bool {
+    let pending = owner.storage_regions.values().any(|region| {
+        matches!(region, StorageRegion::Remote { publications, .. }
+            if publications.values().any(|upload| upload.key == target))
+    });
+    if pending { return false; }
     match work {
-        RetirementWork::ReplayPack { .. } => owner.holder.is_none() && owner.active_s3_write_lease(crate::now_ms()).is_none(),
-        RetirementWork::ReplayPackTombstone { allocation, tombstone, .. } => {
+        RetirementWork::ReplayPack { version, tombstone, .. } =>
+            version.namespace == tombstone.namespace && version.key == tombstone.key
+                && matches!(&tombstone.condition, rtdb_types::S3TombstoneCondition::Matches(_)),
+        RetirementWork::ReplayPackTombstone { allocation, tombstone, .. } =>
             owner.storage_namespaces.is_some_and(|namespaces| namespaces.objects == *allocation)
-                && matches!(&tombstone.condition, rtdb_types::S3TombstoneCondition::Matches(_))
-                && !owner.storage_regions.values().any(|region| {
-                    matches!(region, StorageRegion::Remote { publications, .. }
-                        if publications.values().any(|upload| upload.key == target))
-                })
-        }
+                && matches!(&tombstone.condition, rtdb_types::S3TombstoneCondition::Matches(_)),
         _ => false,
     }
 }
@@ -114,6 +116,7 @@ pub enum RetirementWork {
         deployment: String,
         target: String,
         version: PhysicalObjectVersion,
+        tombstone: S3TombstoneTarget,
         capture: Uuid,
         checkpoint: Checkpoint,
     },
@@ -512,6 +515,11 @@ mod tests {
             token: Uuid::new_v4(), source,
             work: RetirementWork::ReplayPack {
                 deployment: owner.id.clone(), target: object.clone(), capture, checkpoint,
+                tombstone: S3TombstoneTarget {
+                    namespace: S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
+                    key: format!("cell/{object}"),
+                    condition: S3TombstoneCondition::Matches("\"original\"".into()),
+                },
                 version: PhysicalObjectVersion {
                     namespace: S3ObjectNamespace { bucket: "serving".into(), endpoint: None, region: None },
                     key: format!("cell/{object}"), version: "exact-version".into(),
@@ -556,6 +564,18 @@ mod tests {
             tracks_ordered_index_pages: true, checkpoint_metadata_from: Some(checkpoint.block), checkpoint_replay_from: None,
         });
         assert!(state.authorize_exact_owned(&changed, &retirement).is_err());
+        owner.holder = Some(crate::MemberId("writer".into()));
+        owner.s3_write_lease_until_ms = Some(i64::MAX);
+        let mut uploading = owner.clone();
+        let pending = Uuid::new_v4();
+        uploading.storage_regions.insert(pending, StorageRegion::Remote {
+            archive: None, archive_source: None, checkpoint_suffix: None, repair_archive: Some(capture),
+            tracks_ordered_index_pages: true, checkpoint_metadata_from: Some(checkpoint.block), checkpoint_replay_from: None,
+            owner: None, closed: false, publications: BTreeMap::from([(Uuid::new_v4(), crate::StoragePublication {
+                key: object, upload_id: "prepared-pack".into(), unit: None, rejected: false,
+            })]),
+        });
+        assert!(state.authorize_exact_owned(&uploading, &retirement).is_err());
         let state = state.authorize_exact_owned(&owner, &retirement).unwrap();
         let state: LineageState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
         assert!(state.exact_erasure_authorized());
