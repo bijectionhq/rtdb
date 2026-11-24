@@ -120,7 +120,7 @@ impl Database {
                     through,
                 }),
                 None => Some(self.partition.snapshot()).filter(|snapshot| {
-                    snapshot.catalog_cut().is_none() && snapshot.tx_basis().is_none()
+                    crate::read_selection::empty_catalog_matches_cut(snapshot.catalog_cut(), snapshot.tx_basis())
                 }),
             };
             if let Some(snapshot) = snapshot {

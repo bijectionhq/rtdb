@@ -435,7 +435,7 @@ impl JournalLog {
         let mut unsettled = Vec::with_capacity(reads.len());
         for read in reads.drain(..) {
             match self.reads.journal.release_read(read).await {
-                Ok(position) if position >= read.expires_at => {}
+                Ok(position) if super::read_selection::read_release_settled(position, read.expires_at) => {}
                 Ok(_) | Err(_) => unsettled.push(read),
             }
         }
@@ -479,7 +479,7 @@ impl ReplicaReadIndex for JournalLog {
                     if self.reads.reader_epoch.is_some() {
                         self.reads.route().await?;
                     }
-                    let offset = latest(hold.through)?;
+                    let offset = latest(super::read_selection::barrier_cut(hold))?;
                     crate::residence_trace::record("ordered-read-index", || serde_json::json!({
                         "deployment": current.placement.deployment, "incarnation": current.placement.incarnation,
                         "group": current.placement.group, "generation": current.placement.generation,

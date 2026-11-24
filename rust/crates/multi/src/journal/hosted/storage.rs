@@ -70,14 +70,14 @@ impl ServingLease {
         match renew.await {
             Ok(length) => {
                 let length = Duration::from_millis(length);
-                let deadline = sent.checked_add(length).filter(|deadline| Instant::now() < *deadline)
+                let deadline = sent.checked_add(length).filter(|deadline| crate::journal::read_selection::read_lease_admits(Instant::now(), *deadline))
                     .ok_or_else(|| invalid("The installed serving lease arrived expired"))?;
                 *self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some((deadline, sent + length / 2));
                 Ok(deadline)
             }
             Err(error) => self.lease_state().map(|(deadline, _)| deadline)
-                .filter(|deadline| Instant::now() < *deadline).ok_or(error),
+                .filter(|deadline| crate::journal::read_selection::read_lease_admits(Instant::now(), *deadline)).ok_or(error),
         }
     }
 

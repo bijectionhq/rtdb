@@ -9,6 +9,8 @@ use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp, TransactionKe
 use crate::{CatalogCut, CatalogTrie, LiveIndex, ServingSearch, Snapshot, StagedWrite, TableCatalog, TableMeta, TrieCatalog, TrieState};
 use crate::reader_retention::any_reference_requires;
 
+mod read_selection;
+
 #[derive(Clone, Copy, Debug)]
 enum CatalogPublication {
     Untracked,
@@ -216,7 +218,7 @@ impl PartitionState {
     /// Mutable state between replica application and publication carries no capture authority.
     pub fn published_snapshot(&self, cut: CatalogCut) -> Option<Snapshot> {
         let value = self.value.read();
-        if !matches!(value.catalog_publication, CatalogPublication::Installed(current) if current == cut) {
+        if !matches!(value.catalog_publication, CatalogPublication::Installed(current) if read_selection::catalog_matches_cut(current, cut)) {
             return None;
         }
         let published = self.published.lock();

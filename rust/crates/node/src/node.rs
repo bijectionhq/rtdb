@@ -545,7 +545,10 @@ impl Node {
                 lease = Some(match lease { Some(lease) => lease.earlier(database_lease), None => database_lease });
             }
             let snapshot = match cut {
-                CatalogReadCut::Current => replica_capture.map_or_else(|| database.partition.snapshot(), |capture| (*capture.snapshot).clone()),
+                CatalogReadCut::Current => crate::read_selection::query_snapshot(
+                    replica_capture.map(|capture| (*capture.snapshot).clone()),
+                    || database.partition.snapshot(),
+                ),
                 CatalogReadCut::Reserved(reserved) => {
                     let snapshot = database.partition.snapshot();
                     if snapshot.tx_basis() != Some(reserved) {

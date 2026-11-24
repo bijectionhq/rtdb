@@ -20,6 +20,7 @@ pub mod hosted;
 mod prefix_retirement;
 pub(crate) mod retention_decision;
 mod log;
+mod read_selection;
 pub(crate) mod replay_cursor;
 pub(crate) use log::{Held, JournalLog};
 use ordered_logkeeper::ordered::TrimResult;
@@ -558,12 +559,9 @@ impl InstalledJournal {
 }
 
 pub fn latest(cut: Cut) -> Result<LogOffset> {
-    if cut.next_lsn == 0 {
-        return Ok(LogOffset(-1));
-    }
-    i64::try_from(cut.next_lsn - 1)
+    read_selection::barrier_offset(cut.next_lsn)
         .map(LogOffset)
-        .map_err(|_| mismatch("The journal position exceeds the RTDB log range"))
+        .ok_or_else(|| mismatch("The journal position exceeds the RTDB log range"))
 }
 
 fn mismatch(message: &str) -> Anomaly {
