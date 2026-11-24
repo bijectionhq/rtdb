@@ -299,6 +299,8 @@ pub(super) async fn latest(
     }
     let mut checkpoint = if bytes.starts_with(&ipc::CONTINUATION) {
         decode_manifest(ipc::decode(bytes, 1)?, &allocation)?
+    } else if store.ordered_index_arrow_only() {
+        return Err(format_error("The installed ordered index checkpoint requires Arrow IPC"));
     } else {
         decode_legacy_manifest(&bytes)?
     };
@@ -383,8 +385,9 @@ pub(super) async fn publish(
         manifest_bytes: 0,
         _allocation: None,
     };
-    let _scratch = tree.arrow_references.then(|| tree.memory.reserve(32 << 10)).transpose()?;
-    let encoded = if tree.arrow_references {
+    let arrow = tree.writes_arrow_references();
+    let _scratch = arrow.then(|| tree.memory.reserve(32 << 10)).transpose()?;
+    let encoded = if arrow {
         ipc::encode(&encode_manifest(&checkpoint)?)?
     } else {
         encode_legacy_manifest(&checkpoint)?
@@ -511,10 +514,52 @@ fn decode_manifest(batch: RecordBatch, memory: &Arc<MemoryReservation>) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use std::{ops::Range, path::Path};
+
+    use arrow_array::StringArray;
+    use bytes::Bytes;
     use rtdb_columnar::MemoryBudget;
-    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_storage::{MemoryStore, ObjectStore, StoredObject, cache::BufferPool};
+    use rtdb_types::{Iid, Interval, TableRef, Timestamp};
+
+    use crate::ordered_index::{
+        Definition,
+        key::{Atom, Bucket},
+        postings::KeyRow,
+        tree::{Address, Cursor, IndexRevision, KeyRef, Span},
+    };
 
     use super::*;
+
+    struct InstalledStore(Arc<MemoryStore>);
+
+    #[async_trait::async_trait]
+    impl ObjectStore for InstalledStore {
+        fn ordered_index_arrow_only(&self) -> bool {
+            true
+        }
+        async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> {
+            self.0.head(key).await
+        }
+        async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
+            self.0.get(key).await
+        }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> {
+            self.0.get_range(key, range).await
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
+            self.0.put(key, bytes).await
+        }
+        async fn put_file(&self, key: &ObjectKey, path: &Path) -> rtdb_storage::Result<()> {
+            self.0.put_file(key, path).await
+        }
+        async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
+            self.0.list(directory).await
+        }
+        async fn delete(&self, key: &ObjectKey) -> rtdb_storage::Result<()> {
+            self.0.delete(key).await
+        }
+    }
 
     #[test]
     fn legacy_manifest_accepts_published_bytes_and_preserves_the_checksum() {
@@ -533,11 +578,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arrow_checkpoint_reopens_the_json_subtrees_it_keeps() -> Result<()> {
-        use rtdb_types::Timestamp;
-        use crate::ordered_index::tree::{IndexRevision, KeyRef};
-
-        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+    async fn installed_checkpoint_refuses_shared_json_manifests_and_subtrees() -> Result<()> {
+        let store = Arc::new(MemoryStore::default());
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let installed = Arc::new(BufferPool::new(Arc::new(InstalledStore(store.clone())), 1 << 20));
         let memory = MemoryBudget::new(32 << 20);
         let directory = ObjectKey::new("index")?;
         let mut tree = Tree::new(&storage, &directory, &memory, 0).await?;
@@ -556,12 +600,12 @@ mod tests {
         let root = store_roots(&tree, 1, &roots, &token).await?;
         publish(&tree, 1, 129, root, &token).await?;
 
-        let key = key(&directory, format_args!("{MANIFESTS}/{:016x}", 1))?;
-        assert!(storage.object_store().get_fresh(&key).await?.starts_with(&ipc::CONTINUATION));
+        let manifest = key(&directory, format_args!("{MANIFESTS}/{:016x}", 1))?;
+        assert!(store.get(&manifest).await?.starts_with(&ipc::CONTINUATION));
         let reopened = latest(&storage, &directory, &memory, 1).await?.unwrap();
         let reader = Tree::new(&storage, &directory, &memory, reopened.scope).await?;
         let root = reopened.roots().archived;
-        let mut cursor = crate::ordered_index::tree::Cursor::new(root, false);
+        let mut cursor = Cursor::new(root, false);
         let mut observed = Vec::new();
         while let Some(hit) = cursor.next(&reader, |_| std::cmp::Ordering::Equal).await? {
             let KeyRef::Revision(time) = hit.key() else {
@@ -571,6 +615,101 @@ mod tests {
             observed.push(time.transaction);
         }
         assert_eq!(observed, (0..129).collect::<Vec<_>>());
+
+        tree.arrow_references = false;
+        publish(&tree, 2, 129, None, &token).await?;
+        let error = latest(&installed, &directory, &memory, 2).await.err().unwrap();
+        assert_eq!(error.message.as_deref(), Some("The installed ordered index checkpoint requires Arrow IPC"));
+        let unfunded = MemoryBudget::new(1);
+        let error = latest(&installed, &directory, &unfunded, 2).await.err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+
+        let mixed = latest(&installed, &directory, &memory, 1).await?.unwrap();
+        let reader = Tree::new(&installed, &directory, &memory, mixed.scope).await?;
+        let mut cursor = Cursor::new(mixed.roots().archived, false);
+        let error = cursor.next(&reader, |_| std::cmp::Ordering::Equal).await.err().unwrap();
+        assert_eq!(error.message.as_deref(), Some("An installed ordered index page requires Arrow IPC"));
+
+        let pointer = legacy.revisions.as_ref().unwrap();
+        let page = key(&reader.pages()?, format_args!("{:016x}/{}", pointer.generation, pointer.digest))?;
+        store.delete(&page).await?;
+        store.put(&page, vec![0; pointer.size].into()).await?;
+        let mut cursor = Cursor::new(legacy.roots().archived, false);
+        let error = cursor.next(&reader, |_| std::cmp::Ordering::Equal).await.err().unwrap();
+        assert_eq!(error.message.as_deref(), Some("Ordered index page checksum mismatch"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn installed_arrow_checkpoint_rebuilds_at_the_same_frontier_and_preserves_page_reads() -> Result<()> {
+        let store = Arc::new(MemoryStore::default());
+        let shared = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let installed = Arc::new(BufferPool::new(Arc::new(InstalledStore(store.clone())), 1 << 20));
+        let memory = MemoryBudget::new(32 << 20);
+        let token = CancellationToken::new();
+        let definition = Definition {
+            name: "by_key".into(),
+            table: TableRef::new("public", "events"),
+            columns: vec!["key".into()],
+            version: 6,
+        };
+        let shared_directory = definition.directory(&shared)?;
+        let installed_directory = definition.directory(&installed)?;
+        assert_ne!(shared_directory, installed_directory);
+        let address = Address::new(Iid([1; 16]), Bytes::new());
+        let tuple = KeyRow::Fence(Arc::from([Atom::Text("key".into())]));
+        let posting = Key::Posting {
+            bucket: Bucket { level: 64, start: 0 },
+            tuple: tuple.clone(),
+            address: address.clone(),
+        };
+        let span = Span { valid: Interval::ALL, tuple };
+        for (storage, directory, arrow_only) in [
+            (&shared, &shared_directory, false),
+            (&installed, &installed_directory, true),
+        ] {
+            assert!(latest(storage, directory, &memory, 7).await?.is_none());
+            let tree = Tree::new(storage, directory, &memory, 0).await?;
+            let root = tree.edit(
+                None,
+                vec![
+                    (posting.clone(), Some(Item::Posting)),
+                    (Key::Row(address.clone()), Some(Item::Row(Arc::from([span.clone()])))),
+                ],
+            ).await?;
+            let revisions = RevisionRoots {
+                archived: None,
+                changes: (0..129)
+                    .map(|transaction| (IndexRevision { time: Timestamp(10), transaction }, root.clone()))
+                    .collect(),
+            };
+            let root = store_roots(&tree, 7, &revisions, &token).await?;
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            let error = publish(&tree, 6, 129, root.clone(), &cancelled).await.err().unwrap();
+            assert_eq!(error.message.as_deref(), Some("Ordered index checkpoint refers to a later block"));
+            publish(&tree, 7, 129, root.clone(), &token).await?;
+            publish(&tree, 7, 129, root, &token).await?;
+            let manifest = key(directory, format_args!("{MANIFESTS}/{:016x}", 7))?;
+            assert_eq!(store.get(&manifest).await?.starts_with(&ipc::CONTINUATION), arrow_only);
+
+            let reopened = latest(storage, directory, &memory, 8).await?.unwrap();
+            assert_eq!((reopened.through, reopened.source_rows), (7, 129));
+            let reader = Tree::new(storage, directory, &memory, reopened.scope).await?;
+            assert!(reopened.file_bytes(&reader, &token).await? > reopened.manifest_bytes);
+            let wanted = IndexRevision { time: Timestamp(10), transaction: 64 };
+            let (revision, root) = reopened.roots().at(&reader, wanted).await?.unwrap();
+            assert_eq!(revision, wanted);
+            let mut cursor = Cursor::new(root, false);
+            let hit = cursor.next(&reader, |_| std::cmp::Ordering::Equal).await?.unwrap();
+            let (column, row, _) = hit.plain_column(0, 1).unwrap();
+            assert_eq!(arrow::<StringArray>(column.as_ref())?.value(row), "key");
+            assert_eq!(hit.into_entry().key, posting);
+            let correction = cursor.next(&reader, |_| std::cmp::Ordering::Equal).await?.unwrap().into_entry();
+            assert_eq!(correction.key, Key::Row(address.clone()));
+            let Item::Row(spans) = correction.item else { panic!("Expected correction spans"); };
+            assert_eq!(spans.as_ref(), std::slice::from_ref(&span));
+        }
         Ok(())
     }
 

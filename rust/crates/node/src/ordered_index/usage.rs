@@ -48,7 +48,7 @@ async fn checkpoint_file_bytes(
     definition: &super::Definition,
     through: i64,
 ) -> Result<Option<(i64, i64)>> {
-    let directory = definition.directory()?;
+    let directory = definition.directory(storage)?;
     let Some(manifest) = checkpoint::latest(storage, &directory, &context.memory, through).await? else {
         return Ok(None);
     };

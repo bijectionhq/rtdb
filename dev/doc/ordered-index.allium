@@ -38,14 +38,17 @@ entity Checkpoint {
 -- A snapshot may reuse projected tail changes from the same definition and captured source block.
 -- A read or maintenance cycle owns index page buffers for its own lifetime.
 -- A point read merges bucket prefixes in key order.
--- Every reader opens both JSON and Arrow IPC branch pages, revision directories, and checkpoint manifests within the current layout.
--- Arrow reference publication starts after each reader in the installation can open both formats.
+-- Readers of the shared layout open JSON and Arrow IPC branch pages, revision directories, and checkpoint manifests.
+-- Shared-layout Arrow reference publication starts after each reader in the installation can open both formats.
 -- A process-private in-memory store can publish Arrow references by default.
--- A hosted runtime-installed journal defaults to Arrow publication under its dual-format reader contract.
 -- Other durable or shared stores require the writer's explicit setting to publish Arrow references.
--- An explicit JSON selection takes precedence over the publication default.
+-- An explicit JSON selection takes precedence over the shared-layout publication default.
 -- A legacy checkpoint checksum binds the canonical JSON layout published by the writer.
--- A newly published page can keep a reference to a page originally written in JSON.
+-- A shared-layout Arrow page can keep a reference to a page originally written in JSON.
+-- A runtime-installed journal's serving and exact-snapshot attachments select a distinct ordered-index layout address.
+-- The runtime-installed layout uses Arrow for every published manifest and reachable page.
+-- Maintenance builds the runtime-installed layout from captured sources when its checkpoint is absent.
+-- A reader validates immutable page size and digest before interpreting the page's format.
 -- Arrow references bind the measured subtree count, domain, and coefficient alongside the full key fences.
 -- An Arrow posting fence can share its address bytes under the reservation already held by its key tuple.
 -- Every immutable page reference binds its exact subtree entry count and full fences.

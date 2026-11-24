@@ -80,7 +80,7 @@ impl OrderedIndexMaintenance {
             .chain(owned.as_ref())
             .flat_map(DefinitionSet::iter);
         let directories = active.clone()
-            .map(Definition::directory)
+            .map(|definition| definition.directory(&self.storage))
             .collect::<Result<BTreeSet<_>>>()?;
         if let Some(basis) = snapshot
             .tx_basis()
@@ -89,7 +89,7 @@ impl OrderedIndexMaintenance {
             prune_dropped(&self.storage, &directories, basis.tx_id.0, cancellation).await?;
         }
         for definition in active {
-            let directory = definition.directory()?;
+            let directory = definition.directory(&self.storage)?;
             self.refresh_index(snapshot, definition, &directory, cancellation)
                 .await?;
         }
@@ -1015,7 +1015,7 @@ mod tests {
             drop(other_work);
             assert_eq!(std::mem::take(&mut *store.reads.lock()), vec![None]);
 
-            let tree = Tree::new(&storage, &definition.directory()?, &memory, inputs.cuts.scope).await?;
+            let tree = Tree::new(&storage, &definition.directory(&storage)?, &memory, inputs.cuts.scope).await?;
             let mut roots = RevisionRoots::default();
             assert_eq!(replay_flushed(&tree, &definition, &sources, inputs, &mut roots, &cancellation).await?, 4);
             let reads = std::mem::take(&mut *store.reads.lock());
@@ -1074,7 +1074,7 @@ mod tests {
         let memory = MemoryBudget::new(32 << 20);
         let cancellation = CancellationToken::new();
         let definition = Definition { name: "ordered".into(), table: TableRef::new("public", "orders"), columns: vec!["key".into()], version: 0 };
-        let tree = Tree::new(&storage, &definition.directory()?, &memory, 5).await?;
+        let tree = Tree::new(&storage, &definition.directory(&storage)?, &memory, 5).await?;
         let cuts = ErasureCuts::default();
         let result = flushed_changes(&tree, &definition, &source, &cancellation, Some(&cuts)).await;
         let error = result.err().expect("the replacement range must be refused");
