@@ -18,7 +18,6 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, Mutex}, time::Duration}
 
 use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Decimal256Array, Float64Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt64Array};
 use arrow_flight::Result as ActionResult;
-use crate::actions::SelectionEncoder;
 use arrow_ipc::writer::IpcWriteOptions;
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -37,12 +36,19 @@ use uuid::Uuid;
 use crate::owned_landing_wire::{self, ControlCommand};
 use self::ordered_controls::OrderedControls;
 use crate::{
+    actions::{OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames},
     error::{arrow, invalid, status, unsupported},
     lease::Leased,
     service::{Call, Service, found},
     state::ResourceOwner,
     upload, wire,
 };
+
+pub(crate) enum OwnedReplyFormat<'a> {
+    Unary,
+    Selection(&'a mut SelectionEncoder),
+    StreamV1,
+}
 
 pub(crate) const SEAL_HOSTED_RANGES_V1: &str = "rtdb.owned.SealHostedRanges.v1";
 pub(crate) const VALIDATE_FRESH_HOSTED_V1: &str = "rtdb.owned.ValidateFreshHosted.v1";
@@ -2381,11 +2387,7 @@ impl Service {
         work.clone().ok_or_else(|| Status::failed_precondition("The original read has no audience work allowance"))
     }
 
-    pub(crate) async fn held_owned_point_action(&self, call: &Call, body: &[u8], time: PointTime) -> Result<ActionResult, Status> {
-        self.held_owned_point(call, body, time, false, None).await
-    }
-
-    pub(crate) async fn held_owned_point(&self, call: &Call, body: &[u8], time: PointTime, compact: bool, selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_point(&self, call: &Call, body: &[u8], time: PointTime, compact: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held point has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -2399,7 +2401,7 @@ impl Service {
             require_audience_point(&call.session, &relation, &id, held.audience_projection_work.is_none())?;
         }
         let fixed = matches!(time, PointTime::Required);
-        self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held)), selection).await
+        self.execute_owned_point(&held.snapshot, &relation, &id, valid, fixed, Some((call, &held)), reply_format).await
     }
 
     pub(crate) async fn held_owned_absent_keys_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
@@ -2453,44 +2455,36 @@ impl Service {
         Ok(ActionResult { body: wire::retain(Bytes::from(reply), retained) })
     }
 
-    pub(crate) async fn held_owned_historical_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        self.held_owned_historical_point(call, body, None).await
-    }
-
-    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &[u8], selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_historical_point(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned historical point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned historical point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.retained_owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Optional, selection.is_some())?;
+        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Optional, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.unwrap_or(system);
         let cursor = held.snapshot.open_historical_point(&relation, &id, system, valid).await.map_err(status)?;
-        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, selection).await?;
+        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, reply_format).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_position_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        self.held_owned_position_point(call, body, None).await
-    }
-
-    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &[u8], selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_position_point(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned position point has no handle"))?;
         let (system, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Owned position point has no system time"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let (mask, request) = split_position_mask(request)?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Required, selection.is_some())?;
+        let (relation, id, valid, _identity) = selected_point_request(call, request, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.ok_or_else(|| invalid("Owned position point has no valid instant"))?;
         let cursor = held.snapshot.open_historical_position_point(&relation, &id, system, valid, mask).await.map_err(status)?;
-        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, selection).await?;
+        let reply = self.finish_owned_point(call, system, valid, &id, cursor, None, reply_format).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn held_root_cut_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_root_cut_point_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Root cut point has no hold"))?;
         let (history, request) = request.split_first_chunk::<8>().ok_or_else(|| invalid("Root cut point has no system time"))?;
@@ -2507,7 +2501,7 @@ impl Service {
         let (relation, id, valid, _identity) = point_request(call, request, PointTime::Required)?;
         let valid = valid.ok_or_else(|| invalid("Root cut point has no valid instant"))?;
         let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
-        let reply = self.finish_owned_point(call, system_time, valid, &id, cursor, None, None).await?;
+        let reply = self.finish_owned_point(call, system_time, valid, &id, cursor, None, reply_format).await?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2564,7 +2558,7 @@ impl Service {
                 return Err(history_invalid());
             }
             last = interval.upper();
-            let reply = self.world_point_reply_with_extent(call, point, interval.lower(), None, Some(interval), None)?;
+            let reply = self.world_point_reply_with_extent(call, point, interval.lower(), None, Some(interval), OwnedReplyFormat::Unary)?.into_unary();
             bytes = wire::add(bytes, reply.encoded_len())?;
             if bytes > self.0.config.maximum_message_bytes {
                 return Err(Status::resource_exhausted("World version exceeds the Flight response limit"));
@@ -2605,7 +2599,7 @@ impl Service {
         let mut replies = Vec::with_capacity(2);
         for before in [true, false] {
             let cursor = held.snapshot.open_root_cut_point(&relation, &id, publication, valid, before).await.map_err(status)?;
-            let reply = self.finish_owned_point_inner(call.memory(), group, valid, &id, cursor, None, Some(&columns), None, None, |_| Ok(None)).await?;
+            let reply = self.finish_owned_point_inner(call.memory(), group, valid, &id, cursor, None, Some(&columns), None, OwnedReplyFormat::Unary, |_| Ok(None)).await?.into_unary();
             replies.push(Ok(reply));
         }
         held.snapshot.check_relation(&relation).map_err(status)?;
@@ -3647,7 +3641,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3702,7 +3696,7 @@ impl Service {
         }
         let present = held.snapshot.present().system_time;
         let scope = owned_rank_scope(b"rtdb.owned.search.held.v5\0", &body[..prefix_len + rank.frame_len], rank.query);
-        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present))?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present), reply_format)?;
         held.snapshot.check_relations(rank.partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)
     }
@@ -3733,7 +3727,7 @@ impl Service {
         Ok(shadows)
     }
 
-    pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held nearest has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3785,14 +3779,14 @@ impl Service {
         }
         let present = held.snapshot.present().system_time;
         let scope = owned_rank_scope(b"rtdb.owned.nearest.held.v2\0", body, "");
-        let reply = self.owned_rank_reply_with(call, page, scope, nonces, present, valid.unwrap_or(present),
+        let reply = self.owned_rank_reply_with(call, page, scope, nonces, present, valid.unwrap_or(present), reply_format,
             [(OWNED_NEAREST_APPROXIMATE, if approximate { "1" } else { "0" })])?;
         held.snapshot.check_relations(nearest.partitions.iter().map(|partition| &partition.relation)).map_err(status)?;
         Ok(reply)
     }
 
     /// Fuses a held text ranking and a held nearest ranking of the same relations at the held cut by reciprocal rank fusion.
-    pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held hybrid search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3842,14 +3836,14 @@ impl Service {
         }
         let present = held.snapshot.present().system_time;
         let scope = owned_rank_scope(b"rtdb.owned.hybrid.held.v2\0", body, "");
-        let reply = self.owned_rank_reply_with(call, page, scope, nonces, present, valid.unwrap_or(present),
+        let reply = self.owned_rank_reply_with(call, page, scope, nonces, present, valid.unwrap_or(present), reply_format,
             [(OWNED_NEAREST_APPROXIMATE, if approximate { "1" } else { "0" })])?;
         held.snapshot.check_relations(rank.partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)
     }
 
     /// The world hybrid family: HybridHeldWorld (with staged overlays), HybridHeldWorldAt and HybridHeldWorldParentAt.
-    pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {
+    pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world hybrid handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -3914,7 +3908,7 @@ impl Service {
         drop((text_page, nearest_page));
         let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
         let present = parent_at.or_else(|| earlier.map(|(system, _)| system)).unwrap_or_else(|| held.snapshot.present());
-        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid)?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid, reply_format)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
@@ -3969,7 +3963,7 @@ impl Service {
 
     /// `NearestHeldWorld.v1`, `NearestHeldWorldAt.v1` and `NearestHeldWorldParentAt.v1`:
     /// the SearchHeldWorld prefixes followed by the NearestHeld.v2 frame.
-    pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {
+    pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4041,12 +4035,12 @@ impl Service {
         }
         let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
         let present = parent_at.or_else(|| earlier.map(|(system, _)| system)).unwrap_or_else(|| held.snapshot.present());
-        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid)?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid, reply_format)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
 
-    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead) -> Result<ActionResult, Status> {
+    pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4114,23 +4108,23 @@ impl Service {
             }
         }
         let nonces = witnesses.into_iter().map(|witness| held.remember(call, witness, false)).collect::<Result<Vec<_>, _>>()?;
-        let reply = self.owned_rank_reply(call, page, scope, nonces, parent_at.or_else(|| earlier.map(|(system, _)| system)).unwrap_or_else(|| held.snapshot.present()), valid)?;
+        let reply = self.owned_rank_reply(call, page, scope, nonces, parent_at.or_else(|| earlier.map(|(system, _)| system)).unwrap_or_else(|| held.snapshot.present()), valid, reply_format)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
 
     fn owned_rank_reply(
         &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
-        present: Timestamp, valid: Timestamp,
-    ) -> Result<ActionResult, Status> {
-        self.owned_rank_reply_with(call, page, scope, witnesses, present, valid, [])
+        present: Timestamp, valid: Timestamp, reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
+        self.owned_rank_reply_with(call, page, scope, witnesses, present, valid, reply_format, [])
     }
 
     #[allow(clippy::too_many_arguments)]
     fn owned_rank_reply_with<const N: usize>(
         &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
-        present: Timestamp, valid: Timestamp, extra: [(&str, &str); N],
-    ) -> Result<ActionResult, Status> {
+        present: Timestamp, valid: Timestamp, reply_format: OwnedReplyFormat<'_>, extra: [(&str, &str); N],
+    ) -> Result<OwnedIpcReply, Status> {
         let hits = page.hits.batch();
         let mut metadata = hits.schema_ref().metadata().clone();
         for (key, value) in extra { metadata.insert(key.into(), value.into()); }
@@ -4150,7 +4144,8 @@ impl Service {
             wire::add(bytes, wire::mul(size, 4)?)
         })?;
         let _reply_charge = call.reserve(charge)?;
-        self.owned_point_reply(&schema, (hits.num_rows() != 0).then_some(hits), present, valid, None)
+        self.owned_point_reply_in(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
+            present, valid, None, None, reply_format)
     }
 
     pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
@@ -4748,18 +4743,14 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, call.reserve(25)?) })
     }
 
-    pub(crate) async fn held_world_point_at_action(&self, call: &Call, body: &[u8], parent: bool) -> Result<ActionResult, Status> {
-        self.held_world_point_at(call, body, parent, None).await
-    }
-
-    pub(crate) async fn held_world_point_at(&self, call: &Call, body: &[u8], parent: bool, selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_point_at(&self, call: &Call, body: &[u8], parent: bool, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical world point has no held handle"))?;
         let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical world point has no ordered present"))?;
         let system = Timestamp(i64::from_be_bytes(*system));
         let handle = Bytes::copy_from_slice(handle);
         let held = self.owned_world_resource(call, &handle)?;
-        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, selection.is_some())?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
         let point = if parent {
             held.snapshot.parent_point_at(&relation, &id, valid, system).await
@@ -4769,21 +4760,17 @@ impl Service {
         if point.present != system || point.witness.is_some() || point.until.is_some() {
             return Err(history_invalid());
         }
-        let response = self.world_point_reply_with_extent(call, point, valid, None, None, selection)?;
+        let response = self.world_point_reply_with_extent(call, point, valid, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(response)
     }
 
-    pub(crate) async fn held_world_point_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
-        self.held_world_point(call, body, None).await
-    }
-
-    pub(crate) async fn held_world_point(&self, call: &Call, body: &[u8], selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_point(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world point has no held handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
-        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, selection.is_some())?;
+        let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
@@ -4797,7 +4784,7 @@ impl Service {
         let until = result.until;
         let absent = result.row.is_none() && !result.shadowed;
         let nonce = result.witness.take().map(|evidence| held.remember(call, evidence, absent)).transpose()?;
-        let reply = self.world_point_reply_with_extent(call, result, valid_at, nonce, None, selection)?;
+        let reply = self.world_point_reply_with_extent(call, result, valid_at, nonce, None, reply_format)?;
         if matches!(*mode, 2 | 3 | 4) {
             held.snapshot.check_parent_point(&relation, until).map_err(status)?;
         } else {
@@ -4937,14 +4924,15 @@ impl Service {
     }
 
     fn world_point_reply(&self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>) -> Result<ActionResult, Status> {
-        self.world_point_reply_with_extent(call, result, valid_at, nonce, None, None)
+        self.world_point_reply_with_extent(call, result, valid_at, nonce, None, OwnedReplyFormat::Unary)
+            .map(OwnedIpcReply::into_unary)
     }
 
     fn world_point_reply_with_extent(
         &self, call: &Call, result: crate::WorldPointResult, valid_at: Timestamp, nonce: Option<Uuid>,
         extent: Option<rtdb_types::Interval>,
-        selection: Option<&mut SelectionEncoder>,
-    ) -> Result<ActionResult, Status> {
+        reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         let mut metadata = std::collections::HashMap::from([
             ("rtdb.owned.world_shadowed".into(), u8::from(result.shadowed).to_string()),
         ]);
@@ -4972,9 +4960,9 @@ impl Service {
                 .collect::<Result<Vec<_>, _>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
             let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
             let batch = RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?;
-            self.owned_point_reply_in(self.memory(), &schema, Some(&batch), result.present, valid_at, Some(revision), result.until, selection)
+            self.owned_point_reply_in(self.memory(), &schema, Some(&batch), result.present, valid_at, Some(revision), result.until, reply_format)
         } else {
-            self.owned_point_reply_in(self.memory(), &Schema::empty().with_metadata(metadata), None, result.present, valid_at, None, None, selection)
+            self.owned_point_reply_in(self.memory(), &Schema::empty().with_metadata(metadata), None, result.present, valid_at, None, None, reply_format)
         }
     }
 
@@ -5689,20 +5677,20 @@ impl Service {
         Ok(())
     }
 
-    pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn read_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, id, _, _identity) = point_request(call, body, PointTime::Default)?;
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
         let snapshot = native.open_owned_read().await.map_err(status)?;
-        self.execute_owned_point(&snapshot, &relation, &id, None, false, None, None).await
+        self.execute_owned_point(&snapshot, &relation, &id, None, false, None, reply_format).await
     }
 
     async fn execute_owned_point(
         &self, snapshot: &OwnedReadSession, relation: &OwnedRelation, id: &EntityId, valid: Option<Timestamp>,
-        fixed: bool, origin: Option<(&Call, &OwnedReadResource)>, selection: Option<&mut SelectionEncoder>,
-    ) -> Result<ActionResult, Status> {
+        fixed: bool, origin: Option<(&Call, &OwnedReadResource)>, reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         let present = snapshot.system_time();
         let lifetime = snapshot.lifetime_point_policy(relation).await.map_err(status)?;
         let cursor = snapshot.open_point_at(relation, id, valid).await.map_err(status)?;
@@ -5732,25 +5720,25 @@ impl Service {
             && relation.name() == rtdb_types::OWNED_ATTEMPT_RELATION
             && origin.is_some_and(|(call, _)| call.session.audience_source().is_none()))
             .then_some(snapshot);
-        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, selection, witness).await?;
+        let reply = self.finish_owned_point_inner(memory, present, valid.unwrap_or(present), id, cursor, lifetime, None, attempt, reply_format, witness).await?;
         snapshot.check_live_point_relation(relation).map_err(status)?;
         Ok(reply)
     }
 
-    async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>, selection: Option<&mut SelectionEncoder>) -> Result<ActionResult, Status> {
-        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, None, selection, |_| Ok(None)).await
+    async fn finish_owned_point(&self, call: &Call, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>, lifetime: Option<rtdb_types::OwnedLifetimeFloor>, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        self.finish_owned_point_inner(call.memory(), present, valid, id, result, lifetime, None, None, reply_format, |_| Ok(None)).await
     }
 
     async fn finish_owned_point_inner(
         &self, memory: &Arc<MemoryBudget>, present: Timestamp, valid: Timestamp, id: &EntityId, result: Option<QueryCursor>,
         lifetime: Option<rtdb_types::OwnedLifetimeFloor>, path_columns: Option<&[String]>,
         attempt: Option<&OwnedReadSession>,
-        selection: Option<&mut SelectionEncoder>,
+        reply_format: OwnedReplyFormat<'_>,
         witness: impl FnOnce(Option<Timestamp>) -> Result<Option<Uuid>, Status>,
-    ) -> Result<ActionResult, Status> {
+    ) -> Result<OwnedIpcReply, Status> {
         let Some(mut cursor) = result else {
             let schema = with_point_witness(&Schema::empty(), witness(None)?);
-            return self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, selection);
+            return self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, reply_format);
         };
         let mut result = None;
         while let Some(batch) = cursor.next_batch().await.map_err(status)? {
@@ -5799,7 +5787,7 @@ impl Service {
                 }
                 schema = schema.with_metadata(metadata);
             }
-            let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until, selection)?;
+            let reply = self.owned_point_reply_in(memory, &schema, Some(rows), present, valid, Some(revision), until, reply_format)?;
             if until.is_some_and(|until| until <= self.0.node.now()) {
                 return Err(Status::failed_precondition("The held point reached its creation lifetime"));
             }
@@ -5808,7 +5796,7 @@ impl Service {
             let schema = if path_columns.is_some() { wire::OwnedSchema::empty(memory)? }
                 else { wire::plan_schema(cursor.runtime_schema(), memory)? };
             let schema = with_point_witness(&schema, witness(None)?);
-            self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, selection)
+            self.owned_point_reply_in(memory, &schema, None, present, valid, None, None, reply_format)
         }
     }
 
@@ -5817,14 +5805,15 @@ impl Service {
     }
 
     fn owned_point_reply_until(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>) -> Result<ActionResult, Status> {
-        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, until, None)
+        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, until, OwnedReplyFormat::Unary)
+            .map(OwnedIpcReply::into_unary)
     }
 
     fn owned_point_reply_in(
         &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
         present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
-        selection: Option<&mut SelectionEncoder>,
-    ) -> Result<ActionResult, Status> {
+        reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         let _metadata = memory.reserve(wire::schema_bound(schema)?).map_err(status)?;
         let mut metadata = schema.metadata().clone();
         metadata.insert(OWNED_PRESENT.into(), present.0.to_string());
@@ -5859,13 +5848,18 @@ impl Service {
         let schema = Arc::new(schema.project(&columns).map_err(arrow)?.with_metadata(metadata));
         let batch = batch.map(|batch| RecordBatch::try_new(Arc::clone(&schema), columns.iter().map(|&index| Arc::clone(batch.column(index))).collect()))
             .transpose().map_err(arrow)?;
-        let maximum = self.0.config.maximum_message_bytes.min(crate::config::AUDIENCE_REPLY_BYTES);
-        if let Some(selection) = selection
-            && let Some(reply) = selection.point(memory, &schema, batch.as_ref(), maximum)?
-        {
-            return Ok(reply);
-        }
-        self.owned_stream_reply_in(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default())
+        let stream = match reply_format {
+            OwnedReplyFormat::Selection(selection) => {
+                let maximum = self.0.config.maximum_message_bytes.min(crate::config::AUDIENCE_REPLY_BYTES);
+                if let Some(reply) = selection.point(memory, &schema, batch.as_ref(), maximum)? {
+                    return Ok(OwnedIpcReply::Unary(reply));
+                }
+                false
+            }
+            OwnedReplyFormat::Unary => false,
+            OwnedReplyFormat::StreamV1 => true,
+        };
+        self.encode_owned_stream_reply(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default(), stream)
     }
 
     fn owned_action_reply(&self, schema: &Schema, batch: Option<&RecordBatch>) -> Result<ActionResult, Status> {
@@ -5877,16 +5871,28 @@ impl Service {
     }
 
     fn owned_stream_reply_in(&self, memory: &Arc<MemoryBudget>, schema: &Schema, pages: &[RecordBatch]) -> Result<ActionResult, Status> {
+        self.encode_owned_stream_reply(memory, schema, pages, false).map(OwnedIpcReply::into_unary)
+    }
+
+    fn encode_owned_stream_reply(
+        &self, memory: &Arc<MemoryBudget>, schema: &Schema, pages: &[RecordBatch], stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let bytes = pages.iter().try_fold(0, |bytes, batch| wire::add(bytes, batch.get_array_memory_size()))?;
         let bound = wire::add(wire::schema_bound(schema)?, wire::mul(bytes, 8)?)?;
         let _encoding = memory.reserve(bound).map_err(status)?;
+        if stream && pages.iter().all(|page| page.schema_ref().as_ref() == schema)
+            && let Ok(frames) = encode_ipc_frames(schema, pages)
+        {
+            return retain_ipc_frames(memory, frames, self.0.config.maximum_message_bytes);
+        }
+        // The original writer still decides the status and precedence of codec refusals.
         let bytes = write_arrow_stream(schema, pages, IpcWriteOptions::default()).map_err(status)?;
         let reply = ActionResult { body: bytes.into() };
         if reply.encoded_len() > self.0.config.maximum_message_bytes {
             return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
         }
         let retained = memory.reserve(reply.body.len()).map_err(status)?;
-        Ok(ActionResult { body: wire::retain(reply.body, retained) })
+        Ok(OwnedIpcReply::Unary(ActionResult { body: wire::retain(reply.body, retained) }))
     }
 }
 
