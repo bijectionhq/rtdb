@@ -106,6 +106,9 @@ fn deployment_administration_grants_require_explicit_principals_and_flight() {
     assert!(decode("deploymentAdminPrincipals: [automation]\nflightSql: null").is_err());
     assert!(decode("deploymentAdminPrincipals: [123]").is_err());
     assert!(decode("deploymentAdminPrincipals: [' ']").is_err());
+    assert!(decode("deploymentCreatePrincipals: [cell-creator]").is_ok());
+    assert!(decode("deploymentCreatePrincipals: [cell-creator]\nflightSql: null").is_err());
+    assert!(decode("deploymentCreatePrincipals: [123]").is_err());
     assert!(decode("defaultCheckpointRestoreDirectory: /var/lib/rtdb/restored").is_ok());
     assert!(decode("defaultCheckpointRestoreDirectory: relative/path").is_err());
 }

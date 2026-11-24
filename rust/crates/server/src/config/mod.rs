@@ -168,7 +168,9 @@ impl NodeConfiguration {
             let search = search(fields.take("search"))?;
             let auth = fields.take("authn").map(|value| authentication::decode(value, environment)).transpose()?.unwrap_or_else(|| authentication::default_auth(environment));
             #[cfg(feature = "multi")]
-            let deployment_admin = authentication::deployment_administrators(fields.sequence("deploymentAdminPrincipals")?)?;
+            let deployment_admin = authentication::deployment_administrators(
+                fields.sequence("deploymentAdminPrincipals")?, fields.sequence("deploymentCreatePrincipals")?,
+            )?;
             #[cfg(feature = "multi")]
             let default_checkpoint_restore_directory = fields.string("defaultCheckpointRestoreDirectory")?.map(PathBuf::from);
             #[cfg(feature = "multi")]
@@ -177,7 +179,7 @@ impl NodeConfiguration {
             }
             #[cfg(feature = "multi")]
             if deployment_admin.is_some() && !flight_sql.as_ref().is_some_and(|flight| flight.port >= 0) {
-                return Err(invalid("deploymentAdminPrincipals requires an ordinary Flight SQL listener"));
+                return Err(invalid("Deployment administration grants require an ordinary Flight SQL listener"));
             }
             let tracing = tracing(fields.take("tracer"))?;
             let modules = fields.sequence("modules")?.unwrap_or_default().into_iter().map(module).collect::<Result<_>>()?;

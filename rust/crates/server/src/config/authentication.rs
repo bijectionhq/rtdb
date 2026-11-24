@@ -62,14 +62,21 @@ fn rules(values: Option<Vec<Yaml>>, default: Method) -> Result<Vec<MethodRule>> 
 
 #[cfg(feature = "multi")]
 #[derive(Debug)]
-struct DeploymentAdministrators(std::collections::BTreeSet<String>);
+struct DeploymentAdministrators {
+    administrators: std::collections::BTreeSet<String>,
+    creators: std::collections::BTreeSet<String>,
+}
 
 #[cfg(feature = "multi")]
 impl rtdb_flight_sql::DeploymentAdminAuthority for DeploymentAdministrators {
     fn authorize(
-        &self, principal: &rtdb_auth::Principal, _: rtdb_flight_sql::DeploymentAdminAction<'_>,
+        &self, principal: &rtdb_auth::Principal, action: rtdb_flight_sql::DeploymentAdminAction<'_>,
     ) -> Result<()> {
-        if principal.user_id().is_some_and(|user| self.0.contains(user)) {
+        if principal.user_id().is_some_and(|user| {
+            self.administrators.contains(user)
+                || matches!(action, rtdb_flight_sql::DeploymentAdminAction::Create { .. })
+                    && self.creators.contains(user)
+        }) {
             return Ok(());
         }
         Err(Anomaly::new(
@@ -83,19 +90,29 @@ impl rtdb_flight_sql::DeploymentAdminAuthority for DeploymentAdministrators {
 /// Parses an explicit host grant. Flight verifies the credential and scope before applying it.
 #[cfg(feature = "multi")]
 pub(super) fn deployment_administrators(
-    values: Option<Vec<Yaml>>,
+    administrators: Option<Vec<Yaml>>,
+    creators: Option<Vec<Yaml>>,
 ) -> Result<Option<std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>>> {
+    let administrators = deployment_principal_names("deploymentAdminPrincipals", administrators)?;
+    let creators = deployment_principal_names("deploymentCreatePrincipals", creators)?;
+    Ok((!administrators.is_empty() || !creators.is_empty()).then(|| {
+        std::sync::Arc::new(DeploymentAdministrators { administrators, creators }) as std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>
+    }))
+}
+
+#[cfg(feature = "multi")]
+fn deployment_principal_names(
+    field: &str, values: Option<Vec<Yaml>>,
+) -> Result<std::collections::BTreeSet<String>> {
     let mut principals = std::collections::BTreeSet::new();
     for value in values.into_iter().flatten() {
         let Yaml::String(principal) = value else {
-            return Err(invalid("deploymentAdminPrincipals requires a sequence of principal names"));
+            return Err(invalid(format!("{field} requires a sequence of principal names")));
         };
         if principal.is_empty() || principal.trim() != principal || principal.chars().any(char::is_control) {
             return Err(invalid("An administrator name must be a nonempty authenticated principal name"));
         }
         principals.insert(principal);
     }
-    Ok((!principals.is_empty()).then(|| {
-        std::sync::Arc::new(DeploymentAdministrators(principals)) as std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>
-    }))
+    Ok(principals)
 }

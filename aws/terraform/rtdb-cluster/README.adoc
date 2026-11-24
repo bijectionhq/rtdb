@@ -53,4 +53,5 @@ The bundled Multi configuration grants no deployment administration access.
 To supply a deployment administrator, store the complete node YAML in an operator-owned secret and set `multi_configuration_secret` to its ECS Secrets Manager selector.
 Use the bundled `rust/release/cluster-multi.yaml` as the starting configuration and retain the Flight listener on port 3000.
 Configure the authentication provider that verifies the deployment administrator, and list its exact authenticated principal name under `deploymentAdminPrincipals`.
+Use `deploymentCreatePrincipals` for identities that need only `CreateDeployment`, such as an assigned cell provisioning new databases.
 The ECS execution role receives read access to the selected secret and needs access to its encryption key.
