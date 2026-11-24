@@ -79,6 +79,48 @@ fn ints(batches: &[RecordBatch]) -> Vec<i64> {
 }
 
 #[tokio::test]
+async fn query_parameters_require_one_row_and_continuations_bind_the_exact_ipc() {
+    fn batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_from_iter([(name, Arc::new(Int64Array::from(values)) as ArrayRef)]).unwrap()
+    }
+    fn stream(batch: &RecordBatch, count: usize) -> Vec<u8> {
+        rtdb_format::ipc::write_stream(batch.schema_ref(), &vec![batch.clone(); count]).unwrap()
+    }
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("INSERT INTO wire_params (_id) VALUES (1), (2), (3)", None).await;
+
+    let mut request = input("SELECT _id FROM wire_params WHERE _id >= $1 ORDER BY _id");
+    request.page = Some(v1::Page { limit: 1, after: vec![] });
+    let one = batch("p", vec![2]);
+    request.params_ipc = Some(stream(&one, 1));
+    let (rows, first) = query(&mut client, request.clone()).await;
+    assert_eq!(ints(&rows), [2]);
+    let mut continuation = request.clone();
+    continuation.page.as_mut().unwrap().after = first.next.unwrap();
+    assert_eq!(ints(&query(&mut client, continuation.clone()).await.0), [3]);
+
+    continuation.params_ipc = Some(stream(&batch("renamed", vec![2]), 1));
+    let status = get::<_, v1::QueryTrailer>(&mut client, continuation).await.unwrap_err();
+    let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+    assert_eq!(detail.message, "Continuation belongs to a different query");
+
+    for (bytes, message) in [
+        (stream(&one, 0), "Parameters require exactly one Arrow batch"),
+        (stream(&one, 2), "Parameters require exactly one Arrow batch"),
+        (stream(&batch("p", vec![]), 1), "Parameters require exactly one row"),
+        (stream(&batch("p", vec![2, 3]), 1), "Parameters require exactly one row"),
+    ] {
+        request.params_ipc = Some(bytes);
+        let status = get::<_, v1::QueryTrailer>(&mut client, request.clone()).await.unwrap_err();
+        let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        assert_eq!(detail.message, message);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;

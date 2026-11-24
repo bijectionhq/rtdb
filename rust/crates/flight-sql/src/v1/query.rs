@@ -3,8 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use arrow_buffer::Buffer;
 use arrow_flight::FlightData;
 use prost::Message;
+use rtdb_columnar::MemoryBudget;
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_types::{LogicalType, Timestamp};
@@ -250,8 +252,9 @@ impl Service {
             .map_err(error::anomaly)?;
         let parameters = request
             .params_ipc
-            .as_deref()
-            .map(|bytes| Parameters::read(bytes, &context))
+            .map(|bytes| {
+                Parameters::read(Buffer::from(call.retain_request_bytes(bytes)), &context.memory)
+            })
             .transpose()?;
         let types = parameters
             .as_ref()
@@ -279,9 +282,9 @@ struct Parameters {
 }
 
 impl Parameters {
-    fn read(bytes: &[u8], context: &QueryContext) -> Result<Self, Status> {
+    fn read(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
         let stream =
-            rtdb_format::ipc::OwnedStream::read(bytes, &context.memory).map_err(error::anomaly)?;
+            rtdb_format::ipc::OwnedStream::read_buffer(bytes, memory).map_err(error::anomaly)?;
         let [batch] = stream.pages() else {
             return Err(error::incorrect(
                 "Parameters require exactly one Arrow batch",
@@ -290,7 +293,7 @@ impl Parameters {
         if batch.batch().num_rows() != 1 {
             return Err(error::incorrect("Parameters require exactly one row"));
         }
-        let types = wire::ParameterTypes::from_batch(batch.batch(), &context.memory)
+        let types = wire::ParameterTypes::from_batch(batch.batch(), memory)
             .map_err(error::map_status)?;
         Ok(Self {
             batch: batch.clone(),
@@ -332,4 +335,36 @@ async fn open_query(
         .open_query_columns_typed(context, row.to_vec(), types)
         .await
         .map_err(error::anomaly)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+
+    #[test]
+    fn parameter_values_keep_their_input_allocation_and_both_charges() {
+        let batch =
+            RecordBatch::try_from_iter([("p", Arc::new(Int64Array::from(vec![42])) as ArrayRef)])
+                .unwrap();
+        let bytes = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+            .unwrap();
+        let start = bytes.as_ptr() as usize;
+        let input = start..start + bytes.len();
+        let input_memory = MemoryBudget::new(1 << 20);
+        let decode_memory = MemoryBudget::new(1 << 20);
+        let bytes = wire::retain(bytes, input_memory.reserve(4096).unwrap());
+        let parameters = Parameters::read(Buffer::from(bytes), &decode_memory).unwrap();
+        let array = Arc::clone(parameters.batch.batch().column(0));
+        drop(parameters);
+
+        let values = array.as_any().downcast_ref::<Int64Array>().unwrap().values();
+        assert!(input.contains(&(values.as_ptr() as usize)));
+        assert_eq!(values.as_ref(), &[42]);
+        assert_eq!(input_memory.used_bytes(), 4096);
+        assert!(decode_memory.used_bytes() > 0);
+        drop(array);
+        assert_eq!(input_memory.used_bytes(), 0);
+        assert_eq!(decode_memory.used_bytes(), 0);
+    }
 }
