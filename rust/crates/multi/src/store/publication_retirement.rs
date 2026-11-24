@@ -159,3 +159,61 @@ fn changed() -> Anomaly {
         "The loose or packed serving slot has inconsistent physical custody",
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use bytes::Bytes;
+    use rtdb_storage::MemoryStore;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn an_alias_in_a_relocated_pack_retains_the_original_slot() {
+        let owner = DeploymentRecord::new("parent", "acme", Vec::new(), 0);
+        let mut fork = DeploymentRecord::new("fork", "acme", Vec::new(), 0);
+        fork.lineage.clone_from(&owner.lineage);
+        let bucket = MemoryStore::default();
+        let name = ObjectKey::new("blocks/b00.binpb").unwrap();
+        let target =
+            ObjectKey::new(format!("{}/v06/~packs/b00.pack", owner.storage_prefix())).unwrap();
+        let relocated =
+            ObjectKey::new(format!("{}/v06/~packs/b00.pack", fork.storage_prefix())).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(directory.path().join("keys")).unwrap();
+        let io = IoRegion::new();
+        let peers = [owner.clone(), fork];
+        let census = PublicationCensus::new(&keys, &peers, &io);
+        let origin = [7; PUBLICATION_ID_BYTES];
+        let (body, _) = crate::packing::encode_pack(
+            &BTreeMap::from([(
+                name.to_string(),
+                Bytes::from(vec![7; HEADER_BYTES as usize]),
+            )]),
+            Vec::new(),
+            0,
+        );
+        bucket.put(&relocated, body).await.unwrap();
+
+        assert!(
+            census
+                .has_another_copy(&bucket, &owner, &target, &name, origin, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !census
+                .has_another_copy(
+                    &bucket,
+                    &owner,
+                    &target,
+                    &name,
+                    [9; PUBLICATION_ID_BYTES],
+                    true
+                )
+                .await
+                .unwrap()
+        );
+    }
+}
