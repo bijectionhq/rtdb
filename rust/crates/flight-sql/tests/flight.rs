@@ -1120,6 +1120,53 @@ async fn owned_v2_layout_reads_both_legs_after_redeclaration() {
 }
 
 #[tokio::test]
+async fn owned_v2_layout_keeps_wrapped_null_distinct_from_an_omitted_field() {
+    use arrow_array::{Array, ArrayRef, BinaryArray, NullArray, StructArray};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+    use rtdb_types::Value;
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let relation = b"\0\x05facts";
+    let mut declaration = relation.to_vec();
+    declaration.extend_from_slice(br#"{"version":2,"fields":[{"name":"payload","type":{"kind":"union","legs":[{"kind":"binary"},{"kind":"struct","fields":[{"name":"v2_value","type":{"kind":"union","legs":[{"kind":"i64"},{"kind":"f64"}]},"optional":false,"nullable":true}]}]},"optional":true,"nullable":false}]}"#);
+    client.action("rtdb.owned.DeclareRelation.v2", declaration.into()).await.unwrap();
+    let request = |id, value: Option<ArrayRef>| {
+        let mut columns = vec![("_id", Arc::new(Int64Array::from(vec![id])) as ArrayRef)];
+        columns.extend(value.map(|value| ("payload", value)));
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let mut body = relation.to_vec();
+        body.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+        Bytes::from(body)
+    };
+    let wrapped = |values: ArrayRef| Arc::new(StructArray::from(vec![
+        (Arc::new(Field::new("v2_value", values.data_type().clone(), true)), values),
+    ])) as ArrayRef;
+    for (id, payload) in [
+        (1, Some(Arc::new(BinaryArray::from_iter_values([b"legacy"])) as ArrayRef)),
+        (2, Some(wrapped(Arc::new(Int64Array::from(vec![11]))))),
+        (3, Some(wrapped(Arc::new(NullArray::new(1))))),
+        (4, None),
+    ] {
+        client.action("rtdb.owned.Create.v1", request(id, payload)).await.unwrap();
+    }
+    for (id, expected) in [
+        (1, Value::Binary(b"legacy".to_vec())),
+        (2, Value::Struct(rtdb_types::StructFields::from([("v2_value".into(), Value::I64(11))]))),
+        (3, Value::Struct(rtdb_types::StructFields::from([("v2_value".into(), Value::Null)]))),
+        (4, Value::Null),
+    ] {
+        let output = client.action("rtdb.owned.ReadPoint.v1", request(id, None)).await.unwrap();
+        let batch = StreamReader::try_new(output[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+        let schema = batch.schema();
+        let (index, field) = schema.column_with_name("payload").unwrap();
+        assert_eq!(rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0).unwrap(), expected);
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn owned_v2_layout_checks_nested_decimal_precision() {
     use arrow_array::{ArrayRef, Decimal128Array, StructArray};
     use arrow_ipc::writer::IpcWriteOptions;
