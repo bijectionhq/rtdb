@@ -1,5 +1,5 @@
 {
-  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment.",
+  "summary": "Installed request construction preserves the exact Logkeeper scope, grant, head, read invocation and withdrawn enrollment. A writer nomination accepts only the immediate successor epoch and preserves the active predecessor key generation.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -11,6 +11,60 @@
   ],
   "min_verified_functions": 23,
   "controls": {
+    "reuse-writer-epoch": {
+      "defect": "A nomination accepts an unchanged epoch as a writer handoff.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "predecessor_epoch.checked_add(1)",
+          "replace": "predecessor_epoch.checked_add(0)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "function": "ordered_writer_successor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "skip-writer-epoch": {
+      "defect": "A nomination accepts a grant for a different successor.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "next_epoch == successor_epoch && same_key",
+          "replace": "next_epoch <= successor_epoch && same_key"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "function": "ordered_writer_successor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "replace-writer-key": {
+      "defect": "A plain writer handoff silently replaces the key of the incumbent grant.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "find": "Some(key) => successor_key == key,",
+          "replace": "Some(_) => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/adapter_command.rs",
+          "function": "ordered_writer_successor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
     "ignore-placement-group": {
       "defect": "An adapter accepts a route from a different group in the same deployment.",
       "mutate": [

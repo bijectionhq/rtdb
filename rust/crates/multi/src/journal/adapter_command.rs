@@ -87,6 +87,26 @@ pub(super) fn same_writer(observed: Option<Grant>, local: Grant) -> bool {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (successor_epoch as int == predecessor_epoch as int + 1
+        && (predecessor_key.is_some() ==> predecessor_key.unwrap() == successor_key)),
+))]
+pub(super) fn ordered_writer_successor(
+    predecessor_epoch: u64,
+    predecessor_key: Option<u64>,
+    successor_epoch: u64,
+    successor_key: u64,
+) -> bool {
+    let Some(next_epoch) = predecessor_epoch.checked_add(1) else {
+        return false;
+    };
+    let same_key = match predecessor_key {
+        Some(key) => successor_key == key,
+        None => true,
+    };
+    next_epoch == successor_epoch && same_key
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == Command::Barrier,
 ))]
 pub(super) fn barrier_command() -> Command {
@@ -142,6 +162,16 @@ pub(super) fn dispose_expired_command(enrollment: Enrollment) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_writer_nomination_must_replace_its_exact_predecessor() {
+        assert!(ordered_writer_successor(37, Some(2), 38, 2));
+        assert!(ordered_writer_successor(0, None, 1, 2));
+        assert!(!ordered_writer_successor(37, Some(2), 37, 2));
+        assert!(!ordered_writer_successor(37, Some(2), 39, 2));
+        assert!(!ordered_writer_successor(37, Some(2), 38, 3));
+        assert!(!ordered_writer_successor(u64::MAX, None, 0, 2));
+    }
 
     #[test]
     fn release_names_the_original_read_and_its_horizon() {

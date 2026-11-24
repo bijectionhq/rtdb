@@ -177,7 +177,7 @@ impl InstalledJournal {
     }
 
     pub async fn grant(&self, nomination: &Request) -> Result<WriterAdmission> {
-        let Command::Grant { candidate, .. } = &nomination.command else {
+        let Command::Grant { expected, candidate } = &nomination.command else {
             return Err(mismatch("The request is not a writer nomination"));
         };
         let decision = self.execute(nomination).await?;
@@ -185,13 +185,18 @@ impl InstalledJournal {
         else {
             return Err(mismatch("The journal did not return a writer grant"));
         };
-        if grant.enrollment != *candidate
+        if !adapter_command::ordered_writer_successor(
+            expected.epoch,
+            expected.grant.map(|predecessor| predecessor.key_generation),
+            grant.epoch,
+            grant.key_generation,
+        ) || grant.enrollment != *candidate
             || recovery.owner != *candidate
             || recovery.id != nomination.id
             || recovery.admitted_at != decision.receipt.position
         {
             return Err(mismatch(
-                "The writer grant and its protected recovery basis disagree",
+                "The writer grant disagrees with its predecessor or protected recovery basis",
             ));
         }
         Ok(WriterAdmission {
