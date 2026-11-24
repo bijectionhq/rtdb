@@ -331,9 +331,14 @@ impl TrieCatalog {
     }
 
     pub(crate) fn accepts_search_source(&self, table: &TableRef, change: &log_pb::SearchRunChange) -> bool {
-        let Some(receipt) = change.run.as_ref().and_then(|run| run.source_receipt.as_ref()) else { return true; };
+        let Some(run) = change.run.as_ref() else { return false; };
+        let Some(receipt) = &run.source_receipt else { return true; };
         if receipt.table() != table.schema_and_table() { return false; }
-        if change.retire_only() || receipt.directory_root.is_none() { return true; }
+        if change.retire_only() || receipt.directory_root.is_none()
+            || (change.replaces.is_empty() && self.search_runs(table).any(|active| active == run))
+        {
+            return true;
+        }
         self.entity_directory(table).is_some_and(|directory| directory.root == receipt.directory_root
             && directory.erase_frontier_digest == receipt.erase_frontier_digest)
             || (!change.replaces.is_empty() && change.replaces.iter().all(|digest| self.search_runs(table).any(|run|

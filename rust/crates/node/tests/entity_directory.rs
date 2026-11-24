@@ -321,10 +321,10 @@ async fn sealed_directory_points_survive_missing_history_relocation_and_erase() 
     .unwrap();
     let block = catalog.with_entity_directory(&table, block);
     let closure = block
-        .checkpoint_trie_files_with_pages(&entry.slug, CheckpointContents::Replay, &store)
+        .checkpoint_trie_files_with_pages(&entry, CheckpointContents::Replay, &store)
         .await
         .unwrap();
-    assert!(!closure.contains(&entry.slug.data_key(&first_trie)));
+    assert!(closure.contains(&entry.slug.data_key(&first_trie)));
     for page in pages {
         assert!(closure.contains(&cow_tree::page_key(&store.prefix, page)));
     }

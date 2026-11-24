@@ -314,7 +314,7 @@ impl ReplicaTrimWitness {
         writes_history: bool, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Option<Self>> {
         let Some((checkpoint, inventory)) = record.checkpoint.zip(record.recovery_manifest_sha256) else { return Ok(None); };
         let epoch = StorageEpoch(record.log_epoch);
-        let catalog = crate::archive::replica_suffix::read_published_catalog(store, checkpoint, epoch, memory).await?;
+        let catalog = crate::archive::read_published_catalog(store, checkpoint, epoch, memory).await?;
         for entry in catalog.table_entries()? {
             if entry.table.schema == "xt" || rtdb_types::TableRef::owned_schema(&entry.table.schema) { continue; }
             let table = crate::archive::table_history::read_table_block(store, &catalog, &entry, memory).await?;

@@ -91,7 +91,7 @@ pub(crate) use stage::discard_checkpoint_stage;
 mod retirement;
 mod replica_artifact;
 mod replica_suffix;
-pub(crate) use replica_suffix::reseal_live_journal;
+pub(crate) use replica_suffix::{read_published_catalog, reseal_live_journal};
 pub(crate) mod table_history;
 mod replay_handoff;
 pub(crate) use replica_suffix::{capture as capture_replica_suffix, find_held_publication};
@@ -1348,7 +1348,7 @@ async fn catalog_objects_at_view(plaintext: &dyn ObjectStore, catalog: &BlockCat
         for detail in metadata.trie_details() {
             let trie: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
             let data = key(&table.slug.data_key(&trie))?;
-            if detail.trie_state == Some(rtdb_format::block::proto::TrieState::Garbage as i32)
+            if detail.trie_state == Some(rtdb_format::log::proto::TrieState::Garbage as i32)
                 && trie.level() == 0 && serving_directory.is_some_and(|root| trie.block_index().0 <= root.through_block())
             {
                 closure.remove(&data);

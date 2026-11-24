@@ -1227,8 +1227,8 @@ async fn compatible_writers_keep_both_search_formats_through_restart() {
 #[test]
 fn a_ranked_snapshot_combines_a_tree_and_an_older_search_format() {
     std::thread::Builder::new()
-        .name("mixed-format ranked query".into())
-        .stack_size(2 << 20)
+        .name("mixed-format search fixture".into())
+        .stack_size(rtdb_node::WORKER_STACK_BYTES)
         .spawn(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1289,9 +1289,19 @@ async fn verify_ranked_snapshot_with_mixed_search_formats() {
     let context = QueryContext::new(input, Arc::clone(&memory), Timestamp(i64::MAX / 2), "UTC", Default::default(), &cancellation).unwrap()
         .with_accelerators(Arc::from([recording.clone() as Arc<dyn rtdb_query::ScanAccelerator>]));
     let statement = "SELECT _id, body, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 2";
-    let prepared = rtdb_sql::prepare_in(statement, &context.catalog, &Default::default(), &memory).unwrap();
-    let cursor = PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, vec![]).await.unwrap();
-    let selected = rows(cursor).await;
+    let selected = std::thread::Builder::new()
+        .name("mixed-format ranked query".into())
+        .stack_size(2 << 20)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+                let prepared = rtdb_sql::prepare_in(statement, &context.catalog, &Default::default(), &memory).unwrap();
+                let cursor = PreparedQuery::from_prepared(prepared, &memory).unwrap().execute(context, vec![]).await.unwrap();
+                rows(cursor).await
+            })
+        })
+        .unwrap()
+        .join()
+        .unwrap();
     assert_eq!(ids(selected.clone()), [-1, 1]);
     assert_eq!(selected, rows(session.query_sql(statement, vec![]).await.unwrap()).await);
     assert_eq!(*recording.retained.lock().unwrap(), [2]);
@@ -1962,8 +1972,18 @@ async fn a_same_commit_reinsert_keeps_only_the_post_erase_search_revision() {
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking() {
+#[test]
+fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(check_missing_logical_run_repair());
+    }).unwrap().join().unwrap();
+}
+
+async fn check_missing_logical_run_repair() {
     use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
     use tokio_util::sync::CancellationToken;
 
@@ -2016,7 +2036,8 @@ async fn a_missing_logical_run_becomes_gap_work_while_healthy_runs_keep_ranking(
     }
     database.build_artefacts().await.unwrap();
     let catalog = database.trie_catalog();
-    let runs: Vec<_> = catalog.search_runs(&table).cloned().collect();
+    let mut runs: Vec<_> = catalog.search_runs(&table).cloned().collect();
+    runs.sort_unstable_by_key(|run| std::cmp::Reverse(run.blocks.len()));
     assert_eq!(runs.len(), 2);
     let slug = database.snapshot().table_entry(&table).unwrap().slug.clone();
     let missing = rtdb_storage::ObjectKey::new(runs[0].object_key(&slug).unwrap()).unwrap();
