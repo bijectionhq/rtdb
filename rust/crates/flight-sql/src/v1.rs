@@ -25,11 +25,13 @@ mod transact;
 const API: &str = "rtdb.v1";
 const RECEIVER_CLOCK: &str = "query.receiver-clock";
 const APPLIED_POSITION: &str = "query.applied-position";
+const FOLLOWER_PROGRESS: &str = "query.follower-progress";
 const MAX_PAGE_ROWS: u32 = 4096;
 const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
+pub(crate) const CAPABILITIES: &str = "rtdb.v1.Capabilities";
 pub(crate) const ACTIONS: [&str; 3] = [
-    "rtdb.v1.Capabilities",
+    CAPABILITIES,
     "rtdb.v1.Transact",
     "rtdb.v1.TxStatus",
 ];
@@ -68,9 +70,11 @@ impl Service {
         action: flight::Action,
     ) -> Result<Response<Output<flight::Result>>, Status> {
         let outcome = match action.r#type.as_str() {
-            "rtdb.v1.Capabilities" => decode::<proto::CapabilitiesRequest>(action.body).map(|_| {
+            CAPABILITIES => decode::<proto::CapabilitiesRequest>(action.body).map(|_| {
                 let mut features = Vec::new();
-                if call.session.audience_source().is_none() && !call.session.fresh_replica {
+                if self.follower_only() {
+                    features.extend(["query", "query.track", "query.page", APPLIED_POSITION, FOLLOWER_PROGRESS].map(str::to_owned));
+                } else if call.session.audience_source().is_none() && !call.session.fresh_replica {
                     features.extend(
                         [
                             "query",
@@ -138,7 +142,7 @@ impl Service {
                     features,
                     limits: Some(proto::Limits {
                         max_page_rows: MAX_PAGE_ROWS,
-                        max_change_groups: MAX_CHANGE_GROUPS,
+                        max_change_groups: if self.follower_only() { 0 } else { MAX_CHANGE_GROUPS },
                         max_wait_millis: MAX_WAIT.as_millis() as u64,
                         min_key_bytes: 16,
                         max_key_bytes: 64,
@@ -237,6 +241,13 @@ impl Service {
         if !rtdb_types::rtdb_v1::valid_branch_name(branch) {
             return Err(error::incorrect("Invalid branch name"));
         }
+        #[cfg(feature = "multi")]
+        if let Some(follower) = self.follower() {
+            if branch != rtdb_types::rtdb_v1::MAIN_BRANCH || layer != proto::Layer::Merged {
+                return Err(error::unsupported("query.follower-source"));
+            }
+            return follower.current(&self.0.node).map_err(error::follower);
+        }
         let database = self.wire_attachment(call, DatabaseAccess::Read).await?;
         if database.serving_driver().is_none() {
             if branch != "main" {
@@ -254,7 +265,7 @@ impl Service {
         call: &Call,
         access: DatabaseAccess,
     ) -> Result<Arc<Database>, Status> {
-        if call.session.audience_source().is_some() || call.session.fresh_replica {
+        if self.follower_only() || call.session.audience_source().is_some() || call.session.fresh_replica {
             return Err(error::unsupported("rtdb.v1.route"));
         }
         let scoped = call.session.caller.principal.label_scope().is_some();

@@ -73,6 +73,17 @@ surface StatelessDatabase {
         -- The region can name rows, an index interval, a table, or the selected branch.
         -- The authority issues identical claim bytes for the same evidence under one key generation.
 
+    @guarantee AssignedFollowerQuery
+        -- The cell binds a private TLS listener to one exact local plain Multi replica under its deployment incarnation, placement epoch and assignment identity.
+        -- A verified client presents the exact database and incarnation selector to use Capabilities and native Query on the assigned listener.
+        -- The assigned residence follows the authenticated journal for the life of the listener.
+        -- Latest and AtLeast select the replica's locally applied head on merged main.
+        -- Exactly selects a retained applied cut on merged main and echoes its opaque basis.
+        -- A cut ahead of local apply, a missing retained cut and a different incarnation have distinct refusals.
+        -- A progress reply binds the selected query basis and its recorded position to the assignment and the settled writer head from the authenticated committed prefix.
+        -- The two positions share the incarnation's applied transaction coordinate.
+        -- The cell drains admitted reads before stopping the assigned listener and retiring the assignment.
+
     @guarantee ReceiverClockObservation
         -- Where advertised, the first page includes a sample from the installed receiver clock when requested.
         -- The authenticated observation binds the sample, selected cut, query fingerprint and Flight session.

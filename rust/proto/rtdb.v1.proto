@@ -85,6 +85,17 @@ message QueryTrailer {
   CustodyReadInventory custody_release_inventory = 7;
   // Compare positions only within the same database incarnation and branch.
   optional uint64 applied_position = 8;
+  // Present for observe_applied_position on an assigned Multi follower.
+  FollowerProgress follower_progress = 9;
+}
+message FollowerProgress {
+  string database = 1;
+  bytes incarnation = 2;
+  uint64 placement_epoch = 3;
+  bytes assignment = 4;
+  string endpoint = 5;
+  Basis writer_head = 6;
+  uint64 writer_head_position = 7;
 }
 message CustodyReadInventory {
   repeated CustodyReadContributor contributors = 1;

@@ -14,6 +14,10 @@ mod service;
 mod state;
 mod ticket;
 mod wire;
+#[cfg(feature = "multi")]
+mod follower;
+#[cfg(feature = "multi")]
+pub use follower::NativeFollowerAssignment;
 
 pub use config::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, AudienceSeat, FlightConfig, FlightPeerVerifier, HostedControlConfig};
 pub use config::{AUDIENCE_GATEWAY_TRANSPORT_BYTES, AUDIENCE_H2_CONNECTION_WINDOW, AUDIENCE_H2_STREAM_WINDOW, AUDIENCE_H2_STREAMS};

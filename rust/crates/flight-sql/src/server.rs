@@ -25,6 +25,14 @@ impl ServerHandle {
     pub fn watch_status(&self) -> watch::Receiver<ServerStatus> { self.status.clone() }
 }
 pub struct ServerDriver { listener: Option<TcpListener>, service: Service, tls: Option<TlsAcceptor> }
+
+pub(crate) enum Binding {
+    Ordinary,
+    Standalone,
+    #[cfg(feature = "multi")]
+    Follower(crate::follower::FollowerRoute),
+}
+
 impl ServerDriver {
     /// Binds the insecure Flight endpoint without spawning a task.
     /// The owner runs this driver and cancels its handle, then joins `run`, before closing the node.
@@ -38,20 +46,40 @@ impl ServerDriver {
         {
             return Err(Anomaly::incorrect("rtdb.flight-sql/standalone", "Installed Flight requires a private native listener"));
         }
+        config.validate(Some("xtdb"))?;
         tls.alpn_protocols = vec![b"h2".to_vec()];
-        Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls)))).await
+        let listener = TcpListener::bind(config.address).await.map_err(network)?;
+        Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls))), listener, Binding::Standalone)
     }
     pub async fn bind_with_clock(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>) -> Result<(ServerHandle, Self)> {
-        Self::bind_listener(config, node, authenticator, clock, None).await
-    }
-    async fn bind_listener(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>, tls: Option<TlsAcceptor>) -> Result<(ServerHandle, Self)> {
-        let standalone_custody_owner = tls.as_ref().map(|_| "xtdb");
-        config.validate(standalone_custody_owner)?;
+        config.validate(None)?;
         let listener = TcpListener::bind(config.address).await.map_err(network)?;
+        Self::bind_listener(config, node, authenticator, clock, None, listener, Binding::Ordinary)
+    }
+    /// Binds TLS Flight for one positively assigned Multi follower.
+    /// Run the driver once and join it after shutting down its handle.
+    #[cfg(feature = "multi")]
+    pub async fn bind_follower(
+        address: SocketAddr, node: Node, authenticator: Arc<Authenticator>, mut tls: rustls::ServerConfig,
+        assignment: crate::NativeFollowerAssignment, attachment: &Arc<rtdb_node::Database>, reader: rtdb_node::MultiFollower,
+    ) -> Result<(ServerHandle, Self)> {
+        if !address.ip().is_loopback() {
+            return Err(Anomaly::incorrect("rtdb/follower-assignment", "The follower listener requires a loopback address"));
+        }
+        let config = FlightConfig { address, ..FlightConfig::default() };
+        config.validate(None)?;
+        let listener = TcpListener::bind(address).await.map_err(network)?;
+        let endpoint = listener.local_addr().map_err(network)?;
+        let route = crate::follower::FollowerRoute::new(assignment, endpoint, attachment, reader)?;
+        route.current(&node)?;
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls))), listener, Binding::Follower(route))
+    }
+    fn bind_listener(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>, tls: Option<TlsAcceptor>, listener: TcpListener, binding: Binding) -> Result<(ServerHandle, Self)> {
         let address = listener.local_addr().map_err(network)?;
         let cancellation = node.cancellation().child_token();
         let (sender, receiver) = watch::channel(ServerStatus::default());
-        let service = Service::new(node, authenticator, config, clock, cancellation.clone(), sender, standalone_custody_owner)?;
+        let service = Service::new(node, authenticator, config, clock, cancellation.clone(), sender, binding)?;
         Ok((ServerHandle { address, cancellation, status: receiver }, Self { listener: Some(listener), service, tls }))
     }
     pub async fn run(mut self) -> Result<()> {

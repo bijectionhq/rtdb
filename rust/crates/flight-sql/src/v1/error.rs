@@ -90,6 +90,16 @@ pub fn anomaly(native: Anomaly) -> Status {
     as_status(detail(native))
 }
 
+#[cfg(feature = "multi")]
+pub(crate) fn follower(native: Anomaly) -> Status {
+    let stable = matches!(native.code.as_str(), "rtdb/basis-ahead" | "rtdb/foreign-basis" | "rtdb/unknown-basis"
+        | "rtdb/follower-assignment" | "rtdb/follower-unavailable" | "rtdb/follower-progress-unavailable")
+        .then(|| native.code.clone());
+    let mut error = detail(native);
+    if let Some(code) = stable { error.code = code; }
+    as_status(error)
+}
+
 pub(super) fn detail(native: Anomaly) -> Error {
     let category = match native.category {
         _ if matches!(

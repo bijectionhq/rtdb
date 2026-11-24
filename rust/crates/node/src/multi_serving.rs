@@ -55,6 +55,74 @@ pub struct MultiServing {
     route: Option<Arc<dyn MultiWriteRoute>>,
 }
 
+pub struct MultiFollower {
+    serving: Arc<MultiServing>,
+    owner: Arc<()>,
+}
+
+pub struct MultiFollowerProgress {
+    pub applied_position: u64,
+    pub writer_head: Basis,
+    pub writer_head_position: u64,
+}
+
+impl MultiFollower {
+    pub fn matches_driver(&self, driver: &dyn ServingDriver) -> bool {
+        std::ptr::addr_eq(Arc::as_ptr(&self.serving) as *const dyn ServingDriver, driver)
+    }
+
+    pub async fn query(
+        &self, at: At, now: Timestamp, observe_progress: bool, cancellation: &CancellationToken,
+    ) -> Result<(QueryView, Option<MultiFollowerProgress>)> {
+        cancellation.run_until_cancelled(async {
+            let (index, generation) = self.serving.database.lock().await.follower_view(&self.owner)?;
+            require_plain_follower(&index)?;
+            match at {
+                At::Exactly(basis) => { index.cut(At::AtLeast(basis))?; }
+                At::Latest | At::AtLeast(_) => (),
+                _ => return Err(Anomaly::unsupported("rtdb/follower-source", "The follower selects Latest, AtLeast or Exactly")),
+            }
+            let view = index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, at, Layer::Merged, now).map_err(|error| {
+                if error.code == "rtdb/unknown-basis" {
+                    Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired", "The replica has no retained exact cut at this basis")
+                } else { error }
+            })?;
+            let cut = view.cut();
+            let progress = if observe_progress {
+                let applied_position = index.applied_position(cut)?;
+                let (writer_head, writer_head_position) = self.serving.database.lock().await.follower_writer_head(&self.owner).await?;
+                if writer_head.incarnation() != cut.basis.incarnation() || writer_head_position < applied_position {
+                    return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The writer head does not cover the selected follower cut"));
+                }
+                Some(MultiFollowerProgress { applied_position, writer_head, writer_head_position })
+            } else { None };
+            let snapshot = rtdb_query::branch_snapshot(&view, &self.serving.memory)?;
+            Ok((QueryView {
+                snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
+                custody_contributors: Some(BTreeSet::new()), key_generation: Some(generation),
+            }, progress))
+        }).await.ok_or_else(interrupted)?
+    }
+
+    pub async fn check_delivery(&self, basis: Basis, generation: u64, now: Timestamp, cancellation: &CancellationToken) -> Result<()> {
+        cancellation.run_until_cancelled(async {
+            let database = self.serving.database.lock().await;
+            let (index, _) = database.follower_view(&self.owner)?;
+            require_plain_follower(&index)?;
+            index.view(rtdb_types::rtdb_v1::MAIN_BRANCH, At::Exactly(basis), Layer::Merged, now)?;
+            database.check_generation(generation).await
+        }).await.ok_or_else(interrupted)?
+    }
+}
+
+fn require_plain_follower(index: &BranchIndex) -> Result<()> {
+    index.require_local_custody()?;
+    if index.has_custody_groups() || index.has_visibility_history() {
+        return Err(Anomaly::unsupported("rtdb/follower-plain", "The follower requires a plain Multi database"));
+    }
+    Ok(())
+}
+
 pub struct ManagedCheckpointRead<'a> {
     pub generation: u64,
     pub branch: &'a str,
@@ -95,6 +163,15 @@ pub enum MultiWriteAdmission<'a> {
 }
 
 impl MultiServing {
+    pub async fn assign_follower(self: &Arc<Self>) -> Result<MultiFollower> {
+        let owner = Arc::new(());
+        let mut database = self.database.lock().await;
+        database.assign_follower(&owner).await?;
+        let (index, _) = database.follower_view(&owner)?;
+        require_plain_follower(&index)?;
+        Ok(MultiFollower { serving: Arc::clone(self), owner })
+    }
+
     pub async fn restored_checkpoint_basis(&self, manifest_digest: [u8; 32]) -> Result<Option<Basis>> {
         self.database.lock().await.restored_checkpoint_basis(manifest_digest).await
     }
@@ -722,6 +799,43 @@ mod tests {
             }],
             otherwise: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn assigned_query_uses_the_local_cut_and_reports_a_separate_writer_head() {
+        let journal = MemoryJournal::default();
+        let id = Uuid::from_u128(1);
+        let store = Arc::new(MemoryStore::default());
+        let kms = Arc::new(LocalKms::new(|| 10));
+        let open = |node, identity| MultiDatabase::new(
+            MultiOptions { database: id, node, lease_micros: 100, drift_micros: 1 },
+            Arc::new(journal.handle(identity)), store.clone(), kms.clone(), Arc::new(|| Timestamp(10)),
+        ).unwrap();
+        let writer_node = IpAddr::from([127, 0, 0, 1]);
+        let mut writer = open(writer_node, Identity::from_static("urn:rtdb:test:1"));
+        writer.create().await.unwrap();
+        writer.tick(&BTreeSet::from([writer_node])).await.unwrap();
+        let first = writer.transact(&write(1, "one", None)).await.unwrap();
+        let follower_node = IpAddr::from([127, 0, 0, 2]);
+        let follower = Arc::new(MultiServing::new(open(follower_node, Identity::from_static("urn:rtdb:test:2")), MemoryBudget::new(64 << 20)));
+        let reader = follower.assign_follower().await.unwrap();
+        let second = writer.transact(&write(2, "two", Some(Timestamp(20)))).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let select = |at, progress| reader.query(at, Timestamp(10), progress, &cancellation);
+
+        for selector in [At::AtLeast(second.basis), At::Exactly(second.basis)] {
+            assert_eq!(select(selector, false).await.err().unwrap().code, "rtdb/basis-ahead");
+        }
+        let (local, evidence) = select(At::Latest, true).await.unwrap();
+        assert_eq!(local.cut.basis, first.basis);
+        let evidence = evidence.unwrap();
+        assert_eq!(evidence.writer_head, second.basis);
+        assert_eq!(evidence.writer_head_position, evidence.applied_position + 2);
+        assert_eq!(select(At::AtLeast(first.basis), false).await.unwrap().0.cut.basis, second.basis);
+        assert_eq!(select(At::Exactly(first.basis), false).await.unwrap().0.cut.basis, first.basis);
+        let unretained = Basis::new(*id.as_bytes(), evidence.applied_position + 1);
+        assert_eq!(select(At::Exactly(unretained), false).await.err().unwrap().code, "rtdb/cursor-expired");
+        assert_eq!(select(At::Exactly(Basis::new([5; 16], 0)), false).await.err().unwrap().code, "rtdb/foreign-basis");
     }
 
     #[tokio::test]

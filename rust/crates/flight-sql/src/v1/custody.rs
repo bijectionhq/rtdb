@@ -200,7 +200,7 @@ impl Service {
         let route = config.custody_providers.get(&call.database).map(Arc::as_ref);
         let owner = route.and_then(CustodyProviderRoute::owner)
             .or_else(|| config.hosted_controls.as_ref().map(|policy| policy.owner.as_str()))
-            .or(self.0.standalone_custody_owner);
+            .or(self.standalone_custody_owner());
         let caller = &call.session.caller;
         if owner.is_none()
             || caller.principal.user_id() != owner

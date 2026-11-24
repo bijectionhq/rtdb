@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 use crate::config::accepts_seat_header;
 use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
-use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::ServerStatus, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
+use crate::{AUDIENCE_FLIGHT_HEADER, AUDIENCE_SEAT_HEADER, FORWARDED_PEER_HEADER, AudienceFlightConfig, FlightConfig, auth::{self, Authentication, Credentials}, error::{arrow, cancelled, status, unsupported}, lease::{Leased, Lookup, Registry}, server::{Binding, ServerStatus}, state::{AudienceSession, ConnectionResource, Prepared, PreparedScope, Session, Transaction}, wire};
 use crate::audience_seat::{OccupiedSeatAction, SeatAttachment, SeatDecision, SeatState, admit_audience_seat, occupied_seat_action};
 
 #[macro_use]
@@ -28,7 +28,7 @@ pub(crate) struct Inner {
     pub node: Node,
     pub(crate) v1: crate::v1::State,
     pub config: FlightConfig,
-    pub(crate) standalone_custody_owner: Option<&'static str>,
+    binding: Binding,
     pub cancellation: CancellationToken,
     pub sessions: Registry<String, Session>,
     pub transactions: Registry<Bytes, Transaction>,
@@ -59,11 +59,15 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Get, V1Action }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Get | Self::V1Action)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities | Self::V1Action)
+    }
+
+    fn serves_assigned_follower(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities)
     }
 
     fn action(audience: bool, name: &str) -> Self {
@@ -168,7 +172,7 @@ impl Call {
     }
 }
 impl Service {
-    pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, standalone_custody_owner: Option<&'static str>) -> rtdb_types::Result<Self> {
+    pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, binding: Binding) -> rtdb_types::Result<Self> {
         let memory = Arc::clone(node.memory());
         let audience = if let Some(profile) = config.audience {
             let cache = CacheBudget::with_memory(memory.prepay(profile.cache_bytes())?);
@@ -185,7 +189,21 @@ impl Service {
                 transport,
             })
         } else { None };
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, standalone_custody_owner, cancellation, status })))
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, binding, cancellation, status })))
+    }
+    pub(crate) fn standalone_custody_owner(&self) -> Option<&'static str> {
+        matches!(&self.0.binding, Binding::Standalone).then_some("xtdb")
+    }
+    #[cfg(feature = "multi")]
+    pub(crate) fn follower(&self) -> Option<&crate::follower::FollowerRoute> {
+        match &self.0.binding { Binding::Follower(route) => Some(route), _ => None }
+    }
+    pub(crate) fn follower_only(&self) -> bool {
+        match &self.0.binding {
+            Binding::Ordinary | Binding::Standalone => false,
+            #[cfg(feature = "multi")]
+            Binding::Follower(_) => true,
+        }
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     fn sessions(&self, reserved: bool) -> &Registry<String, Session> {
@@ -232,6 +250,12 @@ impl Service {
     }
     async fn call_with_kind<T>(&self, request: &Request<T>, body_bytes: usize, kind: CallKind) -> Result<Call, Status> {
         if self.0.cancellation.is_cancelled() { return Err(cancelled()); }
+        if self.follower_only() && (!kind.serves_assigned_follower()
+            || request.metadata().contains_key(FORWARDED_PEER_HEADER)
+            || request.metadata().contains_key(crate::GATEWAY_ANSWER_DEADLINE_HEADER))
+        {
+            return Err(follower_refusal());
+        }
         let transport = request.extensions().get::<crate::server::FlightConnectInfo>();
         let source_headers = request.metadata().get_all(AUDIENCE_FLIGHT_HEADER);
         let mut sources = source_headers.iter();
@@ -242,7 +266,7 @@ impl Service {
                 .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))
         }).transpose()?;
         if sources.next().is_some() || audience_source.is_some() != self.0.config.audience.is_some()
-            || audience_source.is_some() && matches!(kind, CallKind::Ordinary | CallKind::V1Get) {
+            || audience_source.is_some() && matches!(kind, CallKind::Ordinary | CallKind::V1Query | CallKind::V1Changes) {
             return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
         }
         let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
@@ -273,6 +297,11 @@ impl Service {
         let request_memory = audience.map_or(self.memory(), |audience| &audience.memory);
         let reservation = request_memory.reserve(wire::add(header_bytes, wire::mul(body_bytes, 32)?)?).map_err(status)?;
         let requested_database = request.metadata().get("x-xtdb-database").map(|value| value.to_str().map_err(arrow)).transpose()?;
+        let follower_attachment: Option<Arc<rtdb_node::Database>> = None;
+        #[cfg(feature = "multi")]
+        let (requested_database, follower_attachment) = if let Some(follower) = self.follower() {
+            (Some(follower.select(request.metadata()).map_err(crate::v1::error::follower)?), Some(follower.current(&self.0.node).map_err(crate::v1::error::follower)?))
+        } else { (requested_database, follower_attachment) };
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
@@ -291,11 +320,11 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Action) {
+            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Action | CallKind::AudienceCleanup)
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Capabilities | CallKind::V1Action | CallKind::AudienceCleanup)
             {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
@@ -329,6 +358,9 @@ impl Service {
                 (transport.and_then(|transport| transport.peer.remote_addr()).or_else(|| request.remote_addr()).map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
+            if self.follower_only() && (!caller.verified_credential || caller.principal.label_scope().is_some()) {
+                return Err(auth::unauthenticated("The assigned follower requires verified unscoped credentials"));
+            }
             if let Some(scope) = caller.principal.label_scope() {
                 if !kind.allows_label_scope() || audience.is_some() || fresh_replica {
                     return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
@@ -337,7 +369,10 @@ impl Service {
                     .ok_or_else(|| Status::invalid_argument("A scoped credential requires x-xtdb-database"))?;
                 scope.admit_database_name(database).map_err(status)?;
             }
-            let placement = if catalog.is_placed() {
+            let placement = if let Some(attachment) = follower_attachment {
+                caller.principal.authorize_database(attachment.name(), DatabaseAccess::Read).map_err(status)?;
+                Some(attachment)
+            } else if catalog.is_placed() {
                 let name = placed_name()?;
                 if caller.principal.label_scope().is_none() {
                     caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
@@ -641,7 +676,11 @@ impl FlightService for Service {
     async fn do_get(&self, request: Request<flight::Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = &request.get_ref().ticket;
         if let Some(command) = crate::v1::ticket(ticket) {
-            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::V1Get)
+            let kind = match &command {
+                crate::v1::Ticket::Query(_) => CallKind::V1Query,
+                crate::v1::Ticket::Changes(_) => CallKind::V1Changes,
+            };
+            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
                 .await.map_err(crate::v1::error::map_status)?;
             return self.v1_get(call, command, request.metadata()).await;
         }
@@ -657,17 +696,23 @@ impl FlightService for Service {
         self.upload(call, request.into_inner()).await
     }
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
-        let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
-        if crate::v1::is_action(&request.get_ref().r#type) {
-            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::V1Action)
+        let name = request.get_ref().r#type.as_str();
+        if crate::v1::is_action(name) {
+            let kind = if name == crate::v1::CAPABILITIES { CallKind::V1Capabilities } else { CallKind::V1Action };
+            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
                 .await.map_err(crate::v1::error::map_status)?;
             return self.v1_action(call, request.into_inner()).await;
         }
+        let kind = CallKind::action(self.0.audience.is_some(), name);
         let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)
             .is_some_and(|encoding| encoding == "stream-v1");
         self.action(call, request.into_inner(), ipc_stream).await
     }
+}
+
+fn follower_refusal() -> Status {
+    Status::permission_denied("The assigned follower serves only native Query and Capabilities")
 }
 
 pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
@@ -682,11 +727,21 @@ mod tests {
 
     #[test]
     fn label_scope_is_only_admitted_to_v1_and_handshake() {
-        for kind in [CallKind::Handshake, CallKind::V1Get, CallKind::V1Action] {
+        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
             assert!(kind.allows_label_scope());
         }
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup] {
             assert!(!kind.allows_label_scope());
+        }
+    }
+
+    #[test]
+    fn follower_admission_has_a_positive_query_allowlist() {
+        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities] {
+            assert!(kind.serves_assigned_follower());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action] {
+            assert!(!kind.serves_assigned_follower());
         }
     }
 

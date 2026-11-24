@@ -288,6 +288,14 @@ impl BranchIndex {
 
     pub fn head(&self) -> BranchCut { self.head }
 
+    pub fn applied_position(&self, cut: BranchCut) -> Result<u64> {
+        self.require_incarnation(cut.basis)?;
+        self.times.get_key_value(&cut.basis.position())
+            .filter(|(_, time)| **time == cut.system_time)
+            .map(|(&position, _)| position)
+            .ok_or_else(|| Anomaly::fault("rtdb/transaction-order", "The selected cut has no applied position"))
+    }
+
     /// Enumerates the stored images a checkpoint carries, including inactive branches and superseded rows.
     pub fn retained_images(&self) -> impl Iterator<Item = (&str, &TableRef, &BranchEvent, &RowImage)> {
         self.branches.iter().flat_map(|(branch, data)| {

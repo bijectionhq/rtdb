@@ -18,7 +18,7 @@ use arrow_schema::{DataType, Field, Schema};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_crypt::tokens::{PageToken, ReceiverClockObservation, TokenIssuer};
-use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::QuerySource};
+use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::{QuerySource, QueryView, ServingDriver, ServingScope}};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::transact::CustodyGroupId;
 use rtdb_types::{LogicalType, Timestamp, Value, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
@@ -110,6 +110,33 @@ struct OpenedQuery {
 }
 
 impl Service {
+    async fn query_view(
+        &self, call: &Call, driver: &dyn ServingDriver, source: QuerySource, visibility: Option<&ServingScope>,
+        request: &proto::QueryRequest, now: Timestamp,
+    ) -> Result<(QueryView, Option<(u64, proto::FollowerProgress)>), Status> {
+        #[cfg(feature = "multi")]
+        if let Some(route) = self.follower() {
+            let (view, progress) = route.reader.query(source.at, now, request.observe_applied_position, &call.cancellation)
+                .await.map_err(error::follower)?;
+            let progress = progress.map(|progress| (progress.applied_position, proto::FollowerProgress {
+                database: route.assignment.database.clone(),
+                incarnation: route.assignment.incarnation.as_bytes().to_vec(),
+                placement_epoch: route.assignment.placement_epoch,
+                assignment: route.assignment.assignment.as_bytes().to_vec(),
+                endpoint: route.endpoint.to_string(),
+                writer_head: Some(progress.writer_head.into()),
+                writer_head_position: progress.writer_head_position,
+            }));
+            return Ok((view, progress));
+        }
+        let view = match visibility {
+            Some(scope) => driver.query_scoped(source, request.track, now, scope, &call.cancellation).await,
+            None if request.verify_ranked_artefacts => driver.query_ranked_artefacts(&call.database, source, now, &call.cancellation).await,
+            None => driver.query(source, false, now, &call.cancellation).await,
+        }.map_err(error::anomaly)?;
+        Ok((view, None))
+    }
+
     pub(super) async fn v1_query(
         &self,
         call: Call,
@@ -129,7 +156,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
             let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
-            check_read_delivery(&call, &database, key_generation, &custody_groups).await?;
+            service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
             yield schema_frame;
@@ -157,7 +184,7 @@ impl Service {
                 for item in data {
                     if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
                     let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
-                    check_read_delivery(&call, &database, key_generation, &custody_groups).await?;
+                    service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
                     service.check_attachment(&call, &database)?;
                     call.handoff(grant, cutoff).map_err(error::map_status)?;
                     yield item;
@@ -172,7 +199,7 @@ impl Service {
             if skip != 0 { Err(cursor_expired())?; }
             if let Some(issuer) = &issuer { issuer.check_readable().await.map_err(error::anomaly)?; }
             let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
-            check_read_delivery(&call, &database, key_generation, &custody_groups).await?;
+            service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
@@ -180,6 +207,15 @@ impl Service {
         let mut response = Response::new(stream);
         *response.metadata_mut() = headers;
         Ok(response)
+    }
+
+    async fn check_query_delivery(&self, call: &Call, database: &Database, _basis: Basis, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
+        #[cfg(feature = "multi")]
+        if let Some(route) = self.follower() {
+            let generation = generation.ok_or_else(|| error::unavailable("The follower cut has no readable generation"))?;
+            return route.reader.check_delivery(_basis, generation, self.0.node.now(), &call.cancellation).await.map_err(error::follower);
+        }
+        check_read_delivery(call, database, generation, groups).await
     }
 
     async fn open_v1_query(
@@ -197,6 +233,14 @@ impl Service {
         let selection = source.at.as_ref().and_then(|at| at.selection.as_ref());
         if source.at.is_some() && selection.is_none() {
             return Err(error::incorrect("Empty At selector"));
+        }
+        if self.follower_only() {
+            if matches!(selection, Some(Selection::Linearizable(_) | Selection::AsOfMicros(_))) {
+                return Err(error::unsupported("query.follower-source"));
+            }
+            if request.observe_receiver_clock || request.custody_release_evidence || request.verify_ranked_artefacts {
+                return Err(error::unsupported("query.follower-authority"));
+            }
         }
         if request.custody_release_evidence {
             self.custody_route(call)?;
@@ -274,15 +318,11 @@ impl Service {
             Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
             None => (None, None),
         };
-        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors) = if let Some(driver) = driver {
+        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, follower_evidence) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
-            let view = match &visibility {
-                Some(scope) => driver.query_scoped(query_source, request.track, now, scope, &call.cancellation).await,
-                None if request.verify_ranked_artefacts => driver.query_ranked_artefacts(&call.database, query_source, now, &call.cancellation).await,
-                None => driver.query(query_source, false, now, &call.cancellation).await,
-            }.map_err(error::anomaly)?;
+            let (view, follower_evidence) = self.query_view(call, driver, query_source, visibility.as_ref(), &request, now).await?;
             let cut = view.cut.system_time;
             let (context, clock) = if visibility.is_some() {
                 let clock = continuation.map_or(now, |page| page.clock);
@@ -292,12 +332,16 @@ impl Service {
                 (context, clock)
             } else {
                 let clock = if exact { cut } else { clock };
-                let context = self.wire_context(call, &database, false).await?
-                    .with_wire_snapshot(view.snapshot, cut, clock.into()).map_err(error::anomaly)?;
+                let context = if self.follower_only() {
+                    let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
+                    self.scoped_wire_context(call, snapshot, clock)?.with_wire_cut(cut, clock.into())
+                } else {
+                    self.wire_context(call, &database, false).await?.with_wire_snapshot(view.snapshot, cut, clock.into())
+                }.map_err(error::anomaly)?;
                 (context, clock)
             };
             let page = PageToken { basis: view.cut.basis, clock, offset, request: request_hash };
-            (context, page, cut, view.claim, view.custody_groups, view.key_generation, view.custody_contributors)
+            (context, page, cut, view.claim, view.custody_groups, view.key_generation, view.custody_contributors, follower_evidence)
         } else {
             let minimum = match (continuation, selection) {
                 (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
@@ -348,7 +392,7 @@ impl Service {
             let context = context
                 .with_wire_cut(cut, page.clock.into())
                 .map_err(error::anomaly)?;
-            (context, page, cut, None, BTreeSet::new(), None, None)
+            (context, page, cut, None, BTreeSet::new(), None, None, None)
         };
         if request.require_clear_rank_input && (
             !custody_groups.is_empty() || !custody_contributors.as_ref().is_some_and(BTreeSet::is_empty)
@@ -400,6 +444,10 @@ impl Service {
             let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors).await?;
             (Some(proof), Some(inventory))
         } else { (None, None) };
+        let (applied_position, follower_progress) = match follower_evidence {
+            Some((position, progress)) => (Some(position), Some(progress)),
+            None => (request.observe_applied_position.then(|| page.basis.position()), None),
+        };
         let trailer = proto::QueryTrailer {
             basis: Some(page.basis.into()),
             system_time_micros: cut.0,
@@ -408,7 +456,8 @@ impl Service {
             receiver_clock,
             custody_release_proof,
             custody_release_inventory,
-            applied_position: request.observe_applied_position.then(|| page.basis.position()),
+            applied_position,
+            follower_progress,
         };
         Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }

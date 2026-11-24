@@ -84,6 +84,43 @@ fn live(n: u8) -> BTreeSet<IpAddr> {
 }
 
 #[tokio::test]
+async fn assigned_follower_observes_settled_writer_progress_without_admitting_writes() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    writer.create().await.unwrap();
+    assert!(matches!(writer.tick(&live(1)).await.unwrap(), Role::Writer(_)));
+
+    let owner = Arc::new(());
+    assert_eq!(writer.assign_follower(&owner).await.unwrap_err().code, "rtdb/follower-unavailable");
+    let first = writer.transact(&put(1, 1, "first")).await.unwrap();
+    follower.assign_follower(&owner).await.unwrap();
+    let replacement = Arc::new(());
+    assert_eq!(follower.assign_follower(&replacement).await.unwrap_err().code, "rtdb/follower-unavailable");
+    assert_eq!(follower.follower_state(&replacement).err().unwrap().code, "rtdb/follower-unavailable");
+
+    cluster.at(20);
+    let second = writer.transact(&put(2, 2, "second")).await.unwrap();
+    cluster.at(30);
+    writer.renew().await.unwrap();
+    let (local, _) = follower.follower_view(&owner).unwrap();
+    assert_eq!(local.head().basis, first.basis);
+    assert_eq!(local.cut(At::AtLeast(second.basis)).unwrap_err().code, "rtdb/basis-ahead");
+    let (head, position) = follower.follower_writer_head(&owner).await.unwrap();
+    assert_eq!(head, second.basis);
+    assert_eq!(position + 1, writer.stream.head().await.unwrap().0);
+    assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Follower);
+    assert_eq!(follower.transact(&put(3, 3, "denied")).await.unwrap_err().code, "rtdb/no-writer");
+
+    cluster.at(200);
+    assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Follower);
+    assert_eq!(follower.follower_writer_head(&owner).await.unwrap_err().code, "rtdb/follower-progress-unavailable");
+    drop(owner);
+    assert!(matches!(follower.tick(&live(2)).await.unwrap(), Role::Writer(_)));
+}
+
+#[tokio::test]
 async fn multi_driver_tokens_reroute_and_verify_the_row_footprint() {
     use rtdb_crypt::tokens::PageToken;
     use rtdb_types::rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimRegion, ClaimScope};

@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, net::IpAddr, sync::Arc};
+use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}};
 
 use journal_contract::{Epoch, Journal, JournalError, Lsn};
 use rtdb_crypt::{Generation, Kms, tokens::TokenAuthority};
@@ -10,7 +10,7 @@ use rtdb_store::{
 use rtdb_tx::transact::{
     Erasure, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use uuid::Uuid;
 
 use crate::{
@@ -72,6 +72,7 @@ pub struct MultiDatabase {
     candidate: Option<Lease>,
     last_allocated: Epoch,
     competing_seal: Option<Lease>,
+    assigned_follower: Weak<()>,
 }
 
 impl MultiDatabase {
@@ -106,6 +107,7 @@ impl MultiDatabase {
             candidate: None,
             last_allocated: Epoch(0),
             competing_seal: None,
+            assigned_follower: Weak::new(),
         })
     }
 
@@ -144,6 +146,10 @@ impl MultiDatabase {
     }
 
     pub async fn tick(&mut self, live_nodes: &BTreeSet<IpAddr>) -> Result<Role> {
+        if self.assigned_follower.strong_count() != 0 {
+            self.refresh().await?;
+            return Ok(Role::Follower);
+        }
         let selected = preferred(self.options.database, live_nodes) == Some(self.options.node);
         self.recover_writer().await?;
         if let Err(error) = self.refresh().await {
@@ -411,6 +417,41 @@ impl MultiDatabase {
             self.durable_transactions().index().clone(),
             state.generation,
         ))
+    }
+
+    pub async fn assign_follower(&mut self, owner: &Arc<()>) -> Result<()> {
+        if self.writer.is_some() || self.candidate.is_some() || self.assigned_follower.strong_count() != 0 {
+            return Err(follower_unavailable());
+        }
+        self.refresh().await?;
+        self.require_active()?;
+        self.assigned_follower = Arc::downgrade(owner);
+        Ok(())
+    }
+
+    pub fn follower_view(&self, owner: &Arc<()>) -> Result<(BranchIndex, u64)> {
+        let state = self.follower_state(owner)?;
+        Ok((state.transactions.index().clone(), state.generation))
+    }
+
+    fn follower_state(&self, owner: &Arc<()>) -> Result<&Committed> {
+        if !self.assigned_follower.ptr_eq(&Arc::downgrade(owner)) || self.writer.is_some() {
+            return Err(follower_unavailable());
+        }
+        self.require_active()?;
+        self.committed.as_ref().ok_or_else(follower_unavailable)
+    }
+
+    pub async fn follower_writer_head(&mut self, owner: &Arc<()>) -> Result<(Basis, u64)> {
+        self.follower_state(owner)?;
+        self.refresh().await?;
+        let state = self.follower_state(owner)?;
+        if !state.lease.is_some_and(|(epoch, until)| epoch == state.epoch && self.before(until)) {
+            return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-progress-unavailable", "The committed journal has no current writer lease"));
+        }
+        let index = state.transactions.index();
+        let cut = index.head();
+        Ok((cut.basis, index.applied_position(cut)?))
     }
 
     pub async fn fresh_history(&mut self) -> Result<ChangeHistory<'_>> {
@@ -829,6 +870,10 @@ fn no_writer() -> Anomaly {
         "rtdb/no-writer",
         "This node has no active writer lease",
     )
+}
+
+fn follower_unavailable() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-unavailable", "An exclusive local Multi follower is required")
 }
 
 fn write_erases(write: &Append) -> Result<bool> {

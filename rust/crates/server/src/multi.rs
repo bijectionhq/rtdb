@@ -12,6 +12,7 @@ use journal_contract::{
     Identity, Journal, JournalError, StreamId,
     reference::{FileJournal, Limits},
 };
+use rtdb_auth::Authenticator;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Generation, Kms};
 use rtdb_db::{
@@ -32,6 +33,8 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::config::NodeConfiguration;
+
+pub use rtdb_flight_sql::NativeFollowerAssignment;
 
 mod catalog;
 mod managed_transfer;
@@ -60,6 +63,27 @@ pub struct MultiRuntime {
 }
 
 impl MultiRuntime {
+    /// Binds an existing local replica to a private listener for the lifetime of one cell assignment.
+    /// The cell supplies an assignment-specific authenticator and TLS identity and owns listener shutdown.
+    pub async fn bind_native_follower(
+        &self, node: &Node, assignment: NativeFollowerAssignment, address: std::net::SocketAddr,
+        authenticator: Arc<Authenticator>, tls: tokio_rustls::rustls::ServerConfig,
+    ) -> Result<(rtdb_flight_sql::ServerHandle, rtdb_flight_sql::ServerDriver)> {
+        validate_deployment_name(&assignment.database)?;
+        let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb/follower-unavailable", "The assigned deployment has no local Multi replica");
+        if !node.catalog().is_managed() || !self.catalog.read().await?.get(&assignment.database)
+            .is_some_and(|entry| entry.status.ready() && entry.database == assignment.incarnation)
+        {
+            return Err(unavailable());
+        }
+        let attachment = node.catalog().database(&assignment.database).map_err(|_| unavailable())?;
+        let driver = self.databases.read().expect("Multi serving catalog").get(&assignment.database)
+            .filter(|driver| driver.incarnation() == *assignment.incarnation.as_bytes())
+            .cloned().ok_or_else(unavailable)?;
+        let reader = driver.assign_follower().await?;
+        rtdb_flight_sql::ServerDriver::bind_follower(address, node.clone(), authenticator, tls, assignment, &attachment, reader).await
+    }
+
     pub async fn development(
         path: &Path,
         config: &mut NodeConfiguration,
