@@ -155,7 +155,7 @@ Goal: every point and range read in production agrees with the bitemporal refere
 
 The [exact-cut model](tla/ExactTemporalCut.tla) and [Lean selection laws](lean/ExactTemporalCut.lean) exercise the position and cap distinction.
 The model includes no-lead, position-tie, erased-winner and cap-plus-await controls, with reachability cases for late correction, ties and erasure.
-The native resolver imports the ordinary SQL history-time functions proved by [Verus](verus/system_time/proof.rs).
+The native resolver imports the [Verus proof sources](verus/system_time/proof.rs) for SQL history assignment and the prepared Proposal window. The controls substitute append for the receiver observation, include the window endpoint and remove the append ceiling.
 The directory clock and the runtime publisher call the transition functions in [receiver clock](verus/receiver_clock/proof.rs).
 The hosted receiver stores the observation in its ordered result row. Replica application installs the stored rows without taking a new decision reading.
 The SQL token owner retains the admitted view in the issuing node. Placement-issued tokens can also re-admit the identical installed cut after restart or load its exact retained checkpoint by authenticated boundary and root digest. Cut reconstruction for arbitrary suffixes, full owned revision addressing and funded appointments remain open production refinements.

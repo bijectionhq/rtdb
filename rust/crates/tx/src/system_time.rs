@@ -69,6 +69,22 @@ pub fn clock_slot_reading(observed: rtdb_types::Timestamp) -> Option<rtdb_types:
     observed.0.checked_add(500_000).map(rtdb_types::Timestamp)
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(admitted =>
+    ensures admitted == (through <= predecessor && previous_time < reading
+        && reading <= appended && reading <= observed
+        && reading as int + 1000000 <= i64::MAX as int && (observed as int) < reading as int + 1000000),
+))]
+pub(crate) fn clock_slot_admits(
+    through: i64, predecessor: i64, previous_time: i64, reading: i64, appended: i64, observed: i64,
+) -> bool {
+    let Some(until) = reading.checked_add(1_000_000) else { return false; };
+    through <= predecessor
+        && previous_time < reading
+        && reading <= appended
+        && reading <= observed
+        && observed < until
+}
+
 #[cfg(not(verus_keep_ghost))]
 pub(crate) fn clock_slot_time(
     slot: crate::OwnedClockSlot,
@@ -76,17 +92,11 @@ pub(crate) fn clock_slot_time(
     appended: rtdb_types::Timestamp,
     observed: rtdb_types::Timestamp,
 ) -> Option<rtdb_types::Timestamp> {
-    const GRACE_MICROS: i64 = 1_000_000;
     let head = head?;
-    let reading = slot.reading;
-    let until = reading.0.checked_add(GRACE_MICROS)?;
-    (head.tx_id.0 >= slot.through.0
-        // The owned storage format still stages effects at a distinct history coordinate.
-        && head.system_time < reading
-        && appended >= reading
-        && observed >= reading
-        && observed.0 < until)
-        .then_some(reading)
+    // The staged effects still require a distinct historical coordinate.
+    clock_slot_admits(
+        slot.through.0, head.tx_id.0, head.system_time.0, slot.reading.0, appended.0, observed.0,
+    ).then_some(slot.reading)
 }
 
 #[cfg(not(verus_keep_ghost))]

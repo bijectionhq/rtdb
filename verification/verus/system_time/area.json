@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 15,
+  "min_verified_functions": 18,
   "controls": {
     "reuse_the_previous_tick": {
       "mutate": [
@@ -196,6 +196,54 @@
         {
           "file": "rust/crates/tx/src/system_time.rs",
           "function": "admits_historical_time",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "substitute_append_for_the_receiver_observation": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& reading <= observed\n        && observed < until",
+          "replace": "&& reading <= appended\n        && appended < until"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "include_the_receiver_window_end": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& observed < until",
+          "replace": "&& observed <= until"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
+          "category": "postcondition not satisfied"
+        }
+      ]
+    },
+    "let_a_prepared_clock_lead_append": {
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "find": "&& reading <= appended\n        && reading <= observed",
+          "replace": "&& reading <= observed"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/system_time.rs",
+          "function": "clock_slot_admits",
           "category": "postcondition not satisfied"
         }
       ]
