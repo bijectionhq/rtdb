@@ -21,7 +21,7 @@ use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, Instant, LogicalType, Result, ScalarType, TableRef};
+use rtdb_types::{Anomaly, Instant, LogicalType, Result, ScalarType, TableRef, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
