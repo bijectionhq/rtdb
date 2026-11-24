@@ -228,8 +228,8 @@ fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status
     let valid = if from.is_some() || to.is_some() {
         let bound = |field: Option<proto::Cell>, default| match field.map(|field| cell(field, memory)).transpose()? {
             None => Ok(default),
-            Some(Cell::Value(Value::I64(micros))) => Ok(Timestamp(micros)),
-            _ => Err(error::incorrect("Valid-time bounds require literal signed microseconds")),
+            Some(Cell::Value(value)) => valid_bound(value),
+            Some(Cell::TxTime | Cell::TxBasis) => Err(error::incorrect("Valid-time bounds must be literal")),
         };
         Some(Interval::new(bound(from, Timestamp::MIN)?, bound(to, Timestamp::MAX)?).map_err(error::anomaly)?)
     } else { None };
@@ -242,6 +242,23 @@ fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status
         valid,
         cells,
     })
+}
+
+/// A bound is signed microseconds, or a zoned Arrow timestamp; a naive timestamp names no instant.
+fn valid_bound(value: Value) -> Result<Timestamp, Status> {
+    match value {
+        Value::I64(micros) => Ok(Timestamp(micros)),
+        Value::Timestamp { value, unit, timezone: Some(_) } => {
+            let per_second = unit.units_per_second();
+            let micros = if per_second >= 1_000_000 {
+                Some(value.div_euclid(per_second / 1_000_000))
+            } else {
+                value.checked_mul(1_000_000 / per_second)
+            };
+            micros.map(Timestamp).ok_or_else(|| error::incorrect("The valid-time bound is out of range"))
+        }
+        _ => Err(error::incorrect("Valid-time bounds require signed microseconds or a zoned timestamp")),
+    }
 }
 
 fn interval(valid: proto::Interval) -> Result<Interval, Status> {
@@ -343,5 +360,63 @@ pub(super) fn receipt(receipt: tx::Receipt) -> proto::Receipt {
         }),
         replayed: receipt.replayed,
         erasure: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray};
+
+    use super::*;
+
+    fn wire(column: ArrayRef) -> proto::Cell {
+        let batch = RecordBatch::try_from_iter([("value", column)]).unwrap();
+        proto::Cell {
+            value: Some(proto::cell::Value::ArrowIpc(
+                rtdb_format::ipc::write_stream(batch.schema_ref(), &[batch.clone()]).unwrap(),
+            )),
+        }
+    }
+
+    fn row(bounds: impl IntoIterator<Item = (&'static str, ArrayRef)>) -> Result<Row, Status> {
+        let mut cells: std::collections::HashMap<_, _> = bounds.into_iter()
+            .map(|(name, column)| (name.to_owned(), wire(column))).collect();
+        cells.insert("_id".into(), wire(Arc::new(Int64Array::from(vec![1]))));
+        cells.insert("title".into(), wire(Arc::new(Int64Array::from(vec![7]))));
+        decode_row(proto::Row { cells: cells.into_iter().collect() }, &MemoryBudget::new(1 << 20))
+    }
+
+    #[test]
+    fn put_rows_carry_their_explicit_valid_interval() {
+        let unbounded = row([]).unwrap();
+        assert_eq!(unbounded.valid, None);
+        assert_eq!(unbounded.cells.len(), 1);
+
+        let micros = row([
+            ("_valid_from", Arc::new(Int64Array::from(vec![10])) as ArrayRef),
+            ("_valid_to", Arc::new(Int64Array::from(vec![20]))),
+        ]).unwrap();
+        assert_eq!(micros.valid, Some(Interval::new(Timestamp(10), Timestamp(20)).unwrap()));
+        assert!(!micros.cells.contains_key("_valid_from") && !micros.cells.contains_key("_valid_to"));
+
+        let open_ended = row([("_valid_from", Arc::new(TimestampMicrosecondArray::from(vec![30]).with_timezone("UTC")) as ArrayRef)]).unwrap();
+        assert_eq!(open_ended.valid, Some(Interval::new(Timestamp(30), Timestamp::MAX).unwrap()));
+
+        let units = row([
+            ("_valid_from", Arc::new(TimestampMillisecondArray::from(vec![2]).with_timezone("UTC")) as ArrayRef),
+            ("_valid_to", Arc::new(TimestampNanosecondArray::from(vec![5_000_999]).with_timezone("+01:00"))),
+        ]).unwrap();
+        assert_eq!(units.valid, Some(Interval::new(Timestamp(2_000), Timestamp(5_000)).unwrap()));
+    }
+
+    #[test]
+    fn put_rows_refuse_naive_or_inverted_valid_intervals() {
+        let naive = row([("_valid_from", Arc::new(TimestampMicrosecondArray::from(vec![30])) as ArrayRef)]);
+        assert_eq!(naive.unwrap_err().code(), tonic::Code::InvalidArgument);
+        let inverted = row([
+            ("_valid_from", Arc::new(Int64Array::from(vec![20])) as ArrayRef),
+            ("_valid_to", Arc::new(Int64Array::from(vec![10]))),
+        ]);
+        assert!(inverted.is_err());
     }
 }
