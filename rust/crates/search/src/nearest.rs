@@ -9,6 +9,7 @@ use arrow_array::{Array, Float32Array, Float64Array, RecordBatch, UInt64Array};
 use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionMode};
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, ListValue, NumericCell, NumericSpan, OwnedRelation, Result,

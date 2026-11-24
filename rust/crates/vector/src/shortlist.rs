@@ -95,7 +95,7 @@ impl Shortlist {
             generation.probed = generation.probed.max(probes);
             let key = &generation.key;
             let clusters = &generation.clusters;
-            let blocks = futures::stream::iter(generation.order[start..probes].iter().map(|&index| {
+            let blocks = futures::stream::iter(generation.order[start..probes].iter().copied().map(|index| {
                 let cluster = &clusters[index];
                 async move {
                     let bytes = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
@@ -161,9 +161,11 @@ async fn frontier_rows(cut: Cut<'_>, definition: &VectorDefinition, sources: &[S
         lane::read_indexed_rows(std::io::Cursor::new(lease), definition, cut.memory, cut.cancellation, &mut output)?;
     }
     for segment in cut.snapshot.iter_segments(&definition.table) {
-        let events = segment.view();
-        for row in 0..events.len() {
-            output.push_event(&events.borrow_event(row)?, definition)?;
+        for batch in segment.batches() {
+            let events = batch.view();
+            for row in 0..events.len() {
+                output.push_event(&events.borrow_event(row)?, definition)?;
+            }
         }
     }
     Ok(output)

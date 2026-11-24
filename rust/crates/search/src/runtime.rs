@@ -1225,6 +1225,7 @@ mod live_coverage_tests {
         assert_eq!(covered, 1);
         let batch = extended.batches().next().unwrap();
         let terms = ServingTerms {
+            analyzer: rtdb_text::Analyzer::Simple,
             batches: BTreeMap::from([(Arc::as_ptr(batch) as usize, ServingBatch {
                 _batch: Arc::downgrade(batch), first: 0, pages: initial.clone().into(),
             })]),
