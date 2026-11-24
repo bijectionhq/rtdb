@@ -18,7 +18,11 @@ enum Kind {
     Uuid,
     Day,
     Bool,
-    InstantMicros,
+    Timestamp(TimeUnit, bool),
+    Time(TimeUnit),
+    Duration(TimeUnit),
+    YearMonth,
+    MonthDay(bool),
 }
 
 impl Kind {
@@ -47,10 +51,16 @@ impl Kind {
                 LogicalType::Scalar(ScalarType::Uuid) => Self::Uuid,
                 LogicalType::Scalar(ScalarType::DateDay | ScalarType::DateMilli) => Self::Day,
                 LogicalType::Scalar(ScalarType::Bool) => Self::Bool,
-                LogicalType::Scalar(ScalarType::Timestamp {
-                    unit: TimeUnit::Microsecond,
-                    timezone: Some(_),
-                }) => Self::InstantMicros,
+                LogicalType::Scalar(ScalarType::Timestamp { unit, timezone }) => {
+                    Self::Timestamp(unit, timezone.is_some())
+                }
+                LogicalType::Scalar(ScalarType::Time { unit, .. }) => Self::Time(unit),
+                LogicalType::Scalar(ScalarType::Duration(unit)) => Self::Duration(unit),
+                LogicalType::Scalar(ScalarType::Interval(rtdb_types::IntervalUnit::YearMonth)) => {
+                    Self::YearMonth
+                }
+                LogicalType::Scalar(ScalarType::Interval(rtdb_types::IntervalUnit::MonthDayNano)) => Self::MonthDay(false),
+                LogicalType::Scalar(ScalarType::IntervalMonthDayMicro) => Self::MonthDay(true),
                 _ => return None,
             };
             if kind.is_some_and(|known| known != next) {
@@ -129,9 +139,14 @@ impl Kind {
             (Self::Uuid, DataType::FixedSizeBinary(16), Some("uuid")) => true,
             (Self::Day, DataType::Date32 | DataType::Date64, None) => true,
             (Self::Bool, DataType::Boolean, None) => true,
-            (Self::InstantMicros, DataType::Timestamp(ArrowTime::Microsecond, Some(_)), None) => {
-                true
+            (Self::Timestamp(unit, zoned), DataType::Timestamp(physical, zone), None) => {
+                unit == time_unit(physical) && zoned == zone.is_some()
             }
+            (Self::Time(unit), DataType::Time32(physical) | DataType::Time64(physical), None)
+            | (Self::Duration(unit), DataType::Duration(physical), None) => unit == time_unit(physical),
+            (Self::YearMonth, DataType::Interval(arrow_schema::IntervalUnit::YearMonth), None) => true,
+            (Self::MonthDay(false), DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano), None)
+            | (Self::MonthDay(true), DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano), Some("xt/intervalDMMType")) => true,
             _ => false,
         }
     }
@@ -157,14 +172,16 @@ impl Kind {
             (Self::Uuid, Value::Uuid(value)) => Key::Text(value),
             (Self::Day, value) => Key::Integer(value.date_days()?),
             (Self::Bool, Value::Bool(value)) => Key::Integer(i64::from(u8::from(*value))),
-            (
-                Self::InstantMicros,
-                Value::Timestamp {
-                    value,
-                    unit: TimeUnit::Microsecond,
-                    timezone: Some(_),
-                },
-            ) => Key::Integer(*value),
+            (Self::Timestamp(unit, zoned), Value::Timestamp { value, unit: input, timezone })
+                if unit == *input && zoned == timezone.is_some() => Key::Integer(*value),
+            (Self::Time(unit), Value::Time { value, unit: input, .. })
+            | (Self::Duration(unit), Value::Duration { value, unit: input })
+                if unit == *input => Key::Integer(*value),
+            (Self::YearMonth, Value::IntervalYearMonth(months)) => Key::Integer(i64::from(*months)),
+            (Self::MonthDay(false), Value::IntervalMonthDayNano { months, days, nanoseconds })
+            | (Self::MonthDay(true), Value::IntervalMonthDayMicro { months, days, nanoseconds }) => {
+                Key::month_day(*months, *days, *nanoseconds)
+            }
             _ => return None,
         })
     }
@@ -215,11 +232,40 @@ impl Kind {
             DataType::Date64 => Key::Integer(
                 value!(Date64Type).div_euclid(rtdb_types::java_date::MILLIS_PER_DAY),
             ),
-            DataType::Timestamp(ArrowTime::Microsecond, Some(_)) => {
-                Key::Integer(value!(TimestampMicrosecondType))
+            DataType::Timestamp(unit, _) => Key::Integer(match unit {
+                ArrowTime::Second => value!(TimestampSecondType),
+                ArrowTime::Millisecond => value!(TimestampMillisecondType),
+                ArrowTime::Microsecond => value!(TimestampMicrosecondType),
+                ArrowTime::Nanosecond => value!(TimestampNanosecondType),
+            }),
+            DataType::Duration(unit) => Key::Integer(match unit {
+                ArrowTime::Second => value!(DurationSecondType),
+                ArrowTime::Millisecond => value!(DurationMillisecondType),
+                ArrowTime::Microsecond => value!(DurationMicrosecondType),
+                ArrowTime::Nanosecond => value!(DurationNanosecondType),
+            }),
+            DataType::Time32(ArrowTime::Second) => Key::Integer(i64::from(value!(Time32SecondType))),
+            DataType::Time32(ArrowTime::Millisecond) => Key::Integer(i64::from(value!(Time32MillisecondType))),
+            DataType::Time64(ArrowTime::Microsecond) => Key::Integer(value!(Time64MicrosecondType)),
+            DataType::Time64(ArrowTime::Nanosecond) => Key::Integer(value!(Time64NanosecondType)),
+            DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
+                Key::Integer(i64::from(value!(IntervalYearMonthType)))
+            }
+            DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano) => {
+                let value = value!(IntervalMonthDayNanoType);
+                Key::month_day(value.months, value.days, value.nanoseconds)
             }
             _ => unreachable!("only admitted sort keys are read"),
         }
+    }
+}
+
+fn time_unit(unit: &ArrowTime) -> TimeUnit {
+    match unit {
+        ArrowTime::Second => TimeUnit::Second,
+        ArrowTime::Millisecond => TimeUnit::Millisecond,
+        ArrowTime::Microsecond => TimeUnit::Microsecond,
+        ArrowTime::Nanosecond => TimeUnit::Nanosecond,
     }
 }
 
@@ -228,38 +274,44 @@ enum Key<'a> {
     Integer(i64),
     Float(f64),
     Text(&'a [u8]),
+    MonthDay { has_positive_months: bool, nanos: i64 },
 }
 
 impl Key<'_> {
-    fn compare(self, right: Self, order: &SortExpr) -> Ordering {
+    fn month_day(months: i32, days: i32, nanos: i64) -> Self {
+        Self::MonthDay {
+            has_positive_months: months > 0,
+            nanos: i64::from(days).wrapping_mul(86_400_000_000_000).wrapping_add(nanos),
+        }
+    }
+
+    fn compare(self, right: Self, order: &SortExpr) -> rtdb_types::Result<Ordering> {
         let comparison = match (self, right) {
-            (Self::Null, Self::Null) => return Ordering::Equal,
+            (Self::Null, Self::Null) => return Ok(Ordering::Equal),
             (Self::Null, _) => {
-                return if order.nulls_first {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                };
+                return Ok(if order.nulls_first { Ordering::Less } else { Ordering::Greater });
             }
             (_, Self::Null) => {
-                return if order.nulls_first {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                };
+                return Ok(if order.nulls_first { Ordering::Greater } else { Ordering::Less });
             }
             (Self::Integer(left), Self::Integer(right)) => left.cmp(&right),
             (Self::Float(left), Self::Float(right)) => float_order(left, right),
             (Self::Integer(left), Self::Float(right)) => float_order(left as f64, right),
             (Self::Float(left), Self::Integer(right)) => float_order(left, right as f64),
             (Self::Text(left), Self::Text(right)) => left.cmp(right),
+            (Self::MonthDay { has_positive_months: a, nanos: left },
+             Self::MonthDay { has_positive_months: b, nanos: right }) => {
+                if a || b {
+                    return Err(rtdb_types::Anomaly::incorrect(
+                        "xtdb.expression/cannot-compare-mdn-interval-with-months",
+                        "Cannot compare month-day-micro/nano intervals when month component is non-zero.",
+                    ));
+                }
+                left.cmp(&right)
+            }
             _ => unreachable!("sort key columns have one admitted kind"),
         };
-        if order.descending {
-            comparison.reverse()
-        } else {
-            comparison
-        }
+        Ok(if order.descending { comparison.reverse() } else { comparison })
     }
 }
 
@@ -296,16 +348,16 @@ impl NativeOrder {
         right: &ColumnBatch,
         right_row: usize,
         order: &[SortExpr],
-    ) -> Ordering {
+    ) -> rtdb_types::Result<Ordering> {
         for (&(column, kind), order) in self.0.iter().zip(order) {
             let left = kind.read(&left.columns[column], left_row);
             let right = kind.read(&right.columns[column], right_row);
-            let comparison = left.compare(right, order);
+            let comparison = left.compare(right, order)?;
             if !comparison.is_eq() {
-                return comparison;
+                return Ok(comparison);
             }
         }
-        Ordering::Equal
+        Ok(Ordering::Equal)
     }
 }
 
@@ -335,10 +387,10 @@ fn borrowed_sort_keys_follow_selected_arrow_positions_and_missing_sources() {
 }
 
 #[test]
-fn native_sort_matches_scalar_order_for_index_key_families() {
+fn arrow_wave4_native_sort_matches_scalar_order_for_index_key_families() {
     use rtdb_plan::{ColumnId, Expr};
 
-    let cases = [
+    let mut cases = vec![
         vec![
             Value::F64(-0.0),
             Value::F64(0.0),
@@ -360,6 +412,20 @@ fn native_sort_matches_scalar_order_for_index_key_families() {
             Value::Binary(vec![128, 0]),
         ],
     ];
+    let units = [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond];
+    for unit in units {
+        for timezone in [None, Some("America/New_York".to_owned())] {
+            cases.push([-7, 0, 7].map(|value| Value::Timestamp {
+                value, unit, timezone: timezone.clone()
+            }).to_vec());
+        }
+        cases.push([-7, 0, 7].map(|value| Value::Duration { value, unit }).to_vec());
+    }
+    cases.push(vec![Value::IntervalYearMonth(-1), Value::IntervalYearMonth(0), Value::IntervalYearMonth(12)]);
+    cases.push(vec![
+        Value::IntervalMonthDayNano { months: -1, days: 1, nanoseconds: i64::MAX },
+        Value::IntervalMonthDayNano { months: 0, days: -1, nanoseconds: 0 },
+    ]);
     for mut values in cases {
         values.push(Value::Null);
         let ty = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
@@ -400,7 +466,7 @@ fn native_sort_matches_scalar_order_for_index_key_families() {
                     };
                     assert_eq!(
                         kind.read(&column, left)
-                            .compare(kind.read(&column, right), &order),
+                            .compare(kind.read(&column, right), &order).unwrap(),
                         expected
                     );
                 }

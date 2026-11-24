@@ -14,7 +14,7 @@ use crate::{
 
 #[derive(Clone, Copy)]
 struct ArrowKey<'a> {
-    batch: &'a ColumnBatch,
+    columns: &'a [Column],
     row: usize,
     projected: bool,
 }
@@ -157,15 +157,15 @@ impl<'a> Key<'a> {
 
     pub(crate) fn for_columns(batch: &'a ColumnBatch, row: usize, projected: bool, positions: &'a [usize],
         context: &QueryContext) -> Result<Self> {
-        Self::read(ArrowKey { batch, row, projected }, Some(positions), context)
+        Self::read(ArrowKey { columns: &batch.columns, row, projected }, Some(positions), context)
     }
 
     fn len(&self) -> usize {
-        self.positions.map_or(self.source.batch.columns.len(), <[usize]>::len)
+        self.positions.map_or(self.source.columns.len(), <[usize]>::len)
     }
 
     fn column(&self, index: usize) -> &'a Column {
-        &self.source.batch.columns[self.positions.map_or(index, |positions| positions[index])]
+        &self.source.columns[self.positions.map_or(index, |positions| positions[index])]
     }
 
     fn read_value(&self, index: usize) -> Result<Value> {
@@ -187,7 +187,7 @@ impl<'a> Key<'a> {
     }
 
     fn bind(batch: &'a ColumnBatch, row: usize, projected: bool, context: &QueryContext, hashing: KeyHash) -> Result<(u32, Self)> {
-        let key = Self::read(ArrowKey { batch, row, projected }, None, context)?;
+        let key = Self::read(ArrowKey { columns: &batch.columns, row, projected }, None, context)?;
         let hash = match hashing {
             KeyHash::Set => (0..key.len()).fold(0, |hash, index| {
                 let cell = match key.cached(index) {
@@ -212,7 +212,7 @@ impl<'a> Key<'a> {
     }
 
     fn equals(&self, other: ArrowKey<'_>, context: &QueryContext) -> Result<bool> {
-        if self.len() != other.batch.columns.len() { return Ok(false); }
+        if self.len() != other.columns.len() { return Ok(false); }
         let right = Key::read(other, None, context)?;
         // URI preflight can raise a hash error in a later cell even if an earlier cell compares unequal.
         if self.has_uri || right.has_uri {
@@ -268,20 +268,20 @@ struct Position {
 struct Positions {
     rows: Vec<Position>,
     // The first and last position in each hash chain, in input order.
-    chains: HashMap<u32, (usize, usize)>,
+    chains: HashMap<u64, (usize, usize)>,
 }
 
 impl Positions {
     fn allocation_bound(rows: usize) -> Result<usize> {
-        rows.checked_mul(4 * size_of::<Position>() + 4 * (size_of::<(u32, (usize, usize))>() + 1))
+        rows.checked_mul(4 * size_of::<Position>() + 4 * (size_of::<(u64, (usize, usize))>() + 1))
             .and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(size_error)
     }
 
-    fn push(&mut self, hash: u32, batch: usize, row: usize) {
+    fn push(&mut self, bucket: u64, batch: usize, row: usize) {
         use std::collections::hash_map::Entry;
         let index = self.rows.len();
-        match self.chains.entry(hash) {
+        match self.chains.entry(bucket) {
             Entry::Occupied(mut entry) => {
                 let (_, last) = entry.get_mut();
                 self.rows[*last].next = Some(index);
@@ -299,21 +299,20 @@ impl Positions {
         });
     }
 
-    fn find<'a>(
+    fn find(
         &mut self,
-        hash: u32,
-        key: &Key<'_>,
+        bucket: u64,
         all: bool,
         context: &QueryContext,
-        resolve: impl Fn(Position) -> ArrowKey<'a>,
+        equal: impl Fn(Position) -> Result<bool>,
     ) -> Result<Option<usize>> {
-        let mut next = self.chains.get(&hash).map(|&(first, _)| first);
+        let mut next = self.chains.get(&bucket).map(|&(first, _)| first);
         let mut checked = 0usize;
         while let Some(index) = next {
             context.check_cancelled_at(checked)?;
             checked += 1;
             let position = self.rows[index];
-            if (!all || !position.consumed) && key.equals(resolve(position), context)? {
+            if (!all || !position.consumed) && equal(position)? {
                 if all {
                     self.rows[index].consumed = true;
                 }
@@ -408,7 +407,7 @@ impl BatchKeyIndex {
         let page = self.batches.len();
         self.batches.push((batch, projected));
         for (row, &hash) in hashes.iter().enumerate() {
-            self.positions.push(hash, page, row);
+            self.positions.push(u64::from(hash), page, row);
         }
         Ok(())
     }
@@ -458,14 +457,46 @@ impl BatchKeyIndex {
         context: &QueryContext,
     ) -> Result<Option<usize>> {
         let batches = &self.batches;
-        self.positions.find(hash, key, all, context, |position| {
+        self.positions.find(u64::from(hash), all, context, |position| {
             let (batch, projected) = &batches[position.batch];
-            ArrowKey {
-                batch,
-                row: position.row,
-                projected: *projected,
-            }
+            key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected: *projected }, context)
         })
+    }
+
+    pub fn insert_distinct_argument(
+        &mut self, batch: &ColumnBatch, column: usize, row: usize, group: usize, projected: bool,
+        retained_source: &mut Option<usize>, context: &QueryContext,
+    ) -> Result<bool> {
+        let columns = std::slice::from_ref(&batch.columns[column]);
+        let key = Key::read(ArrowKey { columns, row, projected }, None, context)?;
+        let hash = key.vector_hash()?;
+        let source = &self.batches;
+        let group = u32::try_from(group).map_err(|_| size_error())?;
+        let bucket = (u64::from(group) << 32) | u64::from(hash);
+        if self.positions.find(bucket, false, context, |position| {
+            let (batch, projected) = &source[position.batch];
+            let other = Key::read(ArrowKey { columns: &batch.columns, row: position.row, projected: *projected }, None, context)?;
+            Ok(key.equal_at(&other, 0, false, context, None)? == Some(true))
+        })?.is_some() {
+            return Ok(false);
+        }
+        let rows = self.positions.rows.len().checked_add(1).ok_or_else(size_error)?;
+        let batches = self.batches.len().checked_add(usize::from(retained_source.is_none())).ok_or_else(size_error)?;
+        let bytes = batches.checked_mul(4 * size_of::<(ColumnBatch, bool)>())
+            .and_then(|batches| Positions::allocation_bound(rows).ok()?.checked_add(batches))
+            .ok_or_else(size_error)?;
+        Arc::get_mut(&mut self.reservation).expect("The key index owns its reservation").grow_to(bytes)?;
+        let page = match *retained_source {
+            Some(page) => page,
+            None => {
+                let page = self.batches.len();
+                self.batches.push((batch.key_projection(&[column], &context.memory)?, projected));
+                *retained_source = Some(page);
+                page
+            }
+        };
+        self.positions.push(bucket, page, row);
+        Ok(true)
     }
 
     pub fn distinct(
@@ -521,17 +552,15 @@ impl BatchKeyIndex {
                 visit(row, index, false)?;
                 continue;
             }
-            let known = current.find(hash, &key, false, context, |position| ArrowKey {
-                batch,
-                row: position.row,
-                projected,
+            let known = current.find(u64::from(hash), false, context, |position| {
+                key.equals(ArrowKey { columns: &batch.columns, row: position.row, projected }, context)
             })?;
             let index = previous
                 .checked_add(known.unwrap_or(current.rows.len()))
                 .ok_or_else(size_error)?;
             visit(row, index, known.is_none())?;
             if known.is_none() {
-                current.push(hash, 0, row);
+                current.push(u64::from(hash), 0, row);
                 picks.push((0, row));
                 hashes.push(hash);
             }
@@ -782,7 +811,7 @@ mod tests {
         assert_eq!(hash, crate::operators::equality_hash(&expected, &context.timezone));
         assert_eq!(first.vector_hash().unwrap(), crate::join_storage::hash_values(&expected).unwrap());
         assert_eq!(first.equal_at(&second, 0, false, &context, None).unwrap(), Some(true));
-        assert!(!first.equals(ArrowKey { batch: &batch, row: 1, projected: false }, &context).unwrap());
+        assert!(!first.equals(ArrowKey { columns: &batch.columns, row: 1, projected: false }, &context).unwrap());
         assert_eq!(direct_bloom_hashes(&batch.columns[0], 0).unwrap().0, (
             rtdb_columnar::hash_value(&expected[0], 0).unwrap(),
             rtdb_columnar::hash_value_murmur3(&expected[0], 0).unwrap(),

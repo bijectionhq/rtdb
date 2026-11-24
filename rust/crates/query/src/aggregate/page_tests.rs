@@ -544,3 +544,54 @@ fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_typ
     builder.finish().unwrap()
 }
 fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
+
+#[tokio::test]
+async fn arrow_wave4_numeric_aggregates_match_scalar_rows_and_float_bits() {
+    let execution = execution(8);
+    let context = &execution.context;
+    let baseline = context.memory.used_bytes();
+    let ty = LogicalType::Scalar(ScalarType::F64).maybe();
+    let input_field = field(0, ty.clone());
+    let schema = Schema::new(vec![input_field.clone()]).unwrap();
+    for values in [
+        vec![Value::F64(-0.0), Value::Null, Value::F64(0.0), Value::F64(-0.0)],
+        vec![Value::F64(f64::from_bits(0x7ff8_0000_0000_0001)), Value::F64(1.0), Value::F64(f64::from_bits(0x7ff8_0000_0000_0002))],
+        vec![Value::Null, Value::Null],
+    ] {
+        for (function, distinct) in [
+            (AggregateFunction::Min, false), (AggregateFunction::Max, false),
+            (AggregateFunction::Sum, true), (AggregateFunction::Average, true),
+            (AggregateFunction::VariancePopulation, false), (AggregateFunction::Count, true),
+            (AggregateFunction::Percentile {
+                kind: PercentileKind::Continuous, fraction: PercentileFraction::Literal(0.5), descending: false,
+            }, false),
+        ] {
+            let mut aggregate = AggregateExpr {
+                field: field(1, LogicalType::Null), function, argument: Some(input_field.expression()),
+                distinct, filter: None, order_by: vec![],
+            };
+            aggregate.field.data_type = AggregateTypes::derive(&aggregate, ty.clone(), true, EmissionMode::Execution).unwrap().output_type().clone();
+            let input = Arc::new(Relation::new(schema.clone(), RelationNode::Values { rows: vec![] }).unwrap());
+            let output = Schema::new(vec![aggregate.field.clone()]).unwrap();
+            let relation = Arc::new(Relation::new(output, RelationNode::Aggregate {
+                input, groups: vec![], aggregates: vec![aggregate.clone()],
+            }).unwrap());
+            let runtime = EmittedRelation::derive(relation, &context.catalog, &[], &context.memory).unwrap();
+            let batch = ColumnBatch::settled(vec![Column::Arrow {
+                array: rtdb_columnar::copy_array(&ty, &values).unwrap(),
+                field: Arc::new(rtdb_columnar::to_field(&input_field.name, &ty).unwrap()),
+                logical: Some(ty.clone()),
+            }], values.len(), context.memory.reserve(4096).unwrap()).unwrap();
+            let mut vector = AggregateCursor::from_batches(Box::new(Batches(Some(batch))), false, schema.clone(), vec![], vec![aggregate.clone()], runtime, execution.clone()).unwrap();
+            let expected = primitive_result(cursor(&execution, schema.clone(),
+                vec![values.iter().cloned().map(|value| vec![value]).collect()], vec![], vec![aggregate], None).0).await;
+            let output = vector.next_batch().await.unwrap().unwrap();
+            let actual = output.columns[0].value(0).unwrap();
+            match (expected, actual) {
+                (Value::F64(expected), Value::F64(actual)) => assert_eq!(expected.to_bits(), actual.to_bits()),
+                (expected, actual) => assert_eq!(expected, actual),
+            }
+        }
+    }
+    assert_eq!(context.memory.used_bytes(), baseline);
+}

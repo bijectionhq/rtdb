@@ -138,3 +138,66 @@ fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_typ
     builder.finish().unwrap()
 }
 fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
+
+#[tokio::test]
+async fn arrow_wave4_selected_boolean_projection_and_filter_match_scalar_evaluation() {
+    use crate::columnar::{BatchCursor, BatchExpressions, Column, ColumnBatch, SelectedColumn};
+    let execution = execution();
+    let context = &execution.context;
+    let ty = LogicalType::Scalar(ScalarType::F32).maybe();
+    let field = field(0, ty.clone());
+    let schema = Schema::new(vec![field.clone()]).unwrap();
+    let predicate = Expr::binary(BinaryOp::Lt, field.expression(), Expr::Literal(Value::F32(0.0)));
+    let array = Arc::new(arrow_array::Float32Array::from(vec![Some(-0.0), None, Some(1.0)]));
+    let nullable = Arc::new(rtdb_columnar::to_field(&field.name, &ty).unwrap());
+    let column = Column::Selected(SelectedColumn::new(
+        vec![Some((array, nullable, Some(ty), None)), None],
+        Arc::new(vec![(1, 0), (0, 2), (0, 0), (0, 1)]),
+    ));
+    let batch = ColumnBatch::settled(vec![column], 4, context.memory.reserve(4096).unwrap()).unwrap();
+    let scope = execution.scope().unwrap();
+    let mut expected = Vec::new();
+    for row in 0..batch.len {
+        expected.push(execution.evaluate(&scope, &predicate, &schema, &[batch.columns[0].value(row).unwrap()]).await.unwrap());
+        scope.reset().unwrap();
+    }
+    let mask = crate::columnar::typed_predicate_mask(&batch, &predicate, &schema, execution.parameters.evaluator()).unwrap();
+    assert_eq!(mask, expected.iter().map(|value| *value == Value::Bool(true)).collect::<Vec<_>>());
+    let input = crate::columnar::single_batch(Some(batch), context.clone());
+    let mut projections = BatchExpressions::new(input, schema, vec![predicate], execution.clone());
+    let output = projections.next_batch().await.unwrap().unwrap();
+    assert!(matches!(&output.columns[0], Column::Arrow { array, .. } if array.data_type() == &arrow_schema::DataType::Boolean));
+    assert_eq!((0..output.len).map(|row| output.columns[0].value(row).unwrap()).collect::<Vec<_>>(), expected);
+}
+
+#[tokio::test]
+async fn arrow_wave4_selected_checked_arithmetic_falls_back_at_the_first_failing_row() {
+    use crate::columnar::{BatchCursor, BatchExpressions, Column, ColumnBatch, SelectedColumn};
+    let execution = execution();
+    let context = &execution.context;
+    let ty = LogicalType::Scalar(ScalarType::I64).maybe();
+    let field = field(0, ty.clone());
+    let schema = Schema::new(vec![field.clone()]).unwrap();
+    let expression = Expr::binary(BinaryOp::Add, field.expression(), Expr::Literal(Value::I64(2)));
+    let array = Arc::new(arrow_array::Int64Array::from(vec![Some(40), None, Some(i64::MAX)]));
+    let nullable = Arc::new(rtdb_columnar::to_field(&field.name, &ty).unwrap());
+    let batch = |rows: Vec<(usize, usize)>| {
+        let len = rows.len();
+        let column = Column::Selected(SelectedColumn::new(
+            vec![Some((array.clone(), nullable.clone(), Some(ty.clone()), None)), None],
+            Arc::new(rows),
+        ));
+        ColumnBatch::settled(vec![column], len, context.memory.reserve(4096).unwrap()).unwrap()
+    };
+    let selected = batch(vec![(1, 0), (0, 0), (0, 1)]);
+    let result = crate::columnar::projection::column(&expression, &schema, &selected, execution.parameters.evaluator()).unwrap().unwrap();
+    let expected = [Value::Null, Value::I64(42), Value::Null];
+    assert_eq!((0..selected.len).map(|row| result.value(row).unwrap()).collect::<Vec<_>>(), expected);
+    let selected = batch(vec![(0, 1), (0, 2), (0, 0)]);
+    let input = crate::columnar::single_batch(Some(selected), context.clone());
+    let mut projection = BatchExpressions::new(input, schema.clone(), vec![expression.clone(), invalid_pattern()], execution.clone());
+    let scope = execution.scope().unwrap();
+    let expected = execution.evaluate(&scope, &expression, &schema, &[Value::I64(i64::MAX)]).await.unwrap_err();
+    let error = projection.next_batch().await.err().unwrap();
+    assert_eq!((error.code, error.message), (expected.code, expected.message));
+}

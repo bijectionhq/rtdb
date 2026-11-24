@@ -1,8 +1,9 @@
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
-use arrow_array::Array;
+use arrow_array::{Array, cast::AsArray, types::*};
+use arrow_schema::DataType;
 use async_trait::async_trait;
+use rtdb_columnar::MemoryReservation;
 use rtdb_expr::{cast, compare_in_timezone, is_true, number, sql_eq_in_timezone};
 use rtdb_plan::{AggregateExpr, AggregateFunction, Binder, NamedExpr, PercentileFraction, PercentileKind, Schema};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
@@ -59,6 +60,10 @@ impl<'a> Rows<'a> {
             return Ok(is_null);
         }
         Ok(matches!(self.value(row, position)?.as_ref(), Value::Null | Value::Undefined))
+    }
+
+    fn arrow_column(&self, position: Option<usize>) -> Option<&'a Column> {
+        self.batch.columns.get(position?)
     }
 }
 
@@ -297,18 +302,32 @@ impl BatchCursor for AggregateCursor {
                 }
                 AggregateFunction::Sum | AggregateFunction::Average
                     if without_nullability(&field.data_type) == &LogicalType::Scalar(ScalarType::F64) => {
-                    let scope = self.execution.scope()?;
                     let mut sums = Vec::with_capacity(batch.len);
                     for (index, state) in states.values.iter().enumerate() {
                         context.check_cancelled_at(index)?;
-                        sums.push(match state.finish(aggregate, &scope)? {
-                            Value::F64(value) => Some(value),
-                            Value::Null => None,
-                            _ => return Err(invalid("aggregate-input", "Expected a floating-point aggregate state")),
-                        });
-                        scope.reset()?;
+                        let result = if aggregate.function == AggregateFunction::Average {
+                            state.average_double()
+                        } else {
+                            match state.accumulator.as_ref().map(|row| &row.values[0]) {
+                                Some(Value::F64(value)) => Some(*value),
+                                None => None,
+                                _ => return Err(invalid("aggregate-input", "Expected a floating-point aggregate state")),
+                            }
+                        };
+                        sums.push(result);
                     }
                     Arc::new(arrow_array::Float64Array::from(sums))
+                }
+                AggregateFunction::VariancePopulation | AggregateFunction::VarianceSample
+                | AggregateFunction::StddevPopulation | AggregateFunction::StddevSample => {
+                    let mut results = Vec::with_capacity(batch.len);
+                    for (index, state) in states.values.iter().enumerate() {
+                        context.check_cancelled_at(index)?;
+                        results.push(state.variance_double(&aggregate.function));
+                    }
+                    let (column, charge) = double_results(results, reservation)?;
+                    batch.append_column(column, charge, &context.memory)?;
+                    continue;
                 }
                 _ => {
                     let scope = self.execution.scope()?;
@@ -335,6 +354,18 @@ impl BatchCursor for AggregateCursor {
         }
         Ok(Some(batch))
     }
+}
+
+fn double_results(values: Vec<Option<f64>>, reservation: Arc<MemoryReservation>) -> Result<(Column, Arc<MemoryReservation>)> {
+    let (array, logical): (arrow_array::ArrayRef, _) = if values.iter().all(Option::is_none) {
+        (Arc::new(arrow_array::NullArray::new(values.len())), LogicalType::Null)
+    } else {
+        let logical = LogicalType::Scalar(ScalarType::F64);
+        let logical = if values.iter().any(Option::is_none) { logical.maybe() } else { logical };
+        (Arc::new(arrow_array::Float64Array::from(values)), logical)
+    };
+    let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+    Ok((Column::Arrow { array, field, logical: Some(logical) }, reservation))
 }
 
 fn direct_rank_type(ty: &LogicalType) -> bool {
@@ -422,14 +453,61 @@ impl AggregateCursor {
 
 struct AggregateColumn { accumulation: Accumulation, distinct: Option<DistinctSeen> }
 /// The distinct arguments each group has taken so far, by the group and the hash of the argument.
-struct DistinctSeen {
-    index: std::collections::HashMap<(usize, u32), Vec<usize>>,
-    values: Vec<DistinctCell>,
+enum DistinctSeen {
+    FirstBatch,
+    Rows { index: HashMap<(usize, u32), Vec<usize>>, values: Vec<OwnedRow> },
+    Columns(Box<BatchKeyIndex>),
 }
 
-enum DistinctCell {
-    Value(OwnedRow),
-    Arrow { key: Arc<ColumnBatch>, row: usize, projected: bool },
+impl DistinctSeen {
+    fn select(
+        &mut self, input: Rows<'_>, mapping: &[usize], mask: &mut [bool], argument: Option<usize>,
+        types: &AggregateTypes, execution: &Execution,
+    ) -> Result<()> {
+        if matches!(self, Self::FirstBatch) {
+            *self = match (input, argument) {
+                (_, Some(_)) => Self::Columns(Box::new(BatchKeyIndex::vector_hashing(&execution.context)?)),
+                _ => Self::Rows { index: HashMap::new(), values: Vec::new() },
+            };
+        }
+        let mut retained_source = None;
+        let mut admitted = false;
+        for (row, (group, selected)) in mapping.iter().copied().zip(mask).enumerate() {
+            execution.context.check_cancelled()?;
+            if !*selected { continue; }
+            if !admitted {
+                rtdb_plan::validate_equality_types(&types.input, &types.input)?;
+                admitted = true;
+            }
+            match self {
+                Self::Columns(index) => {
+                    let (Rows { batch, projected, .. }, Some(argument)) = (input, argument) else {
+                        return Err(invalid("aggregate-input", "A distinct batch argument is absent"));
+                    };
+                    *selected = index.insert_distinct_argument(batch, argument, row, group, projected, &mut retained_source, &execution.context)?;
+                }
+                Self::Rows { index, values } => {
+                    let cell = input.value(row, argument)?;
+                    let value = cell.as_ref();
+                    let hash = crate::join_storage::hash_values(std::iter::once(value))?;
+                    let candidates = index.entry((group, hash)).or_default();
+                    for &candidate in candidates.iter() {
+                        let allocation = execution.scope()?;
+                        if sql_eq_in_timezone(value, &values[candidate].values[0], &execution.context.timezone, &allocation)? == Some(true) {
+                            *selected = false;
+                            break;
+                        }
+                    }
+                    if *selected {
+                        candidates.push(values.len());
+                        values.push(OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?);
+                    }
+                }
+                Self::FirstBatch => unreachable!(),
+            }
+        }
+        Ok(())
+    }
 }
 enum Accumulation { Scalar(ScalarGroups), Vectors(CollectionVectors) }
 impl AggregateColumn {
@@ -441,14 +519,19 @@ impl AggregateColumn {
             }
             _ => Accumulation::Scalar(ScalarGroups::new(execution)?),
         };
-        let distinct = if aggregate.distinct && !matches!(aggregate.function,AggregateFunction::Min | AggregateFunction::Max) { Some(DistinctSeen { index: Default::default(), values: Vec::new() }) } else { None };
+        let distinct = if aggregate.distinct && !matches!(aggregate.function,AggregateFunction::Min | AggregateFunction::Max) { Some(DistinctSeen::FirstBatch) } else { None };
         Ok(Self { accumulation,distinct })
     }
     async fn aggregate(&mut self,input: Rows<'_>,mapping: &[usize],group_count: usize,aggregate: &AggregateExpr,types: &AggregateTypes,schema: &Schema,execution: &Execution) -> Result<()> {
         let scope = execution.scope()?;
         scope.reserve(input.len())?;
         let mut mask = vec![true;input.len()];
-        if let Some(filter) = &aggregate.filter {
+        if let Some(filter) = &aggregate.filter
+            && let Some(selected) = crate::columnar::typed_predicate_mask(input.batch, filter, schema, execution.parameters.evaluator())
+        {
+            execution.prepare_expression(filter, schema, &scope)?;
+            mask = selected;
+        } else if let Some(filter) = &aggregate.filter {
             let invocation = execution.prepare_expression(filter,schema,&scope)?;
             for (row, selected) in mask.iter_mut().enumerate() {
                 let row_scope = execution.scope()?;
@@ -459,45 +542,7 @@ impl AggregateColumn {
         }
         let argument = aggregate.argument.as_ref().map(|argument|argument_position(argument,schema)).transpose()?;
         if let Some(seen) = &mut self.distinct {
-            let mut vector = None;
-            let mut admitted = false;
-            for (row, (group, selected)) in mapping.iter().zip(&mut mask).enumerate() {
-                execution.context.check_cancelled()?;
-                if !*selected { continue; }
-                if !admitted { rtdb_plan::validate_equality_types(&types.input,&types.input)?; admitted = true; }
-                let cell = input.value(row, argument)?;
-                let value = cell.as_ref();
-                let hash = crate::join_storage::hash_values(std::iter::once(value))?;
-                if let Some(candidates) = seen.index.get(&(*group, hash)) {
-                    for &candidate in candidates {
-                        let allocation = rtdb_expr::EvaluationScope::new(&execution.context.memory)?;
-                        let decoded;
-                        let other = match &seen.values[candidate] {
-                            DistinctCell::Value(row) => &row.values[0],
-                            DistinctCell::Arrow { key, row, projected } => {
-                                decoded = key.columns[0].expression_value(*row, *projected, Some(&allocation))?;
-                                &decoded
-                            }
-                        };
-                        if sql_eq_in_timezone(value, other, &execution.context.timezone, &allocation)? == Some(true) {
-                            *selected = false;
-                            break;
-                        }
-                    }
-                }
-                if *selected {
-                    seen.index.entry((*group, hash)).or_default().push(seen.values.len());
-                    let cell = match argument {
-                        Some(position) => {
-                            let Rows { batch, projected, memory } = input;
-                            if vector.is_none() { vector = Some(Arc::new(batch.key_projection(&[position], memory)?)); }
-                            DistinctCell::Arrow { key: Arc::clone(vector.as_ref().expect("The input key vector is retained")), row, projected }
-                        }
-                        _ => DistinctCell::Value(OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?),
-                    };
-                    seen.values.push(cell);
-                }
-            }
+            seen.select(input, mapping, &mut mask, argument, types, execution)?;
         }
         validate_aggregate_input(aggregate,types)?;
         match &mut self.accumulation {
@@ -627,15 +672,33 @@ impl CollectionVectors {
         let bytes = groups.checked_mul(2 * std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512))
             .ok_or_else(|| invalid("aggregate-size", "Percentile results exceed addressable memory"))?;
         let mut reservation = memory.reserve(bytes)?;
-        let mut values = Vec::with_capacity(groups);
-        let mut picks = Vec::with_capacity(groups);
         let gather = kind == PercentileKind::Discrete && direct_rank_type(&output.data_type);
+        let mut values = Vec::with_capacity(if kind == PercentileKind::Discrete && !gather { groups } else { 0 });
+        let mut picks = Vec::with_capacity(if gather { groups } else { 0 });
+        let mut interpolated = Vec::with_capacity(if kind == PercentileKind::Continuous { groups } else { 0 });
         let read = |(batch, row): (usize, usize)| Rows { batch: &self.batches[batch], projected: self.projected, memory }.value(row, Some(0));
+        let read_number = |position: (usize, usize)| -> Result<f64> {
+            let (batch, row) = position;
+            let column = &self.batches[batch].columns[0];
+            match ScalarKey::read(column, row) {
+                Some(ScalarKey::Signed(value)) => return Ok(value as f64),
+                Some(ScalarKey::Float(value)) => return Ok(value),
+                _ => {}
+            }
+            let cell = read(position)?;
+            number(cell.as_ref()).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))
+        };
         for group in 0..groups {
             context.check_cancelled_at(group)?;
             let rows = self.groups.get(group).map_or(&[][..], Vec::as_slice);
             if rows.is_empty() {
-                if gather { picks.push(None); } else { values.push(Value::Null); }
+                if gather {
+                    picks.push(None);
+                } else if kind == PercentileKind::Continuous {
+                    interpolated.push(None);
+                } else {
+                    values.push(Value::Null);
+                }
                 continue;
             }
             let (low, high, weight) = percentile_ranks(kind, fraction, rows.len() as i32)?;
@@ -655,28 +718,31 @@ impl CollectionVectors {
                 picks.push(Some(lower));
                 continue;
             }
+            if kind == PercentileKind::Continuous {
+                let lower = read_number(lower)?;
+                let value = if low == high {
+                    lower
+                } else {
+                    let upper = read_number(upper)?;
+                    lower + weight * (upper - lower)
+                };
+                interpolated.push(Some(value));
+                continue;
+            }
             let scope = execution.scope()?;
             let lower = read(lower)?;
-            let value = if kind == PercentileKind::Discrete {
-                let value = lower.as_ref();
-                scope.reserve(value.retained_bytes()?.checked_mul(2).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
-                execution.evaluate(&scope, &rtdb_plan::Expr::Literal(value.clone()), &Schema::default(), &[]).await?
-            } else {
-                let lower = number(lower.as_ref()).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?;
-                if low == high {
-                    Value::F64(lower)
-                } else {
-                    let upper = read(upper)?;
-                    let upper = number(upper.as_ref()).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?;
-                    Value::F64(lower + weight * (upper - lower))
-                }
-            };
+            let value = lower.as_ref();
+            scope.reserve(value.retained_bytes()?.checked_mul(2).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
+            let value = execution.evaluate(&scope, &rtdb_plan::Expr::Literal(value.clone()), &Schema::default(), &[]).await?;
             let lease = Arc::get_mut(&mut reservation).expect("The percentile aggregate owns its result reservation");
             lease.grow_to(lease.bytes().checked_add(value.retained_bytes()?).ok_or_else(|| invalid("aggregate-size", "Percentile output overflow"))?)?;
             values.push(value);
         }
         if gather {
             return crate::columnar::gather_nullable_column(|batch| &self.batches[batch], &picks, 0, memory);
+        }
+        if kind == PercentileKind::Continuous {
+            return double_results(interpolated, reservation);
         }
         crate::columnar::pack_evaluated_column(&values, memory)
     }
@@ -828,6 +894,92 @@ fn argument_position(argument: &rtdb_plan::Expr,schema: &Schema) -> Result<usize
     match argument { rtdb_plan::Expr::Column { id,.. } => schema.position(*id).ok_or_else(||invalid("aggregate-column","Aggregate argument column is absent")),_ => Err(invalid("aggregate-column","Aggregate argument must be projected before aggregation")) }
 }
 
+#[derive(Clone, Copy)]
+enum NumericCell {
+    Integer(i64),
+    Float32(f32),
+    Float64(f64),
+}
+
+impl NumericCell {
+    fn as_f32(self) -> f32 {
+        match self {
+            Self::Integer(value) => value as f32,
+            Self::Float32(value) => value,
+            Self::Float64(value) => value as f32,
+        }
+    }
+
+    fn as_f64(self) -> f64 {
+        match self {
+            Self::Integer(value) => value as f64,
+            Self::Float32(value) => f64::from(value),
+            Self::Float64(value) => value,
+        }
+    }
+
+    fn key(self) -> crate::scalar_key::ScalarKey<'static> {
+        match self {
+            Self::Integer(value) => crate::scalar_key::ScalarKey::Signed(value),
+            float => crate::scalar_key::ScalarKey::Float(float.as_f64()),
+        }
+    }
+}
+
+struct NumericColumn<'a>(&'a Column);
+
+impl<'a> NumericColumn<'a> {
+    fn bind(column: &'a Column, expected: Option<&LogicalType>) -> Option<Self> {
+        let accepts = |array: &dyn Array, field: &arrow_schema::Field, logical: Option<&LogicalType>| {
+            if !field.metadata().is_empty() || field.data_type() != array.data_type() { return false; }
+            let physical = match array.data_type() {
+                DataType::Null => return field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null),
+                DataType::Int8 => ScalarType::I8,
+                DataType::Int16 => ScalarType::I16,
+                DataType::Int32 => ScalarType::I32,
+                DataType::Int64 => ScalarType::I64,
+                DataType::UInt8 => ScalarType::U8,
+                DataType::UInt16 => ScalarType::U16,
+                DataType::UInt32 => ScalarType::U32,
+                DataType::UInt64 => ScalarType::U64,
+                DataType::Float32 => ScalarType::F32,
+                DataType::Float64 => ScalarType::F64,
+                _ => return false,
+            };
+            let physical = LogicalType::Scalar(physical);
+            logical.is_none_or(|ty| without_nullability(ty) == &physical)
+                && expected.is_none_or(|ty| without_nullability(ty) == &physical)
+        };
+        let admitted = match column {
+            Column::Arrow { array, field, logical } => accepts(array.as_ref(), field, logical.as_ref()),
+            Column::Selected(selected) => selected.source_layouts().all(|(array, field, logical)| accepts(array, field, logical)),
+            Column::Values(_) => false,
+        };
+        admitted.then_some(Self(column))
+    }
+
+    fn get(&self, row: usize) -> Option<NumericCell> {
+        let (array, _, _, row) = self.0.arrow_cell(row)??;
+        if array.data_type() == &DataType::Null || array.is_null(row) { return None; }
+        macro_rules! cell {
+            ($ty:ty) => { array.as_primitive::<$ty>().value(row) };
+        }
+        Some(match array.data_type() {
+            DataType::Int8 => NumericCell::Integer(i64::from(cell!(Int8Type))),
+            DataType::Int16 => NumericCell::Integer(i64::from(cell!(Int16Type))),
+            DataType::Int32 => NumericCell::Integer(i64::from(cell!(Int32Type))),
+            DataType::Int64 => NumericCell::Integer(cell!(Int64Type)),
+            DataType::UInt8 => NumericCell::Integer(i64::from(cell!(UInt8Type) as i8)),
+            DataType::UInt16 => NumericCell::Integer(i64::from(cell!(UInt16Type) as i16)),
+            DataType::UInt32 => NumericCell::Integer(i64::from(cell!(UInt32Type) as i32)),
+            DataType::UInt64 => NumericCell::Integer(cell!(UInt64Type) as i64),
+            DataType::Float32 => NumericCell::Float32(cell!(Float32Type)),
+            DataType::Float64 => NumericCell::Float64(cell!(Float64Type)),
+            _ => unreachable!("only admitted numeric vectors are read"),
+        })
+    }
+}
+
 struct ScalarGroups { values: Vec<ScalarAccumulator>, reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl ScalarGroups {
     fn new(execution: &Execution) -> Result<Self> { Ok(Self { values: Vec::new(),reservation: execution.context.memory.reserve(0)? }) }
@@ -870,11 +1022,21 @@ impl ScalarGroups {
             }
             _ => {
                 self.ensure(group_count,execution)?;
+                let extrema = matches!(aggregate.function, A::Min | A::Max).then(|| {
+                    NumericColumn::bind(page.arrow_column(argument)?, Some(types.output_type()))
+                }).flatten();
                 for (row,(group,selected)) in mapping.iter().zip(mask).enumerate() {
                     execution.context.check_cancelled_at(row)?;
                     if *selected {
-                        let value = page.value(row,argument)?;
-                        self.values[*group].step(value.as_ref(),aggregate,types,execution)?;
+                        let state = &mut self.values[*group];
+                        if let Some(column) = &extrema {
+                            if let Some(value) = column.get(row) {
+                                state.numeric_extremum(value, types.output_type(), aggregate.function == A::Min, execution)?;
+                            }
+                        } else {
+                            let value = page.value(row,argument)?;
+                            state.step(value.as_ref(),aggregate,types,execution)?;
+                        }
                     }
                 }
             }
@@ -883,11 +1045,19 @@ impl ScalarGroups {
     }
     fn sum_page(&mut self,page: Rows<'_>,mapping: &[usize],mask: &[bool],argument: Option<usize>,summer: &SumFactory<'_>,execution: &Execution) -> Result<()> {
         let _scratch = execution.context.memory.reserve(4096)?;
+        let numeric = matches!(summer.output, LogicalType::Scalar(ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64))
+            .then(|| NumericColumn::bind(page.arrow_column(argument)?, None)).flatten();
         for (index,(group,selected)) in mapping.iter().zip(mask).enumerate() {
             execution.context.check_cancelled_at(index)?;
             if !*selected { continue; }
-            let value = page.value(index,argument)?;
             let state = &mut self.values[*group];
+            if let Some(column) = &numeric {
+                if let Some(value) = column.get(index) {
+                    state.add_numeric(value, summer.output, execution)?;
+                }
+                continue;
+            }
+            let value = page.value(index,argument)?;
             if let Some(next) = summer.add(state.accumulator.as_ref().map(|row|&row.values[0]),value.as_ref(),index)? {
                 match &mut state.accumulator {
                     // A sum that retains what the previous one did reuses its cell and charge.
@@ -912,6 +1082,64 @@ impl ScalarGroups {
 #[derive(Default)]
 struct ScalarAccumulator { count: i64, accumulator: Option<OwnedRow>, squares: Option<f64> }
 impl ScalarAccumulator {
+    fn add_numeric(&mut self, value: NumericCell, output: &LogicalType, execution: &Execution) -> Result<()> {
+        let previous = self.accumulator.as_mut().map(|row| &mut row.values[0]);
+        let next = match (output, previous, value) {
+            (LogicalType::Scalar(ScalarType::I32), Some(Value::I32(sum)), NumericCell::Integer(value)) => {
+                *sum = sum.wrapping_add(value as i32);
+                return Ok(());
+            }
+            (LogicalType::Scalar(ScalarType::I64), Some(Value::I64(sum)), NumericCell::Integer(value)) => {
+                *sum = sum.wrapping_add(value);
+                return Ok(());
+            }
+            (LogicalType::Scalar(ScalarType::F32), Some(Value::F32(sum)), value) => {
+                *sum += value.as_f32();
+                return Ok(());
+            }
+            (LogicalType::Scalar(ScalarType::F64), Some(Value::F64(sum)), value) => {
+                *sum += value.as_f64();
+                return Ok(());
+            }
+            (LogicalType::Scalar(ScalarType::I32), None, NumericCell::Integer(value)) => Value::I32(value as i32),
+            (LogicalType::Scalar(ScalarType::I64), None, NumericCell::Integer(value)) => Value::I64(value),
+            (LogicalType::Scalar(ScalarType::F32), None, value) => Value::F32(value.as_f32()),
+            (LogicalType::Scalar(ScalarType::F64), None, value) => Value::F64(value.as_f64()),
+            _ => return Err(sum_state()),
+        };
+        self.accumulator = Some(OwnedRow::new(vec![next], &execution.context.memory)?);
+        Ok(())
+    }
+
+    fn numeric_extremum(&mut self, value: NumericCell, output: &LogicalType, minimum: bool, execution: &Execution) -> Result<()> {
+        use crate::scalar_key::ScalarKey;
+        if let Some(previous) = &self.accumulator {
+            let previous = match &previous.values[0] {
+                Value::I8(value) => ScalarKey::Signed(i64::from(*value)),
+                Value::I16(value) => ScalarKey::Signed(i64::from(*value)),
+                Value::I32(value) => ScalarKey::Signed(i64::from(*value)),
+                Value::I64(value) => ScalarKey::Signed(*value),
+                Value::F32(value) => ScalarKey::Float(f64::from(*value)),
+                Value::F64(value) => ScalarKey::Float(*value),
+                _ => return Err(invalid("aggregate-state", "Expected a numeric extremum")),
+            };
+            if value.key().ordered_compare(previous) != Some(if minimum { Ordering::Less } else { Ordering::Greater }) {
+                return Ok(());
+            }
+        }
+        let next = match (without_nullability(output), value) {
+            (LogicalType::Scalar(ScalarType::I8), NumericCell::Integer(value)) => Value::I8(value as i8),
+            (LogicalType::Scalar(ScalarType::I16), NumericCell::Integer(value)) => Value::I16(value as i16),
+            (LogicalType::Scalar(ScalarType::I32), NumericCell::Integer(value)) => Value::I32(value as i32),
+            (LogicalType::Scalar(ScalarType::I64), NumericCell::Integer(value)) => Value::I64(value),
+            (LogicalType::Scalar(ScalarType::F32), NumericCell::Float32(value)) => Value::F32(value),
+            (LogicalType::Scalar(ScalarType::F64), NumericCell::Float64(value)) => Value::F64(value),
+            _ => return Err(invalid("aggregate-state", "Numeric extremum does not match its output vector")),
+        };
+        self.accumulator = Some(OwnedRow::new(vec![next], &execution.context.memory)?);
+        Ok(())
+    }
+
     fn step(&mut self,value: &Value,aggregate: &AggregateExpr,types: &AggregateTypes,execution: &Execution) -> Result<()> {
         let _value = execution.context.memory.reserve(value.retained_bytes()?)?;
         let value = value.clone();
@@ -941,6 +1169,26 @@ impl ScalarAccumulator {
         if let Some(next) = next { self.accumulator = Some(OwnedRow::new(vec![next], &execution.context.memory)?); }
         Ok(())
     }
+    fn average_double(&self) -> Option<f64> {
+        if self.count == 0 { return None; }
+        match self.accumulator.as_ref().map(|row| &row.values[0]) {
+            Some(Value::F64(sum)) => Some(*sum / self.count as f64),
+            _ => None,
+        }
+    }
+
+    fn variance_double(&self, function: &AggregateFunction) -> Option<f64> {
+        use AggregateFunction as A;
+        let sample = matches!(function, A::VarianceSample | A::StddevSample);
+        let sum = match self.accumulator.as_ref().map(|row| &row.values[0]) {
+            Some(Value::F64(sum)) => *sum,
+            _ => return None,
+        };
+        if self.count < if sample { 2 } else { 1 } { return None; }
+        let variance = (self.squares? - sum * sum / self.count as f64) / (self.count - i64::from(sample)) as f64;
+        Some(if matches!(function, A::StddevPopulation | A::StddevSample) { variance.sqrt() } else { variance })
+    }
+
     fn finish(&self,aggregate: &AggregateExpr,output: &rtdb_expr::EvaluationScope) -> Result<Value> {
         use AggregateFunction as A;
         if let Some(accumulator) = &self.accumulator { output.reserve(accumulator.values[0].retained_bytes()?)?; }
@@ -949,17 +1197,10 @@ impl ScalarAccumulator {
             A::Average if self.count == 0 => Value::Null,
             A::Average => match self.accumulator.as_ref().map(|row| &row.values[0]) {
                 Some(Value::Duration { value, unit }) => Value::Duration { value: value.wrapping_div(self.count), unit: *unit },
-                Some(Value::F64(value)) => Value::F64(*value / self.count as f64),
-                _ => Value::Null,
+                _ => self.average_double().map_or(Value::Null, Value::F64),
             },
-            A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample => {
-                let sample = matches!(aggregate.function, A::VarianceSample | A::StddevSample);
-                if let (Some(Value::F64(sum)),Some(squares)) = (self.accumulator.as_ref().map(|row|&row.values[0]),self.squares) {
-                    if self.count < if sample { 2 } else { 1 } { return Ok(Value::Null); }
-                    let variance = (squares - sum * sum / self.count as f64) / (self.count - i64::from(sample)) as f64;
-                    Value::F64(if matches!(aggregate.function, A::StddevPopulation | A::StddevSample) { variance.sqrt() } else { variance })
-                } else { Value::Null }
-            }
+            A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample =>
+                self.variance_double(&aggregate.function).map_or(Value::Null, Value::F64),
             _ => self.accumulator.as_ref().map_or(Value::Null, |row| row.values[0].clone()),
         };
         Ok(value)
@@ -1109,6 +1350,16 @@ fn square_column(page: Rows<'_>,argument: Option<usize>,input: &LogicalType,scop
     }
     scope.reserve(page.len().checked_mul(std::mem::size_of::<Option<f64>>()).ok_or_else(||invalid("aggregate-size","Variance square column capacity overflow"))?)?;
     let mut squares = Vec::with_capacity(page.len());
+    if let Some(column) = page.arrow_column(argument).and_then(|column| NumericColumn::bind(column, None)) {
+        for row in 0..page.len() {
+            execution.context.check_cancelled()?;
+            squares.push(column.get(row).map(|cell| {
+                let value = cell.as_f64();
+                value * value
+            }));
+        }
+        return Ok(squares);
+    }
     for row in 0..page.len() {
         execution.context.check_cancelled()?;
         let cell = page.value(row,argument)?;

@@ -2330,6 +2330,14 @@ impl BatchCursor for BatchFilter {
     fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
 }
 
+pub(crate) fn typed_predicate_mask(
+    batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, parameters: rtdb_expr::Parameters<'_>,
+) -> Option<Vec<bool>> {
+    let truth = kernel::truth(predicate, schema, batch, parameters)
+        .or_else(|| crate::vector::truth(predicate, schema, batch, parameters))?;
+    Some(truth.into_iter().map(|value| value == Some(true)).collect())
+}
+
 /// Computes selection in place so an ordered seek can keep row offsets into the original batch.
 pub(crate) async fn predicate_mask(
     batch: &ColumnBatch, predicate: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, execution: &crate::context::Execution,
@@ -2341,10 +2349,12 @@ pub(crate) async fn predicate_mask(
     {
         return Ok(values.iter().map(|value| value == Some(true)).collect());
     }
-    let truth = kernel::truth(predicate, schema, batch, execution.parameters.evaluator())
-        .or_else(|| crate::vector::truth(predicate, schema, batch, execution.parameters.evaluator()));
-    if let Some(truth) = truth {
-        return Ok(truth.into_iter().map(|value| value == Some(true)).collect());
+    if let Some(mask) = typed_predicate_mask(batch, predicate, schema, execution.parameters.evaluator()) {
+        if batch.columns.iter().any(|column| matches!(column, Column::Selected(_))) {
+            let metadata = execution.scope()?;
+            execution.prepare_expression(predicate, schema, &metadata)?;
+        }
+        return Ok(mask);
     }
     let metadata = execution.scope()?;
     let invocation = execution.prepare_expression(predicate, schema, &metadata)?;
@@ -2395,7 +2405,7 @@ impl rtdb_expr::RowInput for BatchRow<'_> {
 /// Three-valued predicate evaluation over a batch's columns, for the predicate shapes and cell types whose
 /// semantics are exactly those of the scalar evaluator; `None` sends the batch to it instead.
 mod kernel {
-    use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{Array, BooleanArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray};
     use arrow_schema::{DataType, TimeUnit as ArrowUnit};
     use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
     use rtdb_types::{ScalarType, TimeUnit, Value};
@@ -2409,76 +2419,102 @@ mod kernel {
         /// A UUID as the big-endian integer of its bytes, which orders as the bytes do.
         Uuid(u128) }
 
-    enum Cells<'a> { Uuid(&'a FixedSizeBinaryArray), Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
+    enum Cells<'a> { Null, Uuid(&'a FixedSizeBinaryArray), Int(&'a Int64Array), Int32(&'a Int32Array), Int16(&'a Int16Array), Int8(&'a Int8Array), Float(&'a Float64Array), Float32(&'a Float32Array), Text(&'a StringArray), Bool(&'a BooleanArray), Micros(&'a TimestampMicrosecondArray, Option<&'a str>), Values(&'a [Value]), Owned(Vec<Option<Cell<'static>>>),
         /// A dense union whose legs are each a plain cell type, read through the leg each cell's type id names.
-        Union { array: &'a arrow_array::UnionArray, legs: Vec<Option<Cells<'a>>> } }
+        Union { array: &'a arrow_array::UnionArray, legs: Vec<Option<Cells<'a>>> },
+        Selected { rows: &'a [(usize, usize)], sources: Vec<Option<Cells<'a>>> },
+    }
 
     impl<'a> Cells<'a> {
         fn of(column: &'a Column) -> Option<Self> {
             match column {
                 Column::Values(values) => Some(Self::Values(values)),
-                Column::Selected(_) => None,
-                Column::Arrow { array, field, logical } => {
-                    let scalar = logical.as_ref().and_then(super::plain_scalar);
-                    let plain = |expected: ScalarType| match logical { Some(_) => scalar == Some(&expected), None => field.metadata().is_empty() };
-                    let any = array.as_any();
-                    match array.data_type() {
-                        DataType::Int64 if plain(ScalarType::I64) => any.downcast_ref().map(Self::Int),
-                        DataType::Int32 if plain(ScalarType::I32) => any.downcast_ref().map(Self::Int32),
-                        DataType::Int16 if plain(ScalarType::I16) => any.downcast_ref().map(Self::Int16),
-                        DataType::Int8 if plain(ScalarType::I8) => any.downcast_ref().map(Self::Int8),
-                        DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
-                        DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
-                        DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
-                        // Sixteen bytes are a UUID only where the column's logical type says so.
-                        DataType::FixedSizeBinary(16) if scalar == Some(&ScalarType::Uuid) => any.downcast_ref().map(Self::Uuid),
-                        // A cell reads its zone from the column's logical type, or from the layout where it has none.
-                        DataType::Timestamp(ArrowUnit::Microsecond, zone) => {
-                            let zone = match (logical, scalar) {
-                                (Some(_), Some(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone })) => timezone.as_deref(),
-                                (None, _) if field.metadata().is_empty() => zone.as_deref(),
-                                _ => return None,
-                            };
-                            any.downcast_ref().map(|array| Self::Micros(array, zone))
-                        }
-                        DataType::Union(fields, arrow_schema::UnionMode::Dense) => {
-                            let array: &arrow_array::UnionArray = any.downcast_ref()?;
-                            let mut legs: Vec<Option<Self>> = Vec::new();
-                            for (id, field) in fields.iter() {
-                                if id < 0 || !field.metadata().is_empty() { return None; }
-                                let child = array.child(id);
-                                let leg_any = child.as_any();
-                                let cells = match child.data_type() {
-                                    DataType::Int64 => Self::Int(leg_any.downcast_ref()?),
-                                    DataType::Int32 => Self::Int32(leg_any.downcast_ref()?),
-                                    DataType::Int16 => Self::Int16(leg_any.downcast_ref()?),
-                                    DataType::Int8 => Self::Int8(leg_any.downcast_ref()?),
-                                    DataType::Float64 => Self::Float(leg_any.downcast_ref()?),
-                                    DataType::Utf8 => Self::Text(leg_any.downcast_ref()?),
-                                    DataType::Boolean => Self::Bool(leg_any.downcast_ref()?),
-                                    _ => return None,
-                                };
-                                let id = id as usize;
-                                if legs.len() <= id { legs.resize_with(id + 1, || None); }
-                                legs[id] = Some(cells);
-                            }
-                            Some(Self::Union { array, legs })
-                        }
-                        _ => None,
-                    }
+                Column::Arrow { array, field, logical } => Self::arrow(array.as_ref(), field, logical.as_ref()),
+                Column::Selected(selected) => {
+                    let sources = selected.sources.iter().map(|source| match source {
+                        Some((array, field, logical, _)) => Self::arrow(array.as_ref(), field, logical.as_ref()).map(Some),
+                        None => Some(None),
+                    }).collect::<Option<Vec<_>>>()?;
+                    Some(Self::Selected { rows: &selected.cells, sources })
                 }
             }
         }
+
+        fn arrow(array: &'a dyn Array, field: &'a arrow_schema::Field, logical: Option<&'a rtdb_types::LogicalType>) -> Option<Self> {
+            let scalar = logical.and_then(super::plain_scalar);
+            let plain = |expected: ScalarType| match logical { Some(_) => scalar == Some(&expected), None => field.metadata().is_empty() };
+            let any = array.as_any();
+            match array.data_type() {
+                DataType::Null if field.is_nullable() && logical.is_none_or(|ty| *ty == rtdb_types::LogicalType::Null) => Some(Self::Null),
+                DataType::Int64 if plain(ScalarType::I64) => any.downcast_ref().map(Self::Int),
+                DataType::Int32 if plain(ScalarType::I32) => any.downcast_ref().map(Self::Int32),
+                DataType::Int16 if plain(ScalarType::I16) => any.downcast_ref().map(Self::Int16),
+                DataType::Int8 if plain(ScalarType::I8) => any.downcast_ref().map(Self::Int8),
+                DataType::Float32 if plain(ScalarType::F32) => any.downcast_ref().map(Self::Float32),
+                DataType::Float64 if plain(ScalarType::F64) => any.downcast_ref().map(Self::Float),
+                DataType::Utf8 if plain(ScalarType::Utf8) => any.downcast_ref().map(Self::Text),
+                DataType::Boolean if plain(ScalarType::Bool) => any.downcast_ref().map(Self::Bool),
+                // Sixteen bytes are a UUID only where the column's logical type says so.
+                DataType::FixedSizeBinary(16) if scalar == Some(&ScalarType::Uuid) => any.downcast_ref().map(Self::Uuid),
+                // A cell reads its zone from the column's logical type, or from the layout where it has none.
+                DataType::Timestamp(ArrowUnit::Microsecond, zone) => {
+                    let zone = match (logical, scalar) {
+                        (Some(_), Some(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone })) => timezone.as_deref(),
+                        (None, _) if field.metadata().is_empty() => zone.as_deref(),
+                        _ => return None,
+                    };
+                    any.downcast_ref().map(|array| Self::Micros(array, zone))
+                }
+                DataType::Union(fields, arrow_schema::UnionMode::Dense) => {
+                    if logical.is_some_and(|logical| rtdb_columnar::from_field(field).ok().as_ref() != Some(logical)) {
+                        return None;
+                    }
+                    let array: &arrow_array::UnionArray = any.downcast_ref()?;
+                    let mut legs: Vec<Option<Self>> = Vec::new();
+                    for (id, field) in fields.iter() {
+                        if id < 0 || !field.metadata().is_empty() { return None; }
+                        let child = array.child(id);
+                        let leg_any = child.as_any();
+                        let cells = match child.data_type() {
+                            DataType::Int64 => Self::Int(leg_any.downcast_ref()?),
+                            DataType::Int32 => Self::Int32(leg_any.downcast_ref()?),
+                            DataType::Int16 => Self::Int16(leg_any.downcast_ref()?),
+                            DataType::Int8 => Self::Int8(leg_any.downcast_ref()?),
+                            DataType::Float32 => Self::Float32(leg_any.downcast_ref()?),
+                            DataType::Float64 => Self::Float(leg_any.downcast_ref()?),
+                            DataType::Utf8 => Self::Text(leg_any.downcast_ref()?),
+                            DataType::Boolean => Self::Bool(leg_any.downcast_ref()?),
+                            _ => return None,
+                        };
+                        let id = id as usize;
+                        if legs.len() <= id { legs.resize_with(id + 1, || None); }
+                        legs[id] = Some(cells);
+                    }
+                    Some(Self::Union { array, legs })
+                }
+                _ => None,
+            }
+        }
+
         /// `Err` where a cell has a type the kernel doesn't evaluate.
         fn get(&self, row: usize) -> Result<Option<Cell<'a>>, ()> {
             fn valid<A: Array>(array: &A, row: usize) -> bool { array.is_valid(row) }
             Ok(match self {
+                Self::Null => None,
+                Self::Selected { rows, sources } => {
+                    let (source, position) = rows[row];
+                    match &sources[source] {
+                        Some(cells) => cells.get(position)?,
+                        None => None,
+                    }
+                }
                 Self::Int(array) => valid(*array, row).then(|| Cell::Int(array.value(row))),
                 Self::Int32(array) => valid(*array, row).then(|| Cell::Int(i64::from(array.value(row)))),
                 Self::Int16(array) => valid(*array, row).then(|| Cell::Int(i64::from(array.value(row)))),
                 Self::Int8(array) => valid(*array, row).then(|| Cell::Int(i64::from(array.value(row)))),
                 Self::Owned(cells) => cells[row],
                 Self::Float(array) => valid(*array, row).then(|| Cell::Float(array.value(row))),
+                Self::Float32(array) => valid(*array, row).then(|| Cell::Float(f64::from(array.value(row)))),
                 Self::Text(array) => valid(*array, row).then(|| Cell::Text(array.value(row))),
                 Self::Bool(array) => valid(*array, row).then(|| Cell::Bool(array.value(row))),
                 Self::Micros(array, zone) => valid(*array, row).then(|| Cell::Micros(array.value(row), *zone)),
@@ -2594,13 +2630,13 @@ mod kernel {
                 Some(left.into_iter().zip(right).map(|pair| match pair { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None }).collect())
             }
             Expr::Unary { op: UnaryOp::Not, expr } => Some(truth(expr, schema, batch, parameters)?.into_iter().map(|value| value.map(|value| !value)).collect()),
-            Expr::Unary { op: op @ (UnaryOp::IsNull | UnaryOp::IsNotNull), expr } => {
+            Expr::Unary { op: op @ (UnaryOp::IsNull | UnaryOp::IsUnknown | UnaryOp::IsNotNull), expr } => {
                 if let Expr::Column { id, .. } = expr.as_ref()
                     && let Column::Selected(column) = &batch.columns[schema.position(*id)?] {
-                    return column.null_test(*op == UnaryOp::IsNull);
+                    return column.null_test(*op != UnaryOp::IsNotNull);
                 }
                 let operand = Operand::of(expr, schema, batch, parameters)?;
-                (0..rows).map(|row| operand.get(row).ok().map(|cell| Some(cell.is_none() == (*op == UnaryOp::IsNull)))).collect()
+                (0..rows).map(|row| operand.get(row).ok().map(|cell| Some(cell.is_none() == (*op != UnaryOp::IsNotNull)))).collect()
             }
             Expr::Column { .. } => {
                 let operand = Operand::of(expr, schema, batch, parameters)?;
@@ -3358,6 +3394,30 @@ impl BatchCursor for BatchExpressions {
                 columns.push(column);
                 continue;
             }
+            if batch.len != 0
+                && matches!(plain_scalar(&expression.data_type()), Some(rtdb_types::ScalarType::Bool))
+                && let Some(truth) = kernel::truth(kernel, &self.schema, &batch, parameters)
+            {
+                let metadata = self.execution.scope()?;
+                self.execution.prepare_expression(expression, &self.schema, &metadata)?;
+                let logical = if truth.iter().all(Option::is_none) {
+                    LogicalType::Null
+                } else {
+                    let boolean = LogicalType::Scalar(rtdb_types::ScalarType::Bool);
+                    if truth.iter().any(Option::is_none) { boolean.maybe() } else { boolean }
+                };
+                let array: ArrayRef = if logical == LogicalType::Null {
+                    Arc::new(arrow_array::NullArray::new(batch.len))
+                } else {
+                    Arc::new(arrow_array::BooleanArray::from(truth))
+                };
+                let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+                let column = Column::Arrow { array, field, logical: Some(logical) };
+                let lease = Arc::get_mut(&mut reservation).expect("Batch projection owns its reservation");
+                lease.grow_to(lease.bytes().checked_add(column.retained_bytes()?).ok_or_else(size_error)?)?;
+                columns.push(column);
+                continue;
+            }
             let metadata = self.execution.scope()?;
             let invocation = self.execution.prepare_expression(expression, &self.schema, &metadata)?;
             let scope = self.execution.scope()?;
@@ -3544,7 +3604,7 @@ fn scalar_result_type<'a>(values: impl Iterator<Item = &'a Value>) -> Option<Log
 /// including any integer overflow, so its error is raised.
 pub(crate) mod projection {
     use std::sync::Arc;
-    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray, StructArray, make_array};
+    use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray, StructArray, cast::AsArray, make_array, types::{Float64Type, Int64Type}};
     use arrow_buffer::{NullBuffer, OffsetBuffer};
     use arrow_schema::{DataType, Field as ArrowField};
     use rtdb_plan::{BinaryOp, CastTarget, Expr, Schema};
@@ -3553,16 +3613,30 @@ pub(crate) mod projection {
 
     #[derive(Clone, Copy)]
     enum Number { Int(i64), Float(f64) }
-    enum Numbers<'a> { Int(&'a Int64Array), Float(&'a Float64Array), Constant(Option<Number>) }
+    enum Numbers<'a> {
+        Int(&'a Int64Array),
+        Float(&'a Float64Array),
+        Selected(&'a Column, bool),
+        Constant(Option<Number>),
+    }
     impl Numbers<'_> {
         fn get(&self, row: usize) -> Option<Number> {
             match self {
                 Self::Int(array) => array.is_valid(row).then(|| Number::Int(array.value(row))),
                 Self::Float(array) => array.is_valid(row).then(|| Number::Float(array.value(row))),
+                Self::Selected(column, floating) => {
+                    let (array, _, _, offset) = column.arrow_cell(row)??;
+                    if array.data_type() == &DataType::Null || array.is_null(offset) { return None; }
+                    Some(if *floating {
+                        Number::Float(array.as_primitive::<Float64Type>().value(offset))
+                    } else {
+                        Number::Int(array.as_primitive::<Int64Type>().value(offset))
+                    })
+                }
                 Self::Constant(number) => *number,
             }
         }
-        fn floating(&self) -> Option<bool> { match self { Self::Int(_) => Some(false), Self::Float(_) => Some(true), Self::Constant(Some(Number::Float(_))) => Some(true), Self::Constant(Some(Number::Int(_))) => Some(false), Self::Constant(None) => None } }
+        fn floating(&self) -> Option<bool> { match self { Self::Int(_) => Some(false), Self::Float(_) => Some(true), Self::Selected(_, floating) => Some(*floating), Self::Constant(Some(Number::Float(_))) => Some(true), Self::Constant(Some(Number::Int(_))) => Some(false), Self::Constant(None) => None } }
     }
     fn constant(value: &Value) -> Option<Option<Number>> {
         match value {
@@ -3577,13 +3651,29 @@ pub(crate) mod projection {
     enum Parameters<'a> { Values(rtdb_expr::Parameters<'a>), Columns(&'a [Column]) }
 
     fn numbers<'a>(expr: &Expr, schema: &Schema, columns: &'a [Column], len: usize, computed: &'a mut Option<Column>, parameters: Parameters<'a>) -> Result<Option<Numbers<'a>>> {
-        let plain = |logical: &Option<LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(logical) => super::plain_scalar(logical) == Some(&expected), None => field.metadata().is_empty() };
+        let plain = |logical: Option<&LogicalType>, field: &ArrowField, expected: ScalarType| match logical { Some(logical) => super::plain_scalar(logical) == Some(&expected), None => field.metadata().is_empty() };
         let array_numbers = |column: &'a Column| -> Option<Numbers<'a>> {
-            let Column::Arrow { array, field, logical } = column else { return None };
-            match array.data_type() {
-                DataType::Int64 if plain(logical, field, ScalarType::I64) => array.as_any().downcast_ref().map(Numbers::Int),
-                DataType::Float64 if plain(logical, field, ScalarType::F64) => array.as_any().downcast_ref().map(Numbers::Float),
-                _ => None,
+            match column {
+                Column::Arrow { array, field, logical } => match array.data_type() {
+                    DataType::Int64 if plain(logical.as_ref(), field, ScalarType::I64) => array.as_any().downcast_ref().map(Numbers::Int),
+                    DataType::Float64 if plain(logical.as_ref(), field, ScalarType::F64) => array.as_any().downcast_ref().map(Numbers::Float),
+                    _ => None,
+                },
+                Column::Selected(selected) => {
+                    let mut floating = None;
+                    for (array, field, logical) in selected.source_layouts() {
+                        let is_float = match array.data_type() {
+                            DataType::Null if field.is_nullable() && logical.is_none_or(|ty| *ty == LogicalType::Null) => continue,
+                            DataType::Int64 if plain(logical, field, ScalarType::I64) => false,
+                            DataType::Float64 if plain(logical, field, ScalarType::F64) => true,
+                            _ => return None,
+                        };
+                        if floating.is_some_and(|known| known != is_float) { return None; }
+                        floating = Some(is_float);
+                    }
+                    floating.map(|floating| Numbers::Selected(column, floating))
+                }
+                Column::Values(_) => None,
             }
         };
         Ok(match expr {
@@ -3631,6 +3721,17 @@ pub(crate) mod projection {
             }
             (Arc::new(Int64Array::from(values)), ScalarType::I64)
         };
+        if matches!(left, Numbers::Selected(..)) || matches!(right, Numbers::Selected(..)) {
+            let (array, logical) = if array.null_count() == len {
+                (Arc::new(arrow_array::NullArray::new(len)) as ArrayRef, LogicalType::Null)
+            } else {
+                let logical = LogicalType::Scalar(scalar);
+                let logical = if array.null_count() == 0 { logical } else { logical.maybe() };
+                (array, logical)
+            };
+            let field = Arc::new(rtdb_columnar::to_field("value", &logical)?);
+            return Ok(Some(Column::Arrow { array, field, logical: Some(logical) }));
+        }
         let field = Arc::new(ArrowField::new("value", array.data_type().clone(), true));
         Ok(Some(Column::Arrow { array, field, logical: Some(LogicalType::Scalar(scalar)) }))
     }

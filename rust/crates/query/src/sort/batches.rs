@@ -247,15 +247,12 @@ impl BatchSort {
             while positions.len() < size {
                 context.check_cancelled()?;
                 let mut winner: Option<usize> = None;
-                for (lane, run) in runs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, run)| run.batch.is_some())
-                {
+                for lane in 0..runs.len() {
+                    let (preceding, candidates) = runs.split_at_mut(lane);
+                    let run = &mut candidates[0];
+                    if run.batch.is_none() { continue; }
                     if let Some(first) = winner
-                        && !run
-                            .compare(&runs[first], plan, key_columns, native)?
-                            .is_lt()
+                        && !run.compare(&mut preceding[first], plan, key_columns, native)?.is_lt()
                     {
                         continue;
                     }
@@ -415,23 +412,26 @@ impl Block {
         };
         let _temporary = context.memory.reserve(bytes)?;
         let mut order: Vec<_> = (0..len).collect();
-        let compare = |left, right| {
+        let mut keys = (!self.native).then(|| BlockKeys::new(len, &context.memory)).flatten();
+        let compare = |left_index, right_index| {
             context.check_cancelled()?;
-            let (left, left_row) = self.positions[left];
-            let (right, right_row) = self.positions[right];
+            let (left, left_row) = self.positions[left_index];
+            let (right, right_row) = self.positions[right_index];
             let (left, right) = (&self.batches[left], &self.batches[right]);
             if !self.native {
-                let left = scalar_key(left, left_row, plan, key_columns, projected)?;
-                let right = scalar_key(right, right_row, plan, key_columns, projected)?;
-                return plan.compare(&left.values, &right.values);
+                return compare_scalar_keys(&mut keys, left_index, right_index, plan, |index| {
+                    let (batch, row) = self.positions[index];
+                    scalar_key(&self.batches[batch], row, plan, key_columns, projected).map(Key::for_comparison)
+                });
             }
-            Ok(native.expect("only an admitted sort can borrow its keys")
-                .compare(left, left_row, right, right_row, &plan.order))
+            native.expect("only an admitted sort can borrow its keys")
+                .compare(left, left_row, right, right_row, &plan.order)
         };
         match algorithm {
             ObjectSort::TimSort => timsort::sort(&mut order, compare)?,
             ObjectSort::LegacyMergeSort => legacy::sort(&mut order, compare)?,
         }
+        drop(keys);
         order.truncate(usize::try_from(plan.limit).unwrap_or(usize::MAX));
         let Self {
             batches,
@@ -575,6 +575,63 @@ struct Key {
     values: Vec<Value>,
     _reservation: Arc<MemoryReservation>,
 }
+impl Key {
+    fn for_comparison(mut self) -> Self {
+        // ORDER BY compares decimals as doubles, including against integral keys.
+        for value in &mut self.values {
+            if let Value::Decimal(decimal) = value {
+                *value = Value::F64(rtdb_expr::decimal_to_f64(decimal));
+            }
+        }
+        self
+    }
+}
+
+struct BlockKeys {
+    keys: Vec<Option<Key>>,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl BlockKeys {
+    fn new(rows: usize, memory: &Arc<MemoryBudget>) -> Option<Self> {
+        let reservation = memory.reserve(rows.checked_mul(size_of::<Option<Key>>())?).ok()?;
+        let keys = std::iter::repeat_with(|| None).take(rows).collect();
+        Some(Self { keys, _reservation: reservation })
+    }
+
+    fn load(&mut self, index: usize, read: &impl Fn(usize) -> Result<Key>) -> Result<()> {
+        if self.keys[index].is_none() {
+            self.keys[index] = Some(read(index)?);
+        }
+        Ok(())
+    }
+
+    fn compare(
+        &mut self, left: usize, right: usize, plan: &SortPlan, read: &impl Fn(usize) -> Result<Key>,
+    ) -> Result<std::cmp::Ordering> {
+        self.load(left, read)?;
+        self.load(right, read)?;
+        plan.compare(
+            &self.keys[left].as_ref().expect("loaded sort key").values,
+            &self.keys[right].as_ref().expect("loaded sort key").values,
+        )
+    }
+}
+
+fn compare_scalar_keys(
+    cache: &mut Option<BlockKeys>, left: usize, right: usize, plan: &SortPlan,
+    read: impl Fn(usize) -> Result<Key>,
+) -> Result<std::cmp::Ordering> {
+    if let Some(keys) = cache {
+        match keys.compare(left, right, plan, &read) {
+            // The cache must not consume the memory the two-key comparator needs to run.
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" => *cache = None,
+            result => return result,
+        }
+    }
+    plan.compare(&read(left)?.values, &read(right)?.values)
+}
+
 struct Run {
     reader: SpillReader,
     batch: Option<ColumnBatch>,
@@ -609,17 +666,17 @@ impl Run {
     }
 
     fn read_key(&mut self, plan: &SortPlan, columns: &[usize]) -> Result<()> {
-        if !self.native
-            && let Some(batch) = &self.batch
-        {
-            self.key = Some(scalar_key(batch, self.row, plan, columns, false)?);
+        if self.native {
+            self.key = None;
+        } else if let Some(batch) = &self.batch {
+            self.key = Some(scalar_key(batch, self.row, plan, columns, false)?.for_comparison());
         }
         Ok(())
     }
 
     fn compare(
-        &self,
-        other: &Self,
+        &mut self,
+        other: &mut Self,
         plan: &SortPlan,
         columns: &[usize],
         native: Option<&NativeOrder>,
@@ -627,31 +684,19 @@ impl Run {
         let left = self.batch.as_ref().expect("a selected run owns a batch");
         let right = other.batch.as_ref().expect("a selected run owns a batch");
         if self.native && other.native {
-            return Ok(native
-                .expect("only admitted runs borrow their keys")
-                .compare(left, self.row, right, other.row, &plan.order));
+            return native.expect("only admitted runs borrow their keys")
+                .compare(left, self.row, right, other.row, &plan.order);
         }
-        let left_key = if self.native {
-            Some(scalar_key(left, self.row, plan, columns, false)?)
-        } else {
-            None
-        };
-        let right_key = if other.native {
-            Some(scalar_key(right, other.row, plan, columns, false)?)
-        } else {
-            None
-        };
-        let left = self
-            .key
-            .as_ref()
-            .or(left_key.as_ref())
-            .expect("sort run has a key");
-        let right = other
-            .key
-            .as_ref()
-            .or(right_key.as_ref())
-            .expect("sort run has a key");
-        plan.compare(&left.values, &right.values)
+        if self.key.is_none() {
+            self.key = Some(scalar_key(left, self.row, plan, columns, false)?.for_comparison());
+        }
+        if other.key.is_none() {
+            other.key = Some(scalar_key(right, other.row, plan, columns, false)?.for_comparison());
+        }
+        plan.compare(
+            &self.key.as_ref().expect("loaded run key").values,
+            &other.key.as_ref().expect("loaded run key").values,
+        )
     }
 }
 
@@ -724,4 +769,23 @@ fn read_semantic_page(
         rows += count;
     }
     ColumnBatch::take_ranges(sources, &spans, rows, &context.memory)
+}
+
+#[test]
+fn arrow_wave4_sort_reads_each_cached_key_once() {
+    use std::cell::Cell;
+
+    let memory = MemoryBudget::new(1 << 20);
+    let mut keys = BlockKeys::new(2, &memory).unwrap();
+    let reads = Cell::new(0);
+    let read = |index| {
+        reads.set(reads.get() + 1);
+        Ok(Key { values: vec![Value::I64(index as i64)], _reservation: memory.reserve(64)? })
+    };
+    for index in [1, 0, 0, 1, 0] {
+        keys.load(index, &read).unwrap();
+    }
+    assert_eq!(reads.get(), 2);
+    drop(keys);
+    assert_eq!(memory.used_bytes(), 0);
 }

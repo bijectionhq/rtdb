@@ -2094,9 +2094,11 @@ surface QueryAccess {
         -- Compatible global counts and floating-point sums and averages reduce Arrow columns and emit scalar result vectors.
         -- Compatible grouping columns can use the first Arrow position of each key and emit scalar aggregates in that first-seen order.
         -- Grouped output keeps the configured transport row limit.
-        -- Scalar aggregates read their operands as needed and write compatible results as Arrow columns.
+        -- Scalar aggregates reduce compatible numeric Arrow operands in input order and write compatible results as Arrow columns.
+        -- Aggregate DISTINCT indexes its selected argument positions within each group and retains arguments whose SQL equality is unknown.
         -- List aggregates collect selected Arrow positions after applying filters and distinctness, and sort Arrow keys when the aggregate specifies an order.
         -- Percentile aggregates order each group's selected positions and read the ranked arguments from their source vectors.
+        -- Continuous percentiles interpolate compatible numeric operands into a nullable Arrow result.
         -- A compatible scalar membership join indexes the build key vectors and appends nullable Boolean marks to the probe batches.
         -- Scalar membership uses the raw vector hash to select candidates before comparing them.
         -- A spilled scalar membership join retains the probe payloads and the build's global null facts through Arrow partition replay.
@@ -2120,11 +2122,15 @@ surface QueryAccess {
         -- With no match, a reached null comparison gives an unknown result.
         -- A compatible cast to nullable or union list elements checks the types observed in the selected input.
         -- Text conversion of packed numeric lists renders the selected typed components into one text buffer.
+        -- Compatible Boolean expressions select rows or produce a result vector directly from Arrow inputs, including selections across multiple source vectors.
+        -- Checked numeric arithmetic can produce a result vector from selected Arrow positions with a compatible physical type.
         -- A nested field read can select its child from an input struct vector.
         -- Computed outputs publish Arrow columns or positions in arrays with differing physical fields.
         -- Computed Arrow projections validate decimal precision on the selected result cells, including nested decimals.
         -- Run-end encoding of list values groups adjacent equal representations and preserves raw floating-point bits.
         -- Supported physical sort keys are read from their vectors in memory and during Arrow spill replay.
+        -- A sort can retain comparison keys within its memory grant and reuse them across comparisons in the same block or at the head of a spill run.
+        -- A sort preserves key order, null placement and ties across spill replay.
         -- A projection over a direct scan retains its compatible input columns when other expressions use scalar evaluation.
         -- Adjacent compatible projections can pass computed scalar results as Arrow columns, including into a mutation's document projection.
         -- A literal table with stable scalar columns builds one Arrow batch before its consumers run.
