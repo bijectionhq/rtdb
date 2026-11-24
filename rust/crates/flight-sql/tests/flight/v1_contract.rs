@@ -1564,6 +1564,14 @@ async fn rtdb_v1_native_driver_requires_fences_both_arms_and_replays() {
     let successor = transact_wire(&mut client, v1::TransactRequest {
         key: vec![2; 16], ops: vec![put(1, 20)], ..Default::default()
     }).await.unwrap();
+    assert!(caps.features.iter().any(|feature| feature == "query.written-basis"));
+    let read_version = input("SELECT _rtdb_written_basis FROM wire_owner WHERE _id = 1");
+    let (versions, _) = query(&mut client, read_version).await;
+    let written = versions[0].column(0).as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap();
+    let written = v1::Basis { value: written.value(0).to_vec() };
+    assert_eq!(Some(&written), successor.basis.as_ref());
+    let (all, _) = query(&mut client, input("SELECT * FROM wire_owner")).await;
+    assert!(all[0].schema().field_with_name("_rtdb_written_basis").is_err());
 
     let stale = v1::TransactRequest {
         key: vec![3; 16], require: vec!["transact.requires".into()],
@@ -1587,7 +1595,7 @@ async fn rtdb_v1_native_driver_requires_fences_both_arms_and_replays() {
     assert_eq!(v1::Receipt::decode(status[0].body.clone()).unwrap(), replayed);
 
     let selected = transact_wire(&mut client, v1::TransactRequest {
-        key: vec![4; 16], requires: vec![version(1, Expect::Written(successor.basis.unwrap()))], ..stale
+        key: vec![4; 16], requires: vec![version(1, Expect::Written(written))], ..stale
     }).await.unwrap();
     assert_eq!(selected.outcome, Some(Outcome::Otherwise(v1::Otherwise { failed: vec![0] })));
     assert_eq!(ints(&query(&mut client, read).await.0), [20, 40]);

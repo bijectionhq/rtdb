@@ -63,6 +63,11 @@ surface StatelessDatabase {
         -- The writer resolves both endpoints against the receipt's system time and records the resolved interval.
         -- Overflow, a reversed interval and an empty interval fail before any row effect is applied.
 
+    @guarantee WrittenBasis
+        -- Where advertised, a caller can explicitly select _rtdb_written_basis for a visible row version.
+        -- It names the row version rather than the selected query cut and can be supplied to a Version guard.
+        -- For a scoped query, the returned basis uses the reader's projection domain.
+
     @guarantee TokenAuthority
         -- All routes to an incarnation use the same wrapped token key for each published generation.
         -- New queries use the latest published generation.

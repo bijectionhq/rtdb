@@ -8,6 +8,8 @@ use crate::{Anomaly, Iid, Result, TableRef, Timestamp};
 pub type Branch = String;
 pub const MAIN_BRANCH: &str = "main";
 pub const MAX_BRANCH_BYTES: usize = 255;
+pub const WRITTEN_BASIS_COLUMN: &str = "_rtdb_written_basis";
+pub const QUERY_WRITTEN_BASIS: &str = "query.written-basis";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LabelScope {

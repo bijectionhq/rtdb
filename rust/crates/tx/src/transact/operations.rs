@@ -408,7 +408,7 @@ fn validate_table(table: &TableRef) -> Result<()> {
 }
 
 fn validate_column(name: &str) -> Result<()> {
-    if name.is_empty() || matches!(name, "_id" | "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to") {
+    if name.is_empty() || matches!(name, "_id" | "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" | rtdb_types::rtdb_v1::WRITTEN_BASIS_COLUMN) {
         return Err(Anomaly::incorrect("rtdb/reserved-field", format!("Invalid document column {name}")));
     }
     Ok(())

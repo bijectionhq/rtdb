@@ -9,7 +9,7 @@ use rtdb_trie::TrieConfig;
 use rtdb_types::{
     Anomaly, BlockIndex, EntityId, Interval, LogicalType, Result, ScalarType, StructFields, TableRef, Timestamp,
     TransactionKey, TxId, Value,
-    rtdb_v1::Basis,
+    rtdb_v1::{Basis, WRITTEN_BASIS_COLUMN},
 };
 
 pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Result<Snapshot> {
@@ -43,7 +43,11 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
         let system_time = events.first().map_or(head.system_time, |(_, _, _, cut, _)| cut.system_time);
         let mut buffer = TransactionBuffer::new(before, tx_key(BranchCut { basis, system_time })?, Arc::clone(memory))?;
         for (table, id, valid_time, _, image) in events {
-            let operation = image.map_or(StoredOperation::Delete, |cells| StoredOperation::Put(cells.clone()));
+            let operation = image.map_or(StoredOperation::Delete, |cells| {
+                let mut cells = cells.clone();
+                cells.insert(WRITTEN_BASIS_COLUMN.into(), basis_value(basis));
+                StoredOperation::Put(cells)
+            });
             buffer.append(table.clone(), StoredEvent {
                 position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(),
                 system_from: system_time, valid_time, operation, recency: None,
@@ -51,8 +55,10 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
         }
         if basis == head.basis {
             for (table, definition) in view.tables() {
-                buffer.declare_table(table.clone(), definition.columns.keys().cloned())?;
-                buffer.declare_document_types(table, &definition.columns)?;
+                let mut columns = definition.columns.clone();
+                columns.insert(WRITTEN_BASIS_COLUMN.into(), LogicalType::Scalar(ScalarType::Binary));
+                buffer.declare_table(table.clone(), columns.keys().cloned())?;
+                buffer.declare_document_types(table, &columns)?;
             }
             append_lineage(view, &mut buffer)?;
             append_ordered_indexes(view, &mut buffer)?;

@@ -113,7 +113,7 @@ impl Service {
                     });
                     features.retain(|feature| admitted && matches!(feature.as_str(), ROW_VISIBILITY | "query" |
                         "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" |
-                        TRANSACT_REQUIRES | "tx-status" | "sql.history"));
+                        TRANSACT_REQUIRES | rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS | "tx-status" | "sql.history"));
                 }
                 proto::CapabilitiesResponse {
                     api: API.into(),
