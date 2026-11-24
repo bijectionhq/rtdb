@@ -33,11 +33,11 @@ The bounded model still represents physical trim in the original settlement sequ
 
 ## Bounded check
 
-[OffloadedReplicaReclamation](../tla/OffloadedReplicaReclamation.tla) models one ambiguous append, one prior-version reader, one ordinary live reader, and two versions at a provider key.
-It treats the certified committed binding, exclusion of new legacy admissions, and exact provider effects as transitions.
-TLC exhausts 80 distinct states.
-The eight controls reject an unbound append, missing reader tracking and compatibility fences, deletion on trim authorization, lost retirement intent, and deletion by key.
-The reachability cases settle after a lost append acknowledgement and restart between the physical trim and deletion, and after restart with the delete already applied.
+[OffloadedReplicaReclamation](../tla/OffloadedReplicaReclamation.tla) models an ambiguous append, a live draining reader, an unrelated held position, an absent historical journal and two physical versions at a provider key.
+The model requires a complete successor before closing replay admission. It orders the exact grant, key withdrawal, physical removal and settlement independently from active journal trim.
+The controls cover missing successor members, bypassed drain, stale admission, deletion before withdrawal, grant loss and deletion by key.
+The progress controls use an unrelated hold and a permanently absent journal. The crash witnesses cover both a lost append acknowledgement and an applied deletion whose reply was lost.
+The revised model and controls have not been run.
 
 The directory keeps the certified detached dependency boundary separately from the physical journal trim anchor.
 A successor checkpoint permits the census to advance past a finite replay ticket while the broker keeps the positions covered by that ticket.

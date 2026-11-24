@@ -4,11 +4,11 @@ VARIABLE custody
 
 Init ==
     custody = [append |-> "pending", acknowledged |-> FALSE, bound |-> FALSE,
-               legacyClosed |-> FALSE, legacyRead |-> FALSE, reaping |-> FALSE,
-               liveRead |-> FALSE, authorized |-> FALSE, plan |-> FALSE,
-               physicallyTrimmed |-> FALSE, trimObserved |-> FALSE,
-               crashStage |-> "never", present |-> {"original", "replacement"},
-               settled |-> FALSE]
+               successor |-> "unprepared", fenced |-> FALSE, activeRead |-> FALSE,
+               reopened |-> FALSE, unrelatedHold |-> TRUE, historicalJournal |-> "absent",
+               grant |-> FALSE, pending |-> FALSE, keyWithdrawn |-> FALSE,
+               physicallyTrimmed |-> FALSE, crashStage |-> "never",
+               present |-> {"original", "replacement"}, settled |-> FALSE]
 
 Commit(acknowledged) ==
     /\ custody.append = "pending"
@@ -24,84 +24,85 @@ BindCertifiedPublication ==
         \/ (custody.append = "pending" /\ Mutation = "trust_pending_append")
     /\ custody' = [custody EXCEPT !.bound = TRUE]
 
-AdmitLegacyRead ==
-    /\ custody.append = "committed" /\ ~custody.legacyRead
-    /\ ~custody.legacyClosed
-        \/ (custody.authorized /\ Mutation = "legacy_reopens_after_closure")
-    /\ custody' = [custody EXCEPT !.legacyRead = TRUE]
+AdmitRead ==
+    /\ custody.append = "committed" /\ ~custody.activeRead
+    /\ ~custody.fenced \/ Mutation = "reopen_fenced_route"
+    /\ custody' = [custody EXCEPT !.activeRead = TRUE, !.reopened = custody.fenced]
 
-CloseLegacyAdmission ==
-    /\ ~custody.legacyClosed
-    /\ custody' = [custody EXCEPT !.legacyClosed = TRUE]
+DrainRead ==
+    /\ custody.activeRead
+    /\ custody' = [custody EXCEPT !.activeRead = FALSE]
 
-DrainLegacyRead ==
-    /\ custody.legacyRead
-    /\ custody' = [custody EXCEPT !.legacyRead = FALSE]
+PrepareSuccessor ==
+    /\ custody.successor = "unprepared"
+    /\ custody' = [custody EXCEPT !.successor =
+                    IF Mutation = "omit_successor_member" THEN "incomplete" ELSE "complete"]
 
-EnableReclamation ==
-    /\ custody.legacyClosed /\ ~custody.reaping
-    /\ ~custody.legacyRead \/ Mutation = "enable_before_legacy_drain"
-    /\ custody' = [custody EXCEPT !.reaping = TRUE]
-
-AdmitLiveRead ==
-    /\ custody.append = "committed" /\ ~custody.liveRead
-    /\ ~custody.authorized \/ Mutation = "live_reopens_after_anchor"
-    /\ custody' = [custody EXCEPT !.liveRead = TRUE]
-
-DrainLiveRead ==
-    /\ custody.liveRead
-    /\ custody' = [custody EXCEPT !.liveRead = FALSE]
+ExcludeOldDependencies ==
+    /\ ~custody.fenced
+    /\ custody.successor = "complete"
+        \/ (custody.successor = "incomplete" /\ Mutation = "omit_successor_member")
+    /\ custody' = [custody EXCEPT !.fenced = TRUE]
 
 Authorize ==
-    /\ custody.reaping /\ custody.bound /\ ~custody.authorized
-    /\ ~custody.liveRead \/ Mutation = "ignore_live_read"
-    /\ custody' = [custody EXCEPT !.authorized = TRUE, !.plan = TRUE]
+    /\ custody.fenced /\ custody.bound /\ ~custody.grant
+    /\ ~custody.activeRead \/ Mutation = "ignore_live_read"
+    /\ ~custody.unrelatedHold \/ Mutation # "global_floor"
+    /\ custody' = [custody EXCEPT !.grant = TRUE, !.pending = TRUE]
 
-Trim ==
-    /\ custody.authorized /\ ~custody.physicallyTrimmed
+TrimActiveJournal ==
+    /\ custody.fenced /\ ~custody.activeRead /\ ~custody.physicallyTrimmed
     /\ custody' = [custody EXCEPT !.physicallyTrimmed = TRUE]
 
-ObserveTrim ==
-    /\ custody.physicallyTrimmed /\ ~custody.trimObserved
-    /\ custody' = [custody EXCEPT !.trimObserved = TRUE]
+WithdrawKey ==
+    /\ custody.pending /\ ~custody.keyWithdrawn
+    /\ custody' = [custody EXCEPT !.keyWithdrawn = TRUE]
 
 Crash ==
-    /\ custody.authorized /\ custody.crashStage = "never" /\ ~custody.settled
+    /\ custody.grant /\ custody.crashStage = "never" /\ ~custody.settled
     /\ LET stage == IF "original" \notin custody.present THEN "after-delete"
-                    ELSE IF custody.physicallyTrimmed THEN "after-trim" ELSE "before-trim"
-       IN custody' = [custody EXCEPT !.crashStage = stage, !.trimObserved = FALSE,
-                        !.plan = IF Mutation = "lose_plan_on_crash" THEN FALSE ELSE @]
+                    ELSE IF custody.keyWithdrawn THEN "after-key" ELSE "before-key"
+       IN custody' = [custody EXCEPT !.crashStage = stage,
+                        !.pending = IF Mutation = "lose_grant_on_crash" THEN FALSE ELSE @]
 
 Erase ==
-    /\ custody.plan /\ "original" \in custody.present
-    /\ custody.trimObserved \/ Mutation = "delete_on_authorization"
+    /\ custody.pending /\ "original" \in custody.present
+    /\ custody.keyWithdrawn \/ Mutation = "delete_without_key_withdrawal"
+    /\ custody.historicalJournal # "absent" \/ Mutation # "wait_for_all_journals"
     /\ custody' = [custody EXCEPT !.present = IF Mutation = "delete_by_key" THEN {} ELSE {"replacement"}]
 
 Settle ==
-    /\ custody.plan /\ custody.trimObserved /\ "original" \notin custody.present
-    /\ custody' = [custody EXCEPT !.settled = TRUE, !.plan = FALSE]
+    /\ custody.pending /\ "original" \notin custody.present
+    /\ custody' = [custody EXCEPT !.settled = TRUE, !.pending = FALSE]
 
 Next ==
     \/ \E ack \in BOOLEAN : Commit(ack)
-    \/ ResolveAbsent \/ BindCertifiedPublication
-    \/ AdmitLegacyRead \/ CloseLegacyAdmission \/ DrainLegacyRead \/ EnableReclamation
-    \/ AdmitLiveRead \/ DrainLiveRead \/ Authorize \/ Trim \/ ObserveTrim \/ Crash \/ Erase \/ Settle
+    \/ ResolveAbsent \/ BindCertifiedPublication \/ AdmitRead \/ DrainRead
+    \/ PrepareSuccessor \/ ExcludeOldDependencies \/ Authorize \/ TrimActiveJournal
+    \/ WithdrawKey \/ Crash \/ Erase \/ Settle
+
 Spec == Init /\ [][Next]_custody
+        /\ WF_custody(Authorize) /\ WF_custody(WithdrawKey)
+        /\ WF_custody(Erase) /\ WF_custody(Settle)
 
 BindingNamesCommittedRecord == custody.bound => custody.append = "committed"
-AdmittedReaderCanResolve == custody.legacyRead \/ custody.liveRead => "original" \in custody.present
-FutureAdmissionRespectsAnchor == custody.authorized => ~custody.liveRead
-DeletionHasPhysicalTrim == "original" \notin custody.present =>
-    custody.bound /\ custody.authorized /\ custody.physicallyTrimmed
-SettlementHasExactPlan == custody.authorized /\ ~custody.settled => custody.plan
+AdmittedReaderCanResolve == custody.activeRead => "original" \in custody.present /\ ~custody.keyWithdrawn
+ExcludedRouteStaysClosed == ~custody.reopened
+FenceHasCompleteSuccessor == custody.fenced => custody.successor = "complete"
+DeletionHasExactGrant == "original" \notin custody.present =>
+    custody.bound /\ custody.fenced /\ custody.grant /\ custody.keyWithdrawn
+SettlementHasExactPlan == custody.grant /\ ~custody.settled => custody.pending
 OtherVersionsSurvive == "replacement" \in custody.present
 
 Safe ==
-    /\ BindingNamesCommittedRecord /\ AdmittedReaderCanResolve /\ FutureAdmissionRespectsAnchor
-    /\ DeletionHasPhysicalTrim /\ SettlementHasExactPlan /\ OtherVersionsSurvive
+    /\ BindingNamesCommittedRecord /\ AdmittedReaderCanResolve /\ ExcludedRouteStaysClosed
+    /\ FenceHasCompleteSuccessor /\ DeletionHasExactGrant /\ SettlementHasExactPlan /\ OtherVersionsSurvive
+
+ReclaimsExcludedPublication ==
+    (custody.fenced /\ custody.bound /\ ~custody.activeRead) ~> custody.settled
 
 NeverSettlesLostReplyAfterCrash ==
-    ~(custody.settled /\ ~custody.acknowledged /\ custody.crashStage = "after-trim")
+    ~(custody.settled /\ ~custody.acknowledged /\ custody.crashStage = "after-key")
 NeverSettlesAfterDeleteCrash ==
     ~(custody.settled /\ custody.crashStage = "after-delete")
 ==============================================================================
