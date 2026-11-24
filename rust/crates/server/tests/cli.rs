@@ -222,11 +222,12 @@ fn retain_repair_base_requires_a_detached_store_and_checkpoint_receipt() {
 #[test]
 fn a_retained_base_requires_the_detached_export_and_one_target_receipt() {
     let through = format!("23@{}", "C4".repeat(32));
-    let Command::RepairRetainedCheckpoint { request, .. } = parse(&[
+    let Command::RepairRetainedCheckpoint { request, checkpoint_key_vault, .. } = parse(&[
         "repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through,
-        "--retained-base", "--base-storage", "export",
+        "--retained-base", "--base-storage", "export", "--checkpoint-key-vault", "original-vault",
     ]) else { panic!("expected repair from retained base") };
     assert_eq!(request.base_storage.to_str(), Some("export"));
+    assert_eq!(checkpoint_key_vault.as_deref(), Some(std::path::Path::new("original-vault")));
     assert_eq!(request.through.block.0, 23);
     let detached_required = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &through, "--retained-base"];
     assert!(cli::parse(detached_required.map(str::to_owned), &|_| None).is_err());
@@ -239,7 +240,7 @@ fn a_retained_base_requires_the_detached_export_and_one_target_receipt() {
 fn checkpoint_repair_requires_exact_publication_receipts() {
     let base = format!("9@{}", "a1".repeat(32));
     let through = format!("23@{}", "C4".repeat(32));
-    let Command::RepairCheckpoint { request, memory_bytes } = parse(&[
+    let Command::RepairCheckpoint { request, memory_bytes, checkpoint_key_vault } = parse(&[
         "repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", &base, &through,
         "--base-storage", "known-good", "--memory-limit", "104857600",
     ]) else { panic!("expected checkpoint repair") };
@@ -252,6 +253,7 @@ fn checkpoint_repair_requires_exact_publication_receipts() {
     assert_eq!(request.through.block.0, 23);
     assert_eq!(request.through.sha256, [0xc4; 32]);
     assert_eq!(memory_bytes, 104857600);
+    assert!(checkpoint_key_vault.is_none());
     for invalid in ["9", "9@abcd", &format!("-9@{}", "ab".repeat(32)), &format!("9@{}", "zz".repeat(32))] {
         let arguments = ["repair-checkpoint", "source", "logs/REPLICA_LOG", "repairs", invalid, &through];
         assert!(cli::parse(arguments.map(str::to_owned), &|_| None).is_err());

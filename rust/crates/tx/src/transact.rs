@@ -537,6 +537,38 @@ impl TransactState {
         Ok(())
     }
 
+    pub fn verify_repaired_checkpoint(&self, selected: &Self) -> Result<()> {
+        if self.pending.is_some() || selected.pending.is_some() || self.receipts.len() != selected.receipts.len() {
+            return Err(invalid_record());
+        }
+        for (scope, receipts) in &selected.receipts {
+            let actual = self.receipts.get(scope).filter(|actual| actual.len() == receipts.len()).ok_or_else(invalid_record)?;
+            for (key, expected) in receipts {
+                let actual = actual.get(key).ok_or_else(invalid_record)?;
+                if actual.fingerprint != expected.fingerprint || actual.receipt != expected.receipt
+                    || expected.installed.is_some_and(|position| actual.installed != Some(position))
+                {
+                    return Err(invalid_record());
+                }
+            }
+        }
+        struct HashWriter(Sha256);
+        impl std::io::Write for HashWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let index_digest = |index: &BranchIndex| -> Result<[u8; 32]> {
+            let mut writer = HashWriter(Sha256::new());
+            serde_json::to_writer(&mut writer, index).map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))?;
+            Ok(writer.0.finalize().into())
+        };
+        if index_digest(&self.index)? != index_digest(&selected.index)? { return Err(invalid_record()); }
+        Ok(())
+    }
+
     /// A checkpoint can replace the settled prefix once the mode installs its manifest.
     pub fn encode_checkpoint(&self) -> Result<Bytes> {
         if self.pending.is_some() { return Err(pending_error()); }

@@ -61,28 +61,19 @@ pub(crate) async fn open(
         }
         None => None,
     };
-    let (mut serving, _) =
-        NativeServing::open(authority, Arc::clone(store), checkpoint.as_ref(), false)?;
-    if serving.pending_erasure().is_some() {
-        return Err(erasure_recovery_required());
-    }
-    if let Some(block) = block {
-        serving.verify_checkpoint_prefix(block)?;
-    }
-    serving
-        .recover_classic(
-            snapshot,
-            block.and_then(BlockCatalog::boundary_replica_position),
-            storage,
-            memory,
-            cancellation,
-            true,
-            checkpoint
-                .as_ref()
-                .is_some_and(NativeServing::is_shared_checkpoint),
-        )
-        .await?;
-    Ok(Some(serving))
+    open_selected(authority, block, snapshot, storage, memory, cancellation, checkpoint.as_ref()).await.map(Some)
+}
+
+pub(crate) async fn open_selected(
+    authority: NativeServingAuthority, block: Option<&BlockCatalog>, snapshot: Snapshot,
+    storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken, checkpoint: Option<&NativeCheckpointImage>,
+) -> Result<NativeServing> {
+    let (mut serving, _) = NativeServing::open(authority, Arc::clone(storage.object_store()), checkpoint, false)?;
+    if serving.pending_erasure().is_some() { return Err(erasure_recovery_required()); }
+    if let Some(block) = block { serving.verify_checkpoint_prefix(block)?; }
+    serving.recover_classic(snapshot, block.and_then(BlockCatalog::boundary_replica_position), storage, memory, cancellation,
+        true, checkpoint.is_some_and(NativeServing::is_shared_checkpoint)).await?;
+    Ok(serving)
 }
 
 pub(crate) fn genesis(

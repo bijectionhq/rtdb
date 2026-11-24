@@ -116,6 +116,10 @@ impl BranchIndex {
         Ok(())
     }
 
+    pub fn has_custody_address(&self, table: &TableRef, id: &EntityId) -> bool {
+        self.custody.values().any(|group| group.members.iter().any(|member| &member.table == table && &member.id == id))
+    }
+
     pub fn custody_group_live(&self, group: CustodyGroupId) -> Result<bool> {
         self.custody.get(&group).map(|group| group.revoked.is_none()).ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb/custody-group-unknown", "Unknown custody group")

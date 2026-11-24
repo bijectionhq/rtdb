@@ -1,8 +1,8 @@
-use std::{cmp::Reverse, sync::Arc};
+use std::{cmp::Reverse, collections::BTreeSet, sync::Arc};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation};
-use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable}};
+use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer, branches::{BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage}};
 use rtdb_storage::{HeldView, IoRegion, cache::BufferPool};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, EntityId, Interval, Iid, LogicalType, Result, SourcePosition, StructFields, TableRef, Timestamp, TransactionKey, TxId,
@@ -113,12 +113,24 @@ pub(crate) fn stage_source(snapshot: Snapshot, prior: &BranchIndex, source: Sour
     let key = TransactionKey { tx_id: TxId(source.0), system_time: receipt.system_time };
     let mut buffer = TransactionBuffer::new(snapshot, key, Arc::clone(memory))?;
     let view = prior.view(MAIN_BRANCH, At::Latest, Layer::Merged, prior.head().system_time)?;
-    for effect in effects {
+    let protected: BTreeSet<_> = effects.iter().filter_map(|effect| match effect {
+        BranchEffect::Write { branch, table, event } if branch == MAIN_BRANCH && event.image.as_deref().is_some_and(is_protected) => {
+            Some((table, &event.id))
+        }
+        _ => None,
+    }).collect();
+    for (ordinal, effect) in effects.iter().enumerate() {
+        let preceding = &effects[..ordinal];
         match effect {
             BranchEffect::Write { branch, table, event } if branch == MAIN_BRANCH => {
                 let iid = prior.physical_iid(table, &event.id);
-                if event.image.as_ref().is_some_and(|image| image.custody_group.is_some() || image.custody_payload.is_some()) {
-                    return Err(super::invalid());
+                if event.image.as_deref().is_some_and(is_protected) {
+                    withdraw_public(&mut buffer, &view, table, &event.id, iid, event.valid, preceding)?;
+                    continue;
+                }
+                if event.image.is_none() && (protected.contains(&(table, &event.id)) || prior.has_custody_address(table, &event.id)) {
+                    withdraw_public(&mut buffer, &view, table, &event.id, iid, event.valid, preceding)?;
+                    continue;
                 }
                 let put_until = event.image.as_ref().map_or(event.valid.lower(), |image| {
                     image.expires_at.unwrap_or(event.valid.upper()).clamp(event.valid.lower(), event.valid.upper())
@@ -131,26 +143,75 @@ pub(crate) fn stage_source(snapshot: Snapshot, prior: &BranchIndex, source: Sour
                 }
             }
             BranchEffect::Erase { branch, table, id } if branch.as_deref().is_none_or(|branch| branch == MAIN_BRANCH) => {
-                append(&mut buffer, table, prior.physical_iid(table, id), Interval::ALL, StoredOperation::Erase)?;
+                let public = view.history(table, id).into_iter().any(|event| event.image.as_deref().is_some_and(|image| !is_protected(image)))
+                    || preceding.iter().any(|effect| matches!(effect, BranchEffect::Write { branch, table: written, event }
+                        if branch == MAIN_BRANCH && written == table && &event.id == id && event.image.as_deref().is_some_and(|image| !is_protected(image))));
+                if public || (!protected.contains(&(table, id)) && !prior.has_custody_address(table, id)) {
+                    append(&mut buffer, table, prior.physical_iid(table, id), Interval::ALL, StoredOperation::Erase)?;
+                }
             }
             BranchEffect::Declare { table, definition } if definition.dropped => {
-                let mut ids = view.ids(table).into_iter().cloned().collect::<std::collections::BTreeSet<EntityId>>();
+                let mut ids = view.ids(table).into_iter().cloned().collect::<BTreeSet<EntityId>>();
                 ids.extend(effects.iter().filter_map(|effect| match effect {
                     BranchEffect::Write { branch, table: written, event } if branch == MAIN_BRANCH && written == table => Some(event.id.clone()),
                     _ => None,
                 }));
-                for id in ids { append(&mut buffer, table, prior.physical_iid(table, &id), Interval::ALL, StoredOperation::Delete)?; }
+                for id in ids {
+                    let iid = prior.physical_iid(table, &id);
+                    if protected.contains(&(table, &id)) || prior.has_custody_address(table, &id) {
+                        withdraw_public(&mut buffer, &view, table, &id, iid, Interval::ALL, preceding)?;
+                    } else {
+                        append(&mut buffer, table, iid, Interval::ALL, StoredOperation::Delete)?;
+                    }
+                }
             }
             BranchEffect::Declare { table, definition } => {
                 buffer.declare_table(table.clone(), definition.columns.keys().cloned())?;
                 let fields = definition.columns.iter().map(|(name, ty)| (name.clone(), ty.clone())).collect::<Vec<_>>();
                 buffer.record_sql_declaration(table, &fields)?;
             }
-            BranchEffect::RevokeCustodyGroup { .. } => return Err(super::invalid()),
             _ => (),
         }
     }
     buffer.stage()
+}
+
+fn is_protected(image: &RowImage) -> bool { image.custody_group.is_some() || image.custody_payload.is_some() }
+
+fn withdraw_public(buffer: &mut TransactionBuffer, view: &BranchView<'_>, table: &TableRef, id: &EntityId, iid: Iid,
+    valid: Interval, preceding: &[BranchEffect],
+) -> Result<()> {
+    let mut visible = Vec::new();
+    for event in view.history(table, id) { update_public(&mut visible, event.valid, event.image.as_deref())?; }
+    for effect in preceding {
+        match effect {
+            BranchEffect::Write { branch, table: written, event } if branch == MAIN_BRANCH && written == table && &event.id == id => {
+                update_public(&mut visible, event.valid, event.image.as_deref())?;
+            }
+            BranchEffect::Erase { branch, table: written, id: erased }
+                if branch.as_deref().is_none_or(|branch| branch == MAIN_BRANCH) && written == table && erased == id => visible.clear(),
+            BranchEffect::Declare { table: written, definition } if written == table && definition.dropped => visible.clear(),
+            _ => (),
+        }
+    }
+    for overlap in visible.into_iter().filter_map(|range| range.intersection(valid)) {
+        append(buffer, table, iid, overlap, StoredOperation::Delete)?;
+    }
+    Ok(())
+}
+
+fn update_public(visible: &mut Vec<Interval>, valid: Interval, image: Option<&RowImage>) -> Result<()> {
+    let old = std::mem::take(visible);
+    for range in old {
+        let Some(overlap) = range.intersection(valid) else { visible.push(range); continue; };
+        if range.lower() < overlap.lower() { visible.push(Interval::new(range.lower(), overlap.lower())?); }
+        if overlap.upper() < range.upper() { visible.push(Interval::new(overlap.upper(), range.upper())?); }
+    }
+    if let Some(image) = image.filter(|image| !is_protected(image)) {
+        let end = image.expires_at.unwrap_or(valid.upper()).min(valid.upper());
+        if valid.lower() < end { visible.push(Interval::new(valid.lower(), end)?); }
+    }
+    Ok(())
 }
 
 fn append(buffer: &mut TransactionBuffer, table: &TableRef, iid: Iid, valid_time: Interval, operation: StoredOperation) -> Result<()> {
@@ -163,7 +224,41 @@ fn append(buffer: &mut TransactionBuffer, table: &TableRef, iid: Iid, valid_time
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtdb_types::{TxId, Value};
+    use rtdb_types::{EventOp, Value};
+
+    #[test]
+    fn a_protected_assertion_only_masks_the_previously_clear_overlap_at_its_stored_iid() {
+        use rtdb_index::branches::{BranchEvent, CustodyPayload, WrittenVersion};
+        use rtdb_tx::transact::Outcome;
+
+        let memory = MemoryBudget::new(1 << 24);
+        let partition = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        let table = TableRef::new("public", "items");
+        let mut index = BranchIndex::new([7; 16]);
+        advance(&mut index, Timestamp(1)).unwrap();
+        let iid = Iid([0x31; 16]);
+        let clear = Interval::new(Timestamp(4), Timestamp(8)).unwrap();
+        index.apply_classic_event(&table, StoredEvent { position: None, origin: None, commit_position: 0, entity_key: None,
+            iid, system_from: Timestamp(1), valid_time: clear, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("_id".into(), Value::I64(1))])), }, Some(TxId(1))).unwrap();
+
+        let cut = BranchCut { basis: Basis::new([7; 16], 2), system_time: Timestamp(2) };
+        let receipt = Receipt { key: vec![3; 16], basis: cut.basis, system_time: cut.system_time, outcome: Outcome::Then,
+            replayed: false, erasure: None };
+        let protected = Interval::new(Timestamp(6), Timestamp(10)).unwrap();
+        let protect = |id| BranchEffect::Write { branch: MAIN_BRANCH.into(), table: table.clone(), event: BranchEvent {
+            id: EntityId::Integer(id), valid: protected, cut, written: WrittenVersion::Branch,
+            image: Some(Arc::new(RowImage { cells: StructFields::from([("_id".into(), Value::I64(id))]), expires_at: None,
+                custody_group: Some([3; 16]), custody_payload: Some(CustodyPayload { binding: [4; 32], envelope: vec![5] }) })),
+        } };
+        let write = stage_source(partition.snapshot(), &index, SourcePosition(5), &receipt, &[protect(1), protect(2)], &memory).unwrap();
+        let batch = write.tables()[&table].batch().unwrap();
+        assert_eq!(batch.len(), 1);
+        let header = batch.header(0).unwrap();
+        assert_eq!(header.iid, iid);
+        assert_eq!(header.op, EventOp::Delete);
+        assert_eq!(header.valid_time, clear.intersection(protected).unwrap());
+    }
 
     #[test]
     fn legacy_classic_effect_needs_provenance_for_a_written_basis() {

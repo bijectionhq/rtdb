@@ -44,15 +44,17 @@ async fn run() -> Result<()> {
                 writeln!(output, "Retained repair base {} from replica boundary {}", request.base.block.0, boundary.0)
             })
         },
-        Command::RepairCheckpoint { request, memory_bytes } => {
+        Command::RepairCheckpoint { request, memory_bytes, checkpoint_key_vault } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
-            report_checkpoint_repair(request.rebuild(memory, &cancellation), &cancellation).await
+            let keys = repair_checkpoint_keys(checkpoint_key_vault.as_deref())?;
+            report_checkpoint_repair(request.rebuild_with_checkpoint_keys(keys, memory, &cancellation), &cancellation).await
         },
-        Command::RepairRetainedCheckpoint { request, memory_bytes } => {
+        Command::RepairRetainedCheckpoint { request, memory_bytes, checkpoint_key_vault } => {
             let memory = rtdb_columnar::MemoryBudget::new(memory_bytes);
             let cancellation = tokio_util::sync::CancellationToken::new();
-            report_checkpoint_repair(request.rebuild(memory, &cancellation), &cancellation).await
+            let keys = repair_checkpoint_keys(checkpoint_key_vault.as_deref())?;
+            report_checkpoint_repair(request.rebuild_with_checkpoint_keys(keys, memory, &cancellation), &cancellation).await
         },
         Command::Start(options) => {
             let (config, memory, _configuration) = options.load_reserved()?.into_execution(options.allocation_limit_bytes)?;
@@ -92,6 +94,15 @@ async fn run() -> Result<()> {
             run_started(&handle, driver).await
         }
     }
+}
+
+fn repair_checkpoint_keys(path: Option<&std::path::Path>) -> Result<Option<std::sync::Arc<dyn rtdb_crypt::Kms>>> {
+    use rtdb_node::Clock;
+
+    path.map(|path| {
+        let keys = rtdb_crypt::FileKms::open(path, || rtdb_node::SystemClock.now().0)?;
+        Ok(std::sync::Arc::new(keys) as std::sync::Arc<dyn rtdb_crypt::Kms>)
+    }).transpose()
 }
 
 #[cfg(feature = "multi")]

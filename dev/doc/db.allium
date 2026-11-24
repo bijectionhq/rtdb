@@ -43,7 +43,12 @@
 -- A replayed reply preserves the original receipt position.
 -- Retained SQL cuts, table history and offline repair apply shared decision effects through the same projector as live replication.
 -- A sealed shared checkpoint requires its original read authority for replay.
+-- Offline repair authenticates the selected sealed image and verifies its receipts and fold against the admitted replica interval.
+-- A repaired store copies the selected sealed object into independent storage with its original key generation and receipt coordinates.
 -- Classic writes to a relation with canonical label or custody authority are refused before replication.
+-- The shared projector keeps a protected assertion or revocation in the canonical fold.
+-- A protected assertion withdraws only previously clear ranges for its installed Classic IID.
+-- Default custody admission requires the installed release and delivery fence.
 -- Branch Transact submissions with operations append the canonical request and its authenticated admission context to the source log.
 -- The admission context preserves the receipt namespace, label scope, verified claims and any sealed custody request digest.
 -- Nodes that submit or resolve branch requests share the database's source admission key through its private object store.

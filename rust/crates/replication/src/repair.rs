@@ -8,6 +8,7 @@ use std::{
 use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_columnar::MemoryBudget;
+use rtdb_crypt::Kms;
 use rtdb_format::{
     catalog::{BlockCatalog, CheckpointContents, TableBlock, legacy_table_ref, publication_digest, same_publication_digest},
     envelope::ReplicaBody,
@@ -26,7 +27,8 @@ use rtdb_types::residence_trace::{self, RepairInventory, RepairInventoryTarget};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{BlockDiscovery, BlockStore, PartitionLogs, RecoveredPartition, ReplicaRecord, blocks::matches_catalog_boundary, repair_decision};
+use crate::{BlockDiscovery, BlockStore, NativeServingAuthority, PartitionLogs, RecoveredPartition, ReplicaRecord,
+    blocks::matches_catalog_boundary, repair_decision, serving::{NativeCheckpointImage, retained}};
 
 const CACHE_BYTES: usize = 32 << 20;
 
@@ -151,6 +153,9 @@ impl RetainRepairBase {
             }
             base_store.sync_existing(&ObjectKey::new(entry.slug.block_key(self.base.block)?)?).await?;
         }
+        if let Some(object) = &base.as_proto().serving_checkpoint_object {
+            base_store.sync_existing(&ObjectKey::new(object.clone())?).await?;
+        }
         base_store.sync_existing(&ObjectKey::new(block_key(self.base.block)?)?).await?;
         for parent in base_root.ancestors().skip(1) {
             cancelled(cancellation)?;
@@ -193,11 +198,18 @@ impl LocalRepair {
     pub async fn rebuild(
         &self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
     ) -> Result<RepairedStore> {
+        self.rebuild_with_checkpoint_keys(None, memory, cancellation).await
+    }
+
+    /// Sealed images use the original NativeCheckpointAuthority's KMS for both selections.
+    pub async fn rebuild_with_checkpoint_keys(
+        &self, keys: Option<Arc<dyn Kms>>, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
+    ) -> Result<RepairedStore> {
         require_advancing_cut(self.base, self.through)?;
         cancelled(cancellation)?;
         let paths = RepairPaths::resolve(&self.source_storage, self.base_storage.as_deref(), &self.output_parent)?;
         RepairRange { base: BaseSelection::Explicit(self.base), through: self.through }
-            .rebuild(paths, &self.replica_log, &memory, cancellation).await
+            .rebuild(paths, &self.replica_log, &memory, cancellation, keys.as_ref()).await
     }
 }
 
@@ -206,11 +218,18 @@ impl RetainedLocalRepair {
     pub async fn rebuild(
         &self, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
     ) -> Result<RepairedStore> {
+        self.rebuild_with_checkpoint_keys(None, memory, cancellation).await
+    }
+
+    /// Sealed images use the original NativeCheckpointAuthority's KMS for both selections.
+    pub async fn rebuild_with_checkpoint_keys(
+        &self, keys: Option<Arc<dyn Kms>>, memory: Arc<MemoryBudget>, cancellation: &CancellationToken,
+    ) -> Result<RepairedStore> {
         cancelled(cancellation)?;
         let paths = RepairPaths::resolve(&self.source_storage, Some(&self.base_storage), &self.output_parent)?;
         require_detached_base(&paths.source_root, &paths.base_root)?;
         RepairRange { base: BaseSelection::Retained, through: self.through }
-            .rebuild(paths, &self.replica_log, &memory, cancellation).await
+            .rebuild(paths, &self.replica_log, &memory, cancellation, keys.as_ref()).await
     }
 }
 
@@ -326,7 +345,7 @@ impl PrimaryReset {
         let staged_blocks = BlockStore::new(staged.clone(), pool(staged.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut rebuilt = staged_blocks.recover(Default::default(), source.source_floor()?, Timestamp(0), BlockDiscovery::At(base.block_index())).await?;
         IoRegion::reading(recovery,
-            replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation)).await?;
+            replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation, None)).await?;
         if let Some(observation) = observation { observation.observe("repair-replayed"); }
         let value = rebuilt.partition.value();
         let catalog = Arc::clone(value.trie_catalog());
@@ -412,9 +431,10 @@ struct RepairRange {
 impl RepairRange {
     async fn rebuild(
         &self, paths: RepairPaths, replica_log: &Path, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+        keys: Option<&Arc<dyn Kms>>,
     ) -> Result<RepairedStore> {
         let (journal, region) = exclusive_journal(replica_log)?;
-        let built = self.build(&paths, &journal, memory, &region, cancellation).await;
+        let built = self.build(&paths, &journal, memory, &region, cancellation, keys).await;
         region.close_and_wait().await;
         built
     }
@@ -422,6 +442,7 @@ impl RepairRange {
     async fn build(
         &self, paths: &RepairPaths, journal: &Path,
         memory: &Arc<MemoryBudget>, io_region: &Arc<IoRegion>, cancellation: &CancellationToken,
+        keys: Option<&Arc<dyn Kms>>,
     ) -> Result<RepairedStore> {
         let RepairPaths { source_root, base_root, output_parent, root } = paths;
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
@@ -462,7 +483,7 @@ impl RepairRange {
             return Err(invalid("Repair requires a strictly advancing interval in one replica journal"));
         }
         let latest_transaction = target.latest_completed_tx().ok_or_else(|| invalid("The target has no completed transaction"))?;
-        let logs = open_repair_logs(journal, io_region, epoch, source, source_pool, memory, None)?;
+        let logs = open_repair_logs(journal, io_region, epoch, source.clone(), source_pool, memory, None)?;
 
         let directory = Arc::new(tempfile::Builder::new().prefix("repair-").tempdir_in(output_parent).map_err(io)?);
         let staged = directory.path().join(".staging");
@@ -485,7 +506,8 @@ impl RepairRange {
 
         let stage_blocks = BlockStore::new(destination.clone(), pool(destination.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut repaired = stage_blocks.recover(Default::default(), logs.source_floor()?, Timestamp(0), BlockDiscovery::At(base_receipt.block)).await?;
-        let sha256 = replay(&logs, &stage_blocks, &destination, &mut repaired, &base, &target, memory, cancellation).await?;
+        let (sha256, generation) = replay(&logs, &stage_blocks, &destination, &mut repaired, &base, &target, memory, cancellation,
+            keys.map(|keys| (source.as_ref(), keys))).await?;
         if let Some(observation) = observation { observation.observe("repair-replayed"); }
         let checkpoint = RepairCheckpoint { block: self.through.block, sha256 };
         drop(stage_blocks);
@@ -494,6 +516,9 @@ impl RepairRange {
         drop(stage_io);
         let directory = Arc::try_unwrap(directory).map_err(|_| invalid("Repair staging still has active I/O"))?;
         cancelled(cancellation)?;
+        if let Some(generation) = generation {
+            keys.ok_or_else(|| unavailable("The original sealed checkpoint authority is unavailable"))?.check_readable(generation).await?;
+        }
         let ready = directory.path().join("storage");
         fs::rename(staged, &ready).map_err(io)?;
         rtdb_storage::sync_directory(directory.path()).map_err(io)?;
@@ -529,6 +554,10 @@ async fn stage_primary_base(
         let bytes = Bytes::from(primary.encode());
         digests.insert(entry.oid, publication_digest(&bytes).to_vec());
         destination.put(&ObjectKey::new(entry.slug.block_key(base.block_index())?)?, bytes).await?;
+    }
+    if let Some(object) = &base_wire.serving_checkpoint_object {
+        let key = ObjectKey::new(object.clone())?;
+        base_storage.copy_to(&key, destination, &key).await?;
     }
     base_wire.table_block_manifest = Some(rtdb_format::block::proto::TableBlockManifest { sha256_by_oid: digests });
     let mut staged_base = BlockCatalog::from_proto(base_wire)?;
@@ -593,7 +622,8 @@ fn require_offline_lifetime_admission(catalog: &BlockCatalog) -> Result<()> {
 async fn replay(
     logs: &PartitionLogs, blocks: &BlockStore, destination: &LocalStore, repair: &mut RecoveredPartition,
     base: &BlockCatalog, target: &BlockCatalog, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
-) -> Result<[u8; 32]> {
+    custody: Option<(&LocalStore, &Arc<dyn Kms>)>,
+) -> Result<([u8; 32], Option<rtdb_crypt::Generation>)> {
     let after = base.boundary_replica_position().ok_or_else(|| invalid("The base has no replica boundary"))?;
     let through = target.boundary_replica_position().ok_or_else(|| invalid("The target has no replica boundary"))?;
     let mut range = logs.replica_range(after, next_replica_byte(through)?).await?;
@@ -603,18 +633,44 @@ async fn replay(
     let first = logs.decode_replica(first)?.ok_or_else(|| invalid("The trusted base has an unknown replica record"))?;
     require_boundary(&first, base)?;
     drop(first);
-    if base.as_proto().serving_checkpoint_object.is_some() || target.as_proto().serving_checkpoint_object.is_some() {
+    let sealed_base = base.as_proto().serving_checkpoint_object.is_some();
+    let sealed_target = target.as_proto().serving_checkpoint_object.is_some();
+    if (sealed_base || sealed_target) && custody.is_none() {
         return Err(unavailable("Offline mixed replay needs the original sealed serving checkpoint authority"));
     }
-    let authority = crate::serving::retained::checkpoint_incarnation(target)?
-        .map(|incarnation| crate::NativeServingAuthority { incarnation, checkpoints: None });
-    let mut serving = crate::serving::retained::open(authority, Some(base), repair.partition.snapshot(), blocks.storage(), memory, cancellation).await?;
+    if sealed_base && !sealed_target { return Err(invalid("The selected repair target has no sealed serving image")); }
+    let base_incarnation = retained::checkpoint_incarnation(base)?;
+    let target_incarnation = retained::checkpoint_incarnation(target)?;
+    if let (Some(base), Some(target)) = (base_incarnation, target_incarnation) && base != target {
+        return Err(invalid("The selected repair images belong to different database incarnations"));
+    }
+    let mut selected = None;
+    let mut serving = if let Some(incarnation) = target_incarnation.or(base_incarnation) {
+        let base = NativeServingAuthority::read_selected_checkpoint(incarnation, custody.map(|(_, kms)| kms.as_ref()),
+            blocks.object_store(), base.as_proto().serving_checkpoint.as_deref(), base.as_proto().serving_checkpoint_object.as_deref()).await?;
+        if let Some(NativeCheckpointImage::Sealed { id, .. }) = &base {
+            let epoch = u64::try_from(repair.fence.highest_term().0).map_err(|_| invalid("The base term is invalid"))?;
+            if id.epoch > epoch { return Err(invalid("The sealed serving image is beyond the base term")); }
+        }
+        if sealed_target {
+            let (source, kms) = custody.ok_or_else(|| unavailable("The original sealed checkpoint authority is unavailable"))?;
+            selected = NativeServingAuthority::read_selected_checkpoint(incarnation, Some(kms.as_ref()), source,
+                None, target.as_proto().serving_checkpoint_object.as_deref()).await?;
+        }
+        let authority = NativeServingAuthority { incarnation, checkpoints: None };
+        Some(retained::open_selected(authority, repair.block.as_ref(), repair.partition.snapshot(), blocks.storage(), memory, cancellation, base.as_ref()).await?)
+    } else { None };
     let mut previous = base.clone();
+    let mut reached = after;
     while let Some(raw) = cancellation.run_until_cancelled(range.next(ReadReservation::new(bound, memory.reserve(bound)?)))
         .await.ok_or_else(interrupted)??
     {
         let record = logs.decode_replica(raw)?.ok_or_else(|| invalid("The repair interval contains an unknown replica record"))?;
         let position = record.metadata.position;
+        if reached.0.checked_add(1) != Some(position.0) || position > through {
+            return Err(invalid("The repair interval does not cover the selected replica prefix"));
+        }
+        reached = position;
         let (_, admitted) = repair.fence.admit_record(record)?;
         let Some(admitted) = admitted else {
             if position == through { return Err(invalid("The target checkpoint belongs to a fenced replica record")); }
@@ -648,7 +704,19 @@ async fn replay(
                 if position == through && installed.live().latest_completed_tx() != target.latest_completed_tx() {
                     return Err(invalid("The replayed transaction head differs from the target checkpoint"));
                 }
-                let serving_checkpoint = serving.as_mut().map(|serving| serving.checkpoint(record.envelope.term, false)).transpose()?;
+                let serving_checkpoint = if position != through { None } else if let Some(serving) = &mut serving {
+                    serving.verify_checkpoint_prefix(target)?;
+                    if let Some(image @ NativeCheckpointImage::Sealed { id, opened }) = &selected {
+                        let (source, kms) = custody.ok_or_else(|| unavailable("The original sealed checkpoint authority is unavailable"))?;
+                        let epoch = u64::try_from(target.boundary_term().0).map_err(|_| invalid("The selected term is invalid"))?;
+                        if id.epoch > epoch { return Err(invalid("The sealed serving image is beyond the selected term")); }
+                        let checkpoint = serving.repair_checkpoint(image, Some(Arc::clone(kms)))?;
+                        let key = ObjectKey::new(id.to_string())?;
+                        source.copy_to(&key, destination, &key).await?;
+                        kms.check_readable(opened.generation).await?;
+                        Some(checkpoint)
+                    } else { Some(serving.checkpoint(record.envelope.term, false)?) }
+                } else { None };
                 let output = blocks.produce_with_search(&prepared, &record, Default::default(), cancellation, None, serving_checkpoint).await?;
                 if position == through && output.catalog.table_entries()? != target.table_entries()? {
                     return Err(invalid("The rebuilt table registry differs from the target checkpoint"));
@@ -658,9 +726,9 @@ async fn replay(
                     .ok_or_else(|| invalid("The staged checkpoint differs from its durable read-back"))?;
                 repair.partition.adopt_block(prepared, stored.clone(), &table_blocks, &output.tries, record.metadata.timestamp)?;
                 repair.progress.source_position = source;
-                discard_staged_checkpoint(destination, &previous, cancellation).await?;
+                discard_staged_checkpoint(destination, &previous, &stored, cancellation).await?;
                 previous = stored;
-                if position == through { return Ok(digest); }
+                if position == through { return Ok((digest, selected.as_ref().and_then(NativeCheckpointImage::generation))); }
             }
             ReplicaBody::TablesRetired(message) => {
                 let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
@@ -693,13 +761,18 @@ async fn replay(
 }
 
 async fn discard_staged_checkpoint(
-    destination: &LocalStore, checkpoint: &BlockCatalog, cancellation: &CancellationToken,
+    destination: &LocalStore, checkpoint: &BlockCatalog, replacement: &BlockCatalog, cancellation: &CancellationToken,
 ) -> Result<()> {
     let index = checkpoint.block_index();
     destination.delete(&ObjectKey::new(block_key(index)?)?).await?;
     for entry in checkpoint.table_entries()? {
         cancelled(cancellation)?;
         destination.delete(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
+    }
+    if let Some(key) = &checkpoint.as_proto().serving_checkpoint_object
+        && replacement.as_proto().serving_checkpoint_object.as_ref() != Some(key)
+    {
+        destination.delete(&ObjectKey::new(key.clone())?).await?;
     }
     Ok(())
 }

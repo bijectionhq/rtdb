@@ -7,7 +7,7 @@ use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
 use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite}};
 use rtdb_tx::transact::{
-    COUNT_RANGE_CONSTRAINT, Decision, Erasure, GROUPED_COUNT_CONSTRAINT, InstalledReceipt, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact,
+    COUNT_RANGE_CONSTRAINT, Decision, Erasure, GROUPED_COUNT_CONSTRAINT, InstalledReceipt, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, Resolution, ScopedTransact,
     TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState,
     TransactionRecord, TrustedCustodyCommand,
 };
@@ -87,30 +87,39 @@ pub struct NativeCheckpointAuthority {
 
 pub(crate) enum NativeCheckpointImage {
     Inline(Bytes),
-    Sealed(rtdb_crypt::Plaintext),
+    Sealed { id: ObjectId, opened: rtdb_crypt::Plaintext },
 }
 
 impl NativeCheckpointImage {
     pub(crate) fn bytes(&self) -> &[u8] {
-        match self { Self::Inline(bytes) => bytes, Self::Sealed(opened) => &opened.bytes }
+        match self { Self::Inline(bytes) => bytes, Self::Sealed { opened, .. } => &opened.bytes }
     }
 
-    fn key_generation(&self) -> Option<u64> {
-        match self { Self::Inline(_) => None, Self::Sealed(opened) => Some(opened.generation.number) }
+    pub(crate) fn key_generation(&self) -> Option<u64> {
+        self.generation().map(|generation| generation.number)
+    }
+
+    pub(crate) fn generation(&self) -> Option<Generation> {
+        match self { Self::Inline(_) => None, Self::Sealed { opened, .. } => Some(opened.generation) }
     }
 }
 
 impl NativeServingAuthority {
     pub(crate) async fn read_checkpoint(&self, store: &dyn ObjectStore, inline: Option<&[u8]>, object: Option<&str>) -> Result<Option<NativeCheckpointImage>> {
+        Self::read_selected_checkpoint(self.incarnation, self.checkpoints.as_ref().map(|authority| authority.kms.as_ref()), store, inline, object).await
+    }
+
+    pub(crate) async fn read_selected_checkpoint(incarnation: [u8; 16], kms: Option<&dyn Kms>, store: &dyn ObjectStore,
+        inline: Option<&[u8]>, object: Option<&str>,
+    ) -> Result<Option<NativeCheckpointImage>> {
         match (inline, object) {
             (Some(bytes), None) => Ok(Some(NativeCheckpointImage::Inline(Bytes::copy_from_slice(bytes)))),
             (None, None) => Ok(None),
             (None, Some(key)) => {
                 let id: ObjectId = key.parse()?;
-                if id.database.as_bytes() != &self.incarnation { return Err(invalid()); }
-                let checkpoints = self.checkpoints.as_ref().ok_or_else(unavailable)?;
-                let plaintext = rtdb_store::read_file(store, checkpoints.kms.as_ref(), id).await?;
-                Ok(Some(NativeCheckpointImage::Sealed(plaintext)))
+                if id.database.as_bytes() != &incarnation { return Err(invalid()); }
+                let opened = rtdb_store::read_file(store, kms.ok_or_else(unavailable)?, id).await?;
+                Ok(Some(NativeCheckpointImage::Sealed { id, opened }))
             }
             (Some(_), Some(_)) => Err(invalid()),
         }
@@ -279,10 +288,10 @@ impl<C> NativeRequest<C> {
         if self.transaction.uses_erasure() {
             return Err(Anomaly::unsupported("rtdb/erasure-required", "Default erasure needs ordered retirement of the source and replica keys"));
         }
-        if self.transaction.uses_custody() && !self.transaction.is_response_release() {
-            return Err(Anomaly::unsupported("rtdb/feature-required", "Default row custody requires a protected Classic projection"));
-        }
         let features = if self.scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
+        if self.transaction.uses_custody() && !self.transaction.is_response_release() && !features.contains(&ROW_CUSTODY) {
+            return Err(Anomaly::unsupported("rtdb/feature-required", "Default row custody requires an installed delivery fence"));
+        }
         self.transaction.require_sealed_custody(features)
     }
 }
@@ -324,7 +333,13 @@ pub(crate) struct NativeServing {
 
 pub(crate) struct ServingCheckpoint {
     image: Bytes,
-    writer: Option<CheckpointWriter>,
+    publication: CheckpointPublication,
+}
+
+enum CheckpointPublication {
+    Inline,
+    Writer(CheckpointWriter),
+    Retained { id: ObjectId, generation: Generation, kms: Arc<dyn Kms> },
 }
 
 struct CheckpointWriter {
@@ -355,15 +370,18 @@ impl ServingCheckpoint {
     }
 
     pub(crate) async fn verify(&self, store: &dyn ObjectStore, inline: Option<&[u8]>, object: Option<&str>) -> Result<()> {
-        let same = match (inline, object) {
-            (Some(inline), None) => self.image.as_ref() == inline && self.writer.is_none(),
-            (None, Some(key)) => {
-                let writer = self.writer.as_ref().ok_or_else(invalid)?;
+        let same = match (&self.publication, inline, object) {
+            (CheckpointPublication::Inline, Some(inline), None) => self.image.as_ref() == inline,
+            (CheckpointPublication::Writer(writer), None, Some(key)) => {
                 let id: ObjectId = key.parse()?;
                 if id.database != writer.database || id.epoch > writer.epoch { return Err(invalid()); }
                 let plaintext = rtdb_store::read_file(store, writer.authority.kms.as_ref(), id).await?;
                 self.image.as_ref() == plaintext.bytes.as_slice()
                     && (checkpoint_rewrite(&self.image)?.is_none() || plaintext.generation.number == writer.authority.generation)
+            }
+            (CheckpointPublication::Retained { id, generation, kms }, None, Some(key)) if key.parse::<ObjectId>()? == *id => {
+                let plaintext = rtdb_store::read_file(store, kms.as_ref(), *id).await?;
+                plaintext.generation == *generation && self.image.as_ref() == plaintext.bytes.as_slice()
             }
             _ => false,
         };
@@ -371,8 +389,16 @@ impl ServingCheckpoint {
     }
 
     pub(crate) async fn store(self, blocks: &crate::BlockStore, cancellation: &CancellationToken) -> Result<(Option<Vec<u8>>, Option<String>)> {
-        let Some(writer) = self.writer else { return Ok((Some(self.image.to_vec()), None)); };
         let store = blocks.object_store();
+        let writer = match &self.publication {
+            CheckpointPublication::Inline => return Ok((Some(self.image.to_vec()), None)),
+            CheckpointPublication::Retained { id, .. } => {
+                let key = id.to_string();
+                self.verify(store, None, Some(&key)).await?;
+                return Ok((None, Some(key)));
+            }
+            CheckpointPublication::Writer(writer) => writer,
+        };
         let prepared = writer.allocator.lock().await.file(writer.authority.kms.as_ref(), writer.authority.generation, &self.image).await?;
         prepared.put(store).await?;
         let reachable = Reachability::from_roots(writer.database, writer.epoch, [])?;
@@ -426,7 +452,21 @@ impl NativeServing {
             let (_, writer) = self.writer.as_ref().expect("writer installed for this term");
             Some(CheckpointWriter { allocator: Arc::clone(writer), authority: authority.clone(), database, epoch, collect: confirmed && self.collect_checkpoints })
         } else { None };
-        Ok(ServingCheckpoint { image: frame.freeze(), writer })
+        let publication = writer.map_or(CheckpointPublication::Inline, CheckpointPublication::Writer);
+        Ok(ServingCheckpoint { image: frame.freeze(), publication })
+    }
+
+    pub(crate) fn repair_checkpoint(&self, selected: &NativeCheckpointImage, kms: Option<Arc<dyn Kms>>) -> Result<ServingCheckpoint> {
+        let (expected, position, shared) = decode_checkpoint_image(selected.bytes(), self.authority.incarnation)?;
+        if self.position != position || self.shares_main != shared { return Err(invalid()); }
+        self.durable().verify_repaired_checkpoint(&expected)?;
+        let publication = match selected {
+            NativeCheckpointImage::Inline(_) => CheckpointPublication::Inline,
+            NativeCheckpointImage::Sealed { id, opened } => CheckpointPublication::Retained {
+                id: *id, generation: opened.generation, kms: kms.ok_or_else(unavailable)?,
+            },
+        };
+        Ok(ServingCheckpoint { image: Bytes::copy_from_slice(selected.bytes()), publication })
     }
 
     pub(crate) fn checkpoint_authority(&self) -> &NativeServingAuthority { &self.authority }
@@ -954,8 +994,8 @@ mod tests {
         assert!(!reopened.shares_main());
     }
 
-    #[test]
-    fn sealed_rows_are_refused_before_a_default_decision_is_appended() {
+    #[tokio::test]
+    async fn authenticated_sealed_rows_are_refused_before_a_default_decision_is_appended() {
         let (mut serving, _) = open(None);
         let mut transaction = put(1);
         let Op::Put { rows, .. } = &mut transaction.ops[0] else { unreachable!() };
@@ -963,11 +1003,96 @@ mod tests {
         rows[0].protected_columns = vec!["protected".into()];
         rows[0].custody_payload = Some(rtdb_tx::transact::CustodyPayload { binding: [2; 32], envelope: vec![3] });
         let source = SourcePosition(5);
-        let message = serving.decide_source(source, Timestamp(40), None, Ok(unscoped(transaction))).unwrap();
+        let envelope = serving.source_authority.seal(NativeRequest { transaction, claims: VerifiedClaims::default(), scope: None }).await.unwrap();
+        let request = serving.source_authority.open(&envelope).await.unwrap();
+        let message = serving.decide_source(source, Timestamp(40), None, request).unwrap();
         assert_eq!(message.serving_record.as_deref().unwrap()[0], SOURCE_REPLY_FRAME);
         let (_, reply) = serving.apply(&message, true, |_, _, _, _| unreachable!()).unwrap().unwrap();
         assert_eq!(reply.unwrap_err().code, "rtdb/feature-required");
         assert!(!serving.durable().has_receipts());
+    }
+
+    #[test]
+    fn retained_protected_decisions_and_revocation_have_no_classic_rows() {
+        use rtdb_types::rtdb_v1::{Layer, MAIN_BRANCH};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let partition = rtdb_index::PartitionState::empty(Default::default()).unwrap();
+        let group = [1; 16];
+        let (mut serving, _) = open(None);
+        let mut request = put(1);
+        let Op::Put { rows, .. } = &mut request.ops[0] else { unreachable!() };
+        rows[0].custody_group = Some(group);
+        rows[0].protected_columns = vec!["sealed".into()];
+        rows[0].custody_payload = Some(rtdb_tx::transact::CustodyPayload { binding: [3; 32], envelope: vec![4] });
+        request.ops.insert(0, Op::CreateCustodyGroup { group });
+        let apply = |serving: &mut NativeServing, request: &Transact, position: u64, source: i64, prior_source: i64| {
+            let Resolution::Append(prepared) = serving.durable().resolve(request, position, Timestamp(40), &[ROW_CUSTODY], &VerifiedClaims::default()).unwrap() else { panic!() };
+            let message = decision_message(position, &prepared.record().encode().unwrap(), Some(SourcePosition(source)), true, true);
+            let replay = super::retained::apply(Some(serving), &message, partition.snapshot(), SourcePosition(prior_source),
+                ReplicaPosition(source + 7), Term(2), &memory).unwrap().unwrap();
+            let (write, committed) = replay.write.unwrap();
+            assert!(committed);
+            assert!(write.tables().is_empty());
+            partition.apply(&write).unwrap();
+        };
+        let table = TableRef::new("public", "items");
+        let id = EntityId::Integer(1);
+        apply(&mut serving, &request, 1, 3, 2);
+        let index = serving.durable().index();
+        let view = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+        assert!(view.row(&table, &id, Timestamp(40)).unwrap().image.as_ref().unwrap().custody_payload.is_some());
+        let mut revoke = put(2);
+        revoke.ops = vec![Op::RevokeCustodyGroup { group, inventory_sha256: index.custody_inventory(group).unwrap().sha256 }];
+        apply(&mut serving, &revoke, 2, 4, 3);
+        let index = serving.durable().index();
+        let view = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+        assert!(view.row(&table, &id, Timestamp(40)).is_none());
+    }
+
+    #[tokio::test]
+    async fn detached_repair_preserves_the_selected_ciphertext_and_receipt_on_a_retired_generation() {
+        use rtdb_storage::ObjectStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(LocalStore::open(directory.path().join("source")).unwrap());
+        let destination = Arc::new(LocalStore::open(directory.path().join("destination")).unwrap());
+        let kms: Arc<dyn Kms> = Arc::new(LocalKms::new(|| 0));
+        let database = Uuid::from_bytes(INCARNATION);
+        let generation = Generation { database, number: 3 };
+        kms.create(generation).await.unwrap();
+        let (mut writer, _) = open(None);
+        let offset = SourcePosition(7);
+        let replica = ReplicaPosition(10);
+        let message = writer.decide_source(offset, Timestamp(40), None, Ok(unscoped(put(1)))).unwrap();
+        let (_, receipt) = writer.apply_ordered(&message, true, Some((replica, Term(2))), |_, _, _, _| Ok(())).unwrap().unwrap();
+        let receipt = receipt.unwrap();
+        let image = writer.checkpoint(Term(2), true).unwrap().image;
+        let sealed = WriterObjects::new(database, 2).file(kms.as_ref(), generation.number, &image).await.unwrap();
+        sealed.put(source.as_ref()).await.unwrap();
+        kms.retire(generation, 100).await.unwrap();
+        let authority = NativeServingAuthority { incarnation: INCARNATION,
+            checkpoints: Some(NativeCheckpointAuthority { kms: Arc::clone(&kms), generation: 9 }) };
+        let object = sealed.id().to_string();
+        let selected = authority.read_checkpoint(source.as_ref(), None, Some(&object)).await.unwrap().unwrap();
+        assert_eq!(selected.generation(), Some(generation));
+        let (mut different, _) = open(None);
+        different.apply_ordered(&message, false, Some((ReplicaPosition(replica.0 + 1), Term(2))), |_, _, _, _| Ok(())).unwrap();
+        assert!(different.repair_checkpoint(&selected, Some(Arc::clone(&kms))).is_err());
+        let checkpoint = writer.repair_checkpoint(&selected, Some(Arc::clone(&kms))).unwrap();
+        let key = ObjectKey::new(object.clone()).unwrap();
+        source.copy_to(&key, destination.as_ref(), &key).await.unwrap();
+        let store: Arc<dyn ObjectStore> = destination.clone();
+        let blocks = crate::BlockStore::new(Arc::clone(&store), Arc::new(BufferPool::new(Arc::clone(&store), 1 << 20)),
+            MemoryBudget::new(1 << 24), 100_000_000).unwrap();
+        let (inline, restored_object) = checkpoint.store(&blocks, &CancellationToken::new()).await.unwrap();
+        assert!(inline.is_none());
+        assert_eq!(restored_object, Some(object.clone()));
+        assert_eq!(source.get(&key).await.unwrap(), destination.get(&key).await.unwrap());
+        let copied = authority.read_checkpoint(store.as_ref(), None, Some(&object)).await.unwrap();
+        let (reopened, view) = NativeServing::open(authority, store, copied.as_ref(), false).unwrap();
+        assert_eq!(view.borrow().key_generation, Some(generation.number));
+        assert_eq!(reopened.durable().installed_receipt(None, &receipt.key, receipt.basis), Some(InstalledReceipt { source: offset, replica, term: Term(2) }));
     }
 
     fn put(key: u8) -> Transact {
