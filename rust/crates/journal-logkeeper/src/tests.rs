@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use journal_contract::{Identity, conformance};
 use stream_logkeeper::stream::{
@@ -15,7 +19,7 @@ const EPOCH: Epoch = Epoch(1);
 struct LocalTransport {
     keepers: Arc<BTreeMap<KeeperId, Keeper>>,
     identity: Identity,
-    drop_publication_replies: bool,
+    drop_publication_replies: Option<Arc<AtomicBool>>,
 }
 
 impl Transport for LocalTransport {
@@ -29,7 +33,10 @@ impl Transport for LocalTransport {
         request: Request,
     ) -> BoxFuture<'_, std::result::Result<Reply, TransportError>> {
         Box::pin(async move {
-            let drop_reply = self.drop_publication_replies
+            let drop_reply = self
+                .drop_publication_replies
+                .as_ref()
+                .is_some_and(|enabled| enabled.load(Ordering::Relaxed))
                 && matches!(&request, Request::Append { records, .. } if records.is_empty());
             let reply = self.keepers[&keeper].call(&self.identity, request).await?;
             if drop_reply && matches!(reply, Reply::Appended { .. }) {
@@ -55,7 +62,7 @@ fn keepers(path: &Path, limits: Limits) -> Arc<BTreeMap<KeeperId, Keeper>> {
 fn client(
     keepers: &Arc<BTreeMap<KeeperId, Keeper>>,
     identity: Identity,
-    drop_publication_replies: bool,
+    drop_publication_replies: Option<Arc<AtomicBool>>,
 ) -> StreamJournal {
     let transport = Arc::new(LocalTransport {
         keepers: Arc::clone(keepers),
@@ -76,7 +83,7 @@ async fn stream_journal_conforms_to_the_contract() {
             ..Limits::default()
         },
     );
-    conformance::run(|identity| Arc::new(client(&keepers, identity, false))).await;
+    conformance::run(|identity| Arc::new(client(&keepers, identity, None))).await;
 }
 
 fn records() -> Vec<(Lsn, Bytes)> {
@@ -112,7 +119,7 @@ async fn stream_journal_appends_a_batch_in_order() {
     let writer = client(
         &keepers,
         Identity::from_static("urn:logkeeper:client:batch"),
-        false,
+        None,
     );
     writer.create(STREAM).await.unwrap();
     assert_eq!(writer.seal(STREAM, EPOCH).await, Ok(Lsn(0)));
@@ -127,15 +134,16 @@ async fn stream_journal_appends_a_batch_in_order() {
 async fn stream_journal_recovers_a_batch_after_lost_publication_replies() {
     let dir = tempfile::tempdir().unwrap();
     let keepers = keepers(dir.path(), Limits::default());
+    let drop_publication_replies = Arc::new(AtomicBool::new(true));
     let writer = client(
         &keepers,
         Identity::from_static("urn:logkeeper:client:writer"),
-        true,
+        Some(Arc::clone(&drop_publication_replies)),
     );
     let successor = client(
         &keepers,
         Identity::from_static("urn:logkeeper:client:successor"),
-        false,
+        None,
     );
     writer.create(STREAM).await.unwrap();
     assert_eq!(writer.seal(STREAM, EPOCH).await, Ok(Lsn(0)));
@@ -143,7 +151,26 @@ async fn stream_journal_recovers_a_batch_after_lost_publication_replies() {
         writer.append_batch(STREAM, EPOCH, records()).await,
         Err(JournalError::Unavailable),
     );
+    drop_publication_replies.store(false, Ordering::Relaxed);
     assert_eq!(successor.head(STREAM).await, Ok(Lsn(2)));
-    assert_eq!(successor.seal(STREAM, Epoch(2)).await, Ok(Lsn(2)));
+    assert_eq!(writer.seal(STREAM, EPOCH).await, Ok(Lsn(2)));
     assert_committed_batch(&successor).await;
+    let next = Bytes::from_static(b"third");
+    assert_eq!(
+        writer
+            .append_batch(STREAM, EPOCH, vec![(Lsn(3), next.clone())])
+            .await,
+        Ok(Lsn(3))
+    );
+    assert_eq!(successor.seal(STREAM, Epoch(2)).await, Ok(Lsn(3)));
+    let mut expected = records();
+    expected.push((Lsn(3), next));
+    assert_eq!(
+        successor
+            .read(STREAM, Lsn(1), 3, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        expected
+    );
 }
