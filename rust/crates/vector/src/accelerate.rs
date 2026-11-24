@@ -42,24 +42,23 @@ impl ScanAccelerator for VectorAccelerator {
     fn accepts_arrow_iids(&self) -> bool { true }
 
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
+        Ok(self.selected(request).await?.map(|iids| iids.iter().collect()))
+    }
+
+    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+        Ok(self.selected(request).await?.map(|iids| ScanSelection { iids, scores: None }))
+    }
+}
+
+impl VectorAccelerator {
+    async fn selected(&self, request: &ScanRequest<'_>) -> Result<Option<CandidateIids>> {
         match self.narrow(request).await {
             Err(error) if declined(&error) => Ok(None),
             result => result,
         }
     }
 
-    async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
-        let Some(iids) = self.candidate_iids(request).await? else { return Ok(None) };
-        match CandidateIids::from_set(iids, request.memory) {
-            Ok(iids) => Ok(Some(ScanSelection { iids, scores: None })),
-            Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-impl VectorAccelerator {
-    async fn narrow(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
+    async fn narrow(&self, request: &ScanRequest<'_>) -> Result<Option<CandidateIids>> {
         let Some(asked) = self.asked(request).await? else { return Ok(None) };
         let scope = request.iid_scope();
         if scope.is_some_and(|scope| scope.len() <= self.exact_scope.max(asked.limit)) { return Ok(None); }
@@ -69,7 +68,8 @@ impl VectorAccelerator {
         let Some(mut shortlist) = Shortlist::open(cut, &asked.definition, asked.probe, asked.limit, partition, scope, budget).await? else { return Ok(None) };
         loop {
             let Some(Round { candidates, complete }) = shortlist.round(cut, scope).await? else { return Ok(None) };
-            let Some(visible) = request.verifier.retain_visible(candidates.clone()).await? else { return Ok(Some(candidates)) };
+            let candidates = CandidateIids::from_set(candidates, request.memory)?;
+            let Some(visible) = request.verifier.retain_visible(&candidates).await? else { return Ok(Some(candidates)) };
             if visible.len() >= asked.limit || complete { return Ok(Some(visible)); }
             // Too few candidates passed the filter: widen the probe and the shortlist until it is satisfied or the budget is spent.
             if !shortlist.widen() { return Ok(None); }

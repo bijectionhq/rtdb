@@ -28,6 +28,8 @@ pub(crate) use prepared_landing::{PreparedLanding, is_landing as is_prepared_lan
 mod constraint_receipt;
 mod resolution_candidate;
 mod control_order;
+mod owned_flight_decision;
+use owned_flight_decision::{PrimaryResult, Publish, select_publication, stage_marker};
 mod schedule_order;
 mod retry;
 mod retention;
@@ -439,7 +441,7 @@ impl TxResolver {
         let mut constraint_failed = false;
         let mut prepared_writes = None;
         let mut settled = false;
-        let mut outcome = if let Some(error) = slot_time.err().or(placement.err()).or(plan_error).or(retry_error) {
+        let outcome = if let Some(error) = slot_time.err().or(placement.err()).or(plan_error).or(retry_error) {
             Err(error)
         } else if has_owned_operations && matches!(request.guard, Some(SourceGuard::Bounded(_))) {
             Err(Anomaly::incorrect("rtdb/idempotency-owned-scope", "Bounded application retry metadata is supported on ordinary transactions"))
@@ -540,16 +542,26 @@ impl TxResolver {
                 (None, None) => Ok(()),
             })
         };
-        if constraint_failed && !refusal.is_empty() {
-            drop(tx);
-            tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
-            tx.terms_time = terms_time;
-            tx.clock_slot = slot;
-            tx.decision = decision;
-            tx.trace_parent = span.as_ref().map(|span| span.context());
-            outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
-            settled = outcome.is_ok();
-        }
+        let primary_result = match outcome {
+            Ok(()) => PrimaryResult::Staged(()),
+            Err(error) if constraint_failed => PrimaryResult::Constraint(error),
+            Err(error) => PrimaryResult::Failed(error),
+        };
+        let mut outcome = match select_publication(primary_result, (!refusal.is_empty()).then_some(refusal)) {
+            Publish::Primary(()) => Ok(()),
+            Publish::Abort(error) => Err(error),
+            Publish::StageRefusal(refusal) => {
+                drop(tx);
+                tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+                tx.terms_time = terms_time;
+                tx.clock_slot = slot;
+                tx.decision = decision;
+                tx.trace_parent = span.as_ref().map(|span| span.context());
+                let result = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
+                settled = result.is_ok();
+                result
+            }
+        };
         if outcome.is_ok() && let Some(authority) = classic_authority {
             let mut tables = tx.buffer.pending_tables().chain(prepared_writes.iter().flat_map(|write| write.tables().keys()));
             outcome = tables.try_for_each(|table| authority.require_classic_write(table));
@@ -2674,11 +2686,14 @@ impl<'a> OpenTransaction<'a> {
         }
         let relation = OwnedRelation::new(OWNED_ATTEMPT_RELATION)?;
         let id = EntityId::String(attempt.to_owned());
-        if self.read_owned_revision(owner, &relation, &id, Interval::ALL).await?.is_some() {
-            return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/context-used", "The attempt context has already published"));
+        let observed = self.read_owned_revision(owner, &relation, &id, Interval::ALL).await?;
+        let marker = stage_marker(attempt, fingerprint, self.tx_key().system_time.0, observed.map(|time| time.0))
+            .ok_or_else(|| Anomaly::new(AnomalyCategory::Conflict, "rtdb.world/context-used", "The attempt context has already published"))?;
+        if self.tx_key().system_time.0 != marker.revision {
+            return Err(Anomaly::fault("rtdb.owned/marker-revision", "Attempt marker requires the assigned transaction revision"));
         }
         let docs = crate::Documents::new(
-            vec![attempt_marker_document(attempt, fingerprint)], &self.context.memory,
+            vec![attempt_marker_document(marker.context, marker.fingerprint)], &self.context.memory,
         )?;
         self.write_owned(&relation, &docs, None, Some(Timestamp::MIN), Some(Timestamp::MAX), true).await
     }

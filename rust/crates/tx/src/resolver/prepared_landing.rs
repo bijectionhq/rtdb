@@ -107,18 +107,23 @@ impl SourceTransaction {
             validate_document_operation(operation, self.options.user.as_deref())?;
             tx.apply(operation).await?;
         }
-        let refused = match tx.finish_owned_effects(primary).await {
-            Ok(()) => {
+        let staged = match tx.finish_owned_effects(primary).await {
+            Ok(()) => PrimaryResult::Staged(()),
+            Err(error) if constraint_receipt::may_settle(&error) => PrimaryResult::Constraint(error),
+            Err(error) => PrimaryResult::Failed(error),
+        };
+        let refused = match select_publication(staged, Some(refusal)) {
+            Publish::Primary(()) => {
                 tx.write_owned_changes().await?;
                 false
             }
-            Err(error) if constraint_receipt::may_settle(&error) => {
+            Publish::StageRefusal(refusal) => {
                 tx = OpenTransaction::new(base, key, &self.options, context)?;
                 tx.terms_time = time;
                 tx.apply_selected_refusal(primary, refusal, Some(scope)).await?;
                 true
             }
-            Err(error) => return Err(error),
+            Publish::Abort(error) => return Err(error),
         };
         let writes = tx.buffer.stage()?;
         if writes.tables().keys().any(|table| table.schema == "xt") {

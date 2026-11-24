@@ -4,18 +4,18 @@ mod selection;
 
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    io::Cursor,
+    io::{self, Cursor, Write},
     sync::Arc,
 };
 
 use arrow_buffer::Buffer;
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{
     block::proto as pb,
     catalog::{BlockCatalog, TableEntry, publication_digest},
     data::{EventBatch, StoredEvent, StoredOperation},
-    ipc::{ArrowFile, inspect_file_reserved, write_file_pages},
+    ipc::{ArrowFile, ArrowFileEncoder, inspect_file_reserved},
     keys::{TrieKey, block_key},
     metadata::MetadataBuilder,
 };
@@ -411,24 +411,74 @@ impl AsRef<[u8]> for ChargedOutput {
     }
 }
 
+struct TrieOutputSink<'a> {
+    key: &'a ObjectKey,
+    provider_bytes: u64,
+    output: &'a mut ChargedOutput,
+    refusal: &'a mut Option<Anomaly>,
+}
+
+impl TrieOutputSink<'_> {
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        let current = &mut self.output.bytes;
+        let next = current.len().checked_add(bytes.len()).ok_or_else(|| invalid("Survivor trie output size overflows"))?;
+        if rtdb_storage::sealing::cipher::object::sealed_size(self.key, next)? as u64 > self.provider_bytes {
+            return Err(invalid("The survivor closure exceeds its provider reservation"));
+        }
+        if next > current.capacity() {
+            let provider_bytes = usize::try_from(self.provider_bytes).unwrap_or(usize::MAX);
+            let growth = current.capacity().saturating_mul(2).min(provider_bytes);
+            let capacity = next.max(growth);
+            let grant = Arc::get_mut(&mut self.output._allocation).expect("Survivor output has unique custody");
+            // The allocator may briefly hold both the old and new buffers.
+            let peak = grant.bytes().checked_add(capacity).ok_or_else(|| invalid("The survivor allocation overflows"))?;
+            grant.grow_to(peak)?;
+            current.try_reserve_exact(capacity - current.len()).map_err(|_| invalid("Cannot allocate the survivor trie"))?;
+            let retained = current.capacity().checked_add(256).ok_or_else(|| invalid("The survivor allocation overflows"))?;
+            grant.shrink_to(retained)?;
+        }
+        current.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl Write for TrieOutputSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self.append(bytes) {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                let io_error = io::Error::other(error.to_string());
+                *self.refusal = Some(error);
+                Err(io_error)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
 impl Candidate<'_> {
     async fn write(&mut self, key: ObjectKey, bytes: Vec<u8>) -> Result<()> {
-        let sealed = rtdb_storage::sealing::cipher::object::sealed_size(&key, bytes.len())? as u64;
-        self.remaining = self
-            .remaining
-            .checked_sub(sealed)
-            .ok_or_else(|| invalid("The survivor closure exceeds its provider reservation"))?;
+        self.charge_provider(&key, bytes.len())?;
         let _allocation = self.memory.reserve(
             bytes
                 .capacity()
                 .checked_add(256)
                 .ok_or_else(|| invalid("The survivor allocation overflows"))?,
         )?;
+        self.publish(key, ChargedOutput { bytes, _allocation }).await
+    }
+
+    fn charge_provider(&mut self, key: &ObjectKey, size: usize) -> Result<()> {
+        let sealed = rtdb_storage::sealing::cipher::object::sealed_size(key, size)? as u64;
+        self.remaining = self.remaining.checked_sub(sealed)
+            .ok_or_else(|| invalid("The survivor closure exceeds its provider reservation"))?;
+        Ok(())
+    }
+
+    async fn publish(&self, key: ObjectKey, output: ChargedOutput) -> Result<()> {
         self.store
-            .put(
-                &key,
-                Bytes::from_owner(ChargedOutput { bytes, _allocation }),
-            )
+            .put(&key, Bytes::from_owner(output))
             .await?;
         Ok(())
     }
@@ -444,37 +494,29 @@ impl Candidate<'_> {
             return Ok(None);
         }
         let pages = live.block_pages(self.memory)?;
-        let mut output = TrieOutput {
-            metadata: MetadataBuilder::new(false, false),
-            pages: Vec::new(),
-            retained: Vec::new(),
+        let key = ObjectKey::new(table.slug.data_key(trie))?;
+        let mut data = ChargedOutput { bytes: Vec::new(), _allocation: self.memory.reserve(256)? };
+        let mut refusal = None;
+        let metadata = {
+            let mut output = TrieOutput {
+                metadata: MetadataBuilder::new(false, false),
+                sink: Some(TrieOutputSink { key: &key, provider_bytes: self.remaining, output: &mut data, refusal: &mut refusal }),
+                encoder: None,
+                retained: Vec::new(),
+            };
+            output.copy(live.trie().root(), &pages, self.memory, cancellation)
+                .and_then(|_| output.finish())
         };
-        output.copy(live.trie().root(), &pages, self.memory, cancellation)?;
-        let first = output
-            .pages
-            .first()
-            .ok_or_else(|| invalid("Nonempty survivor trie has no data pages"))?;
-        let schema = first.batch().schema_ref();
-        let bound = output.pages.iter().try_fold(
-            rtdb_format::ipc::schema_translation_bound(schema)?,
-            |size, page| {
-                page.batch()
-                    .get_array_memory_size()
-                    .checked_mul(4)
-                    .and_then(|bytes| bytes.checked_add(size))
-                    .ok_or_else(|| invalid("Survivor trie serialization exceeds memory"))
-            },
-        )?;
-        let _encoding = self.memory.reserve(bound)?;
-        let data = write_file_pages(schema, output.pages.iter().map(OwnedBatch::batch))?;
-        let size = i64::try_from(data.len())
+        if let Some(refusal) = refusal { return Err(refusal); }
+        let (metadata, _retained) = metadata?;
+        let size = i64::try_from(data.bytes.len())
             .map_err(|_| invalid("Survivor trie size exceeds its format"))?;
-        self.write(ObjectKey::new(table.slug.data_key(trie))?, data)
-            .await?;
+        self.charge_provider(&key, data.bytes.len())?;
+        self.publish(key, data).await?;
         let _encoding = self
             .memory
-            .reserve(output.metadata.serialization_bound()?)?;
-        let (meta, summary) = output.metadata.finish()?;
+            .reserve(metadata.serialization_bound()?)?;
+        let (meta, summary) = metadata.finish()?;
         self.write(
             ObjectKey::new(table.slug.metadata_key(trie))?,
             meta.write()?,
@@ -488,13 +530,19 @@ impl Candidate<'_> {
     }
 }
 
-struct TrieOutput {
+struct TrieOutput<'a> {
     metadata: MetadataBuilder,
-    pages: Vec<OwnedBatch>,
+    sink: Option<TrieOutputSink<'a>>,
+    encoder: Option<ArrowFileEncoder<TrieOutputSink<'a>>>,
     retained: Vec<Arc<MemoryReservation>>,
 }
 
-impl TrieOutput {
+impl TrieOutput<'_> {
+    fn finish(self) -> Result<(MetadataBuilder, Vec<Arc<MemoryReservation>>)> {
+        self.encoder.ok_or_else(|| invalid("Nonempty survivor trie has no data pages"))?.finish()?;
+        Ok((self.metadata, self.retained))
+    }
+
     fn copy(
         &mut self,
         node: &TrieNode,
@@ -519,7 +567,10 @@ impl TrieOutput {
                 let (index, allocation) =
                     self.metadata.write_leaf_reserved(page.batch(), memory)?;
                 self.retained.push(allocation);
-                self.pages.push(page);
+                if let Some(sink) = self.sink.take() {
+                    self.encoder = Some(ArrowFileEncoder::new(sink, page.batch().schema_ref(), memory)?);
+                }
+                self.encoder.as_mut().expect("A leaf owns its output encoder").write(page.batch())?;
                 Ok(index)
             }
         }
@@ -540,7 +591,47 @@ fn invalid(message: &str) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rtdb_format::ipc::write_file_pages;
     use rtdb_types::{BlockIndex, Interval, ScalarType, TableRef, Timestamp, TxId};
+
+    #[test]
+    fn survivor_stream_preserves_ipc_bytes_and_retains_only_final_capacity() -> Result<()> {
+        use arrow_array::{ArrayRef, BinaryArray, RecordBatch};
+
+        let pages = [b"old survivor".as_slice(), b"later survivor".as_slice()].map(|payload| {
+            let cells = BinaryArray::from_iter_values([payload]);
+            RecordBatch::try_from_iter([("body", Arc::new(cells) as ArrayRef)]).unwrap()
+        });
+        let schema = pages[0].schema_ref();
+        let expected = write_file_pages(schema, &pages)?;
+        let key = ObjectKey::new("tables/test/data/000.arrow")?;
+        let sealed = rtdb_storage::sealing::cipher::object::sealed_size(&key, expected.len())? as u64;
+        let memory = MemoryBudget::new(1 << 21);
+
+        for limit in [sealed, sealed - 1] {
+            let mut output = ChargedOutput { bytes: Vec::new(), _allocation: memory.reserve(256)? };
+            let mut refusal = None;
+            let result = (|| {
+                let sink = TrieOutputSink { key: &key, provider_bytes: limit, output: &mut output, refusal: &mut refusal };
+                let mut file = ArrowFileEncoder::new(sink, schema, &memory)?;
+                for page in &pages { file.write(page)?; }
+                file.finish()?;
+                Ok::<(), Anomaly>(())
+            })();
+            if limit == sealed {
+                result?;
+                assert!(refusal.is_none());
+                assert_eq!(output.bytes, expected);
+                assert_eq!(memory.used_bytes(), output.bytes.capacity() + 256);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(refusal.unwrap().code, "rtdb/sql-survivor");
+            }
+            drop(output);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+        Ok(())
+    }
 
     #[test]
     fn compatible_survivor_input_reuses_the_funded_file_body() -> Result<()> {

@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 use rtdb_types::{EntityId, OwnedRelation};
 
 use super::*;
-use super::control_order::{HostedStamp, hosted_stamps_current};
+use super::control_order::HostedStamp;
+use super::owned_flight_decision::{ControlDecision, check_controls};
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -417,7 +418,8 @@ impl OpenTransaction<'_> {
         let (Value::Utf8(kind), Value::Binary(incarnation), Value::Utf8(writer)) =
             (field("kind")?, field("incarnation")?, field("writer")?)
         else { return Err(stale()); };
-        if !proof.matches(&kind, &incarnation, &writer) {
+        let authority_current = proof.matches(&kind, &incarnation, &writer);
+        if !authority_current {
             return Err(stale());
         }
 
@@ -502,12 +504,14 @@ impl OpenTransaction<'_> {
                 expected: control.expected().map(|time| time.0),
             });
         }
-        if !hosted_stamps_current(&stamps) {
-            return Err(Anomaly::new(
+        match check_controls(authority_current, &stamps) {
+            ControlDecision::Current => {}
+            ControlDecision::StaleAuthority => return Err(stale()),
+            ControlDecision::StaleControl => return Err(Anomaly::new(
                 AnomalyCategory::Conflict,
                 "rtdb.hosted/stale-control",
                 "An observed hosted control changed before ordering",
-            ));
+            )),
         }
         if funded.is_some() && !funded_seat_seen {
             return Err(funded_booking_missing());
