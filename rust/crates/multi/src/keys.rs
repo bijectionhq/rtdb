@@ -104,6 +104,10 @@ pub trait KeyService: Send + Sync {
         Err(unit::unsupported())
     }
 
+    fn retained_unit_ledger(&self, _scope: UnitScope, _io: Arc<IoRegion>) -> Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>> {
+        Err(unit::unsupported())
+    }
+
     async fn provision_journal_key(&self, key: JournalKey) -> Result<()> {
         self.key(&key.id()).await.map(|_| ())
     }
@@ -342,6 +346,9 @@ impl LocalKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for LocalKeyService {
+    fn retained_unit_ledger(&self, scope: UnitScope, io: Arc<IoRegion>) -> Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>> {
+        Ok(Arc::new(UnitLedger::new(Arc::new(self.clone()), scope, io)))
+    }
     async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<UnitOutput> {
         let vault = self.clone();
         let id = id.to_owned();

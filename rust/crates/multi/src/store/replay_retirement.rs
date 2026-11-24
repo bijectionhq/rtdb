@@ -5,7 +5,7 @@ use rtdb_storage::{Error, ObjectKey, ObjectStore};
 use rtdb_types::{BlockIndex, PhysicalObjectVersion, Result, S3TombstoneCondition, StorageEpoch, TerminalObjectPublication};
 
 use crate::archive::{self, ArchivedCheckpoint};
-use crate::cipher::Cipher;
+use rtdb_storage::{IoRegion, sealing::PublicationSealing};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
 use crate::packing::{PACK_DIRECTORY, PackEntry, PackIndex, block_pack, observe_pack_index, pack_block, read_pack_index_with};
@@ -70,8 +70,7 @@ pub(super) async fn reap(
         if record.required_replica_offsets(rtdb_directory::now_ms()).any(|first| first <= anchor.interval[1]) {
             return Ok(0);
         }
-        let Some(material) = keys.existing_key(&record.key_id()).await? else { return Ok(0); };
-        let cipher = Cipher::new(&material)?;
+        let cipher = crate::store::directory_publications(keys, record, IoRegion::new())?;
         let mut erased = 0;
         for (block, pack) in candidates {
             let observed = ObservedPack::raw(bucket, &pack).await?;
@@ -96,14 +95,14 @@ pub(super) async fn reap(
 
 async fn covered_pack(
     pack: &ObservedPack<'_>, block: i64, log_epoch: i32,
-    cipher: &Cipher, archive: &ArchivedCheckpoint,
+    cipher: &PublicationSealing, archive: &ArchivedCheckpoint,
 ) -> Result<Option<i64>> {
     let index = &pack.index;
     let root = block_key(BlockIndex(block))?;
     let Some(entry) = index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
         else { return Ok(None); };
     let bytes = pack.read_member(entry).await?;
-    let catalog = BlockCatalog::decode(&cipher.open(&root, &bytes)?)?;
+    let catalog = BlockCatalog::decode(&cipher.open(&key(&root)?, bytes).await?)?;
     if catalog.block_index().0 != block { return Ok(None); }
     let Some(boundary) = catalog.boundary_replica_position() else { return Ok(None); };
     let boundary = boundary.after_offset(StorageEpoch(log_epoch));
@@ -147,7 +146,7 @@ pub(super) async fn terminal_pack_index(
 }
 
 pub(super) async fn terminal_checkpoint_matches(
-    provider: &NeverVersionedRetirement<'_>, key: &ObjectKey, checkpoint: Checkpoint, cipher: &Cipher,
+    provider: &NeverVersionedRetirement<'_>, key: &ObjectKey, checkpoint: Checkpoint, cipher: &PublicationSealing,
 ) -> Result<bool> {
     let Some(pack) = ObservedPack::terminal(provider, key).await? else { return Ok(false); };
     pack.checkpoint_matches(checkpoint, cipher).await
@@ -180,13 +179,13 @@ impl<'a> ObservedPack<'a> {
         Ok(Some(Self { key, index, storage: PackStorage::Terminal { retirement, publication } }))
     }
 
-    async fn checkpoint_matches(&self, checkpoint: Checkpoint, cipher: &Cipher) -> Result<bool> {
+    async fn checkpoint_matches(&self, checkpoint: Checkpoint, cipher: &PublicationSealing) -> Result<bool> {
         let Some(digest) = checkpoint.root_sha256 else { return Ok(false); };
         let root = block_key(BlockIndex(checkpoint.block))?;
         let Some(entry) = self.index.entries.get(&root).filter(|entry| entry.length <= MAXIMUM_MEMBER_BYTES)
             else { return Ok(false); };
         let sealed = self.read_member(entry).await?;
-        let catalog = BlockCatalog::decode(&cipher.open(&root, &sealed)?)?;
+        let catalog = BlockCatalog::decode(&cipher.open(&ObjectKey::new(root)?, sealed).await?)?;
         Ok(catalog.block_index().0 == checkpoint.block && catalog.publication_sha256() == Some(digest))
     }
 

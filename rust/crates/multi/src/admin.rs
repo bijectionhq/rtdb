@@ -601,8 +601,8 @@ pub async fn fork_time_into(directory: &Arc<dyn Directory>, storage: &CellStorag
                 let bucket = storage.bucket(Arc::clone(&io)).await?;
                 let scope = format!("{}/{}", source.storage_prefix(), crate::archive::checkpoint_storage_root()?);
                 let store = crate::store::open_deployment_store(bucket, &scope, crate::packing::PackDiscovery::From(checkpoint.block), crate::store::wall_clock()).await?;
-                let material = fork_key(keys, &current).await?;
-                let store = crate::store::EncryptingStore::new(store, &material)?;
+                let publications = crate::store::directory_publications(keys, &current, Arc::clone(&io))?;
+                let store = crate::store::EncryptingStore::published(store, publications);
                 let root = crate::reference::key(&block_key(BlockIndex(checkpoint.block))?)?;
                 let catalog = BlockCatalog::decode(&store.get_fresh(&root).await?)?;
                 crate::archive::verify_cut(&catalog, checkpoint, StorageEpoch(source.log_epoch))?;
@@ -630,10 +630,6 @@ fn fork_unavailable(name: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/fork-unavailable", format!("{name} changed or cannot be forked in its current state"))
 }
 
-async fn fork_key(keys: &dyn KeyService, source: &DeploymentRecord) -> Result<[u8; crate::keys::KEY_BYTES]> {
-    keys.existing_key(&source.key_id()).await?.ok_or_else(|| fork_unavailable(&source.name))
-}
-
 async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, access: ForkAccess, keys: &dyn KeyService, source: &DeploymentRecord, destination: ForkDestination<'_>, at_block: Option<i64>, mut tail: Vec<rtdb_format::envelope::ReplicaEnvelope>, maximum_message_bytes: usize) -> Result<DeploymentRecord> {
     let ForkAccess { bucket, io, preparation, maintenance } = access;
     let org = destination.org.unwrap_or(&source.org);
@@ -647,7 +643,6 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
     child.storage_namespaces = source.storage_namespaces;
     // The parent's checkpoint names positions in the parent's logs, not the fork's: the fork's first holder finds its block by listing, and publishes the fork's own.
     child.ensemble = choose_ensemble(directory.as_ref(), &child, source.ensemble.len()).await?;
-    let source_key = fork_key(keys, source).await?;
     let published = source.checkpoint.ok_or_else(|| fork_unavailable(&source.name))?;
     let selected = at_block.unwrap_or(published.block);
     if selected > published.block { return Err(fork_unavailable(&source.name)); }
@@ -682,12 +677,11 @@ async fn fork_with_tail(directory: Arc<dyn Directory>, storage: &CellStorage, ac
             None => bucket,
         };
         if same_organisation {
-            crate::archive::reference_fork_checkpoint(bucket, source, &source_key, &child, selected).await?;
-            keys.install(&child.key_id(), source_key).await?;
+            crate::archive::reference_fork_checkpoint(bucket, source, keys, &child, selected, Arc::clone(&io)).await?;
         } else {
-            let key = keys.key(&child.key_id()).await?;
-            crate::archive::copy_fork_checkpoint(bucket.clone(), source, &source_key, &child, &key, Some(selected)).await?;
+            crate::archive::copy_fork_checkpoint(bucket, source, keys, &child, Some(selected), Arc::clone(&io)).await?;
         }
+        keys.key(&child.key_id()).await?;
         if let Some(stream) = &child_stream {
             let writer = rtdb_logkeeper::open_writer(stream.clone(), child.epoch, CancellationToken::new()).await?;
             let writer = crate::logs::SealedLog::new(writer, keys, &child.key_id(), &child.replica_seal_scope(), Arc::clone(&io)).await?;
@@ -1017,8 +1011,8 @@ async fn prepared_cell_move(
         require_storage_drained(&target)?;
         let bucket = to.storage.bucket(rtdb_storage::IoRegion::new()).await?;
         require_storage_namespaces(&target, storage_namespaces(bucket.as_ref(), to.keys).await?)?;
-        let material = if target.checkpoint.is_some() { to.keys.existing_key(&target.key_id()).await? } else { None };
-        Box::pin(crate::archive::verify_cell_move_checkpoint(&target, bucket, material.as_ref())).await?;
+        let publications = crate::store::directory_publications(to.keys, &target, IoRegion::new())?;
+        Box::pin(crate::archive::verify_cell_move_checkpoint(&target, bucket, &publications)).await?;
     }
     Ok((source, target))
 }
@@ -1273,10 +1267,6 @@ async fn prepare_cell_move(
     }
     let mut bound_source = current.clone();
     bind_admin_storage(&mut bound_source, source_binding)?;
-    let material = from.keys.existing_key(&current.key_id()).await?;
-    if material.is_none() && current.checkpoint.is_some() {
-        return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
-    }
     if let Some(target) = to.directory.deployment(&current.id).await? {
         require_storage_namespaces(&target, target_binding)?;
     }
@@ -1312,7 +1302,8 @@ async fn prepare_cell_move(
     let serving_archive = if current.lifecycle == Lifecycle::Live {
         let archive = Box::pin(crate::archive::require_transferable_serving_archive(from.directory.as_ref(), from.storage, from.keys, &current, hosted_task.as_ref())).await?;
         if archive.is_none() {
-            Box::pin(crate::archive::verify_cell_move_checkpoint(&current, source_bucket, material.as_ref())).await?;
+            let publications = crate::store::directory_publications(from.keys, &current, IoRegion::new())?;
+            Box::pin(crate::archive::verify_cell_move_checkpoint(&current, source_bucket, &publications)).await?;
         }
         archive
     } else {
@@ -1528,31 +1519,14 @@ async fn stage_cell_storage(
     let uncertain = admitted.as_ref().is_err_and(|error| error.code != "rtdb.multi/cell-transfer");
     let result = async {
         admitted?;
-        use crate::cipher::Cipher;
-        use rtdb_storage::{Error, ObjectKey};
+        use rtdb_storage::ObjectKey;
 
-        let material = from.keys.existing_key(&source.key_id()).await?;
-        if source.checkpoint.is_some() && material.is_none() {
-            return Err(Anomaly::fault("rtdb.multi/transfer-key", "The source checkpoint has no key in its original vault"));
-        }
-        let destination_material = match material {
-            Some(material) => {
-                let destination = to.keys.key(&staged.key_id()).await?;
-                if material == destination {
-                    return Err(Anomaly::incorrect("rtdb.multi/transfer-key", "The destination serving key must be independent"));
-                }
-                Some(destination)
-            }
-            None => None,
-        };
-        let source_cipher = material.as_ref().map(|key| Cipher::new(key)).transpose()?;
-        let destination_cipher = destination_material.as_ref().map(|key| Cipher::new(key)).transpose()?;
+        to.keys.key(&staged.key_id()).await?;
+        let source_cipher = crate::store::directory_publications(from.keys, source, Arc::clone(&io))?;
+        let destination_cipher = crate::store::directory_publications(to.keys, staged, Arc::clone(&io))?;
         let reseal_member = async |name: &ObjectKey, body: bytes::Bytes| {
-            let (Some(source), Some(destination)) = (&source_cipher, &destination_cipher) else {
-                return Err(Error::Closed("The serving copy has no source or destination key".into()));
-            };
-            let plaintext = source.open_object(name, &body)?;
-            destination.seal_object(name, &plaintext)
+            let plaintext = source_cipher.open(name, body).await?;
+            destination_cipher.seal(name, plaintext).await
         };
         let reseal = async |name: &ObjectKey, body: bytes::Bytes| {
             if name.as_str().strip_prefix(crate::store::GARBAGE_DIRECTORY).is_some_and(|path| path.starts_with('/')) {
@@ -1570,12 +1544,12 @@ async fn stage_cell_storage(
             source_bucket.as_ref(), &source.storage_prefix(), target_bucket.as_ref(), &staged.storage_prefix(), reseal,
         ).await?;
         Box::pin(crate::archive::materialize_serving_archive(
-            from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), destination_cipher.as_ref(), hosted_task.as_ref(),
+            from.directory.as_ref(), from.keys, source, staged, target_bucket.clone(), &destination_cipher, hosted_task.as_ref(),
         )).await?;
         if let Some(checkpoint) = staged.checkpoint {
             crate::reference::verify_block_pack(target_bucket.as_ref(), &staged.storage_prefix(), checkpoint.block).await?;
         }
-        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, destination_material.as_ref())).await?;
+        Box::pin(crate::archive::verify_cell_move_checkpoint(staged, target_bucket, &destination_cipher)).await?;
         Ok(())
     }.await;
     io.close_and_wait().await;
@@ -2592,8 +2566,9 @@ mod tests {
         let store = crate::reference::PrefixedStore::new(bucket.clone(), root);
         crate::store::check_root(&store, &record.id, true).await.unwrap();
         let packed = crate::packing::PackingStore::open(std::sync::Arc::new(store), crate::packing::PackDiscovery::List).await.unwrap();
-        let material = keys.key(&record.key_id()).await.unwrap();
-        let plaintext = crate::store::EncryptingStore::new(packed, &material).unwrap();
+        keys.key(&record.key_id()).await.unwrap();
+        let publications = crate::store::directory_publications(keys, &record, rtdb_storage::IoRegion::new()).unwrap();
+        let plaintext = crate::store::EncryptingStore::published(packed, publications);
         let epoch = StorageEpoch(record.log_epoch);
         let mut catalog = BlockCatalog::from_proto(proto::Block {
             block_index: Some(block),

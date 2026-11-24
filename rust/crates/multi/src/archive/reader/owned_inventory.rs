@@ -446,10 +446,9 @@ pub(crate) async fn activate_checkpoint_transfer_target(
             let staged = super::open_inventory(storage, keys, &record, stage, Arc::clone(&region)).await?;
             staged.require_serving_envelope()?;
             let memory = MemoryBudget::new(NodeOptions::default().execution_memory_bytes);
-            let material = keys.existing_key(&record.key_id()).await?
-                .ok_or_else(|| unavailable("The staged serving key is unavailable"))?;
+            let publications = crate::store::directory_publications(keys, &record, Arc::clone(&region))?;
             let raw = Arc::new(PrefixedStore::new(Arc::clone(&bucket), root.clone()));
-            let loose = EncryptingStore::new(raw.clone(), &material)?;
+            let loose = EncryptingStore::published(raw.clone(), publications.clone());
             let mut expected = std::collections::BTreeSet::from([key(ROOT_MARKER)?]);
             for member in staged.store.list(None).await? {
                 let body = PayloadBytes::read(staged.store.as_ref(), &member.key, &memory).await?;
@@ -464,7 +463,7 @@ pub(crate) async fn activate_checkpoint_transfer_target(
             let store = open_deployment_store(
                 bucket, &root, PackDiscovery::From(stage.checkpoint.block), wall_clock(),
             ).await?;
-            let plaintext = EncryptingStore::new(store, &material)?;
+            let plaintext = EncryptingStore::published(store, publications);
             recovery_manifest_sha256(&plaintext, stage.checkpoint, StorageEpoch(stage.source_log_epoch)).await
         },
     ).await?;

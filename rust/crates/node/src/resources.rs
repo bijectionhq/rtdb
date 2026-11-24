@@ -106,6 +106,7 @@ pub struct OpenedRecoveryStore {
     pub checkpoint_metadata: Option<Arc<dyn Send + Sync>>,
     /// Identity of the actual opened storage for delegated scans.
     pub fragment_storage: Option<Arc<str>>,
+    pub publication_sealing: Option<rtdb_storage::sealing::PublicationSealing>,
 }
 
 #[async_trait]
@@ -117,7 +118,7 @@ pub trait RemoteStorageFactory: Send + Sync {
     async fn open_for_recovery(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<OpenedRecoveryStore> {
         let store = self.open(configuration, storage_root, io).await?;
         let blocks = self.block_discovery(configuration).await?;
-        Ok(OpenedRecoveryStore { store, audience: None, blocks, checkpoint_metadata: None, fragment_storage: None })
+        Ok(OpenedRecoveryStore { store, audience: None, blocks, checkpoint_metadata: None, fragment_storage: None, publication_sealing: None })
     }
     /// These provider configurations use the Classic installation's key authority.
     fn uses_classic_custody(&self) -> bool { false }
@@ -126,7 +127,7 @@ pub trait RemoteStorageFactory: Send + Sync {
     /// factory may opt out to avoid retaining an extra physical copy.
     fn use_disk_cache(&self) -> bool { true }
     /// Wraps the ordinary disk view and any audience view admitted by `open_for_recovery`.
-    async fn wrap_stores(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>, _audience: Option<Arc<dyn ObjectStore>>) -> Result<OpenedServingStores> {
+    async fn wrap_stores(&self, _configuration: &Any, cached: Arc<dyn ObjectStore>, _audience: Option<Arc<dyn ObjectStore>>, _publication_sealing: Option<rtdb_storage::sealing::PublicationSealing>) -> Result<OpenedServingStores> {
         Ok(OpenedServingStores { ordinary: cached, audience: None })
     }
     /// Identifies the raw objects returned by `open` before `wrap_stores`.
@@ -368,7 +369,7 @@ impl ResourceFactory for NativeResources {
                     } else {
                         remote
                     };
-                    let opened = factory.wrap_stores(configuration, storage, opened.audience).await?;
+                    let opened = factory.wrap_stores(configuration, storage, opened.audience, opened.publication_sealing).await?;
                     audience_storage = opened.audience;
                     match classic_keys {
                         Some(keys) => Arc::new(rtdb_storage::sealing::ClassicKeyVault::wrap(opened.ordinary, keys)?),

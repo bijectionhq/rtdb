@@ -192,6 +192,9 @@ impl DynamoKeyService {
 
 #[async_trait::async_trait]
 impl KeyService for DynamoKeyService {
+    fn retained_unit_ledger(&self, scope: UnitScope, io: Arc<IoRegion>) -> Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>> {
+        Ok(Arc::new(super::UnitLedger::new(Arc::new(self.clone()), scope, io)))
+    }
     async fn grant_deployment_key(
         &self,
         id: &str,

@@ -171,6 +171,9 @@ impl S3KeyService {
 
 #[async_trait::async_trait]
 impl KeyService for S3KeyService {
+    fn retained_unit_ledger(&self, scope: UnitScope, io: Arc<IoRegion>) -> Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>> {
+        Ok(Arc::new(super::UnitLedger::new(Arc::new(self.clone()), scope, io)))
+    }
     async fn grant_deployment_key(&self, id: &str, binding: [u8; KEY_BYTES]) -> rtdb_storage::Result<super::UnitOutput> {
         let material = self.existing_key(id).await.map_err(super::journal::key_error)?;
         super::delivery::require_deployment_key(material, binding)?;

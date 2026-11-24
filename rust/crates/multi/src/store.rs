@@ -1,7 +1,7 @@
-//! A deployment's object store as a node sees it (contract `ObjectStorage`): fenced by the holder's epoch, encrypted under the deployment's key, and unable to delete.
+//! A deployment's object store as a node sees it (contract `ObjectStorage`): fenced by the holder's epoch, sealed under individually enrolled publication slots, and unable to delete.
 //!
 //! - `FencedStore` checks current directory authority before admitting each write (`ZombiesCannotDamageStorage`).
-//! - `EncryptingStore` seals objects with AES-256-GCM under the deployment's key, bound to the object name.
+//! - `EncryptingStore` seals objects with AES-256-GCM with provider-owned keys bound to the publication and object name.
 //! - `GarbageStore` turns a delete into a garbage record; only the reaper erases an object, once it has been garbage for the grace period (`OnlyTheReaperDeletes`, `ReapUnreachable`).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,7 +30,7 @@ use crate::catalog_readers::CatalogReaders;
 use crate::deployment::CellStorage;
 use crate::keys::{DeploymentDelivery, KeyService, UnitLedger, UnitOperation, UnitOutput, UnitScope};
 pub use rtdb_storage::sealing::EncryptingStore;
-use rtdb_storage::sealing::ObjectCipher;
+use rtdb_storage::sealing::{ObjectCipher, PublicationSealing};
 use crate::checkpoint_retention::checkpoint_metadata_collectable;
 use crate::ordered_index_storage::{self, HostedIndexPages};
 use crate::reference::custody::ReferenceReads;
@@ -59,6 +59,20 @@ pub(crate) fn stays_in_source_residence(name: &str) -> bool {
                 || (record.starts_with('/') && record.ends_with(TRIE_RETIREMENT_RELEASE)))
 }
 
+pub(crate) fn directory_publications(keys: &dyn KeyService, record: &DeploymentRecord, region: Arc<IoRegion>) -> Result<PublicationSealing> {
+    use ring::digest::{Context, SHA256};
+
+    let ledger = keys.retained_unit_ledger(UnitScope::directory_serving(&record.org, &record.lineage), region)?;
+    let mut origin = Context::new(&SHA256);
+    origin.update(b"rtdb.multi/serving-publication-residence/v1\0");
+    origin.update(record.storage_prefix().as_bytes());
+    let origin = origin.finish().as_ref().try_into().expect("SHA-256 width");
+    Ok(PublicationSealing::new(ledger, origin, |name| {
+        (!name.as_str().starts_with('~') || rtdb_format::keys::is_trie_retirement_object(name.as_str()))
+            && ordered_index_storage::page_generation(name.as_str()).is_none()
+    }))
+}
+
 
 /// The deployment store a node opens, carried in its `DatabaseConfig`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +93,7 @@ pub struct CellStoreConfig {
 
 impl CellStoreConfig {
     fn cache_identity(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(&("framed-trie-data-v1", &self.storage, &self.prefix, &self.deployment))
+        serde_json::to_vec(&("directory-publication-envelope-v1", &self.storage, &self.prefix, &self.deployment))
             .map_err(|error| Anomaly::fault("rtdb.multi/cache-identity", error.to_string()))
     }
 }
@@ -226,12 +240,14 @@ impl RemoteStorageFactory for CellStoreFactory {
         let blocks = discovery_from_admitted_record(&config, &record)?;
         let fragment_storage = crate::fragments::storage_identity(self.storage_namespaces.objects, &record);
         let checkpoint_metadata: Arc<dyn Send + Sync> = Arc::new(checkpoint_metadata);
-        let (opened, audience_reads) = IoRegion::reading(rtdb_storage::HeldView::recovery(Arc::clone(&checkpoint_metadata)), async {
+        let (opened, audience_reads, publications) = IoRegion::reading(rtdb_storage::HeldView::recovery(Arc::clone(&checkpoint_metadata)), async {
             let recovery = if storage_root.as_str() == crate::archive::checkpoint_storage_root()? {
                 crate::archive::ArchivedCheckpoint::load(&record, self.keys.as_ref(), owner, region.clone(), audience_writer).await?
             } else {
                 None
             };
+            let mut publications = directory_publications(self.keys.as_ref(), &record, Arc::clone(&region))?;
+            if let Some(recovery) = &recovery { publications = publications.with_archive(recovery.object_cipher()); }
             if record.storage_namespaces.is_some() {
                 crate::deployment::require_storage_namespaces(&record, self.storage_namespaces)?;
             }
@@ -276,9 +292,7 @@ impl RemoteStorageFactory for CellStoreFactory {
             }
             if let Some(expected) = record.recovery_manifest_sha256 {
                 let checkpoint = record.checkpoint.ok_or_else(|| storage_region_error("A recovery manifest has no checkpoint"))?;
-                let material = self.keys.existing_key(&record.key_id()).await?
-                    .ok_or_else(|| storage_region_error("The recovery manifest's serving key is unavailable"))?;
-                let plaintext = EncryptingStore::new(opened.clone(), &material)?;
+                let plaintext = EncryptingStore::published(opened.clone(), publications.clone());
                 if crate::archive::recovery_manifest_sha256(&plaintext, checkpoint, rtdb_types::StorageEpoch(record.log_epoch)).await? != expected {
                     return Err(storage_region_error("The recovery inventory does not match the directory receipt"));
                 }
@@ -288,11 +302,11 @@ impl RemoteStorageFactory for CellStoreFactory {
             serving.catalog_readers = Some(CatalogReaders::new(
                 self.directory.clone(), self.storage_regions.clone(), &record, storage_root.to_string(), self.storage_namespaces, owner, config.writer_epoch,
             ));
-            Ok::<_, Anomaly>((opened, audience_reads))
+            Ok::<_, Anomaly>((opened, audience_reads, publications))
         }).await?;
         let store: Arc<dyn ObjectStore> = opened;
         let audience = audience_reads.then(|| Arc::clone(&store));
-        Ok(OpenedRecoveryStore { store, audience, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage) })
+        Ok(OpenedRecoveryStore { store, audience, blocks, checkpoint_metadata: Some(checkpoint_metadata), fragment_storage: Some(fragment_storage), publication_sealing: Some(publications) })
     }
 
     fn cache_identity<'a>(&self, configuration: &'a Any) -> Result<std::borrow::Cow<'a, [u8]>> {
@@ -301,8 +315,8 @@ impl RemoteStorageFactory for CellStoreFactory {
         Ok(std::borrow::Cow::Owned(store.cache_identity()?))
     }
 
-    /// Both views use the key of the same admitted storage residence. The ordinary disk cache holds ciphertext.
-    async fn wrap_stores(&self, configuration: &Any, cached: Arc<dyn ObjectStore>, audience: Option<Arc<dyn ObjectStore>>) -> Result<OpenedServingStores> {
+    /// Both views use the same admitted publication slots. The disk cache holds ciphertext.
+    async fn wrap_stores(&self, configuration: &Any, cached: Arc<dyn ObjectStore>, audience: Option<Arc<dyn ObjectStore>>, publications: Option<PublicationSealing>) -> Result<OpenedServingStores> {
         let config: CellStoreConfig = serde_json::from_slice(&configuration.value)
             .map_err(|error| Anomaly::incorrect("rtdb.multi/storage-config", format!("Cell storage configuration is malformed: {error}")))?;
         let record = self.directory.deployment(&config.deployment).await?
@@ -323,9 +337,13 @@ impl RemoteStorageFactory for CellStoreFactory {
             deployment: Cipher::new(&material)?,
             delivery: DeploymentDelivery::new(self.keys.clone(), id, &material),
         });
-        let ordinary = Arc::new(EncryptingStore::with_units(cached, Arc::clone(&keys)));
+        let publications = match publications {
+            Some(publications) => publications,
+            None => directory_publications(self.keys.as_ref(), &record, IoRegion::new())?,
+        };
+        let ordinary = Arc::new(EncryptingStore::with_units(cached, Arc::clone(&keys)).with_publications(publications.clone()));
         let audience = audience.zip(self.audience_writer(&config, &record)).map(|(store, source)| {
-            let store = Arc::new(AudienceObjectStore(EncryptingStore::with_units(store, keys)));
+            let store = Arc::new(AudienceObjectStore(EncryptingStore::with_units(store, keys).with_publications(publications)));
             AudienceReadStorage { source, store }
         });
         Ok(OpenedServingStores { ordinary, audience })
@@ -2275,20 +2293,20 @@ mod tests {
         }).unwrap() };
         let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         for writer_epoch in [None, Some(1)] {
-            let result = factory.wrap_stores(&configuration(writer_epoch), cached.clone(), None).await;
+            let result = factory.wrap_stores(&configuration(writer_epoch), cached.clone(), None, None).await;
             assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
         }
         assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
-        factory.wrap_stores(&configuration(Some(2)), cached.clone(), None).await.unwrap();
+        factory.wrap_stores(&configuration(Some(2)), cached.clone(), None, None).await.unwrap();
         assert!(keys.existing_key(&record.key_id()).await.unwrap().is_some());
-        factory.wrap_stores(&configuration(None), cached.clone(), None).await.unwrap();
+        factory.wrap_stores(&configuration(None), cached.clone(), None, None).await.unwrap();
 
         std::fs::remove_file(root.path().join("keys").join(format!("{}.key", record.key_id()))).unwrap();
         crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
             record.replica_journals.insert("replica".into());
             Ok(())
         }).await.unwrap();
-        let result = factory.wrap_stores(&configuration(Some(2)), cached, None).await;
+        let result = factory.wrap_stores(&configuration(Some(2)), cached, None, None).await;
         assert!(matches!(result, Err(error) if error.code == "rtdb.multi/key-missing"));
         assert_eq!(keys.existing_key(&record.key_id()).await.unwrap(), None);
     }
@@ -2321,13 +2339,13 @@ mod tests {
         }).unwrap() };
         let cached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
         let uncached: Arc<dyn ObjectStore> = Arc::new(MemoryStore::default());
-        let stores = factory.wrap_stores(&configuration(Some(2)), cached.clone(), Some(uncached.clone())).await.unwrap();
+        let stores = factory.wrap_stores(&configuration(Some(2)), cached.clone(), Some(uncached.clone()), None).await.unwrap();
         let audience = stores.audience.unwrap();
         assert_eq!(audience.source, Uuid::parse_str(&record.id).unwrap());
-        let material = keys.existing_key(&record.key_id()).await.unwrap().unwrap();
+        let publications = directory_publications(keys.as_ref(), &record, IoRegion::new()).unwrap();
         let object = key("blocks/b00.binpb");
         let bytes = Bytes::from_static(b"catalog");
-        EncryptingStore::new(uncached.clone(), &material).unwrap().put(&object, bytes.clone()).await.unwrap();
+        EncryptingStore::published(uncached.clone(), publications).put(&object, bytes.clone()).await.unwrap();
         assert!(matches!(stores.ordinary.get(&object).await, Err(Error::MissingObject(_))));
         let allocation = audience.store.whole_object_allocation(&object, bytes.len()).unwrap();
         let peak = allocation.retained_bytes + allocation.scratch_bytes;
@@ -2343,9 +2361,9 @@ mod tests {
         assert_eq!(pool.pool_retained_bytes(), 0);
         assert!(matches!(audience.store.get(&object).await, Err(Error::Closed(_))));
 
-        let unsupported = factory.wrap_stores(&configuration(Some(2)), cached.clone(), None).await.unwrap();
+        let unsupported = factory.wrap_stores(&configuration(Some(2)), cached.clone(), None, None).await.unwrap();
         assert!(unsupported.audience.is_none());
-        let stale = factory.wrap_stores(&configuration(Some(1)), cached, Some(uncached)).await.unwrap();
+        let stale = factory.wrap_stores(&configuration(Some(1)), cached, Some(uncached), None).await.unwrap();
         assert!(stale.audience.is_none());
     }
 

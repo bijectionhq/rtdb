@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::{ObservedPack, PackStorage, covered_pack, eligible};
 use crate::archive;
-use crate::cipher::Cipher;
+use rtdb_storage::{IoRegion, sealing::PublicationSealing};
 use crate::deployment::CellStorage;
 use crate::keys::KeyService;
 use crate::packing::{PACK_DIRECTORY, block_pack, pack_block};
@@ -175,14 +175,14 @@ async fn authorize(
     {
         return Ok(());
     }
-    let (Some(anchor), Some(material)) = (record.replica_anchor.as_deref(), keys.existing_key(&record.key_id()).await?)
+    let Some(anchor) = record.replica_anchor.as_deref()
         else { return Ok(()); };
     if record.required_replica_offsets(now_ms()).any(|first| first <= anchor.interval[1]) {
         return Ok(());
     }
     let references = References::scan(bucket, &directory.deployments().await?).await?;
     if references.has_declared_reference(&target) { return Ok(()); }
-    let cipher = Cipher::new(&material)?;
+    let cipher = crate::store::directory_publications(keys, &record, IoRegion::new())?;
     let terminal = match publication {
         Publication::Version(_) => None,
         Publication::Tombstone { allocation, .. } => {
@@ -246,7 +246,7 @@ async fn observe_pack<'a>(bucket: &'a dyn ObjectStore, terminal: Option<&'a Neve
 
 async fn successor_present(
     bucket: &dyn ObjectStore, terminal: Option<&NeverVersionedRetirement<'_>>,
-    store: &str, checkpoint: Checkpoint, cipher: &Cipher,
+    store: &str, checkpoint: Checkpoint, cipher: &PublicationSealing,
 ) -> Result<bool> {
     let root = block_key(BlockIndex(checkpoint.block))?;
     let pack = key(&format!("{store}/{}", block_pack(&root)))?;

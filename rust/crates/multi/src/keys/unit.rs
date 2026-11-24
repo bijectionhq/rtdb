@@ -72,6 +72,15 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
+    pub(crate) fn directory_serving(org: &str, lineage: &str) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/directory-serving-scope/v1\0");
+        digest.update(org.as_bytes());
+        digest.update(b"\0");
+        digest.update(lineage.as_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {

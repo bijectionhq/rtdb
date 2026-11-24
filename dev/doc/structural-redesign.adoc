@@ -233,8 +233,8 @@ Directory-managed replica journal frames use independently registered slots. A c
 Classic Kafka database logs seal frames before enqueueing and use the original vault lineage bound to the broker topic ID. The vault records the exact frame at each acknowledged offset and retires recorded slots below a confirmed broker floor.
 Classic offline repair-anchor reclamation withdraws the exact sealed local-log frame slots before overwriting their ciphertext and preserves the replica boundary.
 Directory-managed ordered-index pages use per-page slots in their admitted generation. The index custodian withdraws the entire generation, including unplaced slots, before ciphertext collection.
-Directory cell moves open serving objects and pack members under the source key and reseal them under an independently provisioned destination residence key. The rebuilt pack keeps its predecessor links and publication time.
-Other live directory serving objects and per-unit retirement outside coordinated releases remain open.
+Directory-managed serving objects carry their original publication slot through packing and same-domain forks. Independent forks, cell moves and stage activation open authenticated source publications and reseal every serving member into a destination slot. Archive overlays use the admitted archive slots.
+Exact withdrawal of directory serving slots after the last reference, including abandoned publications, remains open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

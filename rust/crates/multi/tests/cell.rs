@@ -3162,6 +3162,11 @@ struct InterruptedInstall {
 
 #[async_trait::async_trait]
 impl KeyService for InterruptedInstall {
+    fn retained_unit_ledger(&self, scope: rtdb_multi::keys::UnitScope, io: Arc<rtdb_storage::IoRegion>)
+        -> rtdb_types::Result<Arc<dyn rtdb_storage::sealing::ObjectCipher>>
+    {
+        self.keys.retained_unit_ledger(scope, io)
+    }
     fn custody_namespace(&self) -> rtdb_types::Result<String> { self.keys.custody_namespace() }
     fn hold_local_storage_region(&self, region: uuid::Uuid) -> rtdb_types::Result<Option<std::fs::File>> { self.keys.hold_local_storage_region(region) }
     fn local_storage_region_drained(&self, region: uuid::Uuid) -> rtdb_types::Result<bool> { self.keys.local_storage_region_drained(region) }

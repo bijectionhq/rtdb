@@ -3,6 +3,8 @@
 pub mod cipher;
 mod classic;
 mod delivery;
+mod publication;
+pub use publication::{PublicationSealing, PUBLICATION_ID_BYTES};
 pub use delivery::{DeliveryDeadline, DeliveryIo, current_delivery_deadline, PlaintextDelivery, PlaintextDependencies, PlaintextScopes, PlaintextView, drain_unit_delivery};
 pub(crate) use classic::LOG_SEAL_OVERHEAD;
 pub use classic::{ClassicKeyVault, ClassicObjectKeys, KAFKA_LOG_SEAL_OVERHEAD};
@@ -54,12 +56,17 @@ pub enum UnitOperation {
     Frames(FramedObject, Range<usize>, Bytes),
     SealValue(String, Bytes),
     OpenValue(String, Bytes),
+    AtLogicalName(ObjectKey, Box<UnitOperation>),
     Grant,
 }
 
 impl UnitOperation {
     pub fn provisions(&self) -> bool {
-        matches!(self, Self::Seal(_) | Self::SealValue(..))
+        match self {
+            Self::Seal(_) | Self::SealValue(..) => true,
+            Self::AtLogicalName(_, operation) => operation.provisions(),
+            _ => false,
+        }
     }
 
     pub fn apply(self, key: &Cipher, name: &ObjectKey) -> crate::Result<UnitOutput> {
@@ -82,6 +89,7 @@ impl UnitOperation {
             Self::OpenValue(associated, sealed) => {
                 key.open(&associated, &sealed).map(UnitOutput::Bytes)
             }
+            Self::AtLogicalName(logical, operation) => operation.apply(key, &logical),
         }
     }
 }
@@ -120,6 +128,7 @@ impl UnitOutput {
 pub struct EncryptingStore {
     inner: Arc<dyn ObjectStore>,
     keys: ObjectKeys,
+    published: Option<PublicationSealing>,
     classic_control: Option<ObjectKey>,
 }
 
@@ -133,6 +142,7 @@ impl EncryptingStore {
         Ok(Self {
             inner,
             keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: None },
+            published: None,
             classic_control: None,
         })
     }
@@ -144,6 +154,7 @@ impl EncryptingStore {
         Ok(Self {
             inner,
             keys: ObjectKeys::Deployment { cipher: Cipher::new(key)?, delivery: Some(authority) },
+            published: None,
             classic_control: None,
         })
     }
@@ -152,8 +163,33 @@ impl EncryptingStore {
         Self {
             inner,
             keys: ObjectKeys::Units(ledger),
+            published: None,
             classic_control: None,
         }
+    }
+
+    pub fn with_publications(mut self, published: PublicationSealing) -> Self {
+        self.published = Some(published);
+        self
+    }
+
+    pub fn published(inner: Arc<dyn ObjectStore>, sealing: PublicationSealing) -> Self {
+        Self::with_units(inner, sealing.ledger()).with_publications(sealing)
+    }
+
+    fn publication(&self, key: &ObjectKey) -> Option<&PublicationSealing> {
+        self.published.as_ref().filter(|scope| scope.applies(key))
+    }
+
+    fn sealed_size(&self, key: &ObjectKey, length: usize) -> crate::Result<usize> {
+        object::sealed_size(key, length)?.checked_add(self.publication(key).map_or(0, |_| PUBLICATION_ID_BYTES))
+            .ok_or_else(|| Error::Task("Sealed publication length overflow".into()))
+    }
+
+    fn plain(&self, stored: StoredObject) -> crate::Result<StoredObject> {
+        let overhead = self.publication(&stored.key).map_or(0, |_| PUBLICATION_ID_BYTES as u64);
+        let body = stored.size.checked_sub(overhead).ok_or_else(|| Error::ConflictingObject(stored.key.to_string()))?;
+        Ok(StoredObject { size: object::plaintext_size(&stored.key, body)?, ..stored })
     }
     fn with_classic_control(mut self, marker: ObjectKey) -> Self {
         self.classic_control = Some(marker);
@@ -180,13 +216,26 @@ impl EncryptingStore {
     }
 
     async fn seal(&self, key: &ObjectKey, plaintext: Bytes) -> crate::Result<Bytes> {
+        if let Some(publication) = self.publication(key) {
+            return publication.seal(key, plaintext).await;
+        }
         self.crypt(key, UnitOperation::Seal(plaintext))
             .await?
             .bytes()
     }
 
     async fn open(&self, key: &ObjectKey, sealed: Bytes) -> crate::Result<Bytes> {
+        if let Some(publication) = self.publication(key) {
+            return publication.open(key, sealed).await;
+        }
         self.crypt(key, UnitOperation::Open(sealed)).await?.bytes()
+    }
+
+    async fn open_retained(&self, key: &ObjectKey, sealed: RetainedBytes) -> crate::Result<Bytes> {
+        if let Some(publication) = self.publication(key) {
+            return publication.open_retained(key, sealed).await;
+        }
+        self.crypt(key, UnitOperation::OpenRetained(sealed)).await?.bytes()
     }
 
     async fn seal_missing(&self, key: &ObjectKey, bytes: Bytes) -> crate::Result<Option<Bytes>> {
@@ -203,19 +252,24 @@ impl EncryptingStore {
         key: &ObjectKey,
         range: Range<u64>,
     ) -> crate::Result<ObjectObservation<Bytes>> {
-        use object::{FRAME_BYTES, SEALED_HEADER_BYTES, sealed_size};
+        use object::{FRAME_BYTES, SEALED_HEADER_BYTES};
 
         let head = self.inner.observe_head(key).await?;
+        let publication = self.publication(key);
+        let prefix = publication.map_or(0, |_| PUBLICATION_ID_BYTES as u64);
         let header = self
             .inner
-            .observe_range(key, 0..SEALED_HEADER_BYTES as u64)
+            .observe_range(key, 0..prefix + SEALED_HEADER_BYTES as u64)
             .await?;
-        let layout = self
-            .crypt(key, UnitOperation::Header(header.value))
-            .await?
-            .header()?;
+        let (layout, origin) = match publication {
+            Some(publication) => {
+                let (layout, origin) = publication.header(key, header.value).await?;
+                (layout, Some((publication, origin)))
+            }
+            None => (self.crypt(key, UnitOperation::Header(header.value)).await?.header()?, None),
+        };
         if header.version != head.version
-            || head.value.size != sealed_size(key, layout.length())? as u64
+            || head.value.size != self.sealed_size(key, layout.length())? as u64
         {
             return Err(Error::ConflictingObject(key.to_string()));
         }
@@ -226,17 +280,19 @@ impl EncryptingStore {
                 version: header.version,
             });
         }
+        let physical = layout.physical_range(&frames);
         let sealed = self
             .inner
-            .observe_range(key, layout.physical_range(&frames))
+            .observe_range(key, prefix + physical.start..prefix + physical.end)
             .await?;
         if sealed.version != header.version {
             return Err(Error::ConflictingObject(key.to_string()));
         }
-        let plaintext = self
-            .crypt(key, UnitOperation::Frames(layout, frames, sealed.value))
-            .await?
-            .bytes()?;
+        let operation = UnitOperation::Frames(layout, frames, sealed.value);
+        let plaintext = match origin {
+            Some((publication, origin)) => publication.operate(key, origin, operation).await?,
+            None => self.crypt(key, operation).await?,
+        }.bytes()?;
         let start = range.start as usize % FRAME_BYTES;
         let end = start + (range.end - range.start) as usize;
         let bytes = plaintext
@@ -247,13 +303,6 @@ impl EncryptingStore {
             version: sealed.version,
         })
     }
-}
-
-fn plain(stored: StoredObject) -> crate::Result<StoredObject> {
-    Ok(StoredObject {
-        size: object::plaintext_size(&stored.key, stored.size)?,
-        ..stored
-    })
 }
 
 #[async_trait]
@@ -346,10 +395,10 @@ impl ObjectStore for EncryptingStore {
         self.inner.release_search_run(key, publication, cut).await
     }
     async fn head(&self, key: &ObjectKey) -> crate::Result<StoredObject> {
-        self.inner.head(key).await.and_then(plain)
+        self.inner.head(key).await.and_then(|stored| self.plain(stored))
     }
     async fn head_fresh(&self, key: &ObjectKey) -> crate::Result<StoredObject> {
-        self.inner.head_fresh(key).await.and_then(plain)
+        self.inner.head_fresh(key).await.and_then(|stored| self.plain(stored))
     }
     async fn observe_head(
         &self,
@@ -357,7 +406,7 @@ impl ObjectStore for EncryptingStore {
     ) -> crate::Result<ObjectObservation<StoredObject>> {
         let observed = self.inner.observe_head(key).await?;
         Ok(ObjectObservation {
-            value: plain(observed.value)?,
+            value: self.plain(observed.value)?,
             version: observed.version,
         })
     }
@@ -367,7 +416,7 @@ impl ObjectStore for EncryptingStore {
     ) -> crate::Result<BTreeMap<ObjectKey, ObjectObservation<StoredObject>>> {
         let mut observed = self.inner.observe_heads(keys).await?;
         for head in observed.values_mut() {
-            head.value.size = object::plaintext_size(&head.value.key, head.value.size)?;
+            head.value.size = self.plain(head.value.clone())?.size;
         }
         Ok(observed)
     }
@@ -394,7 +443,7 @@ impl ObjectStore for EncryptingStore {
         key: &ObjectKey,
         length: usize,
     ) -> crate::Result<ObjectReadAllocation> {
-        let sealed = object::sealed_size(key, length)?;
+        let sealed = self.sealed_size(key, length)?;
         let source = self.inner.whole_object_allocation(key, sealed)?;
         let scratch_bytes = source
             .retained_bytes
@@ -418,20 +467,19 @@ impl ObjectStore for EncryptingStore {
                 "Encrypted object read has no retained reservation".into(),
             ));
         }
-        let sealed_length = object::sealed_size(key, reservation.length())?;
+        let sealed_length = self.sealed_size(key, reservation.length())?;
         let allocation = self.inner.whole_object_allocation(key, sealed_length)?;
         let source = reservation.take_scratch_read(sealed_length, allocation)?;
         let sealed = reservation
             .retaining_io(self.inner.get_reserved_object(key, source))
             .await?;
         let plaintext = reservation
-            .retaining_io(self.crypt(key, UnitOperation::OpenRetained(sealed)))
-            .await?
-            .bytes()?;
+            .retaining_io(self.open_retained(key, sealed))
+            .await?;
         reservation.finish(plaintext)
     }
     async fn get_fresh_exact(&self, key: &ObjectKey, length: usize) -> crate::Result<Bytes> {
-        let exact = object::sealed_size(key, length)?;
+        let exact = self.sealed_size(key, length)?;
         self.open(key, self.inner.get_fresh_exact(key, exact).await?)
             .await
     }
@@ -440,7 +488,7 @@ impl ObjectStore for EncryptingStore {
         key: &ObjectKey,
         length: usize,
     ) -> crate::Result<ObjectReadAllocation> {
-        let sealed = object::sealed_size(key, length)?;
+        let sealed = self.sealed_size(key, length)?;
         let scratch_bytes = sealed
             .checked_mul(3)
             .ok_or_else(|| Error::Task("Encrypted object allocation size overflow".into()))?;
@@ -454,7 +502,7 @@ impl ObjectStore for EncryptingStore {
         key: &ObjectKey,
         length: usize,
     ) -> crate::Result<ObjectObservation<Bytes>> {
-        let exact = object::sealed_size(key, length)?;
+        let exact = self.sealed_size(key, length)?;
         let observed = self.inner.observe_fresh_exact(key, exact).await?;
         Ok(ObjectObservation {
             value: self.open(key, observed.value).await?,
@@ -542,7 +590,7 @@ impl ObjectStore for EncryptingStore {
         let expanded = length
             .checked_add(2 * (object::FRAME_BYTES - 1))
             .ok_or_else(overflow)?;
-        let scratch_bytes = object::sealed_size(key, expanded)?
+        let scratch_bytes = self.sealed_size(key, expanded)?
             .checked_mul(4)
             .ok_or_else(overflow)?;
         Ok(ObjectReadAllocation {
@@ -619,7 +667,7 @@ impl ObjectStore for EncryptingStore {
             .await?
             .into_iter()
             .filter(|object| self.classic_control.as_ref() != Some(&object.key))
-            .map(plain)
+            .map(|stored| self.plain(stored))
             .collect()
     }
     async fn delete(&self, key: &ObjectKey) -> crate::Result<()> {

@@ -43,6 +43,7 @@ use rtdb_format::{
 };
 use rtdb_storage::{
     object_store::StoredObject,
+    sealing::{ObjectCipher, PUBLICATION_ID_BYTES, PublicationSealing},
     Error,
     IoRegion,
     ObjectKey,
@@ -70,7 +71,6 @@ use uuid::Uuid;
 
 use crate::{
     admin::{administration_stream, await_storage_drain, update_installation},
-    cipher::Cipher,
     deployment::CellStorage,
     keys::{ArchiveKey, KeyService},
     packing::PackDiscovery,
@@ -182,7 +182,7 @@ pub(crate) struct ArchivedCheckpoint {
     audience_transport: bool,
     objects: BTreeMap<ObjectKey, ArchivedObject>,
     archive_cipher: Arc<dyn ArchiveKey>,
-    serving_cipher: Cipher,
+    serving_cipher: PublicationSealing,
 }
 
 /// Select the repair in the same directory observation that authorizes its I/O.
@@ -317,28 +317,22 @@ impl ArchivedCheckpoint {
             .map(|object| Ok((key(&object.name)?, object)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let legacy_trie = objects.iter().any(|(key, object)| object.is_legacy_trie(key));
-        if legacy_trie && record.serving_replay_capture.is_some() {
+        if legacy_trie {
             return Err(inconsistent("Serving replay requires authenticated frame inventory"));
         }
         Ok(Some(Self {
             files: PrefixedStore::new(bucket, format!("{prefix}/objects")),
-            audience_transport: audience_transport && !legacy_trie,
+            audience_transport,
             objects,
-            archive_cipher: archive_key(keys, &capture.point, region).await?,
-            serving_cipher: Cipher::new(&keys.existing_key(&record.key_id()).await?
-                .ok_or_else(|| unavailable("The current installation key is unavailable"))?)?,
+            archive_cipher: archive_key(keys, &capture.point, Arc::clone(&region)).await?,
+            serving_cipher: crate::store::directory_publications(keys, record, region)?,
         }))
     }
 
+    pub(crate) fn object_cipher(&self) -> Arc<dyn ObjectCipher> { self.archive_cipher.clone() }
+
     pub(crate) fn supports_audience_reads(&self) -> bool {
         self.audience_transport
-    }
-
-    fn require_transferable(&self) -> Result<()> {
-        if self.objects.iter().any(|(name, object)| object.is_legacy_trie(name)) {
-            return Err(unavailable("Cell transfer requires framed trie data in the selected serving archive"));
-        }
-        Ok(())
     }
 
     async fn verify_serving_transfer_envelopes(&self, raw: &dyn ObjectStore) -> Result<()> {
@@ -358,38 +352,27 @@ impl ArchivedCheckpoint {
         object.open(self.archive_cipher.as_ref(), name, ciphertext).await
     }
 
-    async fn seal_for_serving(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
-        let plaintext = self.read_plaintext(name, object).await?;
-        self.serving_cipher.seal_object(name, &plaintext)
+    async fn archived_envelope(&self, name: &ObjectKey, object: &ArchivedObject) -> rtdb_storage::Result<Bytes> {
+        object.require_audience_frame(name)?;
+        let sealed = read_object(&self.files, name, object).await?;
+        Ok(PublicationSealing::archived(sealed))
     }
 
     async fn observe_frame_range(&self, name: &ObjectKey, object: &ArchivedObject, range: Range<u64>) -> rtdb_storage::Result<ObjectObservation<Bytes>> {
-        use crate::cipher::object::{SEALED_HEADER_BYTES, sealed_size};
+        use crate::cipher::object::SEALED_HEADER_BYTES;
 
-        let expected = object.frame_header_sha256.as_ref()
-            .ok_or_else(|| Error::Closed("The retained trie has no authenticated ranges".into()))?;
-        let header_range = 0..SEALED_HEADER_BYTES as u64;
-        let header = self.files.observe_range(name, header_range.clone()).await?;
-        if *expected != digest(&header.value) {
+        let prefix = PUBLICATION_ID_BYTES as u64;
+        if range == (0..prefix + SEALED_HEADER_BYTES as u64) {
+            let header = self.files.observe_range(name, 0..SEALED_HEADER_BYTES as u64).await?;
+            if object.frame_header_sha256.as_deref() != Some(digest(&header.value).as_str()) {
+                return Err(Error::ConflictingObject(name.to_string()));
+            }
+            return Ok(ObjectObservation { value: PublicationSealing::archived(header.value), version: header.version });
+        }
+        if range.start < prefix || range.start > range.end || range.end > object.serving_bytes(name)? {
             return Err(Error::ConflictingObject(name.to_string()));
         }
-        let layout = self.archive_cipher.open_frame_header(name, header.value).await?;
-        if sealed_size(name, layout.length())? as u64 != object.bytes {
-            return Err(Error::ConflictingObject(name.to_string()));
-        }
-        if range == header_range {
-            return Ok(ObjectObservation { value: layout.seal_header(&self.serving_cipher, name)?, version: header.version });
-        }
-
-        let frames = layout.selected_frames(name, &range)?;
-        let archived = self.files.observe_range(name, range.clone()).await?;
-        if archived.version != header.version {
-            return Err(Error::ConflictingObject(name.to_string()));
-        }
-        let mut value = Vec::with_capacity(archived.value.len());
-        let plaintext = self.archive_cipher.open_frames(name, layout, frames.clone(), archived.value).await?;
-        layout.seal_frames(&self.serving_cipher, name, frames.start, &plaintext, &mut value)?;
-        Ok(ObjectObservation { value: value.into(), version: archived.version })
+        self.files.observe_range(name, range.start - prefix..range.end - prefix).await
     }
 
     pub(crate) fn contains_original(&self, name: &ObjectKey) -> bool {
@@ -398,7 +381,7 @@ impl ArchivedCheckpoint {
 
     pub(crate) async fn matches_original(&self, name: &ObjectKey, original: &Bytes) -> rtdb_storage::Result<bool> {
         let Some(object) = self.objects.get(name) else { return Ok(false); };
-        let plaintext = self.serving_cipher.open_retained_object(name, original)?;
+        let plaintext = self.serving_cipher.open(name, original.clone()).await?;
         if object.plaintext_bytes(name)? != plaintext.len() as u64 { return Ok(false); }
         Ok(self.read_plaintext(name, object).await? == plaintext)
     }
@@ -416,7 +399,7 @@ impl ArchivedCheckpoint {
         &self,
         record: &DeploymentRecord,
         destination: Arc<dyn ObjectStore>,
-        destination_cipher: &Cipher,
+        destination_cipher: &PublicationSealing,
     ) -> Result<()> {
         let checkpoint = record
             .checkpoint
@@ -435,12 +418,14 @@ impl ArchivedCheckpoint {
         for (name, object) in &self.objects {
             let plaintext = self.read_plaintext(name, object).await?;
             match serving.get(name).await {
-                Ok(bytes) if destination_cipher.open_object(name, &bytes)? == plaintext => continue,
-                Ok(_) => return Err(Error::ConflictingObject(name.to_string()).into()),
+                Ok(bytes) => {
+                    if destination_cipher.open(name, bytes).await? == plaintext { continue; }
+                    return Err(Error::ConflictingObject(name.to_string()).into());
+                }
                 Err(Error::MissingObject(_)) => {},
                 Err(error) => return Err(error.into()),
             }
-            let ciphertext = destination_cipher.seal_object(name, &plaintext)?;
+            let ciphertext = destination_cipher.seal(name, plaintext).await?;
             if name.as_str().starts_with("blocks/") && rtdb_format::keys::block_index_from_key(name.as_str()).is_ok() {
                 roots.push((name, ciphertext));
             } else {
@@ -456,40 +441,36 @@ impl ArchivedCheckpoint {
 }
 
 async fn verify_transfer_envelope(
-    raw: &dyn ObjectStore, cipher: &Cipher, name: &ObjectKey, object: ObjectObservation<StoredObject>,
+    raw: &dyn ObjectStore, cipher: &PublicationSealing, name: &ObjectKey, object: ObjectObservation<StoredObject>,
 ) -> Result<()> {
-    use crate::cipher::object::{FramedObject, SEALED_HEADER_BYTES, sealed_size};
+    use crate::cipher::object::{SEALED_HEADER_BYTES, sealed_size};
 
     let unframed = || unavailable("Cell transfer requires authenticated frames in checkpoint trie files");
-    if object.value.size < SEALED_HEADER_BYTES as u64 { return Err(unframed()); }
-    let header = raw.observe_range(name, 0..SEALED_HEADER_BYTES as u64).await?;
-    let layout = FramedObject::open_header(cipher, name, &header.value).map_err(|_| unframed())?;
-    if object.version != header.version || object.value.size != sealed_size(name, layout.length())? as u64 {
+    let header_len = (PUBLICATION_ID_BYTES + SEALED_HEADER_BYTES) as u64;
+    if object.value.size < header_len { return Err(unframed()); }
+    let header = raw.observe_range(name, 0..header_len).await?;
+    let (layout, _) = cipher.header(name, header.value).await.map_err(|_| unframed())?;
+    if object.version != header.version || object.value.size != sealed_size(name, layout.length())? as u64 + PUBLICATION_ID_BYTES as u64 {
         return Err(unframed());
     }
     Ok(())
 }
 
 pub(crate) async fn verify_cell_move_checkpoint(
-    record: &DeploymentRecord, bucket: Arc<dyn ObjectStore>, material: Option<&[u8; crate::keys::KEY_BYTES]>,
+    record: &DeploymentRecord, bucket: Arc<dyn ObjectStore>, cipher: &PublicationSealing,
 ) -> Result<()> {
     let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
     let physical = PrefixedStore::new(bucket.clone(), root.clone());
     crate::store::check_root(&physical, &record.id, false).await?;
     let Some(checkpoint) = record.checkpoint else { return Ok(()); };
-    let material = material.ok_or_else(|| {
-        Anomaly::fault("rtdb.multi/transfer-key", "The transfer checkpoint has no installation key")
-    })?;
     let raw = open_deployment_store(bucket, &root, PackDiscovery::From(checkpoint.block), wall_clock()).await?;
-    let cipher = Cipher::new(material)?;
-    let plaintext = EncryptingStore::new(raw.clone(), material)?;
+    let plaintext = EncryptingStore::published(raw.clone(), cipher.clone());
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&key(&block_key(BlockIndex(checkpoint.block))?)?).await?)?;
     verify_cut(&catalog, checkpoint, StorageEpoch(record.log_epoch))?;
     let closure = catalog_objects(&plaintext, &catalog, CheckpointContents::Replay).await?;
     let tries = closure.iter().filter_map(|(name, digest)| digest.is_none().then_some(name));
     futures::stream::iter(tries.map(Ok)).try_for_each_concurrent(16, |name| {
         let raw = raw.as_ref();
-        let cipher = &cipher;
         async move {
             if crate::cipher::object::framed(name) {
                 verify_transfer_envelope(raw, cipher, name, raw.observe_head(name).await?).await?;
@@ -523,7 +504,6 @@ pub(crate) async fn require_transferable_serving_archive(
         |record, owner, io| Box::pin(async move {
             let retained = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io.clone(), false)).await?
                 .ok_or_else(|| inconsistent("The transfer lost its admitted serving archive"))?;
-            retained.require_transferable()?;
             let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
             let discovery = record.checkpoint.map_or(PackDiscovery::List, |checkpoint| PackDiscovery::From(checkpoint.block));
             let raw = open_deployment_store(storage.bucket(io).await?, &root, discovery, wall_clock()).await?;
@@ -541,11 +521,10 @@ pub(crate) async fn materialize_serving_archive(
     source: &DeploymentRecord,
     target: &DeploymentRecord,
     destination: Arc<dyn ObjectStore>,
-    destination_cipher: Option<&Cipher>,
+    destination_cipher: &PublicationSealing,
     hosted_task: Option<&rtdb_directory::HostedTask>,
 ) -> Result<()> {
     let Some(selected) = serving_archive(source)? else { return Ok(()); };
-    let destination_cipher = destination_cipher.ok_or_else(|| inconsistent("The move has no destination serving key"))?;
     let archive: CellStorage = serde_json::from_str(selected.archive)
         .map_err(|_| inconsistent("Invalid retained archive binding"))?;
     Box::pin(stage::with_region(
@@ -565,7 +544,6 @@ pub(crate) async fn materialize_serving_archive(
         |record, owner, io| Box::pin(async move {
             let repair = Box::pin(ArchivedCheckpoint::load(&record, keys, owner, io, false)).await?
                 .ok_or_else(|| inconsistent("The source lost its admitted repair"))?;
-            repair.require_transferable()?;
             Box::pin(repair.materialize(target, destination, destination_cipher)).await
         }),
     )).await
@@ -578,6 +556,8 @@ struct CheckpointStore {
 
 #[async_trait::async_trait]
 impl ObjectStore for CheckpointStore {
+    fn permits_shared_read_cache(&self) -> bool { false }
+
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool {
         !self.archive.objects.contains_key(key) && self.serving.supports_scan_ranges(key)
     }
@@ -632,8 +612,7 @@ impl ObjectStore for CheckpointStore {
             return Err(Error::ConflictingObject(key.to_string()));
         }
         let observed = observe_archive_object(&self.archive.files, key, object).await?;
-        let plaintext = object.open(self.archive.archive_cipher.as_ref(), key, observed.value).await?;
-        let value = self.archive.serving_cipher.seal_object(key, &plaintext)?;
+        let value = PublicationSealing::archived(observed.value);
         Ok(ObjectObservation { value, version: observed.version })
     }
 
@@ -668,7 +647,7 @@ impl ObjectStore for CheckpointStore {
 
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         match self.archive.objects.get(key) {
-            Some(object) => self.archive.seal_for_serving(key, object).await,
+            Some(object) => self.archive.archived_envelope(key, object).await,
             None => self.serving.get(key).await,
         }
     }
@@ -692,7 +671,7 @@ impl ObjectStore for CheckpointStore {
 
     async fn get_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         match self.archive.objects.get(key) {
-            Some(object) => self.archive.seal_for_serving(key, object).await,
+            Some(object) => self.archive.archived_envelope(key, object).await,
             None => self.serving.get_fresh(key).await,
         }
     }
@@ -720,7 +699,7 @@ impl ObjectStore for CheckpointStore {
                 length,
             });
         }
-        let bytes = self.archive.seal_for_serving(key, object).await?;
+        let bytes = self.archive.archived_envelope(key, object).await?;
         Ok(Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]))
     }
 
@@ -745,7 +724,7 @@ impl ObjectStore for CheckpointStore {
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> {
         if let Some(object) = self.archive.objects.get(key) {
-            let plaintext = self.archive.serving_cipher.open_object(key, &bytes)?;
+            let plaintext = self.archive.serving_cipher.open(key, bytes.clone()).await?;
             if self.archive.read_plaintext(key, object).await? != plaintext {
                 return Err(Error::ConflictingObject(key.to_string()));
             }
@@ -853,13 +832,12 @@ impl ArchivedObject {
     }
 
     fn serving_bytes(&self, name: &ObjectKey) -> rtdb_storage::Result<u64> {
-        let length = usize::try_from(self.plaintext_bytes(name)?)
-            .map_err(|_| Error::ConflictingObject(name.to_string()))?;
-        Ok(crate::cipher::object::sealed_size(name, length)? as u64)
+        self.bytes.checked_add(PUBLICATION_ID_BYTES as u64)
+            .ok_or_else(|| Error::ConflictingObject(name.to_string()))
     }
 
     async fn open(&self, cipher: &dyn ArchiveKey, name: &ObjectKey, sealed: Bytes) -> rtdb_storage::Result<Bytes> {
-        if self.frame_header_sha256.is_some() {
+        if !self.is_legacy_trie(name) {
             cipher.open_object(name, sealed).await
         } else {
             cipher.open(name.as_str(), sealed).await
@@ -1439,21 +1417,6 @@ impl CheckpointCopySource {
         }
         Ok(observed.value)
     }
-
-    async fn retained_plaintext_size(&self, store: &dyn ObjectStore, cipher: &Cipher) -> Result<usize> {
-        use crate::cipher::object::{SEALED_HEADER_BYTES, framed};
-
-        let header = if framed(&self.name) && self.observed_bytes >= SEALED_HEADER_BYTES {
-            let observed = store.observe_range(&self.name, 0..SEALED_HEADER_BYTES as u64).await?;
-            if observed.version != self.version || observed.value.len() != SEALED_HEADER_BYTES {
-                return Err(inconsistent("Checkpoint source publication changed during envelope inspection"));
-            }
-            observed.value
-        } else {
-            Bytes::new()
-        };
-        Ok(cipher.retained_plaintext_size(&self.name, self.observed_bytes, &header)?)
-    }
 }
 
 pub(crate) async fn ordered_checkpoint_sources(
@@ -1483,6 +1446,7 @@ async fn plan_checkpoint_copy(
         if batch.is_empty() { break; }
         for source in observe_checkpoint_batch(store, batch).await? {
             if let Some(remaining) = &mut archive_budget {
+                source.witness.require_extent(source.observed_bytes as u64)?;
                 let sealed = crate::cipher::object::sealed_size(&source.name, source.observed_bytes)?;
                 *remaining = crate::checkpoint_copy_budget::remaining_after_sealing(
                     *remaining, source.observed_bytes as u64, (sealed - source.observed_bytes) as u64,
@@ -1492,26 +1456,6 @@ async fn plan_checkpoint_copy(
         }
     }
     Ok(sources)
-}
-
-async fn replay_archive_plaintext_sizes(store: &dyn ObjectStore, sources: &[CheckpointCopySource], cipher: &Cipher,
-    capacity: u64,
-) -> Result<Vec<usize>> {
-    let exceeds_budget = || unavailable("Checkpoint exceeds the archive byte budget");
-    // Old trie ciphertext can grow when the archive adds frames.
-    sources.iter().try_fold(capacity, |remaining, source| {
-        crate::checkpoint_copy_budget::remaining_after_sealing(remaining, source.observed_bytes as u64, 0)
-    }).ok_or_else(exceeds_budget)?;
-    let mut sizes = Vec::with_capacity(sources.len());
-    let mut remaining = capacity;
-    for source in sources {
-        let size = source.retained_plaintext_size(store, cipher).await?;
-        let length = crate::cipher::object::sealed_size(&source.name, size)?;
-        remaining = crate::checkpoint_copy_budget::remaining_after_sealing(remaining, size as u64, (length - size) as u64)
-            .ok_or_else(exceeds_budget)?;
-        sizes.push(size);
-    }
-    Ok(sizes)
 }
 
 /// Generic deployment forks cannot adopt governed custody. Verify the
@@ -1534,8 +1478,8 @@ fn verify_plain_fork_catalog(
 /// Called under the source lineage reservation. Verify every logical
 /// dependency and attach only its containing physical unit to the fork.
 pub(crate) async fn reference_fork_checkpoint(
-    bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, source_key: &[u8],
-    child: &DeploymentRecord, selected: i64,
+    bucket: Arc<dyn ObjectStore>, source: &DeploymentRecord, keys: &dyn KeyService,
+    child: &DeploymentRecord, selected: i64, io: Arc<IoRegion>,
 ) -> Result<()> {
     let version = checkpoint_storage_root()?;
     let root = format!("{}/{version}", source.storage_prefix());
@@ -1546,7 +1490,7 @@ pub(crate) async fn reference_fork_checkpoint(
     }
     let source_base = Base::load(bucket.as_ref(), &root).await?;
     let source_store = open_deployment_store(bucket.clone(), &root, PackDiscovery::From(selected), wall_clock()).await?;
-    let plaintext = EncryptingStore::new(source_store.clone(), source_key)?;
+    let plaintext = EncryptingStore::published(source_store.clone(), crate::store::directory_publications(keys, source, Arc::clone(&io))?);
     let catalog_key = key(&block_key(BlockIndex(selected))?)?;
     let catalog = BlockCatalog::decode(&plaintext.get_fresh(&catalog_key).await?)?;
     verify_plain_fork_catalog(source, selected, &catalog)?;
@@ -1577,7 +1521,7 @@ pub(crate) async fn reference_fork_checkpoint(
     }
     base.initialize(bucket.as_ref(), &child_root).await?;
     let store = open_deployment_store(bucket, &child_root, PackDiscovery::List, wall_clock()).await?;
-    let target = EncryptingStore::new(store, source_key)?;
+    let target = EncryptingStore::published(store, crate::store::directory_publications(keys, child, io)?);
     // Bootstrap lists roots in a fork before it publishes its first
     // checkpoint. An enclosing pack must not expose a later parent root.
     let blocks = target.list(Some(&key("blocks")?)).await?;
@@ -1604,10 +1548,10 @@ pub(crate) async fn reference_fork_checkpoint(
 pub(crate) async fn copy_fork_checkpoint(
     bucket: Arc<dyn ObjectStore>,
     source: &DeploymentRecord,
-    source_key: &[u8],
+    keys: &dyn KeyService,
     child: &DeploymentRecord,
-    child_key: &[u8],
     at_block: Option<i64>,
+    io: Arc<IoRegion>,
 ) -> Result<()> {
     let selected = at_block.or_else(|| source.checkpoint.map(|checkpoint| checkpoint.block))
         .ok_or_else(|| unavailable("The source has no checkpoint to copy"))?;
@@ -1624,7 +1568,7 @@ pub(crate) async fn copy_fork_checkpoint(
     let source_store = open_deployment_store(
         bucket.clone(), &source_root, PackDiscovery::From(selected), wall_clock(),
     ).await?;
-    let plaintext = EncryptingStore::new(source_store, source_key)?;
+    let plaintext = EncryptingStore::published(source_store, crate::store::directory_publications(keys, source, Arc::clone(&io))?);
     let block = BlockIndex(selected);
     let catalog_key = key(&block_key(block)?)?;
     let root_source = CheckpointCopySource::observe(&plaintext, catalog_key.clone(), None).await?;
@@ -1637,12 +1581,12 @@ pub(crate) async fn copy_fork_checkpoint(
     let physical = Arc::new(PrefixedStore::new(bucket, destination_root));
     crate::store::check_root(physical.as_ref(), &child.id, true).await?;
     let packed = crate::packing::PackingStore::open(physical, PackDiscovery::List).await?;
-    let cipher = Cipher::new(child_key)?;
+    let destination = EncryptingStore::published(packed, crate::store::directory_publications(keys, child, io)?);
     for source in sources {
         let content = source.read(&plaintext).await?;
-        packed.put(&source.name, cipher.seal_object(&source.name, &content)?).await?;
+        destination.put(&source.name, content).await?;
     }
-    packed.put(&catalog_key, cipher.seal_object(&catalog_key, &catalog_bytes)?).await?;
+    destination.put(&catalog_key, catalog_bytes).await?;
     Ok(())
 }
 
@@ -1968,10 +1912,10 @@ async fn capture_registered(
         return Err(unavailable("The capture's original checkpoint metadata is no longer retained"));
     }
 
-    let serving_material = keys.existing_key(&record.key_id()).await?
-        .ok_or_else(|| unavailable("The source key is unavailable"))?;
     let archive_cipher = keys.archive_key(&archive_key_id(&point), true, Arc::clone(&io)).await?;
     let recovery = ArchivedCheckpoint::load(record, keys, region, io.clone(), false).await?;
+    let mut publications = crate::store::directory_publications(keys, record, io.clone())?;
+    if let Some(recovery) = &recovery { publications = publications.with_archive(recovery.object_cipher()); }
     // A local sweep and this source read share the maintenance witness. The
     // provider keeps its clone during a read even if this copy is cancelled.
     let maintenance = storage.try_local_maintenance()?;
@@ -1998,13 +1942,11 @@ async fn capture_registered(
         recovery,
     )
     .await?;
-    let plaintext = EncryptingStore::new(sealed.clone(), &serving_material)?;
+    let plaintext = EncryptingStore::published(sealed, publications);
     let format = CheckpointContents::Replay;
     let closure = checkpoint_objects(&plaintext, &point, format).await?;
 
-    let sources = plan_checkpoint_copy(sealed.as_ref(), closure, None).await?;
-    let serving_cipher = Cipher::new(&serving_material)?;
-    let sizes = replay_archive_plaintext_sizes(sealed.as_ref(), &sources, &serving_cipher, MAXIMUM_BYTES).await?;
+    let sources = plan_checkpoint_copy(&plaintext, closure, Some(MAXIMUM_BYTES)).await?;
     if let (Some(bucket), Some(task)) = (source_scope.as_deref(), hosted_task)
         && source_hold.as_ref().is_some_and(|hold| hold.lineage == record.lineage)
         && let Some((own, inherited)) = capture_source_holds(directory, bucket, &sources, record, &version).await?
@@ -2044,15 +1986,8 @@ async fn capture_registered(
         release_capture_lineage(directory, source_hold).await?;
     }
     let mut objects = Vec::with_capacity(sources.len());
-    for (source, size) in sources.into_iter().zip(sizes) {
-        let observed = source.read_observed(sealed.as_ref()).await?;
-        let content = serving_cipher.open_retained_object(&source.name, &observed)?;
-        if content.len() != size {
-            return Err(inconsistent("Checkpoint source envelope changed during copying"));
-        }
-        source.witness.require_extent(content.len() as u64)?;
-        require_bound_metadata(source.witness.digest, &content)?;
-        drop(observed);
+    for source in sources {
+        let content = source.read(&plaintext).await?;
         let object = source.name;
         let ciphertext = archive_cipher.seal_object(&object, content).await?;
         let archived = ArchivedObject::from_sealed(&object, &ciphertext)?;
@@ -2803,6 +2738,7 @@ pub async fn finish_retirement(
 
 #[cfg(test)]
 mod tests {
+    use crate::cipher::Cipher;
     use super::*;
     use rtdb_directory::{DisposalReceipt, MemoryDirectory};
 
@@ -2933,84 +2869,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_replay_archive_still_serves_its_exact_recovery_inventory() -> Result<()> {
-        let fixture = replay_fixture()?;
-        let raw: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
-        let files = PrefixedStore::new(raw.clone(), "capture/objects");
-        let material = [3; crate::keys::KEY_BYTES];
-        let archive_cipher = Cipher::new(&material)?;
-        let mut objects = BTreeMap::new();
-        for (name, plaintext) in &fixture.files {
-            let sealed = archive_cipher.seal_deterministic(name.as_str(), plaintext)?;
-            objects.insert(name.clone(), ArchivedObject {
-                name: name.to_string(), bytes: sealed.len() as u64, sha256: digest(&sealed), frame_header_sha256: None,
-            });
-            files.put(name, sealed).await?;
-        }
-        let capture = Capture { point: fixture.point, format: CheckpointContents::Replay, objects: objects.values().cloned().collect() };
-        let encoded = encode(&capture)?;
-        let loaded = serde_json::from_slice::<Capture>(&encoded).unwrap();
-        assert_eq!(encode(&loaded)?, encoded);
-        let archive_cipher = crate::keys::legacy_archive_key(&material)?;
-        loaded.verify(raw, "capture", &archive_cipher).await?;
-
-        let serving_material = [7; crate::keys::KEY_BYTES];
-        let archive = ArchivedCheckpoint { files, audience_transport: false, objects, archive_cipher,
-            serving_cipher: Cipher::new(&serving_material)? };
-        let name = &fixture.retained[0];
-        let expected = &fixture.files[name];
-        let legacy = archive.serving_cipher.seal_deterministic(name.as_str(), expected)?;
-        assert!(archive.matches_original(name, &legacy).await?);
-        assert!(!archive.supports_audience_reads());
-        let transfer = archive.require_transferable().unwrap_err();
-        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires framed trie data in the selected serving archive"));
-        let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
-        let plaintext = EncryptingStore::new(serving.clone(), &serving_material)?;
-        assert!(!plaintext.supports_scan_ranges(name));
-        assert!(plaintext.whole_object_allocation(name, expected.len())?.scratch_bytes > expected.len());
-        assert_eq!(plaintext.observe_head(name).await?.value.size, expected.len() as u64);
-        assert_eq!(plaintext.observe_fresh_exact(name, expected.len()).await?.value, *expected);
-        assert!(plaintext.get_range(name, 0..3).await.is_err());
-        assert_eq!(plaintext.get(name).await?, *expected);
-        let directory = tempfile::tempdir().unwrap();
-        let cache = rtdb_storage::disk_cache::DiskCache::open(directory.path(), 1 << 20,
-            rtdb_columnar::MemoryBudget::new(1 << 20))?;
-        let cached = cache.scope(key("live-envelope")?, serving)?;
-        assert_eq!(EncryptingStore::new(cached, &serving_material)?.get(name).await?, *expected);
-        let expected_inventory = rtdb_storage::MemoryStore::default();
-        for (name, bytes) in &fixture.files { expected_inventory.put(name, bytes.clone()).await?; }
-        assert_eq!(
-            recovery_manifest_sha256(&plaintext, loaded.point.checkpoint, StorageEpoch(0)).await?,
-            recovery_manifest_sha256(&expected_inventory, loaded.point.checkpoint, StorageEpoch(0)).await?,
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn a_legacy_archive_range_observation_carries_its_authenticated_version() -> Result<()> {
-        let name = key("tables/t/data/l00-rc-b00.arrow")?;
-        let provider = Arc::new(crate::packing::tests::VersionedPacks::default());
-        let files = PrefixedStore::new(provider, "capture/objects");
-        let archive_cipher = Cipher::new(&[3; crate::keys::KEY_BYTES])?;
-        let serving_cipher = Cipher::new(&[7; crate::keys::KEY_BYTES])?;
-        let original = archive_cipher.seal_deterministic(name.as_str(), b"retained rows")?;
-        files.put(&name, original.clone()).await?;
-        let version = files.observe_head(&name).await?.version.unwrap();
-        let expected = serving_cipher.seal_object(&name, b"retained rows")?;
-        let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
-        let archive = ArchivedCheckpoint { files, audience_transport: false, archive_cipher, serving_cipher,
-            objects: BTreeMap::from([(name.clone(), ArchivedObject {
-                name: name.to_string(), bytes: original.len() as u64, sha256: digest(&original), frame_header_sha256: None,
-            })]) };
-        let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
-        assert!(!serving.supports_scan_ranges(&name) && !serving.supports_observed_scan_ranges(&name));
-        let observed = serving.observe_range(&name, 0..8).await?;
-        assert_eq!(observed.version, Some(version));
-        assert_eq!(observed.value, expected.slice(..8));
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn serving_recovery_manifest_requires_the_complete_inventory_and_stable_versions() -> Result<()> {
         let fixture = replay_fixture()?;
         let store = crate::packing::tests::VersionedPacks::default();
@@ -3074,139 +2932,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_checkpoint_preflight_accounts_for_the_new_frames() -> Result<()> {
-        let source = rtdb_storage::MemoryStore::default();
-        let name = key("tables/t/data/l00-rc-b00.arrow")?;
-        let cipher = Cipher::new(&[5; crate::keys::KEY_BYTES])?;
-        let body = vec![8; crate::cipher::object::FRAME_BYTES + 1];
-        let sealed = cipher.seal_deterministic(name.as_str(), &body)?;
-        let legacy_size = sealed.len() as u64;
-        source.put(&name, sealed).await?;
-        let framed_size = crate::cipher::object::sealed_size(&name, body.len())? as u64;
-        let sources = plan_checkpoint_copy(&source, BTreeMap::from([(name, None)]), None).await?;
-        let refused = replay_archive_plaintext_sizes(&source, &sources, &cipher, legacy_size).await.unwrap_err();
-        assert_eq!(refused.message.as_deref(), Some("Checkpoint exceeds the archive byte budget"));
-        assert_eq!(replay_archive_plaintext_sizes(&source, &sources, &cipher, framed_size).await?, [body.len()]);
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn a_transferred_checkpoint_requires_its_trie_metadata() -> Result<()> {
         let fixture = replay_fixture()?;
-        let material = [5; crate::keys::KEY_BYTES];
-        let cipher = Cipher::new(&material)?;
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path())?;
         let mut record = DeploymentRecord::new("orders", "acme", Vec::new(), 0);
         record.checkpoint = Some(fixture.point.checkpoint);
+        let cipher = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
         let bucket: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::MemoryStore::default());
         let raw = PrefixedStore::new(bucket.clone(), format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?));
         let metadata = &fixture.retained[1];
         for (name, bytes) in fixture.files.iter().filter(|(name, _)| *name != metadata) {
-            raw.put(name, cipher.seal_object(name, bytes)?).await?;
+            raw.put(name, cipher.seal(name, bytes.clone()).await?).await?;
         }
-        let absent = verify_cell_move_checkpoint(&record, bucket.clone(), Some(&material)).await.unwrap_err();
+        let absent = verify_cell_move_checkpoint(&record, bucket.clone(), &cipher).await.unwrap_err();
         assert_eq!(absent.code, "rtdb.storage/missing-object");
 
-        raw.put(metadata, cipher.seal_object(metadata, &fixture.files[metadata])?).await?;
-        verify_cell_move_checkpoint(&record, bucket, Some(&material)).await
+        raw.put(metadata, cipher.seal(metadata, fixture.files[metadata].clone()).await?).await?;
+        verify_cell_move_checkpoint(&record, bucket, &cipher).await
     }
 
     #[tokio::test]
-    async fn a_parked_checkpoint_with_an_unframed_pack_can_adopt_a_framed_replay_archive() -> Result<()> {
-        let fixture = replay_fixture()?;
-        let location = tempfile::tempdir().unwrap();
-        let storage = CellStorage::Local { root: location.path().join("serving") };
-        let archive = CellStorage::Local { root: location.path().join("archive") };
-        let keys = crate::keys::LocalKeyService::with_archive_broker(location.path().join("keys"))?;
-        let directory = MemoryDirectory::new();
-        let mut record = DeploymentRecord::new("orders", "acme", Vec::new(), 0);
-        let deployment = record.id.parse().unwrap();
-        let operation = Uuid::new_v4();
-        let checkpoint = fixture.point.checkpoint;
-        record.checkpoint = Some(checkpoint);
-        record.recovery_manifest_sha256 = Some([1; 32]);
-        let bucket = storage.bucket(IoRegion::new()).await?;
-        let root = format!("{}/{}", record.storage_prefix(), checkpoint_storage_root()?);
-        let physical = PrefixedStore::new(bucket.clone(), &root);
-        crate::store::check_root(&physical, &record.id, true).await?;
-        let material = keys.key(&record.key_id()).await?;
-        let cipher = Cipher::new(&material)?;
-        let packed = open_deployment_store(bucket.clone(), &root, PackDiscovery::List, wall_clock()).await?;
-        let legacy = &fixture.retained[0];
-        for (name, body) in fixture.files.iter().filter(|(name, _)| *name != &fixture.root) {
-            let sealed = if name == legacy { cipher.seal_deterministic(name.as_str(), body)? } else { cipher.seal_object(name, body)? };
-            packed.put(name, sealed).await?;
-        }
-        packed.put(&fixture.root, cipher.seal_object(&fixture.root, &fixture.files[&fixture.root])?).await?;
-        let pack = key(&crate::packing::block_pack(fixture.root.as_str()))?;
-        let original = physical.get(&pack).await?;
-        let before = EncryptingStore::new(packed, &material)?;
-        assert!(before.get(legacy).await.is_err());
-        let transfer = verify_cell_move_checkpoint(&record, bucket.clone(), Some(&material)).await.unwrap_err();
-        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires authenticated frames in checkpoint trie files"));
-        directory.create_deployment(record).await?;
-
-        let captured = capture(directory.clone(), &storage, &archive, &keys, deployment, operation, None, None).await?;
-        assert_eq!(captured.point.checkpoint, checkpoint);
-        assert!(captured.objects.iter().find(|member| member.name == legacy.as_str()).unwrap().frame_header_sha256.is_some());
-
-        let old = CapturePoint { operation: Uuid::new_v4(), ..captured.point.clone() };
-        let old_key = keys.archive_key(&archive_key_id(&old), true, IoRegion::new()).await?;
-        let archive_bucket = archive.bucket(IoRegion::new()).await?;
-        let old_prefix = format!("checkpoint-captures/{deployment}/{}", old.operation);
-        let old_scope = PrefixedStore::new(archive_bucket.clone(), &old_prefix);
-        let mut objects = Vec::new();
-        for (name, body) in &fixture.files {
-            let bytes = old_key.seal(name.as_str(), body.clone()).await?;
-            objects.push(ArchivedObject { name: name.to_string(), bytes: bytes.len() as u64, sha256: digest(&bytes), frame_header_sha256: None });
-            old_scope.put(&key(&format!("objects/{name}"))?, bytes).await?;
-        }
-        let old_capture = Capture { point: old.clone(), objects, format: CheckpointContents::Replay };
-        old_capture.verify(archive_bucket, &old_prefix, &old_key).await?;
-        old_scope.put(&key("capture.json")?, encode(&old_capture)?).await?;
-        let binding = archive_binding(&archive)?;
-        let namespace = keys.namespace_id().await?;
-        let manifest = old_capture.manifest_sha256()?;
-        update_installation(directory.as_ref(), &deployment.to_string(), |record| {
-            record.checkpoint_captures.insert(old.operation, CheckpointCapture {
-                archive: binding.clone(), key_namespace: Some(namespace), incarnation: record.incarnation,
-                log_epoch: record.log_epoch, checkpoint, automatic_fork: false, world_replay: None,
-                media_bound: true, manifest_sha256: Some(manifest.clone()), remote_disposal: None,
-            });
-            record.checkpoint_recovery = Some(Box::new(CheckpointRecovery {
-                operation: old.operation, checkpoint, epoch: record.epoch, previous_lifecycle: Lifecycle::Live,
-                archive: binding.clone(), manifest_sha256: manifest.clone(), completed_at_ms: Some(1),
-            }));
-            record.recovery_manifest_sha256 = None;
-            Ok(())
-        }).await?;
-
-        let replay = Uuid::new_v4();
-        let framed = capture(directory.clone(), &storage, &archive, &keys, deployment, replay, None, None).await?;
-        let current = directory.deployment(&deployment.to_string()).await?.unwrap();
-        retain_serving_replay(directory.as_ref(), &storage, &archive, &keys, &current, replay, &framed.manifest_sha256()?, None).await?;
-        let adopted = directory.deployment(&deployment.to_string()).await?.unwrap();
-        assert_eq!(adopted.serving_replay_capture, Some(replay));
-        assert!(adopted.recovery_manifest_sha256.is_some());
-        assert!(retain_serving_replay(directory.as_ref(), &storage, &archive, &keys, &adopted,
-            operation, &captured.manifest_sha256()?, None).await.is_err());
-        assert_eq!(adopted.checkpoint, Some(checkpoint));
-        let current = directory.deployment(&deployment.to_string()).await?.unwrap();
-        let transfer = require_transferable_serving_archive(directory.as_ref(), &storage, &keys, &current, None).await.unwrap_err();
-        assert_eq!(transfer.message.as_deref(), Some("Cell transfer requires authenticated frames in checkpoint trie files"));
-        let current = directory.deployment(&deployment.to_string()).await?.unwrap();
-        assert_eq!(current.lifecycle, Lifecycle::Live);
-        let reopened = with_replay_archive(directory.as_ref(), &storage, &keys, &current, None, |_, _, replay| async {
-            let raw = open_deployment_store_with_archive(bucket, &root, PackDiscovery::From(checkpoint.block), wall_clock(), Some(replay)).await?;
-            let serving = EncryptingStore::new(raw, &material)?;
-            Ok(serving.get(legacy).await?)
-        }).await?;
-        assert_eq!(reopened.as_ref(), Some(&fixture.files[legacy]));
-        assert_eq!(physical.get(&pack).await?, original);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn an_older_repair_reads_complete_trie_objects_only_under_ordinary_custody() -> Result<()> {
+    async fn a_legacy_archive_cannot_be_mounted_in_serving_storage() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let archive = CellStorage::Local { root: temp.path().join("archive") };
         let keys = crate::keys::LocalKeyService::new(temp.path().join("keys"))?;
@@ -3219,7 +2966,6 @@ mod tests {
         let binding = archive_binding(&archive)?;
         let name = key("tables/orders/data/l00-rc-b00.arrow")?;
         let body = Bytes::from(vec![7; crate::cipher::object::FRAME_BYTES + 19]);
-        let material = keys.key(&record.key_id()).await?;
         let legacy_key = keys.key(&archive_key_id(&point)).await?;
         let sealed = Cipher::new(&legacy_key)?.seal_deterministic(name.as_str(), &body)?;
         let capture = Capture {
@@ -3252,21 +2998,8 @@ mod tests {
             checkpoint_metadata_from: None, checkpoint_replay_from: None,
         });
 
-        let repair = ArchivedCheckpoint::load(&record, &keys, region, IoRegion::new(), true).await?.unwrap();
-        assert!(!repair.supports_audience_reads());
-        let store = Arc::new(EncryptingStore::new(repair.with_serving(Arc::new(rtdb_storage::MemoryStore::default())), &material)?);
-        assert!(!store.supports_scan_ranges(&name));
-        assert!(matches!(store.get_range(&name, 0..1).await, Err(Error::Closed(_))));
-        assert!(matches!(IoRegion::audience_object_read(store.get_fresh_exact(&name, body.len())).await,
-            Err(Error::Closed(_))));
-        let pool = rtdb_storage::cache::BufferPool::new(store, 1 << 20);
-        let memory = rtdb_types::MemoryBudget::new(1 << 20);
-        assert_eq!(pool.get_or(&name, &memory).await?.as_slice(), body.as_ref());
-
-        record.serving_replay_capture = Some(operation);
-        let refused = ArchivedCheckpoint::load(&record, &keys, region, IoRegion::new(), false).await;
-        assert_eq!(refused.err().and_then(|error| error.message).as_deref(),
-            Some("Serving replay requires authenticated frame inventory"));
+        let refused = ArchivedCheckpoint::load(&record, &keys, region, IoRegion::new(), true).await;
+        assert!(refused.is_err());
         Ok(())
     }
 
@@ -3283,7 +3016,8 @@ mod tests {
         let keys = crate::keys::LocalKeyService::with_archive_broker(vault.path())?;
         let id = "archived-trie-range";
         let archive_cipher = keys.archive_key(id, true, IoRegion::new()).await?;
-        let material = [7; crate::keys::KEY_BYTES];
+        let record = DeploymentRecord::new("serving", "acme", vec![], 0);
+        let publications = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
         let sealed = archive_cipher.seal_object(&name, Bytes::copy_from_slice(&plaintext)).await?;
         let files = PrefixedStore::new(Arc::clone(&raw), "capture/objects");
         files.put(&name, sealed.clone()).await?;
@@ -3294,12 +3028,13 @@ mod tests {
                 audience_transport: true,
                 objects: BTreeMap::from([(name.clone(), object)]),
                 archive_cipher: Arc::clone(&archive_cipher),
-                serving_cipher: Cipher::new(&material)?,
+                serving_cipher: publications.clone(),
             };
+            let publications = publications.clone().with_archive(archive.object_cipher());
             let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
             assert!(!serving.supports_scan_ranges(&name));
             assert!(serving.supports_observed_scan_ranges(&name));
-            EncryptingStore::new(serving, &material)
+            Ok(EncryptingStore::published(serving, publications))
         };
         let range = FRAME_BYTES - 11..FRAME_BYTES + 17;
         let store = read(archived.clone())?;
@@ -3318,15 +3053,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_original_matches_the_same_plaintext_in_a_framed_archive() -> Result<()> {
+    async fn a_serving_slot_matches_the_same_plaintext_in_a_framed_archive() -> Result<()> {
         let name = key("tables/t/data/l00-rc-b00.arrow")?;
         let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
-        let serving_cipher = Cipher::new(&[7; crate::keys::KEY_BYTES])?;
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path())?;
+        let record = DeploymentRecord::new("serving", "acme", vec![], 0);
+        let serving_cipher = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
         let ciphertext = archive_cipher.seal_object(&name, Bytes::from_static(b"first input")).await?;
         let files = PrefixedStore::new(Arc::new(rtdb_storage::MemoryStore::default()), "archive/objects");
         files.put(&name, ciphertext.clone()).await?;
-        let original = serving_cipher.seal_deterministic(name.as_str(), b"first input")?;
-        let substituted = serving_cipher.seal_deterministic(name.as_str(), b"other input")?;
+        let original = serving_cipher.seal(&name, Bytes::from_static(b"first input")).await?;
+        let substituted = serving_cipher.seal(&name, Bytes::from_static(b"other input")).await?;
         let archive = ArchivedCheckpoint {
             files, audience_transport: false,
             objects: BTreeMap::from([(name.clone(), ArchivedObject::from_sealed(&name, &ciphertext)?)]),
@@ -3342,7 +3080,10 @@ mod tests {
         let raw: Arc<dyn ObjectStore> = Arc::new(crate::packing::tests::VersionedPacks::default());
         let files = PrefixedStore::new(raw, "accepted-archive/objects");
         let name = key("covered")?;
-        let material = [7; crate::keys::KEY_BYTES];
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path())?;
+        let record = DeploymentRecord::new("serving", "acme", vec![], 0);
+        let serving_cipher = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
         let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
         let bytes = Bytes::from_static(b"accepted");
         let ciphertext = archive_cipher.seal(name.as_str(), bytes.clone()).await?;
@@ -3354,11 +3095,12 @@ mod tests {
                 name: name.to_string(), bytes: ciphertext.len() as u64, sha256: digest(&ciphertext), frame_header_sha256: None,
             })]),
             archive_cipher,
-            serving_cipher: Cipher::new(&material)?,
+            serving_cipher: serving_cipher.clone(),
         };
-        let store = EncryptingStore::new(
-            archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default())), &material,
-        )?;
+        let publications = serving_cipher.with_archive(archive.object_cipher());
+        let store = EncryptingStore::published(
+            archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default())), publications,
+        );
         let source = CheckpointCopySource::observe(&store, name.clone(), None).await?;
         assert_eq!(source.version.as_ref().map(|version| version.key.as_str()),
             Some("accepted-archive/objects/covered"), "repair bytes must name archive custody");
@@ -3393,23 +3135,38 @@ mod tests {
         let scope = |record: &DeploymentRecord| format!("{}/{version}", record.storage_prefix());
         let source_physical = PrefixedStore::new(bucket.clone(), scope(&source));
         crate::store::check_root(&source_physical, &source.id, true).await?;
-        let source_material = [3; crate::keys::KEY_BYTES];
-        let child_material = [7; crate::keys::KEY_BYTES];
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path())?;
         let serving = open_deployment_store(bucket.clone(), &scope(&source), PackDiscovery::List, wall_clock()).await?;
-        let source_store = EncryptingStore::new(serving, &source_material)?;
+        let source_store = EncryptingStore::published(serving, crate::store::directory_publications(&keys, &source, IoRegion::new())?);
         for (name, bytes) in fixture.files.iter().filter(|(name, _)| *name != &fixture.root) {
             source_store.put(name, bytes.clone()).await?;
         }
         source_store.put(&fixture.root, fixture.files[&fixture.root].clone()).await?;
-        copy_fork_checkpoint(bucket.clone(), &source, &source_material, &child, &child_material, None).await?;
+        let mut shared = DeploymentRecord::new("shared", "org", Vec::new(), 0);
+        shared.lineage = source.lineage.clone();
+        keys.key(&source.key_id()).await?;
+        reference_fork_checkpoint(bucket.clone(), &source, &keys, &shared, fixture.point.checkpoint.block, IoRegion::new()).await?;
+        keys.destroy(&source.key_id()).await?;
+        let parent_raw = open_deployment_store(bucket.clone(), &scope(&source), PackDiscovery::List, wall_clock()).await?;
+        let shared_raw = open_deployment_store(bucket.clone(), &scope(&shared), PackDiscovery::List, wall_clock()).await?;
+        let child_reader = EncryptingStore::published(shared_raw.clone(), crate::store::directory_publications(&keys, &shared, IoRegion::new())?);
+        for (name, bytes) in &fixture.files {
+            assert_eq!(parent_raw.get_fresh(name).await?, shared_raw.get_fresh(name).await?);
+            assert_eq!(&child_reader.get_fresh(name).await?, bytes);
+        }
+
+        copy_fork_checkpoint(bucket.clone(), &source, &keys, &child, None, IoRegion::new()).await?;
         let serving = open_deployment_store(bucket.clone(), &scope(&child), PackDiscovery::List, wall_clock()).await?;
-        let copied = EncryptingStore::new(serving, &child_material)?;
+        let copied = EncryptingStore::published(serving.clone(), crate::store::directory_publications(&keys, &child, IoRegion::new())?);
+        let original = crate::store::directory_publications(&keys, &source, IoRegion::new())?;
         for (name, bytes) in &fixture.files {
             assert_eq!(&copied.get_fresh(name).await.expect("the fork must contain every replay dependency"), bytes);
+            assert!(original.open(name, serving.get_fresh(name).await?).await.is_err());
         }
 
         source_physical.delete(&fixture.artefact).await?;
-        let failure = copy_fork_checkpoint(bucket.clone(), &source, &source_material, &incomplete, &child_material, None).await;
+        let failure = copy_fork_checkpoint(bucket.clone(), &source, &keys, &incomplete, None, IoRegion::new()).await;
         assert_eq!(failure.unwrap_err().code, "rtdb.storage/missing-object");
         let serving = open_deployment_store(bucket, &scope(&incomplete), PackDiscovery::List, wall_clock()).await?;
         assert!(matches!(serving.head_fresh(&fixture.root).await, Err(Error::MissingObject(_))),
@@ -3454,8 +3211,7 @@ mod tests {
         let physical = PrefixedStore::new(bucket.clone(), &root);
         crate::store::check_root(&physical, &record.id, true).await?;
         let packed = open_deployment_store(bucket, &root, PackDiscovery::List, wall_clock()).await?;
-        let material = keys.key(&record.key_id()).await?;
-        let source = EncryptingStore::new(packed, &material)?;
+        let source = EncryptingStore::published(packed, crate::store::directory_publications(&keys, &record, IoRegion::new())?);
         for (name, bytes) in fixture.files.iter().filter(|(name, _)| *name != &fixture.root) {
             source.put(name, bytes.clone()).await?;
         }
@@ -3547,16 +3303,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repaired_reads_verify_and_reseal_the_accepted_archive() -> Result<()> {
+    async fn repaired_reads_expose_the_original_archive_ciphertext() -> Result<()> {
         let archive_bucket = Arc::new(rtdb_storage::MemoryStore::default());
         let files = PrefixedStore::new(archive_bucket, "archive");
         let serving = Arc::new(rtdb_storage::MemoryStore::default());
         let covered = key("covered")?;
         let newer = key("newer")?;
         let archive_cipher = crate::keys::legacy_archive_key(&[3; crate::keys::KEY_BYTES])?;
-        let serving_cipher = Cipher::new(&[7; crate::keys::KEY_BYTES])?;
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path())?;
+        let record = DeploymentRecord::new("serving", "acme", vec![], 0);
+        let serving_cipher = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
         let ciphertext = archive_cipher.seal(covered.as_str(), Bytes::from_static(b"accepted")).await?;
-        let want = serving_cipher.seal_deterministic(covered.as_str(), b"accepted")?;
+        let want = PublicationSealing::archived(ciphertext.clone());
         files.put(&covered, ciphertext.clone()).await?;
         serving.put(&covered, Bytes::from_static(b"rewritten")).await?;
         serving.put(&newer, Bytes::from_static(b"current tail")).await?;

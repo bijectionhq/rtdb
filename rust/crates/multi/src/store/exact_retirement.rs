@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{GARBAGE_DIRECTORY, StoredRelease, can_reap, checkpoint_metadata_block, permits_release, recovery_covers_release};
 use crate::checkpoint_retention::checkpoint_pack_collectable;
-use crate::cipher::Cipher;
+use rtdb_storage::{IoRegion, sealing::PublicationSealing};
 use crate::keys::KeyService;
 use crate::packing::{PackIndex, block_pack, observe_pack_index, pack_block};
 use crate::reference::{Base, References, stores};
@@ -78,7 +78,7 @@ pub(super) trait RetirementProvider: Send + Sync {
         Ok(None)
     }
 
-    async fn terminal_checkpoint_matches(&self, _: &ObjectKey, _: Checkpoint, _: &Cipher) -> Result<bool> {
+    async fn terminal_checkpoint_matches(&self, _: &ObjectKey, _: Checkpoint, _: &PublicationSealing) -> Result<bool> {
         Ok(false)
     }
 
@@ -110,7 +110,7 @@ impl RetirementProvider for rtdb_s3::VersionedInventory {
         super::replay_retirement::terminal_pack_index(&provider, key, expected).await
     }
 
-    async fn terminal_checkpoint_matches(&self, key: &ObjectKey, checkpoint: Checkpoint, cipher: &Cipher) -> Result<bool> {
+    async fn terminal_checkpoint_matches(&self, key: &ObjectKey, checkpoint: Checkpoint, cipher: &PublicationSealing) -> Result<bool> {
         let Some(provider) = self.enrolled_terminal_retirement().await? else { return Ok(false); };
         super::replay_retirement::terminal_checkpoint_matches(&provider, key, checkpoint, cipher).await
     }
@@ -495,8 +495,7 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         let successor = ObjectKey::new(format!("{store}/{}", block_pack(&catalog)))?;
         if witness.terminal.is_some() {
             let Some(keys) = keys else { return Ok(None); };
-            let Some(material) = keys.existing_key(&owner.key_id()).await? else { return Ok(None); };
-            let cipher = Cipher::new(&material)?;
+            let cipher = crate::store::directory_publications(keys, owner, IoRegion::new())?;
             if !provider.terminal_checkpoint_matches(&successor, checkpoint, &cipher).await? { return Ok(None); }
         } else {
             match observe_pack_index(bucket, &successor).await {
@@ -1078,12 +1077,12 @@ mod tests {
                 }
                 Ok(Some(observe_pack_index(self.bucket, key).await?.value))
             }
-            async fn terminal_checkpoint_matches(&self, key: &ObjectKey, checkpoint: Checkpoint, cipher: &Cipher) -> Result<bool> {
+            async fn terminal_checkpoint_matches(&self, key: &ObjectKey, checkpoint: Checkpoint, cipher: &PublicationSealing) -> Result<bool> {
                 let index = observe_pack_index(self.bucket, key).await?.value;
                 let root = block_key(BlockIndex(checkpoint.block))?;
                 let Some(entry) = index.entries.get(&root) else { return Ok(false); };
                 let sealed = self.bucket.get_range(key, entry.offset..entry.offset + entry.length).await?;
-                Ok(checkpoint.root_sha256 == Some(rtdb_format::catalog::publication_digest(&cipher.open(&root, &sealed)?)))
+                Ok(checkpoint.root_sha256 == Some(rtdb_format::catalog::publication_digest(&cipher.open(&ObjectKey::new(root)?, sealed).await?)))
             }
             async fn terminal_targets(&self, key: &ObjectKey, release: &ObjectKey, publication: &TerminalObjectPublication)
                 -> Result<Option<[S3TombstoneTarget; 2]>>
@@ -1108,8 +1107,7 @@ mod tests {
         owner.storage_namespaces = Some(StorageNamespaces { objects: allocation, keys: [0; 32] });
         let key_dir = tempfile::tempdir().unwrap();
         let keys = crate::keys::LocalKeyService::new(key_dir.path()).unwrap();
-        let material = keys.key(&owner.key_id()).await.unwrap();
-        let cipher = Cipher::new(&material).unwrap();
+        let cipher = crate::store::directory_publications(&keys, &owner, IoRegion::new()).unwrap();
         let root_bytes = bytes::Bytes::from(rtdb_format::catalog::BlockCatalog::from_proto(rtdb_format::block::proto::Block {
             block_index: Some(1), ..Default::default()
         }).unwrap().encode());
@@ -1127,10 +1125,12 @@ mod tests {
             &members.iter().map(|name| (name.to_string(), Bytes::from_static(b"metadata"))).collect(), Vec::new(), 0,
         ).0;
         bucket.put(&older, contents(&[catalog, table])).await.unwrap();
-        let successor = |bytes: &[u8]| crate::packing::encode_pack(
-            &BTreeMap::from([("blocks/b01.binpb".into(), cipher.seal("blocks/b01.binpb", bytes).unwrap())]), Vec::new(), 0,
+        let successor = |sealed| crate::packing::encode_pack(
+            &BTreeMap::from([("blocks/b01.binpb".into(), sealed)]), Vec::new(), 0,
         ).0;
-        bucket.put(&newer, successor(b"unpublished root")).await.unwrap();
+        let root_key = ObjectKey::new("blocks/b01.binpb").unwrap();
+        let wrong = cipher.seal(&root_key, Bytes::from_static(b"unpublished root")).await.unwrap();
+        bucket.put(&newer, successor(wrong)).await.unwrap();
         let publication = TerminalObjectPublication {
             namespace: S3ObjectNamespace { bucket: "cell".into(), region: None, endpoint: None },
             allocation, key: older.to_string(), etag: r#""pack""#.into(),
@@ -1150,7 +1150,7 @@ mod tests {
         pass().await.unwrap();
         assert!(bucket.head(&older).await.is_ok());
         bucket.delete(&newer).await.unwrap();
-        bucket.put(&newer, successor(&root_bytes)).await.unwrap();
+        bucket.put(&newer, successor(cipher.seal(&root_key, root_bytes).await.unwrap())).await.unwrap();
 
         let reader = Uuid::new_v4();
         crate::admin::update_installation(directory.as_ref(), &owner.id, |current| {

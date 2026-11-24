@@ -125,6 +125,10 @@ impl RetainedBytes {
     pub fn as_slice(&self) -> &[u8] { &self.bytes }
     pub fn len(&self) -> usize { self.bytes.len() }
     pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
+    pub(crate) fn discard_prefix(mut self, bytes: usize) -> Self {
+        self.bytes = self.bytes.slice(bytes..);
+        self
+    }
 }
 
 /// A derived ordered index's published page namespace.

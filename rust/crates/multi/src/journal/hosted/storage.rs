@@ -235,6 +235,7 @@ impl RemoteStorageFactory for StoreFactory {
             audience: None,
             checkpoint_metadata: None,
             fragment_storage: None,
+            publication_sealing: None,
         })
     }
 }
@@ -302,7 +303,7 @@ impl StoreFactory {
         let store = Arc::new(ServingStore {
             lower, upper, writer: None, reader: Some(ServingReader { scope, objects }),
         });
-        Ok(OpenedRecoveryStore { store, blocks, audience: None, checkpoint_metadata: None, fragment_storage: None })
+        Ok(OpenedRecoveryStore { store, blocks, audience: None, checkpoint_metadata: None, fragment_storage: None, publication_sealing: None })
     }
 }
 
