@@ -220,6 +220,12 @@ surface StatelessDatabase {
         -- The inventory includes inactive reservations and active occurrences, so a new reservation or activation invalidates an earlier revocation plan.
         -- Revocation permanently closes placement and release admission.
         -- An exact retry can recover the original receipt even after its custody key has been destroyed.
+        -- A tracked exact merged Query by the original writer can authenticate a reviewed non-main source point and the complete native group inventory at that cut.
+        -- The same Query seals the reviewed branch, cut, validity point, Original and winning physical occurrence into its release proof and independently confirms both writing receipts.
+        -- The reviewed reservation records its transaction key and basis and commits the source evidence alongside the destination and link identities.
+        -- The accepting arm checks the retained reservation receipt and the current writer, source and group inventory, then places the protected main rows and drops the reviewed branch together.
+        -- Exact placement and branch catalogue readback at the accepted basis pairs the retained activation with its keyed transaction receipt after branch drop.
+        -- Revocation masks the matching occurrences through all retained ancestor views and drains their existing release holds before native key destruction.
         -- Scoped readers receive no placement or release inventory.
 
     @guarantee ProtectedResponseRelease

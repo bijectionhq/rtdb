@@ -147,6 +147,36 @@ pub struct CustodyPlacementEntry<'a> {
     pub enrolled: Basis,
     pub reservation: Option<[u8; 32]>,
     pub occurrence: Option<&'a CustodyOccurrence>,
+    pub reviewed: Option<(&'a ReviewedCustodyReservation, &'a CustodyReservation)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyReview {
+    pub branch: Branch,
+    pub basis: Basis,
+    pub valid_at: Timestamp,
+    pub inventory_sha256: [u8; 32],
+}
+
+impl CustodyReview {
+    pub fn commitment(&self, group: CustodyGroupId, original: [u8; 32], selected: [u8; 32]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/v1/custody-review-source\0");
+        hash.update(self.basis.to_bytes());
+        hash.update(self.valid_at.0.to_be_bytes());
+        hash.update(self.inventory_sha256);
+        hash.update(group);
+        hash.update(original);
+        hash.update(selected);
+        hash.update(self.branch.as_bytes());
+        hash.finalize().into()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewedCustodyReservation {
+    pub source: CustodyReview,
+    pub receipt_key: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +184,23 @@ pub(super) struct ReservedPlacement {
     pub at: Basis,
     pub reservation: CustodyReservation,
     pub occurrence: Option<CustodyOccurrence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<ReviewedCustodyReservation>,
+}
+
+impl ReservedPlacement {
+    pub(super) fn commitment(&self, incarnation: [u8; 16], group: CustodyGroupId) -> [u8; 32] {
+        let reservation = self.reservation.commitment(incarnation, group);
+        let Some(reviewed) = &self.reviewed else { return reservation; };
+        let source = &reviewed.source;
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/v1/reviewed-custody-reservation\0");
+        hash.update(reservation);
+        hash.update(self.at.to_bytes());
+        hash.update(source.commitment(group, self.reservation.original, self.reservation.source));
+        hash.update(&reviewed.receipt_key);
+        hash.finalize().into()
+    }
 }
 
 impl BranchIndex {
@@ -164,7 +211,7 @@ impl BranchIndex {
     ) -> Result<bool> {
         let record = self.live_custody(group)?;
         if let Some(prior) = record.reservations.get(&reservation.destination) {
-            return if &prior.reservation == reservation {
+            return if prior.reviewed.is_none() && &prior.reservation == reservation {
                 Ok(false)
             } else {
                 Err(placement_conflict())
@@ -215,7 +262,7 @@ impl BranchIndex {
                 let reservation = &pending.reservation;
                 if pending.occurrence.is_some()
                     || pending.at >= occurrence.written
-                    || reservation.commitment(self.head.basis.incarnation(), group) != commitment
+                    || pending.commitment(self.head.basis.incarnation(), group) != commitment
                     || reservation.target.with_valid(reservation.target.valid.resolve(self.head.system_time)?) != occurrence.target
                     || reservation.carrier_sha256 != occurrence.carrier_sha256
                     || Some(reservation.link_sha256) != occurrence.link_sha256
@@ -230,6 +277,97 @@ impl BranchIndex {
 
     pub fn next_custody_ordinal(&self) -> u64 {
         self.writes.len() as u64 + 1
+    }
+
+    pub fn custody_review_at(
+        &self, branch: &str, basis: Basis, valid_at: Timestamp, group: CustodyGroupId, selected: [u8; 32],
+    ) -> Result<(CustodyReview, &CustodyOccurrence, &CustodyOccurrence)> {
+        if branch == MAIN_BRANCH || self.visibility_projection { return Err(placement_conflict()); }
+        self.writable(branch)?;
+        let record = self.live_custody(group)?;
+        let inventory = record.inventory(group, basis).ok_or_else(placement_conflict)?;
+        let original = record.original.as_ref().ok_or_else(placement_conflict)?;
+        let source = record.occurrence(group, selected).ok_or_else(placement_conflict)?;
+        let view = self.view(branch, At::Exactly(basis), Layer::Merged, self.head.system_time)?;
+        let members = record.members.iter().filter(|member| member.written <= basis);
+        let mut occurrences = record.occurrences().filter(|occurrence| occurrence.written <= basis);
+        if original.written > basis || source.written > basis
+            || members.count() != occurrences.clone().count()
+            || occurrences.any(|occurrence| {
+                occurrence.receipt_key.is_empty() || occurrence.ordinal.checked_sub(1).is_none_or(|ordinal| {
+                    !record.members.contains(&super::custody::CustodyMember {
+                        branch: occurrence.target.branch.clone(), table: occurrence.target.table.clone(),
+                        id: occurrence.target.id.clone(), valid: occurrence.target.valid,
+                        written: occurrence.written, ordinal,
+                    })
+                })
+            })
+            || self.local_custody_event(group, original).is_none()
+            || !self.custody_winner(&view, group, source, valid_at)
+        {
+            return Err(placement_conflict());
+        }
+        let review = CustodyReview { branch: branch.into(), basis, valid_at, inventory_sha256: inventory.sha256 };
+        Ok((review, original, source))
+    }
+
+    fn custody_winner(&self, view: &BranchView<'_>, group: CustodyGroupId, source: &CustodyOccurrence, valid_at: Timestamp) -> bool {
+        let target = &source.target;
+        view.row(&target.table, &target.id, valid_at)
+            .zip(self.local_custody_event(group, source))
+            .is_some_and(|(winner, authored)| std::ptr::eq(winner, authored))
+    }
+
+    fn check_current_custody_review(
+        &self, group: CustodyGroupId, reservation: &CustodyReservation, review: &CustodyReview,
+        except: Option<CustodyPlacementId>,
+    ) -> Result<()> {
+        let (observed, original, source) = self.custody_review_at(
+            &review.branch, review.basis, review.valid_at, group, reservation.source,
+        )?;
+        let view = self.view(&review.branch, At::Latest, Layer::Merged, self.head.system_time)?;
+        let current = self.live_custody(group)?.inventory_except(group, self.head.basis, except);
+        if observed != *review || original.commitment(group) != reservation.original
+            || current.is_none_or(|inventory| inventory.sha256 != review.inventory_sha256)
+            || view.data.changed.is_some_and(|changed| changed > review.basis)
+            || !self.custody_winner(&view, group, source, review.valid_at)
+        {
+            return Err(placement_conflict());
+        }
+        Ok(())
+    }
+
+    pub fn check_reviewed_custody_reservation(
+        &self, group: CustodyGroupId, reservation: &CustodyReservation, reviewed: &ReviewedCustodyReservation,
+    ) -> Result<()> {
+        if reservation.target.branch != MAIN_BRANCH || reviewed.source.basis >= self.head.basis
+            || !(16..=64).contains(&reviewed.receipt_key.len())
+            || !self.check_custody_reservation(group, reservation)?
+        {
+            return Err(placement_conflict());
+        }
+        self.check_current_custody_review(group, reservation, &reviewed.source, None)
+    }
+
+    pub fn check_custody_activation_route(
+        &self, group: CustodyGroupId, destination: CustodyPlacementId,
+        review: Option<(&str, Basis, &[u8])>,
+    ) -> Result<()> {
+        let record = self.live_custody(group)?;
+        let pending = record.reservations.get(&destination);
+        match (pending.and_then(|entry| entry.reviewed.as_ref()), review) {
+            (None, None) => Ok(()),
+            (Some(reviewed), Some((branch, basis, key))) => {
+                let pending = pending.ok_or_else(placement_conflict)?;
+                if reviewed.source.branch != branch || pending.at != basis || reviewed.receipt_key.as_slice() != key
+                    || pending.occurrence.is_some()
+                {
+                    return Err(placement_conflict());
+                }
+                self.check_current_custody_review(group, &pending.reservation, &reviewed.source, Some(destination))
+            }
+            _ => Err(placement_conflict()),
+        }
     }
 
     /// Resolve one exact commitment from a captured Query inventory. The
@@ -271,7 +409,15 @@ impl BranchIndex {
         if !self.check_custody_reservation(group, &reservation)? {
             return Err(placement_conflict());
         }
-        self.record_custody_reservation(group, reservation, None);
+        self.record_custody_reservation(group, reservation, None, None);
+        Ok(())
+    }
+
+    pub(super) fn reserve_reviewed_custody_placement(
+        &mut self, group: CustodyGroupId, reservation: CustodyReservation, reviewed: ReviewedCustodyReservation,
+    ) -> Result<()> {
+        self.check_reviewed_custody_reservation(group, &reservation, &reviewed)?;
+        self.record_custody_reservation(group, reservation, None, Some(reviewed));
         Ok(())
     }
 
@@ -280,6 +426,7 @@ impl BranchIndex {
         group: CustodyGroupId,
         reservation: CustodyReservation,
         occurrence: Option<CustodyOccurrence>,
+        reviewed: Option<ReviewedCustodyReservation>,
     ) {
         self.used_custody_placements.insert(reservation.destination);
         self.used_custody_placements.insert(reservation.link);
@@ -290,6 +437,7 @@ impl BranchIndex {
                 at: self.head.basis,
                 reservation,
                 occurrence,
+                reviewed,
             },
         );
     }
@@ -378,7 +526,7 @@ impl BranchIndex {
             ))?;
         event.written = WrittenVersion::Custody(Some(occurrence.ordinal));
         if let Some(reservation) = derived {
-            self.record_custody_reservation(group, reservation, Some(occurrence));
+            self.record_custody_reservation(group, reservation, Some(occurrence), None);
         } else if occurrence.reservation.is_some() {
             let placement_id = occurrence.placement_id;
             Arc::make_mut(self.custody.get_mut(&group).expect("checked custody group"))

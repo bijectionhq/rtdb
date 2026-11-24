@@ -18,7 +18,7 @@ mod custody_release;
 mod custody_transfer;
 mod visibility;
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
-pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyTarget, DerivedCustodyReservation};
+pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, ReviewedCustodyReservation};
 pub use custody_release::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart};
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
@@ -185,6 +185,7 @@ pub enum BranchEffect {
     CreateCustodyGroup { group: CustodyGroupId },
     RevokeCustodyGroup { group: CustodyGroupId },
     ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
+    ReserveReviewedCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation, reviewed: ReviewedCustodyReservation },
     ActivateCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence },
     ActivateDerivedCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence, reservation: DerivedCustodyReservation },
     CustodyRelease(CustodyRelease),
@@ -743,6 +744,9 @@ impl BranchIndex {
             BranchEffect::CreateCustodyGroup { group } => self.create_custody_group(group)?,
             BranchEffect::RevokeCustodyGroup { group } => self.revoke_custody_group(group)?,
             BranchEffect::ReserveCustodyPlacement { group, reservation } => self.reserve_custody_placement(group, reservation)?,
+            BranchEffect::ReserveReviewedCustodyPlacement { group, reservation, reviewed } => {
+                self.reserve_reviewed_custody_placement(group, reservation, reviewed)?;
+            }
             BranchEffect::ActivateCustodyOccurrence { group, occurrence } => self.activate_custody_occurrence(group, occurrence, None)?,
             BranchEffect::ActivateDerivedCustodyOccurrence { group, occurrence, reservation } => {
                 self.activate_custody_occurrence(group, occurrence, Some(reservation))?;
@@ -812,6 +816,7 @@ impl<'a> BranchView<'a> {
     pub fn layer(&self) -> Layer { self.layer }
     pub fn physical_iid(&self, table: &TableRef, id: &EntityId) -> Iid { self.index.physical_iid(table, id) }
     pub fn base(&self) -> Option<&(Branch, Basis)> { self.data.base.as_ref() }
+    pub fn expires_at(&self) -> Option<Timestamp> { self.data.expires_at(self.cut.basis) }
     pub fn lineage(&self) -> Vec<BranchLineage> { self.index.lineage(self.cut.basis) }
     pub fn custody_inventories(&self) -> impl Iterator<Item = CustodyInventory> + '_ {
         self.index.custody_inventories(self.cut.basis).filter(move |_| !self.index.visibility_projection)

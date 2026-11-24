@@ -3,13 +3,14 @@ use std::{fmt, sync::Arc};
 use rtdb_crypt::tokens::CustodyReadProof;
 use rtdb_node::{
     Database, DatabaseAccess, SystemClock,
+    serving::ServingDriver,
     serving::custody_release::{
         CustodyCarrierAuthority, CustodyContributors, CustodyProviderInstallation,
         CustodyProviderMount, CustodyReleasePhase, CustodyReleaseRegistration,
         CustodyResponseAdmission, CustodyResponseOwner,
     },
 };
-use rtdb_tx::transact::Outcome;
+use rtdb_tx::transact::{CustodyGroupId, CustodyOccurrence, Op, Outcome, Transact};
 use rtdb_types::{Timestamp, rtdb_v1::Basis};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -232,6 +233,7 @@ impl Service {
         basis: Basis,
         generation: Option<u64>,
         contributors: CustodyContributors,
+        review: Option<(&str, &proto::CustodyReviewSelection)>,
     ) -> Result<(Vec<u8>, proto::CustodyReadInventory), Status> {
         if !contributors.is_empty() && generation.is_none() {
             return Err(unavailable());
@@ -245,66 +247,87 @@ impl Service {
             .require_original_writer()
             .await
             .map_err(error::anomaly)?;
+        let expires_at = self.0.node.now().0.checked_add(120_000_000)
+            .map(Timestamp).ok_or_else(unavailable)?;
         let mut inventory = proto::CustodyReadInventory::default();
-        if !contributors.is_empty() {
+        let mut reviewed_source_sha256 = None;
+        if !contributors.is_empty() || review.is_some() {
             let driver = database.serving_driver().ok_or_else(unavailable)?;
             let index = driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
             inventory.contributors.reserve(contributors.len());
             for &(group, commitment) in &contributors {
-                let (original, occurrence) = index
-                    .custody_read_occurrence(basis, group, commitment)
-                    .map_err(error::anomaly)?;
-                let written = index.exact(occurrence.written).map_err(error::anomaly)?;
-                let receipt = driver
-                    .original_custody_receipt(&occurrence.receipt_key, occurrence.written, &call.cancellation)
-                    .await
-                    .map_err(error::anomaly)?;
-                if receipt.key != occurrence.receipt_key || receipt.basis != written.basis
-                    || receipt.system_time != written.system_time
-                    || matches!(receipt.outcome, Outcome::Refused { .. })
-                {
-                    return Err(unavailable());
-                }
-                let target = &occurrence.target;
-                inventory.contributors.push(proto::CustodyReadContributor {
-                    group: group.to_vec(),
-                    original: original.to_vec(),
-                    occurrence: commitment.to_vec(),
-                    receipt_key: receipt.key,
-                    written_basis: Some(receipt.basis.into()),
-                    system_time_micros: receipt.system_time.0,
-                    table: format!("{}.{}", target.table.schema, target.table.table),
-                    row_id: target.id.handle_bytes(),
-                    valid_from_micros: target.valid.lower().0,
-                    valid_to_micros: target.valid.upper().0,
-                    carrier_sha256: occurrence.carrier_sha256.to_vec(),
-                    branch: target.branch.clone(),
-                    ordinal: occurrence.ordinal,
-                    placement_id: occurrence.placement_id.to_vec(),
-                    reservation_sha256: occurrence.reservation.map(|digest| digest.to_vec()),
-                    link_sha256: occurrence.link_sha256.map(|digest| digest.to_vec()),
+                let (original, occurrence) = index.custody_read_occurrence(basis, group, commitment).map_err(error::anomaly)?;
+                let written_at = index.exact(occurrence.written).map_err(error::anomaly)?.system_time;
+                inventory.contributors.push(confirmed_occurrence(call, driver, group, original, occurrence, written_at).await?);
+            }
+            if let Some((branch, selection)) = review {
+                let group = selection.group.as_slice().try_into().map_err(|_| unavailable())?;
+                let selected: [u8; 32] = selection.selected_occurrence_sha256.as_slice().try_into().map_err(|_| unavailable())?;
+                if !contributors.contains(&(group, selected)) { return Err(unavailable()); }
+                let (review, original, _) = index.custody_review_at(
+                    branch, basis, Timestamp(selection.valid_at_micros), group, selected,
+                ).map_err(error::anomaly)?;
+                let original_commitment = original.commitment(group);
+                let selected_evidence = inventory.contributors.iter().find(|entry| {
+                    entry.group.as_slice() == group.as_slice() && entry.occurrence.as_slice() == selected.as_slice()
+                }).ok_or_else(unavailable)?.clone();
+                let original = if original_commitment == selected {
+                    selected_evidence.clone()
+                } else {
+                    let written_at = index.exact(original.written).map_err(error::anomaly)?.system_time;
+                    confirmed_occurrence(call, driver, group, original_commitment, original, written_at).await?
+                };
+                reviewed_source_sha256 = Some(review.commitment(group, original_commitment, selected));
+                inventory.reviewed_source = Some(proto::CustodyReviewedSource {
+                    cut: Some(proto::CustodyReviewCut {
+                        branch: review.branch, basis: Some(review.basis.into()), valid_at_micros: review.valid_at.0,
+                        inventory_sha256: review.inventory_sha256.to_vec(),
+                    }),
+                    original: Some(original), selected: Some(selected_evidence), proof_expires_at_micros: expires_at.0,
                 });
             }
         }
-        let expires_at = self
-            .0
-            .node
-            .now()
-            .0
-            .checked_add(120_000_000)
-            .map(Timestamp)
-            .ok_or_else(unavailable)?;
         let proof = CustodyReadProof {
             basis,
             key_generation: generation,
             expires_at,
             contributors: contributors.into_iter().collect(),
+            reviewed_source_sha256,
         };
         let sealed = issuer
             .seal_custody_read(&proof, route.proof_owner(&owner), session_binding(call))
             .await
             .map_err(error::anomaly)?;
         Ok((sealed, inventory))
+    }
+
+    pub(super) async fn authenticate_reviewed_custody(
+        &self, call: &Call, database: &Arc<Database>, request: &Transact,
+    ) -> Result<(), Status> {
+        let route = self.custody_route(call)?;
+        let owner = route.acquire(self, call, database).await?;
+        let mounted = owner.response_release(&SystemClock, &call.cancellation).map_err(error::anomaly)?;
+        let writer = mounted.original_writer_fence().await.map_err(error::anomaly)?;
+        if !request.requires.first().is_some_and(|guard| writer.authenticates(guard)) {
+            return Err(unavailable());
+        }
+        for op in &request.ops {
+            let Op::ReserveReviewedCustodyPlacement { group, reservation, source, read_proof } = op else { continue; };
+            let cutoff = request.window.before.ok_or_else(|| error::incorrect("A reviewed reservation needs the read proof cutoff"))?;
+            let driver = database.serving_driver().ok_or_else(unavailable)?;
+            let tokens = database.token_authority().await.map_err(error::anomaly)?;
+            let proof = tokens.open_custody_read(read_proof, route.proof_owner(&owner), session_binding(call)).await.map_err(error::anomaly)?;
+            if proof.basis != source.basis || proof.expires_at < cutoff || cutoff <= self.0.node.now()
+                || proof.reviewed_source_sha256 != Some(source.commitment(*group, reservation.original, reservation.source))
+                || !proof.contributors.contains(&(*group, reservation.source))
+            {
+                return Err(unavailable());
+            }
+            let groups = proof.contributors.iter().map(|(group, _)| *group).collect();
+            let generation = proof.key_generation.ok_or_else(unavailable)?;
+            driver.check_custody_release_delivery(&groups, &writer, generation, &call.cancellation).await.map_err(error::anomaly)?;
+        }
+        self.check_attachment(call, database)
     }
 
     pub(super) async fn custody_release_action(
@@ -468,6 +491,29 @@ impl Service {
         let (basis, generation) = selected.ok_or_else(unavailable)?;
         Ok((contributors, basis, generation))
     }
+}
+
+async fn confirmed_occurrence(
+    call: &Call, driver: &dyn ServingDriver, group: CustodyGroupId,
+    original: [u8; 32], occurrence: &CustodyOccurrence, written_at: Timestamp,
+) -> Result<proto::CustodyReadContributor, Status> {
+    let receipt = driver.original_custody_receipt(&occurrence.receipt_key, occurrence.written, &call.cancellation)
+        .await.map_err(error::anomaly)?;
+    if receipt.key != occurrence.receipt_key || receipt.basis != occurrence.written || receipt.system_time != written_at
+        || matches!(receipt.outcome, Outcome::Refused { .. })
+    {
+        return Err(unavailable());
+    }
+    let target = &occurrence.target;
+    Ok(proto::CustodyReadContributor {
+        group: group.to_vec(), original: original.to_vec(), occurrence: occurrence.commitment(group).to_vec(),
+        receipt_key: receipt.key, written_basis: Some(receipt.basis.into()), system_time_micros: receipt.system_time.0,
+        table: format!("{}.{}", target.table.schema, target.table.table), row_id: target.id.handle_bytes(),
+        valid_from_micros: target.valid.lower().0, valid_to_micros: target.valid.upper().0,
+        carrier_sha256: occurrence.carrier_sha256.to_vec(), branch: target.branch.clone(), ordinal: occurrence.ordinal,
+        placement_id: occurrence.placement_id.to_vec(), reservation_sha256: occurrence.reservation.map(|digest| digest.to_vec()),
+        link_sha256: occurrence.link_sha256.map(|digest| digest.to_vec()),
+    })
 }
 
 #[cfg(test)]

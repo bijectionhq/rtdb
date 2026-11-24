@@ -6,7 +6,8 @@ use rtdb_index::branches::{
 };
 pub use rtdb_index::branches::{
     CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation, CustodyResponseAdmission,
-    CustodyPlacementId, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition, Visibility,
+    CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition,
+    ReviewedCustodyReservation, Visibility,
     RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind,
 };
 use rtdb_types::{
@@ -82,6 +83,10 @@ impl Transact {
 
     pub fn uses_custody(&self) -> bool { self.ops.iter().chain(&self.otherwise).any(Op::uses_custody) }
 
+    pub fn uses_reviewed_custody(&self) -> bool {
+        self.ops.iter().chain(&self.otherwise).any(Op::is_reviewed_custody)
+    }
+
     pub fn uses_erasure(&self) -> bool {
         self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::Erase { .. }))
     }
@@ -127,7 +132,7 @@ impl Transact {
 
     fn has_unsealed_custody(&self) -> bool {
         self.ops.iter().chain(&self.otherwise).any(|op| {
-            op.put_rows().iter().any(|row| {
+            op.put_rows().any(|row| {
                 !row.protected_columns.is_empty() && (row.custody_payload.is_none()
                     || row.protected_columns.iter().any(|column| row.cells.get(column).is_some()))
             })
@@ -213,6 +218,8 @@ pub enum Op {
     RevokeCustodyGroup { group: CustodyGroupId, inventory_sha256: [u8; 32] },
     ReserveCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation },
     PlaceCustodyRow { branch: Branch, table: TableRef, row: Row, placement: CustodyPlacement },
+    ReserveReviewedCustodyPlacement { group: CustodyGroupId, reservation: CustodyReservation, source: CustodyReview, read_proof: Vec<u8> },
+    LandCustodyBranch { branch: Branch, placements: Vec<ReviewedCustodyPlacement> },
     #[serde(skip_deserializing)]
     CustodyRelease(CustodyRelease),
     #[serde(skip_deserializing)]
@@ -247,19 +254,38 @@ pub struct CustodyPlacementCommitments {
     pub link_sha256: Option<[u8; 32]>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReviewedCustodyPlacement {
+    pub table: TableRef,
+    pub row: Row,
+    pub placement: CustodyPlacement,
+    pub reserved_at: Basis,
+    pub reserve_key: Vec<u8>,
+}
+
 impl Op {
-    fn put_rows(&self) -> &[Row] {
-        match self {
-            Self::Put { rows, .. } => rows,
+    fn put_rows(&self) -> impl Iterator<Item = &Row> {
+        let ordinary = match self {
+            Self::Put { rows, .. } => rows.as_slice(),
             Self::PlaceCustodyRow { row, .. } => std::slice::from_ref(row),
             _ => &[],
-        }
+        };
+        let landing = match self {
+            Self::LandCustodyBranch { placements, .. } => placements.as_slice(),
+            _ => &[],
+        };
+        ordinary.iter().chain(landing.iter().map(|placement| &placement.row))
+    }
+
+    fn is_reviewed_custody(&self) -> bool {
+        matches!(self, Self::ReserveReviewedCustodyPlacement { .. } | Self::LandCustodyBranch { .. })
     }
 
     fn uses_custody(&self) -> bool {
         match self {
             Self::CreateCustodyGroup { .. } | Self::RevokeCustodyGroup { .. }
             | Self::ReserveCustodyPlacement { .. } | Self::PlaceCustodyRow { .. }
+            | Self::ReserveReviewedCustodyPlacement { .. } | Self::LandCustodyBranch { .. }
             | Self::CustodyRelease(_) | Self::AdmitCustodyResponse(_) => true,
             Self::Put { rows, .. } => rows.iter().any(|row| row.custody_group.is_some() || !row.protected_columns.is_empty()),
             _ => false,
@@ -309,6 +335,7 @@ pub const LINEARIZABLE: &str = "linearizable";
 pub const TRANSACT_REQUIRES: &str = "transact.requires";
 pub const RELATIVE_VALID_TIME: &str = "transact.relative-valid-time";
 pub const ROW_CUSTODY: &str = "row-custody";
+pub const REVIEWED_CUSTODY_PLACEMENT: &str = "transact.custody-reviewed-placement";
 pub const PHYSICAL_ERASURE: &str = "erasure";
 pub const COUNT_RANGE_CONSTRAINT: &str = "declare.constraint.count-range";
 pub const GROUPED_COUNT_CONSTRAINT: &str = "declare.constraint.grouped-count";
@@ -859,7 +886,10 @@ impl TransactState {
         request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
         features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>, durable: &BranchIndex,
     ) -> Result<(Outcome, Vec<BranchEffect>, BranchIndex)> {
-        if let Some(feature) = request.require.iter().filter(|feature| !features.contains(&feature.as_str())).min() {
+        if let Some(feature) = request.require.iter().filter(|feature| {
+            !features.contains(&feature.as_str())
+                && !(feature.as_str() == REVIEWED_CUSTODY_PLACEMENT && features.contains(&ROW_CUSTODY))
+        }).min() {
             return Err(feature_required(feature));
         }
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
@@ -872,6 +902,16 @@ impl TransactState {
             return Err(feature_required(ranked_index));
         }
         let response_release = request.is_response_release();
+        let reviewed_custody = request.uses_reviewed_custody();
+        if reviewed_custody && (
+            scope.is_some() || request.otherwise.iter().any(Op::is_reviewed_custody)
+                || !matches!(request.requires.first(), Some(Guard::Version {
+                    branch, valid_at: Some(_), expect: Version::Written(_), ..
+                }) if branch == MAIN_BRANCH)
+                || !request.require.iter().any(|feature| feature == REVIEWED_CUSTODY_PLACEMENT)
+        ) {
+            return Err(Anomaly::incorrect("rtdb/custody-review", "A reviewed placement requires original writer authority and the accepting arm"));
+        }
         if request.contains_native_custody_transfer() {
             let [Op::NativeCustodyTransfer { custody, destination }] = request.ops.as_slice() else {
                 return Err(native_custody_command_error());
@@ -925,7 +965,7 @@ impl TransactState {
                     "rtdb/invalid-requirement", "A count requirement must use the Before phase",
                 ));
             }
-            let valid = if response_release {
+            let valid = if response_release || (reviewed_custody && i == 0) {
                 CustodyWriterFence::check_requirement(requirement, &base, time)?
             } else {
                 evaluate(requirement, &base)?
@@ -937,13 +977,29 @@ impl TransactState {
             }
         }
 
+        for source in request.ops.iter().filter_map(|op| match op {
+            Op::ReserveReviewedCustodyPlacement { source, .. } => Some(source),
+            _ => None,
+        }) {
+            let approved = request.requires.iter().any(|guard| {
+                let Guard::Unchanged(claim) = guard else { return false; };
+                claims.verify(claim).is_ok_and(|evidence| {
+                    evidence.scope.branch == source.branch && evidence.scope.basis == source.basis
+                        && evidence.scope.layer == Layer::Merged
+                })
+            });
+            if !approved {
+                return Err(Anomaly::incorrect("rtdb/custody-review", "The reservation needs a tracked Query requirement for its reviewed cut"));
+            }
+        }
+
         let mut failed = Vec::new();
         for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| !guard.after()) {
             if !evaluate(guard, &base)? { failed.push(i); }
         }
         if failed.is_empty() {
             let mut then = Candidate::new(base.clone(), scope);
-            then.execute(&request.ops, &request.key)?;
+            then.execute(&request.ops, &request.key, before)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
                 if !evaluate(guard, &then.index)? { failed.push(i); }
             }
@@ -953,7 +1009,7 @@ impl TransactState {
             }
         }
         let mut otherwise = Candidate::new(base, scope);
-        otherwise.execute(&request.otherwise, &request.key)?;
+        otherwise.execute(&request.otherwise, &request.key, before)?;
         if !request.otherwise.is_empty() { otherwise.check_constraints()?; }
         Ok((Outcome::Otherwise { failed }, otherwise.effects, otherwise.index))
     }
@@ -1026,6 +1082,11 @@ impl TransactState {
         let mut candidate = self.index.clone();
         candidate.advance(BranchCut { basis: receipt.basis, system_time: receipt.system_time })?;
         for effect in effects {
+            if let BranchEffect::ReserveReviewedCustodyPlacement { reviewed, .. } = &effect
+                && (receipt_namespace.is_some() || reviewed.receipt_key != receipt.key)
+            {
+                return Err(invalid_record());
+            }
             if let BranchEffect::ActivateCustodyOccurrence { occurrence, .. }
                 | BranchEffect::ActivateDerivedCustodyOccurrence { occurrence, .. } = &effect
                 && (receipt_namespace.is_some()

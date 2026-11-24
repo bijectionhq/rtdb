@@ -3,9 +3,9 @@ use rtdb_index::branches::BranchEvent;
 use super::*;
 
 impl Candidate<'_> {
-    pub(super) fn execute(&mut self, ops: &[Op], request_key: &[u8]) -> Result<()> {
+    pub(super) fn execute(&mut self, ops: &[Op], request_key: &[u8], before: Option<Timestamp>) -> Result<()> {
         let cut = self.index.head();
-        for op in ops {
+        for (index, op) in ops.iter().enumerate() {
             match op {
                 Op::Put { branch, table, rows, if_absent } => {
                     self.require_write_branch(branch)?;
@@ -20,32 +20,7 @@ impl Candidate<'_> {
                     }
                 }
                 Op::PlaceCustodyRow { branch, table, row, placement } => {
-                    self.require_unrestricted()?;
-                    self.index.writable(branch)?;
-                    let definition = self.write_definition(table)?;
-                    let (valid, image) = self.put_image(branch, table, &definition, row)?;
-                    let (Some(group), Some(payload), Some(commitments)) = (image.custody_group, &image.custody_payload, placement.commitments) else {
-                        return Err(Anomaly::incorrect("rtdb/custody-placement", "Custody placement requires a sealed carrier and its commitments"));
-                    };
-                    let occurrence = CustodyOccurrence {
-                        placement_id: placement.placement_id,
-                        target: CustodyTarget { branch: branch.clone(), table: table.clone(), id: row.id.clone(), valid },
-                        written: cut.basis,
-                        receipt_key: request_key.to_vec(),
-                        ordinal: self.index.next_custody_ordinal(),
-                        carrier_sha256: commitments.carrier_sha256,
-                        envelope_sha256: Sha256::digest(&payload.envelope).into(),
-                        reservation: placement.reservation,
-                        link_sha256: commitments.link_sha256,
-                    };
-                    self.write(branch, table, row.id.clone(), valid, Some(image))?;
-                    let activation = match &placement.derived {
-                        Some(reservation) => BranchEffect::ActivateDerivedCustodyOccurrence {
-                            group, occurrence, reservation: reservation.clone(),
-                        },
-                        None => BranchEffect::ActivateCustodyOccurrence { group, occurrence },
-                    };
-                    self.push(activation)?;
+                    self.place_custody_row(branch, table, row, placement, request_key, None)?;
                 }
                 Op::Delete { branch, table, ids, valid } => {
                     self.require_write_branch(branch)?;
@@ -146,6 +121,26 @@ impl Candidate<'_> {
                         self.push(BranchEffect::ReserveCustodyPlacement { group: *group, reservation: reservation.clone() })?;
                     }
                 }
+                Op::ReserveReviewedCustodyPlacement { group, reservation, source, .. } => {
+                    self.require_unrestricted()?;
+                    self.require_custody_branch_cutoff(&source.branch, before)?;
+                    self.write_definition(&reservation.target.table)?;
+                    let reviewed = ReviewedCustodyReservation { source: source.clone(), receipt_key: request_key.to_vec() };
+                    self.push(BranchEffect::ReserveReviewedCustodyPlacement { group: *group, reservation: reservation.clone(), reviewed })?;
+                }
+                Op::LandCustodyBranch { branch, placements } => {
+                    self.require_unrestricted()?;
+                    self.require_child(branch)?;
+                    if index + 1 != ops.len() || placements.is_empty() || placements.len() > 512 {
+                        return Err(Anomaly::incorrect("rtdb/custody-review", "A landing must be the final operation and name a bounded nonempty placement set"));
+                    }
+                    self.require_custody_branch_cutoff(branch, before)?;
+                    for ReviewedCustodyPlacement { table, row, placement, reserved_at, reserve_key } in placements {
+                        self.place_custody_row(MAIN_BRANCH, table, row, placement, request_key,
+                            Some((branch.as_str(), *reserved_at, reserve_key)))?;
+                    }
+                    self.push(BranchEffect::Drop { branch: branch.clone() })?;
+                }
                 Op::CustodyRelease(release) => {
                     self.require_unrestricted()?;
                     if self.index.check_custody_release(*release, cut.system_time)? {
@@ -164,6 +159,51 @@ impl Candidate<'_> {
             }
         }
         Ok(())
+    }
+
+    fn require_custody_branch_cutoff(&self, branch: &str, before: Option<Timestamp>) -> Result<()> {
+        if self.view(branch, Layer::Merged)?.expires_at().is_some_and(|expiry| before.is_none_or(|cutoff| cutoff > expiry)) {
+            return Err(conflict("rtdb/custody-review", "A reviewed placement must settle before the source branch expires"));
+        }
+        Ok(())
+    }
+
+    fn place_custody_row(
+        &mut self, branch: &str, table: &TableRef, row: &Row, placement: &CustodyPlacement,
+        request_key: &[u8], reviewed: Option<(&str, Basis, &[u8])>,
+    ) -> Result<()> {
+        self.require_unrestricted()?;
+        self.index.writable(branch)?;
+        let definition = self.write_definition(table)?;
+        let (valid, image) = self.put_image(branch, table, &definition, row)?;
+        let (Some(group), Some(payload), Some(commitments)) = (image.custody_group, &image.custody_payload, placement.commitments) else {
+            return Err(Anomaly::incorrect("rtdb/custody-placement", "Custody placement requires a sealed carrier and its commitments"));
+        };
+        self.index.check_custody_activation_route(group, placement.placement_id, reviewed)?;
+        if reviewed.is_some() && (placement.derived.is_some() || placement.reservation.is_none()
+            || self.present(branch, table, &row.id, valid)?)
+        {
+            return Err(conflict("rtdb/custody-placement", "A reviewed placement requires its reserved and unoccupied destination"));
+        }
+        let occurrence = CustodyOccurrence {
+            placement_id: placement.placement_id,
+            target: CustodyTarget { branch: branch.into(), table: table.clone(), id: row.id.clone(), valid },
+            written: self.index.head().basis,
+            receipt_key: request_key.to_vec(),
+            ordinal: self.index.next_custody_ordinal(),
+            carrier_sha256: commitments.carrier_sha256,
+            envelope_sha256: Sha256::digest(&payload.envelope).into(),
+            reservation: placement.reservation,
+            link_sha256: commitments.link_sha256,
+        };
+        self.write(branch, table, row.id.clone(), valid, Some(image))?;
+        let activation = match &placement.derived {
+            Some(reservation) => BranchEffect::ActivateDerivedCustodyOccurrence {
+                group, occurrence, reservation: reservation.clone(),
+            },
+            None => BranchEffect::ActivateCustodyOccurrence { group, occurrence },
+        };
+        self.push(activation)
     }
 
     fn put_image(&mut self, branch: &str, table: &TableRef, definition: &BranchTable, row: &Row) -> Result<(Interval, Arc<RowImage>)> {

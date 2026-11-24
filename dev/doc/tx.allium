@@ -1811,6 +1811,13 @@ surface ConnectionLifecycle {
 -- An inline derived reservation resolves the earlier original occurrence from the same accepting arm and activates with its own protected row.
 -- A prior ordered reservation binds the authored validity rule and compares its resolved interval at the activating write's receipt clock.
 -- A reserved destination and its link remain in the revocation inventory until the group's permanent denial.
+-- Reviewed reservations require an authenticated original writer version that owns both its configured point and the current decision point.
+-- The reservation requires the tracked merged source cut and the writer's bounded admission window from the authenticated custody Query proof.
+-- A reviewed reservation resolves an exact occurrence in the merged source branch, including through a dropped ancestor retained by the branch's base.
+-- A reviewed reservation or landing of an expiring branch requires a settlement cutoff no later than its ordered expiry.
+-- The complete inventory binds every enrolled native occurrence and pending reservation.
+-- A landing compares the inventory again with only its own pending reservation excluded and refuses an intervening source change.
+-- The final operation of the accepting arm activates the reserved main placements and drops their common source branch at the receipt basis.
 -- The latest revoked inventory keeps the first revocation basis and its digest.
 -- Authenticated release phase effects use the same order as revocation and hold their own receipt namespace.
 -- Default source intake authenticates the internal command and private namespace before reconstructing its canonical request.

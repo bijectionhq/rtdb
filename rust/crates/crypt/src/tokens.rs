@@ -144,9 +144,11 @@ pub struct CustodyReadProof {
     pub key_generation: Option<u64>,
     pub expires_at: Timestamp,
     pub contributors: Vec<([u8; 16], [u8; 32])>,
+    pub reviewed_source_sha256: Option<[u8; 32]>,
 }
 
 const CUSTODY_READ_HEADER: usize = Basis::WIDTH + 1 + 8 + 8 + 32 + 32;
+const CUSTODY_REVIEW_COMMITMENT_BYTES: usize = 32;
 const MAX_CUSTODY_CONTRIBUTORS: usize = 512;
 
 const PAGE_BYTES: usize = Basis::WIDTH + 8 + 8 + 32;
@@ -196,7 +198,7 @@ impl Purpose {
             Self::Page => PAGE_BYTES,
             Self::Export => EXPORT_BYTES,
             Self::ReceiverClock => OBSERVATION_BYTES,
-            Self::CustodyRead => CUSTODY_READ_HEADER + 48 * MAX_CUSTODY_CONTRIBUTORS,
+            Self::CustodyRead => CUSTODY_READ_HEADER + 48 * MAX_CUSTODY_CONTRIBUTORS + CUSTODY_REVIEW_COMMITMENT_BYTES,
             Self::DeploymentErasure => ERASURE_EVIDENCE_BYTES,
             Self::PeerRequest | Self::PeerReply => MAX_PEER_MESSAGE_BYTES,
         }
@@ -415,8 +417,16 @@ impl TokenAuthority {
         let (bound_owner, bytes) = bytes.split_first_chunk::<32>().ok_or_else(invalid)?;
         let (bound_session, bytes) = bytes.split_first_chunk::<32>().ok_or_else(invalid)?;
         let basis = Basis::from_bytes(basis).map_err(|_| invalid())?;
+        let (bytes, reviewed_source_sha256) = match bytes.len() % 48 {
+            0 => (bytes, None),
+            CUSTODY_REVIEW_COMMITMENT_BYTES => {
+                let (contributors, review) = bytes.split_last_chunk::<CUSTODY_REVIEW_COMMITMENT_BYTES>().ok_or_else(invalid)?;
+                (contributors, Some(*review))
+            }
+            _ => return Err(invalid()),
+        };
         if basis.incarnation() != *self.incarnation.as_bytes() || *bound_owner != owner || *bound_session != session
-            || bytes.len() % 48 != 0 || bytes.len() / 48 > MAX_CUSTODY_CONTRIBUTORS
+            || bytes.len() / 48 > MAX_CUSTODY_CONTRIBUTORS
         { return Err(invalid()); }
         let key_generation = match (*tag, u64::from_be_bytes(*generation)) {
             (0, 0) => None,
@@ -429,7 +439,9 @@ impl TokenAuthority {
         if contributors.windows(2).any(|pair| pair[0] >= pair[1])
             || contributors.iter().any(|(group, occurrence)| *group == [0; 16] || *occurrence == [0; 32])
         { return Err(invalid()); }
-        Ok(CustodyReadProof { basis, key_generation, expires_at: Timestamp(i64::from_be_bytes(*expiry)), contributors })
+        Ok(CustodyReadProof {
+            basis, key_generation, expires_at: Timestamp(i64::from_be_bytes(*expiry)), contributors, reviewed_source_sha256,
+        })
     }
 
     pub async fn issuer(&self) -> Result<TokenIssuer> {
@@ -559,7 +571,8 @@ impl TokenIssuer {
             || proof.contributors.windows(2).any(|pair| pair[0] >= pair[1])
             || proof.contributors.iter().any(|(group, occurrence)| *group == [0; 16] || *occurrence == [0; 32])
         { return Err(Purpose::CustodyRead.invalid()); }
-        let mut bytes = Vec::with_capacity(CUSTODY_READ_HEADER + 48 * proof.contributors.len());
+        let review_bytes = usize::from(proof.reviewed_source_sha256.is_some()) * CUSTODY_REVIEW_COMMITMENT_BYTES;
+        let mut bytes = Vec::with_capacity(CUSTODY_READ_HEADER + 48 * proof.contributors.len() + review_bytes);
         bytes.extend_from_slice(&proof.basis.to_bytes());
         bytes.push(u8::from(proof.key_generation.is_some()));
         bytes.extend_from_slice(&proof.key_generation.unwrap_or(0).to_be_bytes());
@@ -569,6 +582,9 @@ impl TokenIssuer {
         for (group, occurrence) in &proof.contributors {
             bytes.extend_from_slice(group);
             bytes.extend_from_slice(occurrence);
+        }
+        if let Some(review) = proof.reviewed_source_sha256 {
+            bytes.extend_from_slice(&review);
         }
         self.authority.seal(&self.key, Purpose::CustodyRead, &bytes).await
     }
@@ -782,6 +798,7 @@ mod tests {
         let evidence = CustodyReadProof {
             basis: Basis::new(*database.as_bytes(), 77), key_generation: Some(9), expires_at: Timestamp(10_000),
             contributors: vec![([1; 16], [2; 32]), ([3; 16], [4; 32])],
+            reviewed_source_sha256: Some([9; 32]),
         };
         let issuer = authority.issuer().await.unwrap();
         let token = issuer.seal_custody_read(&evidence, [5; 32], [6; 32]).await.unwrap();

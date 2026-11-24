@@ -895,6 +895,130 @@ fn custody_carrier(group: CustodyGroupId, id: i64, placement_id: CustodyPlacemen
     }
 }
 
+#[test]
+fn reviewed_custody_landing_orders_the_exact_reservation_and_keeps_ancestor_fences() {
+    use rtdb_index::branches::{CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
+    use std::num::NonZeroU64;
+
+    let group = [8; 16];
+    let features = [ROW_CUSTODY, TRANSACT_REQUIRES];
+    let transact = |state: &mut TransactState, at, request: &Transact| {
+        let prepared = plan(state, request, at, at as i64 * 10, &features);
+        apply(state, at, prepared.record()).unwrap()
+    };
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![put(MAIN_BRANCH, 99, "writer")]));
+    commit(&mut state, 2, &request(2, vec![fork("author", 1), fork("other", 1)]));
+    let mut original = custody_carrier(group, 1, [9; 16]);
+    let Op::PlaceCustodyRow { branch, .. } = &mut original else { unreachable!() };
+    *branch = "author".into();
+    transact(&mut state, 3, &request(3, vec![Op::CreateCustodyGroup { group }, original]));
+    let child = |child: &str, parent: &str, at| Op::Fork {
+        child: child.into(), from: (parent.into(), basis(at)), writable: true, expires_at: None,
+    };
+    commit(&mut state, 4, &request(4, vec![child("review", "author", 3)]));
+    commit(&mut state, 5, &request(5, vec![child("retained", "review", 4)]));
+    commit(&mut state, 6, &request(6, vec![Op::DropBranch { branch: "author".into() }]));
+    let original = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(60)).unwrap()
+        .custody_placements().next().unwrap().occurrence.unwrap().commitment(group);
+    let (source, _, _) = state.index().custody_review_at("review", basis(6), Timestamp(30), group, original).unwrap();
+    assert!(state.index().custody_review_at("other", basis(6), Timestamp(30), group, original).is_err());
+    let reservation = CustodyReservation {
+        original, source: original, destination: [10; 16], link: [11; 16],
+        target: CustodyTarget { branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Integer(2), valid: Interval::ALL.into() },
+        review_sha256: [12; 32], carrier_sha256: [13; 32], link_sha256: [14; 32],
+    };
+    let writer = Guard::Version {
+        branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Integer(99),
+        valid_at: Some(Timestamp(10)), expect: Version::Written(basis(1)),
+    };
+    let reviewed_request = |key, op| {
+        let mut request = request(key, vec![op]);
+        request.require.push(REVIEWED_CUSTODY_PLACEMENT.into());
+        request.requires.push(writer.clone());
+        request
+    };
+    let mut reserve = reviewed_request(7, Op::ReserveReviewedCustodyPlacement {
+        group, reservation: reservation.clone(), source: source.clone(), read_proof: vec![1],
+    });
+    reserve.requires.push(Guard::Unchanged(claims().seal(&ClaimScope {
+        branch: source.branch.clone(), basis: source.basis, layer: Layer::Merged,
+    }).unwrap()));
+    let reserved = transact(&mut state, 7, &reserve);
+    assert_eq!(reserved.outcome, Outcome::Then);
+    let placement_commitment = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(70)).unwrap()
+        .custody_placements().find(|entry| entry.placement_id == reservation.destination).unwrap().reservation.unwrap();
+    let Op::PlaceCustodyRow { table, mut row, mut placement, .. } = custody_carrier(group, 2, reservation.destination)
+        else { unreachable!() };
+    row.protected_columns.push("link".into());
+    placement.reservation = Some(placement_commitment);
+    placement.link_column = Some("link".into());
+    placement.commitments = Some(CustodyPlacementCommitments {
+        carrier_sha256: reservation.carrier_sha256, link_sha256: Some(reservation.link_sha256),
+    });
+    let bypass = request(8, vec![Op::PlaceCustodyRow {
+        branch: MAIN_BRANCH.into(), table: table.clone(), row: row.clone(), placement: placement.clone(),
+    }]);
+    assert!(matches!(transact(&mut state, 8, &bypass).outcome, Outcome::Refused { .. }));
+    let landing = |key, reserve_key| reviewed_request(key, Op::LandCustodyBranch {
+        branch: "review".into(), placements: vec![ReviewedCustodyPlacement {
+            table: table.clone(), row: row.clone(), placement: placement.clone(), reserved_at: reserved.basis, reserve_key,
+        }],
+    });
+    assert!(matches!(transact(&mut state, 9, &landing(9, vec![99; 16])).outcome, Outcome::Refused { .. }));
+    let revoke = request(11, vec![Op::RevokeCustodyGroup {
+        group, inventory_sha256: state.index().custody_inventory(group).unwrap().sha256,
+    }]);
+    let accept = landing(10, reserved.key.clone());
+    let mut fenced_first = state.clone();
+    assert_eq!(transact(&mut fenced_first, 11, &revoke).outcome, Outcome::Then);
+    assert!(matches!(transact(&mut fenced_first, 12, &accept).outcome, Outcome::Refused { .. }));
+    assert!(fenced_first.index().active_names(Timestamp(120)).any(|branch| branch == "review"));
+
+    let applied = transact(&mut state, 10, &accept);
+    assert_eq!(applied.outcome, Outcome::Then);
+    assert!(matches!(transact(&mut state, 11, &revoke).outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-inventory-changed"));
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    let root = state.index().view(MAIN_BRANCH, At::Exactly(applied.basis), Layer::Merged, Timestamp(110)).unwrap();
+    let entry = root.custody_placements().find(|entry| entry.placement_id == reservation.destination).unwrap();
+    assert_eq!(entry.reviewed.unwrap().0.receipt_key, reserved.key);
+    assert_eq!(entry.occurrence.unwrap().receipt_key, applied.key);
+    assert_eq!(entry.occurrence.unwrap().written, applied.basis);
+    assert!(root.lineage().iter().any(|entry| entry.branch == "review" && entry.dropped == Some(applied.basis)));
+    assert_eq!(state.tx_status(&reserved.key).unwrap(), Receipt { replayed: true, ..reserved });
+    assert_eq!(state.tx_status(&applied.key).unwrap(), Receipt { replayed: true, ..applied });
+    assert!(visible(&state, "retained", Layer::Merged, 110).contains(&1));
+    let registration = CustodyReleaseRegistration {
+        authority: CustodyCarrierAuthority {
+            incarnation: INCARNATION, source_history: [15; 32], installation: [16; 16], registry: [17; 32], original_writer: [18; 32],
+        },
+        group, original, occurrence: original, carrier_receipt_sha256: [19; 32], expires_at: Timestamp(200),
+        part: CustodyResponsePart {
+            transport_history: [20; 16], producer: [21; 16], consumer: [22; 16], response: [23; 16], ordinal: NonZeroU64::MIN,
+        },
+    };
+    let release = |phase| TrustedCustodyRelease {
+        release: CustodyRelease { registration, phase },
+        writer: CustodyWriterFence { table: table.clone(), id: EntityId::Integer(99), valid_at: Timestamp(10), written: basis(1) },
+    }.into_request();
+    assert_eq!(commit(&mut state, 12, &release(CustodyReleasePhase::Private)).outcome, Outcome::Then);
+    assert_eq!(commit(&mut state, 13, &release(CustodyReleasePhase::Promoted)).outcome, Outcome::Then);
+    let revoke = request(14, vec![Op::RevokeCustodyGroup {
+        group, inventory_sha256: state.index().custody_inventory(group).unwrap().sha256,
+    }]);
+    assert_eq!(transact(&mut state, 14, &revoke).outcome, Outcome::Then);
+    assert!(!visible(&state, "retained", Layer::Merged, 140).contains(&1));
+    assert!(!visible(&state, MAIN_BRANCH, Layer::Merged, 140).contains(&2));
+    assert!(!state.index().custody_releases_drained(group));
+    let dispose = release(CustodyReleasePhase::Disposed { evidence_sha256: [24; 32] });
+    assert_eq!(commit(&mut state, 15, &dispose).outcome, Outcome::Then);
+    assert!(state.index().custody_releases_drained(group));
+    assert!(matches!(state.resolve(&accept, 16, Timestamp(160), &features, &claims()).unwrap(),
+        Resolution::Answer(receipt) if receipt.replayed && receipt.basis == basis(10)));
+}
+
 fn commit_custody(state: &mut TransactState, at: u64, request: &Transact) -> Receipt {
     let prepared = plan(state, request, at, at as i64 * 10, &[ROW_CUSTODY]);
     apply(state, at, prepared.record()).unwrap()

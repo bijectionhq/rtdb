@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_tx::transact::{
     self as tx, Cell, CountRange, Declaration, GroupedCount, Guard, IndexDefinition, Op, Row, Transact, Version,
-    CustodyPlacement, CustodyReservation, CustodyTarget, DerivedCustodyReservation, ValidTime, ValidTimeBound, When, Window,
+    CustodyPlacement, CustodyReservation, CustodyReview, CustodyTarget, DerivedCustodyReservation,
+    ReviewedCustodyPlacement, ValidTime, ValidTimeBound, When, Window,
     RankedIndexDefinition, RankedIndexKind,
 };
 use rtdb_types::{
@@ -180,53 +181,91 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
                 inventory_sha256: commitment(&revoke.inventory_sha256)?,
             },
             WireOp::ReserveCustodyPlacement(reserve) => {
-                let target = reserve.target.ok_or_else(|| error::incorrect("Missing custody placement target"))?;
-                let valid = target.valid.ok_or_else(|| error::incorrect("Missing custody placement interval"))?;
-                Op::ReserveCustodyPlacement {
-                    group: custody_identity(&reserve.group)?,
-                    reservation: CustodyReservation {
-                        original: commitment(&reserve.original_occurrence_sha256)?,
-                        source: commitment(&reserve.source_occurrence_sha256)?,
-                        destination: custody_identity(&reserve.destination)?,
-                        link: custody_identity(&reserve.link)?,
-                        target: CustodyTarget {
-                            branch: branch(target.branch)?, table: table(&target.table)?,
-                            id: entity(target.id, memory)?, valid: interval(valid)?,
-                        },
-                        review_sha256: commitment(&reserve.review_sha256)?,
-                        carrier_sha256: commitment(&reserve.carrier_sha256)?,
-                        link_sha256: commitment(&reserve.link_sha256)?,
-                    },
-                }
+                let (group, reservation) = decode_custody_reservation(reserve, memory)?;
+                Op::ReserveCustodyPlacement { group, reservation }
             }
             WireOp::PlaceCustodyRow(place) => {
-                if place.reservation_sha256.is_some() && place.derived_reservation.is_some() {
-                    return Err(error::incorrect("Custody placement takes one reservation"));
+                let (branch, table, row, placement) = decode_custody_placement(place, memory)?;
+                Op::PlaceCustodyRow { branch, table, row, placement }
+            }
+            WireOp::ReserveReviewedCustodyPlacement(reserve) => {
+                let (group, reservation) = decode_custody_reservation(
+                    reserve.placement.ok_or_else(|| error::incorrect("Missing custody reservation"))?, memory,
+                )?;
+                let source = reserve.source.ok_or_else(|| error::incorrect("Missing reviewed source cut"))?;
+                let source = CustodyReview {
+                    branch: branch(source.branch)?,
+                    basis: basis(source.basis.ok_or_else(|| error::incorrect("Missing reviewed Basis"))?)?,
+                    valid_at: Timestamp(source.valid_at_micros),
+                    inventory_sha256: commitment(&source.inventory_sha256)?,
+                };
+                Op::ReserveReviewedCustodyPlacement { group, reservation, source, read_proof: reserve.read_proof }
+            }
+            WireOp::LandCustodyBranch(land) => {
+                if !(1..=512).contains(&land.placements.len()) {
+                    return Err(error::incorrect("A branch landing needs a bounded set of placements"));
                 }
-                Op::PlaceCustodyRow {
-                    branch: branch(place.branch)?,
-                    table: table(&place.table)?,
-                    row: decode_row(place.row.ok_or_else(|| error::incorrect("Missing custody row"))?, memory)?,
-                    placement: CustodyPlacement {
-                        placement_id: custody_identity(&place.placement_id)?,
-                        reservation: place.reservation_sha256.as_deref().map(commitment).transpose()?,
-                        derived: place.derived_reservation.map(|derived| -> Result<_, Status> {
-                            Ok(DerivedCustodyReservation {
-                                original_placement_id: custody_identity(&derived.original_placement_id)?,
-                                link: custody_identity(&derived.link)?,
-                                review_sha256: commitment(&derived.review_sha256)?,
-                                carrier_sha256: commitment(&derived.carrier_sha256)?,
-                                link_sha256: commitment(&derived.link_sha256)?,
-                            })
-                        }).transpose()?,
-                        carrier_column: place.carrier_column,
-                        link_column: place.link_column,
-                        commitments: None,
-                    },
-                }
+                let placements = land.placements.into_iter().map(|reviewed| {
+                    super::check_key(&reviewed.reserve_key)?;
+                    let (branch, table, row, placement) = decode_custody_placement(
+                        reviewed.placement.ok_or_else(|| error::incorrect("Missing reviewed placement"))?, memory,
+                    )?;
+                    if branch != rtdb_types::rtdb_v1::MAIN_BRANCH {
+                        return Err(error::incorrect("A branch landing places its rows on main"));
+                    }
+                    let reserved_at = basis(reviewed.reserved_at.ok_or_else(|| error::incorrect("Missing reservation Basis"))?)?;
+                    Ok(ReviewedCustodyPlacement { table, row, placement, reserved_at, reserve_key: reviewed.reserve_key })
+                }).collect::<Result<_, Status>>()?;
+                Op::LandCustodyBranch { branch: branch(land.branch)?, placements }
             }
         },
     )
+}
+
+fn decode_custody_reservation(
+    reserve: proto::ReserveCustodyPlacement, memory: &Arc<MemoryBudget>,
+) -> Result<(tx::CustodyGroupId, CustodyReservation), Status> {
+    let target = reserve.target.ok_or_else(|| error::incorrect("Missing custody placement target"))?;
+    let valid = target.valid.ok_or_else(|| error::incorrect("Missing custody placement interval"))?;
+    Ok((custody_identity(&reserve.group)?, CustodyReservation {
+        original: commitment(&reserve.original_occurrence_sha256)?,
+        source: commitment(&reserve.source_occurrence_sha256)?,
+        destination: custody_identity(&reserve.destination)?,
+        link: custody_identity(&reserve.link)?,
+        target: CustodyTarget {
+            branch: branch(target.branch)?, table: table(&target.table)?,
+            id: entity(target.id, memory)?, valid: interval(valid)?,
+        },
+        review_sha256: commitment(&reserve.review_sha256)?,
+        carrier_sha256: commitment(&reserve.carrier_sha256)?,
+        link_sha256: commitment(&reserve.link_sha256)?,
+    }))
+}
+
+fn decode_custody_placement(
+    place: proto::PlaceCustodyRow, memory: &Arc<MemoryBudget>,
+) -> Result<(Branch, TableRef, Row, CustodyPlacement), Status> {
+    if place.reservation_sha256.is_some() && place.derived_reservation.is_some() {
+        return Err(error::incorrect("Custody placement takes one reservation"));
+    }
+    let placement = CustodyPlacement {
+        placement_id: custody_identity(&place.placement_id)?,
+        reservation: place.reservation_sha256.as_deref().map(commitment).transpose()?,
+        derived: place.derived_reservation.map(|derived| -> Result<_, Status> {
+            Ok(DerivedCustodyReservation {
+                original_placement_id: custody_identity(&derived.original_placement_id)?,
+                link: custody_identity(&derived.link)?,
+                review_sha256: commitment(&derived.review_sha256)?,
+                carrier_sha256: commitment(&derived.carrier_sha256)?,
+                link_sha256: commitment(&derived.link_sha256)?,
+            })
+        }).transpose()?,
+        carrier_column: place.carrier_column,
+        link_column: place.link_column,
+        commitments: None,
+    };
+    let row = decode_row(place.row.ok_or_else(|| error::incorrect("Missing custody row"))?, memory)?;
+    Ok((branch(place.branch)?, table(&place.table)?, row, placement))
 }
 
 fn declaration(

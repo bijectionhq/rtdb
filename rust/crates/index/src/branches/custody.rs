@@ -62,6 +62,10 @@ impl CustodyGroup {
     }
 
     pub(super) fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
+        self.inventory_except(group, at, None)
+    }
+
+    pub(super) fn inventory_except(&self, group: CustodyGroupId, at: Basis, except: Option<CustodyPlacementId>) -> Option<CustodyInventory> {
         if self.created.is_some_and(|created| created > at) { return None; }
         let mut hash = Sha256::new();
         hash.update(b"rtdb/v1/custody-inventory\0");
@@ -85,10 +89,12 @@ impl CustodyGroup {
             hash.update(b"original\0");
             hash.update(original.commitment(group));
         }
-        for pending in self.reservations.values().filter(|pending| pending.at <= at) {
+        for (_, pending) in self.reservations.iter().filter(|(destination, pending)| {
+            Some(**destination) != except && pending.at <= at
+        }) {
             hash.update(b"reservation\0");
             hash.update(pending.at.to_bytes());
-            hash.update(pending.reservation.commitment(at.incarnation(), group));
+            hash.update(pending.commitment(at.incarnation(), group));
             if let Some(occurrence) = pending.occurrence.as_ref().filter(|occurrence| occurrence.written <= at) {
                 hash.update([1]);
                 hash.update(occurrence.commitment(group));
@@ -137,13 +143,14 @@ impl BranchIndex {
         self.custody.iter().flat_map(move |(&group, record)| {
             let original = record.original.iter().filter(move |original| original.written <= at)
                 .map(move |original| CustodyPlacementEntry {
-                    group, placement_id: original.placement_id, enrolled: original.written, reservation: None, occurrence: Some(original),
+                    group, placement_id: original.placement_id, enrolled: original.written, reservation: None, occurrence: Some(original), reviewed: None,
                 });
             let reserved = record.reservations.iter().filter(move |(_, entry)| entry.at <= at)
                 .map(move |(&placement_id, entry)| CustodyPlacementEntry {
                     group, placement_id, enrolled: entry.at,
-                    reservation: Some(entry.reservation.commitment(at.incarnation(), group)),
+                    reservation: Some(entry.commitment(at.incarnation(), group)),
                     occurrence: entry.occurrence.as_ref().filter(|occurrence| occurrence.written <= at),
+                    reviewed: entry.reviewed.as_ref().map(|reviewed| (reviewed, &entry.reservation)),
                 });
             original.chain(reserved)
         })

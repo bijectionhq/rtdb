@@ -318,14 +318,31 @@ fn append_custody_placements(view: &BranchView<'_>, buffer: &mut TransactionBuff
         ("reservation_sha256".into(), binary.clone()),
         ("occurrence_sha256".into(), binary.clone()),
         ("carrier_sha256".into(), binary.clone()),
-        ("written_basis".into(), binary),
+        ("written_basis".into(), binary.clone()),
         ("ordinal".into(), LogicalType::Scalar(ScalarType::U64)),
+        ("reviewed_branch".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ("reviewed_basis".into(), binary.clone()),
+        ("reviewed_valid_at_micros".into(), LogicalType::Scalar(ScalarType::I64)),
+        ("reviewed_inventory_sha256".into(), binary.clone()),
+        ("reviewed_original_sha256".into(), binary.clone()),
+        ("reviewed_source_sha256".into(), binary.clone()),
+        ("review_sha256".into(), binary.clone()),
+        ("reviewed_carrier_sha256".into(), binary.clone()),
+        ("reviewed_link_sha256".into(), binary.clone()),
+        ("reviewed_link_id".into(), binary.clone()),
+        ("reviewed_target_table".into(), LogicalType::Scalar(ScalarType::Utf8)),
+        ("reviewed_target_id".into(), binary.clone()),
+        ("reviewed_written_valid_from_micros".into(), LogicalType::Scalar(ScalarType::I64)),
+        ("reviewed_written_valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64)),
+        ("reviewed_envelope_sha256".into(), binary.clone()),
+        ("reviewed_reserve_key".into(), binary.clone()),
+        ("reviewed_activation_key".into(), binary),
     ]);
     buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
     buffer.declare_document_types(&catalog, &columns)?;
     let binary = |bytes: [u8; 32]| Value::Binary(bytes.to_vec());
     for entry in view.custody_placements() {
-        let cells = StructFields::from([
+        let mut cells = StructFields::from([
             ("_id".into(), Value::Utf8(format!("{:032x}", u128::from_be_bytes(entry.placement_id)))),
             ("group_id".into(), Value::Binary(entry.group.to_vec())),
             ("enrolled_basis".into(), basis_value(entry.enrolled)),
@@ -335,6 +352,31 @@ fn append_custody_placements(view: &BranchView<'_>, buffer: &mut TransactionBuff
             ("written_basis".into(), entry.occurrence.map_or(Value::Null, |occurrence| basis_value(occurrence.written))),
             ("ordinal".into(), entry.occurrence.map_or(Value::Null, |occurrence| Value::U64(occurrence.ordinal))),
         ]);
+        if let Some((reviewed, reservation)) = entry.reviewed {
+            cells.extend([
+                ("reviewed_branch".into(), Value::Utf8(reviewed.source.branch.clone())),
+                ("reviewed_basis".into(), basis_value(reviewed.source.basis)),
+                ("reviewed_valid_at_micros".into(), Value::I64(reviewed.source.valid_at.0)),
+                ("reviewed_inventory_sha256".into(), binary(reviewed.source.inventory_sha256)),
+                ("reviewed_original_sha256".into(), binary(reservation.original)),
+                ("reviewed_source_sha256".into(), binary(reservation.source)),
+                ("review_sha256".into(), binary(reservation.review_sha256)),
+                ("reviewed_carrier_sha256".into(), binary(reservation.carrier_sha256)),
+                ("reviewed_link_sha256".into(), binary(reservation.link_sha256)),
+                ("reviewed_link_id".into(), Value::Binary(reservation.link.to_vec())),
+                ("reviewed_target_table".into(), Value::Utf8(format!("{}.{}", reservation.target.table.schema, reservation.target.table.table))),
+                ("reviewed_target_id".into(), Value::Binary(reservation.target.id.handle_bytes())),
+                ("reviewed_reserve_key".into(), Value::Binary(reviewed.receipt_key.clone())),
+            ]);
+            if let Some(occurrence) = entry.occurrence {
+                cells.extend([
+                    ("reviewed_written_valid_from_micros".into(), Value::I64(occurrence.target.valid.lower().0)),
+                    ("reviewed_written_valid_to_micros".into(), Value::I64(occurrence.target.valid.upper().0)),
+                    ("reviewed_envelope_sha256".into(), binary(occurrence.envelope_sha256)),
+                    ("reviewed_activation_key".into(), Value::Binary(occurrence.receipt_key.clone())),
+                ]);
+            }
+        }
         buffer.put(catalog.clone(), cells, Interval::ALL)?;
     }
     Ok(())

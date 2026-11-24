@@ -32,6 +32,12 @@ impl CustodyWriterFence {
         Self { table: table.clone(), id: id.clone(), valid_at: *valid_at, written: *written }.matches(index, now)
     }
 
+    pub fn authenticates(&self, requirement: &Guard) -> bool {
+        matches!(requirement, Guard::Version { branch, table, id, valid_at: Some(valid_at), expect: Version::Written(written) }
+            if branch == MAIN_BRANCH && table == &self.table && id == &self.id
+                && *valid_at == self.valid_at && *written == self.written)
+    }
+
     fn requirement(&self) -> Guard {
         Guard::Version {
             branch: MAIN_BRANCH.into(),

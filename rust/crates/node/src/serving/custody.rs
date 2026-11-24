@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::CustodyVault;
 use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView}};
-use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, CustodyPlacementCommitments, Op, Transact};
+use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, Op, Row, Transact};
 use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
@@ -22,59 +22,80 @@ pub(crate) async fn prepare(request: &mut Transact, vault: &CustodyVault) -> Res
         }
     }
     for (arm, actions) in [&mut request.ops, &mut request.otherwise].into_iter().enumerate() {
-        for (action, op) in actions.iter_mut().enumerate() {
-            let rows = match op {
-                Op::Put { rows, .. } => rows.as_mut_slice(),
-                Op::PlaceCustodyRow { row, placement, .. } => {
-                    let expected = 1 + usize::from(placement.link_column.is_some());
-                    if placement.reservation.is_some() && placement.derived.is_some()
-                        || (placement.reservation.is_some() || placement.derived.is_some()) != placement.link_column.is_some()
-                        || row.protected_columns.len() != expected
-                        || placement.link_column.as_ref() == Some(&placement.carrier_column)
-                    {
-                        return Err(invalid_carrier());
-                    }
-                    let digest = |column: &str| {
-                        if !row.protected_columns.iter().any(|protected| protected == column) {
-                            return Err(invalid_carrier());
-                        }
-                        match row.cells.get(column) {
-                            Some(Cell::Value(Value::Binary(bytes) | Value::FixedSizeBinary(bytes))) if !bytes.is_empty() => {
-                                Ok(Sha256::digest(bytes).into())
-                            }
-                            _ => Err(invalid_carrier()),
-                        }
-                    };
-                    placement.commitments = Some(CustodyPlacementCommitments {
-                        carrier_sha256: digest(&placement.carrier_column)?,
-                        link_sha256: placement.link_column.as_deref().map(digest).transpose()?,
-                    });
-                    std::slice::from_mut(row)
-                }
-                _ => continue,
-            };
-            for (index, row) in rows.iter_mut().enumerate() {
-                if row.protected_columns.is_empty() { continue; }
-                let group = row.custody_group.ok_or_else(missing_group)?;
-                let mut protected = StructFields::new();
-                for column in &row.protected_columns {
-                    let Some(Cell::Value(value)) = row.cells.remove(column) else {
-                        return Err(Anomaly::incorrect("rtdb/custody-payload", "A protected column requires a literal cell"));
-                    };
-                    protected.insert(column.clone(), value);
-                }
-                let clear = serde_json::to_vec(&protected).map_err(payload_error)?;
-                let binding = binding(fingerprint, arm, action, index);
-                let envelope = match vault.seal(group, binding, &clear).await {
-                    Ok(envelope) => envelope,
-                    // The fold can still recover the exact receipt from the logical digest.
-                    Err(error) if error.code == "rtdb/erased-under-view" => return Ok(()),
-                    Err(error) => return Err(error),
-                };
-                row.custody_payload = Some(CustodyPayload { binding, envelope });
-            }
+        if let Err(error) = prepare_arm(actions, vault, fingerprint, arm).await {
+            // The fold can recover the exact receipt from the logical digest after key destruction.
+            if error.code == "rtdb/erased-under-view" { return Ok(()); }
+            return Err(error);
         }
     }
+    Ok(())
+}
+
+async fn prepare_arm(ops: &mut [Op], vault: &CustodyVault, fingerprint: [u8; 32], arm: usize) -> Result<()> {
+    for (action, op) in ops.iter_mut().enumerate() {
+        match op {
+            Op::Put { rows, .. } => {
+                for (index, row) in rows.iter_mut().enumerate() {
+                    if !row.protected_columns.is_empty() {
+                        seal_row(row, vault, binding(fingerprint, arm, action, index)).await?;
+                    }
+                }
+            }
+            Op::PlaceCustodyRow { row, placement, .. } => {
+                prepare_placement(row, placement)?;
+                seal_row(row, vault, binding(fingerprint, arm, action, 0)).await?;
+            }
+            Op::LandCustodyBranch { placements, .. } => {
+                for (index, reviewed) in placements.iter_mut().enumerate() {
+                    prepare_placement(&reviewed.row, &mut reviewed.placement)?;
+                    seal_row(&mut reviewed.row, vault, binding(fingerprint, arm, action, index)).await?;
+                }
+            }
+            _ => (),
+        }
+    }
+    Ok(())
+}
+
+fn prepare_placement(row: &Row, placement: &mut CustodyPlacement) -> Result<()> {
+    let expected = 1 + usize::from(placement.link_column.is_some());
+    if placement.reservation.is_some() && placement.derived.is_some()
+        || (placement.reservation.is_some() || placement.derived.is_some()) != placement.link_column.is_some()
+        || row.protected_columns.len() != expected
+        || placement.link_column.as_ref() == Some(&placement.carrier_column)
+    {
+        return Err(invalid_carrier());
+    }
+    let digest = |column: &str| {
+        if !row.protected_columns.iter().any(|protected| protected == column) {
+            return Err(invalid_carrier());
+        }
+        match row.cells.get(column) {
+            Some(Cell::Value(Value::Binary(bytes) | Value::FixedSizeBinary(bytes))) if !bytes.is_empty() => {
+                Ok(Sha256::digest(bytes).into())
+            }
+            _ => Err(invalid_carrier()),
+        }
+    };
+    placement.commitments = Some(CustodyPlacementCommitments {
+        carrier_sha256: digest(&placement.carrier_column)?,
+        link_sha256: placement.link_column.as_deref().map(digest).transpose()?,
+    });
+    Ok(())
+}
+
+async fn seal_row(row: &mut Row, vault: &CustodyVault, binding: [u8; 32]) -> Result<()> {
+    let group = row.custody_group.ok_or_else(missing_group)?;
+    let mut protected = StructFields::new();
+    for column in &row.protected_columns {
+        let Some(Cell::Value(value)) = row.cells.remove(column) else {
+            return Err(Anomaly::incorrect("rtdb/custody-payload", "A protected column requires a literal cell"));
+        };
+        protected.insert(column.clone(), value);
+    }
+    let clear = serde_json::to_vec(&protected).map_err(payload_error)?;
+    let envelope = vault.seal(group, binding, &clear).await?;
+    row.custody_payload = Some(CustodyPayload { binding, envelope });
     Ok(())
 }
 

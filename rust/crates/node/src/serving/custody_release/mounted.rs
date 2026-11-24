@@ -268,12 +268,16 @@ impl MountedResponseRelease<'_> {
     }
 
     pub async fn require_original_writer(&self) -> Result<()> {
+        self.original_writer_fence().await.map(drop)
+    }
+
+    pub async fn original_writer_fence(&self) -> Result<CustodyWriterFence> {
         let release = self.release();
         let authority = self.owner.provider.installation.authority;
-        self.while_mounted(async { release.current_with_writer(authority).await.map(drop) })
+        let (_, writer) = self.while_mounted(release.current_with_writer(authority))
             .await?;
-        self.owner
-            .with_live_mount(|| release.require_authority(authority))
+        self.owner.with_live_mount(|| release.require_authority(authority))?;
+        Ok(writer)
     }
 
     pub async fn capture_ranked(&self, source: QuerySource) -> Result<CapturedCustodyRank> {

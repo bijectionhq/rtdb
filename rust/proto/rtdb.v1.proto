@@ -75,6 +75,8 @@ message QueryRequest {
   // Execute a bounded rank on a proved native IVF generation. Requires tracked,
   // clear, exact merged main; SQL, params_ipc, Page and field 10 are absent.
   RankedIvf ranked_ivf = 11;
+  // Select reviewed occurrences from this same exact merged custody Query.
+  CustodyReviewSelection custody_review = 12;
 }
 message RankedIvf {
   string schema = 1;
@@ -140,6 +142,24 @@ message FollowerProgress {
 }
 message CustodyReadInventory {
   repeated CustodyReadContributor contributors = 1;
+  CustodyReviewedSource reviewed_source = 2;
+}
+message CustodyReviewSelection {
+  bytes group = 1;
+  bytes selected_occurrence_sha256 = 2;
+  sint64 valid_at_micros = 3;
+}
+message CustodyReviewCut {
+  string branch = 1;
+  Basis basis = 2;
+  sint64 valid_at_micros = 3;
+  bytes inventory_sha256 = 4;
+}
+message CustodyReviewedSource {
+  CustodyReviewCut cut = 1;
+  CustodyReadContributor original = 2;
+  CustodyReadContributor selected = 3;
+  sint64 proof_expires_at_micros = 4;
 }
 message CustodyReadContributor {
   bytes group = 1;
@@ -436,6 +456,21 @@ message DerivedCustodyReservation {
   bytes carrier_sha256 = 4;
   bytes link_sha256 = 5;
 }
+message ReserveReviewedCustodyPlacement {
+  ReserveCustodyPlacement placement = 1;
+  CustodyReviewCut source = 2;
+  bytes read_proof = 3;
+}
+message ReviewedCustodyPlacement {
+  PlaceCustodyRow placement = 1;
+  Basis reserved_at = 2;
+  bytes reserve_key = 3;
+}
+message LandCustodyBranch {
+  string branch = 1;
+  // All placements address main and activate earlier reviewed reservations.
+  repeated ReviewedCustodyPlacement placements = 2;
+}
 message Op {
   oneof op {
     Put put = 1;
@@ -450,6 +485,8 @@ message Op {
     RevokeCustodyGroup revoke_custody_group = 10;
     ReserveCustodyPlacement reserve_custody_placement = 11;
     PlaceCustodyRow place_custody_row = 12;
+    ReserveReviewedCustodyPlacement reserve_reviewed_custody_placement = 13;
+    LandCustodyBranch land_custody_branch = 14;
   }
 }
 message Otherwise { repeated uint32 failed = 1; }

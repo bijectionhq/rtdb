@@ -1,5 +1,34 @@
 # RTDB v1 custody producer handoff
 
+## Reviewed branch placement
+
+`transact.custody-reviewed-placement` is available to the configured Original owner on routes that already admit native row custody.
+The native transaction and release folds are shared by Default and Multi.
+The published Multi route still gates native row-custody writes and therefore does not advertise reviewed placement.
+
+1. Run a tracked, unpaged, exact merged Query on the writable source branch, with `custody_release_evidence` and `custody_review` selecting the group, winning occurrence and valid instant.
+   `CustodyReadInventory.reviewed_source` reports the authenticated complete inventory digest and the Original and winning occurrence, including their physical authoring branches, ordinals and independently confirmed receipt keys, bases and clocks.
+   The release token binds that source evidence to the same captured contributors, owner session and generation.
+   An inherited winner can resolve through a retained ancestor after that ancestor drops.
+2. Submit `ReserveReviewedCustodyPlacement` with the returned source cut and release token, the Original and selected occurrence commitments, and the exact destination, link, review and protected binary commitments.
+   Put the configured Original writer's exact `Version` first in `requires` and include the tracked Query claim there.
+   Set `window.before` no later than either the returned `proof_expires_at_micros` or the source branch expiry and pass `transact.custody-reviewed-placement` in `require`.
+   Confirm `TxStatus` at the reservation key and query `xt.custody_placements` at that receipt's exact basis for the reviewed reserve key, inventory, review and reservation commitment.
+3. Submit `LandCustodyBranch` as the final operation in the accepting arm under the same writer requirement and the application's review, publication and expiry requirements.
+   Each entry supplies the exact prior reserve key and basis and its protected `PlaceCustodyRow` on `main`.
+   Include any application receipt and proof rows earlier in the same arm.
+   For an expiring branch, use `window.before` at or before its ordered expiry.
+   The resolver checks the complete current inventory again with only that entry's own pending reservation excluded, verifies the source remains unchanged and requires an unoccupied destination.
+4. Recover outcomes by key using `TxStatus`, including after the proof expires, the response is lost or the source branch drops.
+   Match a `Then` receipt to `xt.custody_placements` and `xt.branch_lineage` at its exact `main` basis.
+   Compare reserve and activation keys, source and review commitments, destination occurrence, validity, ordinal and digests, and the source drop basis.
+   The existing custody group fence and release drain include the new placement and surviving inherited copies.
+
+The placed Original assertion vault is a separate authority.
+An application that uses those stages still needs a durable mapping of the native reviewed source and accepted `Then` receipt and placement to the exact vault member, destination and link stages, application receipt, and accepted binding.
+The provider must authenticate that mapping without an owned branch registration, deny plaintext while activation is pending, and recover the same activation after branch drop.
+Its family fence, positive release terminals, checkpoint-copy drain and stage destruction must settle alongside the separately verified native group fence and drain.
+
 The producer branch includes the Query and Changes frame generation fence from `1a5d1b7e5b`, the Default authenticated source intake, ranked contributor custody from `c11220484e`, and exact Multi export pinning from `fc89eea064`.
 `ROW_CUSTODY` and protected exports remain gated.
 The existing hosted assertion-family route continues to own its current consumers.

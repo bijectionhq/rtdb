@@ -105,6 +105,10 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     hash.update([query.track.into()]);
     if query.observe_receiver_clock { hash.update(b"receiver-clock"); }
     if query.custody_release_evidence { hash.update(b"custody-release-evidence"); }
+    if let Some(review) = &query.custody_review {
+        hash.update(b"custody-review");
+        hash.update(Sha256::digest(review.encode_to_vec()));
+    }
     if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
     if query.observe_applied_position { hash.update(b"observe-applied-position"); }
     if query.verify_ranked_artefacts { hash.update(b"ranked-artefact-readiness"); }
@@ -297,6 +301,13 @@ impl Service {
         let database = self.wire_database(call, &source.branch, layer).await?;
         let driver = database.serving_driver();
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
+        if request.custody_review.is_some() && (
+            !request.custody_release_evidence || !request.track || request.page.is_some()
+                || claim_layer != Layer::Merged || !matches!(selection, Some(Selection::Exactly(_)))
+                || driver.is_none_or(|driver| !driver.features().contains(&rtdb_tx::transact::ROW_CUSTODY))
+        ) {
+            return Err(error::unsupported(rtdb_tx::transact::REVIEWED_CUSTODY_PLACEMENT));
+        }
         if request.require_clear_rank_input && (
             !request.track || !matches!(selection, Some(Selection::Exactly(_)))
                 || request.custody_release_evidence || visibility.is_some()
@@ -533,7 +544,8 @@ impl Service {
         let (custody_release_proof, custody_release_inventory) = if request.custody_release_evidence {
             let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("custody release proof"))?;
             let contributors = custody_contributors.ok_or_else(|| error::unsupported("complete custody release inventory"))?;
-            let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors).await?;
+            let review = request.custody_review.as_ref().map(|review| (source.branch.as_str(), review));
+            let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors, review).await?;
             (Some(proof), Some(inventory))
         } else { (None, None) };
         let (applied_position, follower_progress) = match follower_evidence {

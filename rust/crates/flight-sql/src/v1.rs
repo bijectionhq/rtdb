@@ -6,7 +6,7 @@ use prost::{Message, Name};
 use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
-use rtdb_tx::transact::{PHYSICAL_ERASURE, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{PHYSICAL_ERASURE, REVIEWED_CUSTODY_PLACEMENT, ROW_CUSTODY, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS, RANKED_IVF}};
 use tonic::{Response, Status, metadata::MetadataMap};
 
@@ -133,6 +133,9 @@ impl Service {
                             if driver.supports_row_visibility() && !features.iter().any(|feature| feature == ROW_VISIBILITY) {
                                 features.push(ROW_VISIBILITY.into());
                             }
+                            if driver.features().contains(&ROW_CUSTODY) && self.custody_route(&call).is_ok() {
+                                features.push(REVIEWED_CUSTODY_PLACEMENT.into());
+                            }
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
                         }
@@ -226,6 +229,12 @@ impl Service {
         })?;
         let mut transaction = transact::request(request, call.memory())?;
         transaction.request_memory = Some(call.request_reservation());
+        if transaction.uses_reviewed_custody() {
+            if !driver.features().contains(&ROW_CUSTODY) {
+                return Err(error::unsupported(REVIEWED_CUSTODY_PLACEMENT));
+            }
+            self.authenticate_reviewed_custody(call, &database, &transaction).await?;
+        }
         let receipt = match self.serving_scope(call, driver)? {
             Some(scope) => driver.transact_scoped(transaction, scope, &call.cancellation).await,
             None => driver.transact(transaction, &call.cancellation).await,
