@@ -1070,6 +1070,16 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn apply(&mut self, operation: &Operation) -> Result<()> {
+        let direct = if let (Some(replay), Some(relation)) =
+            (&mut self.hosted_replay, operation.direct_archive_relation())
+            && let Some(position) = replay.take_direct_effect()?
+        {
+            let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
+            self.buffer.begin_direct_archive_effect(relation.table(owner), position)?;
+            true
+        } else {
+            false
+        };
         let span = match operation {
             Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => self.context.transaction_span(self.trace_parent, "xtdb.transaction.sql", &[("query.text", rtdb_plan::TraceValue::Text(sql))]),
             Operation::Public(TxOp::PatchDocs { table, .. }) | Operation::PatchIids { table, .. } | Operation::PatchArrowIids { table, .. } => self.context.transaction_span(self.trace_parent, "xtdb.transaction.patch-docs", &[("db", rtdb_plan::TraceValue::Text(&self.context.database)), ("schema", rtdb_plan::TraceValue::Text(&table.schema)), ("table", rtdb_plan::TraceValue::Text(&table.table))]),
@@ -1079,7 +1089,11 @@ impl<'a> OpenTransaction<'a> {
         self.trace_parent = span.as_ref().map(|span| span.context()).or(parent);
         let result = self.apply_inner(operation).await;
         self.trace_parent = parent;
-        result
+        result?;
+        if direct {
+            self.buffer.finish_direct_archive_effect()?;
+        }
+        Ok(())
     }
     async fn apply_inner(&mut self, operation: &Operation) -> Result<()> {
         self.context.check_cancelled()?;
@@ -1132,7 +1146,7 @@ impl<'a> OpenTransaction<'a> {
                 Err(Anomaly::incorrect("rtdb.hosted/constraint-receipt", "Unexpected refusal boundary"))
             }
             Operation::Public(TxOp::HostedControl(control)) => {
-                if self.hosted_replay.as_ref().is_some_and(|replay| replay.is_transient_world_control(control)) {
+                if self.hosted_replay.as_ref().is_some_and(|replay| replay.is_transient_replay_control(control)) {
                     return Ok(());
                 }
                 if let Some(documents) = control.arrow_replacement() {
@@ -1731,8 +1745,12 @@ impl<'a> OpenTransaction<'a> {
         if proposal_land.is_some() {
             self.buffer.retain_owned_positions()?;
         }
-        if let Some(replay) = replay.as_ref().filter(|replay| !replay.commit_positions().is_empty()) {
-            self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
+        if let Some(replay) = &replay {
+            if replay.direct_effect_count().is_some() {
+                self.buffer.retain_explicit_archive_positions(replay.commit_positions().to_vec())?;
+            } else if !replay.commit_positions().is_empty() {
+                self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
+            }
         }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,

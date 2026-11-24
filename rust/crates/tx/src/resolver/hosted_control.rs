@@ -107,11 +107,21 @@ impl OpenTransaction<'_> {
         }
         if let Some(replay) = &replay {
             replay.check_order(self.tx_key().system_time)?;
-            if validating_world || operations.iter().any(|operation| !matches!(operation,
-                Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::OwnedInsertDocs { .. }
-                    | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. }
-                    | TxOp::HostedControl(_))
-            )) { return Err(unavailable()); }
+            if validating_world || operations.iter().any(|operation|
+                operation.direct_archive_relation().is_none() && !matches!(operation,
+                    Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedCheck { .. } | TxOp::HostedControl(_))
+                )
+            ) {
+                return Err(unavailable());
+            }
+            if let Some(count) = replay.direct_effect_count() {
+                let direct = operations.iter().filter(|operation| operation.direct_archive_relation().is_some());
+                if direct.clone().count() != count
+                    || direct.filter_map(Operation::owned_documents).any(|(_, rows)| rows != 1)
+                {
+                    return Err(unavailable());
+                }
+            }
         }
         let publishing_world = operations.iter().any(|op| matches!(op, Operation::Public(TxOp::OwnedPublishWorld { .. })));
         let retained_release = crate::hosted_control::retained_release_world(operations).is_some();

@@ -44,6 +44,13 @@ impl Operation {
         }
     }
 
+    pub(crate) fn direct_archive_relation(&self) -> Option<&rtdb_types::OwnedRelation> {
+        match self {
+            Self::Public(TxOp::OwnedDelete { relation, .. } | TxOp::OwnedErase { relation, .. }) => Some(relation),
+            operation => operation.owned_documents().map(|(relation, _)| relation),
+        }
+    }
+
     pub(crate) fn owned_documents(&self) -> Option<(&rtdb_types::OwnedRelation, usize)> {
         match self {
             Self::Public(TxOp::OwnedInsertDocs { relation, documents, .. } | TxOp::OwnedReplaceDocs { relation, documents, .. })

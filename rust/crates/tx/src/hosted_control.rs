@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use rtdb_types::{
     Anomaly, EntityId, Interval, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
@@ -81,6 +83,8 @@ pub struct HostedReplay {
     constraints: Vec<ReplayConstraint>,
     #[serde(skip)]
     worlds: Vec<u8>,
+    #[serde(skip)]
+    direct_effects: Option<VecDeque<u32>>,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize)]
@@ -148,6 +152,8 @@ pub fn hosted_replay_controls<'a>(
     let constraints = selected(RESTORE, &constraint_id);
     let expiry_id = format!("native-expiries/{}", source.tx_id.0);
     let expiries = selected(RESTORE, &expiry_id);
+    let effects_id = format!("native-effects/{}", source.tx_id.0);
+    let effects = selected(RESTORE, &effects_id);
     let prefix = format!("native-worlds/{}/", source.tx_id.0);
     let mut chunks = std::collections::BTreeMap::new();
     let mut bytes = 0usize;
@@ -165,7 +171,7 @@ pub fn hosted_replay_controls<'a>(
         }
     }
     if controls.clone().filter(|control| control.name() == RESTORE).count()
-        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + chunks.len()
+        != 5 + usize::from(lifetimes.is_some()) + usize::from(constraints.is_some()) + usize::from(expiries.is_some()) + usize::from(effects.is_some()) + chunks.len()
         || controls.clone().filter(|control| control.name() == "bj_installation").count() != 1
         || controls.clone().filter(|control| control.name() == REPLAY_TRANSACTIONS).count() != 1
         || !check("bj_installation", "authority", true)
@@ -181,6 +187,11 @@ pub fn hosted_replay_controls<'a>(
         || !replay.matches_coordinates(coordinates)
     {
         return Err(replay_invalid());
+    }
+    if let Some(effects) = effects {
+        let body = control_body(effects, MAX_REPLAY_POSITIONS * 4)
+            .filter(|_| effects.expected().is_none()).ok_or_else(replay_invalid)?;
+        replay.direct_effects = Some(decode_direct_effects(body, &replay.commit_positions)?);
     }
     if let Some(lifetimes) = lifetimes {
         let encoded = control_body(lifetimes, MAX_REPLAY_LIFETIME_BYTES)
@@ -257,6 +268,22 @@ pub fn hosted_replay_controls<'a>(
         replay.worlds.extend_from_slice(body);
     }
     Ok(Some(replay))
+}
+
+fn decode_direct_effects(body: &[u8], inventory: &[u32]) -> Result<VecDeque<u32>> {
+    let (ordinals, trailing) = body.as_chunks::<4>();
+    if !trailing.is_empty() {
+        return Err(replay_invalid());
+    }
+    let positions = ordinals.iter().copied().map(u32::from_be_bytes).collect::<VecDeque<_>>();
+    let mut previous = 0;
+    for position in positions.iter().copied().filter(|position| *position != 0) {
+        if position <= previous || inventory.binary_search(&position).is_err() {
+            return Err(replay_invalid());
+        }
+        previous = position;
+    }
+    Ok(positions)
 }
 
 fn replay_constraint_mismatch() -> Anomaly {
@@ -346,6 +373,14 @@ fn control_body(control: &HostedControlWrite, max_bytes: usize) -> Option<&[u8]>
 
 impl HostedReplay {
     pub(crate) fn commit_positions(&self) -> &[u32] { &self.commit_positions }
+
+    pub(crate) fn direct_effect_count(&self) -> Option<usize> {
+        self.direct_effects.as_ref().map(VecDeque::len)
+    }
+
+    pub(crate) fn take_direct_effect(&mut self) -> Result<Option<u32>> {
+        self.direct_effects.as_mut().map(|effects| effects.pop_front().ok_or_else(replay_invalid)).transpose()
+    }
 
     pub(crate) fn decode_resolved(body: &[u8], ordered: Timestamp) -> Result<Self> {
         if body.len() > MAX_REPLAY_RECEIPT_BYTES {
@@ -507,10 +542,11 @@ impl HostedReplay {
     pub(crate) fn world_body(&self) -> &[u8] { &self.worlds }
 
     /// The co-ordered replay receipt commits to the Original inventory.
-    /// Bulk clear world input stays in its destination relations.
-    pub(crate) fn is_transient_world_control(&self, control: &HostedControlWrite) -> bool {
-        !self.worlds.is_empty() && control.name() == RESTORE
-            && matches!(control.id(), EntityId::String(id) if id.starts_with("native-worlds/"))
+    /// Bulk replay input stays in its destination relations.
+    pub(crate) fn is_transient_replay_control(&self, control: &HostedControlWrite) -> bool {
+        control.name() == RESTORE && matches!(control.id(), EntityId::String(id) if
+            (self.direct_effects.is_some() && id.starts_with("native-effects/"))
+                || (!self.worlds.is_empty() && id.starts_with("native-worlds/")))
     }
 
     pub(crate) fn take_expiry(
@@ -942,6 +978,19 @@ mod replay_tests {
         assert!(!original_prefix(
             TransactionKey { tx_id: second.tx_id, system_time: Timestamp(12) }, second,
         ));
+    }
+
+    #[test]
+    fn direct_effect_plan_checks_original_ordinals_and_keeps_support_in_order() {
+        let encode = |ordinals: &[u32]| ordinals.iter().copied().flat_map(u32::to_be_bytes).collect::<Vec<_>>();
+        let inventory = [1, 3, 5];
+        let expected = [0, 1, 0, 5];
+        let decoded = decode_direct_effects(&encode(&expected), &inventory).unwrap();
+        assert!(decoded.into_iter().eq(expected));
+        assert!(decode_direct_effects(&[0; 3], &inventory).is_err());
+        for invalid in [&[2][..], &[3, 1], &[1, 1]] {
+            assert!(decode_direct_effects(&encode(invalid), &inventory).is_err());
+        }
     }
 
     #[test]
