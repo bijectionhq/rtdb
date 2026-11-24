@@ -56,6 +56,11 @@ surface StatelessDatabase {
         -- The region can name rows, an index interval, a table, or the selected branch.
         -- The authority issues identical claim bytes for the same evidence under one key generation.
 
+    @guarantee ReceiverClockObservation
+        -- Where advertised, the first page includes a sample from the installed receiver clock when requested.
+        -- The authenticated observation binds the sample, selected cut, query fingerprint and Flight session.
+        -- The query trailer reports the selected system time separately.
+
     @guarantee OrderedIndexCatalog
         -- An ordered index declaration preserves its columns in the order sent by the caller.
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.

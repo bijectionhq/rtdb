@@ -118,8 +118,18 @@ pub struct ExportTicket {
     pub manifest_sha256: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReceiverClockObservation {
+    pub basis: Basis,
+    pub system_time: Timestamp,
+    pub observed_at: Timestamp,
+    pub request: [u8; 32],
+    pub session: [u8; 32],
+}
+
 const PAGE_BYTES: usize = Basis::WIDTH + 8 + 8 + 32;
 const EXPORT_BYTES: usize = Basis::WIDTH + 16 + 32;
+const OBSERVATION_BYTES: usize = Basis::WIDTH + 16 + 64;
 const SCOPED_CLAIM_DOMAIN: &[u8; 8] = b"scoped\0\x01";
 
 #[derive(Clone, Copy)]
@@ -127,6 +137,7 @@ enum Purpose {
     Claim = 1,
     Page = 2,
     Export = 3,
+    ReceiverClock = 4,
 }
 
 impl Purpose {
@@ -139,6 +150,7 @@ impl Purpose {
                 "Resume from a fresh query",
             ),
             Self::Export => Anomaly::incorrect("rtdb/invalid-export", "Invalid checkpoint export ticket"),
+            Self::ReceiverClock => Anomaly::incorrect("rtdb/invalid-receiver-observation", "Invalid receiver clock observation"),
         }
     }
 
@@ -147,6 +159,7 @@ impl Purpose {
             Self::Claim => MAX_CLAIM_PAYLOAD_BYTES,
             Self::Page => PAGE_BYTES,
             Self::Export => EXPORT_BYTES,
+            Self::ReceiverClock => OBSERVATION_BYTES,
         }
     }
 }
@@ -250,6 +263,24 @@ impl TokenAuthority {
             return Err(invalid());
         }
         Ok(ExportTicket { pin, basis, manifest_sha256: digest.try_into().map_err(|_| invalid())? })
+    }
+
+    pub async fn open_receiver_clock(&self, token: &[u8], session: [u8; 32]) -> Result<ReceiverClockObservation> {
+        let (bytes, _) = self.open(Purpose::ReceiverClock, token).await?;
+        let invalid = || Purpose::ReceiverClock.invalid();
+        let (basis, bytes) = bytes.split_first_chunk::<{ Basis::WIDTH }>().ok_or_else(invalid)?;
+        let (system_time, bytes) = bytes.split_first_chunk::<8>().ok_or_else(invalid)?;
+        let (observed_at, bytes) = bytes.split_first_chunk::<8>().ok_or_else(invalid)?;
+        let (request, bound_session) = bytes.split_first_chunk::<32>().ok_or_else(invalid)?;
+        let basis = Basis::from_bytes(basis).map_err(|_| invalid())?;
+        if basis.incarnation() != *self.incarnation.as_bytes() || bound_session != session.as_slice() {
+            return Err(invalid());
+        }
+        Ok(ReceiverClockObservation {
+            basis, system_time: Timestamp(i64::from_be_bytes(*system_time)),
+            observed_at: Timestamp(i64::from_be_bytes(*observed_at)),
+            request: *request, session,
+        })
     }
 
     pub async fn issuer(&self) -> Result<TokenIssuer> {
@@ -373,6 +404,19 @@ impl TokenAuthority {
 }
 
 impl TokenIssuer {
+    pub async fn seal_receiver_clock(&self, observation: ReceiverClockObservation) -> Result<Vec<u8>> {
+        if observation.basis.incarnation() != *self.authority.incarnation.as_bytes() {
+            return Err(Purpose::ReceiverClock.invalid());
+        }
+        let mut bytes = Vec::with_capacity(OBSERVATION_BYTES);
+        bytes.extend_from_slice(&observation.basis.to_bytes());
+        bytes.extend_from_slice(&observation.system_time.0.to_be_bytes());
+        bytes.extend_from_slice(&observation.observed_at.0.to_be_bytes());
+        bytes.extend_from_slice(&observation.request);
+        bytes.extend_from_slice(&observation.session);
+        self.authority.seal(&self.key, Purpose::ReceiverClock, &bytes).await
+    }
+
     pub async fn seal_claim(&self, evidence: &ClaimEvidence) -> Result<Claim> {
         if evidence.scope.basis.incarnation() != *self.authority.incarnation.as_bytes()
             || !valid_branch_name(&evidence.scope.branch)
@@ -493,6 +537,25 @@ mod tests {
                 .map(|encoded| TokenKey::decode(encoded))
                 .transpose()
         }
+    }
+
+    #[tokio::test]
+    async fn receiver_observation_authenticates_the_query_cut_and_session() {
+        let database = Uuid::from_u128(42);
+        let kms: Arc<dyn Kms> = Arc::new(crate::LocalKms::new(|| 0));
+        let metadata = TokenKey::create(kms.as_ref(), Generation { database, number: 0 }).await.unwrap().encode();
+        let authority = TokenAuthority::new(database, kms, Arc::new(Keys(vec![metadata])));
+        let observation = ReceiverClockObservation {
+            basis: Basis::new(*database.as_bytes(), 9),
+            system_time: Timestamp(67),
+            observed_at: Timestamp(120),
+            request: [3; 32],
+            session: [5; 32],
+        };
+        let proof = authority.issuer().await.unwrap().seal_receiver_clock(observation).await.unwrap();
+        assert_eq!(authority.open_receiver_clock(&proof, observation.session).await.unwrap(), observation);
+        assert_eq!(authority.open_receiver_clock(&proof, [6; 32]).await.unwrap_err().code, "rtdb/invalid-receiver-observation");
+        assert!(authority.open_page(&proof).await.is_err());
     }
 
     #[tokio::test]

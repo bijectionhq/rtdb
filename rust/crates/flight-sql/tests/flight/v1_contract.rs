@@ -1248,9 +1248,12 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
     ] {
         let mut request = input(sql);
         request.source.as_mut().unwrap().at = Some(v1::At { selection: original.basis.clone().map(Selection::Exactly) });
+        request.observe_receiver_clock = true;
         let (rows, trailer) = query(&mut client, request).await;
         assert_eq!(ints(&rows), [expected]);
         assert_eq!(trailer.basis, original.basis);
+        assert_eq!(trailer.system_time_micros, original.system_time_micros);
+        assert!(!trailer.receiver_clock.unwrap().proof.is_empty());
     }
     running.stop().await;
 }

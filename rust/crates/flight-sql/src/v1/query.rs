@@ -8,7 +8,7 @@ use arrow_flight::FlightData;
 use arrow_schema::DataType;
 use prost::Message;
 use rtdb_columnar::MemoryBudget;
-use rtdb_crypt::tokens::{PageToken, TokenIssuer};
+use rtdb_crypt::tokens::{PageToken, ReceiverClockObservation, TokenIssuer};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::QuerySource};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::transact::CustodyGroupId;
@@ -80,6 +80,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
         hash.update(Sha256::digest(params));
     }
     hash.update([query.track.into()]);
+    if query.observe_receiver_clock { hash.update(b"receiver-clock"); }
     hash.finalize().into()
 }
 
@@ -187,7 +188,14 @@ impl Service {
         let database = self.wire_database(call, &source.branch, layer).await?;
         let driver = database.serving_driver();
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
-        let authority = if request.track || request.page.is_some() {
+        if request.observe_receiver_clock && (
+            driver.is_none_or(|driver| !driver.supports_query_tokens())
+                || visibility.is_some()
+                || !database.wire_tokens_supported()
+        ) {
+            return Err(error::unsupported(super::RECEIVER_CLOCK));
+        }
+        let authority = if request.track || request.page.is_some() || request.observe_receiver_clock {
             if !database.wire_tokens_supported() || driver.is_some_and(|driver| !driver.supports_query_tokens()) {
                 return Err(error::unsupported(if request.track { "query.track" } else { "query.page" }));
             }
@@ -325,11 +333,24 @@ impl Service {
             let value = issuer.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
             Some(proto::Claim { value })
         } else { None };
+        let receiver_clock = if request.observe_receiver_clock && continuation.is_none() {
+            let issuer = issuer.as_ref().ok_or_else(|| error::unsupported(super::RECEIVER_CLOCK))?;
+            let observed_at = self.0.node.receiver_time().await.map_err(error::anomaly)?;
+            let proof = issuer.seal_receiver_clock(ReceiverClockObservation {
+                basis: page.basis,
+                system_time: cut,
+                observed_at,
+                request: request_hash,
+                session: Sha256::digest(call.session.id.as_bytes()).into(),
+            }).await.map_err(error::anomaly)?;
+            Some(proto::ReceiverClockObservation { observed_at_micros: observed_at.0, proof })
+        } else { None };
         let trailer = proto::QueryTrailer {
             basis: Some(page.basis.into()),
             system_time_micros: cut.0,
             claim,
             next: None,
+            receiver_clock,
         };
         Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }
