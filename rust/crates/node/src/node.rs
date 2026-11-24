@@ -2561,6 +2561,20 @@ impl OwnedReadSession {
         Ok((batch.into_page()?, witnesses))
     }
 
+    /// The analyzer of the declared search paths a held search ranks, for building its staged overlay.
+    #[cfg(feature = "search")]
+    pub async fn search_analyzer(
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)],
+    ) -> Result<rtdb_text::Analyzer> {
+        self.admit_read().await?;
+        let work = rtdb_search::owned_search_analyzer(
+            self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions,
+        );
+        let analyzer = self.context.reading(work).await?;
+        self.check_relations(partitions.iter().map(|(relation, _)| relation))?;
+        Ok(analyzer)
+    }
+
     #[cfg(feature = "search")]
     pub async fn ranked_search_batch(
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,

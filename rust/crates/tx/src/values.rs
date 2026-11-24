@@ -1632,7 +1632,8 @@ pub enum TxOp {
     OwnedCheckCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix: Vec<u8>, at_most: i64 },
     OwnedDeclareCapacity { relation: rtdb_types::OwnedRelation, column: String, prefix_bytes: i64, cap: i64, when: Vec<u8> },
     OwnedDeclareUniquePath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
-    OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String },
+    /// A clear-text search path whose files and queries tokenise with `analyzer`.
+    OwnedDeclareSearchPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation, column: String, analyzer: rtdb_plan::Analyzer },
     OwnedDeclareRelation { relation: rtdb_types::OwnedRelation, schema: rtdb_types::OwnedSchema },
     OwnedDropSpatialPath { relation: rtdb_types::OwnedRelation, name: rtdb_types::OwnedRelation },
     /// Fence a Root relation against later writes and declarations at this transaction.

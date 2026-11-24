@@ -20,6 +20,6 @@ pub use file::{DocMatch, FORMAT_VERSION, MemberMatches, SearchFile, SearchRow, S
 pub use definitions::{SearchDefinition, definitions_in};
 pub use lane::{GROUP_BYTES, KIND, SearchArtefacts, SearchBuilder, search_pages};
 pub use accelerate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, SearchAccelerator, owned_corpus, owned_ranked, owned_ranked_with_overlay, owned_ranked_overlay_batch};
-pub use held_corpus::{HeldTextCorpus, owned_text_column};
+pub use held_corpus::{HeldTextCorpus, TextShadows, owned_search_analyzer, owned_text_column};
 pub use nearest::{HeldVectorOverlay, NearestPartition, NearestQuery, owned_nearest_batch};
 pub use runtime::{SearchRuntime, Suspect};

@@ -2027,10 +2027,11 @@ async fn check_held_root_rank_flight() {
         let path = RecordBatch::try_from_iter([
             ("_id", Arc::new(StringArray::from(vec!["by_body"])) as arrow_array::ArrayRef),
             ("column", Arc::new(StringArray::from(vec!["body"]))),
+            ("analyzer", Arc::new(StringArray::from(vec!["simple"]))),
         ]).unwrap();
         let mut declaration = prefix.clone();
         declaration.extend(write_arrow_stream(path.schema_ref(), std::slice::from_ref(&path), IpcWriteOptions::default()).unwrap());
-        client.action("rtdb.owned.DeclareSearchPath.v1", declaration.into()).await.unwrap();
+        client.action("rtdb.owned.DeclareSearchPath.v2", declaration.into()).await.unwrap();
 
         let text = Arc::new(StringArray::from(vec!["invoice"; ids.len()]));
         let batch = RecordBatch::try_from_iter([("_id", entity_id_array(ids).unwrap()), ("body", text)]).unwrap();

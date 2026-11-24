@@ -30,6 +30,30 @@ pub async fn owned_text_column(
     Ok(column)
 }
 
+/// The analyzer of the declared search paths a held search ranks: every partition's path must use the same one.
+pub async fn owned_search_analyzer(
+    context: Arc<QueryContext>,
+    owner: &str,
+    partitions: &[(OwnedRelation, OwnedRelation)],
+) -> Result<rtdb_text::Analyzer> {
+    let mut analyzer = None;
+    for (relation, path) in partitions {
+        let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path)
+            .await?
+            .ok_or_else(|| Anomaly::incorrect(
+                "rtdb.owned/search-path",
+                "Owned relation has no declared clear-text search path with this name",
+            ))?;
+        if *analyzer.get_or_insert(definition.analyzer) != definition.analyzer {
+            return Err(Anomaly::incorrect(
+                "rtdb.owned/search-analyzers",
+                "A held search ranks search paths that use one analyzer",
+            ));
+        }
+    }
+    analyzer.ok_or_else(corpus_limit)
+}
+
 const MAX_IDENTITIES: usize = 4096;
 const MAX_TEXT_BYTES: usize = 8 << 20;
 
@@ -38,6 +62,31 @@ struct Match {
     partition: usize,
     length: u32,
     frequencies: Vec<u32>,
+}
+
+/// Staged text shadows admitted before the searched paths' analyzer is known.
+#[derive(Default)]
+pub struct TextShadows {
+    rows: Vec<(usize, EntityId, Option<String>)>,
+}
+
+impl TextShadows {
+    pub fn push(&mut self, partition: usize, id: EntityId, text: Option<&str>) {
+        self.rows.push((partition, id, text.map(str::to_owned)));
+    }
+
+    pub fn len(&self) -> usize { self.rows.len() }
+
+    pub fn is_empty(&self) -> bool { self.rows.is_empty() }
+
+    /// The corpus of `text` under the paths' analyzer, holding these shadows.
+    pub fn into_corpus(self, memory: Arc<MemoryBudget>, analyzer: rtdb_text::Analyzer, text: &str) -> Result<HeldTextCorpus> {
+        let mut corpus = HeldTextCorpus::new(memory, analyzer, text)?;
+        for (partition, id, text) in self.rows {
+            corpus.shadow(partition, id, text.as_deref())?;
+        }
+        Ok(corpus)
+    }
 }
 
 /// Accumulate exact statistics after the held world owner resolves visibility.
@@ -54,12 +103,13 @@ pub struct HeldTextCorpus {
 }
 
 impl HeldTextCorpus {
-    pub fn new(memory: Arc<MemoryBudget>, text: &str) -> Result<Self> {
+    /// A corpus for `text` tokenised by the analyzer of the searched paths (owned_search_analyzer).
+    pub fn new(memory: Arc<MemoryBudget>, analyzer: rtdb_text::Analyzer, text: &str) -> Result<Self> {
         if text.len() > 4096 {
             return Err(corpus_limit());
         }
         let retained = memory.reserve(4096 + 128 * text.len())?;
-        let query = Query::parse(text);
+        let query = Query::analyzed(analyzer, text);
         Ok(Self {
             memory,
             retained,
@@ -238,7 +288,7 @@ mod tests {
     fn arrow_search_held_corpus_counts_phrase_misses_and_evicts_the_last_hit() {
         let memory = MemoryBudget::new(1 << 24);
         let query = r#""a b""#;
-        let mut corpus = HeldTextCorpus::new(memory, query).unwrap();
+        let mut corpus = HeldTextCorpus::new(memory, rtdb_text::Analyzer::Simple, query).unwrap();
         for (id, text) in [(5, "a b"), (1, "b a"), (2, "a b"), (0, "a b a b")] {
             corpus.shadow(0, EntityId::Integer(id), Some(text)).unwrap();
         }
@@ -261,7 +311,7 @@ mod tests {
             EntityId::Integer(i64::MIN),
             EntityId::Uuid([3; 16]),
         ];
-        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), "apples").unwrap();
+        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), rtdb_text::Analyzer::Simple, "apples").unwrap();
         for (partition, id) in ids.into_iter().enumerate() {
             let expected = id.as_value().retained_bytes().unwrap();
             let before = corpus.retained.bytes();
@@ -279,7 +329,7 @@ mod tests {
 
     #[test]
     fn staged_shadows_replace_committed_text_before_statistics() {
-        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), "apples").unwrap();
+        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), rtdb_text::Analyzer::Simple, "apples").unwrap();
         let replaced = EntityId::String("replaced".into());
         let deleted = EntityId::String("deleted".into());
         let unchanged = EntityId::String("unchanged".into());

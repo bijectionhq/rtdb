@@ -94,7 +94,7 @@ pub(crate) enum PathDeclarationWire {
     EncodedSpatial,
 }
 
-pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
+pub(crate) const DECLARE_OWNED_SEARCH_PATH_V2: &str = "rtdb.owned.DeclareSearchPath.v2";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V2: &str = "rtdb.owned.DeclareRelation.v2";
 pub(crate) const OWNED_SHARED_SEARCH_TEXT_V1: &str = "rtdb.owned.SharedSearchText.v1";
@@ -1105,12 +1105,13 @@ impl Service {
         self.owned_write_reply(call, vec![operation]).await
     }
 
+    /// A unique path takes `_id` and `column`; a search path also takes its `analyzer`.
     pub(crate) async fn declare_owned_single_column_path_action(&self, call: &Call, body: &[u8], unique: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, arrow) = split_relation(body)?;
         let batch = request_batch(call, arrow)?;
-        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
-            return Err(invalid("Owned path declaration requires one row with _id and column"));
+        if batch.batch().num_rows() != 1 || batch.batch().num_columns() != if unique { 2 } else { 3 } {
+            return Err(invalid("Owned path declaration requires one row with _id, column and, for search, analyzer"));
         }
         let (rows, _decoded) = upload::documents(batch.batch(), self)?;
         let (Some(Value::Utf8(name)), Some(Value::Utf8(column))) = (rows[0].get("_id"), rows[0].get("column")) else {
@@ -1121,7 +1122,11 @@ impl Service {
         let operation = if unique {
             TxOp::OwnedDeclareUniquePath { relation, name, column }
         } else {
-            TxOp::OwnedDeclareSearchPath { relation, name, column }
+            let Some(Value::Utf8(analyzer)) = rows[0].get("analyzer") else {
+                return Err(invalid("Owned search path declaration requires a text analyzer"));
+            };
+            let analyzer = rtdb_plan::parse_analyzer(analyzer).map_err(status)?;
+            TxOp::OwnedDeclareSearchPath { relation, name, column, analyzer }
         };
         self.owned_write_reply(call, vec![operation]).await
     }
@@ -3621,6 +3626,13 @@ impl Service {
         let prefix_len = body.len() - request.len();
         let rank = owned_rank_request(call, request)?;
         let overlay = overlay.as_ref().map(|input| self.search_shadows(&rank, input.batch())).transpose()?;
+        let overlay = match overlay {
+            Some(shadows) => {
+                let analyzer = held.snapshot.search_analyzer(&rank.partitions).await.map_err(status)?;
+                Some(shadows.into_corpus(Arc::clone(self.memory()), analyzer, rank.query).map_err(status)?)
+            }
+            None => None,
+        };
         let (page, witnesses) = held.snapshot.ranked_search_batch(
             &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe, valid, overlay,
         ).await.map_err(status)?;
@@ -3645,7 +3657,7 @@ impl Service {
         Ok(reply)
     }
 
-    fn search_shadows(&self, rank: &OwnedRankRequest<'_>, input: &RecordBatch) -> Result<rtdb_node::HeldTextCorpus, Status> {
+    fn search_shadows(&self, rank: &OwnedRankRequest<'_>, input: &RecordBatch) -> Result<rtdb_node::TextShadows, Status> {
         if !rank.observe || !(1..=64).contains(&input.num_rows()) || input.num_columns() != 3 {
             return Err(invalid("Staged search requires bounded rows and original evidence"));
         }
@@ -3655,20 +3667,20 @@ impl Service {
         let (Some(partitions), Some(ids), Some(text)) = (partitions, ids, text) else {
             return Err(invalid("Invalid staged search overlay layout"));
         };
-        let mut corpus = rtdb_node::HeldTextCorpus::new(Arc::clone(self.memory()), rank.query).map_err(status)?;
+        let mut shadows = rtdb_node::TextShadows::default();
         for row in 0..input.num_rows() {
             if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
                 || partitions.value(row) >= rank.partitions.len() as u64
             {
                 return Err(invalid("Invalid staged search identity"));
             }
-            corpus.shadow(
+            shadows.push(
                 partitions.value(row) as usize,
                 rtdb_types::EntityId::String(ids.value(row).to_owned()),
                 (!text.is_null(row)).then(|| text.value(row)),
-            ).map_err(status)?;
+            );
         }
-        Ok(corpus)
+        Ok(shadows)
     }
 
     pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
