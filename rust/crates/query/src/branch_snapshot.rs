@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::{
     LiveIndex, Snapshot, StoredEvent, StoredOperation, TableCatalog, TransactionBuffer, TrieCatalog,
-    branches::{BranchCut, BranchView, RowImage},
+    branches::{BranchCut, BranchView, RankedIndexKind, RowImage},
 };
 use rtdb_trie::TrieConfig;
 use rtdb_types::{
@@ -74,6 +74,7 @@ pub fn branch_snapshot_with(
             }
             append_lineage(view, &mut buffer)?;
             append_ordered_indexes(view, &mut buffer)?;
+            append_ranked_indexes(view, &mut buffer)?;
             append_count_constraints(view, &mut buffer)?;
             append_custody_inventory(view, &mut buffer)?;
             append_custody_placements(view, &mut buffer)?;
@@ -176,6 +177,70 @@ fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffe
         cells.insert("predicate_columns".into(), Value::list(rule.equals.keys().cloned().map(Value::Utf8).collect()));
         cells.insert("predicate_values".into(), Value::list(rule.equals.values().cloned().map(Value::Binary).collect()));
         buffer.put(catalog.clone(), cells, Interval::ALL)?;
+    }
+    Ok(())
+}
+
+fn append_ranked_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+    let catalog = TableRef::new("xt", "ranked_indexes");
+    let search = TableRef::new("xt", "search_indexes");
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    let boolean = LogicalType::Scalar(ScalarType::Bool);
+    let shared = StructFields::from([
+        ("_id".into(), text.clone()),
+        ("schema_name".into(), text.clone()),
+        ("table_name".into(), text.clone()),
+        ("columns".into(), LogicalType::list(text.clone())),
+        ("version".into(), integer.clone()),
+    ]);
+    let mut search_columns = shared.clone();
+    search_columns.insert("analyzer".into(), text.clone());
+    search_columns.insert("history".into(), boolean.clone());
+    let mut catalog_columns = search_columns.clone();
+    for field in ["kind", "geometry_encoding", "method", "serving_mode"] {
+        catalog_columns.insert(field.into(), text.clone());
+    }
+    catalog_columns.insert("dimensions".into(), integer);
+    catalog_columns.insert("recall".into(), LogicalType::Scalar(ScalarType::F64));
+    catalog_columns.insert("artefacts_ready".into(), boolean);
+    buffer.declare_table(catalog.clone(), catalog_columns.keys().cloned())?;
+    buffer.declare_document_types(&catalog, &catalog_columns)?;
+    for (table, definition) in view.tables() {
+        for (name, declaration) in &definition.ranked_indexes {
+            let ranked = &declaration.definition;
+            let version = i64::try_from(declaration.position)
+                .map_err(|_| Anomaly::unsupported("rtdb/query-basis", "SQL does not support this declaration position"))?;
+            let mut row = StructFields::from([
+                ("_id".into(), Value::Utf8(name.clone())),
+                ("schema_name".into(), Value::Utf8(table.schema.clone())),
+                ("table_name".into(), Value::Utf8(table.table.clone())),
+                ("columns".into(), Value::list(ranked.columns.iter().cloned().map(Value::Utf8).collect())),
+                ("version".into(), Value::I64(version)),
+            ]);
+            let kind = match &ranked.kind {
+                RankedIndexKind::Search { analyzer, history } => {
+                    row.insert("analyzer".into(), Value::Utf8(analyzer.clone()));
+                    row.insert("history".into(), Value::Bool(*history));
+                    buffer.put(search.clone(), row.clone(), Interval::ALL)?;
+                    "search"
+                }
+                RankedIndexKind::Spatial { geometry_encoding } => {
+                    row.insert("geometry_encoding".into(), Value::Utf8(geometry_encoding.clone()));
+                    "spatial"
+                }
+                RankedIndexKind::Ivf { dimensions, recall_bits } => {
+                    row.insert("method".into(), Value::Utf8("ivf".into()));
+                    row.insert("dimensions".into(), Value::I64(i64::from(*dimensions)));
+                    row.insert("recall".into(), Value::F64(f64::from_bits(*recall_bits)));
+                    "vector"
+                }
+            };
+            row.insert("kind".into(), Value::Utf8(kind.into()));
+            row.insert("serving_mode".into(), Value::Utf8("exact-sql".into()));
+            row.insert("artefacts_ready".into(), Value::Bool(false));
+            buffer.put(catalog.clone(), row, Interval::ALL)?;
+        }
     }
     Ok(())
 }

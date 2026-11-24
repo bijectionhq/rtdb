@@ -78,3 +78,18 @@ Keep the original radius and exclusive lower bound independent of that anchor.
 For an unranked range order and seek by the complete identity key alone.
 Bind any application continuation to the original basis, branch, layer, valid instant, projection, predicate, probe and exact partition values.
 These SQL expressions perform bounded exact refinement over the resolved source.
+
+## Declarations and readiness
+
+Require `declare.ranked-index` in `rtdb.v1.Transact` and send `Declare.Index`.
+`INDEX_KIND_SEARCH` uses `Index.search` (field 4) with a known analyzer and the history flag.
+`INDEX_KIND_SPATIAL` uses `Index.spatial` (field 5) with the exact stored geometry encoding.
+`INDEX_KIND_VECTOR` uses `Index.vector` (field 6) with `method = "ivf"`, dimensions from 1 to 4096, and recall in (0, 1].
+For spatial and vector, send the value column first and then the ordered equality partition columns.
+
+After an applied receipt, use a separate `Query` at `Exactly(receipt.basis)` to read `xt.ranked_indexes`.
+Compare `_id`, `schema_name`, `table_name`, `kind`, `columns`, and the relevant `analyzer, history`, `geometry_encoding`, or `method, dimensions, recall` fields.
+The `version` names the original declaration position and stays stable on an identical redeclaration.
+The applied v1 snapshot reports `serving_mode = 'exact-sql'` and `artefacts_ready = false`.
+The search accelerator can use the same declaration projected into `xt.search_indexes` for eligible MATCH plans.
+A startup policy that requires a physical spatial or IVF index must gate the route on `artefacts_ready`.

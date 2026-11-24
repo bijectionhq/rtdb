@@ -4,6 +4,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_tx::transact::{
     self as tx, Cell, CountRange, Declaration, GroupedCount, Guard, IndexDefinition, Op, Row, Transact, Version,
     CustodyPlacement, CustodyReservation, CustodyTarget, ValidTime, ValidTimeBound, When, Window,
+    RankedIndexDefinition, RankedIndexKind,
 };
 use rtdb_types::{
     EntityId, TableRef, Timestamp, Value,
@@ -250,16 +251,27 @@ fn declaration(
                 Declaration::Schema(columns)
             }
             Change::Index(index) => {
-                if index.kind != proto::IndexKind::Ordered as i32 {
-                    return Err(error::unsupported("declare.index.kind"));
-                }
-                let mut columns = index.columns.into_iter();
-                let column = columns.next().ok_or_else(|| error::incorrect("Ordered index needs a column"))?;
-                Declaration::Index(IndexDefinition {
-                    name: index.name,
-                    column,
-                    additional_columns: columns.collect(),
-                })
+                use proto::{IndexKind, index::Options};
+                let kind = IndexKind::try_from(index.kind).map_err(|_| error::unsupported("declare.index.kind"))?;
+                let ranked = match (kind, index.options) {
+                    (IndexKind::Ordered, None) => {
+                        let mut columns = index.columns.into_iter();
+                        let column = columns.next().ok_or_else(|| error::incorrect("Ordered index needs a column"))?;
+                        return Ok(Declaration::Index(IndexDefinition { name: index.name, column, additional_columns: columns.collect() }));
+                    }
+                    (IndexKind::Search, Some(Options::Search(options))) => RankedIndexKind::Search {
+                        analyzer: options.analyzer, history: options.history,
+                    },
+                    (IndexKind::Spatial, Some(Options::Spatial(options))) => RankedIndexKind::Spatial {
+                        geometry_encoding: options.geometry_encoding,
+                    },
+                    (IndexKind::Vector, Some(Options::Vector(options))) if options.method == "ivf" => RankedIndexKind::Ivf {
+                        dimensions: options.dimensions, recall_bits: options.recall.to_bits(),
+                    },
+                    (IndexKind::Unspecified, _) => return Err(error::unsupported("declare.index.kind")),
+                    _ => return Err(error::incorrect("Index kind and options must agree; the vector method is ivf")),
+                };
+                Declaration::RankedIndex { name: index.name, definition: RankedIndexDefinition { columns: index.columns, kind: ranked } }
             }
             Change::Ttl(ttl) => Declaration::Ttl(ttl.duration_micros),
             Change::Constraint(constraint) => {

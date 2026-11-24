@@ -182,7 +182,20 @@ enum IndexKind {
   INDEX_KIND_SPATIAL = 3;
   INDEX_KIND_VECTOR = 4;
 }
-message Index { string name = 1; IndexKind kind = 2; repeated string columns = 3; }
+message SearchIndexOptions { string analyzer = 1; bool history = 2; }
+message SpatialIndexOptions { string geometry_encoding = 1; }
+message VectorIndexOptions { string method = 1; uint32 dimensions = 2; double recall = 3; }
+message Index {
+  string name = 1;
+  IndexKind kind = 2;
+  // For spatial and vector indexes the first column is the value and the rest are equality partitions.
+  repeated string columns = 3;
+  oneof options {
+    SearchIndexOptions search = 4;
+    SpatialIndexOptions spatial = 5;
+    VectorIndexOptions vector = 6;
+  }
+}
 message Ttl { optional uint64 duration_micros = 1; }
 message CountRangeConstraint {
   string index = 1;

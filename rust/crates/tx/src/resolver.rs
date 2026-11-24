@@ -5649,7 +5649,7 @@ mod tests {
 }
 
 /// A search index's name keys the object paths of its search files.
-fn check_search_index_name(name: &str) -> Result<()> {
+pub(crate) fn check_search_index_name(name: &str) -> Result<()> {
     if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0', '~']) {
         return Err(Anomaly::incorrect("xtdb/invalid-search-index-name", format!("Invalid search index name: {name}")));
     }

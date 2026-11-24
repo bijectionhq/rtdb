@@ -44,6 +44,25 @@ impl IndexDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RankedIndexKind {
+    Search { analyzer: String, history: bool },
+    Spatial { geometry_encoding: String },
+    Ivf { dimensions: u32, recall_bits: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedIndexDefinition {
+    pub columns: Vec<String>,
+    pub kind: RankedIndexKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RankedIndexDeclaration {
+    pub definition: RankedIndexDefinition,
+    pub position: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CountRange {
     pub table: TableRef,
     pub index: String,
@@ -66,6 +85,8 @@ pub struct GroupedCount {
 pub struct BranchTable {
     pub columns: StructFields<LogicalType>,
     pub indexes: BTreeMap<String, IndexDefinition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ranked_indexes: BTreeMap<String, RankedIndexDeclaration>,
     pub ttl_micros: Option<u64>,
     pub constraints: BTreeMap<String, CountRange>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

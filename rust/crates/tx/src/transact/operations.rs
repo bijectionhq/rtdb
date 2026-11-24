@@ -359,7 +359,8 @@ impl Candidate<'_> {
                     validate_column(name)?;
                 }
                 if self.index.tables(cut.basis).any(|(other, definition)| {
-                    other != table && definition.indexes.contains_key(&index.name)
+                    (other != table && definition.indexes.contains_key(&index.name))
+                        || definition.ranked_indexes.contains_key(&index.name)
                 }) {
                     return Err(conflict("rtdb/index-exists", "An index with that name already covers another table"));
                 }
@@ -379,6 +380,44 @@ impl Candidate<'_> {
                     }
                 }
                 definition.indexes.insert(index.name.clone(), index.clone());
+            }
+            Declaration::RankedIndex { name, definition: ranked } => {
+                crate::resolver::check_search_index_name(name)?;
+                let mut ranked = ranked.clone();
+                if !(1..=16).contains(&ranked.columns.len())
+                    || ranked.columns.iter().collect::<BTreeSet<_>>().len() != ranked.columns.len()
+                {
+                    return Err(Anomaly::incorrect("rtdb/invalid-index", "A ranked index requires 1 to 16 distinct stored columns"));
+                }
+                for column in &ranked.columns {
+                    validate_column(column)?;
+                }
+                match &mut ranked.kind {
+                    RankedIndexKind::Search { analyzer, .. } => {
+                        *analyzer = rtdb_plan::parse_analyzer(analyzer)?.name().into();
+                    }
+                    RankedIndexKind::Spatial { geometry_encoding } => {
+                        *geometry_encoding = rtdb_types::SpatialGeometryEncoding::parse(geometry_encoding)?.name().into();
+                    }
+                    RankedIndexKind::Ivf { dimensions, recall_bits } => {
+                        let recall = f64::from_bits(*recall_bits);
+                        if !(1..=4096).contains(dimensions) || !(recall > 0.0 && recall <= 1.0) {
+                            return Err(Anomaly::incorrect("rtdb.vector/definition", "IVF needs dimensions from 1 to 4096 and a recall target in (0, 1]"));
+                        }
+                    }
+                }
+                if self.index.tables(cut.basis).any(|(other, definition)| {
+                    definition.indexes.contains_key(name) || (other != table && definition.ranked_indexes.contains_key(name))
+                }) {
+                    return Err(conflict("rtdb/index-exists", "An index with that name already has a different definition"));
+                }
+                if let Some(prior) = definition.ranked_indexes.get(name) {
+                    if prior.definition != ranked {
+                        return Err(conflict("rtdb/index-exists", "An index with that name already has a different definition"));
+                    }
+                    return Ok(());
+                }
+                definition.ranked_indexes.insert(name.clone(), RankedIndexDeclaration { definition: ranked, position: cut.basis.position() });
             }
             Declaration::Ttl(ttl) => {
                 if definition.visibility.is_some() && ttl.is_some() { return Err(labelled_time_error()); }

@@ -7,6 +7,7 @@ use rtdb_index::branches::{
 pub use rtdb_index::branches::{
     CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation, CustodyResponseAdmission,
     CustodyPlacementId, CustodyTarget, GroupedCount, IndexDefinition, Visibility,
+    RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
@@ -284,6 +285,7 @@ impl Op {
 pub enum Declaration {
     Schema(StructFields<LogicalType>),
     Index(IndexDefinition),
+    RankedIndex { name: String, definition: RankedIndexDefinition },
     Ttl(Option<u64>),
     Constraint { name: String, range: Option<CountRange> },
     GroupedConstraint { name: String, rule: GroupedCount },
@@ -823,6 +825,12 @@ impl TransactState {
         }
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
             return Err(feature_required(TRANSACT_REQUIRES));
+        }
+        let ranked_index = rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS;
+        if !features.contains(&ranked_index) && request.ops.iter().chain(&request.otherwise)
+            .any(|op| matches!(op, Op::Declare { change: Declaration::RankedIndex { .. }, .. }))
+        {
+            return Err(feature_required(ranked_index));
         }
         let response_release = request.is_response_release();
         if request.uses_custody() {

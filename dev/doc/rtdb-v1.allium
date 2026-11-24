@@ -75,6 +75,12 @@ surface StatelessDatabase {
         -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.
         -- A binary or text range guard can name a single-column index, and an unbounded count can name a compound index.
 
+    @guarantee RankedIndexCatalog
+        -- A ranked declaration binds its index name, ordered columns, and kind-specific options at the applied transaction position.
+        -- Query of xt.ranked_indexes reads the definitions present at its selected cut and their serving mode and artefact readiness.
+        -- Search declarations also supply analyzer and history definitions to the search accelerator.
+        -- A declaration on an exact-SQL route reports artefacts_ready false for a physical index that the route cannot prove.
+
     @guarantee CountConstraintCatalog
         -- A count range limits one ordered index interval.
         -- A grouped count limits every qualifying binary key or key prefix at the constraint's valid time.

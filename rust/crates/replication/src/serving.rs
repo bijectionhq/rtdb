@@ -48,6 +48,7 @@ pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, TIMED_TRANSACT, COUNT_RANGE_CONSTRAINT, GROUPED_COUNT_CONSTRAINT, "row-visibility", "tx-status", "sql.history",
     "sql.search", "sql.search-table", "sql.nearest-table", "sql.cosine-distance",
     rtdb_types::rtdb_v1::CLEAR_RANK_INPUT,
+    rtdb_types::rtdb_v1::RANKED_INDEX_DECLARATIONS,
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, "branches", "branch.local-layer",

@@ -1545,6 +1545,7 @@ async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
                 name: name.into(),
                 kind: v1::IndexKind::Ordered as i32,
                 columns: columns.iter().map(|column| (*column).into()).collect(),
+                options: None,
             })),
         })),
     };
@@ -1559,6 +1560,43 @@ async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
     let (rows, trailer) = query(&mut client, read).await;
     assert_eq!(ints(&rows), [1]);
     assert_eq!(trailer.basis, first.basis);
+
+    use v1::{IndexKind, index::Options};
+    let ranked_index = |name: &str, kind: IndexKind, columns: &[&str], options| v1::Op {
+        op: Some(v1::op::Op::Declare(v1::Declare {
+            table: "public.events".into(),
+            change: Some(v1::declare::Change::Index(v1::Index {
+                name: name.into(), kind: kind as i32,
+                columns: columns.iter().map(|column| (*column).into()).collect(),
+                options: Some(options),
+            })),
+        })),
+    };
+    let declarations = vec![
+        ranked_index("events_text", IndexKind::Search, &["body"], Options::Search(v1::SearchIndexOptions {
+            analyzer: "english_stop".into(), history: true,
+        })),
+        ranked_index("events_places", IndexKind::Spatial, &["geometry", "partition_key"], Options::Spatial(v1::SpatialIndexOptions {
+            geometry_encoding: "tagged-wkb-v1".into(),
+        })),
+        ranked_index("events_vectors", IndexKind::Vector, &["embedding"], Options::Vector(v1::VectorIndexOptions {
+            method: "ivf".into(), dimensions: 2, recall: 0.9,
+        })),
+    ];
+    let ranked = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![20; 16], require: vec!["declare.ranked-index".into()], ops: declarations,
+        ..Default::default()
+    }).await.unwrap();
+    assert!(matches!(ranked.outcome, Some(v1::receipt::Outcome::Then(()))));
+    let mut read = input("SELECT COUNT(*) FROM xt.ranked_indexes WHERE table_name = 'events'
+        AND serving_mode = 'exact-sql' AND NOT artefacts_ready AND (
+        (kind = 'search' AND analyzer = 'english_stop' AND history)
+        OR (kind = 'spatial' AND geometry_encoding = 'tagged-wkb-v1' AND columns = ARRAY['geometry', 'partition_key'])
+        OR (kind = 'vector' AND method = 'ivf' AND dimensions = 2 AND recall > 0.8))");
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: ranked.basis.map(Selection::Exactly) });
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [3]);
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.clone().map(Selection::Exactly) });
+    assert_eq!(ints(&query(&mut client, read).await.0), [0]);
 
     let second = transact_wire(&mut client, v1::TransactRequest {
         key: vec![2; 16],
