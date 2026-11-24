@@ -1,4 +1,5 @@
 mod decision_clock;
+pub mod transact;
 pub use decision_clock::{DecisionClock, DecisionObservation, OrderedClockEvidence};
 
 mod values;

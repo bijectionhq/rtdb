@@ -41,7 +41,7 @@
 --   - cache affinity, cache fairness and per-deployment quotas;
 --   - gateways and sessions;
 --   - activation, planned handoff, failover, scale-out and scale-in;
---   - lineages, forks, deletion and encryption;
+--   - in-deployment data branches, administrative deployment lineages, deletion and encryption;
 --   - format and engine upgrades, quarantine, and moving a deployment between cells.
 -- Excludes: transaction resolution, the live index's structure, the trie format, compaction's job selection and merge, query planning and execution.
 -- Those are the existing specs', and this spec treats them as given.
@@ -2641,11 +2641,57 @@ rule RefineKeyForLargeDeployments {
 }
 
 ------------------------------------------------------------
--- Rules: forks
+-- Rules: in-deployment data branches
 ------------------------------------------------------------
 
-rule Fork {
-    -- A fork within an organisation is a new deployment in the parent's lineage.
+-- The data-plane trunk is main.
+-- A branch keeps its base branch and exact base basis in the deployment's transaction stream.
+-- The base can itself be a branch.
+-- A branch has one name for the lifetime of its incarnation.
+-- Branch lineage is exposed through the xt.branch_lineage system table.
+-- Data-branch operations apply in the order of the selected transaction effects (tx.allium).
+-- Local reads resolve the branch's assertions alone.
+-- Merged reads resolve a local assertion or tombstone first for each valid-time region.
+-- The remaining regions resolve through the base at its base basis.
+-- Counts, aggregates, text matching and spatial ranking consume the same effective row population.
+-- A descendant retains its own base cut when an ancestor expires or is dropped.
+
+rule ForkDataBranch {
+    when: OrderedDataBranchFork(deployment, child, parent, base, writable, expires_at, basis)
+    requires: AvailableBranchAt(deployment, parent, base)
+    ensures:
+        BranchRegistered(deployment, child, parent, base, writable, expires_at, basis)
+}
+
+rule RenewDataBranch {
+    when: OrderedDataBranchRenewal(deployment, branch, expires_at, basis)
+    requires: ActiveDataBranch(deployment, branch)
+    ensures:
+        BranchExpirySet(deployment, branch, expires_at, basis)
+}
+
+rule MergeDataBranch {
+    -- A merge copies the source's effective local assertions and tombstones at their original valid intervals.
+    -- A change in the target after the source's fork basis can conflict on an overlapping row and interval.
+    when: OrderedDataBranchMerge(deployment, source, target, basis)
+    requires: MergeAdmitted(deployment, source, target, basis)
+    ensures:
+        BranchDeltaApplied(deployment, source, target, basis)
+}
+
+rule DropDataBranch {
+    when: OrderedDataBranchDrop(deployment, branch, basis)
+    requires: ActiveDataBranch(deployment, branch)
+    ensures:
+        BranchDropped(deployment, branch, basis)
+}
+
+------------------------------------------------------------
+-- Rules: administrative deployment forks
+------------------------------------------------------------
+
+rule ForkDeployment {
+    -- ForkDeployment within an organisation creates a new deployment in the parent's lineage.
     -- Its first manifest references the parent's objects at the fork basis, plus one pack holding the parent's tail up to that basis.
     -- The shared key grants are in the same erasure custody domain.
     -- Child publication checks that the parent is still eligible for forks in the writer epoch and storage generation used to prepare the child.

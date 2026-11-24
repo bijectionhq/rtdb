@@ -1649,6 +1649,69 @@ surface ConnectionLifecycle {
         -- Closing is not an implicit commit.
 }
 
+---- RTDB v1 ordered transactions
+
+-- Default and Multi mode share one resolver and one fold for rtdb.v1.
+-- The serving mode admits validation when its driver can capture a linearizable prefix.
+-- The serving mode admits timed writes when its driver can attest the original durable append.
+-- A transaction key identifies one request digest within the admitted database incarnation.
+-- The resolver returns a stored receipt for an identical request and conflicts on a different request using that key.
+-- The writer samples the transaction time at resolution and keeps it strictly increasing with the preceding settled transaction.
+-- The window includes not_before and excludes before.
+-- A request before not_before can retry with the same key.
+-- Before guards observe the original state.
+-- After guards observe the candidate containing the ordered then operations.
+-- The otherwise operations start from the original state when a guard fails.
+-- TxTime and TxBasis in selected rows name the receipt's transaction time and visible basis.
+-- Unchanged checks a sealed branch, basis, layer and footprint.
+-- A branch-wide footprint conservatively covers row changes, changes to shared declarations and valid-time boundaries.
+-- A transaction applies the selected effects and receipt atomically.
+-- The ordered receipt records Then, Otherwise with its failed guard positions, or Refused with its error.
+
+rule ValidateRtdbV1 {
+    when: TransactValidationRequested(request, reader)
+    requires: LinearizablePrefix(reader, basis)
+    ensures:
+        ValidationAnswered(request, ResolveGuards(request, basis), basis)
+}
+
+rule PublishRtdbV1Transaction {
+    when: UntimedTxReadBack(tx, basis)
+    ensures:
+        ResolvedEffectsApplied(tx, basis)
+        ReceiptAvailable(tx, basis)
+}
+
+rule StageRtdbV1TimedTransaction {
+    when: TimedTxReadBack(tx, lsn)
+    ensures:
+        TimedTransactionPending(tx, lsn)
+}
+
+rule SettleRtdbV1TimedTransaction {
+    -- The original writer observes durable acknowledgement before the cutoff and orders Settle in the adjacent slot.
+    -- The adjacent slot supplies the TxBasis used to resolve row placeholders.
+    when: SettleReadBack(tx_lsn, basis)
+    requires: PendingTimedTransaction(tx_lsn)
+    ensures:
+        ResolvedEffectsApplied(PendingAt(tx_lsn), basis)
+        ReceiptAvailable(PendingAt(tx_lsn), basis)
+}
+
+rule RefuseRtdbV1TimedTransaction {
+    -- A writer on takeover orders Refuse for the recovered pending record before admitting another transaction.
+    -- The same writer orders Refuse if it cannot attest timely original durability.
+    when: RefuseReadBack(tx_lsn, basis)
+    requires: PendingTimedTransaction(tx_lsn)
+    ensures:
+        RefusedReceiptAvailable(PendingAt(tx_lsn), basis)
+}
+
+invariant TimedEffectsFollowSettle {
+    for tx in TimedTransactions:
+        EffectsVisible(tx) implies Settled(tx)
+}
+
 ---- Open Questions
 
 open question "AutoCommitDml stamps opts with user and default_tz only. Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"

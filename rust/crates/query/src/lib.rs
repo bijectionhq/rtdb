@@ -1,6 +1,8 @@
 mod accelerate;
 mod aggregate;
 mod context;
+mod branch_snapshot;
+pub use branch_snapshot::{branch_snapshot, seal_branch_claim};
 mod parameters;
 pub use parameters::BoundParameters;
 mod cursor;

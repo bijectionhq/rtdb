@@ -1,4 +1,5 @@
 mod catalog;
+pub mod branches;
 mod event_revision;
 mod live;
 mod partition;
