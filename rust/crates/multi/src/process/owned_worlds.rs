@@ -432,9 +432,10 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn parent_point_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp, system: Timestamp,
+        original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
         Box::pin(async move {
-            let fact = HeldCheckpointWorld::parent_point_at(self, relation, id, valid, system).await?;
+            let fact = HeldCheckpointWorld::parent_point_at(self, relation, id, valid, system, original_scope).await?;
             Ok(path_touch_result(system, (fact, false)))
         })
     }

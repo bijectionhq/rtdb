@@ -9,7 +9,7 @@
 -- A hosted row-erasure owner can observe whether one exact ciphertext carrier exists anywhere in valid time under its held Root cut. The reply contains only a Boolean.
 -- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
 -- A held point condition preserves the local shadow revision, including a tombstone, or verified local absence.
--- The protected shared column census binds the direct Root parent and selected overlay to the original ordering witness.
+-- The protected shared column census binds the archived Root parent, frozen ancestors and selected overlay to the original ordering witness.
 -- Ordered conditional world writes validate the witnessed placement, deadline and all local conditions before applying effects.
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.
@@ -1736,6 +1736,9 @@ rule ConsumeIntake {
 -- When the winning event carries an assertion ordinal, the point reply carries it with the winning line and event revision.
 -- For a positioned Held winner, the point certifies the clock published with that event.
 -- Point release validates the child's registration and the current Root purge frontier.
+-- An installed live writer can read one exact opaque carrier from its earlier direct Root parent.
+-- The held predecessor certifies the publication under the original pin and relation declarations, and point release checks current purge coverage.
+-- A landed Root carrier opens only against its exact protected journal assertion and current original family authority.
 -- A validation carrying an exclusive clock limit checks its exact world and pin at ordering.
 -- Held validation compares the accepted Held clock, Proposal validation compares the ordered present, and retained validation compares the fixed inherited clock.
 -- One hosted validation can combine covered Root points and ranges, held world witnesses and individual world clock bounds. Each world remains bound to its original pin and placement.

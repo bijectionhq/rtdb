@@ -38,6 +38,7 @@ entity SpatialPostings {
 -- The posting file stores partition digests, cells and IIDs as sorted Arrow IPC columns.
 -- The builder decodes the geometry and partition children of a put where the IPC layout allows projection.
 -- The builder appends covering keys to typed Arrow columns and sorts their row positions.
+-- A posting page whose sorted selection is contiguous reuses source Arrow slices.
 -- The posting digest covers the exact bytes written to the file.
 -- A held read decodes posting pages against the admitted immutable IPC allocation.
 -- A posting read admits the recorded object length and provider scratch before reading its body.

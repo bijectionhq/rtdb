@@ -4809,7 +4809,13 @@ impl Service {
         let (relation, id, valid, _identity) = selected_point_request(call, body, PointTime::Required, matches!(&reply_format, OwnedReplyFormat::Selection(_)))?;
         let valid = valid.ok_or_else(|| invalid("Historical world point requires a valid instant"))?;
         let point = if parent {
-            held.snapshot.parent_point_at(&relation, &id, valid, system).await
+            let original_scope = if relation.name() == "fact_unit_column_payloads" {
+                if !self.supports_hosted_upload(call) { return Err(unsupported()); }
+                Some(self.hosted_control_scope(call).await?)
+            } else {
+                None
+            };
+            held.snapshot.parent_point_at(&relation, &id, valid, system, original_scope).await
         } else {
             held.snapshot.accepted_point(&relation, &id, valid, system).await
         }.map_err(status)?;

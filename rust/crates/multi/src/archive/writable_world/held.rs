@@ -367,7 +367,7 @@ enum AncestorRead {
     Version { id: EntityId, from: Timestamp, through: Timestamp, group: Timestamp },
     Schedule { id: EntityId, valid: Interval },
     Identities { valid: Timestamp, after: Option<String>, limit: usize },
-    OverlayIdentities { valid: Timestamp, after: Option<String>, limit: usize },
+    OverlayIdentities { valid: Timestamp, after: Option<String>, limit: usize, prefix: Option<String> },
     Range {
         path: OwnedRelation,
         lower: Option<RetainedKeyBound>,
@@ -719,12 +719,23 @@ impl HeldCheckpointWorld {
 
     pub async fn parent_point_at(
         &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, system: Timestamp,
+        original_scope: Option<PlacedAttemptScope>,
     ) -> Result<Option<WorldFact>> {
         self.check_relation(relation)?;
         if system > self.parent_basis().system_time { return Err(OwnedWorld::unavailable()); }
-        let schema = self.historical_parent_schema(relation)?;
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
+        let schema = if relation.name() == "fact_unit_column_payloads" {
+            if self.ancestor().is_some() || !original_scope.is_some_and(|scope| witness.matches_scope(scope)) {
+                return Err(OwnedWorld::unavailable());
+            }
+            let schema = self.world_point_schema(relation)?;
+            if !relation.admits_world_ciphertext_points(schema) { return Err(OwnedWorld::unavailable()); }
+            self.projections.require_live_original().await?;
+            schema
+        } else {
+            self.historical_parent_schema(relation)?
+        };
         let guard = self.open.snapshot.parent_point_release_guard(relation, id, system).await?;
         let valid = Interval::at(valid)?;
         let (reply, result) = oneshot::channel();
@@ -903,7 +914,11 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, read: AncestorRead, selected: Option<Timestamp>,
     ) -> Result<(AncestorResult, OwnedWorldWitness)> {
         self.check_relation(relation)?;
-        let schema = if matches!(&read, AncestorRead::Point { .. } | AncestorRead::Clock(_) | AncestorRead::SelectClock(_)) {
+        let shared_columns = relation.name() == "fact_unit_column_payloads"
+            && matches!(&read, AncestorRead::OverlayIdentities { prefix: Some(_), .. });
+        let schema = if shared_columns
+            || matches!(&read, AncestorRead::Point { .. } | AncestorRead::Clock(_) | AncestorRead::SelectClock(_))
+        {
             self.world_point_schema(relation)?
         } else {
             self.historical_parent_schema(relation)?
@@ -1841,7 +1856,7 @@ impl HeldCheckpointWorld {
         if self.uses_frozen_overlay(None) {
             Interval::at(valid)?;
             let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
-                valid, after: after.map(str::to_owned), limit,
+                valid, after: after.map(str::to_owned), limit, prefix: None,
             }).await?;
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
@@ -1856,7 +1871,7 @@ impl HeldCheckpointWorld {
         let candidates = self.open.snapshot.world_identity_candidates(
             self.open.record.id, relation, valid, after, limit + 1,
         ).await?;
-        self.merge_overlay_identities(relation, valid, after, limit, candidates).await
+        self.merge_overlay_identities(relation, valid, after, limit, candidates, None).await
     }
 
     pub async fn overlay_identities_at(
@@ -1866,7 +1881,7 @@ impl HeldCheckpointWorld {
         if !(1..=128).contains(&limit) { return Err(OwnedWorld::unavailable()); }
         if self.uses_frozen_overlay(Some(system)) {
             let (result, _) = self.read_ancestor_at(relation, AncestorRead::OverlayIdentities {
-                valid, after: after.map(str::to_owned), limit,
+                valid, after: after.map(str::to_owned), limit, prefix: None,
             }, Some(system)).await?;
             let AncestorResult::Identities(page) = result else { return Err(OwnedWorld::unavailable()); };
             return Ok(page);
@@ -1874,18 +1889,19 @@ impl HeldCheckpointWorld {
         let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
         self.require_accepted_archive_scope(std::slice::from_ref(relation)).await?;
         let candidates = cut.overlay_identities(valid, after, limit + 1).await?;
-        self.merge_overlay_identities(relation, valid, after, limit, candidates).await
+        self.merge_overlay_identities(relation, valid, after, limit, candidates, None).await
     }
 
     async fn merge_overlay_identities(
         &self, relation: &OwnedRelation, valid: Timestamp, after: Option<&str>, limit: usize,
         local: rtdb_query::OwnedIdentityCandidates,
+        prefix: Option<&str>,
     ) -> Result<WorldIdentityPage> {
         if self.ancestor().is_none() {
             return self.finish_overlay_identities(relation, local, limit);
         }
         let (result, _) = self.read_ancestor(relation, AncestorRead::OverlayIdentities {
-            valid, after: after.map(str::to_owned), limit,
+            valid, after: after.map(str::to_owned), limit, prefix: prefix.map(str::to_owned),
         }).await?;
         let AncestorResult::Identities(mut inherited) = result else { return Err(OwnedWorld::unavailable()); };
         let (keys, reservations) = local.into_parts();
@@ -2251,13 +2267,13 @@ impl<'a> InheritedRelation<'a> {
     }
 
     async fn overlay_identity_page(
-        &self, valid: Timestamp, after: Option<&str>, limit: usize,
+        &self, valid: Timestamp, after: Option<&str>, limit: usize, prefix: Option<&str>,
     ) -> Result<WorldIdentityPage> {
         let mut keys = Vec::new();
         let mut reservations = Vec::new();
         for writer in self.writers() {
-            let page = rtdb_query::owned_identity_candidates(
-                Arc::clone(&writer.overlay), self.owner, &writer.shadow, writer.overlay_basis, valid, after, limit + 1,
+            let page = rtdb_query::owned_identity_candidates_in_prefix(
+                Arc::clone(&writer.overlay), self.owner, &writer.shadow, writer.overlay_basis, valid, after, limit + 1, prefix,
             ).await?;
             let (local, charges) = page.into_parts();
             keys.extend(local);
@@ -2296,7 +2312,7 @@ impl<'a> InheritedRelation<'a> {
             let parent = rtdb_query::owned_identity_candidates(
                 Arc::clone(&self.root), self.owner, self.relation, root_basis, valid, after, FETCH,
             ).await?;
-            let overlay = self.overlay_identity_page(valid, after, FETCH).await?;
+            let overlay = self.overlay_identity_page(valid, after, FETCH, None).await?;
             let (candidates, through) = identity_candidates(&parent.keys, &overlay.keys, FETCH);
             for key in candidates {
                 let id = EntityId::String(key.clone());
@@ -2750,8 +2766,10 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             Ok(AncestorResult::Schedule(inherited.schedule(&id, valid).await?)),
                                                         AncestorRead::Identities { valid, after, limit } =>
                                                             Ok(AncestorResult::Identities(inherited.identities(valid, after, limit).await?)),
-                                                        AncestorRead::OverlayIdentities { valid, after, limit } =>
-                                                            Ok(AncestorResult::Identities(inherited.overlay_identity_page(valid, after.as_deref(), limit).await?)),
+                                                        AncestorRead::OverlayIdentities { valid, after, limit, prefix } =>
+                                                            Ok(AncestorResult::Identities(inherited.overlay_identity_page(
+                                                                valid, after.as_deref(), limit, prefix.as_deref(),
+                                                            ).await?)),
                                                         AncestorRead::Range { path, lower, upper, after, descending, limit, valid } => {
                                                             let request = OwnedRangeRequest {
                                                                 lower: lower.as_ref().map(RetainedKeyBound::borrowed),

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, FixedSizeBinaryArray, RecordBatch, StructArray, cast::AsArray, types::{Int32Type, Int64Type, UInt32Type}};
 use arrow_buffer::{Buffer, MutableBuffer};
+use bytes::Bytes;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{EventHeader, Iid, Interval, MemoryBudget, MemoryReservation, Result, Timestamp};
 use sha2::{Digest, Sha256};
@@ -259,7 +260,7 @@ pub(crate) struct TreeLocator {
     synopsis: Option<Arc<[u8; SYNOPSIS_BYTES]>>,
     canonical_uuid_iids: bool,
     format: i32,
-    inline_root: Option<Arc<[u8]>>,
+    inline_root: Option<Bytes>,
 }
 
 impl TreeLocator {
@@ -284,9 +285,10 @@ impl TreeLocator {
         input.read_exact(&mut bytes).map_err(fault)?;
         page.digest = Sha256::digest(&bytes).into();
         let decoder = arrow_ipc::reader::FileDecoder::new(Arc::clone(super::layout::schema(format)), arrow_ipc::MetadataVersion::V5);
+        let bytes = Bytes::from(bytes);
         let inline_root = (format >= PACKED_FORMAT_VERSION && lz4_flex::block::compress(&bytes).len() <= INLINE_ROOT_BYTES)
-            .then(|| Arc::from(bytes.as_slice()));
-        let root = page.decode(Buffer::from_vec(bytes), &decoder)?;
+            .then(|| bytes.clone());
+        let root = page.decode(Buffer::from(bytes), &decoder)?;
         let synopsis = table(&root, Table::Synopsis);
         let bits = synopsis.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search synopsis layout");
         if bits.len() != 1 || bits.is_null(0) { return Err(corrupt("Search root has no complete term synopsis")); }
@@ -342,7 +344,7 @@ impl TreeLocator {
         let inline_root = root.filter(|hex| load_inline && hex.len() <= INLINE_ROOT_BYTES * 2).and_then(decode_bytes)
             .and_then(|bytes| lz4_flex::block::decompress(&bytes, expected).ok())
             .filter(|bytes| bytes.len() == expected)
-            .filter(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == digest).map(Arc::from);
+            .filter(|bytes| <[u8; 32]>::from(Sha256::digest(bytes)) == digest).map(Bytes::from);
         let canonical_uuid_iids = synopsis.is_some() && fields.next().and_then(decode_hex::<32>)
             .is_some_and(|check| check == uuid_evidence_digest(&digest));
         Some(Self { length, page, synopsis, format, inline_root, canonical_uuid_iids })
@@ -368,7 +370,15 @@ impl TreeLocator {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
+fn encode_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        text.push(DIGITS[(byte >> 4) as usize] as char);
+        text.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    text
+}
 
 fn decode_bytes(hex: &str) -> Option<Vec<u8>> {
     if hex.len() % 2 != 0 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
@@ -440,7 +450,7 @@ impl TreeFile {
     async fn open(source: PageSource, locator: &TreeLocator, columns: &[String], identity: &str, version: i64) -> Result<Self> {
         let reader = TreeReader::new(source, locator.length, locator.format);
         let root = match &locator.inline_root {
-            Some(bytes) => reader.inline_page(locator.page, Arc::clone(bytes))?,
+            Some(bytes) => reader.inline_page(locator.page, bytes.clone())?,
             None => reader.page(locator.page, PageKind::Root).await?,
         };
         let header = table(&root, Table::Header);

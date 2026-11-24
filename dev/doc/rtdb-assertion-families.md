@@ -167,6 +167,12 @@ The existing family envelope actions and the derived-stage response hold bind th
 The retained outcome keeps its existing Root unit seal, and recall requires the original Root unit fence and the exact live family member.
 The installed Root line, family vault and receipt must remain reachable.
 The admitted output route covers a registered result with one exact landed Root point as its protected input.
+On a direct held Original parent, the installed live writer can select an earlier exact Root publication and read its opaque protected carrier through the existing parent point route.
+The earlier selection uses the held parent predecessor and requires matching historical declarations and intact purge coverage.
+For a protected row, the same selected publication scopes both the carrier and the protected row journal.
+The two points must agree on the winning publication, and the journal supplies the assertion ordinal for the original family check.
+The application keeps the original unit and family admission through response-part release.
+A shared field uses its same-cut Root winner selector and carrier, with its current original unit fence.
 A successor archive copy needs a durable route authenticated to the Original deployment, incarnation, ordered journal position and current family authority.
 A frozen capture proves the historical assertion and bytes. Recall through a new deployment also needs access to the Original ordered marker and release owner through any source retirement.
 Successor replay of a family carrier refuses until that route is available.
@@ -305,12 +311,14 @@ Hosted protocol 224 advertises `rtdb.owned.ReadHeldWorldSharedColumnCensus.v1` t
 The request is the existing held world handle (16 bytes), signed big-endian valid instant (8 bytes), u16 byte length and lowercase hexadecimal Root BFCP2 prefix, then the ASCII world-column prefix.
 The valid instant must be the held data clock.
 The response has one Arrow `_id` Utf8 column in strictly increasing ID order and the original world range witness.
-One completion covers the installed Root carrier prefix at the direct archived parent and the opaque shared column prefix in the selected local overlay.
+One completion covers the installed Root carrier prefix at the archived Root parent and the opaque shared column prefix in the selected overlay.
+When the pin has frozen ancestors, the overlay scan joins their exact retained carrier identities with the selected local overlay.
 Root selectors used for point reads sit outside the Root census and never count as overlay carriers.
 The response contains at most 512 identities.
 The witness binds the parent pin, original writer placement, Root purge frontier and selected overlay frontier, and the installer co-orders it with its exact carrier point and current Root unit condition.
-The scope is a writable direct child of Root in the same placement.
-There is no ancestor or restored-source scan in this action.
+The scope is a writable world in the same placement.
+Every retained ancestor requires exact opaque schema and purge coverage.
+A restored destination cannot use a local census to substitute for an unavailable original source.
 The world carrier and Root point selector both use the scoped world-column key, with no fallback to an earlier key shape.
 
 ### Fence plan reply
