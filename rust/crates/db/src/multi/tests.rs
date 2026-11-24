@@ -1113,7 +1113,7 @@ async fn managed_workload_expired_while_waiting_for_the_original_acknowledgement
     let database = Arc::new(Mutex::new(writer));
     let writes = WritePipeline::start(database.clone());
 
-    let point = Point::new("public.bj_installation", "authority".into(), Timestamp(0)).unwrap();
+    let point = Point::new("public.installation_authority", "authority".into(), Timestamp(0)).unwrap();
     let command = |namespace, expires_at, operation| Request { point: point.clone(), namespace, expires_at, operation };
     let submit = |key, authority, transaction| Operation::Submit {
         key: vec![key; 16], authority, transaction, digest: [key; 32],

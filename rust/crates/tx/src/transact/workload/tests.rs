@@ -19,7 +19,7 @@ impl Writer {
     fn new() -> Self {
         Self {
             pipeline: TransactPipeline::new(TransactState::new(INCARNATION), 1, 1).unwrap(),
-            point: Point::new("public.bj_installation", "authority".into(), Timestamp(0)).unwrap(),
+            point: Point::new("public.installation_authority", "authority".into(), Timestamp(0)).unwrap(),
             now: Timestamp(10),
         }
     }
