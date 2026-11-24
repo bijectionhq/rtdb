@@ -1,16 +1,16 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_index::branches::{BranchView, BranchWrite};
-use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingView};
+use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
 
 use super::{ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ServingDriver, TransactSubmission};
+    QuerySource, QueryView, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission};
 use crate::Clock;
 
 pub(crate) struct DefaultServing {
@@ -25,6 +25,7 @@ pub(crate) struct DefaultServing {
 impl ServingDriver for DefaultServing {
     fn incarnation(&self) -> [u8; 16] { self.handle.authority().incarnation }
     fn uses_database_tokens(&self) -> bool { true }
+    fn supports_row_visibility(&self) -> bool { self.handle.is_compatible() && self.tokens.supported() }
 
     fn features(&self) -> &[&str] {
         if !self.handle.is_compatible() { return &[]; }
@@ -58,11 +59,77 @@ impl ServingDriver for DefaultServing {
         } else {
             VerifiedClaims::default()
         };
-        self.handle.transact(request, claims, cancellation).await
+        self.handle.transact(request, claims, None, cancellation).await
     }
 
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {
-        self.handle.tx_status(key.to_vec(), cancellation).await
+        self.handle.tx_status(key.to_vec(), None, cancellation).await
+    }
+
+    async fn query_scoped(
+        &self, source: QuerySource, track: bool, now: Timestamp, scope: &ServingScope,
+        cancellation: &CancellationToken,
+    ) -> Result<QueryView> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let at = if source.at == At::Linearizable { At::Linearizable } else { At::Latest };
+        let mut snapshot = self.handle.view(at, cancellation).await?;
+        loop {
+            match scope.query(&snapshot.index, source.clone(), now, &self.memory) {
+                Ok((mut view, raw)) => {
+                    if track {
+                        view.claim = Some(self.tokens.authority().await?.issuer().await?
+                            .seal_scoped_claim(raw, &scope.labels).await?);
+                    }
+                    return Ok(view);
+                }
+                Err(error) if matches!(source.at, At::AtLeast(_)) && error.code == "rtdb/basis-ahead" => {
+                    let wait = self.handle.after(snapshot.index.head().basis, cancellation);
+                    tokio::time::timeout_at(deadline, wait).await.map_err(|_| error)??;
+                    snapshot = self.handle.view(At::Latest, cancellation).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn transact_scoped(
+        &self, request: ScopedSubmission, scope: ServingScope, cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        if !self.writable {
+            return Err(Anomaly::unsupported("rtdb/default-serving-read-only", "The default serving attachment is read-only"));
+        }
+        let claims = if request.transaction.claims().next().is_some() {
+            self.tokens.authority().await?
+                .verify_claims_in(request.transaction.claims(), Some(&scope.labels)).await
+        } else {
+            VerifiedClaims::default()
+        };
+        let scope = NativeServingScope { labels: scope.labels, receipt_namespace: scope.receipt_namespace };
+        self.handle.transact(request, claims, Some(scope), cancellation).await
+    }
+
+    async fn tx_status_scoped(
+        &self, key: &[u8], scope: &ServingScope, cancellation: &CancellationToken,
+    ) -> Result<Receipt> {
+        let scope = NativeServingScope { labels: scope.labels.clone(), receipt_namespace: scope.receipt_namespace };
+        self.handle.tx_status(key.to_vec(), Some(scope), cancellation).await
+    }
+
+    async fn changes_scoped(
+        &self, request: Changes, scope: &ServingScope, cancellation: &CancellationToken,
+    ) -> Result<ChangePage> {
+        let deadline = tokio::time::Instant::now() + request.wait;
+        loop {
+            let snapshot = self.handle.view(At::Latest, cancellation).await?;
+            let page = scope.changes(&snapshot.index, &request)?;
+            if !page.groups.is_empty() || request.until.is_some() && page.complete || tokio::time::Instant::now() >= deadline {
+                return Ok(page);
+            }
+            match tokio::time::timeout_at(deadline, self.handle.after(snapshot.index.head().basis, cancellation)).await {
+                Ok(result) => result?,
+                Err(_) => return Ok(page),
+            }
+        }
     }
 
     async fn changes(&self, request: Changes, cancellation: &CancellationToken) -> Result<ChangePage> {

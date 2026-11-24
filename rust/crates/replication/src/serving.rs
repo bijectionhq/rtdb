@@ -5,10 +5,10 @@ use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Admission, Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Admission, Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis, QUERY_WRITTEN_BASIS}};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +29,24 @@ pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, "branches",
     "changes", "changes.progress-only", "tx-status", "sql.history",
 ];
+const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TRANSACT_REQUIRES, "row-visibility"];
+
+pub struct NativeServingScope {
+    pub labels: LabelScope,
+    pub receipt_namespace: [u8; 32],
+}
+
+impl NativeServingScope {
+    fn authority(&self) -> ScopedTransact<'_> {
+        ScopedTransact { labels: &self.labels, receipt_namespace: self.receipt_namespace }
+    }
+}
+
+pub(crate) struct NativeRequest {
+    submission: TransactSubmission,
+    claims: VerifiedClaims,
+    scope: Option<NativeServingScope>,
+}
 
 pub struct TransactSubmission {
     pub transaction: Transact,
@@ -125,16 +143,16 @@ impl NativeServingHandle {
         Ok(())
     }
 
-    pub async fn transact(&self, request: TransactSubmission, claims: VerifiedClaims, cancellation: &CancellationToken) -> Result<Receipt> {
+    pub async fn transact(&self, request: TransactSubmission, claims: VerifiedClaims, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
         if request.transaction.ops.is_empty() && request.transaction.otherwise.is_empty() {
             self.replication.serving_barrier(cancellation).await?;
         }
-        self.replication.serving_transact(request, claims, cancellation).await
+        self.replication.serving_transact(NativeRequest { submission: request, claims, scope }, cancellation).await
     }
 
-    pub async fn tx_status(&self, key: Vec<u8>, cancellation: &CancellationToken) -> Result<Receipt> {
+    pub async fn tx_status(&self, key: Vec<u8>, scope: Option<NativeServingScope>, cancellation: &CancellationToken) -> Result<Receipt> {
         self.replication.serving_barrier(cancellation).await?;
-        self.replication.serving_status(key, cancellation).await
+        self.replication.serving_status(key, scope, cancellation).await
     }
 }
 
@@ -155,6 +173,7 @@ pub(crate) struct NativeServing {
 struct Pending {
     frame: Bytes,
     completion: Completion,
+    scope: Option<NativeServingScope>,
 }
 
 pub(crate) struct ServingCheckpoint {
@@ -246,10 +265,10 @@ impl NativeServing {
     }
 
     pub(crate) fn decide_batch(
-        &mut self, now: Timestamp, mut requests: Vec<(TransactSubmission, VerifiedClaims, Completion)>,
+        &mut self, now: Timestamp, mut requests: Vec<(NativeRequest, Completion)>,
     ) -> Result<Vec<proto::NoOp>> {
         if !self.view.borrow().compatible {
-            for (_, _, completion) in requests { let _ = completion.send(Err(incompatible())); }
+            for (_, completion) in requests { let _ = completion.send(Err(incompatible())); }
             return Ok(Vec::new());
         }
         if !self.deciding {
@@ -263,18 +282,25 @@ impl NativeServing {
             self.deciding = true;
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
-        let decisions = requests.iter_mut().map(|(request, claims, _)| {
-            request.transaction.admission = Some(request.admission());
-            pipeline.decide(&request.transaction, now, NATIVE_WRITE_FEATURES, claims)
+        let decisions = requests.iter_mut().map(|(request, _)| {
+            let submission = &mut request.submission;
+            submission.transaction.admission = Some(submission.admission());
+            let transaction = &submission.transaction;
+            match &request.scope {
+                Some(scope) => pipeline.decide_scoped(transaction, now, SCOPED_FEATURES, &request.claims, scope.authority()),
+                None => pipeline.decide(transaction, now, NATIVE_WRITE_FEATURES, &request.claims),
+            }
         }).collect::<Vec<_>>();
         let mut messages = Vec::new();
-        for ((request, _, completion), decision) in requests.into_iter().zip(decisions) {
+        for ((request, completion), decision) in requests.into_iter().zip(decisions) {
             match decision {
-                Ok(Decision::Answer(receipt)) => { let _ = completion.send(Ok(receipt)); }
+                Ok(Decision::Answer(receipt)) => {
+                    let _ = completion.send(self.project_receipt(receipt, request.scope.as_ref()));
+                }
                 Err(error) => { let _ = completion.send(Err(error)); }
                 Ok(Decision::Append { position, record }) => {
-                    let frame = frame(position, &request, &record);
-                    self.pending.insert(position, Pending { frame: frame.clone(), completion });
+                    let frame = frame(position, &request.submission, &record);
+                    self.pending.insert(position, Pending { frame: frame.clone(), completion, scope: request.scope });
                     messages.push(proto::NoOp { serving_record: Some(frame), ..Default::default() });
                 }
             }
@@ -308,17 +334,27 @@ impl NativeServing {
         if own {
             let receipt = receipts.into_iter().next().expect("one ordinary receipt");
             let pending = self.pending.remove(&position).ok_or_else(invalid)?;
-            let _ = pending.completion.send(Ok(receipt));
+            let _ = pending.completion.send(self.project_receipt(receipt, pending.scope.as_ref()));
         }
         Ok(())
     }
 
-    pub(crate) fn status(&self, key: &[u8]) -> Result<Receipt> {
-        if !self.view.borrow().compatible { return Err(incompatible()); }
-        match &self.pipeline {
-            Some(pipeline) => pipeline.tx_status(key),
-            None => self.durable().tx_status(key),
+    fn project_receipt(&self, receipt: Receipt, scope: Option<&NativeServingScope>) -> Result<Receipt> {
+        match scope {
+            Some(scope) => self.durable().project_receipt(receipt, &scope.labels),
+            None => Ok(receipt),
         }
+    }
+
+    pub(crate) fn status(&self, key: &[u8], scope: Option<&NativeServingScope>) -> Result<Receipt> {
+        if !self.view.borrow().compatible { return Err(incompatible()); }
+        let receipt = match (&self.pipeline, scope) {
+            (Some(pipeline), Some(scope)) => pipeline.tx_status_scoped(key, scope.authority()),
+            (Some(pipeline), None) => pipeline.tx_status(key),
+            (None, Some(scope)) => self.durable().tx_status_scoped(key, scope.authority()),
+            (None, None) => self.durable().tx_status(key),
+        }?;
+        self.project_receipt(receipt, scope)
     }
 
     pub(crate) fn withdraw(&mut self) {
@@ -418,6 +454,10 @@ mod tests {
         }
     }
 
+    fn unscoped(submission: TransactSubmission) -> NativeRequest {
+        NativeRequest { submission, claims: VerifiedClaims::default(), scope: None }
+    }
+
     #[tokio::test]
     async fn serving_withdrawal_recovers_only_the_committed_prefix_before_resuming() {
         let (mut serving, view) = NativeServing::open(authority(), None, false).unwrap();
@@ -425,8 +465,8 @@ mod tests {
         let (first_reply, mut first_result) = oneshot::channel();
         let (second_reply, mut second_result) = oneshot::channel();
         let mut messages = serving.decide_batch(Timestamp(41), vec![
-            (first, VerifiedClaims::default(), first_reply),
-            (put(2), VerifiedClaims::default(), second_reply),
+            (unscoped(first), first_reply),
+            (unscoped(put(2)), second_reply),
         ]).unwrap();
         assert_eq!(messages.len(), 2);
         let excluded = messages.pop().unwrap().serving_record.unwrap();
@@ -437,17 +477,17 @@ mod tests {
         assert_eq!(&committed[33..65], &digest);
         assert!(first_result.try_recv().is_err());
         assert!(second_result.try_recv().is_err());
-        assert_eq!(serving.status(&[1; 16]).unwrap_err().code, "rtdb/transaction-pending");
+        assert_eq!(serving.status(&[1; 16], None).unwrap_err().code, "rtdb/transaction-pending");
         assert_eq!(view.borrow().index.head().basis.position(), 0);
 
         serving.withdraw();
         assert_eq!(first_result.await.unwrap().unwrap_err().category, AnomalyCategory::Interrupted);
         assert_eq!(second_result.await.unwrap().unwrap_err().category, AnomalyCategory::Interrupted);
         serving.apply(&committed, false).unwrap();
-        assert!(serving.status(&[1; 16]).unwrap().replayed);
-        assert_eq!(serving.status(&[2; 16]).unwrap_err().code, "rtdb/unknown-transaction");
+        assert!(serving.status(&[1; 16], None).unwrap().replayed);
+        assert_eq!(serving.status(&[2; 16], None).unwrap_err().code, "rtdb/unknown-transaction");
         let (reply, result) = oneshot::channel();
-        let message = serving.decide_batch(Timestamp(42), vec![(put(3), VerifiedClaims::default(), reply)])
+        let message = serving.decide_batch(Timestamp(42), vec![(unscoped(put(3)), reply)])
             .unwrap().remove(0).serving_record.unwrap();
         assert!(serving.apply(&excluded, true).is_err());
         serving.apply(&message, true).unwrap();
@@ -456,7 +496,7 @@ mod tests {
 
         let image = serving.checkpoint(Term(2), true).unwrap().image;
         let (recovered, recovered_view) = NativeServing::open(authority(), Some(&image), false).unwrap();
-        assert_eq!(recovered.status(&[3; 16]).unwrap().basis.position(), 2);
+        assert_eq!(recovered.status(&[3; 16], None).unwrap().basis.position(), 2);
         assert_eq!(recovered_view.borrow().floor.position(), 2);
         assert!(recovered_view.borrow().changes.is_empty());
     }
@@ -471,7 +511,7 @@ mod tests {
                 let requests = batch.iter().map(|&key| {
                     let (completion, reply) = oneshot::channel();
                     replies.push((key, reply));
-                    (put(key), completion)
+                    (unscoped(put(key)), completion)
                 }).collect();
                 let messages = leader.decide_batch(Timestamp(50), requests).unwrap();
                 for (message, (key, reply)) in messages.iter().zip(replies) {
@@ -480,7 +520,7 @@ mod tests {
                     follower.apply(frame, false).unwrap();
                     let receipt = reply.await.unwrap().unwrap();
                     assert_eq!(receipt.basis.position(), u64::from(key));
-                    assert_eq!(leader.status(&[key; 16]).unwrap(), follower.status(&[key; 16]).unwrap());
+                    assert_eq!(leader.status(&[key; 16], None).unwrap(), follower.status(&[key; 16], None).unwrap());
                 }
                 assert_eq!(leader_view.borrow().changes.as_ref(), follower_view.borrow().changes.as_ref());
             }
@@ -488,6 +528,43 @@ mod tests {
             let follower_image = follower.checkpoint(Term(1), true).unwrap();
             assert_eq!(leader_image.image, follower_image.image);
         }
+    }
+
+    #[tokio::test]
+    async fn serving_scoped_receipts_are_projected_and_recover_in_their_namespace() {
+        use rtdb_tx::transact::{Declaration, Outcome, Visibility};
+
+        let (mut serving, _) = NativeServing::open(authority(), None, false).unwrap();
+        let mut declaration = put(1);
+        declaration.transaction.ops = vec![Op::Declare {
+            table: TableRef::new("public", "items"),
+            change: Declaration::Visibility(Visibility { column: "label".into() }),
+        }];
+        let (completion, reply) = oneshot::channel();
+        let mut records = serving.decide_batch(Timestamp(40), vec![(unscoped(declaration), completion)]).unwrap();
+        serving.apply(records.remove(0).serving_record.as_deref().unwrap(), true).unwrap();
+        assert_eq!(reply.await.unwrap().unwrap().outcome, Outcome::Then);
+
+        let scope = || NativeServingScope {
+            labels: LabelScope { read: [vec![7]].into_iter().collect(), write: [vec![7]].into_iter().collect() },
+            receipt_namespace: [7; 32],
+        };
+        let mut submission = put(2);
+        let Op::Put { rows, .. } = &mut submission.transaction.ops[0] else { unreachable!() };
+        rows[0].valid = Some(rtdb_types::Interval::ALL.into());
+        rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![7])));
+        let request = NativeRequest { submission, claims: VerifiedClaims::default(), scope: Some(scope()) };
+        let (completion, reply) = oneshot::channel();
+        let mut records = serving.decide_batch(Timestamp(41), vec![(request, completion)]).unwrap();
+        serving.apply(records.remove(0).serving_record.as_deref().unwrap(), true).unwrap();
+        let receipt = reply.await.unwrap().unwrap();
+        assert_eq!(receipt.outcome, Outcome::Then);
+        assert_eq!(receipt.basis.incarnation(), scope().labels.main_read_incarnation(INCARNATION));
+
+        let checkpoint = serving.checkpoint(Term(1), true).unwrap();
+        let (reopened, _) = NativeServing::open(authority(), Some(&checkpoint.image), false).unwrap();
+        assert_eq!(reopened.status(&[2; 16], Some(&scope())).unwrap().basis, receipt.basis);
+        assert_eq!(reopened.status(&[2; 16], None).unwrap_err().code, "rtdb/unknown-transaction");
     }
 
     #[tokio::test]

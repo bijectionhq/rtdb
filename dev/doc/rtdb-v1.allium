@@ -110,6 +110,8 @@ surface StatelessDatabase {
         -- An OIDC label scope binds its credential to the verified database name and incarnation.
         -- A scoped credential requires a route that enforces that scope for every admitted operation.
         -- The initial scoped serving path selects merged main and uses a logical system-time coordinate.
+        -- Default mode and Multi use the same scoped projection for Query, Changes, and transaction receipts.
+        -- Changes waits for progress observable by the selected scope or the requested deadline.
         -- Put rows can supply literal signed-microsecond valid-time bounds in _valid_from and _valid_to.
 
     @guarantee ChangesImages

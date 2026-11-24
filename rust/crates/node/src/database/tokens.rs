@@ -43,7 +43,7 @@ struct DatabaseAuthority {
 }
 
 impl DatabaseTokens {
-    pub(super) fn supported(&self) -> bool {
+    pub(crate) fn supported(&self) -> bool {
         !matches!(self.custody, Custody::Missing)
     }
 

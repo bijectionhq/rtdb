@@ -45,6 +45,6 @@ pub use sql_survivor::SqlSurvivor;
 pub use replay_closure::{ReplayBase, ReplayDependencySources, checkpoint_dependencies, tail_dependencies};
 pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
-pub use serving::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeCheckpointAuthority, NativeServingAuthority, NativeServingHandle, NativeServingView, TransactSubmission};
+pub use serving::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeCheckpointAuthority, NativeServingAuthority, NativeServingHandle, NativeServingScope, NativeServingView, TransactSubmission};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};
 pub use table_replay::RetainedTableReplay;
