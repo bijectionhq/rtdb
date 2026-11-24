@@ -252,6 +252,9 @@ The offered clock is an acceptance premise.
 RTDB assigns the ordered position when it resolves the prepared generation.
 The pre-publication link therefore names the destination by the receipt digest and review slot, and the post-publication binding adds the exact accepted position selected by that slot.
 The receipt binds the approved source slot, destination carrier and validity, disclosure commitment, and the exact payload and link envelopes.
+The prepared switch includes an absent family marker check for each family in the protected Root carriers.
+The original ordered resolver compares that exact set with the carriers being placed.
+A fence that orders first therefore invalidates the applied switch even when the destination was reserved earlier.
 The release owner authenticates the applied receipt and its proof, the installed carrier and original ordered position, and uses the same evidence when recovering an interrupted activation.
 A constraint refusal, a stale prepared generation or a missing receipt grants no activation.
 A reservation and sealed frames alone grant no release.
