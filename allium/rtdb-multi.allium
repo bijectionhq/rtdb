@@ -18,6 +18,8 @@
 -- Directory rules apply to directory deployments, and installed-journal obligations have their own authority invariants.
 --
 -- Status: target design, ahead of the implementation.
+-- EpochScopedStorage describes the storage shared by default and Multi mode.
+-- The directory-managed storage and reaper rules describe the deployment path still in service.
 -- dev/doc/rtdb-multi-plan.md stages the implementation and names the code each part grows from.
 -- The target serving protocol uses scoped attempt receipts and a loglet read index.
 -- The implementation still exposes numeric intake positions, fences on member lease loss and lacks the subscriber read index.
@@ -821,6 +823,40 @@ contract ObjectStorage {
     @invariant RequestsSpreadAcrossPartitions
         -- The hash at the head of every StorageRoot prefix spreads deployments over the store's request partitions.
         -- A deployment whose request rate exceeds one partition's adds a second hash level inside its prefix.
+}
+
+contract EpochScopedStorage {
+    @invariant UniqueObjectCreation
+        -- Each database writer epoch has one allocation sequence for files and manifests.
+        -- In default mode the epoch is the log processor's leader term.
+        -- A writer restart acquires a higher epoch before allocating.
+        -- Each creation has its own key, and the digest verifies the ciphertext read at that key.
+
+    @invariant CommittedReachability
+        -- A checkpoint publishes its complete file set and carries the active pins at its cut.
+        -- An export or cross-deployment fork is acknowledged after its source pin commits.
+        -- The source pin covers the exact manifest and files until ordered release.
+        -- A pin deadline closes admission, and admitted work drains before Unpin commits.
+        -- An in-database branch's base history remains in the current checkpoint's file set.
+
+    @invariant PermanentUnreachability
+        -- In Multi mode the writer captures all retained records through a committed head after sealing.
+        -- In default mode the confirmed leader supplies the retained checkpoint, replica records, pins and inputs of admitted reads and compaction under its term.
+        -- It deletes only database objects from earlier epochs outside the closure of the retained records, checkpoints and pins.
+        -- Publication inherits earlier-epoch references from the current committed closure and introduces new objects from the current epoch.
+        -- A delayed delete targets the same key and that key stays unreachable after handoff.
+        -- An incomplete reference closure defers collection.
+
+    @invariant TimedWriteDependencies
+        -- A timed Tx holds its storage dependencies while its record is retained.
+        -- Settle and Refuse refer to the original Tx by journal position and introduce no new storage dependencies.
+
+    @invariant KeyGenerationErasure
+        -- A file has an independent data key wrapped under the database key generation.
+        -- Journal payloads are encrypted under a database key generation before append.
+        -- Erasure publishes a clean checkpoint recoverable under the next generation and then commits rotation at its cut.
+        -- The writer arms the retiring generation's key-grant deadline and trims to the clean checkpoint.
+        -- Key custody refuses old-generation delivery at the deadline and destroys the retiring generation once the deadline has elapsed.
 }
 
 ------------------------------------------------------------

@@ -1,4 +1,6 @@
 -- allium: 3
+-- For epoch-scoped keys, block recovery inputs remain roots for the confirmed leader's collection cycle.
+-- The EpochScopedStorage contract in ../../allium/rtdb-multi.allium governs these keys in default and Multi modes.
 -- block-gc.allium
 --
 -- Garbage collection of superseded block-catalog and per-table block files
