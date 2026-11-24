@@ -395,7 +395,8 @@ impl Builder {
             } else {
                 output.page(directory)?;
                 output.page(visibility)?;
-                plan.emit(|table, batch| output.page([(table, batch)]))?;
+                let retain_pages = matches!(output, Output::Batches(_));
+                plan.emit(retain_pages, |table, batch| output.page([(table, batch)]))?;
             }
         } else {
             directory.extend(visibility);
