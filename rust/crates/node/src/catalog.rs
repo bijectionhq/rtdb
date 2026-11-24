@@ -33,6 +33,35 @@ pub struct DatabaseCatalog {
 }
 
 impl DatabaseCatalog {
+    /// Pins an exact export on the installed database for a trusted control-plane caller.
+    #[cfg(feature = "multi")]
+    pub async fn export_deployment_checkpoint(
+        &self, name: &str, pin: uuid::Uuid, basis: rtdb_types::rtdb_v1::Basis,
+        until: Option<rtdb_types::Timestamp>, cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<u8>> {
+        let attachment = self.database(name)?;
+        let driver = attachment.serving_driver().ok_or_else(export_unavailable)?;
+        let ticket = driver.export_checkpoint(pin, basis, until, cancellation).await?;
+        self.with_current_attachment(&attachment, || Ok(ticket))
+    }
+
+    /// Restores into an independently provisioned destination and returns its applied basis.
+    #[cfg(feature = "multi")]
+    pub async fn restore_deployment_checkpoint(
+        &self, source: &str, destination: &str, ticket: Vec<u8>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<rtdb_types::rtdb_v1::Basis> {
+        let original = self.database(source)?;
+        let restored = self.database(destination)?;
+        let source = original.serving_driver().ok_or_else(export_unavailable)?;
+        let target = restored.serving_driver().ok_or_else(export_unavailable)?;
+        let export = source.open_checkpoint_export(ticket, cancellation).await?;
+        self.with_current_attachment(&original, || Ok(()))?;
+        self.with_current_attachment(&restored, || Ok(()))?;
+        let cut = target.restore_checkpoint(export, cancellation).await?;
+        self.with_current_attachment(&restored, || Ok(cut.basis))
+    }
+
     pub(crate) fn new(membership: Membership) -> Arc<Self> {
         Arc::new(Self { value: RwLock::new(Arc::new(DatabaseSet::default())), membership })
     }
@@ -96,6 +125,16 @@ impl DatabaseCatalog {
             _ => Err(no_database(name)),
         }
     }
+    pub(crate) fn with_current_attachment<T>(&self, attachment: &Arc<Database>, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let current = self.value.read();
+        if !matches!(current.entries.get(attachment.name()), Some(Entry::Open { database, driver: DriverLifetime::Running })
+            if Arc::ptr_eq(database, attachment))
+        {
+            return Err(no_database(attachment.name()));
+        }
+        operation()
+    }
+
     fn require_mutable(&self) -> Result<()> {
         if matches!(self.membership, Membership::Fixed(_) | Membership::Placed) { return Err(Anomaly::unsupported("xtdb/fixed-database-catalog", "A fixed database catalog does not accept membership instructions")); }
         Ok(())
@@ -204,3 +243,8 @@ impl DatabaseEffects for CatalogEffects {
 
 fn no_database(name: &str) -> Anomaly { Anomaly::new(AnomalyCategory::NotFound, "xtdb/no-such-db", "Database does not exist").with_context("db-name", name.into()) }
 fn closed() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "xtdb/node-closed", "Node is closed") }
+
+#[cfg(feature = "multi")]
+fn export_unavailable() -> Anomaly {
+    Anomaly::unsupported("rtdb/export-checkpoint", "The deployment has no checkpoint export driver")
+}

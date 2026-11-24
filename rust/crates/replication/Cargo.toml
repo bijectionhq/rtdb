@@ -10,7 +10,10 @@ rtdb-types.workspace = true
 rtdb-format.workspace = true
 rtdb-columnar.workspace = true
 rtdb-index.workspace = true
+rtdb-query.workspace = true
 rtdb-storage.workspace = true
+rtdb-crypt = { path = "../crypt" }
+rtdb-store = { path = "../store" }
 rtdb-trie.workspace = true
 rtdb-tx.workspace = true
 async-trait.workspace = true
@@ -24,6 +27,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 
 [lints]

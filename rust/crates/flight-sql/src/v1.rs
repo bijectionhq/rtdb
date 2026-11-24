@@ -3,8 +3,10 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::{self as flight, FlightData, sql::Any};
 use bytes::Bytes;
 use prost::{Message, Name};
+use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
-use rtdb_query::QueryContext;
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
+use rtdb_tx::transact::{PHYSICAL_ERASURE, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::Timestamp;
 use tonic::{Response, Status, metadata::MetadataMap};
 
@@ -17,8 +19,10 @@ mod changes;
 pub(crate) mod error;
 mod query;
 mod tokens;
+mod transact;
 
 const API: &str = "rtdb.v1";
+const RECEIVER_CLOCK: &str = "query.receiver-clock";
 const MAX_PAGE_ROWS: u32 = 4096;
 const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
@@ -30,7 +34,6 @@ pub(crate) const ACTIONS: [&str; 3] = [
 
 #[derive(Default)]
 pub(crate) struct State {
-    tokens: tokens::Tokens,
     plans: query::PlanCache,
 }
 
@@ -57,7 +60,7 @@ fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
 }
 
 impl Service {
-    pub(crate) fn v1_action(
+    pub(crate) async fn v1_action(
         &self,
         call: Call,
         action: flight::Action,
@@ -69,8 +72,6 @@ impl Service {
                     features.extend(
                         [
                             "query",
-                            "query.track",
-                            "query.page",
                             "changes",
                             changes::PROGRESS_ONLY,
                             changes::SHARED_IMAGES,
@@ -82,15 +83,43 @@ impl Service {
                         ]
                         .map(str::to_owned),
                     );
-                    if self
-                        .0
-                        .node
-                        .catalog()
-                        .database(&call.database)
-                        .is_ok_and(|database| database.wire_linearizable_reads())
-                    {
-                        features.push("query.linearizable".into());
+                    if let Ok(database) = self.0.node.catalog().database(&call.database) {
+                        if let Some(driver) = database.serving_driver() {
+                            features = driver
+                                .features()
+                                .iter()
+                                .map(|feature| (*feature).to_owned())
+                                .collect();
+                            if driver.supports_row_visibility() && !features.iter().any(|feature| feature == ROW_VISIBILITY) {
+                                features.push(ROW_VISIBILITY.into());
+                            }
+                        } else if database.wire_linearizable_reads() {
+                            features.push("query.linearizable".into());
+                        }
+                        if features.iter().any(|feature| feature == "query") && database.wire_tokens_supported()
+                            && database.serving_driver().is_none_or(|driver| driver.supports_query_tokens())
+                        {
+                            for feature in ["query.track", "query.page"] {
+                                if !features.iter().any(|existing| existing == feature) {
+                                    features.push(feature.into());
+                                }
+                            }
+                            if database.serving_driver().is_some() {
+                                features.push(RECEIVER_CLOCK.into());
+                            }
+                        } else {
+                            features.retain(|feature| feature != "query.track" && feature != "query.page");
+                        }
                     }
+                }
+                let scoped = call.session.caller.principal.label_scope().is_some();
+                if scoped {
+                    let admitted = self.0.node.catalog().database(&call.database).is_ok_and(|database| {
+                        database.serving_driver().is_some_and(|driver| self.serving_scope(&call, driver).is_ok())
+                    });
+                    features.retain(|feature| admitted && matches!(feature.as_str(), ROW_VISIBILITY | "query" |
+                        "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" |
+                        TIMED_TRANSACT | TRANSACT_REQUIRES | PHYSICAL_ERASURE | rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS | "tx-status" | "sql.history"));
                 }
                 proto::CapabilitiesResponse {
                     api: API.into(),
@@ -102,24 +131,15 @@ impl Service {
                         min_key_bytes: 16,
                         max_key_bytes: 64,
                     }),
-                    server_time_micros: self.0.node.now().0,
+                    server_time_micros: if scoped { 0 } else { self.0.node.now().0 },
                 }
                 .encode_to_vec()
             }),
-            "rtdb.v1.Transact" => {
-                decode::<proto::TransactRequest>(action.body).and_then(|request| {
-                    check_key(&request.key)?;
-                    Err(error::unsupported(
-                        request.require.first().map_or("transact", String::as_str),
-                    ))
-                })
-            }
-            "rtdb.v1.TxStatus" => {
-                decode::<proto::TxStatusRequest>(action.body).and_then(|request| {
-                    check_key(&request.key)?;
-                    Err(error::unsupported("tx-status"))
-                })
-            }
+            "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
+            "rtdb.v1.TxStatus" => match decode(action.body) {
+                Ok(request) => self.v1_tx_status(&call, request).await,
+                Err(status) => Err(status),
+            },
             _ => Err(error::unsupported("admin")),
         };
         let result = outcome.map_err(|status| call.error(status))?;
@@ -133,6 +153,46 @@ impl Service {
             })],
         )
         .map_err(error::map_status)
+    }
+
+    async fn v1_transact(&self, call: &Call, source: Bytes) -> Result<Vec<u8>, Status> {
+        let request: proto::TransactRequest = decode(source)?;
+        check_key(&request.key)?;
+        let access = if request.ops.is_empty() && request.otherwise.is_empty() {
+            DatabaseAccess::Read
+        } else {
+            DatabaseAccess::Write
+        };
+        let database = self.wire_attachment(call, access).await?;
+        let driver = database.serving_driver().ok_or_else(|| {
+            error::unsupported(request.require.first().map_or("transact", String::as_str))
+        })?;
+        let mut transaction = transact::request(request, call.memory())?;
+        transaction.request_memory = Some(call.request_reservation());
+        let receipt = match self.serving_scope(call, driver)? {
+            Some(scope) => driver.transact_scoped(transaction, scope, &call.cancellation).await,
+            None => driver.transact(transaction, &call.cancellation).await,
+        }.map_err(error::anomaly)?;
+        self.check_attachment(call, &database)?;
+        Ok(transact::receipt(receipt).encode_to_vec())
+    }
+
+    async fn v1_tx_status(
+        &self,
+        call: &Call,
+        request: proto::TxStatusRequest,
+    ) -> Result<Vec<u8>, Status> {
+        check_key(&request.key)?;
+        let database = self.wire_attachment(call, DatabaseAccess::Write).await?;
+        let driver = database
+            .serving_driver()
+            .ok_or_else(|| error::unsupported("tx-status"))?;
+        let receipt = match self.serving_scope(call, driver)? {
+            Some(scope) => driver.tx_status_scoped(&request.key, &scope, &call.cancellation).await,
+            None => driver.tx_status(&request.key, &call.cancellation).await,
+        }.map_err(error::anomaly)?;
+        self.check_attachment(call, &database)?;
+        Ok(transact::receipt(receipt).encode_to_vec())
     }
 
     pub(crate) async fn v1_get(
@@ -159,30 +219,57 @@ impl Service {
         branch: &str,
         layer: proto::Layer,
     ) -> Result<Arc<Database>, Status> {
+        if !rtdb_types::rtdb_v1::valid_branch_name(branch) {
+            return Err(error::incorrect("Invalid branch name"));
+        }
+        let database = self.wire_attachment(call, DatabaseAccess::Read).await?;
+        if database.serving_driver().is_none() {
+            if branch != "main" {
+                return Err(error::unsupported("branches"));
+            }
+            if layer != proto::Layer::Merged {
+                return Err(error::unsupported("branch.local-layer"));
+            }
+        }
+        Ok(database)
+    }
+
+    async fn wire_attachment(
+        &self,
+        call: &Call,
+        access: DatabaseAccess,
+    ) -> Result<Arc<Database>, Status> {
         if call.session.audience_source().is_some() || call.session.fresh_replica {
             return Err(error::unsupported("rtdb.v1.route"));
         }
-        if branch.is_empty() {
-            return Err(error::incorrect("Source requires a branch"));
+        let scoped = call.session.caller.principal.label_scope().is_some();
+        if !scoped {
+            call.session.caller.principal.authorize_database(&call.database, access).map_err(error::anomaly)?;
         }
-        if branch != "main" {
-            return Err(error::unsupported("branches"));
-        }
-        if layer != proto::Layer::Merged {
-            return Err(error::unsupported("branch.local-layer"));
-        }
-        call.session
-            .caller
-            .principal
-            .authorize_database(&call.database, DatabaseAccess::Read)
-            .map_err(error::anomaly)?;
         self.admit_database(&call.database)
             .await
             .map_err(error::map_status)?;
-        self.0
-            .node
-            .catalog()
-            .database(&call.database)
+        let database = self.0.node.catalog().database(&call.database).map_err(error::anomaly)?;
+        if scoped {
+            let driver = database.serving_driver().ok_or_else(|| error::unsupported(ROW_VISIBILITY))?;
+            self.serving_scope(call, driver)?;
+        }
+        Ok(database)
+    }
+
+    fn serving_scope(&self, call: &Call, driver: &dyn ServingDriver) -> Result<Option<ServingScope>, Status> {
+        let Some(scope) = call.session.caller.principal.label_scope() else { return Ok(None); };
+        scope.admit(&call.database, driver.incarnation()).map_err(error::anomaly)?;
+        scope.revalidate(self.0.node.now()).map_err(error::anomaly)?;
+        if !driver.supports_row_visibility() { return Err(error::unsupported(ROW_VISIBILITY)); }
+        Ok(Some(ServingScope { labels: scope.labels().clone(), receipt_namespace: scope.receipt_namespace() }))
+    }
+
+    fn scoped_wire_context(&self, call: &Call, snapshot: DatabaseSnapshot, clock: Timestamp) -> Result<Arc<QueryContext>, Status> {
+        let name = call.database.clone();
+        let catalog = CatalogSnapshot::new(name.clone(), std::collections::BTreeMap::from([(name, snapshot)]), false)
+            .map_err(error::anomaly)?;
+        QueryContext::new(catalog, Arc::clone(call.memory()), clock, "UTC", QueryOptions::default(), &call.cancellation)
             .map_err(error::anomaly)
     }
 
@@ -192,6 +279,7 @@ impl Service {
         database: &Arc<Database>,
         linearizable: bool,
     ) -> Result<Arc<QueryContext>, Status> {
+        if call.session.caller.principal.label_scope().is_some() { return Err(error::unsupported(ROW_VISIBILITY)); }
         if linearizable && !database.wire_linearizable_reads() {
             return Err(error::unsupported("query.linearizable"));
         }
@@ -212,6 +300,9 @@ impl Service {
     }
 
     fn check_attachment(&self, call: &Call, database: &Arc<Database>) -> Result<(), Status> {
+        if let Some(scope) = call.session.caller.principal.label_scope() {
+            scope.revalidate(self.0.node.now()).map_err(error::anomaly)?;
+        }
         if call.cancellation.is_cancelled() {
             return Err(error::map_status(crate::error::cancelled()));
         }

@@ -98,6 +98,8 @@ pub struct Checkpoint {
     pub manifest: ObjectId,
     pub through: u64,
     pub key_generation: u64,
+    /// Installs an independently rewritten state into a fresh deployment.
+    pub restore: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -134,6 +136,17 @@ pub enum Record {
     },
     Refuse {
         tx_lsn: u64,
+    },
+    /// Durable post-commit clock observation for the preceding key rotation.
+    KeyRetirement {
+        generation: u64,
+        rotation_lsn: u64,
+        observed_at: i64,
+        unreadable_by: Option<i64>,
+        armed: bool,
+    },
+    WriterRelease {
+        lease_until: i64,
     },
 }
 

@@ -33,6 +33,10 @@ pub use catalog::{DatabaseCatalog, Membership};
 pub use config::*;
 pub use database::{CompactionRelay, Database};
 pub mod serving;
+#[cfg(feature = "multi")]
+mod multi_serving;
+#[cfg(feature = "multi")]
+pub use multi_serving::MultiServing;
 pub use rtdb_tx::{ArchivedWorldConstraints, AssertionFenceClaim, AssertionFenceWorldWinner, HostedControlWrite, WorldConstraintArchive};
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use node::{DurableRange, FundedMutationClock, MAX_DURABLE_RANGE_BYTES, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};

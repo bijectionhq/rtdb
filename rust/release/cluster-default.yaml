@@ -1,6 +1,7 @@
 remotes:
   cluster: !Kafka
     bootstrapServers: !Env RTDB_KAFKA_BOOTSTRAP
+defaultV1Serving: true
 log: !Kafka
   cluster: cluster
   topic: !Env RTDB_KAFKA_TOPIC
@@ -9,6 +10,9 @@ storage: !Remote
   objectStore: !S3
     bucket: !Env RTDB_BUCKET
     region: !Env AWS_REGION
+diskCache:
+  path: /var/lib/rtdb/cache
+  maxSizeBytes: 8589934592
 server: null
 flightSql:
   host: 0.0.0.0

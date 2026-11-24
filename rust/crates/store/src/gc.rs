@@ -79,7 +79,9 @@ impl Reachability {
                     }
                 }
                 Record::Lease { .. }
+                | Record::WriterRelease { .. }
                 | Record::KeyRotate { .. }
+                | Record::KeyRetirement { .. }
                 | Record::Settle { .. }
                 | Record::Refuse { .. } => {}
             }
@@ -89,6 +91,10 @@ impl Reachability {
 
     pub fn contains(&self, id: ObjectId) -> bool {
         self.objects.contains(&id)
+    }
+
+    pub fn has_files(&self) -> bool {
+        self.objects.iter().any(|id| id.kind == ObjectKind::File)
     }
 
     /// Active pins reconstructed by `from_records`.

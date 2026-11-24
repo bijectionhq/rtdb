@@ -61,12 +61,20 @@ message QueryRequest {
   optional bytes params_ipc = 3;
   bool track = 4;
   Page page = 5;
+  // Ask for an authenticated receiver sample on the first page of this read.
+  bool observe_receiver_clock = 6;
 }
 message QueryTrailer {
   Basis basis = 1;
   sint64 system_time_micros = 2;
   Claim claim = 3;
   optional bytes next = 4;
+  ReceiverClockObservation receiver_clock = 5;
+}
+message ReceiverClockObservation {
+  // A sample from the installed receiver clock. QueryTrailer.system_time_micros names the selected cut.
+  sint64 observed_at_micros = 1;
+  bytes proof = 2;
 }
 message QueryFrame {
   oneof frame {
@@ -82,6 +90,8 @@ message TransactRequest {
   repeated Guard guards = 4;
   repeated Op ops = 5;
   repeated Op otherwise = 6;
+  // Preconditions on the original state. CountAtMost uses WHEN_BEFORE here.
+  repeated Guard requires = 7;
 }
 message TxStatusRequest { bytes key = 1; }
 message Guard {
@@ -119,10 +129,23 @@ message Cell {
     bytes arrow_ipc = 1;
     google.protobuf.Empty tx_time = 2;
     google.protobuf.Empty tx_basis = 3;
+    // A signed offset from the transaction time, used in Put valid-time bounds.
+    sint64 tx_time_offset_micros = 4;
   }
 }
-message Interval { optional sint64 from_micros = 1; optional sint64 to_micros = 2; }
-message Row { map<string, Cell> cells = 1; }
+message Interval {
+  optional sint64 from_micros = 1;
+  optional sint64 to_micros = 2;
+  optional sint64 from_tx_offset_micros = 3;
+  optional sint64 to_tx_offset_micros = 4;
+}
+message Row {
+  map<string, Cell> cells = 1;
+  // A 16-byte nonzero database-local custody group. Empty leaves the row unbound.
+  bytes custody_group = 2;
+  // Cells in these columns are sealed before the transaction is persisted.
+  repeated string protected_columns = 3;
+}
 message Put { string branch = 1; string table = 2; repeated Row rows = 3; bool if_absent = 4; }
 message Delete { string branch = 1; string table = 2; repeated Cell ids = 3; Interval valid = 4; }
 message Erase { optional string branch = 1; string table = 2; repeated Cell ids = 3; }
@@ -136,7 +159,30 @@ enum IndexKind {
 }
 message Index { string name = 1; IndexKind kind = 2; repeated string columns = 3; }
 message Ttl { optional uint64 duration_micros = 1; }
-message Constraint { string name = 1; string expression = 2; }
+message CountRangeConstraint {
+  string index = 1;
+  Cell lower = 2;
+  Cell upper = 3;
+  optional sint64 valid_at_micros = 4;
+  uint64 n = 5;
+}
+message GroupedCountConstraint {
+  string column = 1;
+  optional uint32 prefix_bytes = 2;
+  map<string, bytes> equals = 3;
+  optional sint64 valid_at_micros = 4;
+  uint64 n = 5;
+}
+message Constraint {
+  string name = 1;
+  string expression = 2;
+  oneof change {
+    CountRangeConstraint count_range = 3;
+    google.protobuf.Empty drop = 4;
+    GroupedCountConstraint grouped_count = 5;
+  }
+}
+message Visibility { string column = 1; }
 message Declare {
   string table = 1;
   oneof change {
@@ -145,6 +191,8 @@ message Declare {
     Ttl ttl = 4;
     Constraint constraint = 5;
     google.protobuf.Empty drop = 6;
+    Visibility visibility = 7;
+    google.protobuf.Empty single_label_per_tx = 8;
   }
 }
 message BranchBasis { string branch = 1; Basis basis = 2; }
@@ -152,6 +200,42 @@ message Fork { string child = 1; BranchBasis from = 2; bool writable = 3; option
 message Renew { string branch = 1; sint64 expires_at_micros = 2; }
 message Merge { string from = 1; string into = 2; }
 message DropBranch { string branch = 1; }
+message CreateCustodyGroup { bytes group = 1; }
+message RevokeCustodyGroup {
+  bytes group = 1;
+  // Exact inventory digest selected from xt.custody_groups. A new placement
+  // invalidates the plan and refuses the whole transaction.
+  bytes inventory_sha256 = 2;
+}
+message CustodyPlacementTarget {
+  string branch = 1;
+  string table = 2;
+  Cell id = 3;
+  // An explicit literal interval.
+  Interval valid = 4;
+}
+message ReserveCustodyPlacement {
+  bytes group = 1;
+  bytes original_occurrence_sha256 = 2;
+  bytes source_occurrence_sha256 = 3;
+  bytes destination = 4;
+  bytes link = 5;
+  CustodyPlacementTarget target = 6;
+  bytes review_sha256 = 7;
+  bytes carrier_sha256 = 8;
+  bytes link_sha256 = 9;
+}
+message PlaceCustodyRow {
+  string branch = 1;
+  string table = 2;
+  Row row = 3;
+  bytes placement_id = 4;
+  // Absent for the original occurrence.
+  optional bytes reservation_sha256 = 5;
+  string carrier_column = 6;
+  // Required for a reserved placement. Both named columns are protected binary cells.
+  optional string link_column = 7;
+}
 message Op {
   oneof op {
     Put put = 1;
@@ -162,6 +246,10 @@ message Op {
     Renew renew = 6;
     Merge merge = 7;
     DropBranch drop_branch = 8;
+    CreateCustodyGroup create_custody_group = 9;
+    RevokeCustodyGroup revoke_custody_group = 10;
+    ReserveCustodyPlacement reserve_custody_placement = 11;
+    PlaceCustodyRow place_custody_row = 12;
   }
 }
 message Otherwise { repeated uint32 failed = 1; }
@@ -230,6 +318,7 @@ enum AnomalyCategory {
 // Serialized in the rtdb-error-bin status metadata.
 message Error {
   AnomalyCategory category = 1;
+  // A failed Transact requirement uses conflict / rtdb/requirement-failed.
   string code = 2;
   string message = 3;
   optional string feature = 4;

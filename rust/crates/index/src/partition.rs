@@ -268,6 +268,16 @@ impl PartitionState {
         Some(published.snapshot())
     }
 
+    /// Captures the physical catalog and its replica coordinate from one installation.
+    pub fn current_published_snapshot(&self) -> Option<Snapshot> {
+        let value = self.value.read();
+        let CatalogPublication::Installed(_) = value.catalog_publication else { return None; };
+        let published = self.published.lock();
+        let published = published.as_ref()?;
+        self.retain_catalog(published);
+        Some(published.snapshot())
+    }
+
     /// Publishes a prefix after the replica driver has finished installing it.
     /// A reset suspends publication until adoption of its new naming epoch.
     pub fn publish_catalog_cut(&self, cut: CatalogCut) -> Result<()> {

@@ -13,6 +13,39 @@ fn generation(number: u64) -> Generation {
 }
 
 #[tokio::test]
+async fn custody_values_bind_the_member_and_remain_revoked_after_vault_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    FileKms::create_directory(directory.path()).unwrap();
+    let incarnation = Uuid::from_u128(19);
+    let group = [3; 16];
+    let other_group = [4; 16];
+    let binding = [5; 32];
+    let other_binding = [6; 32];
+    let vault = CustodyVault::new(incarnation, Arc::new(FileKms::open(directory.path(), || 100).unwrap()));
+    let another_incarnation = CustodyVault::new(Uuid::from_u128(20), Arc::new(FileKms::open(directory.path(), || 100).unwrap()));
+    vault.create(group).await.unwrap();
+    vault.create(other_group).await.unwrap();
+    another_incarnation.create(group).await.unwrap();
+    let original = vault.seal(group, binding, b"original").await.unwrap();
+    let copy = vault.seal(group, other_binding, b"copy").await.unwrap();
+    let unaffected = vault.seal(other_group, binding, b"unaffected").await.unwrap();
+    assert_eq!(&*vault.open(group, other_binding, &copy).await.unwrap().bytes, b"copy");
+    assert!(vault.open(group, binding, &copy).await.is_err());
+    assert!(vault.open(other_group, binding, &original).await.is_err());
+    assert!(another_incarnation.open(group, binding, &original).await.is_err());
+    vault.retire(group, 100).await.unwrap();
+    vault.destroy(group).await.unwrap();
+    drop(vault);
+
+    let reopened = CustodyVault::new(incarnation, Arc::new(FileKms::open(directory.path(), || 101).unwrap()));
+    assert_eq!(reopened.check_readable(group).await.unwrap_err(), erased_under_view());
+    assert!(reopened.open(group, binding, &original).await.is_err());
+    assert!(reopened.open(group, other_binding, &copy).await.is_err());
+    assert!(reopened.create(group).await.is_err());
+    assert_eq!(&*reopened.open(other_group, binding, &unaffected).await.unwrap().bytes, b"unaffected");
+}
+
+#[tokio::test]
 async fn envelopes_authenticate_database_purpose_position_and_bytes() {
     let kms = LocalKms::new(|| 0);
     let generation = generation(1);

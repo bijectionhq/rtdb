@@ -144,8 +144,14 @@ pub trait RemoteStorageFactory: Send + Sync {
 
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
+    fn serving_driver(&self, _name: &str, _configuration: &DatabaseConfig, _cancellation: &CancellationToken)
+        -> Result<Option<Arc<dyn crate::serving::ServingDriver>>> { Ok(None) }
+    fn native_serving_authority(&self, _name: &str, _configuration: &DatabaseConfig)
+        -> Result<Option<crate::serving::NativeServingAuthority>> { Ok(None) }
+    fn journal_native_sql(&self) -> bool { false }
     fn table_history(&self, _configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
     fn has_private_storage(&self, _configuration: &DatabaseConfig) -> bool { false }
+    fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { None }
 
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()>;
     /// Opens a fresh database storage region without opening logs; partial failures drain that region.
@@ -178,6 +184,8 @@ pub trait ResourceFactory: Send + Sync {
     async fn close(&self) -> Result<()> { Ok(()) }
 }
 
+type NativeServingAuthorities = BTreeMap<String, crate::serving::NativeServingAuthority>;
+
 pub struct NativeResources {
     pub maximum_log_message_bytes: usize,
     pub log_queue_capacity: usize,
@@ -186,22 +194,34 @@ pub struct NativeResources {
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
     disk_cache: Option<Arc<DiskCache>>,
     pub(crate) classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
+    token_kms: Option<Arc<dyn rtdb_crypt::Kms>>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
     local_log_uses_clock_for_non_transactions: bool,
+    serving_authorities: NativeServingAuthorities,
 }
 
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, io: IoRegion::new(),
-            memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false }
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, io: IoRegion::new(),
+            memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false,
+            serving_authorities: BTreeMap::new() }
     }
 }
 
 impl NativeResources {
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
+    pub fn with_token_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
+        self.token_kms = Some(kms);
+        self
+    }
+    /// Installs the same durable database incarnation and claim authority on each replica.
+    pub fn with_native_serving_authority(mut self, database: impl Into<String>, authority: crate::serving::NativeServingAuthority) -> Self {
+        self.serving_authorities.insert(database.into(), authority);
+        self
+    }
     pub fn with_classic_key_vault(mut self, vault: rtdb_storage::sealing::ClassicKeyVault) -> Self {
         self.classic_vault = Some(vault);
         self
@@ -294,6 +314,13 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 
 #[async_trait]
 impl ResourceFactory for NativeResources {
+    fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.token_kms.clone() }
+
+    fn native_serving_authority(&self, name: &str, _configuration: &DatabaseConfig)
+        -> Result<Option<crate::serving::NativeServingAuthority>> {
+        Ok(self.serving_authorities.get(name).cloned())
+    }
+
     fn table_history(&self, configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> {
         let Some(database_config::Storage::RemoteStorage(storage)) = &configuration.storage else { return Ok(None); };
         let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;

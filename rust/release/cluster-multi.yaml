@@ -1,0 +1,14 @@
+storage: !Remote
+  objectStore: !S3
+    bucket: !Env RTDB_BUCKET
+    region: !Env AWS_REGION
+    prefix: multi-catalog
+diskCache:
+  path: /var/lib/rtdb/cache
+  maxSizeBytes: 8589934592
+server: null
+flightSql:
+  host: 0.0.0.0
+  port: 3000
+authn: !SingleRootUser
+  password: !Env RTDB_ROOT_PASSWORD

@@ -58,9 +58,13 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Get, V1Action }
 
 impl CallKind {
+    fn allows_label_scope(self) -> bool {
+        matches!(self, Self::Handshake | Self::V1Get | Self::V1Action)
+    }
+
     fn action(audience: bool, name: &str) -> Self {
         if audience && matches!(name, CLOSE_SESSION | crate::owned_actions::CLOSE_OWNED_READ_V1) {
             Self::AudienceCleanup
@@ -148,8 +152,11 @@ impl Call {
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.session.memory() }
     pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>, Status> { self.memory().reserve(bytes).map_err(status) }
+    pub(crate) fn request_reservation(&self) -> Arc<MemoryReservation> {
+        Arc::clone(&self._reservation)
+    }
     pub(crate) fn retain_request_bytes(&self, bytes: impl Into<Bytes>) -> Bytes {
-        wire::retain(bytes, Arc::clone(&self._reservation))
+        wire::retain(bytes, self.request_reservation())
     }
     pub fn close_session(&self) {
         self.service.retire_session(&self.session);
@@ -234,7 +241,7 @@ impl Service {
                 .ok_or_else(|| Status::permission_denied("Flight audience reservation is not installed"))
         }).transpose()?;
         if sources.next().is_some() || audience_source.is_some() != self.0.config.audience.is_some()
-            || audience_source.is_some() && matches!(kind, CallKind::Ordinary) {
+            || audience_source.is_some() && matches!(kind, CallKind::Ordinary | CallKind::V1Get) {
             return Err(Status::permission_denied("Flight audience reservation requires its observation transport"));
         }
         let audience = if audience_source.is_some() { Some(self.0.audience.as_ref().ok_or_else(unsupported)?) } else { None };
@@ -283,11 +290,11 @@ impl Service {
                 Lookup::Unknown => return Err(session_error(bearer.is_some(), "unknown session")),
             };
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
-            if session.fresh_replica && !matches!(kind, CallKind::Action) {
+            if session.fresh_replica && !matches!(kind, CallKind::Action | CallKind::V1Action) {
                 return Err(Status::permission_denied("The fresh Flight session carries owned read actions"));
             }
             if session.audience_source() != audience_source
-                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::AudienceCleanup)
+                || audience_source.is_some() && !matches!(kind, CallKind::Action | CallKind::V1Action | CallKind::AudienceCleanup)
             {
                 return Err(Status::permission_denied("Flight session belongs to another admission class"));
             }
@@ -321,9 +328,19 @@ impl Service {
                 (transport.and_then(|transport| transport.peer.remote_addr()).or_else(|| request.remote_addr()).map(|address| address.ip().to_string()), None, false)
             };
             let caller = self.0.cancellation.run_until_cancelled(self.0.auth.authenticate(&credentials, peer.as_deref())).await.ok_or_else(cancelled)??;
+            if let Some(scope) = caller.principal.label_scope() {
+                if !kind.allows_label_scope() || audience.is_some() || fresh_replica {
+                    return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
+                }
+                let database = requested_database.filter(|name| !name.is_empty())
+                    .ok_or_else(|| Status::invalid_argument("A scoped credential requires x-xtdb-database"))?;
+                scope.admit_database_name(database).map_err(status)?;
+            }
             let placement = if catalog.is_placed() {
                 let name = placed_name()?;
-                caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
+                if caller.principal.label_scope().is_none() {
+                    caller.principal.authorize_database(name, DatabaseAccess::Read).map_err(status)?;
+                }
                 match verified_attachment { Some(attachment) => Some(attachment), None => Some(catalog.database(name).map_err(status)?) }
             } else { None };
             if audience_source.is_some() && (placement.is_none() || caller.mac.is_none() || self.0.config.hosted_controls.as_ref()
@@ -422,6 +439,9 @@ impl Service {
             let lease = AcquiredSession { service: self.clone(), session: Arc::clone(&session) };
             (session, true, lease)
         };
+        if session.caller.principal.label_scope().is_some() && !kind.allows_label_scope() {
+            return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
+        }
         let (database, attachment) = if matches!(kind, CallKind::AudienceCleanup) {
             let original = session.placed_database().ok_or_else(unsupported)?;
             if requested_database.is_some_and(|requested| requested != original) {
@@ -439,6 +459,9 @@ impl Service {
                 }
             }
         };
+        if let Some(scope) = session.caller.principal.label_scope() {
+            scope.admit_database_name(&database).map_err(status)?;
+        }
         let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
         let call = Call { service: self.clone(), kind, session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
@@ -614,7 +637,8 @@ impl FlightService for Service {
     async fn do_get(&self, request: Request<flight::Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = &request.get_ref().ticket;
         if let Some(command) = crate::v1::ticket(ticket) {
-            let call = self.call(&request, request.get_ref().encoded_len()).await.map_err(crate::v1::error::map_status)?;
+            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::V1Get)
+                .await.map_err(crate::v1::error::map_status)?;
             return self.v1_get(call, command, request.metadata()).await;
         }
         let call = self.call(&request, request.get_ref().encoded_len()).await?;
@@ -631,8 +655,9 @@ impl FlightService for Service {
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let kind = CallKind::action(self.0.audience.is_some(), &request.get_ref().r#type);
         if crate::v1::is_action(&request.get_ref().r#type) {
-            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await.map_err(crate::v1::error::map_status)?;
-            return self.v1_action(call, request.into_inner());
+            let call = self.call_with_kind(&request, request.get_ref().encoded_len(), CallKind::V1Action)
+                .await.map_err(crate::v1::error::map_status)?;
+            return self.v1_action(call, request.into_inner()).await;
         }
         let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind).await?;
         let ipc_stream = request.metadata().get(crate::actions::OWNED_IPC_HEADER)
@@ -650,6 +675,16 @@ pub(crate) fn query_ticket(ticket: Bytes, memory: &Arc<MemoryBudget>) -> Result<
 mod tests {
     use super::{CLOSE_SESSION, CallKind};
     use crate::owned_actions::CLOSE_OWNED_READ_V1;
+
+    #[test]
+    fn label_scope_is_only_admitted_to_v1_and_handshake() {
+        for kind in [CallKind::Handshake, CallKind::V1Get, CallKind::V1Action] {
+            assert!(kind.allows_label_scope());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup] {
+            assert!(!kind.allows_label_scope());
+        }
+    }
 
     #[test]
     fn only_audience_closes_can_dispatch_without_a_current_attachment() {

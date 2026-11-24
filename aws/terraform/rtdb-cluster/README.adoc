@@ -24,12 +24,27 @@ Terraform stores these selectors rather than the credential values.
 Set `kafka_bootstrap` to brokers reachable from the private subnets and `kafka_topic` to the primary database's source topic.
 Create the source topic and its `<topic>-replica` topic before startup.
 The native node opens the ordinary Kafka source and replica logs and stores its database files in S3.
+Each task caches remote files in its own ephemeral disk under `/var/lib/rtdb/cache`.
+The bundled `cluster-default.yaml` enables `defaultV1Serving` for the primary database.
+Provision v1 writes on a primary with fresh topics and object storage.
+Bring all replica-log readers up with v1 serving enabled before admitting those writes.
+Each replica opens the same database incarnation from S3.
+An applied Classic transaction makes the primary database's v1 branch route unavailable.
+Tracked queries, page continuations and claim guards require a shared token-key vault in the runtime.
 
 == Multi mode
 
-The Multi launch configuration requires an image that implements `rtdb node --multi` with the Journal serving driver.
+The `all-backends` runtime image launches `rtdb node --multi` with the same serving driver as `rtdb dev --multi`.
 Use the separate Logkeeper cluster module to supply `journal_url` unchanged.
 Attach an existing Logkeeper client security group through `journal_client_security_group_id` and pass the same ID in Logkeeper's `client_security_group_ids`.
 This lets both modules plan before any new security group ID exists.
-Supply `journal_credentials` with the Secrets Manager selectors for the client CA certificate, certificate and private key, issued for an identity allowed to read and write.
+Set `journal_credentials` to a map with a certificate, private key and CA selector for each node slot, starting at zero.
+Issue a distinct client identity per slot and authorize each for reads and writes.
+RTDB leases a credential slot for the lifetime of its process and discovers the live nodes through private DNS.
+The Multi pool supports up to eight nodes, the size of a private DNS multivalue answer.
+
+ECS mounts an IAM-restricted, KMS-encrypted EFS access point for durable database generation keys and credential slot leases.
+Multi stores its immutable objects in the S3 bucket.
+Supply permanent database UUIDs in `databases` to run an explicitly provisioned catalog, or use the generated UUID for the initial `xtdb` database.
+Keep the same bucket, cluster name and catalog across node replacement.
 See the https://github.com/bijectionhq/logkeeper/blob/896ed7818780d86e435ebf25c467ac179a1023fb/deploy/README.md[Logkeeper deployment guide] for client issuance and named credentials.

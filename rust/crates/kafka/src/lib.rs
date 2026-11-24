@@ -277,6 +277,7 @@ impl rtdb_storage::log::SharedLog for KafkaLog {
 
 #[async_trait]
 impl Log for KafkaLog {
+    fn shared(&self) -> Option<&dyn rtdb_storage::log::SharedLog> { Some(self) }
     async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn rtdb_storage::log::LogRange>> {
         if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         let mut options = self.options.clone();

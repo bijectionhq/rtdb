@@ -1748,11 +1748,22 @@ surface ConnectionLifecycle {
 -- The writer samples the transaction time at resolution and keeps it strictly increasing with the preceding settled transaction.
 -- The window includes not_before and excludes before.
 -- A request before not_before can retry with the same key.
+-- The resolver evaluates the ordered requires list against the original state before evaluating any arm guard.
+-- A count requirement uses the Before phase.
+-- The first failed requirement selects a Refused outcome with conflict code rtdb/requirement-failed and no effects.
+-- A request with operations in either arm publishes this refusal under its transaction key.
+-- An empty-armed validation answers at the acquired basis without publishing a record.
 -- Before guards observe the original state.
 -- After guards observe the candidate containing the ordered then operations.
 -- The otherwise operations start from the original state when a guard fails.
 -- TxTime and TxBasis in selected rows name the receipt's transaction time and visible basis.
 -- Unchanged checks a sealed branch, basis, layer and footprint.
+-- Unchanged rejects any intersecting applied transaction strictly after the claim basis and through the decision cut, even when a later transaction restores the earlier value.
+-- A row footprint covers writes to the named row and its table declaration.
+-- An index range covers writes to rows that enter, leave or change within the range, and changes to the index declaration.
+-- A table footprint covers each row and declaration in the named table.
+-- Footprints also cover relevant valid-time transitions through the decision time.
+-- Coarsening replaces regions by their containing table or branch when a claim exceeds its size or region limits.
 -- A branch-wide footprint conservatively covers row changes, changes to shared declarations and valid-time boundaries.
 -- A transaction applies the selected effects and receipt atomically.
 -- The ordered receipt records Then, Otherwise with its failed guard positions, or Refused with its error.
@@ -1767,22 +1778,40 @@ surface ConnectionLifecycle {
 -- A scoped credential writes through Transact and requires a visibility declaration on each addressed table.
 -- An unrestricted credential declares visibility before the table has retained row history.
 -- Every put to a declared table contains a literal label in the declared column.
+-- Labelled writes supply their valid-time bounds and literal cells so that stored rows carry only application-selected time coordinates.
+-- A labelled table can express expiry in those valid-time bounds.
 -- SingleLabelPerTx checks the distinct labels affected by the selected effects across declared tables whenever those effects address a table with that policy.
 -- The otherwise arm has the same write checks as the then arm and starts from the original state.
--- Before and After guards evaluate the full original state or the full candidate, respectively.
--- A failed guard returns only its position in the request.
+-- Requirements and Before guards evaluate the full original state.
+-- After guards evaluate the full candidate.
+-- A failed requirement or guard reveals only its zero-based position within its respective list.
 -- A tracked read records an authenticated footprint of its visible query dependencies under its admitted read scope.
 -- Unchanged tests every write intersecting that footprint, including writes the credential cannot read.
 -- A conservative footprint can cover an entire branch when dependencies cannot be represented precisely.
 -- A scoped attempt and its status lookup are bound to the authenticated credential identity and scope.
 -- Scoped receipts, version guards and transaction placeholders use the scoped coordinates defined by the serving surface.
+-- A scoped Written selector resolves its basis against the acknowledged projection before comparing the row version.
 -- Erasure removes the authorized historical payloads and follows the storage erasure contract.
+
+---- RTDB v1 ordered custody
+
+-- Resolved custody placement effects use the same transaction order and replay boundary as the protected row.
+-- The resolved occurrence names the physical authoring branch, target row, valid interval, written basis and within-transaction ordinal.
+-- Copy activation binds the exact reservation, carrier and link and consumes its destination identity.
+-- A reserved destination and its link remain in the revocation inventory until the group's permanent denial.
+-- The latest revoked inventory keeps the first revocation basis and its digest.
+-- Authenticated release phase effects use the same order as revocation and hold their own receipt namespace.
+-- Default source intake authenticates the internal command and private namespace before reconstructing its canonical request.
+-- Both writers evaluate the observed original writer's exact version as an ordered release requirement.
+-- A promoted release requires positive durable disposal from the original carrier journal, while a private release can be durably cancelled.
+-- The terminal retains the original registration and evidence after checkpoint and trim.
+-- The original ordered revocation time fixes the key retirement deadline and destruction waits for the admitted release holds to drain.
 
 rule ValidateRtdbV1 {
     when: TransactValidationRequested(request, reader)
     requires: LinearizablePrefix(reader, basis)
     ensures:
-        ValidationAnswered(request, ResolveGuards(request, basis), basis)
+        ValidationAnswered(request, ResolveRequirementsAndGuards(request, basis), basis)
 }
 
 rule PublishRtdbV1Transaction {

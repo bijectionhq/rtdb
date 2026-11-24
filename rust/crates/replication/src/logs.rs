@@ -3,7 +3,7 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use bytes::{Bytes, BytesMut};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody, SourceMessage}, keys::oversized_key, log::proto};
-use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}};
 use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
@@ -63,6 +63,34 @@ impl EncodedPayload {
         let retained = bytes.capacity().checked_add(256).ok_or_else(size_overflow)?;
         Arc::get_mut(&mut reservation).expect("payload encoding owns its reservation").shrink_to(retained)?;
         Ok(Bytes::from_owner(Self { bytes, _reservation: reservation }))
+    }
+}
+
+pub(crate) enum PartitionReplay {
+    Prepared(Box<dyn LogReplayTail>),
+    Legacy(Box<dyn LogTail>),
+}
+
+impl PartitionReplay {
+    pub(crate) fn replay(&mut self) -> Option<&mut dyn LogReplayTail> {
+        match self {
+            Self::Prepared(tail) => Some(tail.as_mut()),
+            Self::Legacy(tail) => tail.replay(),
+        }
+    }
+
+    async fn open(log: &dyn Log, after: LogOffset) -> rtdb_storage::Result<Self> {
+        match log.shared() {
+            Some(shared) => shared.read_after(after).await.map(Self::Prepared),
+            None => log.tail(after).await.map(Self::Legacy),
+        }
+    }
+}
+
+fn latest(log: &dyn Log) -> rtdb_storage::Result<LogOffset> {
+    match log.shared() {
+        Some(shared) => shared.latest(),
+        None => log.latest(),
     }
 }
 
@@ -142,21 +170,30 @@ impl PartitionLogs {
         self.source.retains_synced_history() && self.replica.retains_synced_history() && self.store.syncs_checkpoints()
     }
     pub fn source_position(&self, metadata: LogMetadata) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, metadata.offset.0) }
-    pub fn latest_source_position(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, self.source.latest()?.0) }
-    pub fn latest_replica_position(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, self.replica.latest()?.0) }
+    pub fn latest_source_position(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, latest(self.source.as_ref())?.0) }
+    pub fn latest_replica_position(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, latest(self.replica.as_ref())?.0) }
     /// An empty epoch has no replica position that startup must wait to read.
     pub fn startup_replica_target(&self) -> Result<Option<ReplicaPosition>> {
-        let offset = self.replica.latest()?.0;
+        let offset = latest(self.replica.as_ref())?.0;
         if offset < 0 { Ok(None) } else { Ok(Some(ReplicaPosition::from_epoch_offset(self.replica_epoch, offset)?)) }
     }
     pub async fn source_tail(&self, after: SourcePosition) -> Result<Box<dyn LogTail>> { self.source.tail(LogOffset(after.after_offset(self.source_epoch))).await.map_err(Into::into) }
-    pub async fn replica_tail(&self, after: ReplicaPosition) -> Result<Box<dyn LogTail>> { self.open_replica_tail(after).await.map_err(Into::into) }
-    pub(crate) async fn open_replica_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Box<dyn LogTail>> {
-        self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await
+    pub async fn replica_tail(&self, after: ReplicaPosition) -> Result<Box<dyn LogTail>> {
+        Ok(self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await?)
     }
-    pub(crate) async fn recovery_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<Box<dyn LogTail>>> {
+    pub(crate) async fn source_replay(&self, after: SourcePosition) -> Result<PartitionReplay> {
+        Ok(PartitionReplay::open(self.source.as_ref(), LogOffset(after.after_offset(self.source_epoch))).await?)
+    }
+    pub(crate) async fn replica_replay(&self, after: ReplicaPosition) -> rtdb_storage::Result<PartitionReplay> {
+        PartitionReplay::open(self.replica.as_ref(), LogOffset(after.after_offset(self.replica_epoch))).await
+    }
+    pub(crate) async fn recovery_tail(&self, after: ReplicaPosition) -> rtdb_storage::Result<Option<PartitionReplay>> {
         let offset = after.after_offset(self.replica_epoch);
-        let tail = self.replica.recovery_tail(LogOffset(offset)).await?;
+        let tail = if let Some(shared) = self.replica.shared() {
+            Some(PartitionReplay::Prepared(shared.read_after(LogOffset(offset)).await?))
+        } else {
+            self.replica.recovery_tail(LogOffset(offset)).await?.map(PartitionReplay::Legacy)
+        };
         if tail.is_none()
             && let Some(LogOffset(first_retained)) = self.replica.retained_floor().await?
             && let Some(requested) = crate::replay_floor::missing_replay_offset(offset, first_retained)
@@ -194,7 +231,7 @@ impl PartitionLogs {
 
     pub fn validate_source_boundary(&self, database: &str, after: SourcePosition) -> Result<()> {
         let offset = after.after_offset(self.source_epoch);
-        let latest = self.source.latest()?.0;
+        let latest = latest(self.source.as_ref())?.0;
         if after.0 >= 0 && after.epoch() > self.source_epoch || offset > latest {
             let log_state = if latest == -1 { "the log is empty".to_owned() } else { format!("epoch={}, offset={latest}", self.source_epoch.0) };
             let message = format!("Database '{database}' failed to start due to an invalid transaction log state ({log_state}) \
@@ -210,7 +247,11 @@ impl PartitionLogs {
         self.append_source_encoded(payload, now).await
     }
     pub async fn append_source_encoded(&self, payload: Bytes, now: Timestamp) -> Result<SourcePosition> {
-        let metadata = self.source.enqueue(payload, now).await?.durable().await?;
+        let receipt = match self.source.shared() {
+            Some(shared) => shared.append(payload, now).await?,
+            None => self.source.enqueue(payload, now).await?,
+        };
+        let metadata = receipt.durable().await?;
         self.source_position(metadata)
     }
     pub async fn enqueue_replica(&self, envelope: &ReplicaEnvelope, block: BlockIndex, now: Timestamp) -> Result<ReplicaReceipt> {
@@ -279,8 +320,7 @@ impl PartitionLogs {
         let maintenance = is_maintenance(
             body, sequence.map(|sequence| sequence.0), fenced, fenced_terminal,
         );
-        let mode = || if maintenance { AppendMode::Maintenance(now) } else { AppendMode::Ordinary(now) };
-        let receipt = match self.replica.enqueue_buffer(&mut payload, mode()).await {
+        let receipt = match self.append_replica_buffer(&mut payload, now, maintenance).await {
             Ok(receipt) => receipt,
             Err(StorageError::MessageTooLarge { .. }) if allow_offload => {
                 let payload_id = uuid::Uuid::new_v4().to_string();
@@ -290,11 +330,18 @@ impl PartitionLogs {
                     proxy.bind_offload_publication(version)?;
                 }
                 let mut payload = self.encode_replica(proxy.term, proxy.term_sequence, &proxy.message)?;
-                self.replica.enqueue_buffer(&mut payload, mode()).await?
+                self.append_replica_buffer(&mut payload, now, maintenance).await?
             }
             Err(error) => return Err(error.into()),
         };
         Ok(ReplicaReceipt { receipt, epoch: self.replica_epoch })
+    }
+    async fn append_replica_buffer(&self, payload: &mut AppendBuffer, now: Timestamp, maintenance: bool) -> rtdb_storage::Result<AppendReceipt> {
+        if let Some(shared) = self.replica.shared() {
+            return payload.append(shared, now).await;
+        }
+        let mode = if maintenance { AppendMode::Maintenance(now) } else { AppendMode::Ordinary(now) };
+        self.replica.enqueue_buffer(payload, mode).await
     }
     pub fn decode_replica(&self, record: LogRecord) -> Result<Option<ReplicaRecord>> {
         Ok(self.decode_readback(record, None, None, None)?.known())

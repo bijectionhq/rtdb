@@ -101,13 +101,19 @@ variable "journal_url" {
 }
 
 variable "journal_credentials" {
-  description = "ECS Secrets Manager selectors for the Multi-mode client CA, certificate and private key PEM values."
-  type = object({
+  description = "One Logkeeper client identity and its ECS Secrets Manager selectors per Multi node, keyed by slot (0, 1, and so on)."
+  type = map(object({
     ca_certificate = string
     certificate    = string
     private_key    = string
-  })
+  }))
   default = null
+}
+
+variable "databases" {
+  description = "Multi database names mapped to permanent Journal UUIDs. Omit to bootstrap one xtdb database for this cluster."
+  type        = map(string)
+  default     = null
 }
 
 variable "journal_client_security_group_id" {

@@ -210,6 +210,7 @@ impl RecoveredPartition {
                     self.apply_snapshot_transaction(message, memory, |write, committed| observe(position, write, committed))?;
                 }
                 ReplicaBody::NoOp(message) => {
+                    crate::serving::require_physical_replay_support(message)?;
                     if let Some(wire) = message.placed_slot_reservation.as_deref() {
                         let reservation = PlacedReservation::decode(wire)?;
                         if slot.is_some() || message.src_msg_id.is_some()

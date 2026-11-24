@@ -20,12 +20,18 @@ surface StatelessDatabase {
     @guarantee CapabilityDiscovery
         -- A caller learns which operations and optional features the selected route can serve.
         -- An unavailable optional feature returns its name for comparison with Capabilities.
+        -- A default attachment can serve guarded v1 writes over Classic effects covered by the shared main-branch fold.
 
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
+        -- The database incarnation survives node restart and is shared by routes to the same database.
         -- A basis orders cuts within the selected database incarnation.
         -- The shared v1 encoding places the 16 incarnation bytes first, then the unsigned position as eight big-endian bytes.
         -- Applied-position drivers supply their applied position in this field.
+        -- A branch query selects the requested branch and layer in the same fold that supplies transaction receipts.
+        -- A Classic catalog query selects the installed replica cut as its basis.
+        -- Exactly can reopen that Classic cut while it is the current published catalog.
+        -- A local-layer read uses the branch's own writes at the selected cut.
         -- The temporal read driver supplies a system-time boundary as the basis position.
         -- Exactly selects its named cut.
         -- AtLeast returns a cut at or beyond its requested basis.
@@ -35,7 +41,9 @@ surface StatelessDatabase {
     @guarantee QueryContinuation
         -- A continuation reopens the same read basis and interpretation for the same ordered query and parameters.
         -- A successful final page has no continuation.
-        -- The caller may redeem a continuation in a new Flight session.
+        -- Any authorized route to the same database incarnation can redeem a continuation while its cut and key generation are readable.
+        -- A continuation binds its query, execution clock and next offset to the captured basis.
+        -- Successive pages preserve the original token generation and share its retirement deadline.
 
     @guarantee RankedReads
         -- Text search returns matching rows ordered by descending relevance score.
@@ -44,11 +52,103 @@ surface StatelessDatabase {
 
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
-        -- The region may cover the entire database.
-        -- The serving process issues claims with its attachment's current authority.
+        -- The same authority seals the claim and authenticates it when the writer evaluates Unchanged.
+        -- The region can name rows, an index interval, a table, or the selected branch.
+        -- The authority issues identical claim bytes for the same evidence under one key generation.
+
+    @guarantee ReceiverClockObservation
+        -- Where advertised, the first page includes a sample from the installed receiver clock when requested.
+        -- The authenticated observation binds the sample, selected cut, query fingerprint and Flight session.
+        -- The query trailer reports the selected system time separately.
+
+    @guarantee OrderedIndexCatalog
+        -- An ordered index declaration preserves its columns in the order sent by the caller.
+        -- Query of xt.ordered_indexes reads the definitions present at its selected applied cut.
+        -- A binary or text range guard can name a single-column index, and an unbounded count can name a compound index.
+
+    @guarantee CountConstraintCatalog
+        -- A count range limits one ordered index interval.
+        -- A grouped count limits every qualifying binary key or key prefix at the constraint's valid time.
+        -- Binary predicates select qualifying rows by equality on the named columns.
+        -- The writer checks the final state of the selected arm before committing its effects.
+        -- An unrestricted Query reads the installed typed definitions in xt.count_constraints at its selected cut.
+
+    @guarantee TransactionRelativeValidTime
+        -- Put and Delete on unlabelled tables may name a valid-time endpoint as a signed offset from the transaction time.
+        -- The writer resolves both endpoints against the receipt's system time and records the resolved interval.
+        -- Overflow, a reversed interval and an empty interval fail before any row effect is applied.
+
+    @guarantee WrittenBasis
+        -- Where advertised, a caller can explicitly select _rtdb_written_basis for a visible row version.
+        -- It names the row version rather than the selected query cut and can be supplied to a Version guard.
+        -- A Classic written basis keeps the transaction identity preserved by the resolved record or the retained event position.
+        -- An imported legacy row without transaction provenance returns a null written basis.
+        -- For a scoped query, the returned basis uses the reader's projection domain.
+
+    @guarantee TokenAuthority
+        -- All routes to an incarnation use the same wrapped token key for each published generation.
+        -- New queries use the latest published generation.
+        -- An earlier generation remains usable until its retirement deadline while the selected view is readable.
+        -- Redeeming a token whose generation is erased returns erased-under-view.
+
+    @guarantee TransactionReceipt
+        -- A route that advertises writes returns its selected outcome with the applied basis and system time.
+        -- A matching committed request returns the stored receipt for its key.
+        -- The idempotency key within its receipt namespace identifies the request.
+        -- The writer records its admission time, the complete canonical request and the selected outcome with resolved effects.
+        -- Followers apply the recorded effects. Checkpoints preserve the namespaced key, request digest and outcome for retries.
+        -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
+
+    @guarantee TransactionRequirements
+        -- A write route that supports requirements advertises transact.requires.
+        -- TransactRequest carries the ordered requires list as repeated Guard at protobuf field 7.
+        -- Each requirement is a precondition on the original state.
+        -- Passing all requirements allows guards to select an arm.
+        -- The first failed requirement selects a Refused receipt with category conflict and code rtdb/requirement-failed.
+        -- The refusal carries only the zero-based requirement index in its message and applies no row or catalog effects.
+        -- A request with operations in either arm records that receipt for replay and TxStatus.
+        -- A scoped receipt carries the basis and system time of the admitted projection.
+
+    @guarantee PhysicalErasure
+        -- A route that supports physical erasure advertises erasure.
+        -- An applied erase removes row values from the clean checkpoint and orders retirement of the preceding journal and checkpoint generation.
+        -- The receipt carries the unreadable-by deadline after the key authority has durably armed it.
+        -- Replayed erase receipts preserve that deadline after trim.
+        -- Previously opened query and change streams verify their selected generation at each frame handoff.
+
+    @guarantee ProtectedPlacement
+        -- A route that serves row custody orders original placement, reservation, activation and revocation in the same database fold.
+        -- A reservation binds the exact original and reviewed source occurrences to fresh destination and link identities, a valid target interval and the reviewed carrier and link bytes.
+        -- Only the ordered write at the reserved target can activate the destination, and its basis, within-transaction ordinal and encrypted envelope become part of the occurrence commitment.
+        -- A same-database branch inherits the original occurrence through its fork basis.
+        -- The inventory includes inactive reservations and active occurrences, so a new reservation or activation invalidates an earlier revocation plan.
+        -- Revocation permanently closes placement and release admission.
+        -- An exact retry can recover the original receipt even after its custody key has been destroyed.
+        -- Scoped readers receive no placement or release inventory.
+
+    @guarantee ProtectedResponseRelease
+        -- The installed original carrier journal authenticates the exact attachment, original writer, response part, admitted occurrence and immutable cutoff.
+        -- The original writer and carrier receipt are observed independently and verified by exact request key, basis and system time on the original attachment.
+        -- The carrier receipt selects the admitted occurrence and its commitment is retained in the release registration.
+        -- The response release command checks the observed writer version in the same order as the hold or terminal.
+        -- An authenticated host mount pins the original writer and provider to the live writable database attachment.
+        -- Removing the mount or detaching its database closes new handoffs and preserves already ordered release evidence.
+        -- The response owner holds every group and occurrence in its authenticated contributor inventory through delivery.
+        -- A native ranked capture retains protected inputs before ranking or slicing, including inherited and shadowing versions.
+        -- Before enqueue the mounted owner rechecks the exact frame commitment, complete promoted inventory, attachment, selected key generation and immutable deadline.
+        -- The ordered release fold serializes private registration, promotion, cancellation and disposal with revocation.
+        -- Final delivery requires a promoted release, current authority, a live group and an unexpired cutoff.
+        -- Only private cancellation or authenticated durable transport disposal terminates an admitted release.
+        -- Recovery retains the original terminal decision and evidence through checkpoint and trim.
+        -- A revoked group's release holds drain before key destruction.
+        -- A route advertises row custody once its protected readers, release adapters and key enforcement support these guarantees.
 
     @guarantee ChangesCoverage
         -- Changes reports its covered interval even when there are no changes for the selected tables.
+        -- An applied-position route takes its coverage from the driver's retained effect history.
+        -- After opening a default branch checkpoint, the retained change interval starts at the checkpoint's basis.
+        -- A reported erasure has a key when keys are requested and omits both row images.
+        -- Default and Multi report the previous image at a closure and the new image at an opening.
         -- A returned page carries whole system-time groups.
         -- An expired starting cut returns the cursor-expired code.
         -- A waiting call returns after a relevant change, complete coverage of its requested interval or expiry of its wait.
@@ -56,6 +156,16 @@ surface StatelessDatabase {
     @guarantee ChangesProgress
         -- Where advertised, progress-only Changes returns the schema and coverage trailer for the request.
         -- The same table admission, group limits, wait and coverage rules apply to a progress-only request.
+
+    @guarantee ScopedVisibilityCapability
+        -- Scoped visibility is a target capability specified by ScopedRowVisibility in allium/rtdb-multi.allium.
+        -- A route without an applied scoped projection omits row-visibility from Capabilities.
+        -- An OIDC label scope binds its credential to the verified database name and incarnation.
+        -- A scoped credential requires a route that enforces that scope for every admitted operation.
+        -- The initial scoped serving path selects merged main and uses a logical system-time coordinate.
+        -- Default mode and Multi use the same scoped projection for Query, Changes, and transaction receipts.
+        -- Changes waits for progress observable by the selected scope or the requested deadline.
+        -- Put rows can supply literal signed-microsecond valid-time bounds in _valid_from and _valid_to.
 
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.

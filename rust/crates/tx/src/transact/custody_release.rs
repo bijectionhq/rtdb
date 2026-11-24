@@ -1,0 +1,68 @@
+use super::*;
+use rtdb_index::branches::CustodyReleasePhase;
+
+pub const CUSTODY_RELEASE_NAMESPACE: [u8; 32] = *b"rtdb/v1/custody-release-receipt\0";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyWriterFence {
+    pub table: TableRef,
+    pub id: EntityId,
+    pub valid_at: Timestamp,
+    pub written: Basis,
+}
+
+impl CustodyWriterFence {
+    pub fn matches(&self, index: &BranchIndex) -> Result<bool> {
+        let view = index.view(
+            MAIN_BRANCH,
+            At::Latest,
+            Layer::Local,
+            index.head().system_time,
+        )?;
+        Ok(view
+            .row(&self.table, &self.id, self.valid_at)
+            .is_some_and(|row| row.cut.basis == self.written))
+    }
+
+    fn requirement(&self) -> Guard {
+        Guard::Version {
+            branch: MAIN_BRANCH.into(),
+            table: self.table.clone(),
+            id: self.id.clone(),
+            valid_at: Some(self.valid_at),
+            expect: Version::Written(self.written),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrustedCustodyRelease {
+    pub release: CustodyRelease,
+    pub writer: CustodyWriterFence,
+}
+
+impl TrustedCustodyRelease {
+    pub fn into_request(self) -> Transact {
+        let discriminator = match self.release.phase {
+            CustodyReleasePhase::Private => 0,
+            CustodyReleasePhase::Promoted => 1,
+            CustodyReleasePhase::Cancelled => 2,
+            CustodyReleasePhase::Disposed { .. } => 3,
+        };
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/v1/custody-response-phase\0");
+        hash.update(self.release.registration.attempt());
+        hash.update([discriminator]);
+        Transact {
+            key: hash.finalize().to_vec(),
+            require: Vec::new(),
+            window: Window::default(),
+            guards: Vec::new(),
+            ops: vec![Op::CustodyRelease(self.release)],
+            otherwise: Vec::new(),
+            requires: vec![self.writer.requirement()],
+            custody_request_digest: None,
+            request_memory: None,
+        }
+    }
+}

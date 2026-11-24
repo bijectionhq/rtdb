@@ -46,7 +46,7 @@ impl ReplayDependencySources for BlockStore {
     async fn adopted_checkpoint(&self, block: BlockIndex) -> Result<(BlockCatalog, BTreeMap<TableRef, TableBlock>)> { self.load(block).await }
 }
 
-/// Every object that replaying onto this checkpoint can read: its root, its table blocks, and the trie files and artefacts they name.
+/// Every object that replaying onto this checkpoint can read.
 pub fn checkpoint_dependencies(catalog: &BlockCatalog, tables: &BTreeMap<TableRef, TableBlock>) -> Result<BTreeSet<ObjectKey>> {
     checkpoint_files(catalog, tables, CheckpointContents::Replay)
 }
@@ -55,7 +55,12 @@ pub fn checkpoint_dependencies(catalog: &BlockCatalog, tables: &BTreeMap<TableRe
 pub(crate) fn checkpoint_files(
     catalog: &BlockCatalog, tables: &BTreeMap<TableRef, TableBlock>, contents: CheckpointContents,
 ) -> Result<BTreeSet<ObjectKey>> {
-    checkpoint_dependency_keys!(catalog, tables, contents; each_replay_input)
+    let keys: Result<BTreeSet<ObjectKey>> = checkpoint_dependency_keys!(catalog, tables, contents; each_replay_input);
+    let mut keys = keys?;
+    if let Some(key) = &catalog.as_proto().serving_checkpoint_object {
+        keys.insert(ObjectKey::new(key.clone())?);
+    }
+    Ok(keys)
 }
 
 /// Every object that replaying the admitted suffix onto `base` can read, beyond the base checkpoint's own dependencies.

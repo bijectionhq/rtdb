@@ -23,6 +23,7 @@ mod retirement_receipt;
 mod snapshot_replay;
 mod sql_survivor;
 mod state;
+mod serving;
 mod table_replay;
 
 pub use rtdb_tx::project_held_replica;
@@ -44,5 +45,6 @@ pub use sql_survivor::SqlSurvivor;
 pub use replay_closure::{ReplayBase, ReplayDependencySources, checkpoint_dependencies, tail_dependencies};
 pub use repair::{LocalRepair, PrimaryReset, PublishedPrimaryReset, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
 pub use progress::{AppliedProgress, AppliedTransaction, ProgressMonitor};
+pub use serving::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeCheckpointAuthority, NativeServingAuthority, NativeServingHandle, NativeServingScope, NativeServingView};
 pub use state::{BlockCycle, FlushTimer, PendingBlock};
 pub use table_replay::RetainedTableReplay;

@@ -92,6 +92,9 @@ message NoOp {
 
     // A placed receiver's reservation does not advance applied source progress.
     bytes placed_slot_reservation = 2;
+    // An applied-branch decision or reply. A timed original stores its source position here.
+    // Only its terminal record sets src_msg_id.
+    bytes serving_record = 3;
 }
 
 // Stands in for a message the log declined for its size: the encoded message is in the

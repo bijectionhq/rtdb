@@ -6,6 +6,9 @@
 -- Includes: the Following/Leading state machine; how a claim is made and adjudicated; the term fence that keeps at most one CONFIRMED leader per database; the obligations the replica log itself has to meet for a term to mean anything.
 -- Excludes: record processing and the block lifecycle (db.allium), the live index (live-index.allium), the external source.
 -- Rust term admission is implemented in rust/crates/replication/src/admission.rs.
+-- An applied-branch writer releases new receipts only after its own ordered read-back.
+-- Resignation withdraws the speculative suffix and returns outcome-unknown to its callers.
+-- Replay recovers committed records into the durable prefix before a later writer resumes resolution.
 --
 -- live-index.allium treats WHICH role owns the live index as a given.
 -- This spec says how that role is selected and swapped, and does not restate what the roles then do with it.
@@ -104,6 +107,7 @@ contract DurableTotalOrder {
 
     @invariant PreparedReadAdvancesOnDelivery
         -- Preparation identifies the next retained record above the reader's position.
+        -- A native ordered log opens its prepared cursor at the configured replica epoch's replay position.
         -- Delivery advances the reader's position.
         -- An unavailable delivery reservation is a read error at the current position.
 

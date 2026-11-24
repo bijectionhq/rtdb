@@ -11,7 +11,7 @@ fn object(kind: ObjectKind) -> ObjectId {
 }
 
 #[test]
-fn all_eight_record_kinds_round_trip_with_fixed_tags() {
+fn record_kinds_round_trip_with_fixed_tags() {
     let manifest = object(ObjectKind::Manifest);
     let pin = Pin {
         id: Uuid::from_u128(42),
@@ -27,6 +27,7 @@ fn all_eight_record_kinds_round_trip_with_fixed_tags() {
             manifest,
             through: 9,
             key_generation: 2,
+            restore: true,
         }),
         Record::Lease { until: i64::MIN },
         Record::Pin(pin.clone()),
@@ -37,6 +38,14 @@ fn all_eight_record_kinds_round_trip_with_fixed_tags() {
         },
         Record::Settle { tx_lsn: 1 },
         Record::Refuse { tx_lsn: u64::MAX },
+        Record::KeyRetirement {
+            generation: 3,
+            rotation_lsn: u64::MAX,
+            observed_at: i64::MIN,
+            unreadable_by: Some(i64::MAX),
+            armed: true,
+        },
+        Record::WriterRelease { lease_until: i64::MAX },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();
@@ -55,13 +64,14 @@ fn malformed_record_envelopes_are_refused() {
     assert!(Record::decode(&bytes).is_err());
 
     let mut unknown = RECORD_HEADER.to_vec();
-    unknown.extend_from_slice(&[0x4a, 0]);
+    unknown.extend_from_slice(&[0x5a, 0]);
     assert!(Record::decode(&unknown).is_err());
     assert!(
         Record::Checkpoint(Checkpoint {
             manifest: object(ObjectKind::File),
             through: 3,
             key_generation: 1,
+            restore: false,
         })
         .encode()
         .is_err()

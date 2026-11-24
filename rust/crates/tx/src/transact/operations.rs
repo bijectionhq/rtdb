@@ -2,45 +2,84 @@ use rtdb_index::branches::BranchEvent;
 
 use super::*;
 
-impl Candidate {
+impl Candidate<'_> {
     pub(super) fn execute(&mut self, ops: &[Op]) -> Result<()> {
         let cut = self.index.head();
         for op in ops {
             match op {
                 Op::Put { branch, table, rows, if_absent } => {
+                    self.require_write_branch(branch)?;
                     self.index.writable(branch)?;
-                    let definition = self.definition(table)?;
+                    let definition = self.write_definition(table)?;
                     for row in rows {
-                        let valid = effective_valid(row.valid, cut.system_time)?;
+                        let (valid, image) = self.put_image(branch, table, &definition, row)?;
                         if *if_absent && self.present(branch, table, &row.id, valid)? {
                             return Err(conflict("rtdb/already-present", "The put overlaps an existing row"));
                         }
-                        let mut cells = row.cells.iter().map(|(name, value)| (name.clone(), value.resolve(cut)))
-                            .collect::<StructFields<_>>();
-                        if cells.contains_key("_id") {
-                            return Err(Anomaly::incorrect("rtdb/reserved-field", "The put supplies its ID separately"));
-                        }
-                        validate_cells(&definition, &cells)?;
-                        cells.insert("_id".into(), row.id.as_value());
-                        let expires_at = definition.ttl_micros.map(|ttl| expiry(cut.system_time, ttl)).transpose()?;
-                        self.write(branch, table, row.id.clone(), valid, Some(Arc::new(RowImage { cells, expires_at })))?;
+                        self.write(branch, table, row.id.clone(), valid, Some(image))?;
                     }
                 }
-                Op::Delete { branch, table, ids, valid } => {
+                Op::PlaceCustodyRow { branch, table, row, placement } => {
+                    self.require_unrestricted()?;
                     self.index.writable(branch)?;
-                    self.definition(table)?;
+                    let definition = self.write_definition(table)?;
+                    let (valid, image) = self.put_image(branch, table, &definition, row)?;
+                    let (Some(group), Some(payload), Some(commitments)) = (image.custody_group, &image.custody_payload, placement.commitments) else {
+                        return Err(Anomaly::incorrect("rtdb/custody-placement", "Custody placement requires a sealed carrier and its commitments"));
+                    };
+                    let occurrence = CustodyOccurrence {
+                        placement_id: placement.placement_id,
+                        target: CustodyTarget { branch: branch.clone(), table: table.clone(), id: row.id.clone(), valid },
+                        written: cut.basis,
+                        ordinal: self.index.next_custody_ordinal(),
+                        carrier_sha256: commitments.carrier_sha256,
+                        envelope_sha256: Sha256::digest(&payload.envelope).into(),
+                        reservation: placement.reservation,
+                        link_sha256: commitments.link_sha256,
+                    };
+                    self.index.check_custody_occurrence(group, &occurrence)?;
+                    self.write(branch, table, row.id.clone(), valid, Some(image))?;
+                    self.push(BranchEffect::ActivateCustodyOccurrence { group, occurrence })?;
+                }
+                Op::Delete { branch, table, ids, valid } => {
+                    self.require_write_branch(branch)?;
+                    self.index.writable(branch)?;
+                    let definition = self.write_definition(table)?;
+                    if definition.visibility.is_some() && !valid.is_some_and(ValidTime::is_literal) {
+                        return Err(labelled_time_error());
+                    }
                     let valid = effective_valid(*valid, cut.system_time)?;
-                    for id in ids { self.write(branch, table, id.clone(), valid, None)?; }
+                    for id in ids {
+                        self.authorize_write(branch, table, id, valid, &definition, None)?;
+                        self.write(branch, table, id.clone(), valid, None)?;
+                    }
                 }
                 Op::Erase { branch, table, ids } => {
-                    self.definition(table)?;
+                    match branch {
+                        Some(branch) => self.require_write_branch(branch)?,
+                        None => self.require_unrestricted()?,
+                    }
+                    let definition = self.write_definition(table)?;
                     if let Some(branch) = branch { self.view(branch, Layer::Local)?; }
                     for id in ids {
+                        if let Some(visibility) = &definition.visibility {
+                            let mut labels = self.index.stored_labels(table, branch.as_deref(), id, visibility);
+                            if let Some(branch) = branch {
+                                labels.extend(self.view(branch, Layer::Merged)?.history(table, id).iter()
+                                    .filter_map(|event| visibility.label(&event.image.as_ref()?.cells))
+                                    .map(<[u8]>::to_vec));
+                            }
+                            self.authorize_labels(&definition, labels)?;
+                        }
                         self.push(BranchEffect::Erase { branch: branch.clone(), table: table.clone(), id: id.clone() })?;
                     }
                 }
-                Op::Declare { table, change } => self.declare(table, change)?,
+                Op::Declare { table, change } => {
+                    self.require_unrestricted()?;
+                    self.declare(table, change)?;
+                }
                 Op::Fork { child, from, writable, expires_at } => {
+                    self.require_unrestricted()?;
                     if !valid_branch_name(child) {
                         return Err(Anomaly::incorrect("rtdb/invalid-branch", "Invalid child branch name"));
                     }
@@ -56,18 +95,107 @@ impl Candidate {
                     self.touched.insert(child.clone());
                 }
                 Op::Renew { branch, expires_at } => {
+                    self.require_unrestricted()?;
                     self.require_child(branch)?;
                     validate_expiry(*expires_at, cut.system_time)?;
                     self.push(BranchEffect::Renew { branch: branch.clone(), expires_at: *expires_at })?;
                 }
-                Op::Merge { from, into } => self.merge(from, into)?,
+                Op::Merge { from, into } => {
+                    self.require_unrestricted()?;
+                    self.merge(from, into)?;
+                }
                 Op::DropBranch { branch } => {
+                    self.require_unrestricted()?;
                     self.require_child(branch)?;
                     self.push(BranchEffect::Drop { branch: branch.clone() })?;
+                }
+                Op::CreateCustodyGroup { group } => {
+                    self.require_unrestricted()?;
+                    if *group == [0; 16] {
+                        return Err(Anomaly::incorrect("rtdb/invalid-custody-group", "A custody group needs a nonzero identity"));
+                    }
+                    match self.index.custody_group_live(*group) {
+                        Ok(true) => (),
+                        Ok(false) => return Err(erased_custody_group()),
+                        Err(error) if error.category == AnomalyCategory::NotFound => {
+                            self.push(BranchEffect::CreateCustodyGroup { group: *group })?;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Op::RevokeCustodyGroup { group, inventory_sha256 } => {
+                    self.require_unrestricted()?;
+                    let live = self.index.custody_group_live(*group)?;
+                    let inventory = self.index.custody_inventory(*group).expect("known group has an inventory");
+                    if inventory.sha256 != *inventory_sha256 {
+                        return Err(conflict("rtdb/custody-inventory-changed", "The custody inventory changed after erasure was planned"));
+                    }
+                    if live { self.push(BranchEffect::RevokeCustodyGroup { group: *group })?; }
+                }
+                Op::ReserveCustodyPlacement { group, reservation } => {
+                    self.require_unrestricted()?;
+                    if self.index.check_custody_reservation(*group, reservation)? {
+                        self.index.writable(&reservation.target.branch)?;
+                        self.write_definition(&reservation.target.table)?;
+                        self.push(BranchEffect::ReserveCustodyPlacement { group: *group, reservation: reservation.clone() })?;
+                    }
+                }
+                Op::CustodyRelease(release) => {
+                    self.require_unrestricted()?;
+                    if self.index.check_custody_release(*release, cut.system_time)? {
+                        self.push(BranchEffect::CustodyRelease(*release))?;
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    fn put_image(&mut self, branch: &str, table: &TableRef, definition: &BranchTable, row: &Row) -> Result<(Interval, Arc<RowImage>)> {
+        let cut = self.index.head();
+        if let Some(group) = row.custody_group {
+            self.require_unrestricted()?;
+            if !self.index.custody_group_live(group)? {
+                return Err(erased_custody_group());
+            }
+        }
+        if row.protected_columns.is_empty() != row.custody_payload.is_none()
+            || row.custody_payload.is_some() && row.custody_group.is_none()
+            || row.protected_columns.iter().any(|column| {
+                row.cells.contains_key(column)
+                    || definition.visibility.as_ref().is_some_and(|visibility| &visibility.column == column)
+            })
+        {
+            return Err(Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed and distinct from clear columns and the visibility label"));
+        }
+        for column in &row.protected_columns { validate_column(column)?; }
+        if let Some(visibility) = &definition.visibility
+            && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
+        {
+            return Err(invalid_label());
+        }
+        if definition.visibility.is_some() && (!row.valid.is_some_and(ValidTime::is_literal)
+            || row.cells.values().any(|cell| !matches!(cell, Cell::Value(_))))
+        {
+            return Err(labelled_time_error());
+        }
+        let valid = effective_valid(row.valid, cut.system_time)?;
+        let resolve = |(name, value): (&String, &Cell)| (name.clone(), value.resolve(cut));
+        let mut cells = if row.cells.keys().is_sorted() {
+            row.cells.iter().map(resolve).collect::<StructFields<_>>()
+        } else {
+            row.cells.sorted().into_iter().map(resolve).collect()
+        };
+        if cells.contains_key("_id") {
+            return Err(Anomaly::incorrect("rtdb/reserved-field", "The put supplies its ID separately"));
+        }
+        validate_cells(definition, &cells)?;
+        cells.insert("_id".into(), row.id.as_value());
+        let expires_at = definition.ttl_micros.map(|ttl| expiry(cut.system_time, ttl)).transpose()?;
+        self.authorize_write(branch, table, &row.id, valid, definition, Some(&cells))?;
+        Ok((valid, Arc::new(RowImage {
+            cells, expires_at, custody_group: row.custody_group, custody_payload: row.custody_payload.clone(),
+        })))
     }
 
     fn require_child(&self, branch: &str) -> Result<()> {
@@ -84,7 +212,7 @@ impl Candidate {
     fn write(&mut self, branch: &str, table: &TableRef, id: EntityId, valid: Interval, image: Option<Arc<RowImage>>) -> Result<()> {
         self.push(BranchEffect::Write {
             branch: branch.into(), table: table.clone(),
-            event: BranchEvent { cut: self.index.head(), id, valid, image },
+            event: BranchEvent { cut: self.index.head(), id, valid, image, written: Default::default() },
         })?;
         self.touched.insert(branch.into());
         Ok(())
@@ -96,6 +224,45 @@ impl Candidate {
         Ok(endpoints(&history, valid).into_iter().any(|at| {
             at < valid.upper() && view.row(table, id, at).is_some()
         }))
+    }
+
+    fn require_unrestricted(&self) -> Result<()> {
+        if self.scope.is_some() { return Err(write_scope_error()); }
+        Ok(())
+    }
+
+    fn require_write_branch(&self, branch: &str) -> Result<()> {
+        if self.scope.is_some() && branch != MAIN_BRANCH {
+            return Err(Anomaly::unsupported("rtdb/scoped-branch", "Scoped row writes select the main branch"));
+        }
+        Ok(())
+    }
+
+    fn authorize_write(&mut self, branch: &str, table: &TableRef, id: &EntityId, valid: Interval,
+                       definition: &BranchTable, cells: Option<&StructFields<Value>>) -> Result<()> {
+        let Some(visibility) = &definition.visibility else { return Ok(()); };
+        let view = self.view(branch, Layer::Merged)?;
+        let history = view.history(table, id);
+        let mut labels = endpoints(&history, valid).into_iter().filter(|at| *at < valid.upper())
+            .filter_map(|at| view.row(table, id, at))
+            .filter_map(|event| visibility.label(&event.image.as_ref()?.cells))
+            .map(<[u8]>::to_vec).collect::<BTreeSet<_>>();
+        if let Some(cells) = cells {
+            labels.insert(visibility.label(cells).ok_or_else(invalid_label)?.to_vec());
+        }
+        self.authorize_labels(definition, labels)
+    }
+
+    fn authorize_labels(&mut self, definition: &BranchTable, labels: BTreeSet<Vec<u8>>) -> Result<()> {
+        if self.scope.is_some_and(|scope| labels.is_empty() || !labels.is_subset(&scope.write)) {
+            return Err(write_scope_error());
+        }
+        self.affected_labels.extend(labels);
+        self.single_label |= definition.single_label_per_tx;
+        if self.single_label && self.affected_labels.len() > 1 {
+            return Err(Anomaly::incorrect("rtdb/mixed-visibility-labels", "The transaction must use a single visibility label"));
+        }
+        Ok(())
     }
 
     fn merge(&mut self, from: &str, into: &str) -> Result<()> {
@@ -123,12 +290,19 @@ impl Candidate {
                         return Err(conflict("rtdb/merge-conflict", "The target changed a valid-time region written by the source"));
                     }
                     let image = event.image.clone().filter(|_| event.image_at(valid.lower()).is_some());
-                    if let Some(image) = &image { validate_cells(definition, &image.cells)?; }
+                    if let Some(image) = &image {
+                        if image.custody_group.is_some() {
+                            return Err(Anomaly::unsupported("rtdb/custody-placement", "Publishing a protected copy requires its own custody placement"));
+                        }
+                        validate_cells(definition, &image.cells)?;
+                    }
                     effects.push((table.clone(), id.clone(), valid, image));
                 }
             }
         }
         for (table, id, valid, image) in effects {
+            let definition = self.definition(&table)?;
+            self.authorize_write(into, &table, &id, valid, &definition, image.as_ref().map(|row| &row.cells))?;
             self.write(into, &table, id, valid, image)?;
         }
         Ok(())
@@ -141,6 +315,14 @@ impl Candidate {
             return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-table", "The table has been dropped"));
         }
         Ok(definition)
+    }
+
+    fn write_definition(&self, table: &TableRef) -> Result<BranchTable> {
+        let definition = self.definition(table);
+        if self.scope.is_some() && !definition.as_ref().is_ok_and(|def| def.visibility.is_some()) {
+            return Err(write_scope_error());
+        }
+        definition
     }
 
     fn declare(&mut self, table: &TableRef, change: &Declaration) -> Result<()> {
@@ -163,16 +345,29 @@ impl Candidate {
                 if index.name.is_empty() {
                     return Err(Anomaly::incorrect("rtdb/invalid-index", "An index needs a name"));
                 }
-                validate_column(&index.column)?;
+                let columns = index.columns().collect::<BTreeSet<_>>();
+                if columns.len() != 1 + index.additional_columns.len() {
+                    return Err(Anomaly::incorrect("rtdb/invalid-index", "Index columns must be distinct"));
+                }
+                for name in columns {
+                    validate_column(name)?;
+                }
+                if self.index.tables(cut.basis).any(|(other, definition)| {
+                    other != table && definition.indexes.contains_key(&index.name)
+                }) {
+                    return Err(conflict("rtdb/index-exists", "An index with that name already covers another table"));
+                }
                 if definition.indexes.get(&index.name).is_some_and(|old| old != index) {
                     return Err(conflict("rtdb/index-exists", "An index with that name already has a different definition"));
                 }
-                for branch in self.index.active_names(cut.system_time) {
-                    let view = self.view(branch, Layer::Merged)?;
-                    for id in view.ids(table) {
-                        for event in view.history(table, id) {
-                            if let Some(cell) = event.image.as_ref().and_then(|image| image.cells.get(&index.column)) {
-                                validate_index_key(&index.column, cell)?;
+                if !index.is_compound() {
+                    for branch in self.index.active_names(cut.system_time) {
+                        let view = self.view(branch, Layer::Merged)?;
+                        for id in view.ids(table) {
+                            for event in view.history(table, id) {
+                                if let Some(cell) = event.image.as_ref().and_then(|image| image.cells.get(&index.column)) {
+                                    validate_index_key(&index.column, cell)?;
+                                }
                             }
                         }
                     }
@@ -180,6 +375,7 @@ impl Candidate {
                 definition.indexes.insert(index.name.clone(), index.clone());
             }
             Declaration::Ttl(ttl) => {
+                if definition.visibility.is_some() && ttl.is_some() { return Err(labelled_time_error()); }
                 if let Some(ttl) = ttl { expiry(cut.system_time, *ttl)?; }
                 definition.ttl_micros = *ttl;
             }
@@ -191,14 +387,51 @@ impl Candidate {
                     if &range.table != table || !definition.indexes.contains_key(&range.index) {
                         return Err(Anomaly::incorrect("rtdb/invalid-constraint", "Declare the constraint's range index on the same table"));
                     }
+                    if definition.grouped_constraints.contains_key(name) {
+                        return Err(conflict("rtdb/constraint-exists", "The name belongs to a grouped constraint"));
+                    }
                     definition.constraints.insert(name.clone(), range.clone());
                 } else {
                     definition.constraints.remove(name);
+                    definition.grouped_constraints.remove(name);
                 }
             }
+            Declaration::GroupedConstraint { name, rule } => {
+                if name.is_empty() || rule.prefix_bytes == Some(0) {
+                    return Err(Anomaly::incorrect("rtdb/invalid-constraint", "A grouped constraint needs a name and a positive prefix width"));
+                }
+                validate_column(&rule.column)?;
+                for column in rule.equals.keys() { validate_column(column)?; }
+                if definition.constraints.contains_key(name) {
+                    return Err(conflict("rtdb/constraint-exists", "The name belongs to a range constraint"));
+                }
+                definition.grouped_constraints.insert(name.clone(), rule.clone());
+            }
             Declaration::Drop => definition = BranchTable {
-                generation: cut.basis.position(), dropped: true, ..BranchTable::default()
+                generation: cut.basis.position(), dropped: true,
+                visibility: definition.visibility, single_label_per_tx: definition.single_label_per_tx,
+                ..BranchTable::default()
             },
+            Declaration::Visibility(visibility) => {
+                validate_column(&visibility.column)?;
+                if definition.ttl_micros.is_some() { return Err(labelled_time_error()); }
+                if definition.visibility.as_ref() != Some(visibility) {
+                    if definition.visibility.is_some() || self.index.has_row_history(table) {
+                        return Err(conflict("rtdb/visibility-declaration", "Declare a stable visibility column before writing the table"));
+                    }
+                    definition.visibility = Some(visibility.clone());
+                }
+            }
+            Declaration::SingleLabelPerTx => {
+                if definition.visibility.is_none() {
+                    return Err(Anomaly::incorrect("rtdb/visibility-declaration", "The table requires a visibility column"));
+                }
+                definition.single_label_per_tx = true;
+                if self.affected_labels.len() > 1 {
+                    return Err(Anomaly::incorrect("rtdb/mixed-visibility-labels", "The transaction must use a single visibility label"));
+                }
+                self.single_label = true;
+            }
         }
         self.push(BranchEffect::Declare { table: table.clone(), definition })?;
         self.declared.insert(table.clone());
@@ -208,7 +441,7 @@ impl Candidate {
     pub(super) fn check_constraints(&self) -> Result<()> {
         let cut = self.index.head();
         for (table, definition) in self.index.tables(cut.basis) {
-            if definition.constraints.is_empty() { continue; }
+            if definition.constraints.is_empty() && definition.grouped_constraints.is_empty() { continue; }
             for branch in self.index.active_names(cut.system_time) {
                 if !self.declared.contains(table) && !self.touched.contains(branch) { continue; }
                 let view = self.view(branch, Layer::Merged)?;
@@ -217,10 +450,19 @@ impl Candidate {
                         return Err(conflict("rtdb/count-constraint", format!("Count constraint {name} failed on branch {branch}")));
                     }
                 }
+                for (name, rule) in &definition.grouped_constraints {
+                    if !view.grouped_count_at_most(table, rule, cut.system_time)? {
+                        return Err(conflict("rtdb/grouped-count-constraint", format!("Grouped count constraint {name} failed on branch {branch}")));
+                    }
+                }
             }
         }
         Ok(())
     }
+}
+
+pub(super) fn erased_custody_group() -> Anomaly {
+    Anomaly::new(AnomalyCategory::NotFound, "rtdb/erased-under-view", "The custody group was revoked")
 }
 
 fn endpoints(history: &[&BranchEvent], within: Interval) -> Vec<Timestamp> {
@@ -236,8 +478,8 @@ fn endpoints(history: &[&BranchEvent], within: Interval) -> Vec<Timestamp> {
     boundaries.into_iter().collect()
 }
 
-fn effective_valid(valid: Option<Interval>, time: Timestamp) -> Result<Interval> {
-    let valid = valid.unwrap_or(Interval::new(time, Timestamp::MAX)?);
+fn effective_valid(valid: Option<ValidTime>, time: Timestamp) -> Result<Interval> {
+    let valid = valid.map_or_else(|| Interval::new(time, Timestamp::MAX), |valid| valid.resolve(time))?;
     if valid.is_empty() {
         return Err(Anomaly::incorrect("rtdb/empty-valid-time", "A row write needs a nonempty valid interval"));
     }
@@ -245,7 +487,7 @@ fn effective_valid(valid: Option<Interval>, time: Timestamp) -> Result<Interval>
 }
 
 fn validate_table(table: &TableRef) -> Result<()> {
-    if table.schema == "xt" || table.schema == "information_schema" || table.schema == "pg_catalog" {
+    if crate::source::is_reserved_write_schema(&table.schema) {
         return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb/system-table", "System tables cannot be written by Transact"));
     }
     if table.schema.is_empty() || table.table.is_empty() {
@@ -255,7 +497,7 @@ fn validate_table(table: &TableRef) -> Result<()> {
 }
 
 fn validate_column(name: &str) -> Result<()> {
-    if name.is_empty() || matches!(name, "_id" | "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to") {
+    if name.is_empty() || matches!(name, "_id" | "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" | rtdb_types::rtdb_v1::WRITTEN_BASIS_COLUMN) {
         return Err(Anomaly::incorrect("rtdb/reserved-field", format!("Invalid document column {name}")));
     }
     Ok(())
@@ -270,7 +512,7 @@ fn validate_cells(definition: &BranchTable, cells: &StructFields<Value>) -> Resu
         {
             return Err(Anomaly::incorrect("rtdb/schema-type", format!("Invalid type for declared column {name}")));
         }
-        if definition.indexes.values().any(|index| index.column == *name) {
+        if definition.indexes.values().any(|index| !index.is_compound() && index.column == *name) {
             validate_index_key(name, cell)?;
         }
     }
@@ -300,4 +542,16 @@ fn validate_expiry(until: Timestamp, time: Timestamp) -> Result<()> {
 
 fn conflict(code: &str, message: impl Into<String>) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, code, message)
+}
+
+fn invalid_label() -> Anomaly {
+    Anomaly::incorrect("rtdb/visibility-label", "The declared visibility column requires a nonempty binary label")
+}
+
+fn write_scope_error() -> Anomaly {
+    Anomaly::new(AnomalyCategory::Forbidden, "rtdb/write-scope", "The row operation is outside the write scope")
+}
+
+fn labelled_time_error() -> Anomaly {
+    Anomaly::unsupported("rtdb/labelled-time", "Labelled rows require explicit valid time and literal cells")
 }

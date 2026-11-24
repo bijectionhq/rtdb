@@ -4,6 +4,80 @@ use rtdb_server::cli::{self, Command, NodeMode};
 fn parse(arguments: &[&str]) -> Command { cli::parse(arguments.iter().map(|value| (*value).into()), &|_| None).unwrap() }
 
 #[test]
+fn dev_uses_loopback_listeners_and_recovers_a_committed_write() {
+    std::thread::Builder::new()
+        .stack_size(rtdb_node::WORKER_STACK_BYTES)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(dev_restart());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn dev_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("dev data");
+    let Command::Dev(options) = parse(&["dev", "--data", data.to_str().unwrap(), "--port", "0", "--flight-sql-port", "0"]) else {
+        panic!("expected dev startup");
+    };
+    for reopening in [false, true] {
+        let limit = options.allocation_limit_bytes;
+        let (config, memory, _configuration) = options.load_reserved().unwrap().into_execution(limit).unwrap();
+        assert!(config.node_options(limit).unwrap().default_v1_serving);
+        let (handle, driver) = rtdb_server::ServerDriver::open_with_memory(config, limit, memory).await.unwrap();
+        assert!(handle.addresses().pgwire.unwrap().ip().is_loopback());
+        assert!(handle.addresses().flight_sql.unwrap().ip().is_loopback());
+        let driver = tokio::spawn(driver.run());
+        let user = handle.authenticator().authenticate_trusted("xtdb").unwrap();
+        let mut session = handle.node().session("xtdb", user).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            if reopening {
+                handle.node().sync_all(std::time::Duration::from_secs(10), session.state().cancellation()).await.unwrap();
+                let mut query = session.query_sql("SELECT value FROM docs WHERE _id = 1", vec![]).await.unwrap();
+                let batch = query.next_batch().await.unwrap().unwrap();
+                assert_eq!(batch.batch().num_rows(), 1);
+                assert_eq!(
+                    rtdb_columnar::read_value(batch.batch().schema().field(0), batch.batch().column(0).as_ref(), 0).unwrap(),
+                    rtdb_types::Value::I64(42),
+                );
+            } else {
+                let insert = rtdb_tx::TxOp::Sql { sql: "INSERT INTO docs (_id, value) VALUES (1, 42)".into(), args: None };
+                let result = session.state_mut().execute_tx(vec![insert], Default::default()).await.unwrap();
+                assert!(result.committed(), "{:?}", result.error());
+            }
+        }).await.unwrap();
+        drop(session);
+        handle.shutdown();
+        driver.await.unwrap().unwrap();
+    }
+    assert!(data.join("log").is_dir());
+    assert!(data.join("storage").is_dir());
+}
+
+#[test]
+fn multi_is_explicit_in_development_and_cluster_startup() {
+    let Command::Dev(development) = parse(&["dev", "--multi", "--data", "data"]) else { panic!("expected development startup") };
+    assert!(development.multi);
+    assert_eq!(development.data, std::path::Path::new("data"));
+    assert!(matches!(parse(&["node", "--multi", "-f", "cluster.yaml"]), Command::StartMulti(_)));
+    assert!(cli::parse(["dev", "--multi", "--port", "5432"].map(str::to_owned), &|_| None).is_err());
+}
+
+#[test]
+fn dev_rejects_missing_data_and_node_config_overrides() {
+    for arguments in [["dev", "--data", "--port"], ["dev", "-f", "node.yaml"]] {
+        assert!(cli::parse(arguments.map(str::to_owned), &|_| None).is_err());
+    }
+    assert!(matches!(parse(&["dev", "--help"]), Command::Help));
+}
+
+#[test]
 fn object_sort_property_is_resolved_once_and_reaches_node_query_options() {
     use rtdb_types::ObjectSort;
     let Command::Start(options) = parse(&["-Djava.util.Arrays.useLegacyMergeSort=TrUe","playground"]) else { panic!("expected start") };

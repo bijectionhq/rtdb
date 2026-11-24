@@ -132,21 +132,8 @@ fn read_batch(file: &mut JournalFile, path: &Path, options: &ReadOnlyLocalLogOpt
     Ok((records, next))
 }
 
-#[async_trait]
-impl Log for ReadOnlyLocalLog {
-    fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
-    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
-        file_range(self.reads.clone(), self.path.clone(), self.options.maximum_message_bytes, from, to, None, self.keys.clone(), self.lineage)
-    }
-    async fn enqueue(&self, _: Bytes, _: Timestamp) -> Result<AppendReceipt> { Err(Error::ReadOnlyLog(self.path.as_ref().clone())) }
-
-    fn latest(&self) -> Result<LogOffset> {
-        let _discovery = self.reads.admit_read(self.path.clone(), ())?;
-        let Some(mut file) = JournalFile::open(&self.path, self.lineage)? else { return Ok(LogOffset(-1)); };
-        latest_in_file(&mut file, &self.path, self.options.maximum_message_bytes).map(|(latest, _)| latest)
-    }
-
-    async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
+impl ReadOnlyLocalLog {
+    fn open_tail(&self, after: LogOffset) -> Result<ReadOnlyTail> {
         if after.0 < -1 { return Err(unavailable(after)); }
         let _discovery = self.reads.admit_read(self.path.clone(), after)?;
         let (next, observed_length) = match JournalFile::open(&self.path, self.lineage)? {
@@ -163,15 +150,45 @@ impl Log for ReadOnlyLocalLog {
                 (next, end)
             }
         };
-        let tail = ReadOnlyTail {
+        Ok(ReadOnlyTail {
             path: Arc::clone(&self.path),
             options: self.options.clone(),
             cursor: ReadOnlyCursor { after, next, observed_length, lineage: self.lineage },
             reads: self.reads.clone(),
             reserved_replay: self.reserved_replay,
             keys: self.keys.clone(),
-        };
-        Ok(Box::new(tail))
+        })
+    }
+}
+
+#[async_trait]
+impl super::SharedLog for ReadOnlyLocalLog {
+    async fn append(&self, _: Bytes, _: Timestamp) -> Result<AppendReceipt> {
+        Err(Error::ReadOnlyLog(self.path.as_ref().clone()))
+    }
+
+    fn latest(&self) -> Result<LogOffset> {
+        let _discovery = self.reads.admit_read(self.path.clone(), ())?;
+        let Some(mut file) = JournalFile::open(&self.path, self.lineage)? else { return Ok(LogOffset(-1)); };
+        latest_in_file(&mut file, &self.path, self.options.maximum_message_bytes).map(|(latest, _)| latest)
+    }
+
+    async fn read_after(&self, after: LogOffset) -> Result<Box<dyn LogReplayTail>> {
+        Ok(Box::new(self.open_tail(after)?))
+    }
+}
+
+#[async_trait]
+impl Log for ReadOnlyLocalLog {
+    fn shared(&self) -> Option<&dyn super::SharedLog> { self.reserved_replay.then_some(self as &dyn super::SharedLog) }
+    fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
+    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
+        file_range(self.reads.clone(), self.path.clone(), self.options.maximum_message_bytes, from, to, None, self.keys.clone(), self.lineage)
+    }
+    async fn enqueue(&self, payload: Bytes, time: Timestamp) -> Result<AppendReceipt> { super::SharedLog::append(self, payload, time).await }
+    fn latest(&self) -> Result<LogOffset> { super::SharedLog::latest(self) }
+    async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
+        Ok(Box::new(self.open_tail(after)?))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {

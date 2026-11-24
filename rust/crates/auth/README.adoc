@@ -25,6 +25,12 @@ The native `SessionIdentity` hook remains available for an explicitly supplied a
 Configured users and superuser flags are exposed through a charged `CatalogUsers` snapshot without password material.
 
 OIDC supports password, client-credentials, device, and refresh-token grants.
+An issuer can attach `rtdb_label_scope` to its UserInfo response.
+The scope names the `database`, its `incarnation` as 16 bytes, and separate `read` and `write` sets of nonempty byte-string labels.
+Each byte string in the JSON response is an array of integers from 0 through 255.
+The credential must expire and the caller must authenticate again after expiry to obtain a fresh scope.
+Flight routes without scoped serving support refuse credentials with this claim.
+An unrestricted session refresh checks the replacement token's UserInfo and requires a new session if it carries a scope.
 The user identity comes from the provider's userinfo subject.
 Expiry uses the provider clock and is strict: a token expires after its expiry instant.
 A missing refresh token in a successful refresh retains the previous token.

@@ -65,6 +65,50 @@ pub(crate) fn unauthenticated(message: impl Into<String>) -> Status { Status::un
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn label_scope_survives_flight_credential_authentication() {
+        use rtdb_auth::{AuthConfig, HttpRequest, HttpResponse, HttpTransport, MethodRule, OidcConfig, Secret};
+        use rtdb_columnar::MemoryBudget;
+        use serde_json::json;
+
+        struct Issuer(Arc<MemoryBudget>);
+
+        #[async_trait::async_trait]
+        impl HttpTransport for Issuer {
+            async fn request(&self, request: HttpRequest) -> rtdb_types::Result<HttpResponse> {
+                let body = match request {
+                    HttpRequest::Get { bearer: None, .. } => json!({
+                        "token_endpoint": "https://issuer.example/token",
+                        "userinfo_endpoint": "https://issuer.example/userinfo",
+                    }),
+                    HttpRequest::Form { .. } => json!({"access_token":"token", "expires_in":60}),
+                    HttpRequest::Get { bearer: Some(_), .. } => {
+                        let incarnation = [1; 16];
+                        json!({ "sub":"client", "rtdb_label_scope": {
+                            "database":"main", "incarnation":incarnation, "read":[[1]], "write":[],
+                        } })
+                    }
+                };
+                HttpResponse::new(200, body, &self.0)
+            }
+        }
+
+        let memory = MemoryBudget::new(8 << 20);
+        let authenticator = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig {
+            issuer_url: "https://issuer.example".parse().unwrap(),
+            client_id: "rtdb".into(),
+            client_secret: Secret::new("configured"),
+            rules: vec![MethodRule::any(Method::ClientCredentials)],
+        }), memory.clone(), Arc::new(rtdb_node::SystemClock), Arc::new(Issuer(memory))).await.unwrap();
+        let mut request = Request::new(());
+        request.metadata_mut().insert("authorization", "Client Y2xpZW50OnNlY3JldA==".parse().unwrap());
+        let credentials = Credentials::parse(&request).unwrap();
+        let caller = Authentication::new(authenticator).authenticate(&credentials, None).await.unwrap();
+        assert!(caller.principal.label_scope().is_some());
+        assert!(caller.principal.authorize_database("main", rtdb_node::DatabaseAccess::Read).is_err());
+    }
+
     #[test]
     fn absent_authentication_messages_follow_category_specific_policy() {
         for (category, code, absent, present) in [(AnomalyCategory::Fault, tonic::Code::Internal, "authentication failed", "authentication failed"), (AnomalyCategory::Unsupported, tonic::Code::Unimplemented, "", ""), (AnomalyCategory::Forbidden, tonic::Code::Unauthenticated, "authentication failed", "")] {

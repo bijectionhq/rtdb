@@ -1,0 +1,20 @@
+[package]
+name = "rtdb-journal-logkeeper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+journal-contract.workspace = true
+stream-logkeeper.workspace = true
+
+[dev-dependencies]
+journal-contract = { workspace = true, features = ["conformance"] }
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

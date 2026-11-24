@@ -1,6 +1,7 @@
 mod http;
 mod oidc;
 mod password;
+mod visibility_scope;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use zeroize::Zeroizing;
 pub use http::{HttpRequest, HttpResponse, HttpTransport, NativeHttp};
 pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
+pub use visibility_scope::VerifiedLabelScope;
 
 #[derive(Clone)]
 pub struct Secret(Zeroizing<String>);
@@ -200,6 +202,7 @@ pub struct Principal {
     credentials: Credentials,
     /// The databases this principal may use and how, if it is limited to some.
     grants: Option<BTreeMap<String, GrantedAccess>>,
+    label_scope: Option<VerifiedLabelScope>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Principal {
@@ -207,18 +210,26 @@ impl Principal {
         let granted = grants.iter().flatten().try_fold(0usize, |bytes, (database, _)| bytes.checked_add(database.len() + 64));
         let bytes = granted.and_then(|granted| user.map_or(0, str::len).checked_add(granted)?.checked_add(std::mem::size_of::<Self>())).ok_or_else(|| Anomaly::incorrect("rtdb.auth/principal-allocation", "Principal allocation exceeds addressable memory"))?;
         let reservation = memory.reserve(bytes)?;
-        Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, grants, _reservation: reservation }))
+        Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, grants, label_scope: None, _reservation: reservation }))
     }
     pub fn user_id(&self) -> Option<&str> { self.user.as_deref() }
+    pub fn label_scope(&self) -> Option<&VerifiedLabelScope> { self.label_scope.as_ref() }
 }
 #[async_trait]
 impl SessionIdentity for Principal {
     fn user(&self) -> Option<&str> { self.user.as_deref() }
     async fn revalidate(&self, now: Timestamp) -> Result<()> {
-        match &self.credentials { Credentials::Static => Ok(()), Credentials::Oidc(credentials) => credentials.revalidate(now).await }
+        if let Some(scope) = &self.label_scope { return scope.revalidate(now); }
+        match &self.credentials {
+            Credentials::Static => Ok(()),
+            Credentials::Oidc(credentials) => credentials.revalidate(now, self.user.as_deref().unwrap_or_default()).await,
+        }
     }
     fn delegable(&self) -> bool { matches!(self.credentials, Credentials::Static) }
     fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
+        if self.label_scope.is_some() {
+            return Err(forbidden("rtdb.auth/scoped-route", "The credential requires a scoped database route"));
+        }
         let Some(grants) = &self.grants else { return Ok(()) };
         match (grants.get(database).or_else(|| grants.get("*")), access) {
             (Some(GrantedAccess::Write), _) | (Some(GrantedAccess::Read), DatabaseAccess::Read) => Ok(()),

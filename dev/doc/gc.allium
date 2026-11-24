@@ -1,6 +1,9 @@
 -- allium: 3
 -- For epoch-scoped keys, the confirmed leader supplies the retained catalog, replay, pin and admitted compaction roots under its term.
 -- The EpochScopedStorage contract in ../../allium/rtdb-multi.allium governs these keys in default and Multi modes.
+-- A default applied-branch attachment with object custody allocates each checkpoint image in the producing replica term.
+-- On coordinated local storage the confirmed leader holds exclusive recovery custody while it collects older-epoch images outside the retained block roots.
+-- A recovered branch view keeps its decoded image in memory for the lifetime of the view.
 -- gc.allium
 --
 -- Garbage collection of superseded tries (data + meta files) for one database.

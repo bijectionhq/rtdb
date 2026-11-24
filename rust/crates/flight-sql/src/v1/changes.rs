@@ -16,9 +16,10 @@ use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit as A
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::ipc::{PreparedStreamRow, RowStreamEncoder};
+use rtdb_node::serving::{ChangeImages, ChangeKind, ChangeOrder, Changes};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
 use rtdb_query::{QueryContext, QueryCursor};
-use rtdb_types::{TableRef, TimeUnit, Timestamp, Value};
+use rtdb_types::{StructFields, TableRef, TimeUnit, Timestamp, Value, rtdb_v1::Basis};
 use tonic::{
     Response, Status,
     metadata::{MetadataMap, MetadataValue},
@@ -31,6 +32,7 @@ use crate::{
 
 use super::{
     MAX_CHANGE_GROUPS, MAX_WAIT, error, head, proto,
+    query::check_read_delivery,
     tokens::{self, cursor_expired},
     trailer,
 };
@@ -628,11 +630,19 @@ impl Service {
             && request.images != proto::Images::None as i32
             && offered.next().is_some_and(|value| value == IMAGE_STREAM)
             && offered.next().is_none();
-        let (database, page) = self
-            .open_change_page(&call, request, shared_images)
+        let database = self
+            .wire_database(&call, &request.branch, proto::Layer::Merged)
             .await
             .map_err(|status| call.error(status))?;
-        let through = tokens::basis(database.wire_incarnation(), page.through).into();
+        if database.serving_driver().is_some() {
+            return self.applied_changes(call, database, request).await;
+        }
+        let (database, page) = self
+            .open_change_page(&call, database, request, shared_images)
+            .await
+            .map_err(|status| call.error(status))?;
+        let scope = database.wire_incarnation().await.map_err(error::anomaly)?;
+        let through = tokens::basis(scope, page.through).into();
         let service = self.clone();
         let schema = schema();
         let first = page.readers[0]
@@ -670,28 +680,12 @@ impl Service {
     async fn open_change_page(
         &self,
         call: &Call,
+        database: Arc<Database>,
         request: proto::ChangesRequest,
         shared_images: bool,
     ) -> Result<(Arc<Database>, Page), Status> {
-        let database = self
-            .wire_database(call, &request.branch, proto::Layer::Merged)
-            .await?;
-        let scope = database.wire_incarnation();
-        let tables = request
-            .tables
-            .iter()
-            .map(|name| {
-                if name.len() > 512 {
-                    return Err(error::incorrect("Table name is too long"));
-                }
-                TableRef::parse(name).map_err(error::anomaly)
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        if !(1..=16).contains(&tables.len()) || request.tables.len() != tables.len() {
-            return Err(error::incorrect(
-                "Changes requires one to sixteen distinct tables",
-            ));
-        }
+        let scope = database.wire_incarnation().await.map_err(error::anomaly)?;
+        let tables = tables(&request.tables)?;
         let read_basis = |basis| tokens::read_basis(scope, basis).map_err(|_| cursor_expired());
         let after = request
             .after
@@ -771,6 +765,227 @@ impl Service {
             }
         }
     }
+
+    async fn applied_changes(
+        &self,
+        call: Call,
+        database: Arc<Database>,
+        request: proto::ChangesRequest,
+    ) -> Result<Response<Output<FlightData>>, Status> {
+        let progress_only = request.progress_only;
+        let (page, images, context, initial, headers, cutoff) = async {
+            let driver = database.serving_driver().expect("checked serving driver");
+            let visibility = self.serving_scope(&call, driver)?;
+            let incarnation = visibility.as_ref().map_or_else(|| driver.incarnation(), |scope| {
+                scope.labels.main_read_incarnation(driver.incarnation())
+            });
+            let tables = tables(&request.tables)?;
+            let read_basis = |basis: proto::Basis| {
+                Basis::from_bytes(&basis.value)
+                    .ok()
+                    .filter(|basis| basis.incarnation() == incarnation)
+                    .ok_or_else(cursor_expired)
+            };
+            let after = request.after.map(read_basis).transpose()?;
+            let until = request.until.map(read_basis).transpose()?;
+            let wait = Duration::from_millis(request.wait_millis.unwrap_or_default());
+            if wait > MAX_WAIT
+                || !(1..=MAX_CHANGE_GROUPS).contains(&request.limit)
+                || after.zip(until).is_some_and(|(after, until)| until < after)
+            {
+                return Err(error::incorrect("Invalid Changes interval, limit or wait"));
+            }
+            let order = match proto::Order::try_from(request.order)
+                .map_err(|_| error::incorrect("Unknown change order"))?
+            {
+                proto::Order::Ascending => ChangeOrder::Ascending,
+                proto::Order::Descending => ChangeOrder::Descending,
+            };
+            let images = match proto::Images::try_from(request.images)
+                .map_err(|_| error::incorrect("Unknown change images"))?
+            {
+                proto::Images::None => ChangeImages::None,
+                proto::Images::Keys => ChangeImages::Keys,
+                proto::Images::Before => ChangeImages::Before,
+                proto::Images::After => ChangeImages::After,
+                proto::Images::Both => ChangeImages::Both,
+            };
+            if progress_only && images != ChangeImages::None {
+                return Err(error::incorrect("Progress-only Changes requires IMAGES_NONE"));
+            }
+            let change = Changes {
+                        branch: request.branch,
+                        tables,
+                        after,
+                        until,
+                        order,
+                        images,
+                        limit: request.limit as usize,
+                        wait,
+            };
+            let (page, context) = if let Some(scope) = &visibility {
+                let now = self.0.node.now();
+                let page = driver.changes_scoped(change, scope, &call.cancellation).await.map_err(error::anomaly)?;
+                let source = rtdb_node::serving::QuerySource {
+                    branch: rtdb_types::rtdb_v1::MAIN_BRANCH.into(), at: rtdb_types::rtdb_v1::At::Latest,
+                    layer: rtdb_types::rtdb_v1::Layer::Merged,
+                };
+                let view = driver.query_scoped(source, false, now, scope, &call.cancellation).await.map_err(error::anomaly)?;
+                let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
+                (page, self.scoped_wire_context(&call, snapshot, now)?.with_plaintext())
+            } else {
+                let context = self.wire_context(&call, &database, false).await?.with_plaintext();
+                let page = context.reading(driver.changes(change, &call.cancellation)).await.map_err(error::anomaly)?;
+                (page, context)
+            };
+            self.check_attachment(&call, &database)?;
+            let initial = context.delivery_grant().await.map_err(error::anomaly)?;
+            let (headers, cutoff) = call
+                .delivery_headers(&initial, true)
+                .map_err(error::map_status)?;
+            Ok((page, images, context, initial, headers, cutoff))
+        }
+        .await
+        .map_err(|status| call.error(status))?;
+        let mut fields = schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("erased", DataType::Boolean, false)));
+        let schema = Arc::new(Schema::new(fields));
+        let service = self.clone();
+        let memory = Arc::clone(call.memory());
+        let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
+            let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
+            let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
+            check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
+            service.check_attachment(&call, &database)?;
+            call.handoff(initial, cutoff).map_err(error::map_status)?;
+            yield schema_frame;
+            for group in page.groups.into_iter().filter(|_| !progress_only) {
+                for row in group.rows {
+                    service.check_attachment(&call, &database)?;
+                    let erased = row.kind == ChangeKind::Erased;
+                    let id = row.id.as_value();
+                    let key = match (images, row.erased_written_basis, row.valid) {
+                        (ChangeImages::None, _, _) => None,
+                        (_, Some(basis), Some(valid)) => Some(write_values([
+                            ("_id", &id),
+                            ("_valid_from", &time_value(valid.lower())),
+                            ("_valid_to", &time_value(valid.upper())),
+                            (rtdb_types::rtdb_v1::WRITTEN_BASIS_COLUMN, &Value::Binary(basis.to_bytes().to_vec())),
+                        ], &memory)?),
+                        _ => Some(write_values([("_id", &id)], &memory)?),
+                    };
+                    let before = if erased || !matches!(images, ChangeImages::Before | ChangeImages::Both) { None }
+                        else { row.before.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
+                    let after = if erased || !matches!(images, ChangeImages::After | ChangeImages::Both) { None }
+                        else { row.after.as_ref().map(|image| write_change_image(&image.cells, &id, row.valid, &memory)).transpose()? };
+                    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+                        Arc::new(StringArray::from(vec![format!("{}.{}", row.table.schema, row.table.table)])),
+                        Arc::new(TimestampMicrosecondArray::from(vec![group.cut.system_time.0]).with_timezone("UTC")),
+                        Arc::new(BooleanArray::from(vec![row.kind == ChangeKind::Opened])),
+                        Arc::new(BinaryArray::from(vec![key.as_deref()])),
+                        Arc::new(BinaryArray::from(vec![before.as_deref()])),
+                        Arc::new(BinaryArray::from(vec![after.as_deref()])),
+                        Arc::new(BooleanArray::from(vec![erased])),
+                    ]).map_err(|error| error::map_status(Status::internal(error.to_string())))?;
+                    for frame in encoder.batch(&batch, &memory).map_err(error::map_status)? {
+                        let grant = context.delivery_grant().await.map_err(error::anomaly)?;
+                        check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
+                        service.check_attachment(&call, &database)?;
+                        call.handoff(grant, cutoff).map_err(error::map_status)?;
+                        yield frame;
+                    }
+                }
+            }
+            let grant = context.delivery_grant().await.map_err(error::anomaly)?;
+            check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
+            service.check_attachment(&call, &database)?;
+            call.handoff(grant, cutoff).map_err(error::map_status)?;
+            yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete });
+        });
+        let mut response = Response::new(stream);
+        *response.metadata_mut() = headers;
+        Ok(response)
+    }
+}
+
+fn write_change_image(
+    cells: &StructFields<Value>,
+    id: &Value,
+    valid: Option<rtdb_types::Interval>,
+    memory: &Arc<rtdb_columnar::MemoryBudget>,
+) -> Result<bytes::Bytes, Status> {
+    let from = valid.map(|valid| time_value(valid.lower()));
+    let to = valid.map(|valid| time_value(valid.upper()));
+    let values = [
+        ("_id", Some(id)),
+        ("_valid_from", from.as_ref()),
+        ("_valid_to", to.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, value)| value.map(|value| (name, value)))
+    .chain(cells.iter().filter_map(|(name, value)| {
+        (!matches!(name.as_str(), "_id" | "_valid_from" | "_valid_to"))
+            .then_some((name.as_str(), value))
+    }));
+    write_values(values, memory)
+}
+
+fn write_values<'a>(
+    values: impl IntoIterator<Item = (&'a str, &'a Value)>,
+    memory: &Arc<rtdb_columnar::MemoryBudget>,
+) -> Result<bytes::Bytes, Status> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let workspace = values.iter().try_fold(0, |size, (name, value)| {
+        let bytes = value.retained_bytes().map_err(error::anomaly)?;
+        let field = wire::add(name.len(), bytes).map_err(error::map_status)?;
+        wire::add(size, field).map_err(error::map_status)
+    })?;
+    let _workspace = memory
+        .reserve(wire::mul(workspace, 4).map_err(error::map_status)?)
+        .map_err(error::anomaly)?;
+    let (fields, columns) = values
+        .into_iter()
+        .map(|(name, value)| {
+            let ty = value.logical_type();
+            Ok((
+                rtdb_columnar::to_field(name, &ty).map_err(error::anomaly)?,
+                rtdb_columnar::build_array_refs(&ty, &[value]).map_err(error::anomaly)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, Status>>()?
+        .into_iter()
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|error| error::map_status(Status::internal(error.to_string())))?;
+    write_image(
+        &batch,
+        0,
+        &(0..batch.num_columns()).collect::<Vec<_>>(),
+        memory,
+    )
+}
+
+fn tables(names: &[String]) -> Result<BTreeSet<TableRef>, Status> {
+    if !(1..=16).contains(&names.len()) {
+        return Err(error::incorrect(
+            "Changes requires one to sixteen distinct tables",
+        ));
+    }
+    let tables = names
+        .iter()
+        .map(|name| {
+            if name.len() > 512 {
+                return Err(error::incorrect("Table name is too long"));
+            }
+            TableRef::parse(name).map_err(error::anomaly)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if names.len() != tables.len() {
+        return Err(error::incorrect(
+            "Changes requires one to sixteen distinct tables",
+        ));
+    }
+    Ok(tables)
 }
 
 fn schema() -> Schema {

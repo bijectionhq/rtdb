@@ -35,6 +35,7 @@ rtdb-temporal = { path = "crates/temporal" }
 rtdb-trie = { path = "crates/trie" }
 rtdb-format = { path = "crates/format" }
 rtdb-storage = { path = "crates/storage" }
+rtdb-crypt = { path = "crates/crypt" }
 rtdb-index = { path = "crates/index" }
 rtdb-plan = { path = "crates/plan" }
 rtdb-expr = { path = "crates/expr" }
@@ -44,6 +45,7 @@ rtdb-sql = { path = "crates/sql" }
 rtdb-replication = { path = "crates/replication" }
 rtdb-tx = { path = "crates/tx" }
 rtdb-maintenance = { path = "crates/maintenance" }
+rtdb-db = { path = "crates/db" }
 rtdb-node = { path = "crates/node" }
 rtdb-kafka = { path = "crates/kafka" }
 rtdb-s3 = { path = "crates/s3" }
@@ -61,7 +63,8 @@ rtdb-tls = { path = "crates/tls" }
 rtdb-affinity = { path = "crates/affinity" }
 rtdb-directory = { path = "crates/directory" }
 rtdb-logkeeper = { path = "crates/logkeeper" }
-journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "f2b964da847ce2487c35fa1dc31fae05a32d6d86" }
+journal-contract = { git = "https://github.com/bijectionhq/logkeeper.git", rev = "b704415199981cd5d40cf4015f067c142737e359" }
+stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "b704415199981cd5d40cf4015f067c142737e359", features = ["stream"] }
 ordered-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "b185475fc84c869895523f51644895435bc8cc95", features = ["ordered-daemon"] }
 rtdb-multi = { path = "crates/multi" }
 rtdb-simulation = { path = "crates/simulation" }
@@ -114,6 +117,7 @@ prost-build = "0.14.3"
 protoc-bin-vendored = "3"
 roaring = "0.11.5"
 serde = { version = "1", features = ["derive", "rc"] }
+imbl = { version = "=7.0.2", features = ["serde"] }
 indexmap = { version = "2.14", features = ["serde"] }
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order", "raw_value"] }
 serde_yaml = "=0.9.34"

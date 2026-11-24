@@ -17,6 +17,7 @@ use crate::Membership;
 pub struct NodeOptions {
     pub membership: Membership,
     pub read_only: bool,
+    pub default_v1_serving: bool,
     /// Enables native owned relations for installations running a compatible engine on every member.
     pub owned_relations: bool,
     pub default_timezone: String,
@@ -48,7 +49,7 @@ impl NodeOptions {
 
 impl Default for NodeOptions {
     fn default() -> Self {
-        Self { membership: Membership::Durable { primary: Default::default(), skipped: Default::default() }, read_only: false, owned_relations: false,
+        Self { membership: Membership::Durable { primary: Default::default(), skipped: Default::default() }, read_only: false, default_v1_serving: false, owned_relations: false,
             default_timezone: Self::DEFAULT_TIMEZONE.into(), execution_memory_bytes: 512 * 1024 * 1024, cache_bytes: 256 * 1024 * 1024,
             command_capacity: 64, file_size_target: 100 * 1024 * 1024, trie: TrieConfig::default(), query: QueryOptions::default(),
             replication: ReplicationConfig::default(), compaction: MergeConfig::default(), compaction_threads: 2,

@@ -4,7 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{
-    Epoch, FileJournal, Identity, Journal, JournalError, Lsn, MemoryJournal, StreamId, conformance,
+    Epoch, Identity, Journal, JournalError, Lsn, StreamId, conformance,
+    reference::{FileJournal, MemoryJournal},
 };
 use rtdb_logkeeper::simulation::{Fault, FaultJournal};
 
@@ -13,7 +14,7 @@ const EPOCH: Epoch = Epoch(3);
 const PAYLOAD: Bytes = Bytes::from_static(b"record");
 
 async fn opened() -> FaultJournal<dyn Journal> {
-    let inner = MemoryJournal::default().handle(Identity(1));
+    let inner = MemoryJournal::default().handle(Identity::from_static("urn:rtdb:test:1"));
     let journal = FaultJournal::new(Arc::new(inner) as Arc<dyn Journal>);
     journal.create(STREAM).await.unwrap();
     assert_eq!(journal.seal(STREAM, EPOCH).await, Ok(Lsn(0)));
@@ -56,7 +57,7 @@ async fn fault_journal_leaves_a_rejected_append_error_visible() {
     assert_eq!(
         journal.append(STREAM, EPOCH, Lsn(2), PAYLOAD).await,
         Err(JournalError::Conflict {
-            committed_end: Lsn(0)
+            head: Lsn(0)
         })
     );
     assert_eq!(
