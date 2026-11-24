@@ -16,6 +16,8 @@ use crate::bounded_retry::{BOUNDED_RETRY_METADATA_KEY, BoundedRetry};
 use crate::values::{DecodedDocumentLayout, LegacyOwnedPresence, contains_fixed_size_list};
 use crate::values::arguments::{canonical_float_field, compatible_float_cell, float_field};
 
+pub(crate) mod canonical;
+
 const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
 // The hosted value model admits UTC years 0001 through 9999.
 const HOSTED_INSTANT_MICROS: std::ops::Range<i64> = -62_135_596_800_000_000..253_402_300_800_000_000;
@@ -1691,6 +1693,15 @@ impl DocumentCell<'_> {
             let _scratch = memory.reserve(cell.field.size().checked_mul(16).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
             if compatible_float_cell(*cell, *declared) { return cell.observed_type(); }
         }
+        if let Self::Arrow { cell, declared: Some(declared) } = self
+            && **declared != LogicalType::Nothing
+            && canonical::selectable(cell.field)
+            && let Ok(scratch) = cell.observed_type_bytes().and_then(|bytes| memory.reserve(bytes))
+            && rtdb_columnar::validate_readable_cell(cell.field, cell.array, declared, cell.row, memory).is_ok()
+            && let Ok(observed) = cell.observed_type() {
+            drop(scratch);
+            return Ok(observed);
+        }
         let _scratch = memory.reserve(self.bound()?)?;
         Ok(self.value()?.logical_type())
     }
@@ -1752,6 +1763,7 @@ fn canonical_cells(
     }
     let (array, _writer) = match copy_document_floats(&target, &ty, cells, memory) {
         Ok(Some(output)) => output,
+        Ok(None) | Err(_) if let Some(output) = gather_document_column(&target, &ty, cells, memory) => output,
         Ok(None) | Err(_) => {
             let missing = if ty == LogicalType::Nothing { &Value::Undefined } else { &Value::Null };
             rtdb_columnar::copy_evaluated_cells(&ty, cells.len(), memory,
@@ -2006,6 +2018,67 @@ fn canonical_document_struct(
         columns.push(column);
     }
     rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))
+}
+
+fn gather_document_column(
+    field: &Field, ty: &LogicalType, cells: &[Option<&DocumentCell<'_>>], memory: &Arc<MemoryBudget>,
+) -> Option<(ArrayRef, Arc<MemoryReservation>)> {
+    use rtdb_columnar::{copy_nullable_cells, estimate_copy_cell_bytes, estimate_null_copy_cell_bytes};
+
+    if ty.unencoded() != *ty || !canonical::selectable(field)
+        || !cells.iter().flatten().any(|cell| matches!(cell, DocumentCell::Arrow { .. })) {
+        return None;
+    }
+    let _inventory = memory.reserve(cells.len().checked_mul(128)?.checked_add(4096)?).ok()?;
+    let mut sources = Vec::new();
+    let mut picks = Vec::with_capacity(cells.len());
+    let mut previous = None;
+    // copy_evaluated_cells clears packed null payloads when it joins multiple chunks.
+    let packed_null_bytes = cells.len() <= 128;
+    let row_values = || cells.iter().flatten().filter_map(|cell| match cell { DocumentCell::Value(value) => Some(value.as_ref()), _ => None });
+    if row_values().next().is_some() {
+        let reserve = memory.reserve(estimate_builder_bytes_refs(ty, row_values()).ok()?).ok()?;
+        let array = rtdb_columnar::copy_array_refs(ty, &row_values().collect::<Vec<_>>()).ok()?;
+        if !(0..array.len()).all(|row| canonical::selectable_cell(ArrowCell { field, array: array.as_ref(), row }, packed_null_bytes)) {
+            return None;
+        }
+        sources.push((array, Some(reserve)));
+    }
+    let mut next_value = 0;
+    for cell in cells {
+        match cell {
+            None => picks.push(None),
+            Some(DocumentCell::Value(_)) => {
+                picks.push(Some((0, next_value)));
+                next_value += 1;
+            }
+            Some(DocumentCell::Arrow { cell: selected, .. }) => {
+                let ArrowCell { field: source, array: column, row } = *selected;
+                if !canonical::selectable(source) || !canonical::selectable_cell(*selected, packed_null_bytes) {
+                    return None;
+                }
+                if previous.is_none_or(|prior| !std::ptr::eq(prior, column)) {
+                    sources.push(canonical::align(&arrow_array::make_array(column.to_data()), source, field, memory)?);
+                    previous = Some(column);
+                }
+                picks.push(Some((sources.len() - 1, row)));
+            }
+        }
+    }
+    let inputs = sources.iter().map(|(array, _)| array.as_ref()).collect::<Vec<_>>();
+    let null = estimate_null_copy_cell_bytes(field).ok()?;
+    let bound = picks.iter().try_fold(4096usize, |size, pick| {
+        let cell = match pick {
+            Some((page, row)) => estimate_copy_cell_bytes(field, inputs[*page], *row).ok()?,
+            None => null,
+        };
+        size.checked_add(cell.checked_mul(4)?)
+    })?;
+    let mut scratch = memory.reserve(bound).ok()?;
+    let array = copy_nullable_cells(&inputs, &picks).ok()?;
+    Arc::get_mut(&mut scratch).expect("The document gather owns its output")
+        .shrink_to(array.get_array_memory_size()).ok()?;
+    Some((array, scratch))
 }
 
 fn masks_dense_union(field: &Field, parent_can_mask: bool) -> bool {
@@ -4708,11 +4781,159 @@ mod tests {
 
     #[test]
     fn receipt_reader_can_charge_and_preserve_an_undefined_document_cell() {
-        let array = arrow_array::NullArray::new(1);
+        let array: ArrayRef = Arc::new(arrow_array::NullArray::new(1));
         let field = Field::new("omitted", DataType::Null, false);
         let cell = DocumentCell::Arrow { cell: ArrowCell { field: &field, array: &array, row: 0 }, declared: Some(&LogicalType::Nothing) };
         assert_eq!(cell.bound().unwrap(), 0);
         assert_eq!(*cell.value().unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn canonical_source_receipts_gather_extended_types_with_legacy_bytes() {
+        use rtdb_types::{DecimalValue, RunEndWidth};
+
+        let memory = budget();
+        let decimal = Value::Decimal(DecimalValue::new((-913i128).to_be_bytes().to_vec(), 64, 129, 128).unwrap());
+        let interval = Value::IntervalMonthDayMicro { months: -7, days: 5, nanoseconds: i64::MIN + 1 };
+        let keyword = Value::Keyword(rtdb_types::Keyword::from_name(":stored/name"));
+        let uri = Value::Uri("https://example.test/a%2Fb?q=1".into());
+        let map = Value::Map { sorted: false, entries: vec![
+            (keyword.clone(), interval.clone()), (keyword.clone(), Value::Null),
+        ] };
+        let run = LogicalType::Scalar(ScalarType::I32).run_end_encoded(RunEndWidth::I16).unwrap();
+        let values = [
+            ("decimal", decimal), ("interval", interval), ("map", map), ("keyword", keyword), ("uri", uri),
+            ("float_bits", Value::F64(f64::from_bits(0xfff8_0000_0000_0009))),
+            ("year_month", Value::IntervalYearMonth(-7)),
+            ("day_time", Value::IntervalDayTime { days: 2, milliseconds: -300 }),
+            ("month_day_nano", Value::IntervalMonthDayNano { months: -1, days: 2, nanoseconds: -3 }),
+        ];
+
+        for length in [5, 130] {
+            let mut fields = vec![to_field("_id", &LogicalType::Scalar(ScalarType::I32)).unwrap(), to_field("run", &run).unwrap()];
+            let mut columns = vec![
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..=length as i32)) as ArrayRef,
+                copy_array(&run, &(0..=length).map(|row| if row % 5 < 3 { Value::I32(-5) } else { Value::I32(7) }).collect::<Vec<_>>()).unwrap(),
+            ];
+            for (name, value) in &values {
+                let ty = value.logical_type().maybe();
+                fields.push(to_field(*name, &ty).unwrap());
+                let values = (0..=length).map(|row| if row % 3 == 0 { Value::Null } else { value.clone() }).collect::<Vec<_>>();
+                columns.push(copy_array(&ty, &values).unwrap());
+            }
+            let array = StructArray::try_new(fields.into(), columns, None).unwrap().slice(1, length);
+            let layout = DecodedDocumentLayout::new(array.fields(), &memory).unwrap();
+            let arrow = ArrowDocuments::from_source(&array, layout, array.get_array_memory_size(), &memory).unwrap().unwrap();
+            let rows = arrow.to_rows(false, &memory).unwrap();
+            assert!(arrow.requires_legacy_receipt(true));
+            for (field, column) in array.fields().iter().zip(array.columns()).skip(1) {
+                let logical = arrow.column_type(field.name()).unwrap();
+                let ty = logical.unencoded();
+                let target = to_field(field.name(), &ty).unwrap();
+                let mut cells = vec![DocumentCell::Value(Cow::Borrowed(&rows.rows()[0][field.name()]))];
+                cells.extend((1..length).map(|row| DocumentCell::Arrow {
+                    cell: ArrowCell { field, array: column.as_ref(), row },
+                    declared: Some(logical),
+                }));
+                let selected = cells.iter().map(Some).collect::<Vec<_>>();
+                assert!(gather_document_column(&target, &ty, &selected, &memory).is_some(), "{}", field.name());
+            }
+            let iids = (1..=length).map(|id| EntityId::Integer(id as i64).iid()).collect::<Vec<_>>();
+            let table = TableRef::new("public", "docs");
+            let actual = SourceTransaction::from_operations(vec![Operation::PatchArrowIids {
+                table: table.clone(), documents: arrow, iids: iids.clone(), valid_from: None, valid_to: None,
+            }], SubmitOptions::default(), &memory).unwrap();
+            let expected = SourceTransaction::from_operations(vec![Operation::PatchIids {
+                table, documents: rows, iids, valid_from: None, valid_to: None,
+            }], SubmitOptions::default(), &memory).unwrap();
+            let receipt_ipc = |source: &SourceTransaction| {
+                let batch = source.operation_batch(None, SourcePurpose::Receipt).unwrap();
+                crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], &memory).unwrap()
+            };
+            assert_eq!(receipt_ipc(&actual).as_slice(), receipt_ipc(&expected).as_slice());
+            assert_eq!(actual.body_digest().unwrap(), expected.body_digest().unwrap());
+            assert_eq!(roundtrip(&actual).body_digest().unwrap(), expected.body_digest().unwrap());
+        }
+    }
+
+    #[test]
+    fn canonical_source_coalescing_keeps_legacy_aliases_and_packed_null_bytes() {
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_buffer::NullBuffer;
+
+        let memory = budget();
+        let uri = Value::Uri("https://example.test/retained".into());
+        let uri_type = uri.logical_type();
+        let alias = UnionArray::try_new(UnionFields::try_new([3, 4, 6], [
+            Field::new("first", DataType::Int64, false),
+            Field::new("second", DataType::Int64, false),
+            Field::new("utf8", DataType::Utf8, false),
+        ]).unwrap(), vec![4i8].into(), Some(vec![0i32].into()), vec![
+            Arc::new(Int64Array::from(Vec::<i64>::new())),
+            Arc::new(Int64Array::from(vec![7])),
+            Arc::new(StringArray::from(Vec::<&str>::new())),
+        ]).unwrap();
+        let numbers = Arc::new(Int64Array::new(vec![91, 5].into(), Some(NullBuffer::from(vec![false, true]))));
+        let numbers_type = LogicalType::list(LogicalType::Scalar(ScalarType::I64).maybe());
+        let numbers_field = to_field("numbers", &numbers_type).unwrap();
+        let DataType::List(item) = numbers_field.data_type() else { unreachable!() };
+        let numbers = ListArray::new(Arc::clone(item), OffsetBuffer::new(vec![0, 2].into()), numbers, None);
+        let fields = vec![
+            Field::new("alias", alias.data_type().clone(), false),
+            numbers_field,
+            to_field("uri", &uri_type).unwrap(),
+        ];
+        let array = StructArray::new(fields.into(), vec![
+            Arc::new(alias), Arc::new(numbers), copy_array(&uri_type, &[uri]).unwrap(),
+        ], None);
+        let layout = DecodedDocumentLayout::new(array.fields(), &memory).unwrap();
+        let documents = ArrowDocuments::from_source(&array, layout, array.get_array_memory_size(), &memory).unwrap().unwrap();
+        let legacy = documents.to_rows(false, &memory).unwrap();
+        let row = SourceDocuments::Rows(&legacy);
+        let mut builder = BatchBuilder::new(4096, &memory).unwrap();
+        assert!(mixed_document_leg(&[SourceDocuments::Arrow(&documents), SourceDocuments::Rows(&legacy)], &mut builder).unwrap().is_none());
+        let actual = document_leg(vec![SourceDocuments::Arrow(&documents), row], &mut builder, &memory).unwrap();
+        let expected = document_leg(vec![SourceDocuments::Rows(&legacy), SourceDocuments::Rows(&legacy)], &mut builder, &memory).unwrap();
+        let ipc = |array: ArrayRef| {
+            let field = Field::new("docs", array.data_type().clone(), false);
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap();
+            crate::ipc::encode(batch.schema_ref(), [&batch], &memory).unwrap()
+        };
+        assert_eq!(ipc(actual).as_slice(), ipc(expected).as_slice());
+        assert!(!canonical::selectable(&array.fields()[0]));
+        assert!(!canonical::selectable_cell(ArrowCell { field: &array.fields()[1], array: array.column(1).as_ref(), row: 0 }, true));
+    }
+
+    #[test]
+    fn canonical_source_receipts_keep_non_float_union_padding_at_the_chunk_boundary() {
+        let memory = budget();
+        let ty = LogicalType::List {
+            kind: ListKind::FixedSizeList(2),
+            element: Box::new(LogicalType::Scalar(ScalarType::Utf8).join(&LogicalType::Scalar(ScalarType::I64)).maybe()),
+        }.maybe();
+        let field = to_field("items", &ty).unwrap();
+        assert!(!canonical::selectable(&field));
+        for length in [128, 129] {
+            let values = (0..length).map(|row| if row % 3 == 0 { Value::Null } else {
+                Value::FixedSizeList(vec![Value::Utf8("selected".into()), Value::I64(row as i64)].into())
+            }).collect::<Vec<_>>();
+            let ids = to_field("_id", &LogicalType::Scalar(ScalarType::I64)).unwrap();
+            let array = StructArray::new(vec![ids, field.clone()].into(), vec![
+                Arc::new(arrow_array::Int64Array::from_iter_values(0..length as i64)), copy_array(&ty, &values).unwrap(),
+            ], None);
+            let layout = DecodedDocumentLayout::new(array.fields(), &memory).unwrap();
+            let arrow = ArrowDocuments::from_source(&array, layout, array.get_array_memory_size(), &memory).unwrap().unwrap();
+            let rows = arrow.to_rows(false, &memory).unwrap();
+            let iids = (0..length).map(|row| EntityId::Integer(row as i64).iid()).collect::<Vec<_>>();
+            let table = TableRef::new("public", "docs");
+            let actual = SourceTransaction::from_operations(vec![Operation::PatchArrowIids {
+                table: table.clone(), documents: arrow, iids: iids.clone(), valid_from: None, valid_to: None,
+            }], SubmitOptions::default(), &memory).unwrap();
+            let expected = SourceTransaction::from_operations(vec![Operation::PatchIids {
+                table, documents: rows, iids, valid_from: None, valid_to: None,
+            }], SubmitOptions::default(), &memory).unwrap();
+            assert_eq!(actual.body_digest().unwrap(), expected.body_digest().unwrap());
+        }
     }
 
     #[test]

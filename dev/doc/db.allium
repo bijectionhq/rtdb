@@ -428,6 +428,8 @@ variant TxMessage : SourceMessage {
     -- SQL source replay binds Arrow arguments by position and reads a scalar parameter when evaluation reaches it.
     -- Compatible row-local mutations bind Arrow argument rows as one column table and stage their results in argument order.
     -- Assertions and mutations whose argument rows can observe earlier writes resolve each binding in order against the transaction snapshot.
+    -- Compatible nested SQL arguments align directly from their Arrow buffers and retain the canonical source bytes.
+    -- SQL source replay binds Arrow argument rows by position and reads a scalar parameter when evaluation reaches it.
     -- Source encoding writes IID lists from their fixed-size bytes.
     -- Source replay reads IIDs directly from the selected position of a compatible Arrow list.
     -- Source replay validates fixed-range binary and text bounds from the selected child positions.
@@ -445,6 +447,7 @@ variant TxMessage : SourceMessage {
     -- Receipt encoding gives masked fixed-size list components the row writer's union tags and offsets.
     -- A document layout retains its schema and column metadata while releasing translation scratch after construction.
     -- Source encoding retains compatible Arrow document vectors and admits reconstructed columns one at a time.
+    -- Document coalescing gathers compatible decimals, intervals, maps, run-end encoded values, keywords and URIs in Arrow.
     -- Embedded ADBC bulk ingest and pgwire Arrow COPY submit document columns in Arrow.
     -- Transit COPY and embedded Transit puts and patches with compatible document IDs submit Arrow columns in the row writer's source layout.
     -- Coalescing those documents uses submitted field presence and type order to preserve the source layout.
@@ -1092,6 +1095,7 @@ rule LeaderProcessesTx {
         -- Its engine advances the stored retry clock by the maximum of the preceding retry clock and the current bounded request's log timestamp.
         -- An elapsed identity cannot become admissible after a clock regression or after removal of its aged-out receipt.
         -- The first admitted terminal outcome installs its receipt in the same replica frame as its transaction result, including an abort.
+        -- Receipt hashing gathers compatible document columns in Arrow and preserves the historical transaction body bytes.
         -- A same-body retry links to that exact outcome; a different body fails with a conflict.
         -- A reader using the first receipt returns the original committed or aborted result.
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
