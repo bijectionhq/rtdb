@@ -257,6 +257,7 @@ fn visible_changes(
                     cells: image.cells.clone(),
                     expires_at: None,
                     custody_group: image.custody_group,
+                    custody_payload: image.custody_payload.clone(),
                 })
             })
         };

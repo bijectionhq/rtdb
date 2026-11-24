@@ -2,6 +2,12 @@ use super::*;
 
 pub type CustodyGroupId = [u8; 16];
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CustodyPayload {
+    pub binding: [u8; 32],
+    pub envelope: Vec<u8>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct CustodyMember {
     pub branch: Branch,
@@ -17,6 +23,8 @@ pub(super) struct CustodyGroup {
 }
 
 impl BranchIndex {
+    pub fn has_custody_groups(&self) -> bool { !self.custody.is_empty() }
+
     pub fn custody_group_live(&self, group: CustodyGroupId) -> Result<bool> {
         self.custody.get(&group).map(|group| group.revoked.is_none()).ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb/custody-group-unknown", "Unknown custody group")

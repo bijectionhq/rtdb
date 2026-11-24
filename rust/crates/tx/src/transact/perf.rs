@@ -24,6 +24,8 @@ fn put(n: u64) -> Transact {
         id: EntityId::Integer(n as i64),
         valid: None,
         custody_group: None,
+        protected_columns: Vec::new(),
+        custody_payload: None,
         cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("row-{n}"))))]),
     };
     Transact {

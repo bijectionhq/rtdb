@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
-use rtdb_tx::transact::{LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES};
+use rtdb_tx::transact::{CustodyGroupId, LINEARIZABLE, RELATIVE_VALID_TIME, ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -139,7 +139,9 @@ impl ServingDriver for MultiServing {
                 };
                 let view = index.view(&source.branch, at, source.layer, now)?;
                 let cut = view.cut();
-                let snapshot = rtdb_query::branch_snapshot(&view, &self.memory)?;
+                let (snapshot, custody_groups) = if index.has_custody_groups() {
+                    crate::serving::custody::snapshot(&view, &self.memory, &self.tokens.custody_vault()).await?
+                } else { (rtdb_query::branch_snapshot(&view, &self.memory)?, BTreeSet::new()) };
                 let claim = if track {
                     Some(self.tokens.seal_claim(&ClaimEvidence {
                         scope: ClaimScope { branch: source.branch, basis: cut.basis, layer: source.layer },
@@ -157,6 +159,7 @@ impl ServingDriver for MultiServing {
                     snapshot,
                     cut,
                     claim,
+                    custody_groups,
                 })
             })
             .await
@@ -165,13 +168,27 @@ impl ServingDriver for MultiServing {
 
     async fn transact(
         &self,
-        request: TransactSubmission,
+        mut request: TransactSubmission,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         cancellation
-            .run_until_cancelled(self.writes.transact(request.into_admitted_transaction()))
+            .run_until_cancelled(async {
+                if request.transaction.uses_custody() && self.features().contains(&ROW_CUSTODY) {
+                    crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
+                }
+                self.writes.transact(request.into_admitted_transaction()).await
+            })
             .await
             .ok_or_else(interrupted)?
+    }
+
+    async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        if groups.is_empty() { return Ok(()); }
+        cancellation.run_until_cancelled(async {
+            let (index, generation) = self.database.lock().await.fresh_view().await?;
+            crate::serving::custody::check_delivery(&index, &self.tokens.custody_vault(), groups).await?;
+            self.database.lock().await.check_generation(generation).await
+        }).await.ok_or_else(interrupted)?
     }
 
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {
@@ -431,6 +448,8 @@ mod tests {
                     id: EntityId::Integer(1),
                     valid: None,
                     custody_group: None,
+                    protected_columns: Vec::new(),
+                    custody_payload: None,
                     cells: StructFields::from([(
                         "title".into(),
                         Cell::Value(Value::Utf8(title.into())),

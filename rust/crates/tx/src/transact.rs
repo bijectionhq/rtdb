@@ -4,7 +4,7 @@ use bytes::Bytes;
 use rtdb_index::branches::{
     BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage, VisibleHistory,
 };
-pub use rtdb_index::branches::{CountRange, CustodyGroupId, IndexDefinition, Visibility};
+pub use rtdb_index::branches::{CountRange, CustodyGroupId, CustodyPayload, IndexDefinition, Visibility};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
@@ -29,6 +29,8 @@ pub struct Admission {
     pub attempt: [u8; 16],
     pub submitted_at: Timestamp,
     pub source_sha256: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_sha256: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -52,6 +54,10 @@ impl Transact {
             _ => None,
         })
     }
+
+    pub fn logical_sha256(&self) -> Result<[u8; 32]> { fingerprint(self) }
+
+    pub fn uses_custody(&self) -> bool { self.ops.iter().chain(&self.otherwise).any(Op::uses_custody) }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -95,6 +101,10 @@ pub struct Row {
     pub cells: StructFields<Cell>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_group: Option<CustodyGroupId>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protected_columns: Vec<String>,
+    #[serde(skip)]
+    pub custody_payload: Option<CustodyPayload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -158,7 +168,7 @@ impl Op {
     fn uses_custody(&self) -> bool {
         match self {
             Self::CreateCustodyGroup { .. } | Self::RevokeCustodyGroup { .. } => true,
-            Self::Put { rows, .. } => rows.iter().any(|row| row.custody_group.is_some()),
+            Self::Put { rows, .. } => rows.iter().any(|row| row.custody_group.is_some() || !row.protected_columns.is_empty()),
             _ => false,
         }
     }
@@ -429,7 +439,8 @@ impl TransactState {
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         validate_key(&request.key)?;
         let receipt_namespace = authority.map(|authority| authority.receipt_namespace);
-        let fingerprint = fingerprint(request)?;
+        let fingerprint = request.admission.and_then(|admission| admission.logical_sha256)
+            .map_or_else(|| fingerprint(request), Ok)?;
         if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
             if stored.fingerprint != fingerprint {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction"));
@@ -503,7 +514,7 @@ impl TransactState {
         if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
             return Err(feature_required(TRANSACT_REQUIRES));
         }
-        if !features.contains(&ROW_CUSTODY) && request.ops.iter().chain(&request.otherwise).any(Op::uses_custody) {
+        if !features.contains(&ROW_CUSTODY) && request.uses_custody() {
             return Err(feature_required(ROW_CUSTODY));
         }
         let Window { not_before, before } = request.window;

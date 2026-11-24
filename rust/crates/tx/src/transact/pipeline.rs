@@ -374,7 +374,7 @@ mod tests {
     fn keys(keys: Vec<TxKey>) -> Vec<Vec<u8>> { keys.into_iter().map(|key| key.key).collect() }
 
     fn put(n: u8, id: i64, if_absent: bool) -> Transact {
-        let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("{n}"))))]), custody_group: None };
+        let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("{n}"))))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None };
         Transact {
             admission: None,
             key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
@@ -634,7 +634,7 @@ mod tests {
         let mut pipeline = pipeline();
         let mut request = put(1, 1, false);
         let first = super::super::Admission {
-            attempt: [21; 16], submitted_at: Timestamp(37), source_sha256: [42; 32],
+            attempt: [21; 16], submitted_at: Timestamp(37), source_sha256: [42; 32], logical_sha256: None,
         };
         request.admission = Some(first);
         let (position, record) = append(&mut pipeline, &request, 42);

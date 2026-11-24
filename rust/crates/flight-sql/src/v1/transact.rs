@@ -247,11 +247,21 @@ fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status
         .into_iter()
         .map(|(name, field)| Ok((name, cell(field, memory)?)))
         .collect::<Result<_, Status>>()?;
+    let mut protected_columns = row.protected_columns;
+    protected_columns.sort_unstable();
+    if protected_columns.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(error::incorrect("Protected columns must be distinct"));
+    }
+    if !protected_columns.is_empty() && custody_group.is_none() {
+        return Err(error::incorrect("Protected columns require a custody group"));
+    }
     Ok(Row {
         id,
         valid,
         cells,
         custody_group,
+        protected_columns,
+        custody_payload: None,
     })
 }
 
@@ -418,7 +428,7 @@ mod tests {
             .map(|(name, column)| (name.to_owned(), wire(column))).collect();
         cells.insert("_id".into(), wire(Arc::new(Int64Array::from(vec![1]))));
         cells.insert("title".into(), wire(Arc::new(Int64Array::from(vec![7]))));
-        decode_row(proto::Row { cells: cells.into_iter().collect(), custody_group: Vec::new() }, &MemoryBudget::new(1 << 20))
+        decode_row(proto::Row { cells: cells.into_iter().collect(), custody_group: Vec::new(), protected_columns: Vec::new() }, &MemoryBudget::new(1 << 20))
     }
 
     #[test]
@@ -454,6 +464,7 @@ mod tests {
                 ("_valid_to".into(), proto::Cell { value: Some(proto::cell::Value::TxTimeOffsetMicros(60)) }),
             ].into_iter().collect(),
             custody_group: Vec::new(),
+            protected_columns: Vec::new(),
         }, &memory).unwrap();
         assert_eq!(row.valid.unwrap().resolve(Timestamp(20)).unwrap(), Interval::new(Timestamp(20), Timestamp(80)).unwrap());
         let delete = interval(proto::Interval { from_tx_offset_micros: Some(-10), to_micros: Some(50), ..Default::default() }).unwrap();

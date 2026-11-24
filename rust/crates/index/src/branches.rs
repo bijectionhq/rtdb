@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 mod custody;
 mod visibility;
-pub use custody::CustodyGroupId;
+pub use custody::{CustodyGroupId, CustodyPayload};
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +83,8 @@ pub struct RowImage {
     pub expires_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custody_group: Option<CustodyGroupId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_payload: Option<CustodyPayload>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

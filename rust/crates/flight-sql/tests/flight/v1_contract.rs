@@ -1035,6 +1035,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
         };
         let view = state.index().view(&source.branch, at, source.layer, now)?;
         Ok(rtdb_node::serving::QueryView {
+            custody_groups: Default::default(),
             snapshot: rtdb_query::branch_snapshot(&view, &self.memory)?,
             cut: view.cut(),
             claim: None,
@@ -1292,6 +1293,7 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
                 rows: vec![v1::Row {
                     cells: cells.into_iter().collect(),
                     custody_group: Vec::new(),
+                    protected_columns: Vec::new(),
                 }],
             })),
         }
@@ -1476,7 +1478,7 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     let mut client = Client::connect(&running.server, None).await;
     let put = |branch: &str, id| v1::Op { op: Some(v1::op::Op::Put(v1::Put {
         branch: branch.into(), table: "public.native_branch".into(), if_absent: false,
-        rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(id * 10))].into_iter().collect(), custody_group: Vec::new() }],
+        rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(id * 10))].into_iter().collect(), custody_group: Vec::new(), protected_columns: Vec::new() }],
     })) };
     let first = transact_wire(&mut client, v1::TransactRequest {
         key: vec![1; 16], ops: vec![put("main", 1)], ..Default::default()
@@ -1567,7 +1569,7 @@ async fn rtdb_v1_default_startup_fences_both_arms_and_recovers_receipts() {
 
     let put = |id, n| v1::Op { op: Some(v1::op::Op::Put(v1::Put {
         branch: "main".into(), table: "public.wire_owner".into(), if_absent: false,
-        rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(n))].into_iter().collect(), custody_group: Vec::new() }],
+        rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(n))].into_iter().collect(), custody_group: Vec::new(), protected_columns: Vec::new() }],
     })) };
     let version = |id, expect| v1::Guard { guard: Some(v1::guard::Guard::Version(v1::Version {
         branch: "main".into(), table: "public.wire_owner".into(), id: Some(integer_cell(id)),

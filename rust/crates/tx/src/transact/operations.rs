@@ -18,6 +18,18 @@ impl Candidate<'_> {
                                 return Err(erased_custody_group());
                             }
                         }
+                        if row.protected_columns.is_empty() != row.custody_payload.is_none()
+                            || row.custody_payload.is_some() && row.custody_group.is_none()
+                            || row.protected_columns.iter().any(|column| {
+                                row.cells.contains_key(column)
+                                    || definition.visibility.as_ref().is_some_and(|visibility| &visibility.column == column)
+                            })
+                        {
+                            return Err(Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed and distinct from clear columns and the visibility label"));
+                        }
+                        for column in &row.protected_columns {
+                            validate_column(column)?;
+                        }
                         if let Some(visibility) = &definition.visibility
                             && !matches!(row.cells.get(&visibility.column), Some(Cell::Value(_)))
                         {
@@ -41,7 +53,10 @@ impl Candidate<'_> {
                         if *if_absent && self.present(branch, table, &row.id, valid)? {
                             return Err(conflict("rtdb/already-present", "The put overlaps an existing row"));
                         }
-                        let image = RowImage { cells, expires_at, custody_group: row.custody_group };
+                        let image = RowImage {
+                            cells, expires_at, custody_group: row.custody_group,
+                            custody_payload: row.custody_payload.clone(),
+                        };
                         self.write(branch, table, row.id.clone(), valid, Some(Arc::new(image)))?;
                     }
                 }

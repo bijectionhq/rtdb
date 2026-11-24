@@ -37,7 +37,7 @@ impl ServingScope {
         } else {
             projected.source_basis(cut.basis)?
         };
-        Ok((QueryView { snapshot: rtdb_query::branch_snapshot(&view, memory)?, cut, claim: None }, raw_cut))
+        Ok((QueryView { snapshot: rtdb_query::branch_snapshot(&view, memory)?, cut, claim: None, custody_groups: BTreeSet::new() }, raw_cut))
     }
 
     pub fn changes(&self, index: &BranchIndex, request: &Changes) -> Result<ChangePage> {
@@ -134,7 +134,7 @@ mod tests {
             let cells = StructFields::from([("label".into(), Value::Binary(vec![label]))]);
             index.apply(BranchEffect::Write {
                 branch: MAIN_BRANCH.into(), table: table.clone(),
-                event: BranchEvent { cut, id, valid: Interval::ALL, image: Some(Arc::new(RowImage { cells, expires_at: None, custody_group: None })) },
+                event: BranchEvent { cut, id, valid: Interval::ALL, image: Some(Arc::new(RowImage { cells, expires_at: None, custody_group: None, custody_payload: None })) },
             }).unwrap();
         };
         let first = advance(&mut index, 1);

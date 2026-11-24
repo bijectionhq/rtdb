@@ -135,6 +135,8 @@ message Row {
   map<string, Cell> cells = 1;
   // A 16-byte nonzero database-local custody group. Empty leaves the row unbound.
   bytes custody_group = 2;
+  // Cells in these columns are sealed before the transaction is persisted.
+  repeated string protected_columns = 3;
 }
 message Put { string branch = 1; string table = 2; repeated Row rows = 3; bool if_absent = 4; }
 message Delete { string branch = 1; string table = 2; repeated Cell ids = 3; Interval valid = 4; }

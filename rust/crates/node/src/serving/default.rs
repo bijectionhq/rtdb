@@ -5,7 +5,7 @@ use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::tokens::VerifiedClaims;
 use rtdb_index::branches::{BranchView, BranchWrite};
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingScope, NativeServingView};
-use rtdb_tx::transact::Receipt;
+use rtdb_tx::transact::{CustodyGroupId, ROW_CUSTODY, Receipt};
 use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer}};
 use tokio_util::sync::CancellationToken;
 
@@ -46,13 +46,21 @@ impl ServingDriver for DefaultServing {
         } else {
             None
         };
-        let snapshot = rtdb_query::branch_snapshot(&branch, &self.memory)?;
-        Ok(QueryView { snapshot, cut: branch.cut(), claim })
+        let cut = branch.cut();
+        let (snapshot, custody_groups) = if snapshot.index.has_custody_groups() {
+            let vault = self.tokens.authority().await?.custody_vault();
+            super::custody::snapshot(&branch, &self.memory, &vault).await?
+        } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new()) };
+        Ok(QueryView { snapshot, cut, claim, custody_groups })
     }
 
-    async fn transact(&self, request: TransactSubmission, cancellation: &CancellationToken) -> Result<Receipt> {
+    async fn transact(&self, mut request: TransactSubmission, cancellation: &CancellationToken) -> Result<Receipt> {
         if !self.writable {
             return Err(Anomaly::unsupported("rtdb/default-serving-read-only", "The default serving attachment is read-only"));
+        }
+        if request.transaction.uses_custody() && self.features().contains(&ROW_CUSTODY) {
+            let vault = self.tokens.authority().await?.custody_vault();
+            super::custody::prepare(&mut request, &vault).await?;
         }
         let claims = if request.transaction.claims().next().is_some() {
             self.tokens.authority().await?.verify_claims(request.transaction.claims()).await
@@ -60,6 +68,13 @@ impl ServingDriver for DefaultServing {
             VerifiedClaims::default()
         };
         self.handle.transact(request, claims, None, cancellation).await
+    }
+
+    async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        if groups.is_empty() { return Ok(()); }
+        let view = self.handle.view(At::Linearizable, cancellation).await?;
+        let vault = self.tokens.authority().await?.custody_vault();
+        super::custody::check_delivery(&view.index, &vault, groups).await
     }
 
     async fn tx_status(&self, key: &[u8], cancellation: &CancellationToken) -> Result<Receipt> {

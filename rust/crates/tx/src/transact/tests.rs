@@ -14,7 +14,7 @@ fn request(key: u8, ops: Vec<Op>) -> Transact {
 }
 
 fn put(branch: &str, id: i64, key: &str) -> Op {
-    let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("key".into(), Cell::Value(Value::Utf8(key.into())))]), custody_group: None };
+    let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("key".into(), Cell::Value(Value::Utf8(key.into())))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None };
     Op::Put { branch: branch.into(), table: table(), rows: vec![row], if_absent: false }
 }
 

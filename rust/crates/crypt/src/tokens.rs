@@ -141,6 +141,10 @@ impl Purpose {
 }
 
 impl TokenAuthority {
+    pub fn custody_vault(&self) -> crate::CustodyVault {
+        crate::CustodyVault::new(self.incarnation, Arc::clone(&self.kms))
+    }
+
     pub fn new(incarnation: Uuid, kms: Arc<dyn Kms>, keys: Arc<dyn TokenKeys>) -> Self {
         Self {
             incarnation,

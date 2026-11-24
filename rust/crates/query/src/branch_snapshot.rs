@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::{
     LiveIndex, Snapshot, StoredEvent, StoredOperation, TableCatalog, TransactionBuffer, TrieCatalog,
-    branches::{BranchCut, BranchView},
+    branches::{BranchCut, BranchView, RowImage},
 };
 use rtdb_trie::TrieConfig;
 use rtdb_types::{
@@ -13,6 +13,18 @@ use rtdb_types::{
 };
 
 pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Result<Snapshot> {
+    branch_snapshot_with(view, memory, |image| {
+        if image.custody_payload.is_some() {
+            return Err(Anomaly::unsupported("rtdb/row-custody", "The query route has no protected value reader"));
+        }
+        Ok(image.cells.clone())
+    })
+}
+
+pub fn branch_snapshot_with(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>,
+    mut open_image: impl FnMut(&RowImage) -> Result<StructFields<Value>>,
+) -> Result<Snapshot> {
     let tables = Arc::new(TableCatalog::default());
     let tries = Arc::new(TrieCatalog::default());
     let mut live = Arc::new(LiveIndex::new(BlockIndex(0), None, TrieConfig::default()));
@@ -27,7 +39,7 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
                 if let Some(image) = &event.image
                     && put_until > event.valid.lower()
                 {
-                    target.push((table, id, Interval::new(event.valid.lower(), put_until)?, event.cut, Some(&image.cells)));
+                    target.push((table, id, Interval::new(event.valid.lower(), put_until)?, event.cut, Some(image.as_ref())));
                 }
                 if put_until < event.valid.upper() {
                     target.push((table, id, Interval::new(put_until, event.valid.upper())?, event.cut, None));
@@ -43,11 +55,11 @@ pub fn branch_snapshot(view: &BranchView<'_>, memory: &Arc<MemoryBudget>) -> Res
         let system_time = events.first().map_or(head.system_time, |(_, _, _, cut, _)| cut.system_time);
         let mut buffer = TransactionBuffer::new(before, tx_key(BranchCut { basis, system_time })?, Arc::clone(memory))?;
         for (table, id, valid_time, _, image) in events {
-            let operation = image.map_or(StoredOperation::Delete, |cells| {
-                let mut cells = cells.clone();
+            let operation = if let Some(image) = image {
+                let mut cells = open_image(image)?;
                 cells.insert(WRITTEN_BASIS_COLUMN.into(), basis_value(basis));
                 StoredOperation::Put(cells)
-            });
+            } else { StoredOperation::Delete };
             buffer.append(table.clone(), StoredEvent {
                 position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(),
                 system_from: system_time, valid_time, operation, recency: None,

@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, time::Duration};
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_index::{Snapshot, branches::BranchCut};
-use rtdb_tx::transact::Receipt;
+use rtdb_tx::transact::{CustodyGroupId, Receipt};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority, TransactSubmission};
 use rtdb_types::{
     EntityId, Interval, Result, StructFields, TableRef, Timestamp, Value,
@@ -11,6 +11,7 @@ use rtdb_types::{
 };
 use tokio_util::sync::CancellationToken;
 
+pub(crate) mod custody;
 pub(crate) mod default;
 mod visibility;
 pub use visibility::{ScopedSubmission, ServingScope, ROW_VISIBILITY};
@@ -26,6 +27,7 @@ pub struct QueryView {
     pub snapshot: Snapshot,
     pub cut: BranchCut,
     pub claim: Option<Claim>,
+    pub custody_groups: BTreeSet<CustodyGroupId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,11 @@ pub trait ServingDriver: Send + Sync {
     }
 
     fn supports_row_visibility(&self) -> bool { false }
+
+    async fn check_custody_delivery(&self, groups: &BTreeSet<CustodyGroupId>, _cancellation: &CancellationToken) -> Result<()> {
+        if groups.is_empty() { return Ok(()); }
+        Err(rtdb_types::Anomaly::unsupported("rtdb/row-custody", "The query route has no protected delivery authority"))
+    }
 
     async fn query_scoped(&self, _source: QuerySource, _track: bool, _now: Timestamp,
                           _scope: &ServingScope, _cancellation: &CancellationToken) -> Result<QueryView> {

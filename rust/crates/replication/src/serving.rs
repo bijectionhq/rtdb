@@ -61,12 +61,19 @@ impl TransactSubmission {
             attempt: *self.attempt.as_bytes(),
             submitted_at: self.submitted_at,
             source_sha256: Sha256::digest(&self.source).into(),
+            logical_sha256: self.transaction.admission.and_then(|admission| admission.logical_sha256),
         }
     }
 
     pub fn into_admitted_transaction(mut self) -> Transact {
         self.transaction.admission = Some(self.admission());
         self.transaction
+    }
+
+    pub fn record_logical_admission(&mut self, logical_sha256: [u8; 32]) {
+        let mut admission = self.admission();
+        admission.logical_sha256 = Some(logical_sha256);
+        self.transaction.admission = Some(admission);
     }
 }
 
@@ -449,7 +456,7 @@ mod tests {
                 key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
                 requires: Vec::new(),
                 ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
-                    rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]), custody_group: None }] }],
+                    rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None }] }],
             },
         }
     }
