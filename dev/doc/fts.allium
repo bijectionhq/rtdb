@@ -232,7 +232,9 @@ rule SearchJobRuns {
     -- Gap nomination skips the directory when every block in its sealed prefix has posting coverage or a live L0 trie.
     -- An uncovered compacted block in the sealed prefix is nominated through the captured entity directory.
     -- Compacted history beyond the sealed prefix is nominated from live primary tries.
-    -- Primary gap reads count the rows of each decoded page against the inspection budget.
+    -- Primary gap reads count all rows of each candidate page against the inspection budget before decoding the page.
+    -- On a cache miss with ranged storage, a primary gap read checks the page's IPC metadata before reading its body.
+    -- Primary history reads project event headers and recorded keys where the page layout supports projection.
     -- Directory gap reads count only rows from uncovered blocks that lack a live L0 trie against that budget.
     -- The per-trie point path checks recorded entity keys in history files, primary pages, and live segments.
     -- Histories with different entity keys under one IID resolve through the scan.

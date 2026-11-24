@@ -60,6 +60,14 @@ impl DataFile {
         self.decode_page_as(page, memory, DataProjection::Full).await
     }
 
+    async fn page_rows(&mut self, page: usize, memory: &Arc<MemoryBudget>) -> Result<usize> {
+        self.open(memory).await?;
+        let opened = self.opened.as_ref().expect("the data file is open");
+        let decoder = &opened.layout.decoder;
+        let metadata = self.read_range(opened.whole.as_ref(), decoder.page_metadata_range(page)?, memory).await?;
+        decoder.page_rows(page, metadata.as_slice())
+    }
+
     async fn decode_page_as(&mut self, page: usize, memory: &Arc<MemoryBudget>, projection: DataProjection<'_>) -> Result<(arrow_array::RecordBatch, Arc<MemoryReservation>)> {
         self.open(memory).await?;
         let opened = self.opened.as_ref().expect("the data file is open");
@@ -188,14 +196,11 @@ pub async fn trie_row_count_up_to(
         storage, key: ObjectKey::new(slug.data_key(trie))?,
         metadata: ObjectKey::new(slug.metadata_key(trie))?, opened: None,
     };
-    file.open(&context.memory).await?;
-    let opened = file.opened.as_ref().expect("the data file is open");
-    let decoder = &opened.layout.decoder;
+    let pages = file.open(&context.memory).await?.layout.decoder.page_count();
     let mut rows = 0usize;
-    for page in 0..decoder.page_count() {
+    for page in 0..pages {
         context.check_cancelled()?;
-        let metadata = file.read_range(opened.whole.as_ref(), decoder.page_metadata_range(page)?, &context.memory).await?;
-        let page_rows = decoder.page_rows(page, metadata.as_slice())?;
+        let page_rows = file.page_rows(page, &context.memory).await?;
         if page_rows > limit - rows { return Ok(None); }
         rows += page_rows;
     }
@@ -268,21 +273,42 @@ pub(crate) async fn primary_point_events(
     let mut inspected = 0usize;
     for page in pages {
         if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
-        let (batch, _charged) = match file.storage.view::<CachedPage>(&file.key, View::Page(page)) {
+        let remaining = max_rows - inspected;
+        let held = file.storage.view::<CachedPage>(&file.key, View::Page(page));
+        let preflight_rows = match &held {
+            Some(held) => Some(held.batch.view().len()),
+            None if max_rows != usize::MAX => Some(file.page_rows(page, memory).await?),
+            None => None,
+        };
+        if let Some(rows) = preflight_rows {
+            if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
+            if rows > remaining { return Ok(None); }
+            audience_work::scan_items(rows)?;
+        }
+        let (batch, _charged) = match held {
             Some(held) => {
                 audience_work::decode_bytes(held.bound)?;
                 (held.batch.view().clone(), memory.reserve(held.bound)?)
             }
             None => {
-                let (batch, charge) = file.decode_page(page, memory).await?;
+                let (batch, charge) = file.decode_page_as(page, memory, DataProjection::PutColumns(&[])).await?;
                 (EventBatch::new(batch)?, charge)
             }
         };
-        inspected = inspected.saturating_add(batch.len());
-        if inspected > max_rows { return Ok(None); }
-        audience_work::scan_items(batch.len())?;
+        let rows = batch.len();
+        match preflight_rows {
+            Some(expected) if rows != expected => {
+                return Err(Anomaly::fault("rtdb.query/point-page-rows", "Primary page row count differs from its metadata"));
+            }
+            Some(_) => {}
+            None => {
+                if rows > remaining { return Ok(None); }
+                audience_work::scan_items(rows)?;
+            }
+        }
+        inspected += rows;
         let page = u32::try_from(page).map_err(|error| invalid("point-page", error))?;
-        for row in 0..batch.len() {
+        for row in 0..rows {
             let iid = batch.iid(row)?;
             if keys.is_some_and(|keys| !keys.contains(&iid)) { continue; }
             let event = crate::LocatedHistoryEvent { header: batch.header(row)?, origin: batch.origin(row)?, witness: None,
@@ -2605,12 +2631,13 @@ mod tests {
 
     use rtdb_types::StructFields;
     use super::*;
+    use std::ops::Range;
     use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
     use rtdb_format::{block::proto as pb, catalog::BlockCatalog, data::{StoredEvent, StoredOperation, build_event_batch},
         ipc::write_file, keys::{TrieKey, block_key}, metadata::MetadataBuilder};
     use rtdb_index::{PartitionState, TransactionBuffer};
     use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable};
-    use rtdb_storage::{MemoryStore, ObjectStore};
+    use rtdb_storage::{MemoryStore, ObjectStore, Result as StorageResult, StoredObject};
     use rtdb_trie::TrieConfig;
     use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
@@ -3551,32 +3578,30 @@ mod tests {
         assert_eq!(page.columns[0].value(0).unwrap(), Value::I64(2));
     }
 
+    struct ScanStore {
+        inner: Arc<MemoryStore>,
+        data: ObjectKey,
+        ranged: bool,
+        reads: std::sync::Mutex<Vec<Range<u64>>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for ScanStore {
+        fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { key != &self.data || self.ranged }
+        async fn head(&self, key: &ObjectKey) -> StorageResult<StoredObject> { self.inner.head(key).await }
+        async fn get(&self, key: &ObjectKey) -> StorageResult<Bytes> { self.get_range(key, 0..self.head(key).await?.size).await }
+        async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> StorageResult<Bytes> {
+            if key == &self.data { self.reads.lock().unwrap().push(range.clone()); }
+            self.inner.get_range(key, range).await
+        }
+        async fn put(&self, key: &ObjectKey, bytes: Bytes) -> StorageResult<()> { self.inner.put(key, bytes).await }
+        async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> StorageResult<()> { self.inner.put_file(key, path).await }
+        async fn list(&self, directory: Option<&ObjectKey>) -> StorageResult<Vec<StoredObject>> { self.inner.list(directory).await }
+        async fn delete(&self, key: &ObjectKey) -> StorageResult<()> { self.inner.delete(key).await }
+    }
+
     #[tokio::test]
     async fn a_cold_point_scan_returns_arrow_after_reading_the_selected_page() {
-        use std::ops::Range;
-        use rtdb_storage::{Result as StorageResult, StoredObject};
-
-        struct ScanStore {
-            inner: Arc<MemoryStore>,
-            data: ObjectKey,
-            ranged: bool,
-            reads: std::sync::Mutex<Vec<Range<u64>>>,
-        }
-        #[async_trait]
-        impl ObjectStore for ScanStore {
-            fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { key != &self.data || self.ranged }
-            async fn head(&self, key: &ObjectKey) -> StorageResult<StoredObject> { self.inner.head(key).await }
-            async fn get(&self, key: &ObjectKey) -> StorageResult<Bytes> { self.get_range(key, 0..self.head(key).await?.size).await }
-            async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> StorageResult<Bytes> {
-                if key == &self.data { self.reads.lock().unwrap().push(range.clone()); }
-                self.inner.get_range(key, range).await
-            }
-            async fn put(&self, key: &ObjectKey, bytes: Bytes) -> StorageResult<()> { self.inner.put(key, bytes).await }
-            async fn put_file(&self, key: &ObjectKey, path: &std::path::Path) -> StorageResult<()> { self.inner.put_file(key, path).await }
-            async fn list(&self, directory: Option<&ObjectKey>) -> StorageResult<Vec<StoredObject>> { self.inner.list(directory).await }
-            async fn delete(&self, key: &ObjectKey) -> StorageResult<()> { self.inner.delete(key).await }
-        }
-
         let (state, table, events, store, _) = persisted_page_fixture().await;
         let data = store.list(None).await.unwrap().into_iter()
             .find(|object| object.key.as_str().contains("/data/")).unwrap().key;
@@ -3628,15 +3653,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn primary_points_keep_the_recorded_keys_of_colliding_rows() {
+    async fn primary_points_keep_the_origins_locations_and_exact_keys_of_colliding_rows() {
         let (state, table, events, store, _) = persisted_page_fixture().await;
         let value = state.value();
         let entry = value.table_catalog().entry(&table).unwrap();
         let trie = TrieKey::l0(value.live().block_index()).unwrap();
+        let origins = [0, 1].map(|row| rtdb_types::EventOrigin::at([1; 16], row, trie.block_index()));
         let mut first = events[0].clone();
         first.entity_key = Some(vec![1].into());
+        first.origin = Some(origins[0]);
         let mut second = first.clone();
         second.entity_key = Some(vec![2].into());
+        second.origin = Some(origins[1]);
         second.system_from = Timestamp(75);
         let puts = value.live().tables()[&table].column_types().clone();
         let page = build_event_batch(&[first, second], Some(puts), None).unwrap();
@@ -3658,11 +3686,15 @@ mod tests {
             constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
         let keys = [events[0].iid].into();
         let mut recorded = Vec::new();
-        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(crate::IidScope::Set(&keys)), usize::MAX, |_, key| {
-            recorded.push(key.unwrap().to_vec());
+        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(crate::IidScope::Set(&keys)), usize::MAX, |event, key| {
+            let crate::SearchRowLocation::Persisted { trie: actual, page, row } = event.location else {
+                panic!("Expected a persisted point location");
+            };
+            assert_eq!(actual, trie);
+            recorded.push((page, row, event.origin, key.unwrap().to_vec()));
             Ok(true)
         }).await.unwrap(), Some(2));
-        assert_eq!(recorded, [vec![1], vec![2]]);
+        assert_eq!(recorded, [(0, 0, Some(origins[0]), vec![1]), (0, 1, Some(origins[1]), vec![2])]);
         assert!(crate::table_point_rows(&request, &keys).await.unwrap().is_none());
     }
 
@@ -3692,6 +3724,55 @@ mod tests {
         }).await.unwrap(), None);
         assert_eq!(visited, [events[0].iid]);
         assert_eq!(memory.used_bytes(), before);
+    }
+
+    #[tokio::test]
+    async fn gap_nomination_without_entity_history_declines_a_wide_first_page_before_reading_its_body() {
+        let (state, table, events) = live_table_with_values([Value::Utf8("wide".into())]);
+        let value = state.value();
+        let entry = value.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(value.live().block_index()).unwrap();
+        let put_fields = value.live().tables()[&table].column_types().clone();
+        let mut event = events[0].clone();
+        event.operation = StoredOperation::Put(StructFields::from([
+            ("_id".into(), Value::I64(1)), ("v".into(), Value::Utf8("wide".repeat(16_384))),
+        ]));
+        let rows: Vec<_> = (0..33).rev().map(|row| StoredEvent { system_from: Timestamp(100 + row), ..event.clone() }).collect();
+        let page = build_event_batch(&rows, Some(put_fields), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, false);
+        metadata.write_leaf(&page).unwrap();
+        let (metadata, statistics) = metadata.finish().unwrap();
+        let bytes = write_file(page.schema().as_ref(), &[page]).unwrap();
+        let tail = bytes.len() - 10;
+        let footer = tail - arrow_ipc::reader::read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+        let decoder = PageDecoder::from_footer(&bytes[footer..tail], footer as u64, None).unwrap();
+        let expected = [tail as u64..bytes.len() as u64, footer as u64..tail as u64, decoder.page_metadata_range(0).unwrap()];
+        let inner = Arc::new(MemoryStore::default());
+        let data = ObjectKey::new(entry.slug.data_key(&trie)).unwrap();
+        let addition = CatalogTrie::notification(trie.clone(), bytes.len() as i64, Some(statistics)).unwrap();
+        inner.put(&data, bytes.into()).await.unwrap();
+        inner.put(&ObjectKey::new(entry.slug.metadata_key(&trie)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![addition])]), Timestamp(200)).unwrap();
+
+        let store = Arc::new(ScanStore { inner, data, ranged: true, reads: Default::default() });
+        let storage = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let snapshot = state.value().snapshot();
+        let live_trie = snapshot.trie_catalog().trie(&table, &trie).unwrap();
+        let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
+            storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+        let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
+            bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
+            current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
+            constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+
+        let inspected = crate::entity_history::visit_trie_events(&request, &entry.slug, live_trie, None, 32, |_, _| {
+            panic!("An over-limit page must never reach the visitor");
+        }).await.unwrap();
+        assert_eq!(inspected, None);
+        assert_eq!(*store.reads.lock().unwrap(), expected);
     }
 
     #[tokio::test]
