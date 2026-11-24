@@ -115,6 +115,7 @@ fn table() -> TableRef {
 
 fn request(key: u8, op: Op) -> Transact {
     Transact {
+        admission: None,
         key: vec![key; 16],
         require: vec![],
         window: Window::default(),

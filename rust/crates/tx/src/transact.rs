@@ -24,6 +24,13 @@ pub struct Window {
     pub before: Option<Timestamp>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Admission {
+    pub attempt: [u8; 16],
+    pub submitted_at: Timestamp,
+    pub source_sha256: [u8; 32],
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Transact {
     pub key: Vec<u8>,
@@ -34,6 +41,8 @@ pub struct Transact {
     pub otherwise: Vec<Op>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Guard>,
+    #[serde(skip)]
+    pub admission: Option<Admission>,
 }
 
 impl Transact {
@@ -216,6 +225,8 @@ pub struct ResolvedTransact {
     receipt_namespace: Option<[u8; 32]>,
     /// The writer's clock sample when it admitted the request.
     submitted_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wire_admission: Option<Admission>,
 }
 
 impl ResolvedTransact {
@@ -223,7 +234,10 @@ impl ResolvedTransact {
     /// the attempt identity (the idempotency key), when the writer admitted it, and the
     /// SHA-256 commitment to the exact submitted request.
     pub fn admission(&self) -> (&[u8], Timestamp, [u8; 32]) {
-        (&self.receipt.key, self.submitted_at, self.fingerprint)
+        match &self.wire_admission {
+            Some(admission) => (&admission.attempt, admission.submitted_at, admission.source_sha256),
+            None => (&self.receipt.key, self.submitted_at, self.fingerprint),
+        }
     }
 }
 
@@ -429,6 +443,7 @@ impl TransactState {
             // For a timed write, `after` is the index once it settles at `position + 1`.
             let record = TransactionRecord::Tx(ResolvedTransact {
                 fingerprint, receipt, effects, before, receipt_namespace, submitted_at: now,
+                wire_admission: request.admission,
             });
             Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
         }

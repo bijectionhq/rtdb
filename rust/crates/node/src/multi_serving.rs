@@ -94,7 +94,7 @@ impl ServingDriver for MultiServing {
     async fn transact_scoped(&self, request: ScopedSubmission, scope: ServingScope,
                              cancellation: &CancellationToken) -> Result<Receipt> {
         cancellation.run_until_cancelled(self.writes.transact_scoped(
-            request.transaction, scope.labels, scope.receipt_namespace,
+            request.into_admitted_transaction(), scope.labels, scope.receipt_namespace,
         )).await.ok_or_else(interrupted)?
     }
 
@@ -169,7 +169,7 @@ impl ServingDriver for MultiServing {
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         cancellation
-            .run_until_cancelled(self.writes.transact(request.transaction))
+            .run_until_cancelled(self.writes.transact(request.into_admitted_transaction()))
             .await
             .ok_or_else(interrupted)?
     }
@@ -415,6 +415,7 @@ mod tests {
 
     fn write(key: u8, title: &str, before: Option<Timestamp>) -> TransactSubmission {
         let transaction = Transact {
+            admission: None,
             key: vec![key; 16],
             require: vec![],
             window: Window {

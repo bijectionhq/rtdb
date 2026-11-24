@@ -5,7 +5,7 @@ use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Decision, LINEARIZABLE, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Admission, Decision, LINEARIZABLE, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis}};
@@ -35,6 +35,21 @@ pub struct TransactSubmission {
     pub attempt: Uuid,
     pub submitted_at: Timestamp,
     pub source: Bytes,
+}
+
+impl TransactSubmission {
+    fn admission(&self) -> Admission {
+        Admission {
+            attempt: *self.attempt.as_bytes(),
+            submitted_at: self.submitted_at,
+            source_sha256: Sha256::digest(&self.source).into(),
+        }
+    }
+
+    pub fn into_admitted_transaction(mut self) -> Transact {
+        self.transaction.admission = Some(self.admission());
+        self.transaction
+    }
 }
 
 #[derive(Clone)]
@@ -230,7 +245,7 @@ impl NativeServing {
     }
 
     pub(crate) fn decide_batch(
-        &mut self, now: Timestamp, requests: Vec<(TransactSubmission, VerifiedClaims, Completion)>,
+        &mut self, now: Timestamp, mut requests: Vec<(TransactSubmission, VerifiedClaims, Completion)>,
     ) -> Result<Vec<proto::NoOp>> {
         if !self.view.borrow().compatible {
             for (_, _, completion) in requests { let _ = completion.send(Err(incompatible())); }
@@ -247,7 +262,8 @@ impl NativeServing {
             self.deciding = true;
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
-        let decisions = requests.iter().map(|(request, claims, _)| {
+        let decisions = requests.iter_mut().map(|(request, claims, _)| {
+            request.transaction.admission = Some(request.admission());
             pipeline.decide(&request.transaction, now, NATIVE_WRITE_FEATURES, claims)
         }).collect::<Vec<_>>();
         let mut messages = Vec::new();
@@ -340,7 +356,7 @@ fn frame(position: u64, request: &TransactSubmission, record: &[u8]) -> Bytes {
     frame.put_u64(position);
     frame.extend_from_slice(request.attempt.as_bytes());
     frame.put_i64(request.submitted_at.0);
-    frame.extend_from_slice(&Sha256::digest(&request.source));
+    frame.extend_from_slice(&request.transaction.admission.expect("framed transaction was admitted").source_sha256);
     frame.extend_from_slice(record);
     frame.freeze()
 }
@@ -392,6 +408,7 @@ mod tests {
             attempt: Uuid::from_u128(key.into()), submitted_at: Timestamp(31),
             source: Bytes::from_static(b"\x0a\x02\x03\x04\xf8\x07\x01"),
             transaction: Transact {
+                admission: None,
                 key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
                 requires: Vec::new(),
                 ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
