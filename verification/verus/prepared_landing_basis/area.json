@@ -1,5 +1,5 @@
 {
-  "summary": "The shipped prepared Proposal switch requires the complete original predecessor, physical catalog and assigned source position for either prepared outcome.",
+  "summary": "The shipped prepared Proposal switch requires the complete original predecessor, physical catalog, assigned source transaction and assigned system time for either prepared outcome.",
   "flags": ["--no-external-by-default"],
   "min_verified_functions": 2,
   "controls": {
@@ -17,7 +17,13 @@
     },
     "substitute-assigned-position": {
       "defect": "A prepared generation can switch with an assigned source position different from the source position that owns its effects.",
-      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_position == assigned_position\n", "replace": ""}],
+      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_key.0 == assigned_key.0\n", "replace": ""}],
+      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 1
+    },
+    "substitute-assigned-time": {
+      "defect": "A prepared generation can switch with a different history timestamp at the same source transaction.",
+      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_key.1 == assigned_key.1\n", "replace": ""}],
       "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
       "min_verified_functions": 1
     }
