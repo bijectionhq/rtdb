@@ -38,7 +38,7 @@ impl Operation {
             Self::Public(TxOp::OwnedDeclareRelation { relation, .. } | TxOp::OwnedDeclarePath { relation, .. } | TxOp::OwnedDeclareSpatialPath { relation, .. } | TxOp::OwnedDeclareEncodedSpatialPath { relation, .. } | TxOp::OwnedRequireSpatialPath { relation, .. } | TxOp::OwnedDropSpatialPath { relation, .. }
                 | TxOp::OwnedRetireRelation { relation, .. } | TxOp::OwnedDeclareSearchPath { relation, .. } | TxOp::OwnedDeclareUniquePath { relation, .. }
                 | TxOp::OwnedDeclareFixedRange { relation, .. } | TxOp::OwnedDeclareCapacity { relation, .. } | TxOp::OwnedCheckCapacity { relation, .. } | TxOp::OwnedCheckRange { relation, .. } | TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckWorldPurge { relation, .. }
-                | TxOp::OwnedErase { relation, .. } | TxOp::OwnedSweepExpired { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
+                | TxOp::OwnedErase { relation, .. } | TxOp::OwnedReplayResidue { relation, .. } | TxOp::OwnedSweepExpired { relation, .. } | TxOp::OwnedDelete { relation, .. } | TxOp::OwnedInsertDocs { relation, .. }
                 | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. }) | Self::OwnedWriteIids { relation, .. } | Self::OwnedArrowIids { relation, .. } => Some(relation),
             _ => None,
         }
@@ -46,7 +46,8 @@ impl Operation {
 
     pub(crate) fn direct_archive_relation(&self) -> Option<&rtdb_types::OwnedRelation> {
         match self {
-            Self::Public(TxOp::OwnedDelete { relation, .. } | TxOp::OwnedErase { relation, .. }) => Some(relation),
+            Self::Public(TxOp::OwnedDelete { relation, .. } | TxOp::OwnedErase { relation, .. }
+                | TxOp::OwnedReplayResidue { relation, .. }) => Some(relation),
             operation => operation.owned_documents().map(|(relation, _)| relation),
         }
     }
@@ -175,7 +176,7 @@ impl SourceTransaction {
                     (relation.name().len() + rule.path.capacity() + rule.column.capacity(), None, 0),
                 Operation::Public(TxOp::OwnedCheckRange { relation, region, .. }) =>
                     (range_evidence_bytes(relation, region), None, 0),
-                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedSweepExpired { relation, id, .. }) =>
+                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedReplayResidue { relation, id, .. } | TxOp::OwnedSweepExpired { relation, id, .. }) =>
                     (relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?, None, 0),
                 Operation::Public(TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. } | TxOp::OwnedArrowDocs { relation, .. }) => (relation.name().len(), None, 0),
                 Operation::Public(TxOp::OwnedRelativePeriod { relation, effect, .. }) => {
@@ -461,7 +462,7 @@ impl SourceTransaction {
                 Operation::Public(TxOp::OwnedDeclareFixedRange { relation, rule }) =>
                     relation.name().len() + rule.path.capacity() + rule.column.capacity(),
                 Operation::Public(TxOp::OwnedCheckRange { relation, region, .. }) => range_evidence_bytes(relation, region),
-                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedSweepExpired { relation, id, .. }
+                Operation::Public(TxOp::OwnedCheck { relation, id, .. } | TxOp::OwnedDelete { relation, id, .. } | TxOp::OwnedErase { relation, id } | TxOp::OwnedReplayResidue { relation, id, .. } | TxOp::OwnedSweepExpired { relation, id, .. }
                     | TxOp::OwnedRelativePeriod { relation, effect: OwnedPeriodEffect::Delete(id), .. }) =>
                     relation.name().len().checked_add(id.as_value().retained_bytes()?).ok_or_else(overflow)?,
                 Operation::Removed(name) => name.capacity(),
@@ -847,6 +848,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("expiry".into(), Value::I64(expiry.0));
             body.insert("scope".into(), Value::Binary(scope.encode().to_vec()));
             "rtdb-owned-sweep-expired-v2"
+        }
+        Operation::Public(TxOp::OwnedReplayResidue { relation, id, origin, valid }) => {
+            body.insert("relation".into(), Value::Utf8(relation.name().into()));
+            body.insert("id".into(), id.as_value());
+            body.insert("origin".into(), Value::Binary(origin.0.to_vec()));
+            time_fields(&mut body, Some(valid.lower()), Some(valid.upper()));
+            "rtdb-owned-replay-residue-v1"
         }
         Operation::Public(TxOp::OwnedErase { relation, id }) => {
             body.insert("relation".into(), Value::Utf8(relation.name().into()));
@@ -1751,6 +1759,7 @@ impl SourceOperationReader<'_> {
             "rtdb-owned-erase-v2" => &["relation", "id"],
             "rtdb-owned-sweep-expired-v2" => &["relation", "id", "created", "expiry", "scope"],
             "rtdb-owned-delete-v1" => &["relation", "id", "_valid_from", "_valid_to"],
+            "rtdb-owned-replay-residue-v1" => &["relation", "id", "origin", "_valid_from", "_valid_to"],
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1" => &["iids", "_valid_from", "_valid_to", "field_presence"],
             "insert-docs" | "put-docs" | "patch-docs" => &["iids", "_valid_from", "_valid_to"],
             "delete-docs" => &["table", "iids", "_valid_from", "_valid_to"],
@@ -2066,6 +2075,23 @@ impl SourceOperationReader<'_> {
                     scope: rtdb_types::PlacedAttemptScope::decode(&scope)?,
                 }
             }
+            "rtdb-owned-replay-residue-v1" => {
+                let (Value::Utf8(relation), Value::Binary(origin)) = (value("relation")?, value("origin")?) else {
+                    return Err(invalid("Owned archive residue has no relation or origin"));
+                };
+                let from = optional_timestamp(value("_valid_from")?)?.ok_or_else(|| invalid("Owned archive residue has no start"))?;
+                let to = optional_timestamp(value("_valid_to")?)?.ok_or_else(|| invalid("Owned archive residue has no end"))?;
+                let valid = rtdb_types::Interval::new(from, to)?;
+                if valid.is_empty() {
+                    return Err(invalid("Owned archive residue has an empty extent"));
+                }
+                TxOp::OwnedReplayResidue {
+                    relation: rtdb_types::OwnedRelation::new(relation)?,
+                    id: value("id")?.entity_id()?,
+                    origin: rtdb_types::EventOrigin(origin.try_into().map_err(|_| invalid("Owned archive residue origin must contain 32 bytes"))?),
+                    valid,
+                }
+            }
             "rtdb-owned-erase-v2" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned erase has no relation")); };
                 TxOp::OwnedErase { relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()? }
@@ -2376,6 +2402,21 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn replay_residue_source_keeps_original_origin_identity_and_extent() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("facts").unwrap();
+        let id = EntityId::Uuid([1; 16]);
+        let origin = rtdb_types::EventOrigin::at([2; 16], 5, rtdb_types::BlockIndex(3));
+        let valid = rtdb_types::Interval::new(Timestamp(10), Timestamp(20)).unwrap();
+        let source = SourceTransaction::new(vec![TxOp::OwnedReplayResidue {
+            relation: relation.clone(), id: id.clone(), origin, valid,
+        }], SubmitOptions::default(), &memory).unwrap();
+        assert!(matches!(roundtrip(&source).operations.as_slice(), [
+            Operation::Public(TxOp::OwnedReplayResidue { relation: r, id: i, origin: o, valid: v })
+        ] if (r, i, *o, *v) == (&relation, &id, origin, valid)));
     }
 
     #[test]

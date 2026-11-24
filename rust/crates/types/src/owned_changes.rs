@@ -10,6 +10,7 @@ pub const OWNED_CHANGE_PAGE_GROUPS: usize = 128;
 pub enum OwnedChangeKind {
     Put,
     Delete,
+    Redacted,
     Erase,
     Expired(Interval),
 }
@@ -32,6 +33,7 @@ impl OwnedChange {
                     match self.kind {
                         OwnedChangeKind::Put => "put",
                         OwnedChangeKind::Delete => "delete",
+                        OwnedChangeKind::Redacted => "redacted",
                         OwnedChangeKind::Erase => "erase",
                         OwnedChangeKind::Expired(_) => "expired",
                     }
@@ -70,6 +72,7 @@ impl OwnedChange {
         let kind = match fields.get("op") {
             Some(Value::Utf8(op)) if op == "put" => OwnedChangeKind::Put,
             Some(Value::Utf8(op)) if op == "delete" => OwnedChangeKind::Delete,
+            Some(Value::Utf8(op)) if op == "redacted" => OwnedChangeKind::Redacted,
             Some(Value::Utf8(op)) if op == "erase" => OwnedChangeKind::Erase,
             Some(Value::Utf8(op)) if op == "expired" => {
                 let (Some(Value::I64(created)), Some(Value::I64(expiry))) =

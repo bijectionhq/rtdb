@@ -1074,6 +1074,9 @@ impl<'a> OpenTransaction<'a> {
             (&mut self.hosted_replay, operation.direct_archive_relation())
             && let Some(position) = replay.take_direct_effect()?
         {
+            if position == 0 && matches!(operation, Operation::Public(TxOp::OwnedReplayResidue { .. })) {
+                return Err(replay_period_unavailable());
+            }
             let owner = self.options.user.as_deref().ok_or_else(no_owned_principal)?;
             self.buffer.begin_direct_archive_effect(relation.table(owner), position)?;
             true
@@ -1188,6 +1191,8 @@ impl<'a> OpenTransaction<'a> {
             },
             Operation::Public(TxOp::OwnedRequireSpatialPath { .. }) => Ok(()),
             Operation::Public(TxOp::OwnedDeadline { .. } | TxOp::OwnedClockSlot { .. } | TxOp::OwnedCheckWorldScope { .. } | TxOp::OwnedCheckWorldPurge { .. } | TxOp::OwnedCheckRange { .. } | TxOp::OwnedCheckCapacity { .. } | TxOp::OwnedCheck { .. }) => Ok(()),
+            Operation::Public(TxOp::OwnedReplayResidue { relation, id, origin, valid }) =>
+                self.replay_owned_residue(relation, id, *origin, *valid).await,
             Operation::Public(TxOp::OwnedErase { relation, id }) =>
                 self.erase_owned(relation, id, rtdb_types::OwnedChangeKind::Erase).await,
             Operation::Public(TxOp::OwnedSweepExpired { relation, id, created, expiry, .. }) =>
@@ -2494,6 +2499,40 @@ impl<'a> OpenTransaction<'a> {
             }
         }
         Ok(observed)
+    }
+
+    async fn replay_owned_residue(
+        &mut self, relation: &rtdb_types::OwnedRelation, id: &EntityId,
+        origin: rtdb_types::EventOrigin, valid: Interval,
+    ) -> Result<()> {
+        let replay = self.hosted_replay.as_ref()
+            .filter(|replay| replay.direct_effect_count().is_some() && relation.is_root_data())
+            .ok_or_else(replay_period_unavailable)?;
+        let original_time = replay.source_time();
+        let owner = self.options.user.as_deref().filter(|owner| !owner.is_empty()).ok_or_else(no_owned_principal)?;
+        let (schema, _) = self.read_owned_schema(owner, relation).await?.ok_or_else(replay_period_unavailable)?;
+        schema.require_replayed_period(valid, original_time, EventOp::Put)?;
+        let snapshot = self.snapshot()?;
+        if snapshot.contains_table(&relation.unique_table(owner))
+            || snapshot.contains_table(&relation.capacity_table(owner))
+            || self.has_staged_capacity(relation)
+        {
+            return Err(purge_path_uncovered());
+        }
+        let fixed_before = self.fixed_range_before(owner, relation, id, valid).await;
+        let position = self.buffer.append_to(&relation.table(owner), StoredEvent {
+            position: None,
+            origin: Some(origin),
+            commit_position: 0,
+            entity_key: Some(id.handle_bytes().into()),
+            iid: id.iid(),
+            system_from: self.tx_key().system_time,
+            valid_time: valid,
+            operation: StoredOperation::Redacted,
+            recency: None,
+        })?;
+        let fixed = self.fixed_range_pair(id, fixed_before, |_| Ok(None));
+        self.record_owned_change(relation, id.clone(), rtdb_types::OwnedChangeKind::Redacted, valid, position, fixed)
     }
 
     async fn erase_owned(

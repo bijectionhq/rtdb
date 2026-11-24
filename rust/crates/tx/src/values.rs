@@ -1356,6 +1356,10 @@ pub enum TxOp {
     },
     OwnedCheck { relation: rtdb_types::OwnedRelation, id: EntityId, valid_at: Timestamp, expected: Option<rtdb_types::OwnedPointVersion> },
     OwnedErase { relation: rtdb_types::OwnedRelation, id: EntityId },
+    OwnedReplayResidue {
+        relation: rtdb_types::OwnedRelation, id: EntityId, origin: rtdb_types::EventOrigin,
+        valid: rtdb_types::Interval,
+    },
     /// Apply one live nomination and order the same relation's replay floor.
     OwnedSweepExpired {
         relation: rtdb_types::OwnedRelation, id: EntityId, created: Timestamp,
@@ -1396,7 +1400,7 @@ impl TxOp {
     }
 
     pub fn is_owned(&self) -> bool {
-        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedRetireRelation { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
+        matches!(self, Self::HostedConstraintRefusal | Self::HostedControl(_) | Self::OwnedDeclareFixedRange { .. } | Self::OwnedDeclareCapacity { .. } | Self::OwnedCheckCapacity { .. } | Self::OwnedDeclareUniquePath { .. } | Self::OwnedDeclareRelation { .. } | Self::OwnedDeclareSearchPath { .. } | Self::OwnedDropSpatialPath { .. } | Self::OwnedRetireRelation { .. } | Self::OwnedDeclareSpatialPath { .. } | Self::OwnedDeclareEncodedSpatialPath { .. } | Self::OwnedRequireSpatialPath { .. } | Self::OwnedDeclarePath { .. } | Self::OwnedDeadline { .. } | Self::OwnedClockSlot { .. } | Self::OwnedCheckWorldScope { .. } | Self::OwnedCheckWorldPurge { .. } | Self::OwnedForkWorld { .. } | Self::OwnedPublishRoot { .. } | Self::OwnedPublishWorld { .. } | Self::OwnedCheckRange { .. } | Self::OwnedCheck { .. } | Self::OwnedErase { .. } | Self::OwnedReplayResidue { .. } | Self::OwnedSweepExpired { .. } | Self::OwnedDelete { .. } | Self::OwnedArrowDocs { .. } | Self::OwnedReplaceDocs { .. } | Self::OwnedInsertDocs { .. } | Self::OwnedRelativePeriod { .. })
     }
 }
 

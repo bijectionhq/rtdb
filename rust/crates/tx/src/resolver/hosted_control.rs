@@ -82,7 +82,7 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedDelete { .. }
                         | TxOp::HostedControl(_)
                 ) | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
-            ) || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedErase { .. })))
+            ) || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedErase { .. } | TxOp::OwnedReplayResidue { .. })))
         };
         if !operations
             .iter()
@@ -155,7 +155,7 @@ impl OpenTransaction<'_> {
                     return Err(unavailable());
                 }
             }
-            has_native_effect |= matches!(operation, Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedDeclareCapacity { .. } | TxOp::OwnedRetireRelation { .. }))
+            has_native_effect |= matches!(operation, Operation::Public(TxOp::OwnedDelete { .. } | TxOp::OwnedErase { .. } | TxOp::OwnedReplayResidue { .. } | TxOp::OwnedDeclareCapacity { .. } | TxOp::OwnedRetireRelation { .. }))
                 || operation.owned_documents().is_some_and(|(_, rows)| rows > 0);
         }
         let fork_with_controls = operations.iter().any(|operation| matches!(

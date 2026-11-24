@@ -1503,7 +1503,7 @@ impl Service {
         let source = batch.batch();
         let controls = [
             "_op", "_read_valid_micros", "_read_system_micros", "_read_event_position", "_valid_from", "_valid_to",
-            "_valid_from_offset_micros", "_valid_to_offset_micros",
+            "_valid_from_offset_micros", "_valid_to_offset_micros", "_archive_origin",
         ];
         let positions = owned_payload_columns(source, row, &controls)?;
         let cell = |name| ArrowCell::named(source, name, row);
@@ -1574,6 +1574,12 @@ impl Service {
             }
             Ok(false)
         };
+        let archive_origin = optional("_archive_origin")?.map(|cell| {
+            cell.binary().ok_or_else(|| invalid("Archive residue origin must be Binary"))
+        }).transpose()?;
+        if operation != "redacted" && archive_origin.is_some() {
+            return Err(invalid("An archive origin belongs to a residue"));
+        }
         let from_offset = signed("_valid_from_offset_micros")?;
         let to_offset = signed("_valid_to_offset_micros")?;
         if from_offset.is_some() || to_offset.is_some() {
@@ -1609,6 +1615,12 @@ impl Service {
             "delete" => {
                 if has_payload()? { return Err(invalid("Owned delete carries document values")); }
                 TxOp::OwnedDelete { relation: relation.clone(), id: own_id()?, valid_from, valid_to }
+            }
+            "redacted" if matches!(effects, CommitEffects::Replay) && relation.is_root_data() => {
+                if valid_at.is_some() || has_payload()? {
+                    return Err(invalid("An archive residue carries only its origin, identity and extent"));
+                }
+                replay_residue(relation, own_id()?, archive_origin, valid_from, valid_to)?
             }
             "erase" if matches!(effects, CommitEffects::Replay) => {
                 if valid_from.is_some() || valid_to.is_some() || has_payload()? {
@@ -1648,6 +1660,11 @@ impl Service {
                 None if expected.is_some() => return Err(invalid("Owned point expectation has no valid instant")),
                 None => (),
             }
+            let archive_origin = match row.remove("_archive_origin") {
+                None | Some(Value::Null | Value::Undefined) => None,
+                Some(Value::Binary(bytes)) if operation == "redacted" => Some(bytes),
+                _ => return Err(invalid("An archive origin belongs to a residue")),
+            };
             let valid_from = valid_endpoint(row.remove("_valid_from"))?;
             let valid_to = valid_endpoint(row.remove("_valid_to"))?;
             let from_offset = optional_micros(row.remove("_valid_from_offset_micros"))?;
@@ -1685,6 +1702,12 @@ impl Service {
                 "delete" => {
                     if has_payload(&row) { return Err(invalid("Owned delete carries document values")); }
                     TxOp::OwnedDelete { relation: relation.clone(), id, valid_from, valid_to }
+                }
+                "redacted" if matches!(effects, CommitEffects::Replay) && relation.is_root_data() => {
+                    if valid_at.is_some() || has_payload(&row) {
+                        return Err(invalid("An archive residue carries only its origin, identity and extent"));
+                    }
+                    replay_residue(relation, id, archive_origin.as_deref(), valid_from, valid_to)?
                 }
                 "erase" if matches!(effects, CommitEffects::Replay) => {
                     if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
@@ -5150,6 +5173,23 @@ fn optional_micros(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
         None | Some(Value::Null | Value::Undefined) => Ok(None),
         _ => Err(invalid("Owned observation requires signed microsecond integers")),
     }
+}
+
+fn replay_residue(
+    relation: &OwnedRelation, id: EntityId, origin: Option<&[u8]>,
+    from: Option<Timestamp>, to: Option<Timestamp>,
+) -> Result<TxOp, Status> {
+    let origin = origin.and_then(|bytes| bytes.try_into().ok())
+        .map(rtdb_types::EventOrigin)
+        .ok_or_else(|| invalid("An archive residue requires a 32-byte origin"))?;
+    let (Some(from), Some(to)) = (from, to) else {
+        return Err(invalid("An archive residue requires both original bounds"));
+    };
+    let valid = Interval::new(from, to).map_err(status)?;
+    if valid.is_empty() {
+        return Err(invalid("An archive residue has an empty extent"));
+    }
+    Ok(TxOp::OwnedReplayResidue { relation: relation.clone(), id, origin, valid })
 }
 
 fn valid_endpoint(value: Option<Value>) -> Result<Option<Timestamp>, Status> {
