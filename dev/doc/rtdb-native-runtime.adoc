@@ -71,8 +71,8 @@ The node option `search: {enabled: false}` turns off the lane and acceleration.
 `search: {writeFormat: 15}` also enables snapshot-pinned serving postings and packed Arrow visibility for ranked SQL.
 `search: {writeFormat: 16}` enables independent Arrow text-revision posting runs, journaled token deltas when admitted, and a table-owned event history for SQL point reads and public history-enabled search indexes.
 See link:rtdb-fts-logical-postings.md[RTDB logical full-text postings].
-The server defaults to format 11 for rolling upgrades.
-Upgrade all readers and maintenance lanes that share the database before enabling Arrow writes.
+The server defaults to paged Arrow format 13.
+During a rolling upgrade from a version without format 13 support, set `search: {writeFormat: 11}` on writers and compaction workers until every reader and maintenance lane sharing the database supports format 13.
 Upgraded nodes can read and repair retained formats 11 through 15.
 Nodes configured for format 16 can repair logical runs from available original L0 inputs or a complete retained local journal.
 When moving a native journal directory, keep `REPLICA_LOG.lineage` with `REPLICA_LOG` so existing search receipts continue to identify the same history.

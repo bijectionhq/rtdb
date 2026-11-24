@@ -338,11 +338,13 @@ impl SearchAccelerator {
     }
 
     /// Where a trie's recorded search file is, if it has one: its key, the trie or partition group it was built over, and which member of it the trie is.
-    fn recorded_key(snapshot: &Snapshot, table: &rtdb_types::TableRef, trie: &rtdb_index::CatalogTrie, definition: &SearchDefinition) -> Result<Option<Recorded>> {
+    fn recorded_key(snapshot: &Snapshot, table: &rtdb_types::TableRef, trie: &rtdb_index::CatalogTrie,
+        definition: &SearchDefinition, prefer_paged: bool) -> Result<Option<Recorded>> {
         let Some(entry) = snapshot.table_entry(table) else { return Ok(None) };
-        let formats = [crate::file::FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::TANTIVY_FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION];
-        let Some(record) = formats.into_iter().find_map(|format| {
-            trie.artefact(KIND, &definition.artefact_id_for(format), definition.version)
+        let formats = [crate::file::PACKED_FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::FORMAT_VERSION,
+            crate::file::LEGACY_FORMAT_VERSION, crate::file::TANTIVY_FORMAT_VERSION];
+        let Some((format, record)) = prefer_paged.then_some(crate::file::FORMAT_VERSION).into_iter().chain(formats).find_map(|format| {
+            trie.artefact(KIND, &definition.artefact_id_for(format), definition.version).map(|record| (format, record))
         }) else { return Ok(None) };
         let owner = ArtefactOwner::of(&trie.key, record)?;
         let member = owner.tries().iter().position(|key| key == &trie.key)
@@ -351,7 +353,7 @@ impl SearchAccelerator {
             .filter(|locator| i64::try_from(locator.length).ok() == record.file_size);
         let sections = record.stats.as_deref().and_then(crate::file::decode_sections);
         let tree = record.stats.as_deref().and_then(crate::file::decode_tree_locator)
-            .filter(|locator| i64::try_from(locator.length).ok() == record.file_size);
+            .filter(|locator| locator.format() == format && i64::try_from(locator.length).ok() == record.file_size);
         Ok(Some(Recorded {
             key: ObjectKey::new(entry.slug.recorded_artefact_key(&trie.key, record)?)?,
             artefact_id: record.definition_id().to_owned(), owner, member, locator, tree, sections,
@@ -376,7 +378,7 @@ impl SearchAccelerator {
         let identity = crate::file::artefact_identity(entry.slug.as_str(), &recorded.owner, &recorded.artefact_id, definition.version);
         let error = match Self::open_recorded(&self.runtime, request.database, request.storage, recorded, definition, &identity).await {
             Ok(file) if file.matches_artefact(&identity, definition.version) => {
-                if matches!(load, LoadSearch::Rank) && !file.needs_ranked_postings() { return Ok(Some(file)); }
+                if matches!(load, LoadSearch::Rank { .. }) && !file.needs_ranked_postings() { return Ok(Some(file)); }
                 match file.prepare_terms(column, queries).await.and_then(|()| file.check_terms(column, queries)) {
                     Ok(()) => return Ok(Some(file)),
                     Err(error) => crate::runtime::FileError::from_anomaly(error).needs_repair(),
@@ -413,7 +415,8 @@ impl SearchAccelerator {
         let visible = |trie: &&rtdb_index::CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
         for trie in snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
             if exclude.is_some_and(|keys| keys.contains(&trie.key)) { continue; }
-            let recorded = Self::recorded_key(snapshot, table, trie, definition)?;
+            let prefer_paged = matches!(load, LoadSearch::Rank { prefer_paged: true });
+            let recorded = Self::recorded_key(snapshot, table, trie, definition, prefer_paged)?;
             if recorded.as_ref().and_then(|recorded| recorded.sections.as_ref())
                 .is_some_and(|sections| !sections.iter().any(|section| section.meets(bounds))) {
                 skipped.push(trie.key.clone());
@@ -483,7 +486,7 @@ struct Recorded {
 }
 
 #[derive(Clone, Copy)]
-enum LoadSearch { Match, Rank }
+enum LoadSearch { Match, Rank { prefer_paged: bool } }
 
 /// A shared file's selected members and their positions in the scan's trie list.
 struct FileMembers { file: Arc<SearchFile>, members: BTreeMap<u32, usize> }
@@ -559,7 +562,7 @@ async fn covered_owned_corpus(
     let entry = snapshot.table_entry(&definition.table).ok_or_else(uncovered_owned_search)?;
     for trie in snapshot.trie_catalog().current_tries(&definition.table) {
         context.check_cancelled()?;
-        let recorded = SearchAccelerator::recorded_key(snapshot, &definition.table, trie, &definition)?
+        let recorded = SearchAccelerator::recorded_key(snapshot, &definition.table, trie, &definition, false)?
             .ok_or_else(uncovered_owned_search)?;
         let file = if let Some(file) = opened.get(&recorded.key) {
             Arc::clone(file)
@@ -1076,7 +1079,7 @@ impl SearchAccelerator {
         }
         let ascending_id = top_k.ascending_id.filter(|&id| request.ranked_id_is_integer(id)
             && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point());
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition, column, &[matching, scoring.query()], LoadSearch::Rank, None).await? else {
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition, column, &[matching, scoring.query()], LoadSearch::Rank { prefer_paged: false }, None).await? else {
             work.decline = Some("coverage");
             return Ok(None);
         };
@@ -1147,7 +1150,7 @@ impl SearchAccelerator {
                             && let Some(file) = index.and_then(|index| files.get(index)) {
                             let table = &request.scan.table.name.table;
                             if let Some(recorded) = request.snapshot.trie_catalog().trie(table, &file.trie)
-                                .and_then(|trie| Self::recorded_key(request.snapshot, table, trie, definition).ok().flatten())
+                                .and_then(|trie| Self::recorded_key(request.snapshot, table, trie, definition, false).ok().flatten())
                                 .filter(|recorded| recorded.key.as_str() == file.identity) {
                                 self.runtime.report(Suspect {
                                     database: request.database.to_owned(), table: table.clone(), owner: recorded.owner,

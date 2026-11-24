@@ -94,8 +94,16 @@ pub(crate) struct HostedSourceReceipt {
     pub(crate) history: String,
     pub(crate) applied: Option<TransactionKey>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchFileFormat { Tantivy, Arrow, Paged, Tree, Packed, Logical }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchFileFormat {
+    Tantivy,
+    Arrow,
+    #[default]
+    Paged,
+    Tree,
+    Packed,
+    Logical,
+}
 
 fn default_search(_format: SearchFileFormat) -> SearchServices {
     #[cfg(feature = "search")] {
@@ -115,7 +123,7 @@ fn default_search(_format: SearchFileFormat) -> SearchServices {
 struct SearchServices { artefact_kinds: Vec<Arc<dyn rtdb_maintenance::ArtefactKind>>, scan_accelerators: Vec<Arc<dyn rtdb_query::ScanAccelerator>> }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self::local_with_search_format(authorization, observer, users, metrics, SearchFileFormat::Tantivy)
+        Self::local_with_search_format(authorization, observer, users, metrics, SearchFileFormat::default())
     }
 
     pub fn local_with_search_format(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>,

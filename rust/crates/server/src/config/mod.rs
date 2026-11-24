@@ -256,13 +256,14 @@ fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
 }
 fn search(value: Option<Yaml>) -> Result<SearchSettings> {
     let mut fields = YamlFields::new(value.unwrap_or_else(empty), "search")?;
-    let write_format = match fields.integer("writeFormat")?.unwrap_or(11) {
-        11 => rtdb_node::SearchFileFormat::Tantivy,
-        12 => rtdb_node::SearchFileFormat::Arrow,
-        13 => rtdb_node::SearchFileFormat::Paged,
-        14 => rtdb_node::SearchFileFormat::Tree,
-        15 => rtdb_node::SearchFileFormat::Packed,
-        16 => rtdb_node::SearchFileFormat::Logical,
+    let write_format = match fields.integer("writeFormat")? {
+        None => rtdb_node::SearchFileFormat::default(),
+        Some(11) => rtdb_node::SearchFileFormat::Tantivy,
+        Some(12) => rtdb_node::SearchFileFormat::Arrow,
+        Some(13) => rtdb_node::SearchFileFormat::Paged,
+        Some(14) => rtdb_node::SearchFileFormat::Tree,
+        Some(15) => rtdb_node::SearchFileFormat::Packed,
+        Some(16) => rtdb_node::SearchFileFormat::Logical,
         _ => return Err(rtdb_types::Anomaly::incorrect("rtdb.config/search-format", "search.writeFormat must be between 11 and 16")),
     };
     let result = SearchSettings { enabled: fields.boolean("enabled")?.unwrap_or(true),

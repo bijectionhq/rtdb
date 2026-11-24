@@ -1180,7 +1180,7 @@ async fn compatible_writers_keep_both_search_formats_through_restart() {
     let template = services();
     let table = TableRef::new("public", "docs");
     let mut published = std::collections::BTreeSet::new();
-    for (phase, format) in [11, 12, 13, 14, 15, 11].into_iter().enumerate() {
+    for (phase, format) in [11, 14, 12, 13, 15, 11].into_iter().enumerate() {
         let runtime = match format {
             11 => rtdb_search::SearchRuntime::with_tantivy_files(16 << 20),
             14 => rtdb_search::SearchRuntime::with_tree_files(16 << 20),
@@ -1216,6 +1216,24 @@ async fn compatible_writers_keep_both_search_formats_through_restart() {
             .filter(|record| record.kind() == "search")
             .map(|record| &record.definition_id()[record.definition_id().len() - 3..]).collect();
         assert_eq!(seen, published, "phase {phase}");
+        let legacy = if format == 14 {
+            let trie = catalog.current_tries(&table).into_iter().find(|trie| {
+                trie.artefacts.iter().any(|record| record.definition_id().ends_with("f11"))
+                    && trie.artefacts.iter().any(|record| record.definition_id().ends_with("f14"))
+            }).unwrap();
+            let record = trie.artefacts.iter().find(|record| record.definition_id().ends_with("f11")).unwrap();
+            let snapshot = database.snapshot();
+            let slug = &snapshot.table_entry(&table).unwrap().slug;
+            let key = rtdb_storage::ObjectKey::new(slug.recorded_artefact_key(&trie.key, record).unwrap()).unwrap();
+            let store = database.object_store();
+            let original = store.get(&key).await.unwrap();
+            store.delete(&key).await.unwrap();
+            Some((store, key, original))
+        } else { None };
+        let statement = "SELECT _id FROM docs WHERE MATCH(body, 'invoice') ORDER BY _id";
+        assert_eq!(ids(rows(session.query_sql(statement, vec![]).await.unwrap()).await), [-2, 1]);
+        assert!(runtime.suspects("xtdb").is_empty());
+        if let Some((store, key, original)) = legacy { store.put(&key, original).await.unwrap(); }
         let sql = "SELECT _id, SEARCH_SCORE(body, 'invoice') AS score FROM docs WHERE MATCH(body, 'invoice') ORDER BY score DESC, _id LIMIT 1";
         assert_eq!(ids(rows(session.query_sql(sql, vec![]).await.unwrap()).await), [-2]);
         drop(session);

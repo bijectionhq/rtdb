@@ -279,15 +279,16 @@ impl<'a> PartitionRankSource<'a> {
         let mut sources = if points.is_none() {
             RecordedTree::select(&search.runtime, &request, &definition, column_index, &matching, include_packs, logical.is_some())?
         } else { Vec::new() };
-        if !matching.phrases().is_empty() && !sources.is_empty() && sources.iter().all(|source| source.pack.locator.format() == TREE_FORMAT_VERSION) {
-            let paged = definition.artefact_id_for(crate::file::FORMAT_VERSION);
-            if sources.iter().flat_map(|source| source.members.values()).all(|key| {
-                request.snapshot.trie_catalog().trie(&definition.table, key)
-                    .is_some_and(|trie| trie.artefact(KIND, &paged, definition.version).is_some())
-            }) {
-                sources.clear();
-            }
-        }
+        let prefer_paged = !matching.phrases().is_empty() && !sources.is_empty()
+            && sources.iter().all(|source| source.pack.locator.format() == TREE_FORMAT_VERSION)
+            && {
+                let paged = definition.artefact_id_for(crate::file::FORMAT_VERSION);
+                sources.iter().flat_map(|source| source.members.values()).all(|key| {
+                    request.snapshot.trie_catalog().trie(&definition.table, key)
+                        .is_some_and(|trie| trie.artefact(KIND, &paged, definition.version).is_some())
+                })
+            };
+        if prefer_paged { sources.clear(); }
         let Some(ranking) = scorer.for_ranking() else { return Ok(None); };
         let routes = match &logical {
             Some(coverage) => coverage.routes(&search.runtime, &request, &definition, column_index, &matching, &ranking).await?,
@@ -297,7 +298,7 @@ impl<'a> PartitionRankSource<'a> {
         let visibility = points.is_none().then(|| super::point::PackedVisibility::new(&request, &definition.table, &sources, column_index, logical.is_some()));
         let files = if points.is_some() || logical.is_some() { Vec::new() } else {
             let TrieFiles::Complete(Found { files, .. }) = search.trie_files(&request, &definition, column, &[&matching, scorer.query()],
-                LoadSearch::Rank, Some(&tree_tries)).await? else { return Ok(None); };
+                LoadSearch::Rank { prefer_paged }, Some(&tree_tries)).await? else { return Ok(None); };
             files
         };
         let integer = ascending_id.is_some_and(|id| request.ranked_id_is_integer(id));

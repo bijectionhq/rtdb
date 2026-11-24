@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 pub struct SearchDefinition { pub name: String, pub table: TableRef, pub columns: Vec<String>, pub version: i64, pub history: bool }
 
 impl SearchDefinition {
-    /// The artefact ID for the preferred reader format and the current analyzer.
+    /// The artefact ID for the default paged writer and the current analyzer.
     pub fn artefact_id(&self) -> String { self.artefact_id_for(crate::file::FORMAT_VERSION) }
 
     pub(crate) fn artefact_id_for(&self, format: i32) -> String {

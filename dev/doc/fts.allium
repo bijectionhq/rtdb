@@ -66,7 +66,7 @@ value SearchIndexDefinition {
     history: Boolean
 
     -- Derived
-    -- The artefact definition id names the analyzer and search file format versions, so a change to either builds new search files rather than reading old ones.
+    -- The artefact definition id distinguishes analyzer versions and search file formats so their files can coexist.
     artefact_id: "{name}~a{analyzer_version}p{event_layout_version}f{format_version}"
 }
 
@@ -132,7 +132,7 @@ config {
     -- Durable logical runs build where the writer can register a staging owner with a recoverable drain witness.
     -- Hosted compactor attachments build primary compaction outputs and leave logical posting builds to the directory holder.
     -- Queries cover missing logical runs through the existing search gap paths.
-    write_format: Integer = 11
+    write_format: Integer = 13
     -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
     enabled: Boolean = true
     threads: Integer = 1
@@ -305,6 +305,8 @@ rule RepairUnreadableSearchFile {
 --      A recorded trie none of whose lifespan sections, read from its record's stats, meets the bounds is left unopened, and within a file a document whose section misses them is passed over.
 --   2. A selected trie whose entry records a search file for that definition contributes the IIDs of its docs whose terms satisfy the query and one of whose rectangles meets the query's bounds.
 --      The scan reads a shared file once and uses the runs of selected members alone for candidates and ranking.
+--      When a trie records several formats for the same definition version, ordinary and held reads prefer the newest Arrow format and can still open a format 11 record on its own.
+--      A ranked phrase scan can use an existing format 13 sidecar when all selected format 14 sources also have that sidecar.
 --   3. A selected trie with no such record, or whose file cannot be read, is read through a search file the node builds from its data file and keeps, under the same rule.
 --      A data file never changes, so a kept one serves every later query of the trie.
 --      Queries that need the same file at once share one build; one that fails or is cancelled leaves the next to build it.

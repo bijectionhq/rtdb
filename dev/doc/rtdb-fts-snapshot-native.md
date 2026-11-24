@@ -85,7 +85,7 @@ The search runtime also counts failures that produce an exceptional gap during l
 
 Install a compatible reader and maintenance binary on every node sharing the database before opting into format 15.
 Existing versions 11 through 14 remain readable and can coexist at a catalog cut.
-The configured writer default remains format 11.
+The writer defaults to paged Arrow format 13.
 
 ```yaml
 search:
