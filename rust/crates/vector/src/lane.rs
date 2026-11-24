@@ -2,7 +2,7 @@ use std::io::{Read, Seek};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::EventBatch, keys::ArtefactOwner, log::proto::ArtefactRecord};
 use rtdb_index::PartitionValue;
 use rtdb_maintenance::{ArtefactBuilder, ArtefactDatabase, ArtefactDefinition, ArtefactJob, ArtefactKind, ArtefactSource, input};
@@ -59,9 +59,14 @@ impl ArtefactBuilder for Builder {
         let memory = Arc::clone(&self.0.memory);
         let cancel = cancellation.clone();
         let written = tokio::task::spawn_blocking(move || {
+            let mut staging = memory.reserve(0)?;
             let mut rows = IndexedRows::new(definition.dimensions);
-            read_indexed_rows(source, &definition, &memory, &cancel, &mut rows)?;
-            let _vectors = memory.reserve(rows.rows().len().saturating_mul(definition.dimensions.saturating_mul(12)))?;
+            read_indexed_rows(source, &definition, &memory, &cancel, &mut rows,
+                Arc::get_mut(&mut staging).expect("generation owns its staging reservation"))?;
+            // Training and output overlap the admitted arena. Include centroid
+            // sums, gathered vectors, sort and assignment scratch, and the directory.
+            let work_per_row = definition.dimensions.saturating_mul(24).saturating_add(384);
+            let _work = memory.reserve(16_384usize.saturating_add(rows.rows().len().saturating_mul(work_per_row)))?;
             let mut writer = std::io::BufWriter::new(std::fs::File::options().write(true).create_new(true).open(target).map_err(fault)?);
             let written = file::write_generation(rows, &mut writer, &cancel)?;
             std::io::Write::flush(&mut writer).map_err(fault)?;
@@ -83,8 +88,8 @@ impl ArtefactBuilder for Builder {
 }
 
 /// Appends the indexable puts of a stored trie file in page order.
-pub(crate) fn read_indexed_rows(source: impl Read + Seek + Send + 'static, definition: &VectorDefinition, memory: &Arc<MemoryBudget>,
-    cancellation: &CancellationToken, output: &mut IndexedRows) -> Result<()> {
+fn read_indexed_rows(source: impl Read + Seek + Send + 'static, definition: &VectorDefinition, memory: &Arc<MemoryBudget>,
+    cancellation: &CancellationToken, output: &mut IndexedRows, staging: &mut MemoryReservation) -> Result<()> {
     let (mut reader, _metadata) = input::open_input(source, memory)?;
     let columns = definition.put_columns();
     for page in 0..reader.page_count() {
@@ -92,7 +97,7 @@ pub(crate) fn read_indexed_rows(source: impl Read + Seek + Send + 'static, defin
         let _page = memory.reserve(reader.page_allocation_bound(page)?)?;
         let events = EventBatch::new(reader.read_event_page(page, &columns)?)?;
         for row in 0..events.len() {
-            output.push_event(&events.borrow_event(row)?, definition)?;
+            output.push_event(&events.borrow_event(row)?, definition, staging)?;
         }
     }
     Ok(())
