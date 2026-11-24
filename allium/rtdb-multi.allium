@@ -22,9 +22,12 @@
 -- EpochScopedStorage describes the storage shared by default and Multi mode.
 -- The directory-managed storage and reaper rules describe the deployment path still in service.
 -- The opt-in stream driver uses the Logkeeper `journal-contract` boundary specified in Logkeeper's verification/target-journal.md.
+-- The stream driver submits contiguous append groups in LSN order and acknowledges the group after every record in it commits.
+-- An unavailable append can leave a committed prefix, which the driver recovers from the journal before resuming writes.
 -- A cluster of the opt-in stream driver runs one node role per process and takes one journal URL with a client identity and trust bundle.
 -- A development process opens FileJournal and a filesystem object store under its selected data directory.
 -- The node uses the persisted database identity and key generations to recover the same journal after reopening the directory.
+-- FileJournal requires the URI identity record format for development journal replay.
 -- Each installed node takes an exclusive credential slot before opening its Logkeeper transport.
 -- The same node image runs the default driver with Kafka source and replica logs when the cluster selects default mode.
 -- dev/doc/rtdb-v1.allium defines the stateless consumer surface shared with default mode.
