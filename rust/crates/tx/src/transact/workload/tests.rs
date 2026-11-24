@@ -19,7 +19,12 @@ impl Writer {
     fn new() -> Self {
         Self {
             pipeline: TransactPipeline::new(TransactState::new(INCARNATION), 1, 1).unwrap(),
-            point: Point::new("public.installation_authority", "authority".into(), Timestamp(0)).unwrap(),
+            point: Point::new(
+                "public.installation_authority",
+                "authority".into(),
+                Timestamp(0),
+            )
+            .unwrap(),
             now: Timestamp(10),
         }
     }
@@ -415,4 +420,65 @@ fn original_valid_point_alone_does_not_authorize_a_displaced_writer() {
         journal.turn(WRITE, request).err().unwrap().code,
         "rtdb/managed-workload-fence"
     );
+}
+
+#[test]
+fn empty_closure_orders_vacancy_and_prevents_a_delayed_claim() {
+    let mut journal = Writer::new();
+    let abandoned = placement(1, 11);
+    let initial = journal
+        .turn(
+            PLACEMENT,
+            submit(
+                Authority::AdvancePlacement {
+                    installation_intent: [6; 16],
+                    previous: Previous::Empty,
+                    next: abandoned.clone(),
+                },
+                10,
+                None,
+            ),
+        )
+        .unwrap();
+    let fence = Fence {
+        placement: abandoned,
+        applied: applied(initial, PLACEMENT),
+    };
+    let closure = Authority::CloseEmptyAssignment {
+        fence: fence.clone(),
+        closure: [13; 16],
+        vacant_epoch: 2,
+    };
+    let applied_close = applied(
+        journal.turn(CLOSE, submit(closure, 13, None)).unwrap(),
+        CLOSE,
+    );
+    journal.restart();
+
+    let delayed = submit(Authority::ClaimWriter { fence }, 11, None);
+    assert_eq!(
+        journal.turn(CLAIM, delayed).err().unwrap().code,
+        "rtdb/managed-workload-fence"
+    );
+    let vacancy = Fence {
+        placement: Placement {
+            epoch: 2,
+            assignment: None,
+        },
+        applied: applied_close,
+    };
+    assert!(
+        matches!(journal.turn(ABSENT, Operation::Observe(vacancy.clone())).unwrap(),
+        Reply::Placement(evidence) if evidence.placement == vacancy.placement)
+    );
+    let successor = submit(
+        Authority::AdvancePlacement {
+            installation_intent: [6; 16],
+            previous: Previous::Vacant { fence: vacancy },
+            next: placement(3, 22),
+        },
+        14,
+        None,
+    );
+    applied(journal.turn(PLACEMENT, successor).unwrap(), PLACEMENT);
 }

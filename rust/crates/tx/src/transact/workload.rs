@@ -81,6 +81,7 @@ pub enum Family {
     ClaimWriter,
     Write,
     CloseWriter,
+    CloseEmptyAssignment,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +107,11 @@ pub enum Authority {
         fence: Fence,
         writer: Applied,
         closure: [u8; 16],
+    },
+    CloseEmptyAssignment {
+        fence: Fence,
+        closure: [u8; 16],
+        vacant_epoch: u64,
     },
     ObservePlacement {
         fence: Fence,
@@ -163,12 +169,19 @@ impl Authority {
                     }
             }
             Self::ClaimWriter { fence } => held(fence),
-            Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => held(fence) && applied(writer),
+            Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => {
+                held(fence) && applied(writer)
+            }
             Self::CloseWriter {
                 fence,
                 writer,
                 closure,
             } => held(fence) && applied(writer) && *closure != [0; 16],
+            Self::CloseEmptyAssignment {
+                fence,
+                closure,
+                vacant_epoch,
+            } => held(fence) && *closure != [0; 16] && *vacant_epoch > fence.placement.epoch,
             Self::ObservePlacement { fence: value } => fence(value),
             Self::PredecessorEvidence { predecessor: value } => predecessor(value),
             Self::ReceiptRecovery {
@@ -189,6 +202,7 @@ impl Authority {
             Self::ClaimWriter { .. } => Family::ClaimWriter,
             Self::Write { .. } => Family::Write,
             Self::CloseWriter { .. } => Family::CloseWriter,
+            Self::CloseEmptyAssignment { .. } => Family::CloseEmptyAssignment,
             _ => return None,
         })
     }
@@ -255,7 +269,10 @@ pub enum Operation {
         family: Family,
     },
     Observe(Fence),
-    ReadRoot { fence: Fence, writer: Applied },
+    ReadRoot {
+        fence: Fence,
+        writer: Applied,
+    },
     Predecessor(Predecessor),
 }
 
@@ -307,7 +324,10 @@ impl Request {
                 Ok(Prepared::Answer(Reply::Receipt(replay(&stored.receipt))))
             }
             Operation::ReadRoot { fence, writer } => {
-                let authority = Authority::ReadRoot { fence: fence.clone(), writer: writer.clone() };
+                let authority = Authority::ReadRoot {
+                    fence: fence.clone(),
+                    writer: writer.clone(),
+                };
                 if !authority.valid(state.index.head().basis.incarnation()) {
                     return Err(denied());
                 }
@@ -351,7 +371,8 @@ impl Request {
                 digest,
             } => {
                 if !authority.valid(state.index.head().basis.incarnation())
-                    || matches!(authority, Authority::CloseWriter { closure, .. } if key.as_slice() != closure.as_slice())
+                    || matches!(authority, Authority::CloseWriter { closure, .. } | Authority::CloseEmptyAssignment { closure, .. }
+                        if key.as_slice() != closure.as_slice())
                 {
                     return Err(denied());
                 }
@@ -419,12 +440,12 @@ impl Point {
                     }
                     Previous::Empty => None,
                 };
-                (next, Cell::TxBasis, String::new(), retirement)
+                (next.clone(), Cell::TxBasis, String::new(), retirement)
             }
             Authority::ClaimWriter { fence } => {
                 let evidence = self.fence(state, fence, now)?;
                 (
-                    &fence.placement,
+                    fence.placement.clone(),
                     binary_cell(fence.applied.basis),
                     hex(key),
                     evidence.predecessor_retirement_basis,
@@ -433,10 +454,26 @@ impl Point {
             Authority::CloseWriter { fence, closure, .. } => {
                 let evidence = self.fence(state, fence, now)?;
                 (
-                    &fence.placement,
+                    fence.placement.clone(),
                     binary_cell(fence.applied.basis),
                     format!("closed:{}", hex(closure)),
                     evidence.predecessor_retirement_basis,
+                )
+            }
+            Authority::CloseEmptyAssignment {
+                fence,
+                vacant_epoch,
+                ..
+            } => {
+                let retirement = self.fence(state, fence, now)?.predecessor_retirement_basis;
+                (
+                    Placement {
+                        epoch: *vacant_epoch,
+                        assignment: None,
+                    },
+                    Cell::TxBasis,
+                    String::new(),
+                    retirement,
                 )
             }
             Authority::Write { .. } => {
@@ -570,7 +607,9 @@ impl Point {
                     self.predecessor(state, predecessor, now)?.close.applied
                 }
             },
-            Authority::ClaimWriter { fence } => self.fence(state, fence, now)?.applied,
+            Authority::ClaimWriter { fence } | Authority::CloseEmptyAssignment { fence, .. } => {
+                self.fence(state, fence, now)?.applied
+            }
             Authority::ReadRoot { fence, writer }
             | Authority::Write { fence, writer }
             | Authority::CloseWriter { fence, writer, .. } => {
@@ -669,7 +708,11 @@ impl Point {
         let stored = state.workload_receipt(applied.namespace, &applied.key)?;
         let receipt = &stored.receipt;
         let basis = Basis::from_bytes(&applied.basis)?;
-        if stored.workload != Some(family)
+        let expected_family = stored.workload == Some(family)
+            || family == Family::AdvancePlacement
+                && fence.placement.assignment.is_none()
+                && stored.workload == Some(Family::CloseEmptyAssignment);
+        if !expected_family
             || receipt.basis != basis
             || receipt.system_time != Timestamp(applied.system_time_micros)
             || !matches!(receipt.outcome, Outcome::Then)

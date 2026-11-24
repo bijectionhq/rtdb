@@ -220,6 +220,11 @@ message WorkloadCloseWriter {
   WorkloadApplied writer = 2;
   bytes closure = 3;
 }
+message WorkloadCloseEmptyAssignment {
+  WorkloadFence fence = 1;
+  bytes closure = 2;
+  uint64 vacant_epoch = 3;
+}
 message WorkloadObservePlacement { WorkloadFence fence = 1; }
 enum WorkloadFamily {
   WORKLOAD_FAMILY_UNSPECIFIED = 0;
@@ -227,6 +232,7 @@ enum WorkloadFamily {
   WORKLOAD_FAMILY_CLAIM_WRITER = 2;
   WORKLOAD_FAMILY_WRITE = 3;
   WORKLOAD_FAMILY_CLOSE_WRITER = 4;
+  WORKLOAD_FAMILY_CLOSE_EMPTY_ASSIGNMENT = 5;
 }
 message WorkloadSettleAttempt {
   bytes original_namespace = 1;
@@ -243,6 +249,7 @@ message ManagedWorkloadRequest {
     WorkloadObservePlacement observe_placement = 6;
     WorkloadPredecessor predecessor_evidence = 7;
     WorkloadSettleAttempt settle_attempt = 8;
+    WorkloadCloseEmptyAssignment close_empty_assignment = 9;
   }
 }
 message WorkloadEvidence {

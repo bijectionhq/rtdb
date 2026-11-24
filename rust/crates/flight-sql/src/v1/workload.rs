@@ -14,25 +14,40 @@ use tonic::Status;
 use super::{Call, Service, check_key, decode, error, proto, transact};
 
 impl Service {
-    pub(super) async fn require_workload_root_read(&self, call: &Call) -> Result<Arc<Database>, Status> {
+    pub(super) async fn require_workload_root_read(
+        &self,
+        call: &Call,
+    ) -> Result<Arc<Database>, Status> {
         let (database, grant) = self.managed_workload_attachment(call)?;
         let driver = database.serving_driver().ok_or_else(denied)?;
         let (authority, point, expires_at) = grant
             .assignment(&call.database, driver.incarnation(), self.0.node.now())
             .map_err(error::anomaly)?;
-        let Authority::ReadRoot { fence, writer } = authority else { return Err(denied()); };
-        let reply = driver.managed_workload(
-            workload::Request {
-                point: point.clone(),
-                namespace: grant.receipt_namespace(),
-                expires_at,
-                operation: Operation::ReadRoot { fence: fence.clone(), writer: writer.clone() },
-            },
-            &call.cancellation,
-        ).await.map_err(error::anomaly)?;
-        if !matches!(reply, workload::Reply::Placement(_)) { return Err(denied()); }
+        let Authority::ReadRoot { fence, writer } = authority else {
+            return Err(denied());
+        };
+        let reply = driver
+            .managed_workload(
+                workload::Request {
+                    point: point.clone(),
+                    namespace: grant.receipt_namespace(),
+                    expires_at,
+                    operation: Operation::ReadRoot {
+                        fence: fence.clone(),
+                        writer: writer.clone(),
+                    },
+                },
+                &call.cancellation,
+            )
+            .await
+            .map_err(error::anomaly)?;
+        if !matches!(reply, workload::Reply::Placement(_)) {
+            return Err(denied());
+        }
         self.check_attachment(call, &database)?;
-        grant.assignment(&call.database, driver.incarnation(), self.0.node.now()).map_err(error::anomaly)?;
+        grant
+            .assignment(&call.database, driver.incarnation(), self.0.node.now())
+            .map_err(error::anomaly)?;
         Ok(database)
     }
 
@@ -191,6 +206,14 @@ fn request_operation(
             },
             None,
         ),
+        Wire::CloseEmptyAssignment(value) => (
+            Authority::CloseEmptyAssignment {
+                fence: fence(required(value.fence)?)?,
+                closure: fixed(value.closure)?,
+                vacant_epoch: value.vacant_epoch,
+            },
+            None,
+        ),
         Wire::ObservePlacement(value) => (
             Authority::ObservePlacement {
                 fence: fence(required(value.fence)?)?,
@@ -323,6 +346,7 @@ fn family(value: i32) -> Result<Family, Status> {
         Ok(proto::WorkloadFamily::ClaimWriter) => Ok(Family::ClaimWriter),
         Ok(proto::WorkloadFamily::Write) => Ok(Family::Write),
         Ok(proto::WorkloadFamily::CloseWriter) => Ok(Family::CloseWriter),
+        Ok(proto::WorkloadFamily::CloseEmptyAssignment) => Ok(Family::CloseEmptyAssignment),
         _ => Err(error::incorrect(
             "Invalid managed workload operation family",
         )),
