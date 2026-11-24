@@ -2547,8 +2547,17 @@ impl OwnedReadSession {
         &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
         offset: usize, limit: usize, observe: bool, valid: Option<Timestamp>, overlay: Option<rtdb_search::HeldTextCorpus>,
     ) -> Result<(rtdb_search::OwnedSearchPage, Vec<OwnedRangeWitness>)> {
+        let (batch, witnesses) = self.ranked_search_batch(partitions, query, offset, limit, observe, valid, overlay).await?;
+        Ok((batch.into_page()?, witnesses))
+    }
+
+    #[cfg(feature = "search")]
+    pub async fn ranked_search_batch(
+        &self, partitions: &[(rtdb_types::OwnedRelation, rtdb_types::OwnedRelation)], query: &str,
+        offset: usize, limit: usize, observe: bool, valid: Option<Timestamp>, overlay: Option<rtdb_search::HeldTextCorpus>,
+    ) -> Result<(rtdb_search::OwnedSearchBatch, Vec<OwnedRangeWitness>)> {
         self.admit_read().await?;
-        let work = rtdb_search::owned_ranked_with_overlay(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, valid, overlay);
+        let work = rtdb_search::owned_ranked_overlay_batch(self.guard_context(Arc::clone(&self.context), partitions.iter().map(|(relation, _)| relation))?, &self.owner, partitions, query, offset, limit, valid, overlay);
         let hits = self.context.reading(work).await?;
         let mut witnesses = Vec::with_capacity(partitions.len());
         if observe {

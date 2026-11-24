@@ -27,7 +27,7 @@ use rtdb_format::ipc::{OwnedStream, write_arrow_stream};
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, ScalarType, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, EntityId, TransactionKey, Interval, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -3368,7 +3368,7 @@ impl Service {
         let prefix_len = body.len() - request.len();
         let rank = owned_rank_request(call, request)?;
         let overlay = overlay.as_ref().map(|input| self.search_shadows(&rank, input.batch())).transpose()?;
-        let (page, witnesses) = held.snapshot.ranked_search_with_overlay(
+        let (page, witnesses) = held.snapshot.ranked_search_batch(
             &rank.partitions, rank.query, rank.offset, rank.limit, rank.observe, valid, overlay,
         ).await.map_err(status)?;
         if let Some(scope) = staged_scope {
@@ -3492,42 +3492,28 @@ impl Service {
     }
 
     fn owned_rank_reply(
-        &self, call: &Call, page: rtdb_node::OwnedSearchPage, scope: String, witnesses: Vec<Uuid>,
+        &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
         present: Timestamp, valid: Timestamp,
     ) -> Result<ActionResult, Status> {
-        let hits = page.hits;
-        let id_type = LogicalType::from_legs([ScalarType::Utf8, ScalarType::Keyword, ScalarType::I64, ScalarType::Uuid].map(LogicalType::Scalar));
-        let mut metadata = std::collections::HashMap::from([
-            (OWNED_SEARCH_TOTAL.into(), page.total.to_string()),
-            (OWNED_SEARCH_SCOPE.into(), scope),
-        ]);
+        let hits = page.hits.batch();
+        let mut metadata = hits.schema_ref().metadata().clone();
+        metadata.insert(OWNED_SEARCH_TOTAL.into(), page.total.to_string());
+        metadata.insert(OWNED_SEARCH_SCOPE.into(), scope);
         if !witnesses.is_empty() {
             let mut nonces = String::with_capacity(32 * witnesses.len());
             for witness in witnesses { nonces.push_str(&witness.simple().to_string()); }
             metadata.insert(OWNED_SEARCH_WITNESSES.into(), nonces);
         }
-        let schema = Arc::new(Schema::new_with_metadata(vec![
-            rtdb_columnar::to_field("_id", &id_type).map_err(status)?,
-            Field::new("score", DataType::Float64, false),
-            Field::new("partition", DataType::UInt64, false),
-        ], metadata));
-        let mut charge = call.reserve(4096)?;
-        let output = if hits.is_empty() {
-            None
-        } else {
-            let mut ids = Vec::with_capacity(hits.len());
-            for hit in &hits {
-                let id = hit.id.as_value();
-                let reservation = Arc::get_mut(&mut charge).expect("search output owns its reservation");
-                reservation.grow_to(wire::add(reservation.bytes(), wire::mul(id.retained_bytes().map_err(status)?, 4)?)?).map_err(status)?;
-                ids.push(id);
-            }
-            let ids = rtdb_columnar::build_array(&id_type, &ids).map_err(status)?;
-            let scores = Arc::new(Float64Array::from_iter_values(hits.iter().map(|hit| hit.score)));
-            let ordinals = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|hit| hit.partition as u64)));
-            Some(RecordBatch::try_new(Arc::clone(&schema), vec![ids, scores, ordinals]).map_err(arrow)?)
-        };
-        self.owned_point_reply(&schema, output.as_ref(), present, valid, None)
+        let schema = hits.schema_ref().as_ref().clone().with_metadata(metadata);
+        // The query owns the batch reservation. Flight still charges the caller's session.
+        let ids = hits.column(0).as_ref();
+        let charge = (0..hits.num_rows()).try_fold(4096, |bytes, row| {
+            let id = read_entity_id(schema.field(0), ids, row).map_err(status)?;
+            let size = wire::add(std::mem::size_of::<Value>(), id.owned_payload_bytes())?;
+            wire::add(bytes, wire::mul(size, 4)?)
+        })?;
+        let _reply_charge = call.reserve(charge)?;
+        self.owned_point_reply(&schema, (hits.num_rows() != 0).then_some(hits), present, valid, None)
     }
 
     pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

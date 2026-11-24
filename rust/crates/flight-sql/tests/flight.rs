@@ -1829,6 +1829,118 @@ async fn check_spatial_pages_at_the_original_cut() {
     running.stop().await;
 }
 
+#[test]
+fn held_root_rank_flight_preserves_typed_ties_and_the_empty_window_schema() {
+    std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(check_held_root_rank_flight());
+    }).unwrap().join().unwrap();
+}
+
+async fn check_held_root_rank_flight() {
+    use arrow_array::{Float64Array, UInt64Array};
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_columnar::{EntityIdRef, entity_id_array, read_entity_id};
+    use rtdb_format::ipc::write_arrow_stream;
+    use sha2::{Digest, Sha256};
+
+    fn frame(body: &mut Vec<u8>, component: &str) {
+        body.extend_from_slice(&(component.len() as u16).to_be_bytes());
+        body.extend_from_slice(component.as_bytes());
+    }
+
+    let running = Running::start(Some("secret"), FlightConfig {
+        owned_native_actions: true, ..FlightConfig::default()
+    }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    for (relation, ids) in [
+        ("rank_alpha", vec![EntityIdRef::Integer(1), EntityIdRef::String("a")]),
+        ("rank_beta", vec![EntityIdRef::String("a")]),
+    ] {
+        let mut prefix = Vec::new();
+        frame(&mut prefix, relation);
+        let mut declaration = prefix.clone();
+        declaration.extend_from_slice(br#"{"fields":[{"name":"body","type":{"kind":"utf8"},"optional":false,"nullable":false}]}"#);
+        client.action("rtdb.owned.DeclareRelation.v1", declaration.into()).await.unwrap();
+
+        let path = RecordBatch::try_from_iter([
+            ("_id", Arc::new(StringArray::from(vec!["by_body"])) as arrow_array::ArrayRef),
+            ("column", Arc::new(StringArray::from(vec!["body"]))),
+        ]).unwrap();
+        let mut declaration = prefix.clone();
+        declaration.extend(write_arrow_stream(path.schema_ref(), std::slice::from_ref(&path), IpcWriteOptions::default()).unwrap());
+        client.action("rtdb.owned.DeclareSearchPath.v1", declaration.into()).await.unwrap();
+
+        let text = Arc::new(StringArray::from(vec!["invoice"; ids.len()]));
+        let batch = RecordBatch::try_from_iter([("_id", entity_id_array(ids).unwrap()), ("body", text)]).unwrap();
+        let mut insert = prefix;
+        insert.extend(write_arrow_stream(batch.schema_ref(), std::slice::from_ref(&batch), IpcWriteOptions::default()).unwrap());
+        client.action("rtdb.owned.Create.v1", insert.into()).await.unwrap();
+    }
+
+    let opened = client.action("rtdb.owned.OpenRead.v3", Bytes::new()).await.unwrap();
+    let handle = opened[0].body.slice(..16);
+    let present = i64::from_be_bytes(opened[0].body[16..24].try_into().unwrap());
+    let mut frame_bytes = handle.to_vec();
+    frame_bytes.extend(i64::MIN.to_be_bytes());
+    frame_bytes.extend(0u32.to_be_bytes());
+    frame_bytes.extend(2u16.to_be_bytes());
+    for relation in ["rank_beta", "rank_alpha"] {
+        frame(&mut frame_bytes, relation);
+        frame(&mut frame_bytes, "by_body");
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"rtdb.owned.search.held.v5\0");
+    digest.update(&frame_bytes);
+    digest.update(b"invoice");
+    let scope = format!("{:x}", digest.finalize());
+    let search = "rtdb.owned.SearchHeld.v5";
+    let request = |offset: u32, limit: u16| {
+        let mut body = frame_bytes.clone();
+        body.extend(offset.to_be_bytes());
+        body.extend(limit.to_be_bytes());
+        body.push(0);
+        body.extend(b"invoice");
+        Bytes::from(body)
+    };
+    let mut first_schema: Option<Arc<Schema>> = None;
+    for (offset, limit, expected) in [
+        (0, 3, vec![(EntityIdRef::String("a"), 0), (EntityIdRef::String("a"), 1), (EntityIdRef::Integer(1), 1)]),
+        (1, 1, vec![(EntityIdRef::String("a"), 1)]),
+        (3, 1, vec![]),
+    ] {
+        let reply = client.action(search, request(offset, limit)).await.unwrap();
+        let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
+        let schema = stream.schema();
+        let metadata = schema.metadata();
+        assert_eq!(metadata["rtdb.owned.search_total"], "3");
+        assert_eq!(metadata["rtdb.owned.search_scope"], scope);
+        assert_eq!(metadata["rtdb.owned.present_micros"], present.to_string());
+        assert_eq!(metadata["rtdb.owned.valid_micros"], present.to_string());
+        assert!(!metadata.contains_key("rtdb.owned.search_witnesses"));
+        assert_eq!(schema.field(0), &rtdb_columnar::to_field("_id", &rtdb_columnar::entity_id_type()).unwrap());
+        assert_eq!(schema.field(1), &Field::new("score", DataType::Float64, false));
+        assert_eq!(schema.field(2), &Field::new("partition", DataType::UInt64, false));
+        assert_eq!(schema.as_ref(), first_schema.get_or_insert_with(|| Arc::clone(&schema)).as_ref());
+        if !expected.is_empty() {
+            let batch = stream.next().unwrap().unwrap();
+            let scores = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+            let partitions = batch.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+            assert_eq!(batch.num_rows(), expected.len());
+            assert!(scores.value(0) > 0.0);
+            for (row, (id, partition)) in expected.into_iter().enumerate() {
+                assert_eq!(read_entity_id(schema.field(0), batch.column(0).as_ref(), row).unwrap(), id);
+                assert_eq!(partitions.value(row), partition);
+                assert_eq!(scores.value(row).to_bits(), scores.value(0).to_bits());
+            }
+        }
+        assert!(stream.next().is_none());
+    }
+    client.action("rtdb.owned.CloseRead.v1", handle).await.unwrap();
+    assert_eq!(client.action(search, request(0, 1)).await.unwrap_err().code(), tonic::Code::NotFound);
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn hosted_source_confirmation_checks_the_exact_prior_positions() {
     let running = Running::start_with_fence(Some("secret"), FlightConfig {

@@ -165,11 +165,11 @@ pub trait OwnedWorldRead: Send + Sync {
     fn ranked_search<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, staged: Option<rtdb_node::HeldTextCorpus>,
-    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>>;
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
     fn ranked_search_at<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp, parent_only: bool,
-    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>>;
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
     fn range<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>, valid: Timestamp,
     ) -> BoxFuture<'a, Result<(OwnedRangePage, OwnedWorldWitness)>>;
@@ -188,7 +188,7 @@ pub trait OwnedWorldRead: Send + Sync {
     fn ranked_search_parent_at<'a>(
         &'a self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp,
-    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)>>;
+    ) -> BoxFuture<'a, Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)>>;
     fn parent_range_at<'a>(
         &'a self, relation: OwnedRelation, path: OwnedRelation, request: OwnedRangeRequest<'a>,
         valid: Timestamp, system: Timestamp,

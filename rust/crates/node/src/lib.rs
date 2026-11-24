@@ -40,7 +40,11 @@ pub use node::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 pub use node::RootCatalogRead;
 pub use node::SearchFileFormat;
 #[cfg(feature = "search")]
-pub use rtdb_search::{HeldTextCorpus, OwnedSearchPage, owned_ranked as rank_owned_cut, owned_ranked_with_overlay as rank_owned_overlay_cut, owned_text_column};
+pub use rtdb_search::{
+    HeldTextCorpus, OwnedSearchBatch, OwnedSearchPage, owned_ranked as rank_owned_cut,
+    owned_ranked_overlay_batch as rank_owned_overlay_batch, owned_ranked_with_overlay as rank_owned_overlay_cut,
+    owned_text_column,
+};
 pub use node::{ChangeEdgeOrder, OwnedChangeEdge, archived_changes_at_cut, archived_path_touch_at_cut, archived_versions_at_cut, HeldSpatialNearest, HeldSpatialRange, IDEMPOTENCY_KEY_PARAMETER, NOT_HELD, REPLICA_BEHIND, NativeSession, Node, NodeDriver, NodeServices, OwnedChangeCommit, OwnedChangePage, OwnedForkCut, OwnedMergedChanges, OwnedPublicationLookup, OwnedRelationChanges, OWNED_MERGED_CHANGE_RELATIONS, OwnedRangeWitness, OwnedReadSession, OwnedRootPublication, OwnedRootSection, OwnedWorldAcceptedCut, OwnedWorldEffect, OwnedWorldFork, OwnedWorldObservations, OwnedWorldRegistrationOutcome, OwnedWorldWitness, OwnedWorldSection, OwnedWorldShadowRead, OwnedWorldVersionRead, OwnedWorldWrite, ReadFence, WorldClockRequest};
 
 mod statement;

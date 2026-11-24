@@ -30,7 +30,8 @@
 -- The scan checks each candidate's complete Arrow identity, microsecond revision, and declared text leg at the held cut.
 -- The ranker uses posting frequencies and stored lengths when the winning revision identifies an unambiguous event in its run.
 -- Overlapping events at the same revision use the resolved text to verify the match and score.
--- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity.
+-- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity, then by the requested partition ordinal.
+-- Root and hosted World Flight replies retain the verified rank columns through encoding and check the held relations again before release.
 -- Retained-world ranking checks for a placed world host before decoding the Flight request.
 -- Row count, token count, and term frequencies use only runs whose temporal visibility is exact at that cut.
 -- Public SQL search definitions remain scoped to the public catalog.

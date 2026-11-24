@@ -233,7 +233,7 @@ enum ArchiveRead {
         valid: Timestamp,
         parent_at: Option<(Timestamp, Vec<(OwnedRelation, rtdb_types::OwnedSchema)>)>,
         guard: Arc<dyn Fn() -> Result<()> + Send + Sync>,
-        reply: oneshot::Sender<Result<rtdb_node::OwnedSearchPage>>,
+        reply: oneshot::Sender<Result<rtdb_node::OwnedSearchBatch>>,
     },
     SearchColumns {
         partitions: Vec<(OwnedRelation, OwnedRelation)>,
@@ -955,7 +955,7 @@ impl HeldCheckpointWorld {
     pub async fn ranked_search(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, staged: Option<rtdb_node::HeldTextCorpus>,
-    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         if staged.is_some() && (self.clock_mode() != WorldClockMode::Proposal || valid != self.present().system_time) {
             return Err(OwnedWorld::unavailable());
         }
@@ -965,14 +965,14 @@ impl HeldCheckpointWorld {
     pub async fn ranked_search_at(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp, parent_only: bool,
-    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         self.ranked_search_on_cut(partitions, query, offset, limit, valid, Some((system, parent_only)), None, None).await
     }
 
     pub async fn ranked_search_parent_at(
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, system: Timestamp,
-    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         self.ranked_search_on_cut(partitions, query, offset, limit, valid, None, Some(system), None).await
     }
 
@@ -980,7 +980,7 @@ impl HeldCheckpointWorld {
         &self, partitions: Vec<(OwnedRelation, OwnedRelation)>, query: String, offset: usize, limit: usize,
         valid: Timestamp, earlier: Option<(Timestamp, bool)>, parent_at: Option<Timestamp>,
         staged: Option<rtdb_node::HeldTextCorpus>,
-    ) -> Result<(rtdb_node::OwnedSearchPage, Vec<OwnedWorldWitness>)> {
+    ) -> Result<(rtdb_node::OwnedSearchBatch, Vec<OwnedWorldWitness>)> {
         self.check()?;
         if offset > 4096 || !(1..=128).contains(&limit) || !(1..=32).contains(&partitions.len())
             || query.len() > 4096
@@ -2809,7 +2809,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                         } else {
                                             overlay
                                         };
-                                        let page = rtdb_node::rank_owned_overlay_cut(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
+                                        let page = rtdb_node::rank_owned_overlay_batch(scoped, &owner, &partitions, &query, offset, limit, Some(valid), overlay).await?;
                                         guard()?;
                                         Ok(page)
                                     };
