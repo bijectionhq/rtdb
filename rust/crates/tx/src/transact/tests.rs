@@ -100,6 +100,7 @@ fn custody_revocation_masks_prior_and_inherited_members_after_checkpoint() {
     let revoke = request(4, vec![Op::RevokeCustodyGroup { group, inventory_sha256: inventory.sha256 }]);
     let prepared = plan(&state, &revoke, 4, 40, &features);
     let first = apply(&mut state, 4, prepared.record()).unwrap();
+    assert_eq!(state.encode_checkpoint_at(basis(2)).unwrap_err().code, "rtdb/erased-under-view");
     let notices = state.index().custody_revocation_writes(group, state.index().head()).unwrap();
     assert_eq!(notices.iter().filter(|write| write.branch == "child")
         .map(|write| (&write.id, write.erased_written_basis)).collect::<Vec<_>>(),
@@ -503,6 +504,7 @@ fn checkpoint_retains_receipts_ancestry_and_mask_without_erased_values() {
     commit(&mut state, 3, &request(3, vec![Op::Erase {
         branch: None, table: table(), ids: vec![EntityId::Integer(1)],
     }]));
+    assert_eq!(state.encode_checkpoint_at(basis(2)).unwrap_err().code, "rtdb/erased-under-view");
     let encoded = state.encode_checkpoint().unwrap();
     assert!(!std::str::from_utf8(&encoded).unwrap().contains("secret"));
     let restored = TransactState::decode_checkpoint(&encoded, state.index().head()).unwrap();
