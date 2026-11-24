@@ -1136,7 +1136,7 @@ impl<'a> OpenTransaction<'a> {
             },
             Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
                 if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
-                let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
+                let arguments = decode_arguments(arg_bytes.clone().into_bytes(), &self.context.memory)?;
                 let mut planned = None;
                 for row in arguments.indexed_bound_rows() {
                     let (index, row) = row?;

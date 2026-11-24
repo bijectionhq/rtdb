@@ -4,7 +4,9 @@ use std::{io::{self, Cursor, Write}, ops::Range};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::{Scan, TemporalFilter};
@@ -115,11 +117,11 @@ impl ScanFragment {
     /// Binds each predicate slot to a matching column in one uploaded IPC row.
     /// Predicate insertion is atomic and the returned bindings retain the Arrow data.
     pub fn bind_wire_predicates(
-        &mut self, predicates: Vec<(usize, rtdb_plan::Expr)>, bytes: &[u8], memory: &Arc<MemoryBudget>,
+        &mut self, predicates: Vec<(usize, rtdb_plan::Expr)>, bytes: FragmentBytes, memory: &Arc<MemoryBudget>,
     ) -> Result<crate::BoundParameters> {
         use rtdb_plan::Expr;
         let malformed = || invalid("fragment-argument", "Invalid delegated predicate argument");
-        let stream = rtdb_format::ipc::OwnedStream::read(bytes, memory)?;
+        let stream = rtdb_format::ipc::OwnedStream::read_buffer(Buffer::from(Bytes::from_owner(bytes)), memory)?;
         let [page] = stream.pages() else { return Err(malformed()); };
         let batch = page.batch();
         if batch.num_rows() != 1 || self.scan.predicates.iter().any(|predicate| !portable(predicate)) { return Err(malformed()); }
@@ -637,7 +639,7 @@ mod tests {
         let bytes = rtdb_format::ipc::write_stream(batch.schema_ref(), &[batch.clone()]).unwrap();
         let mut wire = fragment(vec![Expr::Literal(Value::Bool(true)), Expr::Literal(Value::Bool(false))]);
         let predicate = Expr::binary(BinaryOp::Eq, Expr::Parameter { index: 0, data_type: logical }, Expr::Literal(vector.clone()));
-        let args = wire.bind_wire_predicates(vec![(1, predicate.clone())], &bytes, &memory).unwrap();
+        let args = wire.bind_wire_predicates(vec![(1, predicate.clone())], FragmentBytes::from_vec(bytes, &memory).unwrap(), &memory).unwrap();
         assert_eq!(wire.scan.predicates[1], predicate);
         assert!(args.arrow_input(0).is_some());
         assert_eq!(args.get(0).unwrap(), Some(&vector));

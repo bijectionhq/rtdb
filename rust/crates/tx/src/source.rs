@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
+use bytes::Bytes;
 use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
@@ -249,7 +250,7 @@ impl SourceTransaction {
         };
         let (pages, mut options, guard, legacy, abort_on_legacy_resolver) = match message {
             SourceMessage::Protobuf(SourceBody::Tx(tx)) => {
-                let bytes = tx.tx_ops.as_deref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
+                let bytes = tx.tx_ops.as_ref().ok_or_else(|| invalid("Transaction has no operations stream"))?;
                 let options = SubmitOptions { default_tz: tx.default_tz.clone().ok_or_else(|| invalid("Transaction has no default timezone"))?, user: tx.user.clone(), user_metadata: tx.user_metadata.as_deref().filter(|bytes| !bytes.is_empty()).map(|bytes| decode_metadata(bytes, memory)).transpose()? };
                 let guard = match (&tx.idempotency_guard, &tx.replay_submission, &tx.bounded_retry) {
                     (Some(guard), None, None) => {
@@ -362,7 +363,7 @@ impl SourceTransaction {
         crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)
     }
 
-    pub(crate) fn decode_landing_footprint(&self, footprint: &[u8]) -> Result<Self> {
+    pub(crate) fn decode_landing_footprint(&self, footprint: &Bytes) -> Result<Self> {
         let pages = crate::ipc::decode(footprint, &self.memory)?;
         let mut scratch = self.memory.reserve(4096)?;
         let scratch = Arc::get_mut(&mut scratch).expect("source decoding owns its reservation");
@@ -2664,7 +2665,7 @@ impl SourceOperationReader<'_> {
             }
             "sql" => {
                 let sql = match value("query")? { Value::Utf8(sql) => sql, _ => return Err(invalid("SQL operation has no query")) };
-                let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(&bytes, memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
+                let args = match value("args")? { Value::Null | Value::Undefined => None, Value::Binary(bytes) => Some(decode_arguments(bytes.into(), memory)?), _ => return Err(invalid("SQL arguments are not IPC bytes")) };
                 TxOp::Sql { sql, args }
             }
             "rtdb-owned-insert-v1" | "rtdb-owned-replace-v1"
@@ -2804,9 +2805,9 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
     crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory)
 }
 
-pub(crate) fn decode_arguments(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
-    let _value_reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
-    let stream = rtdb_format::ipc::OwnedStream::read(bytes, memory)?;
+pub(crate) fn decode_arguments(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
+    let _value_reservation = memory.reserve(crate::ipc::allocation_bound(&bytes)?)?;
+    let stream = rtdb_format::ipc::OwnedStream::read_buffer(Buffer::from(bytes), memory)?;
     let schema = Arc::clone(stream.schema());
     for (index, field) in schema.fields().iter().enumerate() {
         if !field.name().is_empty() && field.name() != &format!("${}", index + 1) && field.name() != &format!("?_{}", index) {
@@ -2834,7 +2835,7 @@ fn encode_metadata(metadata: &UserMetadata, memory: &Arc<MemoryBudget>) -> Resul
     let owned = OwnedBatch::with_reservation(batch, reservation)?;
     crate::ipc::encode(owned.batch().schema().as_ref(), [owned.batch()], memory)
 }
-fn decode_metadata(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<UserMetadata> {
+fn decode_metadata(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<UserMetadata> {
     let _value_reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
     let pages = crate::ipc::decode(bytes, memory)?;
     if pages.len() != 1 || pages[0].batch().num_rows() != 1 { return Err(invalid("User metadata must contain one row")); }
@@ -3256,7 +3257,7 @@ mod tests {
         assert!(batch.batch().column(0).as_any().is::<UnionArray>());
         assert!(batch.batch().column(1).as_any().is::<StructArray>());
         let bytes = encode_arguments(&arguments, &memory).unwrap();
-        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+        let replayed = decode_arguments(bytes.into_bytes(), &memory).unwrap();
 
         let rows = replayed.indexed_rows().map(|row| {
             let (ordinal, row) = row.unwrap();
@@ -3288,7 +3289,7 @@ mod tests {
         assert_eq!(arguments.source_columnar_batch(&memory).unwrap().batch().num_rows(), 2);
 
         let bytes = encode_arguments(&arguments, &memory).unwrap();
-        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
+        let replayed = decode_arguments(bytes.into_bytes(), &memory).unwrap();
 
         assert_eq!(replayed.rows().map(|row| row.unwrap().to_vec()).collect::<Vec<_>>(), [first.to_vec(), second.to_vec()]);
     }
@@ -3318,9 +3319,9 @@ mod tests {
         assert_eq!(lists.value_offsets(), &[0, 0, 1]);
 
         let bytes = encode_arguments(&arguments, &memory).unwrap();
-        let replayed = decode_arguments(bytes.as_slice(), &memory).unwrap();
-
         assert!(bytes.as_slice().len() < payload.len());
+        let replayed = decode_arguments(bytes.into_bytes(), &memory).unwrap();
+
         assert_eq!(&*replayed.rows().next().unwrap().unwrap(), &[Value::Null, Value::Null]);
     }
 
@@ -4677,7 +4678,7 @@ mod tests {
         let operations = Arc::new(UnionArray::try_new(fields, vec![tag].into(), Some(vec![0i32].into()), vec![body]).unwrap());
         let schema = Arc::new(Schema::new(vec![batch.schema_ref().field(0).clone().with_data_type(operations.data_type().clone())]));
         let legacy = RecordBatch::try_new(Arc::clone(&schema), vec![operations]).unwrap();
-        tx.tx_ops = Some(crate::ipc::encode(&schema, [&legacy], &memory).unwrap().as_slice().to_vec().into());
+        tx.tx_ops = Some(crate::ipc::encode(&schema, [&legacy], &memory).unwrap().into_bytes());
         let decoded = SourceTransaction::decode(&message, &memory).unwrap();
         let [Operation::PutReplayArrow { documents, iids: None, .. }] = decoded.operations.as_slice() else {
             panic!("Expected legacy Arrow put");
@@ -4749,7 +4750,7 @@ mod tests {
         assert_eq!(roundtrip(&source).options.user_metadata.unwrap().value(), &value);
         let mut message = SourceMessage::decode(source.encode().unwrap().as_slice()).unwrap().unwrap();
         let SourceMessage::Protobuf(SourceBody::Tx(tx)) = &mut message else { panic!("wrong envelope") };
-        tx.user_metadata = Some(bytes::Bytes::new());
+        tx.user_metadata = Some(Bytes::new());
         assert!(SourceTransaction::decode(&message, &memory).unwrap().options.user_metadata.is_none());
     }
 }

@@ -590,6 +590,8 @@ impl OwnedStream {
         Ok(Self { schema, pages, _reservation: reservation })
     }
 
+    /// The input must end with an IPC end marker.
+    /// Decoded arrays can retain the input allocation, so carry its existing charge in the buffer owner.
     pub fn read_buffer(bytes: Buffer, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = memory.reserve(stream_bound(&bytes, true, arrow_descriptors)?)?;
         let bytes = &bytes;

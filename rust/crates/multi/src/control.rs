@@ -437,7 +437,7 @@ async fn read_request(stream: &mut TcpStream, key: &ControlKey, literal_frames: 
     }
     let memory = MemoryBudget::new(16 << 20);
     let bytes = read_arguments(&mut reader, arguments.length, &memory).await?;
-    let args = fragment.bind_wire_predicates(arguments.predicates, bytes.as_slice(), &memory)?;
+    let args = fragment.bind_wire_predicates(arguments.predicates, bytes, &memory)?;
     Ok((envelope, Some(args), None))
 }
 

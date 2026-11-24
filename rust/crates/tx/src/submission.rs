@@ -53,7 +53,7 @@ pub fn prepare_submission_with_sql_options(operations: Vec<TxOp>, options: Submi
         let expanded = match &operation {
             TxOp::Sql { sql, args } => expand(sql, args.as_ref(), &options, database, memory, sql_options)?,
             TxOp::SqlBytes { sql, arg_bytes } => {
-                let args = if arg_bytes.as_slice().is_empty() { None } else { Some(crate::source::decode_arguments(arg_bytes.as_slice(), memory)?) };
+                let args = if arg_bytes.as_slice().is_empty() { None } else { Some(crate::source::decode_arguments(arg_bytes.clone().into_bytes(), memory)?) };
                 expand(sql, args.as_ref(), &options, database, memory, sql_options)?
             }
             _ => None,

@@ -55,3 +55,23 @@ fn arrow_byte_path_source_decode_keeps_owned_protobuf_and_legacy_bytes() {
     let offset = frame.windows(5).position(|window| window == b"\0\xffipc").unwrap();
     assert_eq!(decoded.tx_ops.unwrap().as_ptr(), frame[offset..].as_ptr());
 }
+
+#[test]
+fn owned_ipc_fields_round_trip_existing_protobuf_bytes() {
+    use prost::Message;
+
+    let source = [3, 0x32, 7, 0x0a, 2, 0xff, 0, 0x2a, 1, 9];
+    let decoded = SourceMessage::decode(&source).unwrap().unwrap();
+    assert_eq!(decoded.encode().unwrap(), source);
+    let SourceMessage::Protobuf(SourceBody::Tx(tx)) = decoded else { panic!("expected an ordinary transaction"); };
+    assert_eq!(tx.tx_ops.unwrap().as_ref(), &[0xff, 0]);
+    assert_eq!(tx.user_metadata.unwrap().as_ref(), &[9]);
+
+    let legacy = [0xff, 0xff, 0xff, 0xff, 1];
+    assert_eq!(SourceMessage::decode(&legacy).unwrap().unwrap().encode().unwrap(), legacy);
+
+    let replica = [0x2a, 14, 0x0a, 8, b'p', b'u', b'b', b'l', b'i', b'c', b'/', b't', 0x12, 2, 0xff, 0];
+    let decoded = proto::ResolvedTx::decode(replica.as_slice()).unwrap();
+    assert_eq!(decoded.table_data["public/t"].as_ref(), &[0xff, 0]);
+    assert_eq!(decoded.encode_to_vec(), replica);
+}

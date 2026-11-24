@@ -2689,6 +2689,7 @@ rule RefineKeyForLargeDeployments {
     -- The peers select the newest literal page version they both support.
     -- The JSON request carries the expression shape.
     -- The reader restores literal expressions in their original positions.
+    -- The reader decodes the Arrow IPC arguments from slices of the retained request frame.
     -- The coordinator applies its original predicates to the returned rows.
     -- A reader sends length-framed Arrow IPC when the coordinator advertises binary reply support.
     -- Readers execute concurrently and the coordinator admits each binary reply against query memory before receiving its body in fragment order.

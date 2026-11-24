@@ -22,7 +22,7 @@ impl OperationValue { fn is_null(&self) -> bool { matches!(self, Self::Scalar(Va
 
 pub fn decode_operation_rows(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<OperationRows> {
     let reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
-    let pages = crate::ipc::decode(bytes, memory)?;
+    let pages = rtdb_format::ipc::OwnedStream::read(bytes, memory)?.into_pages();
     let mut rows = Vec::new();
     for page in pages {
         let schema = page.batch().schema();

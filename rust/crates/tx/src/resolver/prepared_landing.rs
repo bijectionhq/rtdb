@@ -64,7 +64,7 @@ impl SourceTransaction {
             return Err(invalid());
         }
         let footprint = self.encode_landing_footprint()?;
-        let mut operations = self.decode_landing_footprint(footprint.as_slice())?;
+        let mut operations = self.decode_landing_footprint(&footprint.into_bytes())?;
         let base = snapshot();
         let catalog = base.catalog_cut().ok_or_else(stale)?;
         let predecessor = base.tx_basis().ok_or_else(stale)?;

@@ -2,7 +2,9 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
+use arrow_buffer::Buffer;
 use arrow_schema::Schema;
+use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::OwnedStream;
 use rtdb_types::{Anomaly, Result};
@@ -31,8 +33,8 @@ pub(crate) fn encode<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a Re
     RetainedBytes::with_reservation(data, reservation)
 }
 
-pub(crate) fn decode(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Vec<OwnedBatch>> {
-    Ok(OwnedStream::read(bytes, memory)?.into_pages())
+pub(crate) fn decode(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<Vec<OwnedBatch>> {
+    Ok(OwnedStream::read_buffer(Buffer::from(bytes.clone()), memory)?.into_pages())
 }
 
 pub(crate) fn allocation_bound(bytes: &[u8]) -> Result<usize> {
@@ -86,3 +88,30 @@ pub(crate) fn allocation_bound(bytes: &[u8]) -> Result<usize> {
 
 fn overflow() -> Anomaly { invalid("IPC allocation bound exceeds address space") }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/invalid-ipc", message) }
+
+#[test]
+fn replay_ipc_buffers_keep_the_source_allocation_and_its_charge() {
+    use arrow_array::Int64Array;
+    use arrow_schema::{DataType, Field};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, -4]))]).unwrap();
+    let bytes = encode(batch.schema_ref(), [&batch], &memory).unwrap();
+    assert_eq!(bytes.as_slice(), rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap());
+    let input_charge = memory.used_bytes();
+    let inside = bytes.as_slice().as_ptr() as usize..bytes.as_slice().as_ptr() as usize + bytes.as_slice().len();
+    let bytes = bytes.into_bytes();
+    let pages = decode(&bytes, &memory).unwrap();
+    let values = Arc::clone(pages[0].batch().column(0));
+    let both_charges = memory.used_bytes();
+
+    drop((pages, bytes));
+    let values_view = values.as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(inside.contains(&(values_view.values().as_ptr() as usize)));
+    assert_eq!(values_view.values().as_ref(), &[7, -4]);
+    assert!(both_charges > input_charge);
+    assert_eq!(memory.used_bytes(), both_charges);
+    drop(values);
+    assert_eq!(memory.used_bytes(), 0);
+}

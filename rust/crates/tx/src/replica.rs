@@ -508,7 +508,7 @@ mod tests {
         for (table, write) in staged.tables() {
             let batch = write.batch().unwrap().arrow();
             let bytes = crate::ipc::encode(batch.schema().as_ref(), [batch], &memory)?;
-            frame.table_data.insert(table.schema_and_table(), bytes.as_slice().to_vec().into());
+            frame.table_data.insert(table.schema_and_table(), bytes.into_bytes());
         }
         let original = frame.table_data[&business.schema_and_table()].clone();
         assert!(decode_held_replica(&frame, Some(previous), staged.block_index(), &memory).is_err());
