@@ -198,11 +198,12 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     directory: Arc<dyn Directory>, archive: &CellStorage, storage: &CellStorage,
     agent: &crate::agent::NodeAgent, keys: &dyn KeyService, hosted_task: Option<&HostedTask>,
     session: &mut NativeSession, deployment: Uuid, cut: rtdb_node::OwnedForkCut,
-    child: Uuid, retain_until: Timestamp,
+    child: Uuid, retain_until: Timestamp, writable: bool,
     resources: CheckpointReadResources<'_>,
 ) -> Result<rtdb_flight_sql::PreparedWorldOverlay> {
     let unavailable = OwnedWorld::unavailable;
     let (world, pin, logical) = cut.overlay().ok_or_else(unavailable)?;
+    let mode = if writable { WorldClockMode::Held { start: logical } } else { WorldClockMode::Retained };
     if child.is_nil() || child.as_bytes() == &world.0 || retain_until <= now() {
         return Err(unavailable());
     }
@@ -292,7 +293,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         world: child, ancestor: Some(ancestor.clone()), owner: owner.clone(),
         capture: retained.capture, manifest_sha256: retained.manifest_sha256.clone(),
         schema_digest: retained.schema_digest, suffix: retained.suffix, basis: retained.basis,
-        parent_publication: retained.parent_publication, mode: WorldClockMode::Retained, until: retain_until,
+        parent_publication: retained.parent_publication, mode, until: retain_until,
     };
     let key = deployment.to_string();
     update_installation(directory.as_ref(), &key, |current| {
@@ -713,9 +714,14 @@ pub(crate) async fn fork_checkpoint_world_selected(
         let child = Uuid::from_bytes(fork.world.0);
         let retained = source.checkpoint_worlds.get(&child).ok_or_else(unavailable)?;
         let ancestor = retained.ancestor.as_ref().ok_or_else(unavailable)?;
+        let mode = match fork.requested {
+            rtdb_node::WorldClockRequest::Retained => WorldClockMode::Retained,
+            rtdb_node::WorldClockRequest::Held { start: None } => WorldClockMode::Held { start: logical },
+            _ => return Err(unavailable()),
+        };
         if !capture.is_nil() || suffix.is_some() || child.is_nil() || retained.world != child
             || fork.world != fork.pin || retained.owner != owner || retained.until != until
-            || retained.mode != WorldClockMode::Retained || fork.cut.until() <= now() || until <= now()
+            || retained.mode != mode || fork.cut.until() <= now() || until <= now()
             || ancestor.logical != logical || !fork.cut.admits_overlay(ancestor.basis, ancestor.system)
             || session.placed_history()? != Some(fork.cut.scope())
         {
@@ -1100,7 +1106,7 @@ pub(crate) async fn commit_checkpoint_world_batch(
         let retained = installation.checkpoint_worlds.get(&pin).ok_or_else(OwnedWorld::unavailable)?;
         admit_session(session, &installation, &retained.owner)?;
         if retained.world.as_bytes() != &section.world.0 || retained.basis != section.parent_basis
-            || now() >= retained.until || (retained.ancestor.is_some() && !matches!(&section.effect, rtdb_node::OwnedWorldEffect::Drop))
+            || now() >= retained.until || (!retained.mode.is_writable() && !matches!(&section.effect, rtdb_node::OwnedWorldEffect::Drop))
         {
             return Err(OwnedWorld::unavailable());
         }

@@ -1866,6 +1866,7 @@ impl<'a> OpenTransaction<'a> {
                             // through the directory even after the writer's live history is gone.
                             if let Some(ancestor) = &world.ancestor
                                 && matches!(source.mode, WorldClockMode::Held { .. })
+                                && source.ancestor.is_none()
                             {
                                 let (original, reading, _charge) = rtdb_query::read_held_world_publication(
                                     &context, owner, source.id, ancestor.system,

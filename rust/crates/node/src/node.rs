@@ -1492,7 +1492,7 @@ impl OwnedReadSession {
         }
         if !(1..=32).contains(&world.schemas.relations().count()) { return Err(unavailable()); }
         let clock = match (&world.ancestor, archived) {
-            (Some(ancestor), Some(archived)) if world.mode == rtdb_types::WorldClockMode::Retained
+            (Some(ancestor), Some(archived)) if world.mode != rtdb_types::WorldClockMode::Proposal
                 && ancestor.basis.system_time < self.present.system_time =>
                 archived.reading(ancestor, system)?,
             (None, None) if matches!(world.mode, rtdb_types::WorldClockMode::Held { .. }) => {
@@ -3099,7 +3099,7 @@ impl NativeSession {
             (None, None) => fork.cut.matches_basis(record.basis)
                 && parent_source.is_none_or(|(source, _)| retaining_child && can_seed_root && record.id != source),
             (Some(ancestor), Some((source, _, clock))) => record.id != source && ancestor.logical == clock
-                && retaining_child && requested == rtdb_types::WorldClockMode::Retained
+                && retaining_child && can_seed_root
                 && fork.cut.admits_overlay(ancestor.basis, ancestor.system),
             _ => false,
         };

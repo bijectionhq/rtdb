@@ -1535,7 +1535,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
     for action in [
         "rtdb.owned.PublishWorldCut.v1", "rtdb.owned.DecideWorldCut.v1",
         "rtdb.owned.DecideHeldWorlds.v1",
-        "rtdb.owned.OpenWorldRead.v4", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
+        "rtdb.owned.OpenWorldRead.v5", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
         "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.ReadHeldWorldHead.v1",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",

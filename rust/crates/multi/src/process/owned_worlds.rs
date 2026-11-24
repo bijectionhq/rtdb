@@ -47,7 +47,7 @@ impl PlacedWorldHost {
 
 impl OwnedWorldHost for PlacedWorldHost {
     fn prepare_world_overlay<'a>(
-        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut, child: Uuid, retain_until: Timestamp,
+        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut, child: Uuid, retain_until: Timestamp, writable: bool,
     ) -> BoxFuture<'a, Result<rtdb_flight_sql::PreparedWorldOverlay>> {
         Box::pin(async move {
             let deployment = self.deployment(&call)?;
@@ -56,7 +56,7 @@ impl OwnedWorldHost for PlacedWorldHost {
                 .ok_or_else(OwnedWorld::unavailable)?;
             crate::archive::prepare_checkpoint_world_overlay(
                 Arc::clone(&self.directory), &self.archive, source, &agent, self.keys.as_ref(),
-                self.hosted_task.as_ref(), call.session, deployment, cut, child, retain_until,
+                self.hosted_task.as_ref(), call.session, deployment, cut, child, retain_until, writable,
                 CheckpointReadResources {
                     node: &self.options, memory: call.node.memory(),
                     cache: Arc::clone(call.node.cache_budget()), cancellation: call.cancellation,

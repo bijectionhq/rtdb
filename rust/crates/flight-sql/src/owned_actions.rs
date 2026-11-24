@@ -257,7 +257,7 @@ pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPa
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
-pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V3: &str = "rtdb.owned.PrepareHeldWorldOverlay.v3";
+pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V4: &str = "rtdb.owned.PrepareHeldWorldOverlay.v4";
 pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
@@ -266,7 +266,7 @@ pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
 pub(crate) const RETAIN_REPLAYED_WORLD_V3: &str = "rtdb.owned.RetainReplayedWorld.v3";
-pub(crate) const OPEN_WORLD_READ_V4: &str = "rtdb.owned.OpenWorldRead.v4";
+pub(crate) const OPEN_WORLD_READ_V5: &str = "rtdb.owned.OpenWorldRead.v5";
 pub(crate) const READ_HELD_WORLD_HEAD_V1: &str = "rtdb.owned.ReadHeldWorldHead.v1";
 pub(crate) const SELECT_HELD_WORLD_PARENT_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldParentAsOf.v1";
 pub(crate) const HELD_WORLD_PARENT_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentPointAt.v1";
@@ -3340,7 +3340,13 @@ impl Service {
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a held world"))?;
         let (system, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Overlay preparation requires an exact system publication"))?;
         let (child, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a child identity"))?;
-        let retain_until = Timestamp(i64::from_be_bytes(rest.try_into().map_err(|_| invalid("Overlay preparation requires a retention deadline"))?));
+        let (until, mode) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Overlay preparation requires a retention deadline"))?;
+        let retain_until = Timestamp(i64::from_be_bytes(*until));
+        let writable = match mode {
+            [0] => false,
+            [1] => true,
+            _ => return Err(invalid("Overlay preparation requires its exact clock mode")),
+        };
         let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
@@ -3353,7 +3359,7 @@ impl Service {
         let charge = call.reserve(4096)?;
         let prepared = host.prepare_world_overlay(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
-            cut, Uuid::from_bytes(*child), retain_until,
+            cut, Uuid::from_bytes(*child), retain_until, writable,
         ).await.map_err(status)?;
         held.snapshot.check().map_err(status)?;
         let body = serde_json::to_vec(&prepared).map_err(|_| Status::internal("Could not encode prepared overlay"))?;
@@ -3450,7 +3456,7 @@ impl Service {
         reply.extend_from_slice(&snapshot.application_clock().unwrap_or(Timestamp::MIN).0.to_be_bytes());
         reply.extend_from_slice(&snapshot.initial_clock().0.to_be_bytes());
         if let Some((world, system)) = snapshot.ancestor() {
-            reply.push(3);
+            reply.push(if snapshot.clock_mode().is_writable() { 4 } else { 3 });
             reply.extend_from_slice(&world.0);
             reply.extend_from_slice(&system.0.to_be_bytes());
         } else {
@@ -4131,7 +4137,7 @@ impl Service {
             let ([kind], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world publication effect"))?;
             rows_left = rows_left.checked_sub(count * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
             let resource = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
-            if resource.snapshot.ancestor().is_some() && *kind != 2 {
+            if !resource.snapshot.clock_mode().is_writable() && *kind != 2 {
                 return Err(unsupported());
             }
             let (checks, charge) = resource.conditions(call, world, nonces)?;

@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// authenticated native session and its already admitted database attachment.
 pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
     fn prepare_world_overlay<'a>(
-        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut, child: Uuid, retain_until: Timestamp,
+        &'a self, call: WorldCall<'a>, cut: rtdb_node::OwnedForkCut, child: Uuid, retain_until: Timestamp, writable: bool,
     ) -> BoxFuture<'a, Result<PreparedWorldOverlay>>;
 
     fn prepare_replay_parent<'a>(
