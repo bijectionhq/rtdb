@@ -346,6 +346,14 @@ impl TxResolver {
             {
                 return Err(Anomaly::incorrect("rtdb.owned/invalid-clock-slot", "A clock slot requires a fresh placed transaction with a deadline"));
             }
+            if slot.funded && (request.prepared_landing.is_some()
+                || !request.operations.iter().any(|operation| matches!(operation,
+                    Operation::Public(TxOp::OwnedDeadline { recheck_at_staging: true, journal_before: Some(cutoff), .. })
+                        if slot.reading.0.checked_add(1_000_000).is_some_and(|end| cutoff.before().0 <= end)
+                )))
+            {
+                return Err(Anomaly::incorrect("rtdb.owned/invalid-clock-slot", "A funded clock slot requires its guarded window"));
+            }
             let observed = decision.ok_or_else(|| Anomaly::incorrect(
                 "rtdb.owned/clock-slot-missed", "The offered transaction clock is unavailable",
             ))?;
@@ -380,6 +388,7 @@ impl TxResolver {
         };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
         tx.terms_time = terms_time;
+        tx.clock_slot = slot.filter(|_| slot_time.is_ok());
         tx.decision = decision;
         tx.trace_parent = span.as_ref().map(|span| span.context());
         let replay = match &request.guard {
@@ -531,6 +540,7 @@ impl TxResolver {
             drop(tx);
             tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
             tx.terms_time = terms_time;
+            tx.clock_slot = slot;
             tx.decision = decision;
             tx.trace_parent = span.as_ref().map(|span| span.context());
             outcome = tx.apply_selected_refusal(primary, refusal, attempt.map(PlacedAttempt::scope)).await;
@@ -741,6 +751,10 @@ impl<'a> OpenTransaction<'a> {
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
 
     fn decision_time(&self) -> Timestamp {
+        self.clock_slot.filter(|slot| slot.funded).map_or_else(|| self.receiver_time(), |slot| slot.reading)
+    }
+
+    fn receiver_time(&self) -> Timestamp {
         self.decision.map_or(self.terms_time, |sample| sample.instant)
     }
 
@@ -1752,7 +1766,7 @@ impl<'a> OpenTransaction<'a> {
         }) {
             return Err(unavailable());
         }
-        if deadline.is_some_and(|until| !crate::system_time::owned_deadline_is_live(self.decision_time().0, until.0)) {
+        if deadline.is_some_and(|until| !crate::system_time::owned_deadline_is_live(self.receiver_time().0, until.0)) {
             return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/expired", "Owned transaction reached its deadline before ordering"));
         }
         if let Some(root) = operations.iter().find_map(|operation| match operation {

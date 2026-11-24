@@ -2,6 +2,8 @@ mod historical_owned_read;
 mod hosted_control;
 pub use hosted_control::RootCatalogRead;
 mod hosted_observation;
+mod funded_mutation_clock;
+pub use funded_mutation_clock::{FundedMutationClock, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};
 mod durable_range;
 pub use durable_range::{DurableRange, MAX_DURABLE_RANGE_BYTES};
 pub use hosted_observation::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};

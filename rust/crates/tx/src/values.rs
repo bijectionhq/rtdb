@@ -1314,6 +1314,7 @@ pub struct OwnedClockSlot {
     pub through: TxId,
     pub reading: Timestamp,
     pub issued: crate::DecisionObservation,
+    pub funded: bool,
 }
 
 #[derive(Clone, Debug)]

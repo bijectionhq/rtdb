@@ -33,7 +33,7 @@ pub use config::*;
 pub use database::{CompactionRelay, Database};
 pub use rtdb_tx::{ArchivedWorldConstraints, HostedControlWrite, WorldConstraintArchive};
 pub use rtdb_replication::{LocalRepair, RepairCheckpoint, RepairedStore, RetainRepairBase, RetainedLocalRepair};
-pub use node::{DurableRange, MAX_DURABLE_RANGE_BYTES};
+pub use node::{DurableRange, FundedMutationClock, MAX_DURABLE_RANGE_BYTES, MAX_FUNDED_MUTATION_CLOCK_TOKEN_BYTES};
 pub use node::{OwnedStorageUsage, ExpiryCandidate, ExpiryCandidatePage, OwnedIdentityPage, OwnedReplayWorld, OwnedValidHistory, OwnedVersion, OwnedVersionOrder, OwnedVersionPage, OwnedVersionRequest};
 pub use node::{AppliedOwnedPoint, AppliedReadConfirmation, AppliedReadFloor};
 pub use node::RootCatalogRead;

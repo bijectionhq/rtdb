@@ -813,7 +813,8 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
             body.insert("through".into(), Value::I64(slot.through.0));
             body.insert("reading".into(), Value::I64(slot.reading.0));
             body.insert("issued".into(), Value::Binary(slot.issued.encode().to_vec()));
-            "rtdb-owned-clock-slot-v3"
+            body.insert("funded".into(), Value::Bool(slot.funded));
+            "rtdb-owned-clock-slot-v4"
         }
         Operation::Public(TxOp::OwnedDeadline { until, recheck_at_staging, journal_before }) => {
             body.insert("until".into(), Value::I64(until.0));
@@ -2021,16 +2022,16 @@ impl SourceOperationReader<'_> {
                 }
                 TxOp::HostedConstraintRefusal
             }
-            "rtdb-owned-clock-slot-v3" => {
-                let (Value::I64(id), Value::I64(micros), Value::Binary(issued)) =
-                    (value("through")?, value("reading")?, value("issued")?) else {
+            "rtdb-owned-clock-slot-v4" => {
+                let (Value::I64(id), Value::I64(micros), Value::Binary(issued), Value::Bool(funded)) =
+                    (value("through")?, value("reading")?, value("issued")?, value("funded")?) else {
                     return Err(invalid("Invalid owned clock slot"));
                 };
                 if id < 0 || micros <= 0 { return Err(invalid("Invalid owned clock slot")); }
                 TxOp::OwnedClockSlot {
                     slot: crate::OwnedClockSlot {
                         through: rtdb_types::TxId(id), reading: Timestamp(micros),
-                        issued: crate::DecisionObservation::decode(&issued)?,
+                        issued: crate::DecisionObservation::decode(&issued)?, funded,
                     },
                 }
             }

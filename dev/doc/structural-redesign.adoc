@@ -81,7 +81,10 @@ Media disposal has independent evidence.
 |System time as a physical clock
 |The ordered receiver validates positions and judges expiry on one certified clock observation, with equality at the deadline refusing.
 It materializes bounded acceptance-relative terms before validating the actual candidate.
-Funded service turns can bind a successful acceptance to an advertised grid reading in its half-open window.
+A funded mutation offer authenticates the placed history, original held position, receiver observation, advertised grid reading and one create-only result receipt.
+The hosted admission owner retains the offer in its durable reservation before it enters guest preparation.
+The receiver binds the guarded commit and its constraint refusal alternative to that exact receipt.
+It uses the advertised reading for logical judgments and the current clock and original quorum for the exclusive physical cutoff.
 A missed window settles only upon original decision evidence or proven exclusion.
 |Successor smoothing, head-derived time reservations and system time as a deadline input.
 

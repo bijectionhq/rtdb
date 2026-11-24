@@ -244,7 +244,7 @@ mod tests {
         let reading = clock_slot_reading(Timestamp(100)).unwrap();
         assert_eq!(reading, Timestamp(1_000_000));
         let issued = DecisionObservation { domain: [3; 16], epoch: 2, sequence: 4, instant: Timestamp(100) };
-        let slot = OwnedClockSlot { through: TxId(8), reading, issued };
+        let slot = OwnedClockSlot { through: TxId(8), reading, issued, funded: false };
         let observe = |instant| DecisionObservation { sequence: 5, instant, ..issued };
         let behind = TransactionKey { tx_id: TxId(7), system_time: Timestamp(100) };
         let carried = TransactionKey { tx_id: TxId(9), system_time: Timestamp(301) };

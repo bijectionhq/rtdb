@@ -57,7 +57,7 @@ impl OrderedClockEvidence {
         let mut bytes = [0; Self::WIDTH as usize];
         bytes[..40].copy_from_slice(&self.observation.encode());
         if let Some(slot) = self.slot {
-            bytes[40] = 1;
+            bytes[40] = if slot.funded { 2 } else { 1 };
             bytes[41..49].copy_from_slice(&slot.through.0.to_be_bytes());
             bytes[49..57].copy_from_slice(&slot.reading.0.to_be_bytes());
             bytes[57..].copy_from_slice(&slot.issued.encode());
@@ -70,7 +70,7 @@ impl OrderedClockEvidence {
         let observation = DecisionObservation::decode(&bytes[..40])?;
         let slot = match bytes[40] {
             0 if bytes[41..].iter().all(|byte| *byte == 0) => None,
-            1 => {
+            flag @ (1 | 2) => {
                 let through = TxId(i64::from_be_bytes(bytes[41..49].try_into().map_err(|_| invalid_observation())?));
                 let reading = Timestamp(i64::from_be_bytes(bytes[49..57].try_into().map_err(|_| invalid_observation())?));
                 let issued = DecisionObservation::decode(&bytes[57..])?;
@@ -80,7 +80,7 @@ impl OrderedClockEvidence {
                 {
                     return Err(invalid_observation());
                 }
-                Some(OwnedClockSlot { through, reading, issued })
+                Some(OwnedClockSlot { through, reading, issued, funded: flag == 2 })
             }
             _ => return Err(invalid_observation()),
         };
@@ -105,7 +105,7 @@ mod tests {
     fn retained_slot_keeps_the_original_target_and_cut() {
         let observation = DecisionObservation { domain: [7; 16], epoch: 3, sequence: 8, instant: Timestamp(1_200_000) };
         let issued = DecisionObservation { sequence: 6, instant: Timestamp(100), ..observation };
-        let slot = OwnedClockSlot { through: TxId(5), reading: Timestamp(1_000_000), issued };
+        let slot = OwnedClockSlot { through: TxId(5), reading: Timestamp(1_000_000), issued, funded: true };
         let original = OrderedClockEvidence { observation, slot: Some(slot) };
         let bytes = original.encode();
         assert_eq!(OrderedClockEvidence::decode(&bytes, TxId(6)).unwrap(), original);
