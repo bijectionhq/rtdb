@@ -255,6 +255,8 @@ pub struct DeploymentRecord {
     /// drains its I/O and any ambiguous publications are confirmed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub storage_regions: BTreeMap<uuid::Uuid, StorageRegion>,
+    /// Serving slots awaiting a local atomic publication or region drain.
+    pub local_publications: BTreeMap<uuid::Uuid, BTreeMap<uuid::Uuid, (String, rtdb_types::ServingPublication)>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub catalog_readers: BTreeMap<uuid::Uuid, CatalogReader>,
     /// Installed catalog admission floors, keyed by storage root.
@@ -1180,7 +1182,7 @@ impl DeploymentRecord {
     pub fn new(name: impl Into<String>, org: impl Into<String>, ensemble: Vec<MemberId>, now_ms: i64) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self { lineage: id.clone(), id, name: name.into(), org: org.into(), incarnation: 1, lifecycle: Lifecycle::Live, epoch: 0, holder: None, resident_idle: None,
-            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
+            ensemble, replica_journals: BTreeSet::new(), storage_regions: BTreeMap::new(), local_publications: BTreeMap::new(), catalog_readers: BTreeMap::new(), catalog_admission_floors: BTreeMap::new(), ordered_indexes: BTreeMap::new(), ordered_index_catalogs: BTreeMap::new(), read_width: 1, activation_crashes: 0, created_at_ms: now_ms, move_intent: None, placement_move: None, log_epoch: 0, parent: None, move_from: None, linearizable_reads: false, checkpoint: None, replica_anchor: None, replica_payload_trim: None, log_copy_servers: Vec::new(), moved_at_ms: None, source_cleanup: None, cell_move: None, storage_generation: None, transfer_replay_namespace: None, storage_namespaces: None, deletion_record: None, s3_write_lease_until_ms: None, engine_pin: None, placed_receipt_retirement: false, deletion_observation: None,
             cell_transfer: None, abandoned_generations: BTreeMap::new(), disposal: None, retired_residences: BTreeMap::new(), checkpoint_recovery: None, compaction_replay_cutoff: None, checkpoint_stage: None, checkpoint_transfer_fence: None, checkpoint_transfer_terminal: None, checkpoint_transfer_bootstrap: None, checkpoint_transfer_replica: None, checkpoint_transfer_activation: None, hosted_fork_stage: None, checkpoint_repair_receipts: BTreeMap::new(), recovery_manifest_sha256: None, checkpoint_decision: None,
             checkpoint_captures: BTreeMap::new(), checkpoint_worlds: BTreeMap::new(), checkpoint_suffix_pins: BTreeMap::new(), checkpoint_capture_retirements: BTreeMap::new(), archive_retirement: None, serving_replay_capture: None, version: 0 }
     }
@@ -1763,6 +1765,10 @@ fn prepare_checkpoint_transfer_activation(
 }
 
 fn require_transfer_update(current: &DeploymentRecord, next: &DeploymentRecord) -> Result<()> {
+    if !current.local_publications.is_empty() && current.storage_prefix() != next.storage_prefix() {
+        return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.directory/local-publications",
+            "The original residence must settle its local serving attempts before switching"));
+    }
     let body_anchor = |record: &DeploymentRecord| record.replica_payload_trim.as_ref()
         .filter(|work| work.belongs_to(record)).and_then(|work| work.body_anchor.as_deref()).copied();
     if current.incarnation == next.incarnation && current.log_epoch == next.log_epoch

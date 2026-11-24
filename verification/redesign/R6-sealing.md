@@ -96,3 +96,7 @@ The owner reopens that plan after a restart and withdraws its slots after the ex
 A hosted pack attempt links its registered member slots before admitting physical provider writes.
 An admitted attempt keeps its first upload identity across retries.
 The original region owner aborts that upload before withdrawing any unsubmitted or rejected member slots.
+Local serving attempts have a durable Directory identity before allocating their keys.
+The individual region is fenced after its volume witness drains.
+The local maintenance and lineage owners then check loose and packed aliases before withdrawing any unselected attempt.
+An ambiguous hosted upload retains its key until the retirement owner obtains definitive provider evidence.

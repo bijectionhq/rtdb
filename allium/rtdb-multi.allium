@@ -1816,6 +1816,8 @@ rule ReleaseReplicaReplay {
 -- A replica payload release identifies the exact publication carried by a certified replica entry.
 -- Provider deletion requires the directory to record trim completion for every journal in the authorized inventory.
 -- A provider retry names the same publication until settlement is recorded.
+-- A local serving attempt registers its slot before provisioning and retains its region through physical publication.
+-- Local orphan withdrawal requires region drain and a loose and packed alias census under the lineage reservation.
 -- A checkpoint fork references checkpoint objects and gives any replayed payload its own journal custody.
 -- A shared hosted fork reserves custody membership against its exact directory preparation before copying.
 -- Membership binds the inherited checkpoint and certified original suffix before directory publication.

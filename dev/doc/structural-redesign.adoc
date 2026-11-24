@@ -270,7 +270,9 @@ Hosted mixed and metadata-only packs bind an authenticated last-slot census to t
 The versioned census checks loose aliases and historical pack members at their immutable provider versions.
 Hosted pack members bind their registered slots to one durable physical pack attempt before its upload.
 The retirement owner fences that exact upload and settles the members together.
-Local unpublished attempts and negative settlement of ambiguous uploads remain open.
+Local serving attempts remain in Directory while the volume owner drains the writer's I/O region.
+The maintenance owner checks every loose and packed alias before withdrawing an unselected local slot.
+A hosted upload with an ambiguous outcome retains its slot until definitive provider evidence.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

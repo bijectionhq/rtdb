@@ -1407,6 +1407,7 @@ async fn prepare_cell_move(
         staged.replica_journals = target_stream.servers.iter().cloned().collect();
         staged.move_from = Some(source_stream.servers.clone());
         staged.storage_regions.clear();
+        staged.local_publications.clear();
         staged.catalog_readers.clear();
         staged.catalog_admission_floors.clear();
         staged.checkpoint_recovery = None;

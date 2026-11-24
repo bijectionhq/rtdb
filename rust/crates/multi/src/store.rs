@@ -272,6 +272,7 @@ impl RemoteStorageFactory for CellStoreFactory {
                 deployment: config.deployment.clone(),
                 prefix: config.prefix.clone(),
                 fence: Fence::from(&config),
+                local_publications: matches!(config.storage, CellStorage::Local { .. }).then_some(owner),
                 _release: Some(release),
             });
             check_root(root.as_ref(), &config.deployment, config.writer_epoch.is_some()).await?;
@@ -486,7 +487,11 @@ impl CellStoreFactory {
             };
             let witnessed = witness.is_some();
             let mut io = parent.child_holding(witness.map(|file| Arc::new(file) as Arc<dyn Send + Sync>));
-            if !local && (config.writer_epoch.is_some() || config.compactor) {
+            if config.writer_epoch.is_some() || config.compactor {
+                if local && !witnessed {
+                    let _ = ready.send(Err(storage_region_error("A local serving writer requires its volume witness")));
+                    return;
+                }
                 track_publications(&mut io, directory.clone(), config.deployment.clone(), id, config.writer_epoch);
             }
             let accepted = crate::admin::update_installation(directory.as_ref(), &config.deployment, |record| {
@@ -640,20 +645,31 @@ struct DirectoryPublications {
     owner: PublicationOwner,
 }
 
+async fn publication_members(key: &ObjectKey, body: &[u8]) -> rtdb_storage::Result<Vec<(String, rtdb_types::ServingPublication)>> {
+    use rtdb_types::ServingPublication;
+
+    if !crate::packing::is_pack_key(key.as_str())
+        && !key.as_str().contains(&format!("/{}/", crate::packing::PACK_DIRECTORY))
+    {
+        return Ok(ServingPublication::from_prefix(body).map(|unit| (key.to_string(), unit)).into_iter().collect());
+    }
+    let index = crate::packing::read_pack_index_with(key, body.len() as u64, 16 << 20, |range| {
+        let bytes = body.get(range.start as usize..range.end as usize)
+            .ok_or_else(|| Error::ConflictingObject(key.to_string())).map(Bytes::copy_from_slice);
+        std::future::ready(bytes)
+    }).await?;
+    Ok(index.entries.into_iter().filter_map(|(name, extent)| {
+        let start = usize::try_from(extent.offset).ok()?;
+        let end = start.checked_add(ServingPublication::BYTES)?;
+        if extent.length < ServingPublication::BYTES as u64 { return None; }
+        let unit = ServingPublication::from_prefix(body.get(start..end)?)?;
+        Some((name, unit))
+    }).collect())
+}
+
 impl DirectoryPublications {
     async fn attach_pack(&self, pack: &ObjectKey, root: &str, body: &[u8]) -> rtdb_storage::Result<Option<Uuid>> {
-        let index = crate::packing::read_pack_index_with(pack, body.len() as u64, 16 << 20, |range| {
-            let bytes = body.get(range.start as usize..range.end as usize)
-                .ok_or_else(|| Error::ConflictingObject(pack.to_string())).map(Bytes::copy_from_slice);
-            std::future::ready(bytes)
-        }).await?;
-        let members: Vec<_> = index.entries.into_iter().filter_map(|(name, extent)| {
-            let start = usize::try_from(extent.offset).ok()?;
-            let end = start.checked_add(rtdb_types::ServingPublication::BYTES)?;
-            if extent.length < rtdb_types::ServingPublication::BYTES as u64 { return None; }
-            let unit = rtdb_types::ServingPublication::from_prefix(body.get(start..end)?)?;
-            Some((name, unit))
-        }).collect();
+        let members = publication_members(pack, body).await?;
         let fresh = Uuid::new_v4();
         for _ in 0..8 {
             let mut record = self.directory.deployment(&self.deployment).await
@@ -721,6 +737,16 @@ impl PublicationJournal for DirectoryPublications {
                 || !matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
             { return Err(storage_region_error("The serving attempt belongs to a closed residence")); }
             require_publication_key(record, None, key)?;
+            if matches!(record.storage_regions.get(&self.region), Some(StorageRegion::Local { archive: None, .. })) {
+                let selected = (logical.to_string(), unit);
+                let attempts = record.local_publications.entry(self.region).or_default();
+                match attempts.entry(unit.attempt) {
+                    std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(selected); }
+                    std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &selected => (),
+                    _ => return Err(storage_region_error("The local slot belongs to another serving attempt")),
+                }
+                return Ok(());
+            }
             let Some(StorageRegion::Remote { archive: None, closed: false, publications, .. }) = record.storage_regions.get_mut(&self.region)
                 else { return Err(storage_region_error("The serving attempt has no open storage region")); };
             let publication = StoragePublication { key: key.to_string(), upload_id: String::new(), unit: Some((logical.to_string(), unit)), rejected: false, container: None };
@@ -1232,6 +1258,7 @@ struct FencedStore {
     deployment: String,
     prefix: String,
     fence: Fence,
+    local_publications: Option<Uuid>,
     _release: Option<oneshot::Sender<()>>,
 }
 
@@ -1246,7 +1273,11 @@ impl FencedStore {
         let current = self.directory.deployment(&self.deployment).await
             .map_err(|error| Error::Remote { key: key.to_string(), message: error.code.into() })?
             .ok_or_else(|| Error::Remote { key: key.to_string(), message: "Deployment authority is missing".into() })?;
-        if current.storage_prefix() != self.prefix { return Err(read_only()); }
+        if current.storage_prefix() != self.prefix
+            || self.local_publications.is_some_and(|region| {
+                !matches!(current.storage_regions.get(&region), Some(StorageRegion::Local { archive: None, .. }))
+            })
+        { return Err(read_only()); }
         match self.fence {
             Fence::Writer { epoch } if current.epoch == epoch && current.holder.is_some()
                 && matches!(current.lifecycle, Lifecycle::Live | Lifecycle::Quarantined) => Ok(()),
@@ -1255,6 +1286,34 @@ impl FencedStore {
             Fence::Reader | Fence::Compactor => Err(read_only()),
         }
     }
+    async fn put_bytes(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
+        self.check(key).await?;
+        let Some(region) = &self.local_publications else {
+            return self.inner.put_with_publication(key, bytes).await;
+        };
+        let members = publication_members(key, &bytes).await?;
+        let origin = UnitScope::publication_origin(&self.prefix);
+        let selected = self.inner.put_with_publication(key, bytes).await?;
+        if !members.iter().any(|(_, unit)| unit.origin == origin) { return Ok(selected); }
+        crate::admin::update_installation(self.directory.as_ref(), &self.deployment, |record| {
+            if record.storage_prefix() != self.prefix
+                || !matches!(record.storage_regions.get(region), Some(StorageRegion::Local { archive: None, .. }))
+            {
+                return Err(storage_region_error("The local publication has lost its region"));
+            }
+            if let Some(attempts) = record.local_publications.get_mut(region) {
+                for (logical, unit) in &members {
+                    if attempts.get(&unit.attempt).is_some_and(|(name, registered)| name == logical && registered == unit) {
+                        attempts.remove(&unit.attempt);
+                    }
+                }
+                if attempts.is_empty() { record.local_publications.remove(region); }
+            }
+            Ok(())
+        }).await.map_err(|error| publication_error(key, error))?;
+        Ok(selected)
+    }
+
 }
 
 #[async_trait]
@@ -1283,11 +1342,10 @@ impl ObjectStore for FencedStore {
         self.inner.observe_fresh_exact(key, length).await
     }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> rtdb_storage::Result<Bytes> { self.inner.get_range(key, range).await }
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put(key, bytes).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<()> { self.put_bytes(key, bytes).await.map(drop) }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<()> { self.check(key).await?; self.inner.put_file(key, source).await }
     async fn put_with_publication(&self, key: &ObjectKey, bytes: Bytes) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
-        self.check(key).await?;
-        self.inner.put_with_publication(key, bytes).await
+        self.put_bytes(key, bytes).await
     }
     async fn put_file_with_publication(&self, key: &ObjectKey, source: &Path) -> rtdb_storage::Result<Option<rtdb_types::PhysicalObjectPublication>> {
         self.check(key).await?;
@@ -2079,10 +2137,12 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
     let local_volume = storage.custody_namespace()?;
     let state = recover_local_lineage(directory, lineage, local_volume).await?;
     let Some(keys) = keys else { return Ok(Reaped::default()); };
-    if state.open_generation().is_none() || !replay_retirement::eligible(candidate) { return Ok(Reaped::default()); }
+    if state.open_generation().is_none() { return Ok(Reaped::default()); }
+    let orphans = candidate.local_publications.keys().any(|region| !candidate.storage_regions.contains_key(region));
+    if !orphans && !replay_retirement::eligible(candidate) { return Ok(Reaped::default()); }
     let io = IoRegion::new().child_holding(Some(maintenance.clone()));
     let bucket = storage.bucket(io.clone()).await?;
-    if !replay_retirement::has_older_pack(bucket.as_ref(), candidate).await? {
+    if !orphans && !replay_retirement::has_older_pack(bucket.as_ref(), candidate).await? {
         return Ok(Reaped::default());
     }
     let generation = state.retirement_generation();
@@ -2092,15 +2152,54 @@ async fn reap_local(directory: &dyn Directory, storage: &CellStorage, maintenanc
     }).await?;
     let result = async {
         let deployments = directory.deployments().await?;
-        let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source && replay_retirement::eligible(record))
+        let Some(record) = deployments.iter().find(|record| record.id == candidate.id && record.storage_prefix() == retirement.source)
             else { return Ok(Reaped::default()); };
+        let withdrawn = reap_local_attempts(directory, keys, bucket.as_ref(), &io, record, &deployments).await?;
+        if !replay_retirement::eligible(record) {
+            return Ok(Reaped { erased: withdrawn, waiting: 0 });
+        }
         let references = crate::reference::References::scan(bucket.as_ref(), &deployments).await?;
-        let erased = replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references).await?;
+        let erased = replay_retirement::reap(directory, storage, keys, bucket.as_ref(), record, &references).await? + withdrawn;
         Ok(Reaped { erased, waiting: 0 })
     }.await;
     io.close_and_wait().await;
     directory.change_lineage(lineage, LineageChange::SettleRetirement { retirement }).await?;
     result
+}
+
+async fn reap_local_attempts(
+    directory: &dyn Directory, keys: &dyn KeyService, bucket: &dyn ObjectStore, io: &Arc<IoRegion>,
+    record: &DeploymentRecord, deployments: &[DeploymentRecord],
+) -> Result<usize> {
+    let mut withdrawn = 0;
+    let census = publication_retirement::PublicationCensus::new(keys, deployments, io);
+    let origin = UnitScope::publication_origin(&record.storage_prefix());
+    let outside_lineage = ObjectKey::new("~local-serving-attempt-census")?;
+    for (region, attempts) in &record.local_publications {
+        if record.storage_regions.contains_key(region) { continue; }
+        crate::deployment::require_storage_namespaces(record, crate::deployment::storage_namespaces(bucket, keys).await?)?;
+        for (id, (name, unit)) in attempts {
+            if *id != unit.attempt || unit.origin != origin {
+                return Err(storage_region_error("The local attempt belongs to another residence"));
+            }
+            let logical = ObjectKey::new(name)?;
+            if !census.has_another_copy(bucket, record, &outside_lineage, &logical, *unit, true).await? {
+                let slot = UnitScope::directory_publication_slot(&record.org, &record.lineage, *unit, &logical);
+                keys.withdraw_unit_key(slot, io).await?;
+                withdrawn += 1;
+            }
+        }
+        crate::admin::update_installation(directory, &record.id, |current| {
+            if current.storage_prefix() != record.storage_prefix() || current.storage_regions.contains_key(region)
+                || current.local_publications.get(region).is_some_and(|pending| pending != attempts)
+            {
+                return Err(storage_region_error("The drained local serving region has changed"));
+            }
+            current.local_publications.remove(region);
+            Ok(())
+        }).await?;
+    }
+    Ok(withdrawn)
 }
 
 pub(crate) async fn with_source_lineage<T>(directory: &dyn Directory, lineage: Option<&str>,
@@ -2194,6 +2293,48 @@ mod tests {
         assert!(recovery_covers_release(&owner, &release));
         owner.checkpoint.as_mut().unwrap().boundary = 5;
         assert!(!recovery_covers_release(&owner, &release));
+    }
+
+    #[tokio::test]
+    async fn drained_local_attempt_retires_only_the_unplaced_slot() {
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let root = tempfile::tempdir().unwrap();
+        let storage = CellStorage::Local { root: root.path().join("objects") };
+        let keys = crate::keys::LocalKeyService::new(root.path().join("keys")).unwrap();
+        let bucket = storage.bucket(IoRegion::new()).await.unwrap();
+        let region = Uuid::new_v4();
+        let witness = keys.hold_local_storage_region(region).unwrap().unwrap();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.storage_namespaces = Some(crate::deployment::storage_namespaces(bucket.as_ref(), &keys).await.unwrap());
+        record.storage_regions.insert(region, StorageRegion::Local {
+            archive: None, checkpoint_suffix: None, repair_archive: None, tracks_ordered_index_pages: false,
+            checkpoint_metadata_from: Some(0), checkpoint_replay_from: None,
+        });
+        let record = directory.create_deployment(record).await.unwrap();
+        let prefix = format!("{}/v06", record.storage_prefix());
+        let journal = Arc::new(DirectoryPublications {
+            directory: directory.clone(), deployment: record.id.clone(), region,
+            writer_epoch: None, owner: PublicationOwner::Serving,
+        });
+        let cipher = directory_publications(&keys, &record, IoRegion::new()).unwrap()
+            .with_attempts(journal, prefix.clone());
+        let name = key("blocks/b00.binpb");
+        let abandoned = cipher.seal(&name, Bytes::from_static(b"abandoned")).await.unwrap();
+        let selected = cipher.seal(&name, Bytes::from_static(b"selected")).await.unwrap();
+        assert_ne!(&abandoned[..rtdb_types::ServingPublication::BYTES], &selected[..rtdb_types::ServingPublication::BYTES]);
+        let (pack, _) = crate::packing::encode_pack(&BTreeMap::from([(name.to_string(), selected.clone())]), vec![], 0);
+        bucket.put(&key(&format!("{prefix}/~packs/b00.pack")), pack).await.unwrap();
+        let active = directory.deployment(&record.id).await.unwrap().unwrap();
+        let lock = Arc::new(storage.try_local_maintenance().unwrap().unwrap());
+        let kept = reap_local(directory.as_ref(), &storage, lock.clone(), &active, Some(&keys)).await.unwrap();
+        assert_eq!(kept.erased, 0);
+        drop(witness);
+        reconcile_storage_regions(directory.as_ref(), &storage, &keys, &active).await.unwrap();
+        let drained = directory.deployment(&record.id).await.unwrap().unwrap();
+        let reaped = reap_local(directory.as_ref(), &storage, lock, &drained, Some(&keys)).await.unwrap();
+        assert_eq!(reaped.erased, 1);
+        assert_eq!(cipher.open(&name, selected).await.unwrap().as_ref(), b"selected");
+        assert!(matches!(cipher.open(&name, abandoned).await, Err(Error::ErasedUnderView)));
     }
 
     #[tokio::test]
@@ -2644,6 +2785,7 @@ mod tests {
             deployment: record.id.clone(),
             prefix: record.storage_prefix(),
             directory: directory.clone(),
+            local_publications: None,
             _release: None,
         };
         store.put(&key("tables/orders/data/l01-before"), Bytes::from_static(b"data")).await.unwrap();
@@ -2809,7 +2951,7 @@ mod tests {
         record = directory.replace_deployment(record.clone(), record.version).await.unwrap().applied().unwrap();
         let store = FencedStore {
             inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1 },
-            directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), _release: None,
+            directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), local_publications: None, _release: None,
         };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
         record.epoch = 2;
@@ -2826,7 +2968,7 @@ mod tests {
         let mut record = directory.create_deployment(record).await.unwrap();
         let store = FencedStore {
             inner: Arc::new(MemoryStore::default()), fence: Fence::Writer { epoch: 1 },
-            directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), _release: None,
+            directory: directory.clone(), deployment: record.id.clone(), prefix: record.storage_prefix(), local_publications: None, _release: None,
         };
         store.put(&key("blocks/a"), Bytes::from_static(b"a")).await.unwrap();
         record.epoch = 2;
@@ -2884,6 +3026,7 @@ mod tests {
             deployment: installation.id.clone(),
             prefix: installation.storage_prefix(),
             fence: Fence::Compactor,
+            local_publications: None,
             _release: None,
         };
         let output = key("tables/t/data/l01-first.arrow");
