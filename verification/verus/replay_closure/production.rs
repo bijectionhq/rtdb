@@ -103,14 +103,14 @@ pub open spec fn checkpointTrieFiles(table: &TableBlock, entry: &TableEntry, con
     } else { files }
 }
 
-pub open spec fn tableKeys(block: i64, entry: TableEntry, tables: &Tables) -> ISet<u64> {
-    checkpointTrieFiles(&tables.map@[entry.table], &entry, CheckpointContents::Replay)
+pub open spec fn tableKeys(block: i64, entry: TableEntry, tables: &Tables, contents: CheckpointContents) -> ISet<u64> {
+    checkpointTrieFiles(&tables.map@[entry.table], &entry, contents)
         .insert(tableBlockKey(entry.slug, block))
 }
 
 pub open spec fn baseKeys(catalog: &BlockCatalog, tables: &Tables) -> ISet<u64> {
     ISet::empty().insert(rootKey(catalog.block))
-        .union(allKeys(catalog.entries@, |entry: TableEntry| tableKeys(catalog.block, entry, tables)))
+        .union(allKeys(catalog.entries@, |entry: TableEntry| tableKeys(catalog.block, entry, tables, CheckpointContents::Replay)))
 }
 
 pub open spec fn addedTrieKeys(trie: TrieDetails, slugs: ISet<TableEntry>) -> ISet<u64> {

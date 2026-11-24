@@ -8,7 +8,7 @@ macro_rules! checkpoint_dependency_keys {
             keys.insert(ObjectKey::new(entry.slug.block_key(block)?)?);
             let files = table.checkpoint_trie_files(entry, $contents)?;
             insert_object_keys(&mut keys, files)?;
-        }, [|entry: TableEntry| tableKeys(block, entry, $tables)]);
+        }, [|entry: TableEntry| tableKeys(block, entry, $tables, $contents)]);
         Ok(keys)
     }};
 }
