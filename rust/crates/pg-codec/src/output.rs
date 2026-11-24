@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::temporal_text::{TimestampText, date_text, interval_text, nanos};
@@ -8,7 +9,7 @@ use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
 use crate::{EncodedValue, binary::{PG_EPOCH_DAYS, PG_EPOCH_MICROS}, invalid, size_error};
 
 mod arrow;
-pub use arrow::encode_arrow;
+pub use arrow::{ArrowWrite, encode_arrow, write_arrow_cell};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format { Text, Binary }
@@ -70,15 +71,13 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Date => {
             let days = value.date_days().ok_or_else(|| incompatible(ty, value))?;
             if binary {
-                let pg_days = i32::try_from(days - i64::from(PG_EPOCH_DAYS))
-                    .map_err(|_| Anomaly::incorrect("xtdb/date-out-of-range", "Date is outside the PostgreSQL binary date range"))?;
-                pg_days.to_be_bytes().to_vec()
+                date_binary(days)?.to_vec()
             } else { date_text(days)?.into_bytes() }
         }
-        PgType::Time => { let Value::Time { value, unit, .. } = value else { return Err(incompatible(ty, value)); }; let value = nanos(*value, *unit); if binary { i64::try_from(value / 1000).map_err(invalid)?.to_be_bytes().to_vec() } else { time_text(value, true)?.into_bytes() } }
+        PgType::Time => { let Value::Time { value, unit, .. } = value else { return Err(incompatible(ty, value)); }; let value = nanos(*value, *unit); if binary { time_binary(value)?.to_vec() } else { time_text(value, true)?.into_bytes() } }
         PgType::Interval => { let (months, days, nanos) = interval_parts(value)?; interval_text(months, days, nanos / 1000 * 1000).into_bytes() }
         PgType::Duration => { if binary { return Err(unsupported(ty, "binary writer")); } let Value::Duration { value, unit } = value else { return Err(incompatible(ty, value)); }; duration_text(nanos(*value, *unit)).into_bytes() }
-        PgType::TsTzRange => { let Value::TimestampTzRange { lower, upper } = value else { return Err(incompatible(ty, value)); }; let bound = |value: i64, absent: i64| if value == absent { Ok(String::new()) } else { timestamp_text(value, TimeUnit::Microsecond, Some("UTC"), TimestampText::Pg) }; format!("[{},{})", bound(*lower, i64::MIN)?, bound(*upper, i64::MAX)?).into_bytes() }
+        PgType::TsTzRange => { let Value::TimestampTzRange { lower, upper } = value else { return Err(incompatible(ty, value)); }; let mut output = Vec::new(); write_range(*lower, *upper, &mut output)?; output }
         PgType::Bytes => { let bytes = match value { Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => bytes, _ => return Err(incompatible(ty, value)) }; if binary { bytes.clone() } else { let mut output = String::from("\\x"); for byte in bytes { use std::fmt::Write; write!(&mut output, "{byte:02x}").map_err(invalid)?; } output.into_bytes() } }
         PgType::Uuid => { let Value::Uuid(bytes) = value else { return Err(incompatible(ty, value)); }; if binary { bytes.to_vec() } else { uuid::Uuid::from_bytes(*bytes).to_string().into_bytes() } }
         PgType::Oid | PgType::RegClass | PgType::RegProc => { let number = match value { Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) | Value::I32(value) => *value as u32, _ => return Err(incompatible(ty, value)) }; number.to_string().into_bytes() }
@@ -91,15 +90,21 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
     Ok(bytes)
 }
 
-/// Encodes the physical timestamp cell using the result field's PostgreSQL timestamp type.
 pub fn encode_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Option<&str>, zoned: bool, environment: &SessionEnvironment) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    write_timestamp(format, value, unit, timezone, zoned, environment, &mut output)?;
+    Ok(output)
+}
+
+fn write_timestamp(format: Format, value: i64, unit: TimeUnit, timezone: Option<&str>, zoned: bool, environment: &SessionEnvironment, output: &mut impl Write) -> Result<()> {
     if format == Format::Binary {
         let nanos = nanos(value, unit);
         let micros = if zoned { nanos.div_euclid(1000) } else { nanos / 1000 };
-        Ok(i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec())
+        let value = i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS);
+        write_bytes(output, &value.to_be_bytes())
     } else {
         let format = if environment.parameter("datestyle") == Some("iso8601") { TimestampText::Iso } else { TimestampText::Pg };
-        Ok(timestamp_text(value, unit, timezone.filter(|_| zoned), format)?.into_bytes())
+        write_bytes(output, timestamp_text(value, unit, timezone.filter(|_| zoned), format)?.as_bytes())
     }
 }
 
@@ -110,6 +115,44 @@ fn integer_bytes(ty: PgType, format: Format, integer: i128) -> Vec<u8> {
         PgType::Int4 => (integer as i32).to_be_bytes().to_vec(),
         _ => (integer as i64).to_be_bytes().to_vec(),
     }
+}
+
+fn date_binary(days: i64) -> Result<[u8; 4]> {
+    let pg_days = i32::try_from(days - i64::from(PG_EPOCH_DAYS))
+        .map_err(|_| Anomaly::incorrect("xtdb/date-out-of-range", "Date is outside the PostgreSQL binary date range"))?;
+    Ok(pg_days.to_be_bytes())
+}
+
+fn time_binary(value: i128) -> Result<[u8; 8]> {
+    Ok(i64::try_from(value / 1000).map_err(invalid)?.to_be_bytes())
+}
+
+fn write_range(lower: i64, upper: i64, output: &mut impl Write) -> Result<()> {
+    let bound = |value: i64, absent| {
+        if value == absent {
+            Ok(String::new())
+        } else {
+            timestamp_text(value, TimeUnit::Microsecond, Some("UTC"), TimestampText::Pg)
+        }
+    };
+    let lower = bound(lower, i64::MIN)?;
+    let upper = bound(upper, i64::MAX)?;
+    write!(output, "[{lower},{upper})").map_err(write_error)
+}
+
+fn write_bytes(output: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    output.write_all(bytes).map_err(write_error)
+}
+
+fn write_error(error: io::Error) -> Anomaly {
+    match error.downcast::<Anomaly>() {
+        Ok(anomaly) => anomaly,
+        Err(error) => invalid(error),
+    }
+}
+
+fn write_json(output: &mut impl Write, value: &impl serde::Serialize) -> Result<()> {
+    serde_json::to_writer(output, value).map_err(|error| write_error(error.into()))
 }
 
 fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironment) -> Result<Vec<u8>> {
@@ -273,11 +316,21 @@ fn translate_output_error(error: Anomaly) -> Anomaly {
     }
 }
 
-pub fn encode_error(error: &Anomaly, format: PgType) -> Result<Vec<u8>> {
-    use rtdb_format::{diagnostics, transit};
-    match format {
-        PgType::JsonLd => serde_json::to_vec(&diagnostics::json_ld(error).map_err(invalid)?).map_err(invalid),
-        PgType::Transit => transit::encode_json(&transit::decode_msgpack(&transit::encode_anomaly(error)?)?),
-        _ => serde_json::to_vec(&diagnostics::JsonAnomaly::from(error)).map_err(invalid),
+fn write_json_error(error: &Anomaly, ld: bool, output: &mut impl Write) -> Result<()> {
+    use rtdb_format::diagnostics;
+    if ld {
+        write_json(output, &diagnostics::json_ld(error).map_err(invalid)?)
+    } else {
+        write_json(output, &diagnostics::JsonAnomaly::from(error))
     }
+}
+
+pub fn encode_error(error: &Anomaly, format: PgType) -> Result<Vec<u8>> {
+    use rtdb_format::transit;
+    if format == PgType::Transit {
+        return transit::encode_json(&transit::decode_msgpack(&transit::encode_anomaly(error)?)?);
+    }
+    let mut output = Vec::new();
+    write_json_error(error, format == PgType::JsonLd, &mut output)?;
+    Ok(output)
 }

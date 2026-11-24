@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, ReplaySubmissionPermit, TransactionStatus, control_schema};
-use rtdb_pg_codec::{Format, SessionEnvironment};
+use rtdb_pg_codec::{ArrowWrite, Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::{BoundParameters, QueryCursor};
 use rtdb_tx::SqlArguments;
@@ -665,8 +665,8 @@ impl ProtocolSession {
                 body.bytes.extend_from_slice(&count.to_be_bytes());
                 for (index, column) in columns.iter().enumerate() {
                     let array = batch.batch().column(index).as_ref();
-                    if direct_cell(column.ty, column.format, schema.field(index), array, row, &environment, &mut body)? { continue; }
                     let cell = rtdb_columnar::ArrowCell { field: schema.field(index), array, row };
+                    if direct_cell(column.ty, column.format, cell, &environment, &memory, &mut body)? { continue; }
                     match rtdb_pg_codec::encode_arrow(column.ty, column.format, &query.types[index], cell, &environment, &memory)? {
                         None => body.null_cell()?,
                         Some(encoded) => body.cell(encoded.as_slice())?,
@@ -1007,13 +1007,27 @@ fn admit_rewrite_syntax(original_bytes: usize, rewritten_bytes: usize, memory: &
     Ok(Some(memory.reserve(rewritten - original)?))
 }
 
+fn direct_cell(
+    ty: PgType,
+    format: Format,
+    cell: rtdb_columnar::ArrowCell<'_>,
+    environment: &SessionEnvironment,
+    memory: &Arc<MemoryBudget>,
+    out: &mut DataRow,
+) -> Result<bool> {
+    let mut payload = DataRowPayload::new(out);
+    match rtdb_pg_codec::write_arrow_cell(ty, format, cell, environment, memory, &mut payload)? {
+        ArrowWrite::Written => { payload.finish()?; Ok(true) }
+        ArrowWrite::Null => { payload.row.null_cell()?; Ok(true) }
+        ArrowWrite::Unsupported => direct_primitive(ty, format, cell.field, cell.array, cell.row, payload.row),
+    }
+}
+
 /// Unsupported layouts leave the row intact for the value codec.
-fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, environment: &SessionEnvironment, out: &mut DataRow) -> Result<bool> {
+fn direct_primitive(ty: PgType, format: Format, field: &arrow_schema::Field, array: &dyn arrow_array::Array, row: usize, out: &mut DataRow) -> Result<bool> {
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-        TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType};
-    use arrow_schema::{DataType, TimeUnit as ArrowUnit, UnionMode};
-    use rtdb_types::TimeUnit;
+    use arrow_array::types::{Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type};
+    use arrow_schema::{DataType, UnionMode};
 
     let data_type = array.data_type();
     let is_uuid = data_type == &DataType::FixedSizeBinary(16) && field.extension_type_name() == Some("uuid");
@@ -1022,7 +1036,7 @@ fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &
         let union = array.as_any().downcast_ref::<arrow_array::UnionArray>().ok_or_else(|| protocol("Invalid result union"))?;
         let tag = union.type_id(row);
         let child = fields.iter().find_map(|(id, field)| (id == tag).then_some(field)).ok_or_else(|| protocol("Result union has no active field"))?;
-        return direct_cell(ty, format, child, union.child(tag).as_ref(), union.value_offset(row), environment, out);
+        return direct_primitive(ty, format, child, union.child(tag).as_ref(), union.value_offset(row), out);
     }
     let binary = format == Format::Binary;
     let fits = match (data_type, ty) {
@@ -1030,7 +1044,6 @@ fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &
         (DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64, PgType::Int2 | PgType::Int4 | PgType::Int8) => true,
         (DataType::Float32 | DataType::Float64, PgType::Float4 | PgType::Float8)
         | (DataType::Boolean, PgType::Bool) | (DataType::Utf8, PgType::Text | PgType::VarChar | PgType::Keyword)
-        | (DataType::Timestamp(..), PgType::Timestamp | PgType::TimestampTz)
         | (DataType::Binary, PgType::Bytes) => true,
         (DataType::FixedSizeBinary(_), PgType::Bytes) => !is_uuid,
         (DataType::FixedSizeBinary(16), PgType::Uuid) => is_uuid,
@@ -1108,16 +1121,6 @@ fn direct_cell(ty: PgType, format: Format, field: &arrow_schema::Field, array: &
                 out.cell(uuid.hyphenated().encode_lower(&mut uuid::Uuid::encode_buffer()).as_bytes())?;
             }
         }
-        DataType::Timestamp(unit, timezone) => {
-            let (value, unit) = match unit {
-                ArrowUnit::Second => (array.as_primitive::<TimestampSecondType>().value(row), TimeUnit::Second),
-                ArrowUnit::Millisecond => (array.as_primitive::<TimestampMillisecondType>().value(row), TimeUnit::Millisecond),
-                ArrowUnit::Microsecond => (array.as_primitive::<TimestampMicrosecondType>().value(row), TimeUnit::Microsecond),
-                ArrowUnit::Nanosecond => (array.as_primitive::<TimestampNanosecondType>().value(row), TimeUnit::Nanosecond),
-            };
-            let bytes = rtdb_pg_codec::encode_timestamp(format, value, unit, timezone.as_deref(), ty == PgType::TimestampTz, environment)?;
-            out.cell(&bytes)?;
-        }
         _ => unreachable!("The result layout was checked"),
     }
     Ok(true)
@@ -1160,8 +1163,52 @@ impl DataRow {
     }
 }
 
+struct DataRowPayload<'a> {
+    row: &'a mut DataRow,
+    start: usize,
+    error: Option<Anomaly>,
+}
+
+impl<'a> DataRowPayload<'a> {
+    fn new(row: &'a mut DataRow) -> Self {
+        let start = row.bytes.len();
+        Self { row, start, error: None }
+    }
+
+    fn finish(self) -> Result<()> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let bytes = &mut self.row.bytes;
+        if bytes.len() == self.start {
+            return self.row.cell(b"");
+        }
+        let payload = self.start + 4;
+        let length = i32::try_from(bytes.len() - payload).map_err(|_| protocol("Value too large"))?;
+        bytes[self.start..payload].copy_from_slice(&length.to_be_bytes());
+        Ok(())
+    }
+}
+
+impl std::io::Write for DataRowPayload<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.error.is_none() {
+            let result = if self.row.bytes.len() == self.start {
+                self.row.cell(bytes)
+            } else {
+                self.row.reserve(bytes.len()).map(|()| self.row.bytes.extend_from_slice(bytes))
+            };
+            self.error = result.err();
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 #[cfg(test)]
 mod tests {
+    use rtdb_columnar::ArrowCell;
     use rtdb_sql::BatchStatement;
     use super::*;
 
@@ -1175,6 +1222,21 @@ mod tests {
             value: -1001, unit: TimeUnit::Nanosecond, timezone: Some("UTC".into()),
         };
         let cases = [
+            (PgType::Date, Value::DateDay(-7)),
+            (PgType::Date, Value::DateMilli(-1)),
+            (PgType::Time, Value::Time { value: 1234567, unit: TimeUnit::Nanosecond, bit_width: 64 }),
+            (PgType::Time, Value::Time { value: 1234, unit: TimeUnit::Millisecond, bit_width: 32 }),
+            (PgType::Interval, Value::IntervalYearMonth(-13)),
+            (PgType::Interval, Value::IntervalDayTime { days: 1, milliseconds: -1001 }),
+            (PgType::Interval, Value::IntervalMonthDayMicro { months: 13, days: -2, nanoseconds: 456_000 }),
+            (PgType::Interval, Value::IntervalMonthDayNano { months: -13, days: 2, nanoseconds: -456_789 }),
+            (PgType::Duration, Value::Duration { value: -123456789, unit: TimeUnit::Nanosecond }),
+            (PgType::TsTzRange, Value::TimestampTzRange { lower: i64::MIN, upper: -1001 }),
+            (PgType::TsTzRange, Value::TimestampTzRange { lower: 1234567, upper: i64::MAX }),
+            (PgType::Oid, Value::Oid(-1)),
+            (PgType::RegClass, Value::RegClass(-2)),
+            (PgType::RegProc, Value::RegProc(3)),
+            (PgType::Oid, Value::I32(-4)),
             (PgType::Bytes, Value::Binary(vec![0, 9, 127, 255])),
             (PgType::Bytes, Value::FixedSizeBinary(vec![1, 2, 3])),
             (PgType::Uuid, Value::Uuid([3; 16])),
@@ -1189,13 +1251,21 @@ mod tests {
             let array = rtdb_columnar::copy_array(&logical, &[Value::Null, value.clone()]).unwrap();
             for format in [Format::Text, Format::Binary] {
                 let mut actual = DataRow::new(&memory).unwrap();
-                assert!(direct_cell(ty, format, &field, array.as_ref(), 0, &environment, &mut actual).unwrap());
+                assert!(direct_cell(ty, format, ArrowCell { field: &field, array: array.as_ref(), row: 0 }, &environment, &memory, &mut actual).unwrap());
                 assert_eq!(actual.bytes, (-1i32).to_be_bytes());
                 actual.bytes.clear();
-                assert!(direct_cell(ty, format, &field, array.as_ref(), 1, &environment, &mut actual).unwrap());
-                let payload = rtdb_pg_codec::encode_value(ty, format, &value, &environment).unwrap();
-                assert_eq!(&actual.bytes[..4], &(payload.len() as i32).to_be_bytes());
-                assert_eq!(&actual.bytes[4..], payload.as_slice());
+                let direct = direct_cell(ty, format, ArrowCell { field: &field, array: array.as_ref(), row: 1 }, &environment, &memory, &mut actual);
+                match rtdb_pg_codec::encode_value(ty, format, &value, &environment) {
+                    Ok(payload) => {
+                        assert!(direct.unwrap());
+                        assert_eq!(&actual.bytes[..4], &(payload.len() as i32).to_be_bytes());
+                        assert_eq!(&actual.bytes[4..], payload.as_slice());
+                    }
+                    Err(error) => {
+                        assert_eq!(direct.unwrap_err(), error);
+                        assert!(actual.bytes.is_empty());
+                    }
+                }
             }
         }
         let logical = LogicalType::Scalar(ScalarType::I64).join(&LogicalType::Scalar(ScalarType::I32));
@@ -1203,9 +1273,73 @@ mod tests {
         let array = rtdb_columnar::copy_array(&logical, &[Value::I64(7), Value::I32(-5)]).unwrap();
         let mut output = DataRow::new(&memory).unwrap();
         for row in 0..array.len() {
-            assert!(direct_cell(PgType::Int8, Format::Text, &field, array.as_ref(), row, &environment, &mut output).unwrap());
+            assert!(direct_cell(PgType::Int8, Format::Text, ArrowCell { field: &field, array: array.as_ref(), row }, &environment, &memory, &mut output).unwrap());
         }
         assert_eq!(&output.bytes, b"\0\0\0\x017\0\0\0\x02-5");
+    }
+
+    #[test]
+    fn postgres_json_arrow_cells_write_into_the_reserved_row() {
+        let text = "\"\n\0\\é".repeat(4_000);
+        let diagnostic = rtdb_format::transit::encode_anomaly(
+            &Anomaly::incorrect("demo/invalid", "input"),
+        ).unwrap();
+        let value = Value::Struct(rtdb_types::StructFields::from([
+            ("typed".into(), Value::list(vec![
+                Value::Bool(true),
+                Value::U64(u64::MAX),
+                Value::F32(-0.0),
+                Value::F64(5e-9),
+                Value::Keyword(rtdb_types::Keyword::from_name("x/y")),
+                Value::Time { value: 123, unit: rtdb_types::TimeUnit::Nanosecond, bit_width: 64 },
+                Value::Timestamp { value: -1001, unit: rtdb_types::TimeUnit::Nanosecond, timezone: Some("Europe/London".into()) },
+                Value::Uuid([3; 16]),
+                Value::Null,
+            ])),
+            ("omitted".into(), Value::Null),
+            ("escaped\"key".into(), Value::Utf8(text)),
+            ("map".into(), Value::Map { sorted: false, entries: vec![(Value::I64(-1), Value::Null)] }),
+            ("diagnostic".into(), Value::Transit(diagnostic)),
+        ]));
+        let logical = value.logical_type();
+        let field = rtdb_columnar::to_field("value", &logical).unwrap();
+        let array = rtdb_columnar::copy_array(&logical, std::slice::from_ref(&value)).unwrap();
+        let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(256 << 10);
+        for ty in [PgType::Json, PgType::JsonLd, PgType::Default] {
+            for format in [Format::Text, Format::Binary] {
+                let expected = rtdb_pg_codec::encode_value(ty, format, &value, &environment).unwrap();
+                let mut actual = DataRow::new(&memory).unwrap();
+                actual.cell(b"previous").unwrap();
+                let start = actual.bytes.len();
+                assert!(direct_cell(ty, format, cell, &environment, &memory, &mut actual).unwrap());
+                assert_eq!(&actual.bytes[start..start + 4], &(expected.len() as i32).to_be_bytes());
+                assert_eq!(&actual.bytes[start + 4..], &expected);
+                assert_eq!(memory.used_bytes(), actual.bytes.capacity() + 256);
+            }
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn postgres_json_arrow_cells_report_encoding_errors_before_row_growth_errors() {
+        let environment = SessionEnvironment::default();
+        let memory = MemoryBudget::new(1024);
+        for last in [Value::F64(f64::INFINITY), Value::F64(1.0)] {
+            let value = Value::list(vec![Value::Utf8("x".repeat(1000)), last.clone()]);
+            let logical = value.logical_type();
+            let field = rtdb_columnar::to_field("value", &logical).unwrap();
+            let array = rtdb_columnar::copy_array(&logical, &[value.clone()]).unwrap();
+            let mut output = DataRow::new(&memory).unwrap();
+            let cell = ArrowCell { field: &field, array: array.as_ref(), row: 0 };
+            let actual = direct_cell(PgType::Json, Format::Text, cell, &environment, &memory, &mut output).unwrap_err();
+            if let Err(expected) = rtdb_pg_codec::encode_value(PgType::Json, Format::Text, &value, &environment) {
+                assert_eq!(actual, expected);
+            } else {
+                assert_eq!(actual.code, memory.reserve(1024).unwrap_err().code);
+            }
+        }
     }
 
     #[test]
@@ -1215,7 +1349,7 @@ mod tests {
         let values = arrow_array::BinaryArray::from(vec![input.as_slice()]);
         let field = arrow_schema::Field::new("b", arrow_schema::DataType::Binary, false);
         let mut output = DataRow::new(&memory).unwrap();
-        assert!(direct_cell(PgType::Bytes, Format::Text, &field, &values, 0, &SessionEnvironment::default(), &mut output).unwrap());
+        assert!(direct_cell(PgType::Bytes, Format::Text, ArrowCell { field: &field, array: &values, row: 0 }, &SessionEnvironment::default(), &memory, &mut output).unwrap());
         assert_eq!(output.bytes.len(), 6 + input.len() * 2);
         assert!(memory.used_bytes() >= output.bytes.capacity());
         drop(output);

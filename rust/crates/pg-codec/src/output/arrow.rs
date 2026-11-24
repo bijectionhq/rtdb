@@ -1,9 +1,74 @@
-use arrow_array::{cast::AsArray, types::{Float32Type, Float64Type}};
+use arrow_array::{
+    FixedSizeBinaryArray,
+    cast::AsArray,
+    types::{Float32Type, Float64Type},
+};
 use arrow_schema::DataType;
 use rtdb_columnar::ArrowCell;
 use rtdb_types::{ListKind, LogicalType};
 
-use super::*;
+use super::{
+    Anomaly, EncodedValue, Format, MemoryBudget, MemoryReservation, PgType, Result,
+    SessionEnvironment, TimestampText, Value, Write, array_payload, date_binary, date_text,
+    duration_text, encode, encode_value, float4_bytes, float8_bytes, float_text, integer_bytes, interval_text, invalid, nanos, size_error, time_binary,
+    time_text, timestamp_text, translate_output_error, unsupported, write_bytes, write_error,
+    write_json, write_json_error, write_range, write_timestamp,
+};
+use std::sync::Arc;
+
+mod scalar;
+use scalar::{json_integer, range_bounds, temporal_text, write_scalar};
+
+pub enum ArrowWrite {
+    Unsupported,
+    Null,
+    Written,
+}
+
+/// Writes an Arrow cell's payload and leaves its length prefix to the caller.
+/// Unsupported and null cells leave the writer untouched.
+/// An error can leave a partial payload.
+pub fn write_arrow_cell(
+    ty: PgType,
+    format: Format,
+    cell: ArrowCell<'_>,
+    environment: &SessionEnvironment,
+    memory: &Arc<MemoryBudget>,
+    output: &mut impl Write,
+) -> Result<ArrowWrite> {
+    let ty = if ty == PgType::Default {
+        environment.fallback()
+    } else {
+        ty
+    };
+    if !matches!(
+        ty,
+        PgType::Json
+            | PgType::JsonLd
+            | PgType::Timestamp
+            | PgType::TimestampTz
+            | PgType::Date
+            | PgType::Time
+            | PgType::Interval
+            | PgType::Duration
+            | PgType::TsTzRange
+            | PgType::Oid
+            | PgType::RegClass
+            | PgType::RegProc
+    ) {
+        return Ok(ArrowWrite::Unsupported);
+    }
+    rtdb_columnar::estimate_read_cell_bytes(cell.field, cell.array, cell.row)?;
+    if cell.is_null()? {
+        return Ok(ArrowWrite::Null);
+    }
+    if matches!(ty, PgType::Json | PgType::JsonLd) {
+        json_cell(cell, ty == PgType::JsonLd, output, Some(memory), 0)?;
+    } else if !write_scalar(ty, format, cell.physical()?, environment, output)? {
+        return Ok(ArrowWrite::Unsupported);
+    }
+    Ok(ArrowWrite::Written)
+}
 
 pub fn encode_arrow(
     ty: PgType,
@@ -55,9 +120,9 @@ pub fn encode_arrow(
             rtdb_format::transit::write_arrow_json(&mut output, cell).map_err(translate_output_error)?;
             output
         } else {
-            let mut output = String::new();
-            json_cell(cell, ty == PgType::JsonLd, &mut output, 0)?;
-            output.into_bytes()
+            let mut output = Vec::new();
+            json_cell(cell, ty == PgType::JsonLd, &mut output, None, 0)?;
+            output
         };
         return settle(bytes, reservation);
     }
@@ -120,110 +185,247 @@ fn read_leaf(cell: ArrowCell<'_>) -> Result<Value> {
     rtdb_columnar::read_value(cell.field, cell.array, cell.row)
 }
 
-fn json_cell(cell: ArrowCell<'_>, ld: bool, output: &mut String, depth: usize) -> Result<()> {
+fn json_cell(
+    cell: ArrowCell<'_>,
+    ld: bool,
+    output: &mut impl Write,
+    memory: Option<&Arc<MemoryBudget>>,
+    depth: usize,
+) -> Result<()> {
     if depth > 128 {
         return Err(size_error());
     }
     let cell = cell.physical()?;
     if cell.is_null()? {
-        output.push_str("null");
-        return Ok(());
+        return write_bytes(output, b"null");
     }
     if let Some(text) = cell.utf8() {
-        return json_string(text, output);
-    }
-    if let Some(integer) = cell.integer() {
-        use std::fmt::Write;
-        write!(output, "{integer}").map_err(invalid)?;
-        return Ok(());
-    }
-    if cell.field.metadata().is_empty() {
-        match cell.field.data_type() {
-            DataType::Boolean => {
-                output.push_str(if cell.array.as_boolean().value(cell.row) { "true" } else { "false" });
-                return Ok(());
-            }
-            DataType::Float32 => {
-                let value = cell.array.as_primitive::<Float32Type>().value(cell.row);
-                if !value.is_finite() { return Err(invalid("JSON cannot encode a non-finite number")); }
-                output.push_str(&float_text(f64::from(value), Some(value)));
-                return Ok(());
-            }
-            DataType::Float64 => {
-                let value = cell.array.as_primitive::<Float64Type>().value(cell.row);
-                if !value.is_finite() { return Err(invalid("JSON cannot encode a non-finite number")); }
-                output.push_str(&float_text(value, None));
-                return Ok(());
-            }
-            _ => (),
-        }
+        return write_json(output, &text);
     }
     if let Some((parameters, buffer)) = cell.decimal_coefficient()? {
         let coefficient = &buffer[buffer.len() - usize::from(parameters.bit_width / 8)..];
         let text = decimal_parts_text(coefficient, parameters.scale);
-        if ld {
-            tagged_json("xt:decimal", &text, output)?;
+        return if ld {
+            tagged(output, "xt:decimal", &text)
         } else {
-            output.push_str(&text);
-        }
-        return Ok(());
+            write_bytes(output, text.as_bytes())
+        };
     }
     if let Some(children) = cell.structure() {
-        output.push('{');
+        write_bytes(output, b"{")?;
         let mut comma = false;
         for child in children {
             if child.is_null()? {
                 continue;
             }
             if comma {
-                output.push(',');
+                write_bytes(output, b",")?;
             }
             comma = true;
-            json_string(child.field.name(), output)?;
-            output.push(':');
-            json_cell(child, ld, output, depth + 1)?;
+            write_json(output, child.field.name())?;
+            write_bytes(output, b":")?;
+            json_cell(child, ld, output, memory, depth + 1)?;
         }
-        output.push('}');
-        return Ok(());
+        return write_bytes(output, b"}");
     }
     match cell.sequence_kind() {
         Some(ListKind::Map { .. }) => {
-            output.push('{');
+            write_bytes(output, b"{")?;
             for (index, entry) in cell.sequence().ok_or_else(size_error)?.enumerate() {
                 let (key, value) = map_entry(entry)?;
                 if index > 0 {
-                    output.push(',');
+                    write_bytes(output, b",")?;
                 }
-                if let Some(text) = key.utf8() {
-                    json_string(text, output)?;
-                } else {
-                    json_string(&display_key(&read_leaf(key)?)?, output)?;
-                }
-                output.push(':');
-                json_cell(value, ld, output, depth + 1)?;
+                json_map_key(key, output, memory)?;
+                write_bytes(output, b":")?;
+                json_cell(value, ld, output, memory, depth + 1)?;
             }
-            output.push('}');
+            write_bytes(output, b"}")
         }
         Some(kind @ (ListKind::List | ListKind::FixedSizeList(_) | ListKind::Set)) => {
             let set = ld && kind == ListKind::Set;
             if set {
-                output.push_str("{\"@type\":\"xt:set\",\"@value\":");
+                write_bytes(output, b"{\"@type\":\"xt:set\",\"@value\":")?;
             }
-            output.push('[');
+            write_bytes(output, b"[")?;
             for (index, child) in cell.sequence().ok_or_else(size_error)?.enumerate() {
                 if index > 0 {
-                    output.push(',');
+                    write_bytes(output, b",")?;
                 }
-                json_cell(child, ld, output, depth + 1)?;
+                json_cell(child, ld, output, memory, depth + 1)?;
             }
-            output.push(']');
-            if set {
-                output.push('}');
-            }
+            write_bytes(output, if set { b"]}" } else { b"]" })
         }
-        _ => return json(&read_leaf(cell)?, ld, output, depth),
+        _ => json_leaf(cell, ld, output, memory),
+    }
+}
+
+fn tagged(output: &mut impl Write, tag: &str, text: &str) -> Result<()> {
+    write_bytes(output, b"{\"@type\":")?;
+    write_json(output, &tag)?;
+    write_bytes(output, b",\"@value\":")?;
+    write_json(output, &text)?;
+    write_bytes(output, b"}")
+}
+
+fn json_scalar_text(output: &mut impl Write, ld: bool, tag: &str, text: &str) -> Result<()> {
+    if ld {
+        tagged(output, tag, text)
+    } else {
+        write_json(output, &text)
+    }
+}
+
+fn json_leaf(
+    cell: ArrowCell<'_>,
+    ld: bool,
+    output: &mut impl Write,
+    memory: Option<&Arc<MemoryBudget>>,
+) -> Result<()> {
+    if let Some(value) = json_integer(cell) {
+        return write!(output, "{value}").map_err(write_error);
+    }
+    let ArrowCell { field, array, row } = cell;
+    match (field.data_type(), field.extension_type_name()) {
+        (DataType::Boolean, None) => write_bytes(
+            output,
+            if array.as_boolean().value(row) {
+                b"true"
+            } else {
+                b"false"
+            },
+        ),
+        (DataType::Float32 | DataType::Float64, None) => {
+            let single = (field.data_type() == &DataType::Float32)
+                .then(|| array.as_primitive::<Float32Type>().value(row));
+            let value =
+                single.map_or_else(|| array.as_primitive::<Float64Type>().value(row), f64::from);
+            if !value.is_finite() {
+                return Err(invalid("JSON cannot encode a non-finite number"));
+            }
+            write_bytes(output, float_text(value, single).as_bytes())
+        }
+        (DataType::Utf8, Some("xt/clj-keyword")) => json_scalar_text(
+            output,
+            ld,
+            "xt:keyword",
+            array.as_string::<i32>().value(row),
+        ),
+        (DataType::FixedSizeBinary(16), Some("uuid")) => {
+            let bytes = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .expect("A UUID uses fixed-size binary")
+                .value(row);
+            let uuid = uuid::Uuid::from_slice(bytes).map_err(invalid)?;
+            json_scalar_text(
+                output,
+                ld,
+                "xt:uuid",
+                uuid.hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer()),
+            )
+        }
+        (DataType::Binary, Some("xt/transit+msgpack")) => {
+            let bytes = array.as_binary::<i32>().value(row);
+            let _scratch = memory
+                .map(|memory| {
+                    let bound = bytes
+                        .len()
+                        .checked_mul(32)
+                        .and_then(|n| n.checked_add(8192))
+                        .ok_or_else(size_error)?;
+                    memory.reserve(bound)
+                })
+                .transpose()?;
+            let error = rtdb_format::transit::decode_anomaly(bytes)?;
+            write_json_error(&error, ld, output)
+        }
+        _ => {
+            if let Some((tag, text)) = temporal_text(cell)? {
+                let text = if !ld && tag == "xt:timestamptz" {
+                    text.split('[').next().unwrap_or(&text)
+                } else {
+                    &text
+                };
+                return json_scalar_text(output, ld, tag, text);
+            }
+            validate_unrenderable_leaf(cell, memory)?;
+            Err(json_representation_error())
+        }
+    }
+}
+
+fn json_map_key(
+    key: ArrowCell<'_>,
+    output: &mut impl Write,
+    memory: Option<&Arc<MemoryBudget>>,
+) -> Result<()> {
+    let key = key.physical()?;
+    if let Some(text) = key.utf8() {
+        return write_json(output, &text);
+    }
+    if key.is_null()? {
+        return write_bytes(output, b"\"null\"");
+    }
+    if let Some(value) = json_integer(key) {
+        return write!(output, "\"{value}\"").map_err(write_error);
+    }
+    let ArrowCell { field, array, row } = key;
+    match (field.data_type(), field.extension_type_name()) {
+        (DataType::Boolean, None) => write_bytes(
+            output,
+            if array.as_boolean().value(row) {
+                b"\"true\""
+            } else {
+                b"\"false\""
+            },
+        ),
+        (DataType::Utf8, Some("xt/clj-keyword")) => {
+            write_json(output, &array.as_string::<i32>().value(row))
+        }
+        (DataType::FixedSizeBinary(16), Some("uuid")) => json_leaf(key, false, output, None),
+        _ => {
+            if let Some((_, text)) = temporal_text(key)? {
+                return write_json(output, &text);
+            }
+            validate_unrenderable_leaf(key, memory)?;
+            Err(json_representation_error())
+        }
+    }
+}
+
+fn validate_unrenderable_leaf(
+    cell: ArrowCell<'_>,
+    memory: Option<&Arc<MemoryBudget>>,
+) -> Result<()> {
+    if cell.field.extension_type_name() == Some("uri") {
+        rtdb_types::UriParts::parse(cell.array.as_string::<i32>().value(cell.row))?;
+        return Ok(());
+    }
+    let needs_layout_validation = match cell.sequence_kind() {
+        Some(ListKind::TimestampTzRange) => range_bounds(cell)?.is_none(),
+        Some(_) => true,
+        None => cell.structure().is_some(),
+    };
+    if needs_layout_validation {
+        let _scratch = memory
+            .map(|memory| {
+                memory.reserve(rtdb_columnar::estimate_read_value_bytes(
+                    cell.field, cell.array, cell.row,
+                )?)
+            })
+            .transpose()?;
+        read_leaf(cell)?;
     }
     Ok(())
+}
+
+fn json_representation_error() -> Anomaly {
+    Anomaly::incorrect(
+        "xtdb/json-encode-error",
+        "Value has no pinned JSON representation",
+    )
 }
 
 fn map_entry(cell: ArrowCell<'_>) -> Result<(ArrowCell<'_>, ArrowCell<'_>)> {
@@ -235,7 +437,11 @@ fn map_entry(cell: ArrowCell<'_>) -> Result<(ArrowCell<'_>, ArrowCell<'_>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        ArrowCell, Format, MemoryBudget, PgType, SessionEnvironment, Value, encode,
+        encode_arrow, encode_value,
+    };
+    use rtdb_format::transit::TransitValue;
     use rtdb_types::{DecimalValue, EntityId, StructFields};
 
     #[test]
