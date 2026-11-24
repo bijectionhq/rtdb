@@ -481,17 +481,14 @@ fn decode_fragment_batch(record: &RecordBatch, memory: &Arc<MemoryBudget>) -> Re
     let mut columns = Vec::with_capacity(record.num_columns());
     for (field, array) in record.schema_ref().fields().iter().zip(record.columns()) {
         let mut metadata = field.metadata().clone();
-        let kind = metadata.remove(COLUMN_KEY);
-        columns.push(match kind.as_deref() {
-            Some("arrow") => {
-                let name = metadata.remove(NAME_KEY).ok_or_else(|| malformed("A fragment column has no name"))?;
-                let logical = metadata.remove(LOGICAL_KEY).map(|logical| serde_json::from_str::<LogicalType>(&logical)).transpose().map_err(|error| invalid("fragment-decode", error))?;
-                let field = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
-                fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?
-            }
-            Some("values") => fragment_column(Arc::clone(array), Arc::clone(field), None, memory, metadata_charge)?,
-            _ => return Err(malformed("A fragment column has no encoding")),
-        });
+        if metadata.remove(COLUMN_KEY).as_deref() != Some("arrow") {
+            return Err(malformed("A fragment column has no Arrow encoding"));
+        }
+        let name = metadata.remove(NAME_KEY).ok_or_else(|| malformed("A fragment column has no name"))?;
+        let logical = metadata.remove(LOGICAL_KEY).map(|logical| serde_json::from_str::<LogicalType>(&logical))
+            .transpose().map_err(|error| invalid("fragment-decode", error))?;
+        let field = Arc::new(field.as_ref().clone().with_name(name).with_metadata(metadata));
+        columns.push(fragment_column(Arc::clone(array), field, logical, memory, metadata_charge)?);
     }
     ColumnBatch::settled(columns, record.num_rows(), reservation)
 }
@@ -768,18 +765,20 @@ mod tests {
             bytes.extend_from_slice(frame);
             decode_batches(FragmentBytes::from_vec(bytes, &memory).unwrap().into_ipc_buffer(), &memory)
         };
-        let legacy = stream([(COLUMN_KEY.into(), "values".into())].into());
-        let decoded = decode(&legacy, legacy.len()).unwrap();
+        let current = stream([(COLUMN_KEY.into(), "arrow".into()), (NAME_KEY.into(), "n".into())].into());
+        let decoded = decode(&current, current.len()).unwrap();
         assert_eq!(decoded[0].columns[0].value(0).unwrap(), Value::I64(42));
         drop(decoded);
         let missing_encoding = stream(Default::default());
         let missing_name = stream([(COLUMN_KEY.into(), "arrow".into())].into());
-        let mut trailing = legacy.clone();
+        let old = stream([(COLUMN_KEY.into(), "values".into())].into());
+        let mut trailing = current.clone();
         trailing.push(0);
         for (frame, length) in [
-            (legacy.as_slice(), legacy.len() + 1),
-            (&legacy[..legacy.len() - 8], legacy.len() - 8),
+            (current.as_slice(), current.len() + 1),
+            (&current[..current.len() - 8], current.len() - 8),
             (trailing.as_slice(), trailing.len()),
+            (old.as_slice(), old.len()),
             (missing_encoding.as_slice(), missing_encoding.len()),
             (missing_name.as_slice(), missing_name.len()),
         ] {
