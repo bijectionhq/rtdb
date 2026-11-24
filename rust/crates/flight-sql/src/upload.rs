@@ -1,9 +1,10 @@
 use rtdb_types::StructFields;
 use std::sync::Arc;
-use arrow_array::RecordBatch;
+use arrow_array::{Array, DictionaryArray, RecordBatch, StringArray, types::Int8Type};
+use arrow_schema::{DataType, Field};
 use arrow_flight::{FlightData, PutResult, sql::{Command, CommandStatementIngest, DoPutUpdateResult, TableExistsOption, TableNotExistOption}};
 use prost::Message;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
+use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
 use rtdb_tx::{ArrowDocuments, SqlArguments, TxOp};
 use rtdb_types::{TableRef, Value};
 use tonic::{Response, Status, Streaming};
@@ -101,15 +102,31 @@ fn validate_ingest(command: &CommandStatementIngest, database: &str) -> Result<(
     Ok(())
 }
 pub(crate) fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
-    decode_documents(batch, service.memory(), rtdb_columnar::read_execution_value_as)
+    decode_documents(batch, service.memory(), None, rtdb_columnar::read_execution_value_as)
 }
 
 pub(crate) fn domain_documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
-    decode_documents(batch, service.memory(), rtdb_columnar::read_value_as)
+    decode_documents(batch, service.memory(), None, rtdb_columnar::read_value_as)
+}
+
+fn operation_dictionary(field: &Field) -> bool {
+    field.name() == "_op" && field.metadata().is_empty()
+        && matches!(field.data_type(), DataType::Dictionary(key, value)
+            if key.as_ref() == &DataType::Int8 && value.as_ref() == &DataType::Utf8)
+}
+
+pub(crate) fn owned_operation(cell: ArrowCell<'_>) -> Option<&str> {
+    if !operation_dictionary(cell.field) { return cell.utf8(); }
+    let dictionary = cell.array.as_any().downcast_ref::<DictionaryArray<Int8Type>>()?;
+    let key = dictionary.key(cell.row)?;
+    let values = dictionary.values().as_any().downcast_ref::<StringArray>()?;
+    (key < values.len() && values.is_valid(key)).then(|| values.value(key))
 }
 
 pub(crate) fn owned_documents(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
-    decode_documents(batch, memory, |ty, field, column, row| {
+    let dictionary = batch.schema_ref().index_of("_op").ok()
+        .filter(|&column| operation_dictionary(batch.schema_ref().field(column)));
+    decode_documents(batch, memory, dictionary, |ty, field, column, row| {
         match ty {
             rtdb_types::LogicalType::Nothing => Ok(Value::Undefined),
             _ => rtdb_columnar::read_value_as(ty, field, column, row),
@@ -155,25 +172,84 @@ fn owned_payload_retains_a_vector_and_struct_with_legacy_upload_metadata() {
 }
 
 fn decode_documents(
-    batch: &RecordBatch, memory: &Arc<MemoryBudget>,
+    batch: &RecordBatch, memory: &Arc<MemoryBudget>, dictionary: Option<usize>,
     read: impl Fn(&rtdb_types::LogicalType, &arrow_schema::Field, &dyn arrow_array::Array, usize) -> rtdb_types::Result<Value>,
 ) -> Result<(Vec<StructFields<Value>>, Arc<MemoryReservation>), Status> {
     let schema = batch.schema();
-    let scratch = reserve_document_decode(batch, memory)?;
-    let types = if batch.num_rows() == 0 { Vec::new() } else { schema.fields().iter().map(|field| rtdb_columnar::from_field(field).map_err(status)).collect::<Result<Vec<_>, _>>()? };
-    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| Ok((field.name().clone(), read(ty, field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<StructFields<_>, Status>>()).collect::<Result<Vec<_>, _>>()?;
+    let scratch = reserve_decode(batch, memory, dictionary)?;
+    let types = if batch.num_rows() == 0 { Vec::new() } else {
+        schema.fields().iter().enumerate().map(|(column, field)| {
+            if Some(column) == dictionary { Ok(None) } else { rtdb_columnar::from_field(field).map(Some).map_err(status) }
+        }).collect::<Result<Vec<_>, _>>()?
+    };
+    let rows = (0..batch.num_rows()).map(|row| {
+        schema.fields().iter().zip(&types).enumerate().map(|(column, (field, ty))| {
+            let array = batch.column(column).as_ref();
+            let value = match ty {
+                Some(ty) => read(ty, field, array, row).map_err(status)?,
+                None => owned_operation(ArrowCell { field, array, row })
+                    .map_or(Value::Null, |operation| Value::Utf8(operation.to_owned())),
+            };
+            Ok((field.name().clone(), value))
+        }).collect::<Result<StructFields<_>, Status>>()
+    }).collect::<Result<Vec<_>, _>>()?;
     Ok((rows, scratch))
 }
 
 pub(crate) fn reserve_document_decode(
     batch: &RecordBatch, memory: &Arc<MemoryBudget>,
 ) -> Result<Arc<MemoryReservation>, Status> {
+    reserve_decode(batch, memory, None)
+}
+
+fn reserve_decode(
+    batch: &RecordBatch, memory: &Arc<MemoryBudget>, dictionary: Option<usize>,
+) -> Result<Arc<MemoryReservation>, Status> {
     let mut bound = 8192;
     for row in 0..batch.num_rows() {
         for (column, field) in batch.schema_ref().fields().iter().enumerate() {
-            let bytes = estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?;
+            let array = batch.column(column).as_ref();
+            let bytes = if Some(column) == dictionary {
+                let length = owned_operation(ArrowCell { field, array, row }).map_or(0, str::len);
+                wire::add(2048, wire::mul(length, 2)?)?
+            } else {
+                estimate_read_value_bytes(field, array, row).map_err(status)?
+            };
             bound = wire::add(bound, wire::add(field.name().len(), bytes)?)?;
         }
     }
     memory.reserve(bound).map_err(status)
+}
+
+#[test]
+fn owned_operation_dictionaries_match_text_in_arrow_and_materialized_reads() {
+    use arrow_array::{ArrayRef, Int8Array};
+
+    let operations = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(1), None, Some(0), Some(1), Some(2)]),
+        Arc::new(StringArray::from(vec![Some("check"), Some("create"), None])),
+    ).unwrap();
+    let packed = RecordBatch::try_from_iter([("_op", Arc::new(operations) as ArrayRef)]).unwrap();
+    let plain = RecordBatch::try_from_iter([("_op", Arc::new(StringArray::from(
+        vec![Some("create"), None, Some("check"), Some("create"), None],
+    )) as ArrayRef)]).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let mut ipc = Vec::new();
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut ipc, packed.schema_ref()).unwrap();
+    writer.write(&packed).unwrap();
+    writer.finish().unwrap();
+    drop(writer);
+    let decoded = rtdb_format::ipc::OwnedStream::read_buffer(ipc.into(), &memory).unwrap();
+    let packed = decoded.pages()[0].batch();
+    let (actual, _actual_charge) = owned_documents(packed, &memory).unwrap();
+    let (expected, _expected_charge) = owned_documents(&plain, &memory).unwrap();
+    assert_eq!(actual, expected);
+    for row in 0..packed.num_rows() {
+        assert_eq!(
+            ArrowCell::named(packed, "_op", row).and_then(owned_operation),
+            ArrowCell::named(&plain, "_op", row).and_then(ArrowCell::utf8),
+        );
+    }
+    let payload = RecordBatch::try_from_iter([("label", Arc::clone(packed.column(0)))]).unwrap();
+    assert!(owned_documents(&payload, &memory).is_err());
 }
