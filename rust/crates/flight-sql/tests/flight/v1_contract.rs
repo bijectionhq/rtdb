@@ -299,6 +299,8 @@ async fn rtdb_v1_tokens_survive_database_and_flight_restart() {
         ..Default::default()
     };
     let mut request = input("SELECT n FROM wire_rows WHERE _id = 1 OR _id = 2 ORDER BY _id");
+    // The Flight SQL update acknowledgement does not select an applied v1 cut.
+    request.source.as_mut().unwrap().at = Some(v1::At { selection: Some(Selection::Linearizable(())) });
     request.track = true;
     request.page = Some(v1::Page { limit: 1, after: Vec::new() });
 
@@ -318,6 +320,8 @@ async fn rtdb_v1_tokens_survive_database_and_flight_restart() {
             ClaimRegion::Row { table, iid: EntityId::Integer(2).iid() },
         ].into_iter().collect());
         client.update("UPDATE wire_rows SET n = 200 WHERE _id = 2", None).await;
+        let latest = v1::QueryRequest { page: None, track: false, ..request.clone() };
+        assert_eq!(ints(&query(&mut client, latest).await.0), [10, 200]);
         database.apply_token_key_rotation(1, i64::MAX).await.unwrap();
         running.stop().await;
         first
