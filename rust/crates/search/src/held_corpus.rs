@@ -10,7 +10,7 @@ use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 
-use crate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
+use crate::{OwnedSearchBatch, OwnedSearchPage, accelerate::{OwnedRankWindow, RankedIdentity}};
 
 /// Resolve a declared single-column search path on its admitted archive cut.
 pub async fn owned_text_column(
@@ -59,10 +59,13 @@ const MAX_IDENTITIES: usize = 4096;
 const MAX_TEXT_BYTES: usize = 8 << 20;
 
 struct Match {
-    id: EntityId,
-    partition: usize,
     length: u32,
     frequencies: Vec<u32>,
+}
+
+enum CorpusSource {
+    Shadow,
+    Root,
 }
 
 /// Staged text shadows borrow the request batch through analysis.
@@ -126,13 +129,14 @@ impl<'a> TextShadows<'a> {
 /// Only match frequencies are retained. Scoring waits for the complete corpus.
 pub struct HeldTextCorpus {
     memory: Arc<MemoryBudget>,
-    retained: Arc<MemoryReservation>,
     query: Query,
     corpus: Corpus,
-    matches: Vec<Match>,
+    shadow_matches: Vec<(usize, EntityId, Match)>,
     shadows: BTreeMap<usize, BTreeSet<EntityId>>,
+    roots: BTreeMap<usize, BTreeMap<EntityId, Option<Match>>>,
     identities: usize,
     text_bytes: usize,
+    retained: Arc<MemoryReservation>,
 }
 
 impl HeldTextCorpus {
@@ -145,31 +149,45 @@ impl HeldTextCorpus {
         let query = Query::analyzed(analyzer, text);
         Ok(Self {
             memory,
-            retained,
             query,
             corpus: Corpus::default(),
-            matches: Vec::new(),
+            shadow_matches: Vec::new(),
             shadows: BTreeMap::new(),
+            roots: BTreeMap::new(),
             identities: 0,
             text_bytes: 0,
+            retained,
         })
     }
 
-    fn observe(&mut self, partition: usize, id: EntityIdRef<'_>, text: Option<&str>) -> Result<()> {
-        self.identities += 1;
-        if self.identities > MAX_IDENTITIES {
+    fn observe(&mut self, id: EntityIdRef<'_>, text: Option<&str>, source: CorpusSource) -> Result<Option<Match>> {
+        if self.identities >= MAX_IDENTITIES {
             return Err(corpus_limit());
         }
+        let identity = identity_charge(id);
+        let root_charge = if matches!(source, CorpusSource::Root) { identity + 192 } else { 0 };
+        let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
         let Some(text) = text else {
-            return Ok(());
+            retained.grow_to(retained.bytes().saturating_add(root_charge))?;
+            self.identities += 1;
+            return Ok(None);
         };
-        self.text_bytes = self
+        let text_bytes = self
             .text_bytes
             .checked_add(text.len())
             .filter(|total| *total <= MAX_TEXT_BYTES)
             .ok_or_else(corpus_limit)?;
         let _tokens = self.memory.reserve(4096 + 64 * text.len())?;
         let (tokens, frequencies, matched) = self.query.text_terms(text, true);
+        let match_charge = if matched {
+            let copied_identity = if matches!(source, CorpusSource::Shadow) { identity } else { 0 };
+            copied_identity + 256 + 4 * frequencies.capacity()
+        } else {
+            0
+        };
+        retained.grow_to(retained.bytes().saturating_add(root_charge + match_charge))?;
+        self.identities += 1;
+        self.text_bytes = text_bytes;
         self.corpus.documents += 1;
         self.corpus.tokens += tokens.len() as u64;
         for (term, &count) in self.query.terms().iter().zip(&frequencies) {
@@ -177,18 +195,7 @@ impl HeldTextCorpus {
                 *self.corpus.frequencies.entry(term.clone()).or_default() += 1;
             }
         }
-        if matched {
-            let charge = identity_charge(id) + 256 + 4 * frequencies.capacity();
-            let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
-            retained.grow_to(retained.bytes().saturating_add(charge))?;
-            self.matches.push(Match {
-                id: id.into_owned(),
-                partition,
-                length: rtdb_text::stored_length(tokens.len()),
-                frequencies,
-            });
-        }
-        Ok(())
+        Ok(matched.then(|| Match { length: rtdb_text::stored_length(tokens.len()), frequencies }))
     }
 
     /// Register an exact typed overlay shadow, even if it contributes no text.
@@ -198,7 +205,9 @@ impl HeldTextCorpus {
     }
 
     fn admit_shadow(&mut self, partition: usize, id: EntityIdRef<'_>, text: Option<&str>) -> Result<()> {
-        self.observe(partition, id, text)?;
+        if let Some(matched) = self.observe(id, text, CorpusSource::Shadow)? {
+            self.shadow_matches.push((partition, id.into_owned(), matched));
+        }
         let charge = identity_charge(id) + 192;
         let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
         retained.grow_to(retained.bytes().saturating_add(charge))
@@ -240,7 +249,6 @@ impl HeldTextCorpus {
         let Some(mut cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(context), owner, relation, valid, &columns,
         ).await? else { return Err(corpus_limit()); };
-        let shadows = self.shadows.remove(&partition).unwrap_or_default();
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             let schema = batch.schema_ref();
@@ -256,9 +264,11 @@ impl HeldTextCorpus {
                 let physical = rtdb_columnar::read_entity_id(id_field, ids, row)?;
                 let protected = sealed.then(|| crate::rank_family::RootProjectionId::parse(physical)).transpose()?;
                 let id = protected.as_ref().map_or(physical, |id| id.canonical()).into_owned();
-                if shadows.contains(&id) { continue; }
+                if self.contains_shadow(partition, &id) { continue; }
+                if self.roots.get(&partition).is_some_and(|rows| rows.contains_key(&id)) {
+                    return Err(if sealed { crate::rank_family::unavailable() } else { corpus_limit() });
+                }
                 if let Some(protected) = protected {
-                    if self.contains_shadow(partition, &id) { return Err(crate::rank_family::unavailable()); }
                     protected.require(context, owner, relation, valid, batch, row).await?;
                 }
                 let value = match rtdb_columnar::owned_text_cell(&logical, text_field, text, row)? {
@@ -266,7 +276,8 @@ impl HeldTextCorpus {
                     rtdb_columnar::TextCell::Missing => None,
                     rtdb_columnar::TextCell::Other => return Err(corpus_limit()),
                 };
-                self.shadow(partition, id, value)?;
+                let matched = self.observe(EntityIdRef::from(&id), value, CorpusSource::Root)?;
+                self.roots.entry(partition).or_default().insert(id, matched);
             }
         }
         Ok(())
@@ -287,15 +298,18 @@ impl HeldTextCorpus {
         Ok(())
     }
 
-    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow) -> Result<()> {
-        for matched in self.matches {
+    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow<'_>) -> Result<()> {
+        let roots = self.roots.into_iter().flat_map(|(partition, rows)| {
+            rows.into_iter().filter_map(move |(id, matched)| matched.map(|matched| (partition, id, matched)))
+        });
+        for (partition, id, matched) in self.shadow_matches.into_iter().chain(roots) {
             window.admit_candidate()?;
             let score = scorer.score(&matched.frequencies, matched.length);
             if !score.is_finite() {
                 return Err(corpus_limit());
             }
-            if let Some(at) = window.position(matched.partition, rtdb_columnar::EntityIdRef::from(&matched.id), score) {
-                window.insert_at(at, OwnedSearchHit { partition: matched.partition, id: matched.id, score })?;
+            if let Some(at) = window.position(partition, EntityIdRef::from(&id), score) {
+                window.insert_at(at, partition, RankedIdentity::Held(id), score)?;
             }
         }
         Ok(())
@@ -366,7 +380,7 @@ mod tests {
             let expected = id.as_value().retained_bytes().unwrap();
             let before = corpus.retained.bytes();
             corpus.shadow(partition, id, Some("apples")).unwrap();
-            let matched = corpus.matches.last().unwrap();
+            let (_, _, matched) = corpus.shadow_matches.last().unwrap();
             assert_eq!(corpus.retained.bytes() - before, 2 * expected + 192 + 256 + 4 * matched.frequencies.capacity());
         }
         let before = corpus.retained.bytes();
@@ -374,7 +388,28 @@ mod tests {
         let expected = id.as_value().retained_bytes().unwrap();
         corpus.shadow(0, id, None).unwrap();
         assert_eq!(corpus.retained.bytes() - before, expected + 192);
-        assert_eq!(corpus.matches.len(), 4);
+        assert_eq!(corpus.shadow_matches.len(), 4);
+    }
+
+    #[test]
+    fn held_root_match_charges_one_typed_identity_and_ranks_it() {
+        let mut corpus = HeldTextCorpus::new(
+            MemoryBudget::new(1 << 20),
+            rtdb_text::Analyzer::Simple,
+            "apples",
+        ).unwrap();
+        let id = EntityId::String("places/東京".repeat(32));
+        let key = EntityIdRef::from(&id);
+        let before = corpus.retained.bytes();
+        let matched = corpus.observe(key, Some("apples"), CorpusSource::Root).unwrap().unwrap();
+        assert_eq!(
+            corpus.retained.bytes() - before,
+            identity_charge(key) + 192 + 256 + 4 * matched.frequencies.capacity(),
+        );
+        corpus.roots.entry(0).or_default().insert(id.clone(), Some(matched));
+        let page = corpus.finish(0, 1).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].id, id);
     }
 
     #[test]
