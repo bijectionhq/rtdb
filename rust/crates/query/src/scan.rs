@@ -163,7 +163,7 @@ pub async fn visit_trie_iids(
 #[doc(hidden)]
 pub async fn visit_trie_events(
     storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &tokio_util::sync::CancellationToken,
-    slug: &TableSlug, trie: &TrieKey, mut visit: impl FnMut(&EventBatch) -> Result<()>,
+    slug: &TableSlug, trie: &TrieKey, put_columns: &[String], mut visit: impl FnMut(&EventBatch) -> Result<()>,
 ) -> Result<()> {
     let mut file = DataFile {
         storage: Arc::clone(storage), key: ObjectKey::new(slug.data_key(trie))?,
@@ -172,7 +172,7 @@ pub async fn visit_trie_events(
     let pages = file.open(memory).await?.layout.decoder.page_count();
     for page in 0..pages {
         if cancellation.is_cancelled() { return Err(point_cancelled()); }
-        let (batch, _charge) = file.decode_page(page, memory).await?;
+        let (batch, _charge) = file.decode_page_as(page, memory, DataProjection::PutColumns(put_columns)).await?;
         visit(&EventBatch::new(batch)?)?;
     }
     Ok(())

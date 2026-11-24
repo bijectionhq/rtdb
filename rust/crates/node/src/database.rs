@@ -583,13 +583,19 @@ impl rtdb_maintenance::TableHistorySource for NativeTableReplay {
     async fn visit_table(&self, read: rtdb_maintenance::HistoryRead<'_>, visit: &mut rtdb_maintenance::HistoryVisitor<'_>)
         -> Result<Option<rtdb_maintenance::HistoryCoverage>> {
         use rtdb_maintenance::{HistoryCoverage, HistoryRow};
+        use rtdb_replication::RetainedHistory;
 
         let Some(target) = read.snapshot.table_catalog().block() else { return Ok(None); };
         let Some(through) = target.boundary_replica_position() else { return Ok(None); };
         let Some(mut replay) = rtdb_replication::RetainedTableReplay::open(&self.logs, target, read.table).await? else { return Ok(None); };
-        while replay.next_block(read.cancellation, |block, batch| {
-            for row in 0..batch.len() { visit(block, HistoryRow::Stored { batch, row })?; }
-            Ok(())
+        while replay.next_history_block(read.cancellation, read.blocks, |block, history| {
+            match history {
+                RetainedHistory::Page(batch) => {
+                    for row in 0..batch.len() { visit(block, HistoryRow::Stored { batch, row })?; }
+                    Ok(())
+                }
+                RetainedHistory::Header { header, origin, page_row } => visit(block, HistoryRow::Header { header, origin, page_row }),
+            }
         }).await?.is_some() {}
         Ok(Some(HistoryCoverage::Native { lineage: format!("native/{}", self.lineage), through }))
     }

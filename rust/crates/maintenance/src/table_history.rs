@@ -15,6 +15,7 @@ pub struct HistoryRead<'a> {
     pub cancellation: &'a CancellationToken,
     pub table: &'a TableRef,
     pub blocks: &'a [i64],
+    pub put_columns: &'a [String],
 }
 
 #[derive(Clone, Copy)]
@@ -25,7 +26,8 @@ pub enum HistoryRow<'a> {
     },
     Header {
         header: EventHeader,
-        origin: EventOrigin,
+        origin: Option<EventOrigin>,
+        page_row: usize,
     },
 }
 
