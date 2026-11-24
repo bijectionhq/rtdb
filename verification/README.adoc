@@ -148,6 +148,12 @@ It also exercises the Azure adapter against a loopback provider and separately m
   On 2026-11-23 TLC 2026.11.19.180144 exhausted 9,522 and 25,252 distinct states in the one- and two-move bounds, rejected nine mutations at their named laws, and reached the concurrent replacement witness.
   On 2026-11-23 Verus 0.2026.11.20.9da409b verified three shipped decisions in link:verus/audience_cross_holder_claim/area.json[the shared seat claim area] and rejected all six controls at their declared diagnostics.
   The production correspondence and timing premises are in link:../dev/doc/rtdb-multi-bijection.md[the Bijection integration notes].
+* link:tla/AudienceSeatResourceFence.tla[Audience seat resource fence] models one logical position with a durable generation compared when the resource applies an operation.
+  On 2026-11-24, TLC 2026.11.19.180144 exhausted 1,088 and 13,120 distinct states with one and two replacements, rejected all six mutations at their declared laws, and reached both retained-charge witnesses.
+  Reclaim with exact readback assumes fair fence and readback service.
+  On the same date, Verus 0.2026.11.20.9da409b checked eight items and 16 controls in link:verus/audience_session_seats/area.json[the Flight seat area] and five items and seven controls in link:verus/audience_cross_holder_claim/area.json[the shared claim area].
+  The production checks cover the local handoff decision and exact release condition.
+  See link:../dev/doc/rtdb-multi-bijection.md#resource-enforced-seat-generations[the resource design and correspondence limits].
 * link:verus/installed_directory_bypass/README.md[Installed directory bypass] checks the installed-UUID ingress guards, node route and move guards, and pressure candidate selection.
 * link:verus/installed_custodian_retention/README.md[Installed custodian retention] checks the exclusive checkpoint cut, exact trim target and disposal-before-trim attempt order.
 * link:verus/installed_adapter/README.md[Installed adapter contract] checks the exact request identities against a named Lean reference and records Logkeeper's admission preconditions at RTDB's pin.

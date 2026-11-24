@@ -1,5 +1,5 @@
 {
-  "summary": "Flight audience turns have two distinct seats and mint only with a vacant seat's permit. A live retry requires the original credential and exact attempt, and retirement requires the current attachment.",
+  "summary": "Flight audience turns have two distinct seats and mint only with a vacant seat's permit. A live retry requires the original credential and exact attempt. The holder orders local data response admission with session close, and permits cleanup acknowledgements after close.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,8 +7,44 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 7,
+  "min_verified_functions": 8,
   "controls": {
+    "handoff_from_closed_session": {
+      "defect": "A data continuation hands its reply to the local Flight egress after the original session closed.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "    open || cleanup\n",
+          "replace": "    open || cleanup || !open\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "audience_handoff_permitted",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "block_original_cleanup_reply": {
+      "defect": "An authenticated cleanup cannot acknowledge the close it has just applied.",
+      "mutate": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "find": "    open || cleanup\n",
+          "replace": "    open\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/flight-sql/src/audience_seat.rs",
+          "function": "audience_handoff_permitted",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
     "resume_with_wrong_attempt": {
       "defect": "The Live seat resumes under the original credential with a different mint attempt.",
       "mutate": [

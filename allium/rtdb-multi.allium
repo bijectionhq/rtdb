@@ -3478,6 +3478,9 @@ actor Gateway {
     -- Only a retry of the live attempt under the same authenticated credential can recover that occupied seat.
     -- A session has a 180-second ceiling fixed before its claim, and the holder sweeps expired registrations.
     -- Close and expiry end session admission, while the seat stays charged until the session and its retained I/O drain.
+    -- A successful audience data reply transfers to the local Flight egress under the same session lock that orders local close.
+    -- An original cleanup reply can acknowledge close after the session has closed.
+    -- Provider requests and socket buffers admitted earlier keep their original custody.
     -- A displaced session authorizes cleanup on its original holder.
     -- Every new data action checks current placement standing.
     -- An audience placement must recover its commissioning checkpoint before it serves.

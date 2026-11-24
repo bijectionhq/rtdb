@@ -87,6 +87,21 @@ impl Session {
     pub fn audience_source(&self) -> Option<Uuid> { self.audience.as_ref().map(|audience| audience.source) }
     pub fn audience_seat(&self) -> Option<crate::AudienceSeat> { self.audience.as_ref().map(|audience| audience.seat) }
 
+    pub(crate) fn with_audience_handoff<T>(
+        &self,
+        cleanup: bool,
+        handoff: impl FnOnce() -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        let state = self.state.lock().expect("session lock");
+        let open = matches!(*state, SessionState::Open { .. });
+        if !crate::audience_seat::audience_handoff_permitted(open, cleanup) {
+            return Err(Status::not_found("session closed"));
+        }
+        let result = handoff();
+        drop(state);
+        result
+    }
+
     pub fn install_audience_projection(&self, projection: AudienceProjection) -> Result<(), Status> {
         self.audience.as_ref().ok_or_else(crate::error::unsupported)?.projection.set(projection)
             .map_err(|_| Status::failed_precondition("The audience projection is already prepared"))
@@ -225,3 +240,36 @@ pub(crate) enum PreparedScope { Session(String), Transaction(Bytes) }
 pub(crate) struct Prepared { pub owner: ResourceOwner, pub sql: String, pub scope: PreparedScope, pub params: Mutex<Option<Arc<BoundParameters>>>, _reservation: Arc<MemoryReservation> }
 impl Prepared { pub fn new(owner: ResourceOwner, sql: String, scope: PreparedScope, reservation: Arc<MemoryReservation>) -> Self { Self { owner, sql, scope, params: Mutex::new(None), _reservation: reservation } } }
 impl Leased for Prepared { fn close(&self) { *self.params.lock().expect("prepared parameters lock") = None; } }
+
+#[cfg(test)]
+mod tests {
+    use super::{Caller, Leased, Owner, Session};
+    use rtdb_auth::{AuthConfig, Authenticator, NativeHttp};
+    use rtdb_columnar::MemoryBudget;
+    use std::{sync::Arc, time::Duration};
+    use tonic::Code;
+
+    #[tokio::test]
+    async fn closed_session_refuses_data_handoff_and_acknowledges_cleanup() {
+        let memory = MemoryBudget::new(4096);
+        let http = NativeHttp::new(Arc::clone(&memory), Duration::from_secs(1), 1024).unwrap();
+        let auth = Authenticator::open(
+            AuthConfig::SingleRootUser { password: None },
+            Arc::clone(&memory),
+            Arc::new(rtdb_node::SystemClock),
+            Arc::new(http),
+        ).await.unwrap();
+        let caller = Arc::new(Caller {
+            owner: Owner::Anonymous,
+            principal: auth.unauthenticated().unwrap(),
+            mac: None,
+        });
+        let session = Session::new("session".into(), caller, None, false, None, memory.reserve(256).unwrap());
+
+        session.with_audience_handoff(false, || Ok(())).unwrap();
+        session.close();
+        let refusal = session.with_audience_handoff::<()>(false, || panic!("closed egress ran"));
+        assert_eq!(refusal.unwrap_err().code(), Code::NotFound);
+        session.with_audience_handoff(true, || Ok(())).unwrap();
+    }
+}

@@ -1,6 +1,8 @@
 ---- MODULE CrossHolderAudienceSeats ----
 EXTENDS Naturals, FiniteSets
 
+\* The installed drain-before-reuse protocol. AudienceSeatResourceFence
+\* models the alternative with a durable check at the accepting resource.
 CONSTANTS Ceiling, Sweep, Moves, Mutation
 VARIABLES epoch, cells, current, retired, pending, phase, violation
 

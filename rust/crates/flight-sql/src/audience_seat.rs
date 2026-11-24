@@ -69,6 +69,11 @@ pub(crate) fn occupied_seat_action(
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (open || cleanup)))]
+pub(crate) fn audience_handoff_permitted(open: bool, cleanup: bool) -> bool {
+    open || cleanup
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures
         out is Some <==> (turn < turns && (digit == b'0' || digit == b'1')),

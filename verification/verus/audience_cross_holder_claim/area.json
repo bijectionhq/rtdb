@@ -1,12 +1,31 @@
 {
-  "summary": "The shared Flight seat claim pins its exact free or stopped predecessor, and cancellation fences a pending write before or after it commits.",
+  "summary": "The shared Flight seat claim pins its exact free or stopped predecessor. The cancellation condition covers pending and committed original claims and excludes a distinct replacement revision under the DynamoDB condition interpretation.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
-    "production"
+    "production",
+    "--verify-root"
   ],
-  "min_verified_functions": 3,
+  "min_verified_functions": 4,
   "controls": {
+    "erase_replacement_revision": {
+      "defect": "A delayed cleanup can replace a newer charged revision when the original observed a predecessor.",
+      "mutate": [
+        {
+          "file": "verification/verus/audience_cross_holder_claim/proof.rs",
+          "find": "row == Some(prior) || row == Some(claimed),",
+          "replace": "row == Some(prior) || row == Some(claimed) || row is Some,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/audience_cross_holder_claim/proof.rs",
+          "function": "stale_release_excludes_replacement",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
     "claim_running_owner": {
       "defect": "A charged seat can be claimed without proof its former task has stopped.",
       "mutate": [

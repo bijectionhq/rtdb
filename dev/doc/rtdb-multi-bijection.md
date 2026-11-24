@@ -130,10 +130,14 @@ A live seat can recover its original session under the same credential and exact
 For the same deployment, the holder compares the candidate with the current local attachment before retiring a displaced or expired occupant.
 Close, expiry and displacement can end a registry entry while its session still owns the permit.
 A lost close request leaves the existing session in place until retirement, and a lost reply leaves the permit charged while original I/O drains.
+The holder orders a successful audience data reply's local egress handoff under the same lock that orders session close.
+An already admitted cleanup call can still acknowledge close.
 
-On 2026-11-23, Verus 0.2026.11.20.9da409b checked seven obligations and rejected fourteen controls in the audience session seat area.
+On 2026-11-24, Verus 0.2026.11.20.9da409b checked eight obligations and rejected all 16 controls in the audience session seat area.
 See [the area manifest](../../verification/verus/audience_session_seats/area.json) for the mutations and expected diagnostics.
 The area checks the shipped alternate parser, registry size and indexing, attachment and admission decisions, and a lost-close model that invokes the shipped admission decision.
+The handoff predicate refuses a closed session's data reply and allows its cleanup acknowledgement.
+Source inspection ties the predicate and synchronous egress handoff to the session lock, which serializes them with close.
 Source inspection ties vacancy to an acquired semaphore permit, retry to lookup of the original live registry entry, and retained provider I/O to a strong reference to the session through its I/O admission.
 The local bound assumes those runtime ownership and serialization rules, the sampled catalog, and authenticated identity comparisons.
 
@@ -141,8 +145,8 @@ The local bound assumes those runtime ownership and serialization rules, the sam
 TLC 2026.11.19.180144 exhausted 9,522 distinct states for one assignment move and 25,252 for two moves, with two holders, two alternates for one prepaid turn, a three-tick ceiling and a two-tick sweep.
 [The model](../../verification/tla/CrossHolderAudienceSeats.tla) checks seven invariants and one progress property, including capacity across holders, current routing and mint authority, local drain before reuse, retained I/O custody, cleanup-only standing, and registry retirement by ceiling plus sweep.
 Nine controls failed their declared laws, and a witness served a replacement while an earlier holder still retained already-admitted I/O in the other seat.
-Verus 0.2026.11.20.9da409b verified three shipped decisions for the shared claim, and all six production mutations failed their declared checks.
-[The claim proof area](../../verification/verus/audience_cross_holder_claim/area.json) covers admission against the exact free or stopped predecessor and release before or after a pending claim commits.
+On 2026-11-24, Verus 0.2026.11.20.9da409b verified five items for the shared claim, and all seven controls failed their declared checks.
+[The claim proof area](../../verification/verus/audience_cross_holder_claim/area.json) checks admission against the exact free or stopped predecessor, release before or after a pending claim commits, and refusal by a delayed release against a distinct replacement revision.
 
 **Cross-holder source inspection.**
 The claim uses the ordinary holder directory client off-turn.
@@ -155,6 +159,27 @@ The 190-second registry-retirement bound assumes a progressing monotonic clock a
 Physical release also requires retained I/O to drain and the directory to accept or observe the fenced release, or exact task-stop evidence to arrive.
 The correspondence assumes DynamoDB conditional-write atomicity and consistent reads within the cell, unique claim revisions, authenticated bearer routes, exact ECS stop records, and the session ownership and clock wiring inspected in Rust.
 Cross-cell transfers and provider I/O drain time require separate evidence.
+
+#### Resource-enforced seat generations
+
+The proposed durable seat fence gives the accepting resource one current generation for each deployment and turn.
+The resource orders replacement and the generation check for each read, write and stream continuation together.
+The replacement owns the logical seat at fence commit, and can recover that decision by exact readback if the reply is lost.
+This transition needs no task-stop observation.
+Physical capacity still includes requests and buffers held by the original generation unless their owner can retire them or bound them independently.
+The installed cold object and pack transports have separate accepting orders from the directory claim.
+A generation compare in Flight cannot change the ordering of requests that those providers have already received.
+A reclaim deadline requires a service bound through durable fence commit and exact readback.
+The current reservations and expiry sweep continue to cover the unfenced provider path.
+
+**Resource model proof checked on 2026-11-24.**
+TLC 2026.11.19.180144 exhausted 1,088 distinct states for one replacement and 13,120 for two in [the proposed resource model](../../verification/tla/AudienceSeatResourceFence.tla).
+It checked exclusion of superseded I/O, unique logical seat ownership, acquisition at fence commit, and reclaim without stop evidence under weak fairness of the fence and exact readback.
+All six mutations failed their intended laws.
+Two witnesses reached a retained old charge after the fence and a successful successor operation with such a charge still present.
+The model assumes that fence persistence and application share an accepting order and that fence and readback service eventually succeed.
+The current Flight handoff change orders application only at local response admission.
+Provider acceptance, already admitted reads and socket buffers keep their original custody boundaries.
 
 #### Journal provenance evidence
 

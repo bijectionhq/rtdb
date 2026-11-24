@@ -70,6 +70,7 @@ impl CallKind {
 }
 pub(crate) struct Call {
     service: Service,
+    kind: CallKind,
     pub session: Arc<Session>,
     pub minted: bool,
     pub database: String,
@@ -102,6 +103,15 @@ impl Call {
         if grant.is_bounded() || relay.is_some() { return Err(Status::unavailable("Flight answer transport has no delivery fence")); }
         grant.observe_answer();
         Ok(())
+    }
+
+    fn handoff_action(&self, grant: PlaintextDelivery, relay: Option<DeliveryDeadline>) -> Result<(), Status> {
+        let handoff = || self.handoff(grant, relay);
+        if self.session.audience_source().is_some() {
+            self.session.with_audience_handoff(matches!(self.kind, CallKind::AudienceCleanup), handoff)
+        } else {
+            handoff()
+        }
     }
 
     pub(crate) fn delivery_headers(
@@ -419,7 +429,7 @@ impl Service {
             }
         };
         let active_call = attachment.as_deref().and_then(|attachment| self.0.node.hold_active_call(attachment)).map(Arc::from);
-        let call = Call { service: self.clone(), session, minted, database, cancellation: self.0.cancellation.child_token(),
+        let call = Call { service: self.clone(), kind, session, minted, database, cancellation: self.0.cancellation.child_token(),
             admission, _lease: Some(lease), _active_call: active_call, _reservation: reservation,
             egress: transport.map(|transport| transport.egress.clone()),
             routed_delivery: request.metadata().get(crate::GATEWAY_ANSWER_DEADLINE_HEADER).is_some_and(|header| header == "forward") };
@@ -487,7 +497,7 @@ pub(crate) async fn action_result_stream(
             let result = call.cancellation.run_until_cancelled(async {
                 let value = value?;
                 let grant = match first.take() { Some(grant) => grant, None => plaintext.grant().await.map_err(status)? };
-                call.handoff(grant, cutoff)?;
+                call.handoff_action(grant, cutoff)?;
                 Ok(value)
             }).await.unwrap_or_else(|| Err(cancelled()));
             let stop = result.is_err();
