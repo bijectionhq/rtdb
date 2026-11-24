@@ -25,6 +25,8 @@
 -- The installed writer reports the first admitted committed erase together with its replica position.
 -- Each managed replica effect carries its stable origin across fork replay.
 -- A dependent erase filters the authenticated origins at its own selected head.
+-- A version 2 owned layout redeclaration publishes its wider schema at the ordered transaction cut.
+-- It retains the relation's stored facts, path contracts and validity policy.
 
 -- Two heads, two homes — callers choose:
 --   RESOLVED head (on the resolver): the highest transaction resolved, and so staged.

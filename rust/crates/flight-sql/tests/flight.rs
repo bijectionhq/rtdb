@@ -1063,6 +1063,56 @@ async fn owned_import_page_uses_the_held_cut_and_commits_atomically() {
     running.stop().await;
 }
 
+#[tokio::test]
+async fn owned_v2_layout_reads_both_legs_after_redeclaration() {
+    use arrow_array::ArrayRef;
+    use arrow_ipc::writer::IpcWriteOptions;
+    use rtdb_format::ipc::write_arrow_stream;
+    use rtdb_types::Value;
+
+    let running = Running::start(Some("secret"), FlightConfig { owned_native_actions: true, ..FlightConfig::default() }).await;
+    let mut client = Client::connect(&running.server, Some("xtdb:secret")).await;
+    let capability = client.action("rtdb.owned.LayoutCapabilities.v1", Bytes::new()).await.unwrap();
+    assert_eq!(capability[0].body.as_ref(), &[2]);
+    let relation = b"\0\x0ctyped-layout";
+    let declaration = |kind| {
+        let mut body = relation.to_vec();
+        body.extend_from_slice(format!(r#"{{"version":2,"fields":[{{"name":"value","type":{{"kind":"{kind}"}},"optional":false,"nullable":false}}]}}"#).as_bytes());
+        Bytes::from(body)
+    };
+    let request = |id, value: Option<ArrayRef>| {
+        let mut columns = vec![("_id", Arc::new(Int64Array::from(vec![id])) as ArrayRef)];
+        columns.extend(value.map(|value| ("value", value)));
+        let batch = RecordBatch::try_from_iter(columns).unwrap();
+        let mut body = relation.to_vec();
+        body.extend(write_arrow_stream(batch.schema_ref(), &[batch.clone()], IpcWriteOptions::default()).unwrap());
+        Bytes::from(body)
+    };
+
+    let legacy = client.action("rtdb.owned.DeclareRelation.v1", declaration("i64")).await.unwrap_err();
+    assert_eq!(legacy.code(), tonic::Code::InvalidArgument);
+    let layout = "rtdb.owned.RelationLayout.v1";
+    let selected = client.action(layout, Bytes::from_static(relation)).await.unwrap();
+    assert_eq!(selected[0].body.as_ref(), &[0]);
+    client.action("rtdb.owned.DeclareRelation.v2", declaration("i64")).await.unwrap();
+    let selected = client.action(layout, Bytes::from_static(relation)).await.unwrap();
+    assert_eq!(selected[0].body.as_ref(), &[2]);
+    client.action("rtdb.owned.Create.v1", request(1, Some(Arc::new(Int64Array::from(vec![7]))))).await.unwrap();
+    client.action("rtdb.owned.DeclareRelation.v2", declaration("utf8")).await.unwrap();
+    let text = Arc::new(StringArray::from(vec!["seven"]));
+    client.action("rtdb.owned.Create.v1", request(2, Some(text))).await.unwrap();
+
+    for (id, expected) in [(1, Value::I64(7)), (2, Value::Utf8("seven".into()))] {
+        let output = client.action("rtdb.owned.ReadPoint.v1", request(id, None)).await.unwrap();
+        let batch = StreamReader::try_new(output[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+        let schema = batch.schema();
+        let (index, field) = schema.column_with_name("value").unwrap();
+        assert!(matches!(field.data_type(), DataType::Union(_, arrow_schema::UnionMode::Dense)));
+        assert_eq!(rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0).unwrap(), expected);
+    }
+    running.stop().await;
+}
+
 #[test]
 fn owned_spatial_flight_pages_share_the_original_cut() {
     std::thread::Builder::new().stack_size(rtdb_node::WORKER_STACK_BYTES).spawn(|| {

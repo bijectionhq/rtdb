@@ -90,14 +90,21 @@
 -- Typed create-only document inserts check absence over their valid-time intervals in the ordered transaction view.
 -- An overlap aborts the entire transaction.
 -- Owned native inserts resolve in the authenticated principal's versioned namespace.
--- The owner can declare a closed scalar schema before an owned relation has stored data.
+-- The owner declares the first layout before an owned relation has stored data.
+-- A version 1 declaration is immutable and specifies one scalar type per field.
+-- The owned Flight capability action advertises version 2 and a separate declaration action admits that version.
+-- The layout lookup returns the selected Root relation's declaration version at an authenticated live cut.
+-- Version 2 admits bounded clear scalar, dense-union, list and struct shapes.
+-- An ordered version 2 redeclaration joins the new clear shapes with the stored declaration and preserves earlier admissions.
+-- A field whose joined shape exceeds its bound admits canonical Binary alongside its retained shape.
+-- Installed path columns keep their original types and presence obligations.
+-- Opaque field kinds are fixed and excluded from owned paths.
 -- An owned create or replacement enforces that schema at the ordering cut.
 -- A creation-lifetime relation declares its immutable acceptance extent before any fact exists.
 -- Its original ordered creation fixes the exclusive expiry and reserves the full identity across that expiry.
 -- A live point uses the live admission clock reading and reports the fact's exclusive expiry.
 -- Retained, archived and other read routes without lifetime coverage refuse the affected relation.
 -- An acceptance-valid root declaration requires every create, replacement and deletion to begin at its original receiver decision reading and have no valid end.
--- The declaration is immutable and must precede the first fact.
 -- Source encoding preserves whether an owned field was omitted or explicitly null.
 -- A live placed held read can resolve one installed ordinary control point under the hosted writer's allowlist.
 -- The control lookup proves an epoch-to-infinity slice or covered absence and returns its originally held revision for a checked commit.

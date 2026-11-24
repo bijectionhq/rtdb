@@ -72,6 +72,9 @@ pub(crate) enum PathDeclarationWire {
 
 pub(crate) const DECLARE_OWNED_SEARCH_PATH_V1: &str = "rtdb.owned.DeclareSearchPath.v1";
 pub(crate) const DECLARE_OWNED_RELATION_V1: &str = "rtdb.owned.DeclareRelation.v1";
+pub(crate) const DECLARE_OWNED_RELATION_V2: &str = "rtdb.owned.DeclareRelation.v2";
+pub(crate) const OWNED_LAYOUT_CAPABILITIES_V1: &str = "rtdb.owned.LayoutCapabilities.v1";
+pub(crate) const OWNED_RELATION_LAYOUT_V1: &str = "rtdb.owned.RelationLayout.v1";
 pub(crate) const DECLARE_OWNED_PATH_V1: &str = "rtdb.owned.DeclarePath.v1";
 pub(crate) const CREATE_OWNED_V1: &str = "rtdb.owned.Create.v1";
 pub(crate) const OFFER_FUNDED_MUTATION_CLOCK_V1: &str = "rtdb.owned.OfferFundedMutationClock.v1";
@@ -809,7 +812,24 @@ fn require_idle(native: &NativeSession) -> Result<(), Status> {
 }
 
 impl Service {
-    pub(crate) async fn declare_owned_relation_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) fn owned_layout_capabilities_action(&self, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        if !body.is_empty() { return Err(invalid("Owned layout capabilities takes an empty body")); }
+        Ok(ActionResult { body: Bytes::from_static(b"\x02") })
+    }
+
+    pub(crate) async fn owned_relation_layout_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (relation, tail) = split_relation(body)?;
+        if !tail.is_empty() || !relation.is_root_data() { return Err(invalid("Invalid owned layout relation")); }
+        let connection = self.connection(call, &call.database).await?;
+        let mut native = connection.borrow().await?;
+        require_idle(&native)?;
+        let version = native.owned_relation_layout_version(&relation).await.map_err(status)?.unwrap_or(0);
+        Ok(ActionResult { body: Bytes::copy_from_slice(&[version]) })
+    }
+
+    pub(crate) async fn declare_owned_relation_action(&self, call: &Call, body: &[u8], v2: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (relation, json) = split_relation(body)?;
         if json.len() > rtdb_types::OwnedSchema::MAX_JSON_BYTES {
@@ -817,6 +837,7 @@ impl Service {
         }
         let _decoded = call.reserve(wire::add(wire::mul(json.len(), 8)?, 4096)?)?;
         let schema = rtdb_types::OwnedSchema::from_json(json).map_err(status)?;
+        if schema.is_v2() != v2 { return Err(invalid("Owned declaration version disagrees with its action")); }
         self.owned_write_reply(call, vec![TxOp::OwnedDeclareRelation { relation, schema }]).await
     }
 

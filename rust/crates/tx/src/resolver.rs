@@ -1278,14 +1278,27 @@ impl<'a> OpenTransaction<'a> {
         if relation.world().is_some() || relation.is_world_catalog() { return Err(rtdb_types::OwnedWorld::unavailable()); }
         let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
             "The owned relation already has a different declaration or inferred data");
-        if let Some((existing, _)) = self.read_owned_schema(owner, relation).await? {
-            return if &existing == schema { Ok(()) } else { Err(conflict()) };
+        let existing = self.read_owned_schema(owner, relation).await?;
+        if let Some((existing, _)) = &existing {
+            if existing == schema { return Ok(()); }
+            if !existing.is_v2() || !schema.is_v2() { return Err(conflict()); }
         }
         let snapshot = self.snapshot()?;
-        if snapshot.contains_table(&relation.table(owner)) {
+        let widened;
+        let _widening;
+        let schema = if let Some((existing, _)) = &existing {
+            _widening = self.context.memory.reserve((existing.retained_bytes() + schema.retained_bytes()) * 8 + 4096)?;
+            widened = existing.widened(schema)?.ok_or_else(conflict)?;
+            if *existing == widened { return Ok(()); }
+            self.check_widened_paths(&snapshot, owner, relation, existing, &widened).await?;
+            &widened
+        } else {
+            schema
+        };
+        if existing.is_none() && snapshot.contains_table(&relation.table(owner)) {
             return Err(conflict());
         }
-        if let Some(duration) = schema.lifetime_micros() {
+        if let Some(duration) = schema.lifetime_micros().filter(|_| existing.is_none()) {
             if !relation.is_root_data() || snapshot.contains_table(&relation.unique_table(owner))
                 || snapshot.contains_table(&relation.capacity_table(owner))
             {
@@ -1302,6 +1315,38 @@ impl<'a> OpenTransaction<'a> {
             ("schema".into(), Value::Binary(schema.to_json()?)),
         ]);
         self.buffer.put(rtdb_types::OwnedRelation::relation_catalog(owner), document, Interval::ALL)
+    }
+
+    async fn check_widened_paths(
+        &self, snapshot: &Snapshot, owner: &str, relation: &rtdb_types::OwnedRelation,
+        before: &rtdb_types::OwnedSchema, after: &rtdb_types::OwnedSchema,
+    ) -> Result<()> {
+        let target = relation.table(owner);
+        let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/relation-exists",
+            "The owned declaration would change an installed path column");
+        for catalog in [rtdb_types::OwnedRelation::path_catalog(owner), rtdb_types::OwnedRelation::search_catalog(owner), rtdb_types::OwnedRelation::spatial_catalog(owner)] {
+            if !snapshot.contains_table(&catalog) { continue; }
+            let context = self.context.query_context(snapshot.clone(), self.tx_key().system_time,
+                &self.options.default_tz, self.trace_parent)?.with_accelerators(Arc::from([]));
+            let Some(mut paths) = rtdb_query::open_owned_path_catalog(context, &catalog, None).await? else { continue; };
+            while let Some(batch) = paths.next_batch().await? {
+                let batch = batch.batch();
+                for row in 0..batch.num_rows() {
+                    let cell = |name| ArrowCell::named(batch, name, row);
+                    if cell("schema_name").and_then(ArrowCell::utf8) != Some(target.schema.as_str())
+                        || cell("table_name").and_then(ArrowCell::utf8) != Some(target.table.as_str())
+                    { continue; }
+                    let columns = cell("columns").and_then(ArrowCell::list).ok_or_else(conflict)?;
+                    for name in columns {
+                        let name = name.utf8().ok_or_else(conflict)?;
+                        if before.path_column_logical_type(name) != after.path_column_logical_type(name) {
+                            return Err(conflict());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn read_owned_schema(&self, owner: &str, relation: &rtdb_types::OwnedRelation) -> Result<Option<(rtdb_types::OwnedSchema, Arc<MemoryReservation>)>> {

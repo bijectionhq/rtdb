@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Anomaly, LogicalType, Result, ScalarType, StructFields, TimeUnit, Value};
+use crate::{Anomaly, ListKind, LogicalType, Result, ScalarType, StructFields, TimeUnit, Value};
 
 /// Durable expiry frontier for one immutable creation-lifetime relation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,11 +114,20 @@ pub struct OwnedSchema(OwnedSchemaWire);
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OwnedSchemaWire {
+    #[serde(default, deserialize_with = "decode_version", skip_serializing_if = "Option::is_none")]
+    version: Option<u8>,
     fields: Vec<Field>,
     #[serde(default, skip_serializing_if = "Validity::is_explicit")]
     validity: Validity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lifetime_micros: Option<i64>,
+}
+
+fn decode_version<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Option<u8>, D::Error> {
+    match u8::deserialize(deserializer)? {
+        2 => Ok(Some(2)),
+        _ => Err(serde::de::Error::custom("Unsupported owned declaration version")),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,7 +155,7 @@ struct Field {
     nullable: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Kind {
     Bool {},
@@ -173,11 +182,19 @@ enum Kind {
         #[serde(rename = "bitWidth")]
         bit_width: u16,
     },
+    Null {},
+    Label {},
+    Sealed {},
+    CanonicalBinary {},
+    Struct { fields: Vec<Field> },
+    List { element: Box<Kind> },
+    Union { legs: Vec<Kind> },
+    Fallback { retained: Box<Kind> },
 }
 
 impl Kind {
-    fn scalar(self) -> ScalarType {
-        match self {
+    fn logical(&self) -> LogicalType {
+        LogicalType::Scalar(match self {
             Self::Bool {} => ScalarType::Bool,
             Self::I8 {} => ScalarType::I8,
             Self::I16 {} => ScalarType::I16,
@@ -190,8 +207,8 @@ impl Kind {
             Self::F16 {} => ScalarType::F16,
             Self::F32 {} => ScalarType::F32,
             Self::F64 {} => ScalarType::F64,
-            Self::Utf8 {} => ScalarType::Utf8,
-            Self::Binary {} | Self::OpaqueBinary {} => ScalarType::Binary,
+            Self::Utf8 {} | Self::Label {} => ScalarType::Utf8,
+            Self::Binary {} | Self::OpaqueBinary {} | Self::Sealed {} | Self::CanonicalBinary {} => ScalarType::Binary,
             Self::DateDay {} => ScalarType::DateDay,
             Self::Uuid {} => ScalarType::Uuid,
             Self::Instant {} => ScalarType::Timestamp {
@@ -203,59 +220,216 @@ impl Kind {
                 scale,
                 bit_width,
             } => ScalarType::Decimal {
-                precision,
-                scale,
-                bit_width,
+                precision: *precision,
+                scale: *scale,
+                bit_width: *bit_width,
             },
+            Self::Null {} => return LogicalType::Null,
+            Self::Struct { fields } => return LogicalType::Struct(fields.iter().map(|field| (field.name.clone(), field.logical())).collect()),
+            Self::List { element } => return LogicalType::list(element.logical()),
+            Self::Union { legs } => return LogicalType::from_legs(legs.iter().map(Self::logical)),
+            Self::Fallback { retained } => return retained.logical().join(&Self::Binary {}.logical()),
+        })
+    }
+
+    fn is_opaque(&self) -> bool {
+        matches!(self, Self::OpaqueBinary {} | Self::Sealed {})
+    }
+
+    fn path_logical(&self) -> Option<LogicalType> {
+        match self {
+            Self::OpaqueBinary {} | Self::Sealed {} | Self::CanonicalBinary {} | Self::Fallback { .. }
+            | Self::Null {} | Self::Union { .. } | Self::Struct { .. } | Self::List { .. } => None,
+            _ => Some(self.logical()),
         }
     }
 
-    fn accepts(self, value: &Value) -> bool {
-        if matches!(self, Self::Instant {}) {
-            return matches!(
-                value,
-                Value::Timestamp {
-                    unit: TimeUnit::Microsecond,
-                    timezone: Some(_),
-                    ..
-                }
-            );
+    fn accepts_type(&self, ty: &LogicalType) -> bool {
+        match ty {
+            LogicalType::Union(legs) => return legs.iter().all(|leg| self.accepts_type(leg)),
+            LogicalType::Maybe(inner) => return self.accepts_type(inner) && self.accepts_type(&LogicalType::Null),
+            _ => {}
         }
-        // A compound value is already incompatible, and its inferred type
-        // could allocate in proportion to the rejected input.
-        match value {
-            Value::List(_)
-            | Value::Set(_)
-            | Value::Map { .. }
-            | Value::FixedSizeList(_)
-            | Value::TimestampTzRange { .. }
-            | Value::Struct(_) => false,
-            value => value.logical_type() == LogicalType::Scalar(self.scalar()),
-        }
-    }
-
-    fn validate(self) -> Result<()> {
-        if let Self::Decimal {
-            precision,
-            scale,
-            bit_width,
-        } = self
-        {
-            let maximum = match bit_width {
-                128 => 38,
-                256 => 76,
-                _ => 0,
-            };
-            if !(1..=maximum).contains(&precision) || !(-128..=precision).contains(&scale) {
-                return Err(invalid("Invalid owned decimal precision, scale or width"));
+        match (self, ty) {
+            (Self::Instant {}, LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_) })) => true,
+            (Self::Union { legs }, ty) => legs.iter().any(|leg| leg.accepts_type(ty)),
+            (Self::Fallback { retained }, ty) => Self::CanonicalBinary {}.accepts_type(ty) || retained.accepts_type(ty),
+            (Self::List { element }, LogicalType::List { kind: ListKind::List, element: actual }) => {
+                **actual == LogicalType::Nothing || element.accepts_type(actual)
             }
+            (Self::Struct { fields }, LogicalType::Struct(actual)) => {
+                fields.iter().all(|field| field.accepts_type(actual.get(&field.name)))
+                    && actual.keys().all(|name| fields.iter().any(|field| &field.name == name))
+            }
+            (kind, ty) => kind.logical() == *ty,
+        }
+    }
+
+    fn accepts(&self, value: &Value) -> bool {
+        match (self, value) {
+            (Self::Struct { fields }, Value::Struct(actual)) => {
+                fields.iter().all(|field| field.accepts(actual.get(&field.name)))
+                    && actual.iter().all(|(name, value)| matches!(value, Value::Undefined) || fields.iter().any(|field| &field.name == name))
+            }
+            (Self::List { element }, Value::List(actual)) => match actual.view() {
+                crate::ListView::Values(values) => values.iter().all(|value| element.accepts(value)),
+                _ => self.accepts_type(&value.logical_type()),
+            },
+            (Self::Union { legs }, value) => legs.iter().any(|leg| leg.accepts(value)),
+            (Self::Fallback { retained }, value) => matches!(value, Value::Binary(_)) || retained.accepts(value),
+            (_, Value::List(_) | Value::Set(_) | Value::Map { .. } | Value::FixedSizeList(_) | Value::TimestampTzRange { .. } | Value::Struct(_)) => false,
+            (kind, value) => kind.accepts_type(&value.logical_type()),
+        }
+    }
+
+    fn validate(&self, v2: bool, depth: usize) -> Result<()> {
+        if depth > 16 {
+            return Err(invalid("Owned field exceeds its nesting limit"));
+        }
+        match self {
+            Self::Decimal { precision, scale, bit_width } => {
+                let maximum = match bit_width { 128 => 38, 256 => 76, _ => 0 };
+                if !(1..=maximum).contains(precision) || !(-128..=*precision).contains(scale) {
+                    return Err(invalid("Invalid owned decimal precision, scale or width"));
+                }
+            }
+            Self::List { element } if v2 => element.validate(v2, depth + 1)?,
+            Self::Struct { fields } if v2 => validate_fields(fields, v2, depth + 1)?,
+            Self::Union { legs } if v2 => {
+                if !(2..=OwnedSchema::MAX_UNION_LEGS).contains(&legs.len()) {
+                    return Err(invalid("Invalid owned union leg count"));
+                }
+                for (index, leg) in legs.iter().enumerate() {
+                    if matches!(leg, Self::Union { .. } | Self::Fallback { .. }) || leg.is_opaque()
+                        || legs[..index].iter().any(|other| leg.same_slot(other))
+                    {
+                        return Err(invalid("Owned union legs must have distinct physical kinds"));
+                    }
+                    leg.validate(v2, depth + 1)?;
+                }
+            }
+            Self::Fallback { retained } if v2 && depth == 0 && !retained.is_opaque()
+                && !matches!(**retained, Self::Fallback { .. } | Self::CanonicalBinary {}) => retained.validate(v2, depth)?,
+            Self::Sealed {} | Self::CanonicalBinary {} | Self::Label {} if v2 && depth == 0 => {},
+            Self::Null {} if v2 && depth > 0 => {},
+            Self::Null {} | Self::Label {} | Self::Sealed {} | Self::CanonicalBinary {}
+            | Self::List { .. } | Self::Struct { .. } | Self::Union { .. } | Self::Fallback { .. } => {
+                return Err(invalid("Owned field kind requires a compatible version 2 layout"));
+            }
+            Self::OpaqueBinary {} if depth > 0 => return Err(invalid("Opaque fields must be top-level columns")),
+            _ => {}
         }
         Ok(())
     }
+
+    fn same_slot(&self, other: &Self) -> bool {
+        matches!((self, other), (Self::Struct { .. }, Self::Struct { .. }) | (Self::List { .. }, Self::List { .. }))
+            || self.logical() == other.logical()
+    }
+
+    fn widened(&self, additional: &Self) -> Self {
+        match (self, additional) {
+            (a, b) if a == b => a.clone(),
+            (a @ (Self::CanonicalBinary {} | Self::Fallback { .. }), _) => a.clone(),
+            (a, Self::CanonicalBinary {}) => Self::Fallback { retained: Box::new(a.clone()) },
+            (Self::Struct { fields }, Self::Struct { fields: next }) => Self::Struct { fields: widen_fields(fields, next) },
+            (Self::List { element }, Self::List { element: next }) => Self::List { element: Box::new(element.widened(next)) },
+            (a, b) => {
+                let mut legs = match a { Self::Union { legs } => legs.clone(), _ => vec![a.clone()] };
+                let incoming = match b { Self::Union { legs } => legs.as_slice(), _ => std::slice::from_ref(b) };
+                for leg in incoming {
+                    match legs.iter_mut().find(|old| old.same_slot(leg)) {
+                        Some(old @ (Self::Struct { .. } | Self::List { .. })) if old != leg => *old = old.widened(leg),
+                        Some(_) => {},
+                        None => legs.push(leg.clone()),
+                    }
+                }
+                Self::Union { legs }
+            }
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Struct { fields } => retained_fields(fields),
+            Self::List { element } | Self::Fallback { retained: element } => std::mem::size_of::<Self>() + element.retained_bytes(),
+            Self::Union { legs } => legs.capacity() * std::mem::size_of::<Self>() + legs.iter().map(Self::retained_bytes).sum::<usize>(),
+            _ => 0,
+        }
+    }
+}
+
+impl Field {
+    fn logical(&self) -> LogicalType {
+        let ty = self.kind.logical();
+        if self.optional || self.nullable { ty.maybe() } else { ty }
+    }
+
+    fn accepts_type(&self, ty: Option<&LogicalType>) -> bool {
+        match ty {
+            None | Some(LogicalType::Nothing) => self.optional,
+            Some(LogicalType::Null) => self.nullable,
+            Some(LogicalType::Maybe(ty)) if self.nullable => self.kind.accepts_type(ty),
+            Some(LogicalType::Union(legs)) => legs.iter().all(|leg| match leg {
+                LogicalType::Null => self.nullable,
+                other => self.kind.accepts_type(other),
+            }),
+            Some(ty) => self.kind.accepts_type(ty),
+        }
+    }
+
+    fn accepts(&self, value: Option<&Value>) -> bool {
+        match value {
+            None | Some(Value::Undefined) => self.optional,
+            Some(Value::Null) => self.nullable,
+            Some(value) => self.kind.accepts(value),
+        }
+    }
+}
+
+fn retained_fields(fields: &Vec<Field>) -> usize {
+    fields.capacity() * (std::mem::size_of::<Field>() + 64)
+        + fields.iter().map(|field| field.name.capacity() + field.kind.retained_bytes()).sum::<usize>()
+}
+
+fn validate_fields(fields: &[Field], v2: bool, depth: usize) -> Result<()> {
+    if fields.len() > 128 {
+        return Err(invalid("An owned declaration accepts at most 128 fields"));
+    }
+    let mut names = BTreeSet::new();
+    for field in fields {
+        if field.name.is_empty() || field.name.len() > 128 || field.name.starts_with('_')
+            || field.name.chars().any(char::is_control) || !names.insert(&field.name)
+        {
+            return Err(invalid("Owned declaration field names must be distinct, nonempty and unreserved"));
+        }
+        field.kind.validate(v2, depth)?;
+    }
+    Ok(())
+}
+
+fn widen_fields(existing: &[Field], additional: &[Field]) -> Vec<Field> {
+    let mut fields: Vec<_> = existing.iter().map(|field| {
+        if let Some(next) = additional.iter().find(|next| next.name == field.name) {
+            Field {
+                name: field.name.clone(),
+                kind: field.kind.widened(&next.kind),
+                optional: field.optional || next.optional,
+                nullable: field.nullable || next.nullable,
+            }
+        } else {
+            Field { optional: true, ..field.clone() }
+        }
+    }).collect();
+    fields.extend(additional.iter().filter(|next| !existing.iter().any(|old| old.name == next.name))
+        .map(|field| Field { optional: true, ..field.clone() }));
+    fields
 }
 
 impl OwnedSchema {
     pub const MAX_JSON_BYTES: usize = 64 * 1024;
+    pub const MAX_UNION_LEGS: usize = 16;
+    pub const MAX_FIELD_KIND_BYTES: usize = 4096;
 
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         if bytes.len() > Self::MAX_JSON_BYTES {
@@ -268,24 +442,44 @@ impl OwnedSchema {
         {
             return Err(invalid("Owned creation lifetime requires acceptance validity and a positive bounded duration"));
         }
-        if schema.fields.len() > 128 {
-            return Err(invalid("An owned declaration accepts at most 128 fields"));
+        let schema = Self(schema);
+        validate_fields(&schema.0.fields, schema.is_v2(), 0)?;
+        if schema.is_v2() && schema.0.fields.iter().any(|field| !kind_fits(&field.kind)) {
+            return Err(invalid("Owned field exceeds its layout size limit"));
         }
-        let mut names = BTreeSet::new();
-        for field in &schema.fields {
-            if field.name.is_empty()
-                || field.name.len() > 128
-                || field.name.starts_with('_')
-                || field.name.chars().any(char::is_control)
-                || !names.insert(&field.name)
+        Ok(schema)
+    }
+
+    pub fn is_v2(&self) -> bool { self.0.version == Some(2) }
+
+    pub fn widened(&self, additional: &Self) -> Result<Option<Self>> {
+        if !self.is_v2() || !additional.is_v2()
+            || self.0.validity != additional.0.validity || self.lifetime_micros() != additional.lifetime_micros()
+            || self.0.fields.len() != additional.0.fields.len()
+        {
+            return Ok(None);
+        }
+        let mut next = self.clone();
+        for (old, target) in self.0.fields.iter().zip(&mut next.0.fields) {
+            let Some(incoming) = additional.0.fields.iter().find(|field| field.name == old.name) else { return Ok(None); };
+            if incoming.kind != old.kind && (old.kind.is_opaque() || incoming.kind.is_opaque()
+                || matches!(incoming.kind, Kind::Fallback { .. } | Kind::Label {}) || matches!(old.kind, Kind::Label {}))
             {
-                return Err(invalid(
-                    "Owned declaration field names must be distinct, nonempty and unreserved",
-                ));
+                return Ok(None);
             }
-            field.kind.validate()?;
+            target.optional |= incoming.optional;
+            target.nullable |= incoming.nullable;
+            let kind = old.kind.widened(&incoming.kind);
+            target.kind = if kind.validate(true, 0).is_ok() && kind_fits(&kind) {
+                kind
+            } else {
+                Kind::Fallback { retained: Box::new(old.kind.clone()) }
+            };
         }
-        Ok(Self(schema))
+        if next.to_json()?.len() > Self::MAX_JSON_BYTES {
+            return Err(invalid("Owned declaration exceeds its byte limit"));
+        }
+        Ok(Some(next))
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>> {
@@ -298,31 +492,28 @@ impl OwnedSchema {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.0.fields.capacity() * (std::mem::size_of::<Field>() + 64)
-            + self
-                .0
-                .fields
-                .iter()
-                .map(|field| field.name.capacity())
-                .sum::<usize>()
+        retained_fields(&self.0.fields)
     }
 
     /// Only declared clear fields may contribute to an ordered or derived path.
     pub fn has_opaque_columns(&self) -> bool {
-        self.0.fields.iter().any(|field| matches!(field.kind, Kind::OpaqueBinary {}))
+        self.0.fields.iter().any(|field| field.kind.is_opaque())
     }
 
     pub fn path_column_type(&self, name: &str) -> Option<ScalarType> {
-        self.path_field(name).map(|field| field.kind.scalar())
+        match self.path_field(name)?.kind.path_logical()? {
+            LogicalType::Scalar(ty) => Some(ty),
+            _ => None,
+        }
     }
 
     pub fn path_column_logical_type(&self, name: &str) -> Option<LogicalType> {
-        self.path_field(name).map(|field| {
-            let ty = LogicalType::Scalar(field.kind.scalar());
+        self.path_field(name).and_then(|field| {
+            let ty = field.kind.path_logical()?;
             if field.optional || field.nullable {
-                ty.maybe()
+                Some(ty.maybe())
             } else {
-                ty
+                Some(ty)
             }
         })
     }
@@ -389,18 +580,14 @@ impl OwnedSchema {
     }
 
     fn path_field(&self, name: &str) -> Option<&Field> {
-        self.0.fields.iter().find(|field| field.name == name && !matches!(field.kind, Kind::OpaqueBinary {}))
+        self.0.fields.iter().find(|field| field.name == name)
     }
 
     pub fn validate_types(&self, types: &StructFields<LogicalType>) -> Result<()> {
         for field in &self.0.fields {
-            let accepts = match types.get(field.name.as_str()) {
-                None | Some(LogicalType::Nothing) => field.optional,
-                Some(LogicalType::Null) => field.nullable,
-                Some(LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some(_) }))
-                    if matches!(field.kind, Kind::Instant {}) => true,
-                Some(ty) => *ty == LogicalType::Scalar(field.kind.scalar()),
-            };
+            let ty = types.get(field.name.as_str());
+            let accepts = (self.is_v2() || !matches!(ty, Some(LogicalType::Union(_) | LogicalType::Maybe(_))))
+                && field.accepts_type(ty);
             if !accepts { return Err(nonconforming(&field.name)); }
         }
         for (name, ty) in types {
@@ -413,12 +600,7 @@ impl OwnedSchema {
 
     pub fn validate_row(&self, row: &StructFields<Value>) -> Result<()> {
         for field in &self.0.fields {
-            let accepts = match row.get(field.name.as_str()) {
-                None | Some(Value::Undefined) => field.optional,
-                Some(Value::Null) => field.nullable,
-                Some(value) => field.kind.accepts(value),
-            };
-            if !accepts {
+            if !field.accepts(row.get(field.name.as_str())) {
                 return Err(nonconforming(&field.name));
             }
         }
@@ -432,6 +614,11 @@ impl OwnedSchema {
         }
         Ok(())
     }
+}
+
+fn kind_fits(kind: &Kind) -> bool {
+    let bounded = match kind { Kind::Fallback { retained } => retained.as_ref(), kind => kind };
+    serde_json::to_vec(bounded).is_ok_and(|bytes| bytes.len() <= OwnedSchema::MAX_FIELD_KIND_BYTES)
 }
 
 fn invalid(message: &'static str) -> Anomaly {
@@ -449,6 +636,48 @@ fn nonconforming(field: &str) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn versioned_field(kind: &str) -> OwnedSchema {
+        OwnedSchema::from_json(format!(r#"{{"version":2,"fields":[{{"name":"value","type":{kind},"optional":true,"nullable":false}}]}}"#).as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn v2_owned_shape_widens_without_changing_v1_bytes() -> Result<()> {
+        let original = br#"{"fields":[{"name":"value","type":{"kind":"i64"},"optional":true,"nullable":false}]}"#;
+        let v1 = OwnedSchema::from_json(original)?;
+        let integers = versioned_field(r#"{"kind":"i64"}"#);
+        let objects = versioned_field(r#"{"kind":"struct","fields":[{"name":"list","type":{"kind":"list","element":{"kind":"union","legs":[{"kind":"bool"},{"kind":"null"}]}},"optional":true,"nullable":false}]}"#);
+        let joined = integers.widened(&objects)?.unwrap();
+        let row = |value| StructFields::from([("value".to_owned(), value)]);
+        let object = |list| Value::Struct(StructFields::from([("list".to_owned(), list)]));
+        assert!(joined.validate_row(&row(Value::I64(9))).is_ok());
+        assert!(joined.validate_row(&row(object(Value::list(vec![Value::Bool(true), Value::Null])))).is_ok());
+        assert!(joined.validate_row(&row(object(Value::Null))).is_err());
+        assert!(joined.validate_row(&row(Value::Null)).is_err());
+        assert!(joined.validate_row(&StructFields::new()).is_ok());
+        assert_eq!(joined, OwnedSchema::from_json(&joined.to_json()?)?);
+        assert!(v1.widened(&integers)?.is_none());
+        assert_eq!(v1.to_json()?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn v2_owned_shape_caps_widening_per_field() -> Result<()> {
+        let decimal = |scale| versioned_field(&format!(r#"{{"kind":"decimal","precision":38,"scale":{scale},"bitWidth":128}}"#));
+        let start = decimal(0);
+        let mut schema = start.clone();
+        for scale in 1..OwnedSchema::MAX_UNION_LEGS {
+            schema = schema.widened(&decimal(scale))?.unwrap();
+        }
+        let fallback = schema.widened(&decimal(OwnedSchema::MAX_UNION_LEGS))?.unwrap();
+        let ty = |ty| StructFields::from([("value".to_owned(), LogicalType::Scalar(ty))]);
+        assert!(fallback.validate_types(&ty(ScalarType::Binary)).is_ok());
+        assert!(fallback.validate_types(&ty(ScalarType::Decimal { precision: 38, scale: 0, bit_width: 128 })).is_ok());
+        assert!(fallback.validate_types(&ty(ScalarType::Decimal { precision: 38, scale: 16, bit_width: 128 })).is_err());
+        assert_eq!(fallback.widened(&start)?, Some(fallback.clone()));
+        assert_eq!(fallback, OwnedSchema::from_json(&fallback.to_json()?)?);
+        Ok(())
+    }
 
     #[test]
     fn replay_keeps_the_first_creation_and_its_original_expiry() -> Result<()> {
