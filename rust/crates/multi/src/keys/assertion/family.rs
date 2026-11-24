@@ -110,6 +110,14 @@ pub struct DerivedRow {
 }
 
 impl DerivedRow {
+    pub(crate) const PROPOSAL_REPLAY_RELATION: &str = "bj_fact_root_admission";
+
+    fn is_proposal_replay(&self) -> bool {
+        self.relation == Self::PROPOSAL_REPLAY_RELATION && self.world.is_some()
+            && self.capability.is_some() && self.key.len() == 64
+            && self.key.iter().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    }
+
     fn same_row(&self, other: &Self) -> bool {
         self.world == other.world && self.relation == other.relation && self.key == other.key
     }
@@ -575,7 +583,9 @@ impl<'a> AssertionFamilies<'a> {
             record.require_live()?;
             let mut changed = false;
             for row in rows {
-                if !row.well_formed() || !row.relation.ends_with("_search") || !record.has_member(row.member) {
+                if !row.well_formed() || !(row.relation.ends_with("_search") || row.is_proposal_replay())
+                    || !record.has_member(row.member)
+                {
                     return Err(conflict());
                 }
                 if record.derived.contains(row) {

@@ -741,26 +741,38 @@ pub async fn owned_ranked_overlay_batch(
     let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, partitions).await?;
     let query = Query::analyzed(analyzer, text);
     if let Some(overlay) = &overlay { overlay.require_query(&query)?; }
+    for (relation, _) in partitions {
+        if crate::rank_family::needs_rank_family(&context, owner, relation).await? {
+            return rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await;
+        }
+    }
     match rank_owned_artefacts(&context, owner, partitions, &query, offset, limit, valid_at, overlay.as_ref()).await {
         Ok((scorer, mut rank)) => {
             if let Some(overlay) = overlay { overlay.rank(&scorer, &mut rank)?; }
             context.check_cancelled()?;
             rank.finish_batch()
         }
-        Err(error) if error.code == "rtdb.owned/search-uncovered" => {
-            let mut corpus = match overlay {
-                Some(overlay) => overlay,
-                None => crate::HeldTextCorpus::new(Arc::clone(&context.memory), analyzer, text)?,
-            };
-            let valid = valid_at.unwrap_or(context.current_time.as_micros()?);
-            for (partition, (relation, path)) in partitions.iter().enumerate() {
-                corpus.read_root_partition(&context, owner, relation, path, partition, valid).await?;
-            }
-            context.check_cancelled()?;
-            corpus.finish_batch(offset, limit)
-        }
+        Err(error) if error.code == "rtdb.owned/search-uncovered" =>
+            rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await,
         Err(error) => Err(error),
     }
+}
+
+async fn rank_owned_exact(
+    context: &Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)],
+    analyzer: rtdb_text::Analyzer, text: &str, offset: usize, limit: usize, valid_at: Option<Timestamp>,
+    overlay: Option<crate::HeldTextCorpus>,
+) -> Result<OwnedSearchBatch> {
+    let mut corpus = match overlay {
+        Some(overlay) => overlay,
+        None => crate::HeldTextCorpus::new(Arc::clone(&context.memory), analyzer, text)?,
+    };
+    let valid = valid_at.unwrap_or(context.current_time.as_micros()?);
+    for (partition, (relation, path)) in partitions.iter().enumerate() {
+        corpus.read_root_partition(context, owner, relation, path, partition, valid).await?;
+    }
+    context.check_cancelled()?;
+    corpus.finish_batch(offset, limit)
 }
 
 async fn rank_owned_artefacts(

@@ -250,6 +250,18 @@ The RTDB adapter derives the registry commitment from the original placed histor
 It authenticates the exact row creator against the current original `bj_installation` writer and checks the original registry address at the same barrier.
 Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
 
+### Ranked response contributor inventory
+
+Protocol 222 includes a complete bounded family inventory in each held text and nearest reply, including replies with no hits.
+The inventory comes from the admitted corpus before result slicing. It covers non-hit text statistics and vector candidates, and includes protected world shadows that affect the inherited corpus.
+The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field. Root contributors resolve their exact carrier on the same held cut.
+The inventory is `rtdb.owned.rank_families` in the authenticated Arrow schema, as lowercase hex of a big-endian u16 entry count and canonical sorted entries.
+An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root carrier publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
+The bounds are 512 entries of at most 1024 bytes and at most 512 Root carrier probes per rank. Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
+`FamilyResponseRelease.v2` adds exact world-derived input kind 2 and exact Root-derived input kind 3 to the existing response-part hold.
+The consumer retains the inventory in the invocation's original output custody even when it returns only counts, cursors or derived scores.
+Hybrid reads retain the combined text and vector dependencies under that same bound.
+
 ### Fence plan reply
 
 Protocol 217 retires the former immediate fence action.
@@ -276,6 +288,15 @@ The landing authority verifies that Proposal and Root have the same installed pa
 This comparison includes the effective world payload-read gate at the reviewed source and the installed payload-read authority at Root.
 Matching label strings alone does not establish equality.
 Proposal authoring, review and approval grants give no payload-read standing.
+Bijection's direct app landing resolves the approved branch at its original audience.
+The Proposal owner and Root hold bind the deployment, serving incarnation, concrete label registration, installed grant catalog and exact table declaration.
+The current caller's Clear grant and the original approval invitation are checked independently.
+The private acceptance names that audience commitment and orders its current authority checks together with the selected world point and Root predecessor.
+The initial admitted case is one unindexed, acceptance-valid keyed creation on an unchanged Root publication.
+The exact key must retain the reviewed protected incarnation and have no Root winner.
+The original registered execution receipt authenticates the sealed review commitment and the guest rerun command, which is sealed under the source family.
+The replay ciphertext has a fresh derived stage at the authoring Proposal, with relation `bj_fact_root_admission` and a 64-byte lowercase hexadecimal receipt-and-position commitment as its slot.
+The original vault admits this slot only at a live Proposal and includes its capability in the ordinary family fence inventory.
 The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
 The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
 

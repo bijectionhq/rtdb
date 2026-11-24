@@ -487,12 +487,12 @@ The count requires the same complete generation as a covered range and uses subt
 
 `rtdb.owned.DeclareSearchPath.v2` uses the relation prefix and a terminated Arrow IPC stream with one batch and one row.
 Its fields are `_id: Utf8` for the path name, `column: Utf8` for the stored clear-text column and `analyzer: Utf8` for the path's full-text analyzer (`simple`, `standard`, or a language analyzer as in `CREATE SEARCH INDEX`).
-The analyzer is part of the path: its search files, SearchHeld.v5, its world variants, the hybrid reads and staged overlays all tokenise with it, every partition of one held search must use the same analyzer, and redeclaring the path with another analyzer conflicts.
+The analyzer is part of the path: its search files, SearchHeld.v6, its world variants, the hybrid reads and staged overlays all tokenise with it, every partition of one held search must use the same analyzer, and redeclaring the path with another analyzer conflicts.
 The relation must already exist in the authenticated owner's namespace, and the column must contain only text or null.
 The FTS maintenance lane uses the private declaration to build the relation's search files.
 A successful declaration returns the same transaction-key Arrow row as Create.
 
-`rtdb.owned.SearchHeld.v5` takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, then a big-endian u32 overlay byte length and the optional Arrow overlay bytes.
+`rtdb.owned.SearchHeld.v6` takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, then a big-endian u32 overlay byte length and the optional Arrow overlay bytes.
 Next comes a big-endian u16 partition count (1 to 32), then a relation prefix and a path prefix per partition.
 A big-endian u32 offset (0 to 4096), u16 limit (1 to 128), and evidence flag byte (0 or 1) follow, then the UTF-8 query (up to 4096 bytes).
 The reply contains `_id` as a typed union of string, keyword, signed Int64 and UUID, `score: Float64`, and `partition: UInt64` as the zero-based request ordinal.
@@ -502,7 +502,7 @@ Every selected partition must have complete format 11 search artefacts at the he
 A placed read with evidence requested publishes `rtdb.owned.search_witnesses` as the concatenated lowercase hex of one 16-byte range nonce per partition in request order. This also covers a successful empty result.
 An overlay requires the configured placed hosted-control owner, the live Root validity and requested evidence. One Arrow batch carries `partition: UInt64`, `_id: Utf8`, and nullable `text: Utf8` for one to 64 exact staged shadows. Null text masks the old run. The whole-relation witnesses still describe the original source.
 
-`rtdb.owned.NearestHeld.v2` ranks clear stored vectors by exact cosine distance at a held cut.
+`rtdb.owned.NearestHeld.v3` ranks clear stored vectors by exact cosine distance at a held cut.
 It takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, then a big-endian u32 overlay byte length and the optional Arrow overlay bytes.
 Next comes a filter count byte F (0 to 8) and a big-endian u16 partition count (1 to 32).
 Each partition is a relation prefix, a vector column prefix and F filter column prefixes, all framed like relation prefixes; relations are distinct.
@@ -512,7 +512,7 @@ A vector column holds a list of numbers; a missing cell or a zero-norm vector is
 A filter column holds Binary values; a row passes when every filter column is present and byte-equal to one of that filter's values.
 The distance is `1 - dot(a, b) / (|a| |b|)` in f64, and the reply keeps the first k candidates by ascending distance, then complete typed identity, then partition ordinal.
 The scan admits at most 100,000 candidates and otherwise refuses with `rtdb.owned/nearest-scan-limit`.
-The reply has `_id` as in SearchHeld.v5, `distance: Float64` and `partition: UInt64`, with the held present and valid instant, `rtdb.owned.search_total` (the candidates that passed the filters) and `rtdb.owned.search_witnesses` as in SearchHeld.v5.
+The reply has `_id` as in SearchHeld.v6, `distance: Float64` and `partition: UInt64`, with the held present and valid instant, `rtdb.owned.search_total` (the candidates that passed the filters) and `rtdb.owned.search_witnesses` as in SearchHeld.v6.
 `rtdb.owned.search_scope` is the lowercase hex SHA-256 of the domain tag `rtdb.owned.nearest.held.v2` and a NUL byte followed by the complete request body.
 With the approximate route, a partition whose relation has an approximate vector path over its vector column ranks only the shortlist of that path's published generations and frontier (`vector.allium`), widened until k candidates pass the filters; other partitions, and any partition whose shortlist exceeds its budget, rank exactly.
 The distances and order remain exact; the result may omit true neighbours.
@@ -520,21 +520,21 @@ The distances and order remain exact; the result may omit true neighbours.
 
 `rtdb.owned.DeclareVectorPath.v1` takes a relation prefix and one Arrow row of `_id` (the path name), `column` (a stored list column), `dimensions` (Int64, 1 to 4096) and `recall` (Float64 in (0, 1]).
 It records the path in the principal's `.vector-paths` catalog; the artefact lane then builds its IVF generations, and a repeated declaration must match exactly.
-An overlay has the same admission as SearchHeld.v5.
+An overlay has the same admission as SearchHeld.v6.
 One Arrow batch carries `partition: UInt64`, `_id: Utf8`, nullable `vector: List<Float32>` and nullable Binary `filter_0` to `filter_{F-1}` for one to 64 exact staged shadows.
 Each shadow masks the stored row with its identity, and a shadow with a vector is itself a candidate.
 
-`rtdb.owned.HybridHeld.v2` fuses a SearchHeld.v5 text ranking and a NearestHeld.v2 nearest ranking of the same relations at one held cut by reciprocal rank fusion.
-It takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, a big-endian u16 limit, then two overlays, each a big-endian u32 byte length and optional Arrow bytes (the text overlay as in SearchHeld.v5, then the vector overlay as in NearestHeld.v2), then a big-endian u32 byte length and the SearchHeld.v5 request that follows its overlay, and last the NearestHeld.v2 request that follows its overlay.
+`rtdb.owned.HybridHeld.v3` fuses a SearchHeld.v6 text ranking and a NearestHeld.v3 nearest ranking of the same relations at one held cut by reciprocal rank fusion.
+It takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, a big-endian u16 limit, then two overlays, each a big-endian u32 byte length and optional Arrow bytes (the text overlay as in SearchHeld.v6, then the vector overlay as in NearestHeld.v3), then a big-endian u32 byte length and the SearchHeld.v6 request that follows its overlay, and last the NearestHeld.v3 request that follows its overlay.
 The text request has offset 0, evidence requested, and its limit is the window W (1 to 128); the nearest request has k = W, evidence requested, and the same relations in the same order; the limit is 1 to W.
 The relations may be several partitions, among them the per-label derived search relations of protected rows; fusion keys each hit by its partition ordinal and typed identity.
 Each ranking keeps its first W hits, and a hit at rank r of a window, counted from 1, contributes 1 / (60 + r).
-The reply has `_id` as in SearchHeld.v5, `score: Float64` (the sum of the contributions, text first), `partition: UInt64`, and nullable `text_rank: UInt32` and `nearest_rank: UInt32` with the hit's rank in each window, ordered by descending score, then complete typed identity, then partition ordinal.
-`rtdb.owned.search_total` counts the distinct hits of both windows, `rtdb.owned.nearest_approximate` is as in NearestHeld.v2, `rtdb.owned.search_witnesses` is the text read's, as in SearchHeld.v5, and `rtdb.owned.search_scope` is the lowercase hex SHA-256 of the domain tag `rtdb.owned.hybrid.held.v2` and a NUL byte followed by the complete request body.
-A staged hybrid read has the admission of a staged SearchHeld.v5 read; each overlay may be empty.
+The reply has `_id` as in SearchHeld.v6, `score: Float64` (the sum of the contributions, text first), `partition: UInt64`, and nullable `text_rank: UInt32` and `nearest_rank: UInt32` with the hit's rank in each window, ordered by descending score, then complete typed identity, then partition ordinal.
+`rtdb.owned.search_total` counts the distinct hits of both windows, `rtdb.owned.nearest_approximate` is as in NearestHeld.v3, `rtdb.owned.search_witnesses` is the text read's, as in SearchHeld.v6, and `rtdb.owned.search_scope` is the lowercase hex SHA-256 of the domain tag `rtdb.owned.hybrid.held.v2` and a NUL byte followed by the complete request body.
+A staged hybrid read has the admission of a staged SearchHeld.v6 read; each overlay may be empty.
 
-`rtdb.owned.HybridHeldWorld.v1`, `rtdb.owned.HybridHeldWorldAt.v1` and `rtdb.owned.HybridHeldWorldParentAt.v1` fuse the same way over a held world.
-Each takes the prefix of the corresponding SearchHeldWorld or NearestHeldWorld action up to and including its valid instant, then the HybridHeld.v2 body from the limit on; only HybridHeldWorld.v1 carries the two overlays, with the admission of a staged SearchHeldWorld.v2 read.
+`rtdb.owned.HybridHeldWorld.v2`, `rtdb.owned.HybridHeldWorldAt.v2` and `rtdb.owned.HybridHeldWorldParentAt.v2` fuse the same way over a held world.
+Each takes the prefix of the corresponding SearchHeldWorld or NearestHeldWorld action up to and including its valid instant, then the HybridHeld.v3 body from the limit on; only HybridHeldWorld.v2 carries the two overlays, with the admission of a staged SearchHeldWorld.v3 read.
 Both rankings read the world at the selected cut, the witnesses are the text read's, and the scope domains are `rtdb.owned.hybrid.world.v1`, `rtdb.owned.hybrid.world-at.v1` and `rtdb.owned.hybrid.world-parent-at.v1`.
 
 === Owned spatial paths
@@ -735,9 +735,9 @@ It takes the world UUID, one signed big-endian 64-bit exclusive deadline in Unix
 The remaining bytes are the existing hosted control groups. Only check rows from the placed allowlist are admitted.
 The ordered transaction checks the world registration, placement, deadline, local point revisions, root erasure frontiers, and hosted ownership before issuing the transaction-key receipt.
 
-`rtdb.owned.SearchHeldWorld.v2` takes the original 16-byte world handle, a signed big-endian i64 valid instant and the big-endian u32 overlay IPC byte length, then the overlay bytes and the same partition, offset, limit, evidence flag and query framing as SearchHeld.v5.
+`rtdb.owned.SearchHeldWorld.v3` takes the original 16-byte world handle, a signed big-endian i64 valid instant and the big-endian u32 overlay IPC byte length, then the overlay bytes and the same partition, offset, limit, evidence flag and query framing as SearchHeld.v6.
 A zero overlay length selects the committed corpus.
-A nonempty overlay uses the same staged layout as SearchHeld.v5 and requires the installed placed writer, the live Proposal's present as the valid instant and original evidence from that writer's placement.
+A nonempty overlay uses the same staged layout as SearchHeld.v6 and requires the installed placed writer, the live Proposal's present as the valid instant and original evidence from that writer's placement.
 A stage replaces the indexed contribution of the same typed identity in either committed layer.
 The scope includes the full stage, and the stage requires covered archived search artifacts.
 The evidence flag must be one, and every partition must have unchanged Root purge frontiers since the archive cut. Retained worlds require complete clear-text artefacts.
@@ -746,14 +746,14 @@ The indexed branch limits the overlay to 4,096 shadow keys and 8 MiB of text, an
 The ranked reply carries the world present, requested valid instant, exact total and one held condition per partition, including for an empty result.
 Conditions validate the original archive pin and whole-corpus purge frontiers, plus the local relation touch frontier for writable worlds.
 
-`rtdb.owned.NearestHeldWorld.v1`, `rtdb.owned.NearestHeldWorldAt.v1` and `rtdb.owned.NearestHeldWorldParentAt.v1` rank the effective world view by exact cosine distance.
-Their prefixes are those of SearchHeldWorld.v2, SearchHeldWorldAt.v1 and SearchHeldWorldParentAt.v1: the 16-byte world handle, then for the At variant a selector byte (0 for the parent only, 1 for the effective world) and a big-endian i64 system revision, for the ParentAt variant a big-endian i64 system revision, then a big-endian i64 valid instant, and for the current variant a big-endian u32 overlay length and the optional overlay.
-The NearestHeld.v2 frame follows unchanged from its filter count to the probe, and the evidence flag must be one; world reads rank exactly whatever the route byte.
-A nonempty overlay uses the NearestHeld.v2 staged layout and requires the installed placed writer and the live Proposal's present as the valid instant.
+`rtdb.owned.NearestHeldWorld.v2`, `rtdb.owned.NearestHeldWorldAt.v2` and `rtdb.owned.NearestHeldWorldParentAt.v2` rank the effective world view by exact cosine distance.
+Their prefixes are those of SearchHeldWorld.v3, SearchHeldWorldAt.v2 and SearchHeldWorldParentAt.v2: the 16-byte world handle, then for the At variant a selector byte (0 for the parent only, 1 for the effective world) and a big-endian i64 system revision, for the ParentAt variant a big-endian i64 system revision, then a big-endian i64 valid instant, and for the current variant a big-endian u32 overlay length and the optional overlay.
+The NearestHeld.v3 frame follows unchanged from its filter count to the probe, and the evidence flag must be one; world reads rank exactly whatever the route byte.
+A nonempty overlay uses the NearestHeld.v3 staged layout and requires the installed placed writer and the live Proposal's present as the valid instant.
 Local world rows, including tombstones, shadow the archived parent rows with the same identity, and frozen ancestor writers shadow the parent as in the world text search.
-The archived parent is ranked with the same filters, window, scan bound and anomalies as NearestHeld.v2.
+The archived parent is ranked with the same filters, window, scan bound and anomalies as NearestHeld.v3.
 `rtdb.owned.search_scope` is the lowercase hex SHA-256 of the complete request body under the domain tags `rtdb.owned.nearest.world.v1`, `rtdb.owned.nearest.world-at.v1` and `rtdb.owned.nearest.world-parent-at.v1`, each terminated by a zero byte.
-The reply has the NearestHeld.v2 columns, carries the selected system revision (or the world present) and the requested valid instant, and one held world condition per partition.
+The reply has the NearestHeld.v3 columns, carries the selected system revision (or the world present) and the requested valid instant, and one held world condition per partition.
 
 `rtdb.owned.RetainReplayedWorld.v5` retains a provisional world on the held restore writer.
 Each Held ancestor carries the original selected publication transaction and the separately protected archive end transaction.
