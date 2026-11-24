@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, PreparedSearchDelta, SearchDelta, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
-use rtdb_storage::{log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
+use rtdb_storage::{Error as StorageError, ObjectKey, ObjectStore, log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1585,7 +1585,7 @@ impl ReplicationDriver {
                 let store = self.resolve.storage.object_store();
                 let rejected = accept_artefacts(&mut message, &durable, self.logs.storage_version.0, self.logs.storage_epoch.0,
                     store.requires_search_publication());
-                admit_search_intents(&mut message, &durable, store.as_ref()).await;
+                let mut message = admit_search_intents(message, &durable, store.as_ref(), &self.cancellation).await?;
                 message.source_msg_id = Some(position.0);
                 leader.enqueue(WriteBody::Message(ReplicaBody::ArtefactsAdded(message)), block, None, &self.resolve.memory)?;
                 leader.resolver_mut()?.advance_source(position)?;
@@ -1966,24 +1966,43 @@ fn search_publication_is_valid(record: &proto::ArtefactRecord) -> bool {
     })
 }
 
-async fn admit_search_intents(message: &mut proto::ArtefactsAdded, durable: &Snapshot, store: &dyn rtdb_storage::ObjectStore) {
-    let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return; };
-    for entry in std::mem::take(&mut message.entries) {
-        if let Some(record) = &entry.record && record.kind() == rtdb_format::search_manifest::RECORD_KIND {
-            let Ok(change) = proto::SearchRunChange::from_artefact(record) else { continue; };
-            let Some(run) = change.run.as_ref() else { continue; };
-            if !change.retire_only() && run.allocation.is_some()
-                && !durable.trie_catalog().search_runs(&table).any(|active| active == run)
-            {
-                let Some(table_entry) = durable.table_entry(&table) else { continue; };
-                let Ok(intent) = run.pending_key(&table_entry.slug).and_then(|key| Ok(rtdb_storage::ObjectKey::new(key)?))
-                    else { continue; };
-                // An earlier source admission is ordered before pruning. A later one needs the intent again.
-                if store.head_fresh(&intent).await.is_err() { continue; }
+async fn admit_search_intents(mut message: proto::ArtefactsAdded, durable: &Snapshot, store: &dyn ObjectStore,
+    cancellation: &CancellationToken) -> Result<proto::ArtefactsAdded> {
+    let Ok(table) = legacy_table_ref(message.table_name.as_deref().unwrap_or_default()) else { return Ok(message); };
+    let admission = async {
+        'entries: for entry in std::mem::take(&mut message.entries) {
+            if let Some(record) = &entry.record && record.kind() == rtdb_format::search_manifest::RECORD_KIND {
+                let Ok(change) = proto::SearchRunChange::from_artefact(record) else { continue; };
+                let Some(run) = change.run.as_ref() else { continue; };
+                if !change.retire_only() && run.allocation.is_some()
+                    && !durable.trie_catalog().search_runs(&table).any(|active| active.digest() == run.digest())
+                {
+                    let Some(table_entry) = durable.table_entry(&table) else { continue; };
+                    let Ok(intent) = run.pending_key(&table_entry.slug).and_then(|key| Ok(ObjectKey::new(key)?))
+                        else { continue; };
+                    // An earlier source admission is ordered before pruning. A later one needs the intent again.
+                    for may_retry in [true, false] {
+                        match store.head_fresh(&intent).await {
+                            Ok(_) => break,
+                            Err(StorageError::MissingObject(_)) => continue 'entries,
+                            Err(error) => {
+                                let error = Anomaly::from(error);
+                                if !may_retry || !matches!(error.category, AnomalyCategory::Unavailable | AnomalyCategory::Busy) {
+                                    return Err(error);
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                }
             }
+            message.entries.push(entry);
         }
-        message.entries.push(entry);
-    }
+        Ok(message)
+    };
+    cancellation.run_until_cancelled(tokio::time::timeout(Duration::from_secs(5), admission)).await.ok_or_else(stopped)?
+        .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.replication/search-intent-timeout",
+            "Search staging intent admission timed out"))?
 }
 
 /// The objects of collected tries this node may hold copies of: data, meta, and the artefacts their entries record.

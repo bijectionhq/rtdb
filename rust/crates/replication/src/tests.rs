@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use rtdb_types::StructFields;
 use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
 use std::time::Duration;
@@ -2709,15 +2709,12 @@ fn search_adoption_requires_a_provider_version_or_terminal_publication_when_the_
     assert!(accepts(None, true, true));
 }
 
-#[tokio::test]
-async fn an_abandoned_search_allocation_cannot_be_adopted_after_tombstone_pruning() {
-    use rtdb_format::{keys::TrieKey, search_manifest::StagedSearchRun};
+fn search_intent_fixture() -> (TableRef, rtdb_index::PartitionState, proto::SearchRun, proto::ArtefactsAdded) {
+    use rtdb_format::keys::TrieKey;
     use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
-    use rtdb_storage::ObjectKey;
 
     let table = TableRef::new("public", "docs");
     let tables = TableCatalog::default().with_seeded_table(table.clone(), Vec::new()).unwrap();
-    let slug = tables.entry(&table).unwrap().slug.clone();
     let anchor = TrieKey::l0(BlockIndex(0)).unwrap();
     let catalog = TrieCatalog::default().with_tries(table.clone(),
         [CatalogTrie::notification(anchor.clone(), 1, None).unwrap()], Timestamp(1)).unwrap();
@@ -2725,19 +2722,30 @@ async fn an_abandoned_search_allocation_cannot_be_adopted_after_tombstone_prunin
     let run = proto::SearchRun { definition_id: Some("bodyf16".into()), definition_version: Some(1), blocks: vec![0],
         digest: Some(vec![1; 32]), locator: Some(vec![1]), file_size: Some(1), source_rows: Some(1),
         allocation: Some(vec![2; 16]), ..Default::default() };
-    let marker = ObjectKey::new(run.pending_key(&slug).unwrap()).unwrap();
-    let store = MemoryStore::default();
-    let staged = StagedSearchRun { run: run.clone(), owner: None };
-    store.put(&marker, staged.encode().unwrap().into()).await.unwrap();
     let change = proto::SearchRunChange { run: Some(run.clone()), ..Default::default() };
     let request = proto::ArtefactsAdded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0),
         table_name: Some(table.schema_and_table()), entries: vec![proto::ArtefactEntry {
             trie_key: Some(anchor.to_string()), record: Some(change.to_artefact().unwrap()),
         }], ..Default::default() };
-    let mut before = request.clone();
+    (table, state, run, request)
+}
+
+#[tokio::test]
+async fn search_intent_admission_rejects_an_abandoned_allocation_after_pruning() {
+    use rtdb_format::{keys::TrieKey, search_manifest::StagedSearchRun};
+    use rtdb_storage::ObjectKey;
+
+    let (table, state, run, request) = search_intent_fixture();
+    let anchor = TrieKey::l0(BlockIndex(0)).unwrap();
     let snapshot = state.snapshot();
+    let marker = ObjectKey::new(run.pending_key(&snapshot.table_entry(&table).unwrap().slug).unwrap()).unwrap();
+    let store = MemoryStore::default();
+    let stop = CancellationToken::new();
+    let staged = StagedSearchRun { run: run.clone(), owner: None };
+    store.put(&marker, staged.encode().unwrap().into()).await.unwrap();
+    let mut before = request.clone();
     accept_artefacts(&mut before, &snapshot, CURRENT_STORAGE_VERSION.0, 0, false);
-    admit_search_intents(&mut before, &snapshot, &store).await;
+    let before = admit_search_intents(before, &snapshot, &store, &stop).await.unwrap();
     assert_eq!(before.entries, request.entries);
 
     let removal = proto::SearchRunChange { run: Some(run), retire_only: Some(true), ..Default::default() };
@@ -2753,8 +2761,68 @@ async fn an_abandoned_search_allocation_cannot_be_adopted_after_tombstone_prunin
     let mut delayed = request;
     accept_artefacts(&mut delayed, &snapshot, CURRENT_STORAGE_VERSION.0, 0, false);
     assert_eq!(delayed.entries.len(), 1);
-    admit_search_intents(&mut delayed, &snapshot, &store).await;
+    let delayed = admit_search_intents(delayed, &snapshot, &store, &stop).await.unwrap();
     assert!(delayed.entries.is_empty());
+}
+
+#[tokio::test]
+async fn search_intent_admission_retries_a_temporary_storage_failure_and_reports_a_persistent_one() {
+    use rtdb_format::search_manifest::StagedSearchRun;
+    use rtdb_storage::ObjectKey;
+
+    let (table, state, run, request) = search_intent_fixture();
+    let snapshot = state.snapshot();
+    let marker = ObjectKey::new(run.pending_key(&snapshot.table_entry(&table).unwrap().slug).unwrap()).unwrap();
+    let store = RecordingStore::default();
+    let staged = StagedSearchRun { run, owner: None };
+    store.put(&marker, staged.encode().unwrap().into()).await.unwrap();
+    let stop = CancellationToken::new();
+
+    store.head_faults.lock().push_back(HeadFault::Unavailable);
+    let admitted = admit_search_intents(request.clone(), &snapshot, &store, &stop).await.unwrap();
+    assert_eq!(admitted, request);
+
+    store.head_faults.lock().extend([HeadFault::Unavailable, HeadFault::Unavailable]);
+    let error = admit_search_intents(request, &snapshot, &store, &stop).await.unwrap_err();
+    assert_eq!(error.code, "rtdb.storage/remote");
+}
+
+#[tokio::test]
+async fn search_intent_admission_bounds_a_hanging_storage_lookup() {
+    let (_, state, _, request) = search_intent_fixture();
+    let snapshot = state.snapshot();
+    let store = RecordingStore::default();
+    let stop = CancellationToken::new();
+    store.head_faults.lock().push_back(HeadFault::Hang);
+
+    let error = tokio::time::timeout(Duration::from_secs(10), admit_search_intents(request.clone(), &snapshot, &store, &stop))
+        .await.unwrap().unwrap_err();
+    assert_eq!(error.code, "rtdb.replication/search-intent-timeout");
+
+    store.head_faults.lock().push_back(HeadFault::Hang);
+    let (result, ()) = tokio::join!(admit_search_intents(request, &snapshot, &store, &stop), async {
+        tokio::task::yield_now().await;
+        stop.cancel();
+    });
+    assert_eq!(result.unwrap_err().category, rtdb_types::AnomalyCategory::Interrupted);
+}
+
+#[tokio::test]
+async fn search_intent_admission_keeps_a_republication_of_an_active_identity_without_its_intent() {
+    let (table, state, mut run, mut request) = search_intent_fixture();
+    let entry = &mut request.entries[0];
+    state.add_artefacts_at(&table, vec![(entry.trie_key().parse().unwrap(), entry.record.clone().unwrap())], Timestamp(2));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.trie_catalog().search_runs(&table).next(), Some(&run));
+
+    run.publication = Some(proto::PublishedObjectVersion {
+        bucket: Some("bucket".into()), key: Some("path".into()), version: Some("version".into()), ..Default::default()
+    });
+    entry.record = Some(proto::SearchRunChange { run: Some(run), ..Default::default() }.to_artefact().unwrap());
+    let republish = request.clone();
+    accept_artefacts(&mut request, &snapshot, CURRENT_STORAGE_VERSION.0, 0, true);
+    let admitted = admit_search_intents(request, &snapshot, &MemoryStore::default(), &CancellationToken::new()).await.unwrap();
+    assert_eq!(admitted, republish);
 }
 
 #[test]
@@ -2880,7 +2948,14 @@ async fn startup_replay_preserves_exact_and_restored_anchors_across_prefix_loss(
     }
 }
 
-struct RecordingStore { inner: Arc<MemoryStore>, reads: Mutex<BTreeSet<rtdb_storage::ObjectKey>> }
+enum HeadFault { Unavailable, Hang }
+
+#[derive(Default)]
+struct RecordingStore {
+    inner: Arc<MemoryStore>,
+    reads: Mutex<BTreeSet<rtdb_storage::ObjectKey>>,
+    head_faults: Mutex<VecDeque<HeadFault>>,
+}
 impl RecordingStore {
     fn read(&self, key: &rtdb_storage::ObjectKey) { self.reads.lock().insert(key.clone()); }
     fn take(&self) -> BTreeSet<rtdb_storage::ObjectKey> { std::mem::take(&mut *self.reads.lock()) }
@@ -2888,7 +2963,15 @@ impl RecordingStore {
 #[async_trait]
 impl ObjectStore for RecordingStore {
     async fn head(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> { self.read(key); self.inner.head(key).await }
-    async fn head_fresh(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> { self.read(key); self.inner.head_fresh(key).await }
+    async fn head_fresh(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<rtdb_storage::StoredObject> {
+        self.read(key);
+        let fault = self.head_faults.lock().pop_front();
+        match fault {
+            Some(HeadFault::Unavailable) => Err(rtdb_storage::Error::Remote { key: key.to_string(), message: "HTTP 503".into() }),
+            Some(HeadFault::Hang) => std::future::pending().await,
+            None => self.inner.head_fresh(key).await,
+        }
+    }
     async fn get(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get(key).await }
     async fn get_fresh(&self, key: &rtdb_storage::ObjectKey) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_fresh(key).await }
     async fn get_fresh_exact(&self, key: &rtdb_storage::ObjectKey, length: usize) -> rtdb_storage::Result<Bytes> { self.read(key); self.inner.get_fresh_exact(key, length).await }
@@ -2975,7 +3058,7 @@ async fn replayed_suffix(oversized_upload: bool) -> ReplayedSuffix {
     let mut suffix = vec![raw(1, 1, 1, produced_upload(&first, 0, -1))];
     producer.driver.consume(suffix[0].clone()).await.unwrap();
 
-    let recording = Arc::new(RecordingStore { inner: Arc::clone(&store), reads: Mutex::new(BTreeSet::new()) });
+    let recording = Arc::new(RecordingStore { inner: Arc::clone(&store), ..Default::default() });
     let mut replayer = fixture_over(config(), 1 << 27, None, |replica| replica, Arc::clone(&store), recording.clone()).await;
     let (base, base_tables) = producer.blocks.load(BlockIndex(0)).await.unwrap();
     let base_keys = checkpoint_dependencies(&base, &base_tables).unwrap();

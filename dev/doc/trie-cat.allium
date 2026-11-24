@@ -510,6 +510,9 @@ rule FollowerRefreshes {
 
 rule AddArtefact {
     -- A source request to adopt a new logical search allocation requires the allocation's staging intent.
+    -- A source request for an active run identity reaches catalog validation after its staging intent has been collected.
+    -- Intent admission for a source message has a bounded deadline.
+    -- An unresolved storage failure leaves the source position unapplied.
     -- Replica replay applies the previously admitted publication in order.
     -- A logical-search publication can install term-directory evidence together with its change to a definition generation's active runs.
     -- The directory update compares the held root and the identities of the active runs before changing either.

@@ -1258,10 +1258,11 @@ rule LeaderProcessesArtefactsAdded {
     -- A group-scoped entry's file is deleted only while the catalog holds none of the group's other members: one it holds may record the file, and is collected with it otherwise.
     -- An entry under another storage version or epoch, or one that does not parse, is dropped without deleting anything, the key this node would compute for it being under its own storage root.
     -- The deletes run beside resolution, never ahead of it.
-    -- The message is forwarded even with no entry accepted, because it carries the source watermark forward.
-    -- See: replication/src/driver.rs (accept_artefacts)
+    -- After admission completes, the leader forwards the message even with no entry accepted, because it carries the source watermark forward.
+    -- See: replication/src/driver.rs (accept_artefacts, admit_search_intents)
     when: SourceArtefactsAddedMessageReceived(msg)
     requires: log_processor.mode = Leader
+    requires: search_intent_admission_completed(msg)
 
     let accepted = accepted_artefacts(msg)
 
@@ -1274,7 +1275,7 @@ rule LeaderProcessesArtefactsAdded {
             source_msg_id: msg.msg_id
         ))
         for entry in msg.entries
-            where not accepted.contains(entry) and storage_matches(msg)
+            where not accepted.contains(entry) and storage_matches(msg) and entry.record.kind != "logical-search"
               and (entry.record.scope = trie or trie_cat/group_members(msg.table, part_group(entry.trie_key)).all(m => m.trie_key = entry.trie_key)):
             ObjectStoreDelete(trie_cat/recorded_artefact_key(msg.table, entry.trie_key, entry.record))
 
@@ -2285,7 +2286,8 @@ open question "What processing obligations apply to a database opened with index
     -- This model currently requires a log processor for each database.
 
 -- Black box helpers for artefacts:
---   accepted_artefacts(msg)  — the entries whose trie the leader's durable catalog holds live, under the leader's storage version and epoch
+--   accepted_artefacts(msg)  — the entries accepted by the leader's storage and catalog checks whose required staging intents are present
+--   search_intent_admission_completed(msg)  — every required fresh staging-intent lookup established presence or absence within the admission deadline
 --   part_group(trie_key)     — the partition group a tiered trie belongs to (trie-cat.allium: PartGroup)
 --   storage_matches(msg)     — whether the message's storage version and epoch are the leader's
 --   ObjectStoreDelete(key)   — as in gc.allium
