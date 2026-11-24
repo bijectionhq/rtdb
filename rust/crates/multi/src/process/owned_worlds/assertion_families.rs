@@ -5,7 +5,6 @@
 use std::{num::NonZeroU64, sync::Arc};
 
 use bytes::Bytes;
-use ring::digest::{Context, SHA256};
 use rtdb_flight_sql::{
     FamilyDerivedRow, FamilyFenceReply, FamilyOccurrenceWire, FamilyReply, FamilyRequest, FamilyReservationWire,
     FamilyStage, WorldRowAuthoring,
@@ -18,7 +17,7 @@ use uuid::Uuid;
 
 use crate::keys::{
     AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, KeyService, LandingLink,
-    LandingReservation, WorldRowSlot, family_vault_address, world_row_scope,
+    LandingReservation, WorldRowSlot, assertion_root_line, family_vault_address, world_row_scope,
 };
 
 struct Scope {
@@ -30,13 +29,7 @@ struct Scope {
 impl Scope {
     fn new(deployment: Uuid, record: &DeploymentRecord) -> Result<Self> {
         let incarnation = NonZeroU64::new(record.incarnation).ok_or_else(OwnedWorld::unavailable)?;
-        let mut line = Context::new(&SHA256);
-        line.update(b"rtdb.owned/assertion-line/v1\0");
-        line.update(deployment.as_bytes());
-        line.update(&record.log_epoch.to_be_bytes());
-        let mut root_line = [0; 16];
-        root_line.copy_from_slice(&line.finish().as_ref()[..16]);
-        Ok(Self { deployment, incarnation, root_line })
+        Ok(Self { deployment, incarnation, root_line: assertion_root_line(deployment, record.log_epoch) })
     }
 
     async fn admit_lines(&self, session: &mut NativeSession, request: &FamilyRequest) -> Result<()> {
@@ -50,8 +43,7 @@ impl Scope {
                 positions[0] = Some(occurrence.position);
                 None
             }
-            FamilyRequest::RequirePositionOpen(position) | FamilyRequest::Fence { selected: position, .. }
-            | FamilyRequest::PlanFence { selected: position, .. } => {
+            FamilyRequest::RequirePositionOpen(position) | FamilyRequest::PlanFence { selected: position, .. } => {
                 positions[0] = Some(*position);
                 None
             }
@@ -253,13 +245,12 @@ pub(super) async fn serve(
         FamilyRequest::OpenWorldRow { row, envelope } => {
             let envelope = AssertionEnvelope::try_from(envelope)?;
             let (stage, authoring) = admit_row(&scope, &families, &row).await?;
-            FamilyReply::Opened(vault()?.open_assertion_for_resolution(stage, authoring, &region, envelope).await?)
+            let opened = vault()?.open_assertion_for_resolution(stage, authoring, &region, envelope).await?;
+            admit_row(&scope, &families, &row).await?;
+            FamilyReply::Opened(opened)
         }
         FamilyRequest::PlanFence { family, selected, order } => {
             fence_reply(families.plan_fence(scope.family(family), selected, order).await?)
-        }
-        FamilyRequest::Fence { family, selected, order } => {
-            fence_reply(families.fence(scope.family(family), selected, order).await?)
         }
         FamilyRequest::Settle { .. } => return Err(Anomaly::unsupported(
             "rtdb.owned/assertion-profile-uninstalled",

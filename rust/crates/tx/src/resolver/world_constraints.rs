@@ -25,8 +25,10 @@ pub trait WorldConstraintArchive: Send + Sync {
 pub struct AssertionFenceClaim<'a> {
     pub database: &'a str,
     pub attempt: rtdb_types::PlacedAttempt,
+    pub durable_predecessor: Option<rtdb_types::TransactionKey>,
     pub family: [u8; 16],
     pub marker: rtdb_types::AssertionFamilyFenceMarker,
+    pub retirement_world: Option<Iid>,
     pub root_erases: &'a BTreeSet<(&'a OwnedRelation, &'a EntityId)>,
 }
 

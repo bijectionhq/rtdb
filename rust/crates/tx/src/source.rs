@@ -148,6 +148,8 @@ impl SourceTransaction {
 
     pub fn requires_durable_predecessor(&self) -> bool {
         crate::resolver::is_prepared_landing(&self.operations) || self.uses_staging_deadline()
+            || self.operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()))
     }
 
     pub fn uses_staging_deadline(&self) -> bool {

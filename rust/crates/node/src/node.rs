@@ -3732,6 +3732,7 @@ impl NativeSession {
         let retained_release = delete_root || (terminal.is_some()
             && root.checks.is_empty() && root.publication.is_none()
             && rtdb_tx::retained_release_controls(&controls));
+        let family_fence = controls.iter().any(rtdb_tx::HostedControlWrite::is_assertion_family_marker);
         let proposal_overlay = root.proposal_overlay;
         let proposal_close = root.proposal_close;
         let proposal_land = root.proposal_land || proposal_close;
@@ -3785,7 +3786,7 @@ impl NativeSession {
             return Err(unavailable());
         }
         if !(1..=8).contains(&sections.len()) || controls.is_empty()
-            || (!retained_release && !proposal_overlay && !proposal_land && controls.iter().any(|control| !control.is_check()))
+            || (!retained_release && !proposal_overlay && !proposal_land && controls.iter().any(|control| !control.is_check() && !control.is_assertion_family_marker()))
             || root.checks.iter().any(|check| match check {
                 TxOp::OwnedCheck { relation, .. } | TxOp::OwnedCheckRange { relation, .. } =>
                     relation.world().is_some() || relation.is_world_catalog(),
@@ -3806,6 +3807,7 @@ impl NativeSession {
         if let Some(root) = &root.publication {
             if root.writes.is_empty() || root.writes.iter().any(|write| match write {
                 _ if rtdb_tx::is_root_partition_frontier(write) || rtdb_tx::is_public_root_version_marker(write) || proposal_land && rtdb_tx::is_proposal_landing_frontier(write) => false,
+                TxOp::OwnedErase { relation, .. } if family_fence => !relation.is_root_data(),
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                 | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. } => !relation.is_root_data(),
                 _ => true,

@@ -178,7 +178,7 @@ Request: family `uuid`, selected `position`, erasure order `uuid`.
 
 Hosted protocol 217 exposes a read-only plan.
 The selected position must be a bound member.
-The reply has the same order, inventory digest and counted sections as `FenceAssertionFamily.v1`.
+The reply has the order, inventory digest and counted sections specified below.
 If the vault already fenced the family, the reply preserves its first order.
 The plan leaves the vault and source unchanged.
 The retiring transaction must take a claim over this inventory before it can order an immutable marker.
@@ -186,12 +186,16 @@ The claim freezes the family record under its vault compare-and-swap and binds t
 The checked insert targets `bj_fact_assertion_family_fences` with the family UUID as 32 lowercase hexadecimal characters and a null expectation.
 Its binary `body` is version 1 (u8), selected `position`, order `uuid` and inventory digest (32).
 Each Root inventory entry requires an erase of its named relation and exact UTF-8 row key in the same transaction.
-The erasure obligation binds the same digest.
-The marker route refuses until current original-authority reads guard both regular and archive release.
+The same transaction carries a `fact_unit_fences` row on the selected line with `unit_phase` set to the erasing state and `assertion_vault_inventory` set to the same digest.
+At most one family fence can order in a transaction.
+The source resolver validates the installed authority, the marker's absence, the retirement obligation, and the exact Root selectors before claiming the unchanged inventory.
+Original-authority marker reads use a current source barrier for both ordinary and archive release.
+A pending claim with no ordered marker leaves already-enrolled stages open under that current admission.
+The vault finalizes the first ordered marker and can replace an aborted claim only once the original source's durable history covers the failed attempt.
 
-### `rtdb.owned.FenceAssertionFamily.v1`
+### Fence plan reply
 
-Request: family `uuid`, selected `position`, erasure order `uuid`.
+Protocol 217 retires the former immediate fence action.
 
 Reply: order `uuid`, vault inventory digest (32), then four counted sections, each a u32 count followed by its items: member `position`s, assertion `stage`s, link `stage`s and `derived` entries.
 
@@ -286,7 +290,9 @@ Bijection owns the equivalent audience check before probing a protected source.
 
 ## Fence semantics across dependent forks
 
-A fence takes effect in the vault, not in any one world, so it closes every world at once.
+An ordered family fence takes effect at the original source publication and closes every world at once.
+While the claim is pending, release checks that source before opening a capability.
+The vault records the first order after reading the accepted marker.
 From the fence commit:
 
 * `RequireLiveFamilyOccurrence.v1`, `OpenWorldOverlayRow.v1`, `SealWorldOverlayRow.v1` and every registration refuse for the family;

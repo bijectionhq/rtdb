@@ -2327,6 +2327,8 @@ impl<'a> OpenTransaction<'a> {
             if !crate::hosted_control::root_partition_frontiers_match(operations) {
                 return Err(unavailable());
             }
+            let family_fence = operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()));
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
                     _ if root_publication.is_some() && crate::hosted_control::source_public_root_version_marker(operation) => 1,
@@ -2340,6 +2342,11 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedDelete { relation, .. })
                         if root_publication.is_some() && relation.is_root_data() => {
+                        root_rows += 1;
+                        1
+                    }
+                    Operation::Public(TxOp::OwnedErase { relation, .. })
+                        if family_fence && root_publication.is_some() && relation.is_root_data() => {
                         root_rows += 1;
                         1
                     }
@@ -2367,7 +2374,7 @@ impl<'a> OpenTransaction<'a> {
                         counts.entry(world).or_default().1 += 1;
                         1
                     }
-                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() || proposal_overlay.is_some() => {
+                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() || control.is_assertion_family_marker() || proposal_overlay.is_some() => {
                         hosted = true;
                         1
                     }
