@@ -1380,7 +1380,10 @@ impl<'a> OpenTransaction<'a> {
             let root = relation.root_relation();
             let target = root.as_ref().unwrap_or(relation);
             if !target.is_root_data() { continue; }
-            if retiring.contains(target.name()) { return Err(relation_retired()); }
+            // A layout replacement rechecks the original population against
+            // the committed prestate before retiring that relation.
+            let prestate_range = matches!(operation, Operation::Public(TxOp::OwnedCheckRange { .. })) && root.is_none();
+            if retiring.contains(target.name()) && !prestate_range { return Err(relation_retired()); }
             touched.insert(target.clone());
         }
         let snapshot = self.buffer.base_snapshot();
