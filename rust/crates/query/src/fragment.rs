@@ -3,7 +3,7 @@
 use std::{io::{self, Cursor, Write}, ops::Range};
 use std::sync::Arc;
 
-use arrow_array::{RecordBatch, RecordBatchOptions};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
@@ -19,6 +19,7 @@ use crate::context::{Execution, OuterRows, QueryContext, cancelled};
 use crate::invalid;
 
 mod literals;
+mod slice;
 
 /// The deepest split: 4^4 = 256 fragments.
 const MAXIMUM_DEPTH: u8 = 4;
@@ -267,6 +268,7 @@ impl crate::columnar::BatchCursor for FragmentRows {
 const COLUMN_KEY: &str = "rtdb.fragment.column";
 const NAME_KEY: &str = "rtdb.fragment.name";
 const LOGICAL_KEY: &str = "rtdb.fragment.logical";
+const IPC_ALIGNMENT: usize = 64;
 
 /// Fragment IPC and the reservation for the bytes it retains.
 #[derive(Debug)]
@@ -376,32 +378,45 @@ fn fragment_arrow_error(error: ArrowError) -> Anomaly {
     }
 }
 
+fn frame_slice(array: &ArrayRef, field: &ArrowField, rows: Range<usize>, memory: &Arc<MemoryBudget>,
+    reservations: &mut Vec<Arc<MemoryReservation>>) -> Option<(ArrayRef, Option<usize>)> {
+    if rows.len() == array.len() {
+        return Some((Arc::clone(array), None));
+    }
+    if !nested_layout(array.data_type()) {
+        return Some((array.slice(rows.start, rows.len()), None));
+    }
+    let (array, reservation, body) = slice::prepare(array.as_ref(), field, rows, memory)?;
+    reservations.push(reservation);
+    Some((array, Some(body)))
+}
+
 fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudget>, out: &mut FragmentBytes) -> Result<()> {
+    let mut reservations = Vec::new();
     let mut fields = Vec::with_capacity(batch.columns.len());
     let mut arrays = Vec::with_capacity(batch.columns.len());
-    let mut reservations = Vec::new();
+    let mut slice_bodies = Vec::with_capacity(batch.columns.len());
     for (position, column) in batch.columns.iter().enumerate() {
         let wire_name = format!("c{position}");
-        let (array, field, logical) = match column {
+        let (array, field, logical, body) = match column {
             Column::Arrow { array, field, logical } if array.len() == batch.len => {
-                let array = if rows.len() == batch.len {
-                    Arc::clone(array)
-                } else if nested_layout(array.data_type()) {
-                    let (compact, reservation) = compact_arrow_rows(array.as_ref(), field, rows.clone(), memory)?;
-                    reservations.push(reservation);
-                    compact
-                } else {
-                    array.slice(rows.start, rows.len())
-                };
-                (array, Arc::clone(field), logical.clone())
-            }
-            Column::Selected(selected) => {
-                if let Some(slice) = selected.fragment_slice(rows.clone()) {
+                let (array, body) = if let Some(slice) = frame_slice(array, field, rows.clone(), memory, &mut reservations) {
                     slice
                 } else {
-                    let (vector, reservation) = selected.fragment_vector(rows.clone(), memory)?;
+                    let (compact, reservation) = compact_arrow_rows(array.as_ref(), field, rows.clone(), memory)?;
                     reservations.push(reservation);
-                    vector
+                    (compact, None)
+                };
+                (array, Arc::clone(field), logical.clone(), body)
+            }
+            Column::Selected(selected) => {
+                if let Some(((source, field, logical), source_rows)) = selected.fragment_source(rows.clone())
+                    && let Some((array, body)) = frame_slice(&source, &field, source_rows, memory, &mut reservations) {
+                    (array, field, logical, body)
+                } else {
+                    let ((array, field, logical), reservation) = selected.fragment_vector(rows.clone(), memory)?;
+                    reservations.push(reservation);
+                    (array, field, logical, None)
                 }
             }
             _ => return Err(invalid("fragment-encode", "Fragment column lacks its packed Arrow vector")),
@@ -414,12 +429,16 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
         }
         fields.push(field.as_ref().clone().with_name(wire_name).with_metadata(metadata));
         arrays.push(array);
+        slice_bodies.push(body);
     }
     let schema = Arc::new(ArrowSchema::new(fields));
     let record = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &RecordBatchOptions::new().with_row_count(Some(rows.len()))).map_err(|error| invalid("fragment-encode", error))?;
     let schema_bound = rtdb_format::ipc::schema_translation_bound(&schema)?;
-    let scratch = record.columns().iter().try_fold(schema_bound, |bound, array| {
-        let bytes = array.to_data().get_slice_memory_size().map_err(|error| invalid("fragment-encode", error))?;
+    let scratch = record.columns().iter().zip(slice_bodies).try_fold(schema_bound, |bound, (array, body)| {
+        let bytes = match body {
+            Some(bytes) => bytes,
+            None => array.to_data().get_slice_memory_size().map_err(|error| invalid("fragment-encode", error))?,
+        };
         bytes.checked_mul(4).and_then(|bytes| bound.checked_add(bytes))
             .ok_or_else(|| invalid("fragment-encode", "IPC allocation bound overflow"))
     })?;
@@ -427,7 +446,9 @@ fn encode_frame(batch: &ColumnBatch, rows: Range<usize>, memory: &Arc<MemoryBudg
     let prefix = out.bytes.len();
     out.write_all(&[0; 8]).map_err(fragment_io)?;
     {
-        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut *out, &schema).map_err(fragment_arrow_error)?;
+        let options = arrow_ipc::writer::IpcWriteOptions::try_new(IPC_ALIGNMENT, false, arrow_ipc::MetadataVersion::V5)
+            .map_err(fragment_arrow_error)?;
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new_with_options(&mut *out, &schema, options).map_err(fragment_arrow_error)?;
         writer.write(&record).map_err(fragment_arrow_error)?;
         writer.finish().map_err(fragment_arrow_error)?;
     }
@@ -812,6 +833,118 @@ mod tests {
         for frame in frames {
             assert_eq!(frame.columns[0].value(0).unwrap(), Value::Binary(data.clone()));
         }
+    }
+
+    #[test]
+    fn sibling_layout_splits_encode_contiguous_nested_columns_under_visible_admission() {
+        use arrow_array::{Array, Int64Array, ListArray, StringArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer};
+        use arrow_schema::DataType;
+        use rtdb_types::{ListKind, ScalarType};
+        use crate::columnar::SelectedColumn;
+
+        let source_memory = MemoryBudget::new(16 << 20);
+        let memory = MemoryBudget::new(256 << 10);
+        let logical = LogicalType::List { kind: ListKind::List, element: Box::new(LogicalType::Scalar(ScalarType::Utf8)) };
+        let field = rtdb_columnar::to_field("items", &logical).unwrap()
+            .with_metadata([("unit".into(), "item".into())].into());
+        let DataType::List(item) = field.data_type() else { unreachable!() };
+        let unpublished = "x".repeat(1 << 20);
+        let child = StringArray::from_iter_values(std::iter::once(unpublished.as_str())
+            .chain(std::iter::repeat_n("item", 1024)).chain(std::iter::once(unpublished.as_str())));
+        let source: ArrayRef = Arc::new(ListArray::new(Arc::clone(item), OffsetBuffer::new(vec![0, 1, 513, 513, 513, 1025, 1026].into()),
+            Arc::new(child), Some(NullBuffer::from(vec![true, true, false, true, true, true]))));
+        let field = Arc::new(field);
+        let grant = source_memory.reserve(source.get_array_memory_size()).unwrap();
+        let selected = SelectedColumn::new(vec![Some((Arc::clone(&source), Arc::clone(&field), Some(logical.clone()), Some(grant)))],
+            Arc::new((1..5).map(|row| (0, row)).collect()));
+        let layout = |array: ArrayRef| Some((Arc::clone(&array), Arc::new(ArrowField::new("split", array.data_type().clone(), false)), None, None));
+        let split = SelectedColumn::new(vec![layout(Arc::new(Int64Array::from(vec![10, 20]))), layout(Arc::new(StringArray::from(vec!["third", "fourth"])))],
+            Arc::new(vec![(0, 0), (0, 1), (1, 0), (1, 1)]));
+        let direct = source.slice(1, 4);
+        let batch = ColumnBatch::settled(vec![
+            Column::Arrow { array: Arc::clone(&direct), field: Arc::clone(&field), logical: Some(logical.clone()) },
+            Column::Selected(selected.clone()), Column::Selected(split.clone()),
+        ], 4, source_memory.reserve(256).unwrap()).unwrap();
+        let mut actual = FragmentBytes::new(&memory).unwrap();
+        encode_batch(&batch, &memory, &mut actual).unwrap();
+        assert!(actual.as_slice().len() < 32 << 10);
+
+        let mut reference = FragmentBytes::new(&source_memory).unwrap();
+        for rows in [0..2, 2..4] {
+            let (array, direct_grant) = compact_arrow_rows(direct.as_ref(), &field, rows.clone(), &source_memory).unwrap();
+            let ((selected_array, selected_field, selected_logical), _selected_grant) = selected.fragment_vector(rows.clone(), &source_memory).unwrap();
+            let ((split_array, split_field, split_logical), _split_grant) = split.fragment_vector(rows.clone(), &source_memory).unwrap();
+            let packed = ColumnBatch::settled(vec![
+                Column::Arrow { array, field: Arc::clone(&field), logical: Some(logical.clone()) },
+                Column::Arrow { array: selected_array, field: selected_field, logical: selected_logical },
+                Column::Arrow { array: split_array, field: split_field, logical: split_logical },
+            ], rows.len(), direct_grant).unwrap();
+            encode_batch(&packed, &source_memory, &mut reference).unwrap();
+        }
+        let actual = decode_batches(actual.into_ipc_buffer(), &source_memory).unwrap();
+        let reference = decode_batches(reference.into_ipc_buffer(), &source_memory).unwrap();
+        assert_eq!(actual.iter().map(|frame| frame.len).collect::<Vec<_>>(), [2, 2]);
+        assert_eq!(reference.len(), actual.len());
+        for (actual, expected) in actual.iter().zip(&reference) {
+            for (column, expected) in actual.columns.iter().zip(&expected.columns) {
+                for row in 0..actual.len { assert_eq!(column.value(row).unwrap(), expected.value(row).unwrap()); }
+            }
+            for column in &actual.columns[..2] {
+                let Column::Selected(column) = column else { panic!("expected a decoded nested field") };
+                let (_, wire_field, wire_logical) = column.source_layouts().next().unwrap();
+                assert_eq!(wire_field, field.as_ref());
+                assert_eq!(wire_logical, Some(&logical));
+            }
+        }
+    }
+
+    #[test]
+    fn incompatible_nested_slice_gathers_without_serializing_a_null_lists_hidden_children() {
+        use arrow_array::{ListArray, StringArray};
+        use arrow_buffer::{NullBuffer, OffsetBuffer};
+        use arrow_schema::DataType;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let item = Arc::new(ArrowField::new("item", DataType::Utf8, true));
+        let array: ArrayRef = Arc::new(ListArray::new(item, OffsetBuffer::new(vec![0, 1, 2, 3].into()),
+            Arc::new(StringArray::from(vec!["first", "hidden-payload-under-null", "last"])),
+            Some(NullBuffer::from(vec![true, false, true]))));
+        let field = Arc::new(ArrowField::new("nested", array.data_type().clone(), true));
+        let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }], 3, memory.reserve(1024).unwrap()).unwrap();
+        let mut out = FragmentBytes::new(&memory).unwrap();
+        append_frame(&batch, 1..3, &memory, &mut out).unwrap();
+        assert!(!out.as_slice().windows(b"hidden-payload-under-null".len()).any(|bytes| bytes == b"hidden-payload-under-null"));
+
+        let frames = decode_batches(out.into_ipc_buffer(), &memory).unwrap();
+        let [frame] = frames.as_slice() else { panic!("expected one frame") };
+        assert_eq!(frame.len, 2);
+        for row in 0..2 {
+            assert_eq!(frame.columns[0].value(row).unwrap(), batch.columns[0].value(row + 1).unwrap());
+        }
+    }
+
+    #[test]
+    fn nested_slice_admission_preserves_the_existing_reply_prefix_on_refusal() {
+        use arrow_array::{ListArray, StringArray};
+        use arrow_buffer::OffsetBuffer;
+        use arrow_schema::DataType;
+
+        let memory = MemoryBudget::new(1 << 20);
+        let reply_memory = MemoryBudget::new(256);
+        let item = Arc::new(ArrowField::new("item", DataType::Utf8, false));
+        let array: ArrayRef = Arc::new(ListArray::new(item, OffsetBuffer::new(vec![0, 1, 2].into()),
+            Arc::new(StringArray::from(vec!["first", "last"])), None));
+        let field = Arc::new(ArrowField::new("items", array.data_type().clone(), false));
+        let batch = ColumnBatch::settled(vec![Column::Arrow { array, field, logical: None }], 2, memory.reserve(1024).unwrap()).unwrap();
+        let source_charge = memory.used_bytes();
+        let mut out = FragmentBytes::new(&reply_memory).unwrap();
+        out.write_all(&[0x42; 16]).unwrap();
+
+        let error = append_frame(&batch, 1..2, &memory, &mut out).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(out.as_slice(), &[0x42; 16]);
+        assert_eq!(memory.used_bytes(), source_charge);
     }
 
     #[test]
