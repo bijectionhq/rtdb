@@ -8,7 +8,7 @@ pub use rtdb_index::branches::{CountRange, IndexDefinition};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Claim, ClaimScope, ClaimSealer, Layer, MAIN_BRANCH, valid_branch_name},
+    rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, Layer, MAIN_BRANCH, valid_branch_name},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -238,7 +238,7 @@ impl TransactState {
     }
 
     pub fn resolve(
-        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &ClaimSealer,
+        &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Result<Resolution> {
         validate_key(&request.key)?;
         let fingerprint = serde_json::to_vec(request)
@@ -303,7 +303,7 @@ impl TransactState {
 
     fn decide(
         &self, request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
-        features: &[&str], claims: &ClaimSealer,
+        features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Result<(Outcome, Vec<BranchEffect>)> {
         if let Some(feature) = request.require.iter().find(|feature| !features.contains(&feature.as_str())) {
             return Err(feature_required(feature));
@@ -436,13 +436,10 @@ impl Guard {
         matches!(self, Self::CountAtMost { when: When::After, .. })
     }
 
-    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &ClaimSealer) -> Result<bool> {
+    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &dyn ClaimVerifier) -> Result<bool> {
         let view = |branch| index.view(branch, At::Latest, Layer::Merged, time);
         match self {
-            Self::Unchanged(claim) => {
-                let ClaimScope { branch, basis, layer } = claims.open(claim)?;
-                index.is_unchanged(&branch, basis, layer, time)
-            }
+            Self::Unchanged(claim) => index.claim_unchanged(&claims.verify(claim)?, time),
             Self::Version { branch, table, id, valid_at, expect } => {
                 if let Version::Written(basis) = expect { index.exact(*basis)?; }
                 let at = valid_at.unwrap_or(time);

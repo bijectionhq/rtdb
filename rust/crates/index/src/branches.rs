@@ -3,7 +3,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     Timestamp, Value,
-    rtdb_v1::{At, Basis, Branch, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, Basis, Branch, ClaimEvidence, ClaimRegion, Layer, MAIN_BRANCH},
 };
 use serde::{Deserialize, Serialize};
 
@@ -235,6 +235,57 @@ impl BranchIndex {
             for id in view.ids(table) {
                 if view.history(table, id).into_iter().any(|event| {
                     crossed(event.valid.lower()) || crossed(event.valid.upper())
+                        || event.image.as_ref().and_then(|image| image.expires_at).is_some_and(crossed)
+                }) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn claim_unchanged(&self, claim: &ClaimEvidence, now: Timestamp) -> Result<bool> {
+        let basis = claim.scope.basis;
+        let branch = &claim.scope.branch;
+        let layer = claim.scope.layer;
+        let Some(regions) = claim.footprint.regions() else {
+            return self.is_unchanged(branch, basis, layer, now);
+        };
+        let cut = self.exact(basis)?;
+        let data = self.active_branch(branch, cut, cut.system_time)?;
+        if !data.active(self.head, now)
+            || data.expiries.last().is_some_and(|(at, _)| *at > basis)
+            || self.erased.is_some_and(|at| at > basis)
+        {
+            return Ok(false);
+        }
+        let view = self.view(branch, At::Latest, layer, now)?;
+        let crossed = |at: Timestamp| cut.system_time < at && at <= now;
+        for region in regions {
+            let table = region.table();
+            if self.catalog.get(table).and_then(|defs| defs.last()).is_some_and(|(at, _)| *at > basis) {
+                return Ok(false);
+            }
+            let range = match region {
+                ClaimRegion::IndexRange { index, lower, upper, .. } => {
+                    let column = view.table(table).and_then(|definition| definition.indexes.get(index))
+                        .ok_or_else(|| Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-index", "Claim names an unknown index"))?;
+                    Some((&column.column, lower.as_deref(), upper.as_deref()))
+                }
+                _ => None,
+            };
+            for id in view.ids(table) {
+                if matches!(region, ClaimRegion::Row { iid, .. } if *iid != id.iid()) { continue; }
+                let history = view.history(table, id);
+                if let Some((column, lower, upper)) = range
+                    && !history.iter().filter_map(|event| event.image.as_ref())
+                        .filter_map(|image| image.cells.get(column).and_then(index_key))
+                        .any(|key| lower.is_none_or(|lower| key >= lower) && upper.is_none_or(|upper| key < upper))
+                {
+                    continue;
+                }
+                if history.iter().any(|event| {
+                    event.cut.basis > basis || crossed(event.valid.lower()) || crossed(event.valid.upper())
                         || event.image.as_ref().and_then(|image| image.expires_at).is_some_and(crossed)
                 }) {
                     return Ok(false);

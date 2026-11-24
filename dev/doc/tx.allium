@@ -1744,6 +1744,12 @@ surface ConnectionLifecycle {
 -- The otherwise operations start from the original state when a guard fails.
 -- TxTime and TxBasis in selected rows name the receipt's transaction time and visible basis.
 -- Unchanged checks a sealed branch, basis, layer and footprint.
+-- Unchanged rejects any intersecting applied transaction strictly after the claim basis and through the decision cut, even when a later transaction restores the earlier value.
+-- A row footprint covers writes to the named row and its table declaration.
+-- An index range covers writes to rows that enter, leave or change within the range, and changes to the index declaration.
+-- A table footprint covers each row and declaration in the named table.
+-- Footprints also cover relevant valid-time transitions through the decision time.
+-- Coarsening replaces regions by their containing table or branch when a claim exceeds its size or region limits.
 -- A branch-wide footprint conservatively covers row changes, changes to shared declarations and valid-time boundaries.
 -- A transaction applies the selected effects and receipt atomically.
 -- The ordered receipt records Then, Otherwise with its failed guard positions, or Refused with its error.

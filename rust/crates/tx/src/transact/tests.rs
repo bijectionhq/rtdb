@@ -1,4 +1,5 @@
 use super::*;
+use rtdb_types::rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimRegion, ClaimScope, ClaimSealer};
 
 const INCARNATION: [u8; 16] = [1; 16];
 const DEFAULT: &[&str] = &[LINEARIZABLE];
@@ -44,6 +45,84 @@ fn visible(state: &TransactState, branch: &str, layer: Layer, at: i64) -> Vec<i6
         EntityId::Integer(n) if view.row(&table(), id, Timestamp(at)).is_some() => Some(*n),
         _ => None,
     }).collect()
+}
+
+fn evidence(position: u64, regions: impl IntoIterator<Item = ClaimRegion>) -> ClaimEvidence {
+    ClaimEvidence {
+        scope: ClaimScope { branch: MAIN_BRANCH.into(), basis: basis(position), layer: Layer::Merged },
+        footprint: ClaimFootprint::from_regions(regions),
+    }
+}
+
+fn claimed_row(id: i64) -> ClaimRegion {
+    ClaimRegion::Row { table: table(), iid: EntityId::Integer(id).iid() }
+}
+
+#[test]
+fn claim_guards_detect_writes_to_rows_and_both_sides_of_index_moves() {
+    struct Verified(ClaimEvidence);
+    impl ClaimVerifier for Verified {
+        fn verify(&self, _: &Claim) -> Result<ClaimEvidence> { Ok(self.0.clone()) }
+    }
+
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![
+        Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by_key".into(), column: "key".into() }) },
+        put(MAIN_BRANCH, 1, "b"), put(MAIN_BRANCH, 2, "z"),
+    ]));
+    let row = Verified(evidence(1, [claimed_row(1)]));
+    let range = Verified(evidence(1, [ClaimRegion::IndexRange {
+        table: table(), index: "by_key".into(), lower: Some(b"a".to_vec()), upper: Some(b"c".to_vec()),
+    }]));
+    let mut validation = request(5, Vec::new());
+    validation.guards.push(Guard::Unchanged(Claim::from_bytes(Vec::new())));
+    let outcome = |state: &TransactState, claim: &Verified| {
+        let Resolution::Answer(receipt) = state.resolve(&validation, 7, Timestamp(70), DEFAULT, claim).unwrap() else {
+            panic!("claim validation must answer at the applied cut");
+        };
+        receipt.outcome
+    };
+
+    commit(&mut state, 2, &request(2, vec![put(MAIN_BRANCH, 2, "x")]));
+    assert_eq!(outcome(&state, &row), Outcome::Then);
+    assert_eq!(outcome(&state, &range), Outcome::Then);
+
+    let mut entering = TransactState::decode_checkpoint(&state.encode_checkpoint().unwrap(), state.index().head()).unwrap();
+    commit(&mut entering, 3, &request(3, vec![put(MAIN_BRANCH, 2, "a")]));
+    assert_eq!(outcome(&entering, &row), Outcome::Then);
+    assert_eq!(outcome(&entering, &range), Outcome::Otherwise { failed: vec![0] });
+
+    commit(&mut state, 3, &request(4, vec![put(MAIN_BRANCH, 1, "y")]));
+    commit(&mut state, 4, &request(5, vec![put(MAIN_BRANCH, 1, "b")]));
+    assert_eq!(outcome(&state, &row), Outcome::Otherwise { failed: vec![0] });
+    assert_eq!(outcome(&state, &range), Outcome::Otherwise { failed: vec![0] });
+}
+
+#[test]
+fn claim_footprint_coarsening_never_accepts_rejected_precise_regions() {
+    let mut initial = TransactState::new(INCARNATION);
+    commit(&mut initial, 1, &request(1, vec![put(MAIN_BRANCH, 0, "initial")]));
+    let rows = (0..17).map(claimed_row).collect::<Vec<_>>();
+    let table_claim = evidence(1, rows.iter().cloned());
+    assert_eq!(table_claim.footprint.regions().unwrap().iter().collect::<Vec<_>>(), [&ClaimRegion::Table(table())]);
+    assert_eq!(table_claim, evidence(1, rows.iter().rev().cloned()));
+
+    let tables = std::iter::once(ClaimRegion::Table(table())).chain((0..32).map(|i| {
+        ClaimRegion::Table(TableRef::new("public", format!("table_{i}")))
+    })).collect::<Vec<_>>();
+    let branch_claim = evidence(1, tables.iter().cloned());
+    assert!(branch_claim.footprint.regions().is_none());
+    assert_eq!(branch_claim, evidence(1, tables.iter().rev().cloned()));
+
+    let checkpoint = initial.encode_checkpoint().unwrap();
+    for id in -1..18 {
+        let mut state = TransactState::decode_checkpoint(&checkpoint, initial.index().head()).unwrap();
+        let ops = if id < 0 { vec![fork("preview", 1)] } else { vec![put(MAIN_BRANCH, id, "changed")] };
+        commit(&mut state, 2, &request(2, ops));
+        let unchanged = |claim: &ClaimEvidence| state.index().claim_unchanged(claim, Timestamp(21)).unwrap();
+        assert!(!unchanged(&table_claim) || rows.iter().all(|part| unchanged(&evidence(1, [part.clone()]))));
+        assert!(!unchanged(&branch_claim) || tables.iter().all(|part| unchanged(&evidence(1, [part.clone()]))));
+    }
 }
 
 #[test]
