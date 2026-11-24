@@ -19,28 +19,50 @@ use crate::term_directory::{TermEdits, TermSummaries};
 
 type Erases = BTreeMap<Iid, SearchPosition>;
 type RunPair = [[u8; 32]; 2];
+type UnmergeablePair = (RunPair, LogicalIndex);
 
 const MAX_UNMERGEABLE_PAIRS: usize = 1024;
 
 #[derive(Default)]
-pub(super) struct UnmergeablePairs(BTreeSet<(RunPair, LogicalIndex)>);
+pub(super) struct UnmergeablePairs {
+    earlier: BTreeSet<UnmergeablePair>,
+    most_recent: Option<UnmergeablePair>,
+}
 
 impl UnmergeablePairs {
-    fn contains(&self, index: &LogicalIndex, pair: RunPair) -> bool {
-        self.0.contains(&(pair, index.clone()))
+    fn touch(&mut self, index: &LogicalIndex, pair: RunPair) -> bool {
+        let key = (pair, index.clone());
+        if self.most_recent.as_ref() == Some(&key) { return true; }
+        let Some(remembered) = self.earlier.take(&key) else { return false; };
+        self.remember(remembered);
+        true
     }
 
     fn insert(&mut self, index: &LogicalIndex, pair: RunPair) {
-        self.0.insert((pair, index.clone()));
-        if self.0.len() > MAX_UNMERGEABLE_PAIRS {
-            self.0.pop_last();
+        let key = (pair, index.clone());
+        if self.most_recent.as_ref() == Some(&key) { return; }
+        self.earlier.remove(&key);
+        self.remember(key);
+    }
+
+    fn remember(&mut self, key: UnmergeablePair) {
+        if let Some(previous) = self.most_recent.replace(key)
+            && self.earlier.len() < MAX_UNMERGEABLE_PAIRS - 1 {
+            self.earlier.insert(previous);
         }
     }
 
     pub(super) fn retain_active(&mut self, catalog: &TrieCatalog) {
-        self.0.retain(|(pair, index)| pair.iter().all(|digest| {
+        let active = |(pair, index): &UnmergeablePair| pair.iter().all(|digest| {
             catalog.active_search_run(&index.table, digest).is_some_and(|run| index.owns(run))
-        }));
+        });
+        self.earlier.retain(active);
+        self.most_recent = self.most_recent.take().filter(active);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.earlier.len() + usize::from(self.most_recent.is_some())
     }
 }
 
@@ -613,7 +635,7 @@ impl SearchBuilder {
             for pair in candidates {
                 let [left, right] = pair.map(SearchRun::identity);
                 let digests = [left?, right?];
-                if self.unmergeable.lock().contains(index, digests) { continue; }
+                if self.unmergeable.lock().touch(index, digests) { continue; }
                 let hold = self.hold_logical_input(&snapshot).await?;
                 let merged = IoRegion::reading(hold, self.merge_logical(index, columns, &snapshot, pair, cancellation)).await;
                 let prepared = match merged {
@@ -1030,8 +1052,10 @@ mod tests {
     }
 
     fn recorded_run(index: &LogicalIndex, block: i64) -> SearchRun {
+        let mut digest = vec![0; 32];
+        digest[..8].copy_from_slice(&block.to_be_bytes());
         SearchRun { definition_id: Some(index.id.clone()), definition_version: Some(index.version),
-            blocks: vec![block], digest: Some(vec![block as u8 + 1; 32]), file_size: Some(1), locator: Some(vec![1]),
+            blocks: vec![block], digest: Some(digest), file_size: Some(1), locator: Some(vec![1]),
             source_rows: Some(1), ..Default::default() }
     }
 
@@ -1098,12 +1122,12 @@ mod tests {
             [text_revision("repaired text"), text_revision("sealed text")]);
     }
 
-    struct CountedReplay(TableReplay, std::sync::atomic::AtomicUsize);
+    struct RecordedReplay(TableReplay, parking_lot::Mutex<Vec<Vec<i64>>>);
 
     #[async_trait::async_trait]
-    impl TableHistorySource for CountedReplay {
+    impl TableHistorySource for RecordedReplay {
         async fn visit_table(&self, read: HistoryRead<'_>, visit: &mut HistoryVisitor<'_>) -> Result<Option<HistoryCoverage>> {
-            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.1.lock().push(read.blocks.to_vec());
             self.0.visit_table(read, visit).await
         }
     }
@@ -1111,7 +1135,7 @@ mod tests {
     #[tokio::test]
     async fn unmergeable_mixed_pair_replays_once_while_active() {
         let events = ["repaired text", "sealed text"].map(|body| StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8(body.into()))])));
-        let source = Arc::new(CountedReplay(TableReplay(events.iter().enumerate().map(|(block, operation)| {
+        let source = Arc::new(RecordedReplay(TableReplay(events.iter().enumerate().map(|(block, operation)| {
             let fields = Some(StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]));
             let event = StoredEvent { position: None, origin: None, commit_position: 1, entity_key: None,
                 iid: Iid([block as u8; 16]), system_from: Timestamp(block as i64 + 1), valid_time: Interval::ALL,
@@ -1131,14 +1155,45 @@ mod tests {
             builder.merge_logical_runs(&index, &columns, &partition, &publisher, TEST_STORAGE, &CancellationToken::new()).await.unwrap();
         }
         assert_eq!(index.records(&partition.value().snapshot()).len(), 2);
-        assert_eq!(source.1.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert_eq!(builder.unmergeable.lock().0.len(), 1);
+        assert_eq!(*source.1.lock(), [vec![0, 1]]);
+        assert_eq!(builder.unmergeable.lock().len(), 1);
 
         use rtdb_maintenance::ArtefactBuilder;
         builder.maintain_independent(&partition, &publisher, TEST_STORAGE, &CancellationToken::new()).await.unwrap();
 
         assert!(index.records(&partition.value().snapshot()).is_empty());
-        assert!(builder.unmergeable.lock().0.is_empty());
+        assert_eq!(builder.unmergeable.lock().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn unmergeable_overflow_rotates_replays_across_ordered_sweeps() {
+        let source = Arc::new(RecordedReplay(TableReplay(Vec::new()), Default::default()));
+        let builder = builder(Arc::new(MemoryStore::default())).with_history(Some(source.clone()));
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let last = MAX_UNMERGEABLE_PAIRS as i64 + 1;
+        let inputs = (0..=last).map(|block| {
+            let mut run = recorded_run(&index, block);
+            if block % 2 == 0 {
+                run.source_receipt = Some(SourceReceipt { lineage: Some("native/journal".into()), checkpoint_boundary: Some(-1),
+                    suffix_through: Some(5), table: Some(index.table.schema_and_table()),
+                    shard_range: Some(rtdb_format::search_manifest::FULL_SHARD_RANGE.to_vec()), source_rows: Some(1),
+                    erase_frontier_digest: Some(Sha256::digest([]).to_vec()), blocks: vec![block], ..Default::default() });
+            }
+            (index.table.clone(), run)
+        }).collect::<Vec<_>>();
+        let partition = replay_partition(&inputs, last);
+        let publisher = CatalogPublisher { partition: &partition, reject_once: parking_lot::Mutex::default() };
+        let columns = ["body".into()];
+        let cancellation = CancellationToken::new();
+
+        builder.merge_logical_runs(&index, &columns, &partition, &publisher, TEST_STORAGE, &cancellation).await.unwrap();
+        assert_eq!(source.1.lock().len(), last as usize);
+
+        for _ in 0..2 {
+            builder.merge_logical_runs(&index, &columns, &partition, &publisher, TEST_STORAGE, &cancellation).await.unwrap();
+        }
+
+        assert_eq!(source.1.lock()[last as usize..], [vec![last - 2, last - 1], vec![last - 3, last - 2]]);
     }
 
     #[tokio::test]
@@ -1154,7 +1209,7 @@ mod tests {
             let mut memo = UnmergeablePairs::default();
             memo.insert(&index, pair);
             memo.retain_active(partition.value().trie_catalog());
-            assert!(memo.contains(&index, pair));
+            assert!(memo.touch(&index, pair));
 
             publish_change(&publisher, TEST_STORAGE, &index, SearchRunChange {
                 run: Some(runs[retired].clone()), retire_only: Some(true), ..Default::default()
@@ -1163,7 +1218,7 @@ mod tests {
             let snapshot = partition.value().snapshot();
             assert_eq!(index.records(&snapshot), [&runs[surviving]]);
             memo.retain_active(snapshot.trie_catalog());
-            assert!(memo.0.is_empty());
+            assert_eq!(memo.len(), 0);
         }
     }
 
@@ -1182,13 +1237,13 @@ mod tests {
             LogicalIndex { version: 2, ..index.clone() },
         ];
         for other in &other_generations {
-            assert!(!memo.contains(other, pair));
+            assert!(!memo.touch(other, pair));
             memo.insert(other, pair);
         }
 
         memo.retain_active(partition.value().trie_catalog());
-        assert_eq!(memo.0.len(), 1);
-        assert!(memo.contains(&index, pair));
+        assert_eq!(memo.len(), 1);
+        assert!(memo.touch(&index, pair));
     }
 
     #[test]
@@ -1203,18 +1258,19 @@ mod tests {
         let mut memo = UnmergeablePairs::default();
         for value in 1..=MAX_UNMERGEABLE_PAIRS {
             memo.insert(&index, pair(value));
-            assert!(memo.0.len() <= MAX_UNMERGEABLE_PAIRS);
+            assert!(memo.len() <= MAX_UNMERGEABLE_PAIRS);
         }
 
         memo.insert(&second_index, pair(0));
 
-        assert_eq!(memo.0.len(), MAX_UNMERGEABLE_PAIRS);
-        assert!(memo.contains(&second_index, pair(0)));
-        assert!(!memo.contains(&index, pair(MAX_UNMERGEABLE_PAIRS)));
+        assert_eq!(memo.len(), MAX_UNMERGEABLE_PAIRS);
+        assert!(memo.touch(&second_index, pair(0)));
+        assert!(!memo.touch(&index, pair(MAX_UNMERGEABLE_PAIRS)));
         memo.insert(&index, pair(MAX_UNMERGEABLE_PAIRS));
-        assert_eq!(memo.0.len(), MAX_UNMERGEABLE_PAIRS);
-        assert!(memo.contains(&index, pair(1)));
-        assert!(memo.contains(&second_index, pair(0)));
+        assert_eq!(memo.len(), MAX_UNMERGEABLE_PAIRS);
+        assert!(!memo.touch(&second_index, pair(0)));
+        assert!(memo.touch(&index, pair(MAX_UNMERGEABLE_PAIRS)));
+        assert!(memo.touch(&index, pair(1)));
     }
 
     #[derive(Default)]
