@@ -14,7 +14,6 @@ pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
 const MAGIC: &[u8] = b"BJWP7";
-const WITHOUT_TOPOLOGY_POSITIONS: &[u8] = b"BJWP6";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
@@ -127,18 +126,13 @@ impl ArchivedWorld {
 
 impl ReplayWorlds {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
-        let (body, topology_positions) = if let Some(body) = bytes.strip_prefix(MAGIC) {
-            (body, true)
-        } else {
-            (bytes.strip_prefix(WITHOUT_TOPOLOGY_POSITIONS).ok_or_else(invalid)?, false)
-        };
-        let mut input = Input(body);
+        let mut input = Input(bytes.strip_prefix(MAGIC).ok_or_else(invalid)?);
         let registrations = input.count()?;
         let mut worlds = Self::default();
         let mut ids = BTreeSet::new();
         let mut positions = BTreeSet::new();
         for _ in 0..registrations {
-            let position = if topology_positions { input.position(&mut positions)? } else { None };
+            let position = input.position(&mut positions)?;
             let world: ArchivedWorld =
                 serde_json::from_slice(input.frame()?).map_err(|_| invalid())?;
             let registration = world.into_registration(position)?;
@@ -153,7 +147,7 @@ impl ReplayWorlds {
             return Err(invalid());
         }
         for _ in 0..clocks {
-            let position = if topology_positions { input.position(&mut positions)? } else { None };
+            let position = input.position(&mut positions)?;
             let id = Iid(input.fixed()?);
             if id.0 == [0; 16] || !ids.insert(id) {
                 return Err(invalid());

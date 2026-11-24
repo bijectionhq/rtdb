@@ -256,7 +256,7 @@ fn verify_archive_replay(
     let replay = HostedReplay::decode_resolved(&frontier, key.system_time)?;
     if binding(&replay.transaction_locator())?.as_deref() != Some(frontier.as_slice())
         || binding(&HostedReplay::destination_locator(key.tx_id))?.as_deref()
-            .is_some_and(|source| source != replay.original_receipt_key().as_slice())
+            != Some(replay.original_receipt_key().as_slice())
     {
         return Err(mismatch());
     }
@@ -294,7 +294,10 @@ fn verify_archive_replay(
                         return Err(mismatch());
                     }
                     let line = if topology {
-                        if event.op != rtdb_types::EventOp::Put || event.valid_time != Interval::ALL {
+                        let id = batch.view().borrow_event(index)?.put_identity()?;
+                        if event.valid_time != Interval::ALL || event.iid.0 == [0; 16]
+                            || id != Some(rtdb_columnar::EntityIdRef::Uuid(event.iid.0))
+                        {
                             return Err(mismatch());
                         }
                         event.iid.0
@@ -537,14 +540,16 @@ mod tests {
         }).to_string().into_bytes();
         let hold = TableRef::new("public", crate::hosted_control::RESTORE);
         let original = EntityId::String("place".into());
-        for (copied, copied_line, omitted, omitted_line, clock_line, source_id, valid) in [
-            (1u32, 1, 2u32, 2, 1, 3i64, true),
-            (3, 1, 2, 2, 1, 3, false),
-            (2, 2, 2, 2, 1, 3, false),
-            (1, 2, 2, 2, 1, 3, false),
-            (1, 1, 2, 1, 1, 3, false),
-            (1, 1, 2, 2, 2, 3, false),
-            (1, 1, 2, 2, 1, 2, false),
+        for (copied, copied_line, omitted, omitted_line, clock_line, clock_id, source_id, valid) in [
+            (1u32, 1, 2u32, 2, 1, 1, Some(3i64), true),
+            (3, 1, 2, 2, 1, 1, Some(3), false),
+            (2, 2, 2, 2, 1, 1, Some(3), false),
+            (1, 2, 2, 2, 1, 1, Some(3), false),
+            (1, 1, 2, 1, 1, 1, Some(3), false),
+            (1, 1, 2, 2, 2, 2, Some(3), false),
+            (1, 1, 2, 2, 1, 2, Some(3), false),
+            (1, 1, 2, 2, 1, 1, Some(2), false),
+            (1, 1, 2, 2, 1, 1, None, false),
         ] {
             let overlay = OwnedRelation::new("locations")?.in_world(Iid([copied_line; 16]))?.table("owner");
             let mut transaction = TransactionBuffer::new(state.snapshot(), key, Arc::clone(&memory))?;
@@ -564,7 +569,7 @@ mod tests {
                 position: None, origin: None, commit_position: 0, entity_key: None,
                 iid: world, system_from: key.system_time, valid_time: Interval::ALL,
                 operation: StoredOperation::Put(StructFields::from([
-                    ("_id".into(), Value::Uuid(world.0)), ("clock".into(), Value::I64(30)),
+                    ("_id".into(), Value::Uuid([clock_id; 16])), ("clock".into(), Value::I64(30)),
                 ])),
                 recency: None,
             }, std::num::NonZeroU32::new(4).unwrap())?;
@@ -573,12 +578,17 @@ mod tests {
             for (id, body) in [
                 (crate::hosted_control::NATIVE_FRONTIER, receipt.clone()),
                 ("native-transaction/3", receipt.clone()),
-                ("native-destination/0", source_id.to_be_bytes().to_vec()),
                 ("native-world-omissions/3", omission),
             ] {
                 transaction.put(hold.clone(), StructFields::from([
                     ("_id".into(), Value::Utf8(id.into())),
                     ("binding".into(), Value::Binary(body)),
+                ]), Interval::new(Timestamp(0), Timestamp::MAX)?)?;
+            }
+            if let Some(source_id) = source_id {
+                transaction.put(hold.clone(), StructFields::from([
+                    ("_id".into(), Value::Utf8("native-destination/0".into())),
+                    ("binding".into(), Value::Binary(source_id.to_be_bytes().to_vec())),
                 ]), Interval::new(Timestamp(0), Timestamp::MAX)?)?;
             }
             let staged = transaction.stage()?;
