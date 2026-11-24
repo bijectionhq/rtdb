@@ -5954,6 +5954,7 @@ fn owned_point_expectation(history: Option<Timestamp>, position: Option<&[u8]>) 
 }
 
 fn world_point_cell(cell: ArrowCell<'_>) -> rtdb_types::Result<(Field, ArrayRef)> {
+    use rtdb_types::LogicalType;
     let selected = cell.physical()?;
     let logical = selected.logical_type()?;
     let field = rtdb_columnar::to_field(cell.field.name(), &logical)?;
