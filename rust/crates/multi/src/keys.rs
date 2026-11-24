@@ -768,21 +768,22 @@ mod tests {
         assert_eq!(keys.key("b").await.unwrap(), key, "a fork's copy survives its parent's deletion");
     }
 
-    #[test]
-    fn a_concurrent_install_cannot_leave_a_destroyed_key_readable() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_concurrent_install_cannot_leave_a_destroyed_key_readable() {
         let directory = tempfile::tempdir().unwrap();
-        let keys = LocalKeyService::new(directory.path()).unwrap();
-        std::thread::scope(|scope| {
-            for id in 0..16 {
-                let keys = &keys;
-                scope.spawn(move || {
-                    let _ = futures::executor::block_on(keys.install(&id.to_string(), [1; KEY_BYTES]));
-                });
-                futures::executor::block_on(keys.destroy(&id.to_string())).unwrap();
-            }
-        });
+        let keys = Arc::new(LocalKeyService::new(directory.path()).unwrap());
         for id in 0..16 {
-            assert_eq!(futures::executor::block_on(keys.key(&id.to_string())).unwrap_err().code, "rtdb.multi/key-destroyed");
+            let id = id.to_string();
+            let install = tokio::spawn({
+                let keys = keys.clone();
+                let id = id.clone();
+                async move { keys.install(&id, [1; KEY_BYTES]).await }
+            });
+            keys.destroy(&id).await.unwrap();
+            if let Err(error) = install.await.unwrap() {
+                assert_eq!(error.code, "rtdb.multi/key-destroyed");
+            }
+            assert_eq!(keys.key(&id).await.unwrap_err().code, "rtdb.multi/key-destroyed");
         }
     }
 
