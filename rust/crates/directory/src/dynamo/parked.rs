@@ -301,6 +301,7 @@ pub(super) fn decode(bytes: &[u8], id: &str, name: &str, epoch: u64, version: Ve
         created_at_ms: packed.created_at_ms,
         move_intent: None,
         placement_move: None,
+        writer_handoffs: Vec::new(),
         log_epoch: packed.log_epoch,
         parent: packed.parent,
         move_from: None,
