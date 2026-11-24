@@ -82,12 +82,17 @@ impl Decoder {
             arrow_ipc::MessageHeader::DictionaryBatch => {
                 let schema = self.schema.as_ref().ok_or_else(|| invalid("Dictionary arrived before schema"))?;
                 let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Invalid dictionary message"))?;
-                arrow_ipc::reader::read_dictionary(&Buffer::from(data.data_body.as_ref()), dictionary, schema, &mut self.dictionaries, &message.version()).map_err(arrow)?;
+                arrow_ipc::reader::read_dictionary(&Buffer::from(data.data_body), dictionary, schema, &mut self.dictionaries, &message.version()).map_err(arrow)?;
                 self.permanent.push(charge); Ok(None)
             }
             arrow_ipc::MessageHeader::RecordBatch => {
                 let schema = self.schema.clone().ok_or_else(|| invalid("Record batch arrived before schema"))?;
-                let batch = arrow_flight::utils::flight_data_to_arrow_batch(&data, schema, &self.dictionaries).map_err(arrow)?;
+                let batch = message.header_as_record_batch().ok_or_else(|| arrow(arrow_schema::ArrowError::ParseError(
+                    "Unable to convert flight data header to a record batch".to_owned(),
+                )))?;
+                let batch = arrow_ipc::reader::read_record_batch(
+                    &Buffer::from(data.data_body), batch, schema, &self.dictionaries, None, &message.version(),
+                ).map_err(arrow)?;
                 let retained = self.memory.reserve(rtdb_columnar::shared_allocation_size(&batch).map_err(status)?).map_err(status)?;
                 let owned = OwnedBatch::with_reservation(batch, retained).map_err(status)?;
                 drop(charge); Ok(Some(owned))
@@ -224,6 +229,52 @@ mod tests {
     use rtdb_columnar::read_value;
     use rtdb_types::Value;
     use arrow_schema::{DataType, Field};
+
+    #[test]
+    fn flight_upload_retains_record_and_dictionary_bodies() {
+        use arrow_array::builder::StringDictionaryBuilder;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int32Type;
+
+        let mut strings = StringDictionaryBuilder::<Int32Type>::new();
+        strings.append("one").unwrap();
+        strings.append("two").unwrap();
+        let batch = RecordBatch::try_from_iter([("label", Arc::new(strings.finish()) as ArrayRef)]).unwrap();
+        let upload = MemoryBudget::new(1 << 20);
+        let response = MemoryBudget::new(1 << 20);
+        let mut tracker = DictionaryTracker::new(false);
+        let options = IpcWriteOptions::default();
+        let encoder = IpcDataGenerator::default();
+        let schema = encoder.schema_to_bytes_with_dictionary_tracker(batch.schema_ref(), &mut tracker, &options);
+        let mut decoder = Decoder::new(Arc::clone(&response));
+        assert!(decoder.decode(schema.into()).unwrap().is_none());
+        let (dictionaries, record) = encoder.encode(&batch, &mut tracker, &options, &mut CompressionContext::default()).unwrap();
+        let mut frames = dictionaries.into_iter().chain(std::iter::once(record)).map(|encoded| {
+            let mut data: FlightData = encoded.into();
+            let charge = upload.reserve(data.data_body.len()).unwrap();
+            data.data_body = retain(data.data_body, charge);
+            data
+        });
+        let dictionary = frames.next().unwrap();
+        let dictionary_body = dictionary.data_body.as_ptr_range();
+        assert!(decoder.decode(dictionary).unwrap().is_none());
+        let record = frames.next().unwrap();
+        let record_body = record.data_body.as_ptr_range();
+        let decoded = decoder.decode(record).unwrap().unwrap();
+        drop(decoder);
+
+        let retained = decoded.batch().column(0).clone();
+        drop(decoded);
+        let array = retained.as_dictionary::<Int32Type>();
+        assert!(record_body.contains(&array.keys().values().as_ptr().cast()));
+        assert!(dictionary_body.contains(&array.values().as_string::<i32>().value_data().as_ptr()));
+        assert_eq!(retained.as_ref(), batch.column(0).as_ref());
+        assert!(response.used_bytes() > 0);
+        drop(retained);
+        assert_eq!(upload.used_bytes(), 0);
+        assert_eq!(response.used_bytes(), 0);
+    }
+
     #[test]
     fn argument_rows_are_each_cell_read_under_its_columns_field() {
         let memory = MemoryBudget::new(1 << 22);
