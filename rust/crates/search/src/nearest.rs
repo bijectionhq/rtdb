@@ -238,42 +238,73 @@ impl NearestWindow {
     }
 
     fn admit(&mut self, partition: usize, id: EntityIdRef<'_>, distance: f64) -> Result<()> {
-        if let Some(at) = self.admit_position(partition, id, distance)? {
-            self.insert_at(at, || NearestHit { partition, id: id.into_owned(), distance })?;
+        let total = self.total_after(1)?;
+        let at = self.position(partition, id, distance);
+        if at < self.k {
+            let full = self.hits.len() == self.k;
+            let removed = if full {
+                identity_charge(&self.hits.last().expect("a full window has a last hit").id) + 128
+            } else { 0 };
+            let bytes = (self.bytes - removed)
+                .saturating_add(size_of::<Value>() + id.owned_payload_bytes() + 128);
+            self.reserve_hits(bytes)?;
+            if full { drop(self.hits.pop()); }
+            self.hits.insert(at, NearestHit { partition, id: id.into_owned(), distance });
+            self.bytes = bytes;
         }
+        self.total = total;
         Ok(())
     }
 
-    fn admit_position(&mut self, partition: usize, id: EntityIdRef<'_>, distance: f64) -> Result<Option<usize>> {
-        self.total += 1;
-        if self.total > MAX_NEAREST_CANDIDATES {
+    fn total_after(&self, added: usize) -> Result<usize> {
+        let total = self.total.saturating_add(added);
+        if total > MAX_NEAREST_CANDIDATES {
             return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/nearest-scan-limit", "Owned nearest exceeded its candidate budget"));
         }
-        let at = self.hits.partition_point(|hit| nearest_order(hit, partition, id, distance).is_lt());
-        Ok((at < self.k).then_some(at))
+        Ok(total)
     }
 
-    fn insert_at(&mut self, at: usize, hit: impl FnOnce() -> NearestHit) -> Result<()> {
-        if self.hits.len() == self.k {
-            let evicted = self.hits.pop().expect("A full nearest window has a last hit");
-            self.bytes -= identity_charge(&evicted.id).saturating_add(128);
-        }
-        let hit = hit();
-        self.bytes = self.bytes.saturating_add(identity_charge(&hit.id).saturating_add(128));
-        self.hits.insert(at, hit);
+    fn position(&self, partition: usize, id: EntityIdRef<'_>, distance: f64) -> usize {
+        self.hits.partition_point(|hit| nearest_order(hit, partition, id, distance).is_lt())
+    }
+
+    fn reserve_hits(&mut self, bytes: usize) -> Result<()> {
         let reservation = Arc::get_mut(&mut self.memory).expect("nearest owns its reservation");
-        reservation.grow_to(self.bytes.max(reservation.bytes()))
+        reservation.grow_to(bytes.max(reservation.bytes()))
     }
 
     /// Admits another window's hits and counts its candidates.
     fn absorb(&mut self, other: NearestWindow) -> Result<()> {
-        let NearestWindow { hits, memory: _source_memory, total, .. } = other;
-        self.total = self.total.saturating_add(total).saturating_sub(hits.len());
-        for hit in hits {
-            if let Some(at) = self.admit_position(hit.partition, EntityIdRef::from(&hit.id), hit.distance)? {
-                self.insert_at(at, || hit)?;
-            }
+        let total = self.total_after(other.total)?;
+        let (mut kept, mut incoming) = (0, 0);
+        let mut bytes = 4096usize;
+        for _ in 0..self.k {
+            let left = self.hits.get(kept);
+            let right = other.hits.get(incoming);
+            let winner = if let Some(right) = right
+                && left.is_none_or(|left| !nearest_order(left, right.partition, EntityIdRef::from(&right.id), right.distance).is_lt())
+            {
+                incoming += 1;
+                right
+            } else if let Some(left) = left {
+                kept += 1;
+                left
+            } else {
+                break;
+            };
+            bytes = bytes.saturating_add(identity_charge(&winner.id).saturating_add(128));
         }
+        // A refusal here lets the caller rank the partition exactly into the original window.
+        self.reserve_hits(bytes)?;
+
+        self.hits.truncate(kept);
+        let NearestWindow { memory: _source_memory, hits, .. } = other;
+        for hit in hits.into_iter().take(incoming) {
+            let at = self.position(hit.partition, EntityIdRef::from(&hit.id), hit.distance);
+            self.hits.insert(at, hit);
+        }
+        self.total = total;
+        self.bytes = bytes;
         Ok(())
     }
 
@@ -643,17 +674,28 @@ mod tests {
     }
 
     #[test]
-    fn nearest_window_merge_grows_before_releasing_the_source_reservation() {
+    fn refused_nearest_window_merge_leaves_the_original_window_for_exact_ranking() {
         let window_charge = 4096 + 2 * size_of::<NearestHit>();
+        let original_bytes = 4096 + size_of::<Value>() + 128;
+        let original_charge = window_charge.max(original_bytes);
         let text = "id".repeat(1024);
         let hit_charge = 4096 + size_of::<Value>() + text.len() + 128;
-        let memory = MemoryBudget::new(window_charge + hit_charge);
+        let memory = MemoryBudget::new(original_charge + hit_charge);
         let mut window = NearestWindow::new(&memory, 1).unwrap();
+        window.admit(0, EntityIdRef::Integer(1), 0.75).unwrap();
         let mut settled = NearestWindow::new(&memory, 1).unwrap();
-        settled.admit(0, EntityIdRef::String(&text), 0.5).unwrap();
+        settled.admit(1, EntityIdRef::String(&text), 0.5).unwrap();
 
         assert_eq!(window.absorb(settled).unwrap_err().code, "rtdb/memory-budget-exceeded");
-        assert_eq!(memory.used_bytes(), window_charge);
+        assert_eq!(memory.used_bytes(), original_charge);
+        assert_eq!(window.bytes, original_bytes);
+        assert_eq!(window.total, 1);
+        assert_eq!(window.hits[0].id, EntityId::Integer(1));
+
+        window.admit(1, EntityIdRef::String(&text), 0.5).unwrap();
+        assert_eq!(window.total, 2);
+        assert_eq!(window.hits[0].id, EntityId::String(text));
+        assert_eq!(memory.used_bytes(), hit_charge);
     }
 
     #[test]
