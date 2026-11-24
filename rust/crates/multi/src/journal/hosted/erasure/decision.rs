@@ -39,14 +39,18 @@ pub(super) fn mirrors_fence(
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (exact_checkpoint && generation == successor_generation && generation > 1),
+    ensures out == (exact_checkpoint && original_request && successor_owner
+        && generation == successor_generation && generation > 1),
 ))]
 pub(super) fn at_clean_checkpoint(
     exact_checkpoint: bool,
+    original_request: bool,
+    successor_owner: bool,
     generation: u64,
     successor_generation: u64,
 ) -> bool {
-    exact_checkpoint && generation == successor_generation && generation > 1
+    exact_checkpoint && original_request && successor_owner
+        && generation == successor_generation && generation > 1
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
