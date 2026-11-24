@@ -803,7 +803,11 @@ async fn arrow_stream_copy_preflights_the_tail_before_any_commit_and_keeps_decod
 
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
-    for (table, payload) in [("docs", vec![]), ("spooled_docs", vec![7; 8192])] {
+    for (table, payload) in [
+        ("docs", vec![]),
+        ("retained_docs", vec![7; 8192]),
+        ("spooled_docs", vec![7; 128 * 1024]),
+    ] {
         assert_eq!(tags(&client.query(&format!("INSERT INTO {table} (_id) VALUES (0)")).await), b"CZ");
         let batch = |id| RecordBatch::try_from_iter([
             ("_id", Arc::new(Int64Array::from(vec![id])) as ArrayRef),
