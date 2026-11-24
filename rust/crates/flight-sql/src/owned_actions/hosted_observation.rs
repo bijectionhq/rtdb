@@ -120,10 +120,10 @@ impl Service {
     pub(crate) async fn confirm_applied_hosted_action(
         &self,
         call: &Call,
-        body: &[u8],
+        envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
-        let (handle, body) = body.split_first_chunk::<16>()
+        let (handle, body) = envelope.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Applied confirmation requires a held handle"))?;
         let (floor, body) = applied_read_floor(body)?;
         if call.session.audience_source().is_some_and(|source| floor.history() != source) {
@@ -143,8 +143,9 @@ impl Service {
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
+        let control_frame = call.retain_request_bytes(envelope.clone());
         let (controls, _control_charges) =
-            self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+            self.decode_hosted_control_groups(call, &control_frame, groups, scope, &mut rows_left, true)?;
         for control in &controls {
             if let EntityId::String(id) = control.id() {
                 hosted_control::require_audience_control(&call.session, &control.table().table, id)?;
@@ -159,10 +160,10 @@ impl Service {
     pub(crate) async fn observe_held_hosted_action(
         &self,
         call: &Call,
-        body: &[u8],
+        envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
-        let (handle, body) = body
+        let (handle, body) = envelope
             .split_first_chunk::<16>()
             .ok_or_else(|| invalid("Hosted observation requires a held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
@@ -181,8 +182,9 @@ impl Service {
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
         let mut rows_left = MAX_GROUPED_COMMIT_ROWS;
+        let control_frame = call.retain_request_bytes(envelope.clone());
         let (controls, _control_charges) =
-            self.decode_hosted_control_groups(call, groups, scope, &mut rows_left, true)?;
+            self.decode_hosted_control_groups(call, &control_frame, groups, scope, &mut rows_left, true)?;
         let witnesses = witnesses
             .into_iter()
             .map(|(_, evidence)| evidence)

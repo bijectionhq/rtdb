@@ -8,7 +8,7 @@ impl Service {
     pub(crate) async fn held_owned_unique_window_action(
         &self,
         call: &Call,
-        body: &[u8],
+        body: &Bytes,
     ) -> Result<ActionResult, Status> {
         use arrow_array::builder::{BinaryBuilder, Int64Builder, StringBuilder};
         use rtdb_types::Interval;
@@ -28,7 +28,7 @@ impl Service {
         };
         let (relation, request) = split_relation(request)?;
         let (path, request_ipc) = split_relation(request)?;
-        let input = request_batch(call, request_ipc)?;
+        let input = request_batch(call, call.retain_request_bytes(body.slice_ref(request_ipc)))?;
         let input = input.batch();
         if input.num_rows() != 1 || input.num_columns() != 5 {
             return Err(invalid("Owned unique window needs one selector, system cut, valid window and limit"));
@@ -106,18 +106,18 @@ impl Service {
     pub(crate) async fn held_owned_unique_action(
         &self,
         call: &Call,
-        body: &[u8],
+        envelope: &Bytes,
     ) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions {
             return Err(unsupported());
         }
-        let (handle, body) = body
+        let (handle, body) = envelope
             .split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned held unique has no handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let (relation, body) = split_relation(body)?;
         let (path, arrow) = split_relation(body)?;
-        let batch = request_batch(call, arrow)?;
+        let batch = request_batch(call, call.retain_request_bytes(envelope.slice_ref(arrow)))?;
         if batch.batch().num_rows() != 1 || batch.batch().num_columns() != 2 {
             return Err(invalid(
                 "Owned held unique requires exactly key and valid_micros",

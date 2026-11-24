@@ -630,7 +630,17 @@ impl OwnedStream {
     pub fn read(bytes: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let bound = stream_bound(bytes, true, arrow_descriptors)?;
         let reservation = memory.reserve(bound)?;
-        let reader = ArrowStream::from_reader(bytes, None)?;
+        Self::from_stream(ArrowStream::from_reader(bytes, None)?, reservation)
+    }
+
+    /// Requires a complete IPC stream whose input bytes own their allocation charge.
+    pub fn read_bytes(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bound = stream_bound(&bytes, true, arrow_descriptors)?;
+        let reservation = memory.reserve(bound)?;
+        Self::from_stream(ArrowStream::from_bytes(bytes, None)?, reservation)
+    }
+
+    fn from_stream<R: Read>(reader: ArrowStream<R>, reservation: Arc<MemoryReservation>) -> Result<Self> {
         let schema = reader.schema();
         let pages = reader.map(|page| OwnedBatch::with_reservation(page?, Arc::clone(&reservation))).collect::<Result<_>>()?;
         Ok(Self { schema, pages, _reservation: reservation })

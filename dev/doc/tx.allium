@@ -211,6 +211,7 @@
 -- Its schedule restores each run at its original position among inline effects and reconstructs field presence before ordering.
 -- An ordinary Flight caller can submit a bounded ordered sequence of held point or range requests in one action.
 -- Each entry uses its scalar action's admission, held cut, authorization and delivery fence.
+-- Aligned Arrow request bodies in scalar actions and held read batches can retain their original charged Flight frame.
 -- The owner streams one scalar IPC reply per successful entry and terminates at the first refusal with that entry's scalar status.
 -- Held selections carry ordered UTF-8 points and valid windows on their original handles with each entry's original cut.
 -- Compatible point selections reuse the Arrow field schema and retain reply metadata per entry.

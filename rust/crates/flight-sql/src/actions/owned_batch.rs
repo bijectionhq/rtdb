@@ -159,7 +159,7 @@ impl Service {
                         audience_work::decode_bytes(original.encoded_len())
                             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                         self.confirm_audience_observation(call).await?;
-                        self.held_owned_point(call, request, PointTime::Optional, false, OwnedReplyFormat::Selection(selection))
+                        self.held_owned_point(call, &original.body, PointTime::Optional, false, OwnedReplyFormat::Selection(selection))
                             .await.map(OwnedIpcReply::into_unary)
                     };
                     let reply = IoRegion::retaining(owner, audience_work::within_turn(
@@ -170,7 +170,7 @@ impl Service {
                     }
                     Ok(reply)
                 } else {
-                    self.batch_read(call, kind, selector, request, selection).await
+                    self.batch_read(call, kind, selector, &body.slice_ref(request), selection).await
                 }
             }).await?;
             let grant = plaintext.grant().await.map_err(status)?;
@@ -181,7 +181,7 @@ impl Service {
     }
 
     async fn batch_read(
-        &self, call: &Call, kind: BatchKind, selector: u8, request: &[u8],
+        &self, call: &Call, kind: BatchKind, selector: u8, request: &Bytes,
         selection: &mut SelectionEncoder,
     ) -> Result<ActionResult, Status> {
         match kind {
