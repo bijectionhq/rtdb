@@ -65,10 +65,10 @@ impl OpenTransaction<'_> {
     pub(super) async fn claim_assertion_family_fences(
         &self, operations: &[Operation], replay: bool,
     ) -> Result<()> {
-        use rtdb_types::{ASSERTION_FAMILY_FENCES, AssertionFamilyFenceMarker};
+        use rtdb_types::AssertionFamilyFenceMarker;
 
         let mut controls = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::HostedControl(control)) if control.name() == ASSERTION_FAMILY_FENCES =>
+            Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker() =>
                 Some(control),
             _ => None,
         });
