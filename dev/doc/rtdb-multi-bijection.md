@@ -431,6 +431,12 @@ For this action, both `destination` and `stage_operation` are the scratch UUID, 
 The returned `transfer_target_verified` receipt carries the same terminal and the ciphertext digest of the exact scratch replay artifact.
 The verifier replays from the copied checkpoint and checks the terminal transaction, source frontier, placed debt and lifetime floors before accepting the artifact.
 The scratch stage can hold replay data for native import while its Classic replica and writer admission stay closed.
+Use `inspect_classic_migration_inventory` under the original recovery envelope to read the prepared input from scratch storage.
+Supply the promised native UUID as `destination`, the scratch UUID as `stage_operation`, and the exact `staged_manifest_sha256` and replay `ciphertext_sha256`.
+The `classic_migration_inventory_inspected` reply carries the exact replay receipt, per-relation event commitments and counts, and a commitment to retained Classic Worlds, suffix pins, captures and pending capture releases.
+The inventory distinguishes literal, Classic outcome, owned and system relations and flags unpositioned, redacted and erased events.
+This observation works from the scratch checkpoint and certified replay artifact after source copy verification.
+It checks the original terminal in the directory and takes no original journal or object admission.
 
 The attempt UUID identifies a private Classic scratch stage independently of the native destination UUID.
 Current Classic staging requires an active source holder and the current captured checkpoint.

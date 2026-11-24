@@ -146,6 +146,12 @@ enum Action {
         stage_operation: Uuid,
         staged_manifest_sha256: String,
     },
+    InspectClassicMigrationInventory {
+        destination: Uuid,
+        stage_operation: Uuid,
+        staged_manifest_sha256: String,
+        ciphertext_sha256: [u8; 32],
+    },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
         stage_operation: Uuid,
@@ -293,6 +299,9 @@ enum Reply {
     },
     TransferTargetVerified {
         bootstrap: rtdb_directory::CheckpointTransferBootstrap,
+    },
+    ClassicMigrationInventoryInspected {
+        inventory: archive::ClassicMigrationInventory,
     },
     StageOwnedRelations {
         name: String,
@@ -824,6 +833,21 @@ impl RecoveryService {
                 )).await?;
                 Ok(Reply::TransferTargetVerified { bootstrap })
             },
+            Action::InspectClassicMigrationInventory { destination, stage_operation, staged_manifest_sha256, ciphertext_sha256 } => {
+                if installation.checkpoint_stage.is_some() || destination.is_nil() || stage_operation.is_nil()
+                    || !valid_manifest(&staged_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let selector = archive::StageSelector {
+                    destination: stage_operation, operation: stage_operation, manifest_sha256: staged_manifest_sha256,
+                    source: Some((request.authority, request.capture, self.org.clone())), transfer_only: true,
+                };
+                let inventory = Box::pin(archive::inspect_classic_migration_inventory(
+                    directory, &self.storage, self.keys.as_ref(), selector, destination, ciphertext_sha256, self.hosted_task.clone(),
+                )).await?;
+                Ok(Reply::ClassicMigrationInventoryInspected { inventory })
+            }
             Action::InspectCheckpointStageOwnedRelations {
                 destination,
                 stage_operation,

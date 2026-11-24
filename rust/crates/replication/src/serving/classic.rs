@@ -68,7 +68,7 @@ pub(super) async fn recover(index: &mut BranchIndex, snapshot: Snapshot, storage
         for table in snapshot.tables().into_iter().filter(data_table) {
             let Some(entry) = snapshot.table_entry(&table) else { continue; };
             for trie in snapshot.trie_entries(&table) {
-                rtdb_query::visit_trie_events(storage, memory, cancellation, &entry.slug, &trie.key, |batch| {
+                rtdb_query::visit_full_trie_events(storage, memory, cancellation, &entry.slug, &trie.key, |batch| {
                     for row in 0..batch.len() {
                         let (event, charge) = read_event(batch, row, memory)?;
                         events.push((table.clone(), event, events.len()));

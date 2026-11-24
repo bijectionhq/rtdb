@@ -43,6 +43,8 @@ use crate::{
 
 mod owned_inventory;
 pub(crate) use owned_inventory::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, inspect_staged_owned_relations, stream_staged_owned_event_files};
+mod classic_migration;
+pub(crate) use classic_migration::{ClassicMigrationInventory, inspect_classic_migration_inventory};
 
 pub struct StagedReaderSettings {
     pub destination: Uuid,
@@ -302,6 +304,7 @@ impl ReadFence for StageReadAuthority {
 
 struct VerifiedStage {
     store: Arc<dyn ObjectStore>,
+    region: Arc<IoRegion>,
     contents: CheckpointContents,
     legacy_trie_data: bool,
 }
@@ -330,7 +333,7 @@ async fn open_inventory(
         ));
     }
     let manifest_path = key(STAGED_MANIFEST)?;
-    let cipher = keys.scoped_unit_key(&staged_key_id(record), region).await?;
+    let cipher = keys.scoped_unit_key(&staged_key_id(record), Arc::clone(&region)).await?;
     let maximum = crate::cipher::object::sealed_size(&manifest_path, MAXIMUM_MANIFEST_BYTES as usize)?;
     let head = files.head_fresh(&manifest_path).await?;
     let length = usize::try_from(head.size)
@@ -398,7 +401,7 @@ async fn open_inventory(
             "The staged object inventory differs from the checkpoint closure",
         ));
     }
-    Ok(VerifiedStage { store: plaintext, contents, legacy_trie_data })
+    Ok(VerifiedStage { store: plaintext, region, contents, legacy_trie_data })
 }
 
 struct StageStorage {

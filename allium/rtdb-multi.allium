@@ -603,6 +603,8 @@ contract LogService {
         -- The source recovery owner drains admitted storage and catalog readers, seals the original replica journal and verifies the checkpoint and certified suffix through the drained source frontier.
         -- An identical retry observes the same retained source terminal.
         -- The verifier can retain independently sealed replay frames and detached bodies under the exact scratch stage with the terminal transaction and lifetime floors preserved.
+        -- An import inventory reader authenticates the staged checkpoint, every replay segment and detached body, and the ordered replay commitment before reporting the exact source relation inventory.
+        -- The reader holds scratch storage while examining the replay and observes the original fence and retained obligations without acquiring original journal or object write authority.
         -- The migration scratch stage stays private and cannot seed a Classic target writer.
 
     @invariant InstalledJournalErasureCommit

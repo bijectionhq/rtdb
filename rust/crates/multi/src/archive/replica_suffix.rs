@@ -1178,7 +1178,16 @@ mod custody_tests {
 
     #[tokio::test]
     async fn a_streamed_transfer_seeds_and_restarts_after_erasing_its_source_payloads() -> Result<()> {
-        use rtdb_directory::{CheckpointStageIntent, MemberRecord, MemberRole, MemberState, ReplayCustody};
+        check_streamed_transfer(false).await
+    }
+
+    #[tokio::test]
+    async fn classic_migration_reads_the_ordered_scratch_artifact_without_the_source_key_or_payloads() -> Result<()> {
+        check_streamed_transfer(true).await
+    }
+
+    async fn check_streamed_transfer(migration: bool) -> Result<()> {
+        use rtdb_directory::{CheckpointStageIntent, CheckpointTransferSelection, ClassicMigration, ClassicMigrationSource, MemberRecord, MemberRole, MemberState, ReplayCustody};
         use rtdb_format::{database::proto::database_config, envelope::{SourceBody, SourceMessage},
             generated::xtdb::{block::proto as block_proto, log::proto::ResolvedTx}};
         use rtdb_node::{LogAccess, LogFactory};
@@ -1186,7 +1195,8 @@ mod custody_tests {
         use tokio_util::sync::CancellationToken;
         use crate::{
             archive::{ArchivedObject, Capture, StageSelector, activate_checkpoint_transfer_target, archive_binding,
-                archive_key_id, archive_witness, digest, issue_checkpoint_transfer, seed_checkpoint_transfer_target,
+                archive_key_id, archive_witness, digest, inspect_classic_migration_inventory, issue_checkpoint_transfer,
+                seal_checkpoint_transfer, seed_checkpoint_transfer_target,
                 stage_checkpoint_transfer, verify_checkpoint_transfer_target},
             deployment::{Role, database_config as holder_config}, logs::LogkeeperLogFactory,
             process::MAXIMUM_LOG_MESSAGE_BYTES, recovery_holds::RecoveryHolds,
@@ -1317,17 +1327,31 @@ mod custody_tests {
         broker.publish(history, source.epoch, &later_path, later_body.clone()).await?;
         writer.enqueue(later_proxy.encode().into(), Timestamp(30)).await?.durable().await?;
         let operation = Uuid::new_v4();
-        let destination = Uuid::new_v4();
+        let destination = if migration { operation } else { Uuid::new_v4() };
+        let native_target = Uuid::new_v4();
         let stage = Box::pin(stage_checkpoint_transfer(directory.clone(), &archive, &storage, keys.as_ref(), CheckpointStageIntent {
             operation, source: deployment, capture, source_manifest_sha256: manifest,
             destination, name: "target".into(), org: source.org.clone(),
-            classic_migration: None,
+            classic_migration: migration.then_some(ClassicMigration {
+                source: ClassicMigrationSource { incarnation: source.incarnation, log_epoch: source.log_epoch, writer_epoch: source.epoch },
+                destination: native_target,
+            }),
         }, None)).await?;
         let selector = StageSelector {
             destination, operation, manifest_sha256: stage.staged_manifest_sha256.clone().unwrap(),
             source: Some((deployment, capture, source.org.clone())), transfer_only: true,
         };
-        let terminal = Box::pin(issue_checkpoint_transfer(directory.clone(), &storage, &archive, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
+        let terminal = if migration {
+            let current = directory.deployment(&source.id).await?.unwrap();
+            let scratch = directory.deployment(&destination.to_string()).await?.unwrap();
+            let fence = directory.fence_checkpoint_transfer(&CheckpointTransferSelection {
+                stage, source_version: current.version, destination_version: scratch.version,
+                drained_source_through: Some(terminal_source),
+            }).await?;
+            Box::pin(seal_checkpoint_transfer(directory.as_ref(), &storage, &archive, keys.as_ref(), Some(&broker), None, &fence)).await?
+        } else {
+            Box::pin(issue_checkpoint_transfer(directory.clone(), &storage, &archive, keys.as_ref(), selector.clone(), Some(&broker), None)).await?
+        };
         assert_eq!(terminal.replica_through, 3);
         assert_eq!(terminal.source_through, terminal_source);
         assert!(directory.deployment(&source.id).await?.unwrap().storage_regions.is_empty());
@@ -1344,6 +1368,22 @@ mod custody_tests {
         files.delete(&earlier_path).await?;
         files.delete(&later_path).await?;
         keys.destroy(&source.key_id()).await?;
+        if migration {
+            let before = directory.deployment(&source.id).await?;
+            let inspect = |target, digest| Box::pin(inspect_classic_migration_inventory(
+                directory.clone(), &storage, keys.as_ref(), selector.clone(), target, digest, None,
+            ));
+            assert!(inspect(Uuid::new_v4(), bootstrap.ciphertext_sha256).await.is_err());
+            assert!(inspect(native_target, [0; 32]).await.is_err());
+            let inventory = serde_json::to_value(inspect(native_target, bootstrap.ciphertext_sha256).await?).unwrap();
+            assert_eq!(inventory["bootstrap"], serde_json::to_value(bootstrap).unwrap());
+            assert_eq!(inventory["relations"][0]["events"], 2);
+            assert_eq!(inventory["relations"][0]["kind"], "literal");
+            assert_eq!(directory.deployment(&source.id).await?, before);
+            cancellation.cancel();
+            server.await.unwrap()?;
+            return Ok(());
+        }
         let seeded = Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
         let retry = Box::pin(seed_checkpoint_transfer_target(directory.clone(), &storage, keys.as_ref(), selector.clone(), Some(&broker), None)).await?;
         assert_eq!(seeded, retry);

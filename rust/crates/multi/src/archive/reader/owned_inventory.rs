@@ -367,13 +367,13 @@ pub(crate) async fn seed_checkpoint_transfer_target(
     )).await
 }
 
-struct DetachedTransferPayload {
+pub(super) struct DetachedTransferPayload {
     path: ObjectKey,
-    resolved: ReplicaEnvelope,
-    body: PayloadBytes,
+    pub(super) resolved: ReplicaEnvelope,
+    pub(super) body: PayloadBytes,
 }
 
-async fn observe_transfer_payload(
+pub(super) async fn observe_transfer_payload(
     artifact: &ReplicaArtifact<'_>, offset: i64, envelope: &ReplicaEnvelope, chain: &mut Context,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Option<DetachedTransferPayload>> {
@@ -386,7 +386,7 @@ async fn observe_transfer_payload(
     Ok(Some(DetachedTransferPayload { path: crate::reference::key(&relative)?, resolved, body }))
 }
 
-fn transfer_first(stage: &rtdb_directory::CheckpointStage) -> Result<i64> {
+pub(super) fn transfer_first(stage: &rtdb_directory::CheckpointStage) -> Result<i64> {
     stage.checkpoint.boundary.checked_add(1)
         .ok_or_else(|| inconsistent("The checkpoint has no terminal replica successor"))
 }
@@ -647,7 +647,7 @@ async fn inspect(
     })
 }
 
-async fn open_owned_snapshot(
+pub(super) async fn open_owned_snapshot(
     authority: &StageReadAuthority,
     store: Arc<dyn ObjectStore>,
 ) -> Result<(RecoveredPartition, TransactionKey, Arc<BufferPool>, Arc<MemoryBudget>, NodeOptions)> {

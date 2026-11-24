@@ -34,6 +34,7 @@ struct OpenedLayout {
     whole: Option<CacheLease>,
 }
 
+#[derive(Clone, Copy)]
 enum DataProjection<'a> {
     Full,
     PutColumns(&'a [String]),
@@ -223,13 +224,28 @@ pub async fn visit_trie_iids(
 #[doc(hidden)]
 pub async fn visit_trie_events(
     storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &tokio_util::sync::CancellationToken,
-    slug: &TableSlug, trie: &TrieKey, put_columns: &[String], mut visit: impl FnMut(&EventBatch) -> Result<()>,
+    slug: &TableSlug, trie: &TrieKey, put_columns: &[String], visit: impl FnMut(&EventBatch) -> Result<()>,
+) -> Result<()> {
+    visit_trie_events_as(storage, memory, cancellation, slug, trie, DataProjection::PutColumns(put_columns), visit).await
+}
+
+#[doc(hidden)]
+pub async fn visit_full_trie_events(
+    storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &tokio_util::sync::CancellationToken,
+    slug: &TableSlug, trie: &TrieKey, visit: impl FnMut(&EventBatch) -> Result<()>,
+) -> Result<()> {
+    visit_trie_events_as(storage, memory, cancellation, slug, trie, DataProjection::Full, visit).await
+}
+
+async fn visit_trie_events_as(
+    storage: &Arc<BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &tokio_util::sync::CancellationToken,
+    slug: &TableSlug, trie: &TrieKey, projection: DataProjection<'_>, mut visit: impl FnMut(&EventBatch) -> Result<()>,
 ) -> Result<()> {
     let mut file = DataFileReader::new(storage, ObjectKey::new(slug.data_key(trie))?);
     let pages = file.open(memory).await?.layout.decoder.page_count();
     for page in 0..pages {
         if cancellation.is_cancelled() { return Err(point_cancelled()); }
-        let (batch, _charge) = file.decode_page_as(page, memory, DataProjection::PutColumns(put_columns)).await?;
+        let (batch, _charge) = file.decode_page_as(page, memory, projection).await?;
         visit(&EventBatch::new(batch)?)?;
     }
     Ok(())
