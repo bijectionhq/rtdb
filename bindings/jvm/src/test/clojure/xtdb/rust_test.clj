@@ -31,6 +31,7 @@
             [xtdb.sql.identifier-test :as original-identifiers]
             [xtdb.sql.with-test :as original-with]
             [xtdb.expression.pg-test :as original-pg-expression]
+            [xtdb.serde :as serde]
             [xtdb.serde.types :as st]
             [xtdb.node-test :as original-node]
             [xtdb.update-test :as original-update]
@@ -47,7 +48,7 @@
             [xtdb.rust :as rust])
   (:import [java.time InstantSource]
            [org.apache.arrow.memory RootAllocator]
-           [xtdb.rust NativeDatabase]))
+           [xtdb.rust NativeConnection NativeDatabase NativeRows NativeStatement]))
 
 (def ^:private node-config "server:\n  port: 0\nflightSql: null\nnodeId: clojure-binding-test\n")
 
@@ -156,6 +157,29 @@
       (is (= [{:xt/id 1, :v #xt/zdt "1969-12-31T23:59:59.999Z[UTC]"}
               {:xt/id 2, :v #xt/zdt "1969-12-31T23:59:59.999Z[UTC]"}]
              (xt/q node ["SELECT _id, v FROM docs WHERE v = ? ORDER BY _id" date]))))))
+
+(deftest plan-q-binds-compatible-positional-arguments-through-c-data
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)
+              ^NativeConnection connection (.connect node)]
+    (let [sql "SELECT ? AS a, ? AS b, ? AS c, ? AS d, ? AS e, ? AS f, ? AS g, ? AS h"
+          args [(byte 7) (short 8) (int 9) 10 (float 0.25) -0.0 [1.25 nil 2.5] nil]
+          expected (with-open [^NativeStatement statement (.createStatement connection sql)]
+                     (.prepare statement)
+                     (.bindTransit statement (#'rust/write-request [args]))
+                     (with-open [^NativeRows rows (.executeRows statement)]
+                       (#'rust/read-rows (.next rows) (serde/read-key-fn :kebab-case-keyword))))]
+      (with-redefs-fn {#'rust/write-request (fn [_] (throw (AssertionError. "Unexpected Transit request")))}
+        (fn []
+          (let [[row :as actual] (xt/q connection (into [sql] args))]
+            (is (= expected actual))
+            (is (= Long/MIN_VALUE (Double/doubleToRawLongBits (:f row))))
+            (is (= [1.25 nil 2.5] (:g row))))))))
+
+(deftest plan-q-can-bind-arguments-when-the-jvm-arrow-allocator-is-full
+  (with-open [allocator (RootAllocator. 1)
+              node (open-node allocator)]
+    (is (= [{:v 42}] (xt/q node ["SELECT ? AS v" 42])))))
 
 (defn- with-native-node [f]
   (let [[log-type {:keys [instant-src]}] (:log tu/*node-opts*)]

@@ -2,6 +2,7 @@ package xtdb.rust;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
@@ -24,6 +25,13 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 final class NativeArguments {
     private NativeArguments() {}
+
+    static VectorSchemaRoot positional(BufferAllocator allocator, List<?> arguments) {
+        var named = new LinkedHashMap<String, Object>();
+        int position = 1;
+        for (Object value : arguments) named.put("$" + position++, value);
+        return create(allocator, named);
+    }
 
     static VectorSchemaRoot create(BufferAllocator allocator, Map<?, ?> arguments) {
         var fields = new ArrayList<Field>(arguments.size());

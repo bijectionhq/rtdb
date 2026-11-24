@@ -99,7 +99,10 @@
             (fn []
               (with-open [^NativeStatement statement (.createStatement connection sql)]
                 (.prepare statement)
-                (when (seq args) (.bindTransit statement (write-request [(vec args)])))
+                (when (seq args)
+                  (let [args (vec args)]
+                    (when-not (.tryBindNativeArguments statement args)
+                      (.bindTransit statement (write-request [args])))))
                 (with-open [^NativeRows rows (.executeRows statement)]
                   (loop [acc initial]
                     (if (reduced? acc)

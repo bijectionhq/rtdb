@@ -3,6 +3,7 @@ package xtdb.rust;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.arrow.adbc.core.AdbcException;
 import org.apache.arrow.adbc.core.AdbcStatement;
@@ -12,6 +13,7 @@ import org.apache.arrow.c.Data;
 import org.apache.arrow.memory.ArrowBuf;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorLoader;
+import org.apache.arrow.memory.OutOfMemoryException;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
@@ -69,6 +71,19 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
             }
             copy.setRowCount(root.getRowCount());
             bindFromAllocator(copy, connection.allocator, "statement_bind");
+        }
+    }
+    public boolean tryBindNativeArguments(List<?> arguments) throws AdbcException {
+        try (VectorSchemaRoot root = NativeArguments.positional(connection.allocator, arguments)) {
+            if (root == null) return false;
+            String entryPoint = abi.supports("statement_bind_retained") ? "statement_bind_retained" : "statement_bind";
+            bindFromAllocator(root, connection.allocator, entryPoint);
+            return true;
+        } catch (OutOfMemoryException exhausted) {
+            return false;
+        } catch (NativeException error) {
+            if ("rtdb/memory-budget-exceeded".equals(error.code())) return false;
+            throw error;
         }
     }
     private void bindFromAllocator(VectorSchemaRoot root, BufferAllocator allocator, String entryPoint) throws AdbcException {
