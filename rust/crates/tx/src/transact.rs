@@ -466,6 +466,16 @@ impl TransactState {
         self.encode_checkpoint_index(&index)
     }
 
+    /// Re-namespace the retained receipt coordinates along with their fold.
+    pub fn restore_in(&mut self, incarnation: [u8; 16]) -> Result<()> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        self.index.restore_in(incarnation)?;
+        for stored in self.receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
+            stored.receipt.basis = Basis::new(incarnation, stored.receipt.basis.position());
+        }
+        Ok(())
+    }
+
     fn encode_checkpoint_index(&self, index: &BranchIndex) -> Result<Bytes> {
         let receipts = self.receipts.values().flat_map(|namespace| namespace.values())
             .filter(|stored| stored.receipt.basis <= index.head().basis).collect::<Vec<_>>();

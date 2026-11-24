@@ -27,6 +27,7 @@ fn record_kinds_round_trip_with_fixed_tags() {
             manifest,
             through: 9,
             key_generation: 2,
+            restore: true,
         }),
         Record::Lease { until: i64::MIN },
         Record::Pin(pin.clone()),
@@ -60,13 +61,14 @@ fn malformed_record_envelopes_are_refused() {
     assert!(Record::decode(&bytes).is_err());
 
     let mut unknown = RECORD_HEADER.to_vec();
-    unknown.extend_from_slice(&[0x4a, 0]);
+    unknown.extend_from_slice(&[0x52, 0]);
     assert!(Record::decode(&unknown).is_err());
     assert!(
         Record::Checkpoint(Checkpoint {
             manifest: object(ObjectKind::File),
             through: 3,
             key_generation: 1,
+            restore: false,
         })
         .encode()
         .is_err()

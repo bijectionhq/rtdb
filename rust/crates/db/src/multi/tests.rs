@@ -13,7 +13,7 @@ use rtdb_tx::transact::{
 };
 use rtdb_types::{
     EntityId, StructFields, TableRef, Value,
-    rtdb_v1::{At, LabelScope, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, Basis, LabelScope, Layer, MAIN_BRANCH},
 };
 
 use super::*;
@@ -48,10 +48,14 @@ impl Cluster {
     }
 
     fn node(&self, n: u8, journal: Arc<dyn Journal>) -> MultiDatabase {
+        self.node_for(DATABASE, n, journal)
+    }
+
+    fn node_for(&self, database: Uuid, n: u8, journal: Arc<dyn Journal>) -> MultiDatabase {
         let time = Arc::clone(&self.time);
         MultiDatabase::new(
             MultiOptions {
-                database: DATABASE,
+                database,
                 node: ip(n),
                 lease_micros: LEASE,
                 drift_micros: DRIFT,
@@ -281,6 +285,36 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     assert_eq!(checkpoint.tx_status(&[1; 16]).unwrap().basis, original.basis);
     assert_eq!(checkpoint.tx_status(&[3; 16]).unwrap_err().code, "rtdb/unknown-transaction");
     assert_eq!(checkpoint.index().exact(future.basis).unwrap_err().code, "rtdb/unknown-basis");
+
+    let destination = Uuid::from_u128(7);
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(Identity(2)))));
+    let mut child = cluster.node_for(destination, 2, faults.clone());
+    child.create().await.unwrap();
+    child.tick(&live(2)).await.unwrap();
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(child.restore_export(&export).await.unwrap_err().category, AnomalyCategory::Interrupted);
+    child.tick(&live(2)).await.unwrap();
+    let restored = child.restore_export(&export).await.unwrap();
+    let local = |basis: Basis| Basis::new(*destination.as_bytes(), basis.position());
+    assert_eq!(restored.basis, local(selected.basis));
+    assert_eq!(child.tx_status(&original.key).await.unwrap().basis, local(original.basis));
+    let index = child.fresh_index().await.unwrap();
+    assert_eq!(index.exact(selected.basis).unwrap_err().code, "rtdb/foreign-basis");
+    assert_eq!(index.view("report", At::Latest, Layer::Merged, restored.system_time).unwrap().base(),
+        Some(&(MAIN_BRANCH.into(), local(original.basis))));
+    assert_eq!(text_at(&mut child, "report", 1).await, Some(Value::Utf8("parent row".into())));
+    assert_eq!(child.fresh_history().await.unwrap().after_floor, restored.basis.position());
+
+    let mut timed = put(5, 2, "new deployment");
+    timed.window.before = Some(Timestamp(50));
+    let written = child.transact(&timed).await.unwrap();
+    assert!(written.basis > restored.basis);
+    assert_eq!(written.outcome, Outcome::Then);
+    writer.release_pin(id).await.unwrap();
+    child.checkpoint(Vec::new()).await.unwrap();
+    let mut follower = cluster.node_for(destination, 3, Arc::new(journal.handle(Identity(3))));
+    assert_eq!(follower.tx_status(&timed.key).await.unwrap().basis, written.basis);
+    assert_eq!(text_at(&mut follower, "report", 1).await, Some(Value::Utf8("parent row".into())));
 }
 
 #[tokio::test]
@@ -1006,7 +1040,6 @@ async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
     let receipt = writer.transact(&put(1, 1, "retained")).await.unwrap();
     let old = writer.write_file(b"old ciphertext").await.unwrap();
     writer.checkpoint(vec![old]).await.unwrap();
-    cluster.at(5);
     gate.block_trim.store(true, Ordering::SeqCst);
     assert!(
         writer
@@ -1020,7 +1053,7 @@ async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
             .is_ok()
     );
 
-    cluster.at(115);
+    cluster.at(120);
     assert_eq!(
         read_file(cluster.store.as_ref(), cluster.kms.as_ref(), old)
             .await
@@ -1029,7 +1062,7 @@ async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
             .code,
         "rtdb/erased-under-view"
     );
-    cluster.at(116);
+    cluster.at(121);
     let mut successor = cluster.node(2, Arc::new(journal.handle(Identity(2))));
     assert_eq!(
         successor.tick(&live(2)).await.unwrap(),
@@ -1055,7 +1088,7 @@ async fn multi_driver_recovers_rotation_after_key_retirement_overtakes_trim() {
             .await
             .unwrap()
             .unreadable_by,
-        Timestamp(115)
+        Timestamp(120)
     );
 }
 

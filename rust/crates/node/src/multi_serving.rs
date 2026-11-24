@@ -267,7 +267,7 @@ fn changes_page(
         }
         Ok(basis.position())
     };
-    let floor = history.floor.0 - 1;
+    let floor = history.after_floor;
     let after = request.after.map(position).transpose()?.unwrap_or(0);
     if after < floor {
         return Err(Anomaly::new(
@@ -283,14 +283,14 @@ fn changes_page(
             "The change interval is inverted",
         ));
     }
-    if after > history.head.0 {
+    if after > history.through {
         return Err(Anomaly::new(
             AnomalyCategory::Unavailable,
             "rtdb/change-basis-ahead",
             "The requested basis has not applied",
         ));
     }
-    let upper = until.unwrap_or(u64::MAX).min(history.head.0);
+    let upper = until.unwrap_or(u64::MAX).min(history.through);
     let index = history.index;
     index.view(&request.branch, At::Latest, Layer::Merged, history.now)?;
     let descending = request.order == ChangeOrder::Descending;
@@ -374,7 +374,7 @@ fn changes_page(
     Ok(ChangePage {
         groups: page,
         through: Basis::new(incarnation, through),
-        complete: next.is_none() && until.is_none_or(|until| until <= history.head.0),
+        complete: next.is_none() && until.is_none_or(|until| until <= history.through),
         custody_groups: BTreeSet::new(),
     })
 }

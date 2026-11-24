@@ -98,6 +98,8 @@ pub struct Checkpoint {
     pub manifest: ObjectId,
     pub through: u64,
     pub key_generation: u64,
+    /// Installs an independently rewritten state into a fresh deployment.
+    pub restore: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

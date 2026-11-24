@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     journal::{Entry, JournalBatchAppender, Stream, journal_error, next},
     placement::preferred,
-    replay::{ChangeHistory, Committed},
+    replay::{ChangeHistory, Committed, JournalCoordinates},
 };
 
 mod pin;
@@ -271,7 +271,7 @@ impl MultiDatabase {
                 self.withdraw_writer();
                 return Err(no_writer());
             }
-            self.append(lease, envelope(terminal)?).await?;
+            self.append(lease, envelope(terminal, self.state().coordinates)?).await?;
         }
         Ok(())
     }
@@ -319,14 +319,14 @@ impl MultiDatabase {
         let original = write.at;
         let (upper, receipts) = self.commit_one(lease, write).await?;
         if request.window.before.is_none() {
-            return receipt_for(receipts, original, &request.key);
+            return receipt_for(receipts, self.state().coordinates.position(original)?, &request.key);
         }
         let (terminal, _) = self
             .decide_terminal(lease, original, upper)
             .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
         let position = terminal.at;
         let (_, receipts) = self.commit_one(lease, terminal).await?;
-        receipt_for(receipts, position, &request.key)
+        receipt_for(receipts, self.state().coordinates.position(position)?, &request.key)
     }
 
     pub async fn tx_status(&mut self, key: &[u8]) -> Result<Receipt> {
@@ -387,10 +387,12 @@ impl MultiDatabase {
     pub async fn fresh_history(&mut self) -> Result<ChangeHistory<'_>> {
         self.refresh().await?;
         let state = self.state();
+        let after_floor = state.coordinates.position(Lsn(state.floor.0 - 1))?
+            .max(state.coordinates.origin.map_or(0, |origin| origin.through));
         Ok(ChangeHistory {
             index: self.durable_transactions().index(),
-            floor: state.floor,
-            head: state.head,
+            after_floor,
+            through: state.coordinates.position(state.head)?,
             groups: &state.effects,
             now: (self.clock)(),
         })
@@ -447,6 +449,7 @@ impl MultiDatabase {
                 self.durable_transactions(),
                 lease.until,
                 false,
+                self.state().coordinates,
             )?,
         };
         let through = self.state().head;
@@ -461,6 +464,7 @@ impl MultiDatabase {
             manifest: image.id(),
             through: through.0,
             key_generation: generation,
+            restore: false,
         };
         self.append_control(lease, Record::Checkpoint(checkpoint))
             .await?;
@@ -633,12 +637,13 @@ impl MultiDatabase {
         record: Record,
     ) -> Result<()> {
         self.authority()?;
-        let at = Lsn(self
+        let coordinates = self.state().coordinates;
+        let at = coordinates.lsn(self
             .writer
             .as_mut()
             .ok_or_else(no_writer)?
             .pipeline
-            .reserve()?);
+            .reserve()?)?;
         let write = Append {
             at,
             entry: Entry {
@@ -744,14 +749,14 @@ impl MultiDatabase {
     }
 }
 
-fn envelope(record: TransactionRecord) -> Result<Record> {
+fn envelope(record: TransactionRecord, coordinates: JournalCoordinates) -> Result<Record> {
     Ok(match record {
         TransactionRecord::Tx(_) => Record::Tx {
             payload: record.encode()?.to_vec(),
             objects: Vec::new(),
         },
-        TransactionRecord::Settle { tx_lsn } => Record::Settle { tx_lsn },
-        TransactionRecord::Refuse { tx_lsn } => Record::Refuse { tx_lsn },
+        TransactionRecord::Settle { tx_lsn } => Record::Settle { tx_lsn: coordinates.lsn(tx_lsn)?.0 },
+        TransactionRecord::Refuse { tx_lsn } => Record::Refuse { tx_lsn: coordinates.lsn(tx_lsn)?.0 },
     })
 }
 

@@ -98,6 +98,7 @@ impl ErasurePlan {
             manifest: manifest.id(),
             through: self.trim_through,
             key_generation: self.next.number,
+            restore: false,
         };
         let checkpoint_record = self
             .seal_record(kms, self.cut, Record::Checkpoint(checkpoint.clone()))

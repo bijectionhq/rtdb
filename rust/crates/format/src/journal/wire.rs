@@ -48,6 +48,8 @@ struct Checkpoint {
     through: u64,
     #[prost(uint64, tag = "3")]
     key_generation: u64,
+    #[prost(bool, tag = "4")]
+    restore: bool,
 }
 
 #[derive(Message)]
@@ -120,6 +122,7 @@ impl TryFrom<&super::Record> for Record {
                 manifest: require_kind(checkpoint.manifest, ObjectKind::Manifest)?.to_string(),
                 through: checkpoint.through,
                 key_generation: checkpoint.key_generation,
+                restore: checkpoint.restore,
             }),
             Lease { until } => Kind::Lease(self::Lease { until: *until }),
             Pin(pin) => Kind::Pin(pin.try_into()?),
@@ -165,6 +168,7 @@ impl TryFrom<Record> for super::Record {
                     manifest: require_kind(checkpoint.manifest.parse()?, ObjectKind::Manifest)?,
                     through: checkpoint.through,
                     key_generation: checkpoint.key_generation,
+                    restore: checkpoint.restore,
                 }),
                 Kind::Lease(lease) => Self::Lease { until: lease.until },
                 Kind::Pin(pin) => Self::Pin(pin.try_into()?),
