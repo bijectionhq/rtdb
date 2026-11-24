@@ -14,8 +14,10 @@ use arrow_array::{
     Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
 };
 use arrow_buffer::{Buffer, ToByteSlice};
-use arrow_ipc::{Message, convert::fb_to_schema, reader::read_record_batch, root_as_message};
+use arrow_ipc::{Message, Precision, reader::read_record_batch, root_as_message};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use bytes::Bytes;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::ipc::write_uncompressed_stream_from_buffers;
 use rtdb_types::{Anomaly, Iid, Result};
 use sha2::{Digest, Sha256};
@@ -28,6 +30,8 @@ const FOOTER_BYTES: usize = 32;
 const ALIGNMENT: u64 = 64;
 const CONTINUATION: [u8; 4] = [255; 4];
 const END: [u8; 8] = [255, 255, 255, 255, 0, 0, 0, 0];
+const DECODE_SCRATCH_BYTES: usize = 8192;
+const BUFFER_OWNER_BYTES: usize = 128;
 
 fn unit_field(dimensions: usize) -> Result<DataType> {
     let width = i32::try_from(dimensions).map_err(|_| corrupt("Vector dimensions exceed the Arrow list width"))?;
@@ -228,12 +232,46 @@ fn message(bytes: &[u8]) -> Result<(Message<'_>, Range<usize>)> {
     Ok((header, end..body_end))
 }
 
-fn decode(bytes: Buffer, schema: &SchemaRef, expected_rows: Option<usize>) -> Result<RecordBatch> {
+// Check the wire fields without materializing the stored schema's metadata.
+fn matches_field(stored: arrow_ipc::Field<'_>, field: &Field) -> bool {
+    if stored.name().unwrap_or_default() != field.name() || stored.nullable() != field.is_nullable()
+        || stored.dictionary().is_some()
+        || stored.custom_metadata().is_some_and(|entries| entries.iter().any(|entry| entry.key().is_some() && entry.value().is_some())) {
+        return false;
+    }
+    match field.data_type() {
+        DataType::FixedSizeBinary(width) => stored.type_as_fixed_size_binary().is_some_and(|ty| ty.byteWidth() == *width),
+        DataType::FixedSizeList(child, width) => {
+            stored.type_as_fixed_size_list().is_some_and(|ty| ty.listSize() == *width)
+                && stored.children().is_some_and(|children| children.len() == 1 && matches_field(children.get(0), child))
+        }
+        DataType::Float32 => stored.type_as_floating_point().is_some_and(|ty| ty.precision() == Precision::SINGLE),
+        DataType::Int64 => stored.type_as_int().is_some_and(|ty| ty.is_signed() && ty.bitWidth() == 64),
+        DataType::UInt64 => stored.type_as_int().is_some_and(|ty| !ty.is_signed() && ty.bitWidth() == 64),
+        DataType::UInt32 => stored.type_as_int().is_some_and(|ty| !ty.is_signed() && ty.bitWidth() == 32),
+        _ => false,
+    }
+}
+
+struct DecodedBatch {
+    batch: RecordBatch,
+    _scratch: Arc<MemoryReservation>,
+    backing: Arc<MemoryReservation>,
+}
+
+fn decode(
+    bytes: impl AsRef<[u8]> + Send + 'static, schema: impl FnOnce() -> Result<SchemaRef>,
+    expected_rows: Option<usize>, memory: &Arc<MemoryBudget>,
+) -> Result<DecodedBatch> {
+    let scratch = memory.reserve(DECODE_SCRATCH_BYTES)?;
+    let schema = schema()?;
+    let mut backing = memory.reserve(size_of_val(&bytes) + 2 * BUFFER_OWNER_BYTES)?;
+    let bytes = Buffer::from(Bytes::from_owner(bytes));
     let (header, body) = message(&bytes)?;
     let stored = header.header_as_schema().filter(|_| body.is_empty()).ok_or_else(|| corrupt("A vector stream must begin with its schema"))?;
     if !stored.endianness().equals_to_target_endianness()
-        || stored.fields().is_none_or(|fields| fields.len() != schema.fields().len())
-        || fb_to_schema(stored).fields() != schema.fields() {
+        || stored.fields().is_none_or(|fields| fields.len() != schema.fields().len()
+            || !fields.iter().zip(schema.fields().iter()).all(|(stored, field)| matches_field(stored, field))) {
         return Err(corrupt("A vector generation stream has the wrong layout"));
     }
     let first_end = body.end;
@@ -258,9 +296,43 @@ fn decode(bytes: Buffer, schema: &SchemaRef, expected_rows: Option<usize>) -> Re
         return Err(corrupt("Invalid Arrow IPC buffers in a vector generation"));
     }
     let data = bytes.slice_with_length(first_end + body.start, body.len());
-    // Arrow retains aligned slices of the input and copies misaligned primitive buffers.
-    read_record_batch(&data, batch, Arc::clone(schema), &Default::default(), None, &header.version())
-        .map_err(|error| corrupt(&error.to_string()))
+    let copy_bytes = alignment_copy_bytes(data.as_slice(), batch, &schema)?;
+    if copy_bytes > 0 {
+        let retained = backing.bytes().checked_add(copy_bytes)
+            .ok_or_else(|| corrupt("Vector decode allocation exceeds addressable memory"))?;
+        Arc::get_mut(&mut backing).expect("vector decode owns its reservation").grow_to(retained)?;
+    }
+    let batch = read_record_batch(&data, batch, schema, &Default::default(), None, &header.version())
+        .map_err(|error| corrupt(&error.to_string()))?;
+    Ok(DecodedBatch { batch, _scratch: scratch, backing })
+}
+
+fn alignment_copy_bytes(body: &[u8], batch: arrow_ipc::RecordBatch<'_>, schema: &Schema) -> Result<usize> {
+    let invalid = || corrupt("Invalid Arrow IPC buffers in a vector generation");
+    let overflow = || corrupt("Vector decode allocation exceeds addressable memory");
+    let mut buffers = batch.buffers().ok_or_else(invalid)?.iter();
+    schema.fields().iter().try_fold(0usize, |bytes, field| {
+        let ty = if let DataType::FixedSizeList(child, _) = field.data_type() {
+            buffers.next().ok_or_else(invalid)?;
+            child.data_type()
+        } else {
+            field.data_type()
+        };
+        let values = buffers.nth(1).ok_or_else(invalid)?;
+        let alignment = match ty {
+            DataType::FixedSizeBinary(_) => 1,
+            DataType::Float32 => align_of::<f32>(),
+            DataType::Int64 => align_of::<i64>(),
+            DataType::UInt64 => align_of::<u64>(),
+            DataType::UInt32 => align_of::<u32>(),
+            _ => return Err(invalid()),
+        };
+        let offset = values.offset() as usize;
+        if body[offset..].as_ptr().align_offset(alignment) == 0 { return Ok(bytes); }
+        // Arrow's alignment copy rounds each buffer's capacity to 64 bytes.
+        let capacity = (values.length() as usize).checked_next_multiple_of(64).ok_or_else(overflow)?;
+        bytes.checked_add(capacity).and_then(|bytes| bytes.checked_add(BUFFER_OWNER_BYTES)).ok_or_else(overflow)
+    })
 }
 
 /// One cluster as the directory names it.
@@ -279,16 +351,18 @@ pub(crate) struct Directory {
     lengths: UInt64Array,
     counts: UInt32Array,
     digests: FixedSizeBinaryArray,
+    _backing: Arc<MemoryReservation>,
 }
 
 impl Directory {
     /// Decodes directory bytes, checking them against the locator's digest.
-    pub(crate) fn read(bytes: Buffer, locator: &Locator) -> Result<Self> {
-        if bytes.len() as u64 != locator.directory.1 || <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) != locator.digest {
+    pub(crate) fn read(bytes: impl AsRef<[u8]> + Send + 'static, locator: &Locator, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if bytes.as_ref().len() as u64 != locator.directory.1 || <[u8; 32]>::from(Sha256::digest(bytes.as_ref())) != locator.digest {
             return Err(corrupt("A vector generation directory does not match its recorded length or digest"));
         }
         let dimensions = locator.dimensions as usize;
-        let batch = decode(bytes, &directory_schema(dimensions)?, None)?;
+        let decoded = decode(bytes, || directory_schema(dimensions), None, memory)?;
+        let batch = &decoded.batch;
         let column = |index: usize| batch.column(index).as_ref();
         let partitions = column(0).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| corrupt("partition"))?;
         let centroids = column(1).as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| corrupt("centroid"))?;
@@ -309,7 +383,7 @@ impl Directory {
         Ok(Self {
             dimensions, partitions: partitions.clone(), centroids: values,
             offsets: offsets.clone(), lengths: lengths.clone(), counts: counts.clone(),
-            digests: digests.clone(),
+            digests: digests.clone(), _backing: decoded.backing,
         })
     }
 
@@ -334,15 +408,24 @@ impl Directory {
 }
 
 /// One cluster's rows.
-pub(crate) struct Block { iids: FixedSizeBinaryArray, valid_from: Int64Array, valid_to: Int64Array, system_from: Int64Array, units: Float32Array, dimensions: usize }
+pub(crate) struct Block {
+    iids: FixedSizeBinaryArray,
+    valid_from: Int64Array,
+    valid_to: Int64Array,
+    system_from: Int64Array,
+    units: Float32Array,
+    dimensions: usize,
+    _backing: Arc<MemoryReservation>,
+}
 
 impl Block {
-    pub(crate) fn read(bytes: Buffer, cluster: &Cluster, dimensions: usize) -> Result<Self> {
-        if cluster.range.end.checked_sub(cluster.range.start) != Some(bytes.len() as u64)
-            || <[u8; 32]>::from(Sha256::digest(bytes.as_slice())) != cluster.digest {
+    pub(crate) fn read(bytes: impl AsRef<[u8]> + Send + 'static, cluster: &Cluster, dimensions: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        if cluster.range.end.checked_sub(cluster.range.start) != Some(bytes.as_ref().len() as u64)
+            || <[u8; 32]>::from(Sha256::digest(bytes.as_ref())) != cluster.digest {
             return Err(corrupt("A vector cluster does not match its recorded length or digest"));
         }
-        let batch = decode(bytes, &block_schema(dimensions)?, Some(cluster.rows as usize))?;
+        let decoded = decode(bytes, || block_schema(dimensions), Some(cluster.rows as usize), memory)?;
+        let batch = &decoded.batch;
         let column = |index: usize| batch.column(index).as_ref();
         let integers = |index: usize| column(index).as_any().downcast_ref::<Int64Array>().cloned().ok_or_else(|| corrupt("temporal column"));
         let units = column(4).as_any().downcast_ref::<FixedSizeListArray>().ok_or_else(|| corrupt("unit"))?
@@ -351,6 +434,7 @@ impl Block {
         Ok(Self {
             iids: column(0).as_any().downcast_ref::<FixedSizeBinaryArray>().cloned().ok_or_else(|| corrupt("_iid"))?,
             valid_from: integers(1)?, valid_to: integers(2)?, system_from: integers(3)?, units, dimensions,
+            _backing: decoded.backing,
         })
     }
 
@@ -368,10 +452,15 @@ pub(crate) fn corrupt(detail: &str) -> Anomaly { Anomaly::fault("rtdb.vector/cor
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use rtdb_columnar::MemoryBudget;
-    use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, cache::BufferPool};
+    use futures::{StreamExt, channel::oneshot};
+    use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, cache::{BufferPool, CacheLease}};
     use rtdb_types::{EventHeader, EventOp, Interval, Timestamp};
+
+    struct StoredBytes(Buffer);
+
+    impl AsRef<[u8]> for StoredBytes {
+        fn as_ref(&self) -> &[u8] { self.0.as_slice() }
+    }
 
     fn encode(schema: &SchemaRef, batch: RecordBatch) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -408,9 +497,10 @@ mod tests {
         let bytes = Buffer::from_slice_ref(&first);
         let directory_bytes = bytes.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize);
         let directory_layout = directory_schema(2).unwrap();
-        let directory_batch = decode(directory_bytes.clone(), &directory_layout, None).unwrap();
-        assert_eq!(directory_bytes.as_slice(), encode(&directory_layout, directory_batch).unwrap().as_slice());
-        let directory = Directory::read(directory_bytes, &locator).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let directory_batch = decode(StoredBytes(directory_bytes.clone()), || Ok(Arc::clone(&directory_layout)), None, &memory).unwrap();
+        assert_eq!(directory_bytes.as_slice(), encode(&directory_layout, directory_batch.batch).unwrap().as_slice());
+        let directory = Directory::read(StoredBytes(directory_bytes), &locator, &memory).unwrap();
         let total: u32 = (0..directory.len()).map(|row| directory.cluster(row).rows).sum();
         assert_eq!(total, 1_000);
         let schema = block_schema(2).unwrap();
@@ -421,9 +511,9 @@ mod tests {
             assert!(first[previous_end as usize..start as usize].iter().all(|&byte| byte == 0));
             previous_end = cluster.range.end;
             let range = bytes.slice_with_length(start as usize, (cluster.range.end - start) as usize);
-            let batch = decode(range.clone(), &schema, Some(cluster.rows as usize)).unwrap();
-            assert_eq!(range.as_slice(), encode(&schema, batch).unwrap().as_slice());
-            let block = Block::read(range, &cluster, 2).unwrap();
+            let batch = decode(StoredBytes(range.clone()), || Ok(Arc::clone(&schema)), Some(cluster.rows as usize), &memory).unwrap();
+            assert_eq!(range.as_slice(), encode(&schema, batch.batch).unwrap().as_slice());
+            let block = Block::read(StoredBytes(range), &cluster, 2, &memory).unwrap();
             assert_eq!(block.len(), cluster.rows as usize);
             for row in 0..block.len() {
                 let (_, _, seed) = block.extent(row);
@@ -449,14 +539,15 @@ mod tests {
         assert!(rows.contiguous_units(&gapped).is_none());
 
         let schema = block_schema(2).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
         for selected in [contiguous, reordered, gapped] {
             let mut bytes = Vec::new();
             let (length, digest) = write_block(&mut bytes, &schema, &rows, &selected).unwrap();
-            let cluster = Cluster { partition: source[0].partition, centroid: 0..2, range: 0..length, rows: 2, digest };
+            let cluster = Cluster { range: 0..length, rows: 2, digest };
             let buffer = Buffer::from_vec(bytes);
-            let batch = decode(buffer.clone(), &schema, Some(selected.len())).unwrap();
-            assert_eq!(buffer.as_slice(), encode(&schema, batch).unwrap().as_slice());
-            let block = Block::read(buffer, &cluster, 2).unwrap();
+            let batch = decode(StoredBytes(buffer.clone()), || Ok(Arc::clone(&schema)), Some(selected.len()), &memory).unwrap();
+            assert_eq!(buffer.as_slice(), encode(&schema, batch.batch).unwrap().as_slice());
+            let block = Block::read(StoredBytes(buffer), &cluster, 2, &memory).unwrap();
             for (index, row) in selected.into_iter().enumerate() {
                 assert_eq!(block.iid(index).unwrap(), row.iid);
                 assert_eq!(block.extent(index), (row.valid_from, row.valid_to, row.system_from));
@@ -495,37 +586,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aligned_directory_and_cluster_columns_keep_their_range_charges() {
-        struct Aligned(Buffer);
-        impl AsRef<[u8]> for Aligned {
-            fn as_ref(&self) -> &[u8] { self.0.as_slice() }
-        }
-
+    async fn directory_and_cluster_columns_keep_their_range_and_decode_charges() {
         let mut bytes = Vec::new();
         let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
-        let memory = MemoryBudget::new(bytes.len());
-        let store = Arc::new(MemoryStore::default());
         let key = ObjectKey::new("vector").unwrap();
-        store.put(&key, Bytes::from_owner(Aligned(Buffer::from_slice_ref(&bytes)))).await.unwrap();
-        let pool = BufferPool::new(store, 0);
+        let range_owner = size_of::<CacheLease>() + 2 * BUFFER_OWNER_BYTES;
+        let directory_len = locator.directory.1 as usize;
+        for shift in [0, 1] {
+            let store = Arc::new(MemoryStore::default());
+            let mut stored = vec![0; shift];
+            stored.extend_from_slice(&bytes);
+            let stored = Buffer::from_slice_ref(&stored).slice(shift);
+            store.put(&key, Bytes::from_owner(StoredBytes(stored))).await.unwrap();
+            let pool = BufferPool::new(store, 0);
 
-        let lease = pool.get_range_or(&key, locator.directory_range(), &memory).await.unwrap();
-        let directory_bytes = lease.as_slice().as_ptr_range();
-        let directory = Directory::read(Buffer::from(Bytes::from_owner(lease)), &locator).unwrap();
-        let cluster = directory.cluster(0);
-        assert!(directory_bytes.contains(&directory.centroid(0).as_ptr().cast::<u8>()));
-        assert_eq!(memory.used_bytes(), locator.directory.1 as usize);
+            let memory = MemoryBudget::new(1 << 20);
+            let lease = pool.get_range_or(&key, locator.directory_range(), &memory).await.unwrap();
+            let directory_bytes = lease.as_slice().as_ptr_range();
+            let directory = Directory::read(lease, &locator, &memory).unwrap();
+            let (cluster, later_cluster) = (directory.cluster(0), directory.cluster(1));
+            assert_eq!(directory_bytes.contains(&directory.centroid(0).as_ptr().cast::<u8>()), shift == 0);
+            let copies = shift * 4 * (64 + BUFFER_OWNER_BYTES);
+            let directory_charge = directory_len + range_owner + copies;
+            assert_eq!(memory.used_bytes(), directory_charge);
 
-        let lease = pool.get_range_or(&key, cluster.range.clone(), &memory).await.unwrap();
-        let cluster_bytes = lease.as_slice().as_ptr_range();
-        let cluster_len = lease.as_slice().len();
-        let block = Block::read(Buffer::from(Bytes::from_owner(lease)), &cluster, 2).unwrap();
-        assert!(cluster_bytes.contains(&block.unit(0).as_ptr().cast::<u8>()));
-        assert_eq!(memory.used_bytes(), locator.directory.1 as usize + cluster_len);
-        drop(directory);
-        assert_eq!(memory.used_bytes(), cluster_len);
-        drop(block);
-        assert_eq!(memory.used_bytes(), 0);
+            let (release, wait) = oneshot::channel();
+            let reads = futures::stream::iter([(&cluster, Some(wait)), (&later_cluster, None)].into_iter().map(|(cluster, wait)| {
+                let (pool, key, memory) = (&pool, &key, &memory);
+                async move {
+                    let lease = pool.get_range_or(key, cluster.range.clone(), memory).await.unwrap();
+                    if let Some(wait) = wait { wait.await.unwrap(); }
+                    let addresses = lease.as_slice().as_ptr_range();
+                    (cluster.range.start, addresses, Block::read(lease, cluster, 2, memory).unwrap())
+                }
+            })).buffer_unordered(2);
+            futures::pin_mut!(reads);
+            let (start, later_bytes, later_block) = reads.next().await.unwrap();
+            assert_eq!(start, later_cluster.range.start);
+            assert_eq!(later_bytes.contains(&later_block.unit(0).as_ptr().cast::<u8>()), shift == 0);
+            release.send(()).unwrap();
+            let (start, cluster_bytes, block) = reads.next().await.unwrap();
+            assert_eq!(start, cluster.range.start);
+            assert_eq!(cluster_bytes.contains(&block.unit(0).as_ptr().cast::<u8>()), shift == 0);
+            let cluster_len = (cluster.range.end - cluster.range.start) as usize;
+            let block_charge = cluster_len + range_owner + copies;
+            let later_charge = (later_cluster.range.end - later_cluster.range.start) as usize + range_owner + copies;
+            assert_eq!(memory.used_bytes(), directory_charge + block_charge + later_charge);
+            drop(directory);
+            assert_eq!(memory.used_bytes(), block_charge + later_charge);
+            drop(block);
+            assert_eq!(memory.used_bytes(), later_charge);
+            drop(later_block);
+            assert_eq!(memory.used_bytes(), 0);
+
+            if shift == 1 {
+                let limited = MemoryBudget::new(directory_len + range_owner + DECODE_SCRATCH_BYTES);
+                let lease = pool.get_range_or(&key, locator.directory_range(), &limited).await.unwrap();
+                let error = Directory::read(lease, &locator, &limited).err().unwrap();
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                assert!(crate::shortlist::declined(&error));
+                assert_eq!(limited.used_bytes(), 0);
+
+                let limited = MemoryBudget::new(cluster_len + range_owner + DECODE_SCRATCH_BYTES);
+                let lease = pool.get_range_or(&key, cluster.range.clone(), &limited).await.unwrap();
+                let error = Block::read(lease, &cluster, 2, &limited).err().unwrap();
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                assert!(crate::shortlist::declined(&error));
+                assert_eq!(limited.used_bytes(), 0);
+            }
+        }
     }
 
     #[test]
@@ -533,12 +662,14 @@ mod tests {
         let mut bytes = Vec::new();
         let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
         let aligned = Buffer::from_slice_ref(&bytes);
-        let directory = Directory::read(aligned.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize), &locator).unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let directory_bytes = aligned.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize);
+        let directory = Directory::read(StoredBytes(directory_bytes), &locator, &memory).unwrap();
         let cluster = directory.cluster(0);
         let mut shifted = vec![0];
         shifted.extend_from_slice(&bytes[cluster.range.start as usize..cluster.range.end as usize]);
         let range = Buffer::from_slice_ref(&shifted).slice(1);
-        let block = Block::read(range.clone(), &cluster, 2).unwrap();
+        let block = Block::read(StoredBytes(range.clone()), &cluster, 2, &memory).unwrap();
         assert_eq!(block.len(), cluster.rows as usize);
         assert!(!range.as_ptr_range().contains(&block.unit(0).as_ptr().cast::<u8>()));
 
@@ -546,10 +677,10 @@ mod tests {
         let bad_digest = Cluster { digest: [0; 32], range: cluster.range.clone(), ..cluster };
         let bad_length = Cluster { range: cluster.range.start..cluster.range.end + 1, ..cluster };
         for record in [&bad_rows, &bad_digest, &bad_length] {
-            let error = Block::read(range.clone(), record, 2).err().unwrap();
+            let error = Block::read(StoredBytes(range.clone()), record, 2, &memory).err().unwrap();
             assert!(crate::shortlist::declined(&error));
         }
-        let error = Block::read(range, &cluster, 3).err().unwrap();
+        let error = Block::read(StoredBytes(range), &cluster, 3, &memory).err().unwrap();
         assert!(crate::shortlist::declined(&error));
     }
 }
