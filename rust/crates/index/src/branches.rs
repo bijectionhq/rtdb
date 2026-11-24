@@ -647,6 +647,12 @@ impl<'a> BranchView<'a> {
         self.index.tables(self.cut.basis)
     }
 
+    pub fn count_constraints(&self) -> impl Iterator<Item = (&TableRef, &str, &CountRange)> {
+        self.tables().filter(|_| !self.index.visibility_projection).flat_map(|(table, definition)| {
+            definition.constraints.iter().map(move |(name, range)| (table, name.as_str(), range))
+        })
+    }
+
     pub fn table(&self, table: &TableRef) -> Option<&BranchTable> {
         self.index.definition(table, self.cut.basis).filter(|definition| !definition.dropped)
     }

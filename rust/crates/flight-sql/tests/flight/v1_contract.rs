@@ -1269,6 +1269,52 @@ async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
     assert_eq!(ints(&query(&mut client, read.clone()).await.0), [2]);
     read.source.as_mut().unwrap().at = Some(v1::At { selection: first.basis.map(Selection::Exactly) });
     assert_eq!(ints(&query(&mut client, read).await.0), [1]);
+
+    let constraint = |change| v1::Op {
+        op: Some(v1::op::Op::Declare(v1::Declare {
+            table: "public.events".into(),
+            change: Some(v1::declare::Change::Constraint(v1::Constraint {
+                name: "event_capacity".into(), expression: String::new(), change: Some(change),
+            })),
+        })),
+    };
+    let installed = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![3; 16],
+        require: vec!["declare.constraint.count-range".into()],
+        ops: vec![constraint(v1::constraint::Change::CountRange(v1::CountRangeConstraint {
+            index: "events_by_partition".into(), n: 2, ..Default::default()
+        }))],
+        ..Default::default()
+    }).await.unwrap();
+    assert!(matches!(installed.outcome, Some(v1::receipt::Outcome::Then(()))));
+    let mut read = input("SELECT COUNT(*) FROM xt.count_constraints WHERE constraint_name = 'event_capacity'");
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: installed.basis.clone().map(Selection::AtLeast) });
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [1]);
+
+    let put = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![4; 16],
+        ops: vec![v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+            branch: "main".into(), table: "public.events".into(),
+            rows: (1..=3).map(|id| v1::Row {
+                cells: [("_id".into(), integer_cell(id)), ("partition_key".into(), integer_cell(1)),
+                    ("sequence_no".into(), integer_cell(id))].into_iter().collect(),
+                ..Default::default()
+            }).collect(),
+            if_absent: false,
+        })) }],
+        ..Default::default()
+    }).await.unwrap();
+    assert!(matches!(put.outcome, Some(v1::receipt::Outcome::Refused(error)) if error.code == "rtdb/count-constraint"));
+
+    let dropped = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![5; 16],
+        ops: vec![constraint(v1::constraint::Change::Drop(()))],
+        ..Default::default()
+    }).await.unwrap();
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: dropped.basis.map(Selection::AtLeast) });
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [0]);
+    read.source.as_mut().unwrap().at = Some(v1::At { selection: installed.basis.map(Selection::Exactly) });
+    assert_eq!(ints(&query(&mut client, read).await.0), [1]);
     running.stop().await;
 }
 

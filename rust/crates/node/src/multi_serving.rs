@@ -5,7 +5,7 @@ use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
-    CustodyGroupId, CustodyWriterFence, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
+    COUNT_RANGE_CONSTRAINT, CustodyGroupId, CustodyWriterFence, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
     ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyRelease,
 };
 use rtdb_types::{
@@ -65,7 +65,7 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
+        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, COUNT_RANGE_CONSTRAINT, ROW_VISIBILITY, "query", "query.track", "query.page", rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS,
           "query.linearizable", "branches", "branch.local-layer", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
     }
 

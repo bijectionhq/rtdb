@@ -9,7 +9,7 @@ use journal_contract::{Epoch, JournalError, Lsn};
 use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
-    Decision, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
+    COUNT_RANGE_CONSTRAINT, Decision, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Terminal, Transact,
     TransactPipeline, TransactState, TransactionRecord, TxKey,
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{ClaimVerifier, LabelScope}};
@@ -25,7 +25,7 @@ use super::{
 };
 
 const CAPACITY: usize = 64;
-const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, PHYSICAL_ERASURE, "row-visibility", "branches"];
+const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, RELATIVE_VALID_TIME, PHYSICAL_ERASURE, COUNT_RANGE_CONSTRAINT, "row-visibility", "branches"];
 const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, PHYSICAL_ERASURE, "row-visibility"];
 type Reply<T> = oneshot::Sender<Result<T>>;
 

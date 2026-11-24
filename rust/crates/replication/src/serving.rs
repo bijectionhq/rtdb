@@ -6,7 +6,7 @@ use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
 use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchIndex, BranchWrite}};
 use rtdb_tx::transact::{
-    Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact,
+    COUNT_RANGE_CONSTRAINT, Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact,
     TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState,
     TransactionRecord, TrustedCustodyRelease,
 };
@@ -37,7 +37,7 @@ const LEGACY_FRAME_HEADER_BYTES: usize = 65;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches", "branch.local-layer",
-    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, TIMED_TRANSACT, "row-visibility", "tx-status", "sql.history",
+    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, RELATIVE_VALID_TIME, TIMED_TRANSACT, COUNT_RANGE_CONSTRAINT, "row-visibility", "tx-status", "sql.history",
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, "branches", "branch.local-layer",

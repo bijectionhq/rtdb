@@ -138,10 +138,11 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
                     .map(|id| entity(Some(id), memory))
                     .collect::<Result<_, _>>()?,
             },
-            WireOp::Declare(declare) => Op::Declare {
-                table: table(&declare.table)?,
-                change: declaration(declare.change, memory)?,
-            },
+            WireOp::Declare(declare) => {
+                let table = table(&declare.table)?;
+                let change = declaration(&table, declare.change, memory)?;
+                Op::Declare { table, change }
+            }
             WireOp::Fork(fork) => {
                 let from = fork
                     .from
@@ -217,6 +218,7 @@ fn decode_op(op: proto::Op, memory: &Arc<MemoryBudget>) -> Result<Op, Status> {
 }
 
 fn declaration(
+    table: &TableRef,
     change: Option<proto::declare::Change>,
     memory: &Arc<MemoryBudget>,
 ) -> Result<Declaration, Status> {
@@ -260,7 +262,25 @@ fn declaration(
                 })
             }
             Change::Ttl(ttl) => Declaration::Ttl(ttl.duration_micros),
-            Change::Constraint(_) => return Err(error::unsupported("declare.constraint")),
+            Change::Constraint(constraint) => {
+                use proto::constraint::Change as ConstraintChange;
+                if !constraint.expression.is_empty() {
+                    return Err(error::unsupported("declare.constraint.expression"));
+                }
+                let range = match constraint.change {
+                    Some(ConstraintChange::CountRange(count)) => Some(CountRange {
+                        table: table.clone(),
+                        index: count.index,
+                        lower: count.lower.map(|bound| bound_bytes(bound, memory)).transpose()?,
+                        upper: count.upper.map(|bound| bound_bytes(bound, memory)).transpose()?,
+                        valid_at: count.valid_at_micros.map(Timestamp),
+                        n: count.n,
+                    }),
+                    Some(ConstraintChange::Drop(())) => None,
+                    None => return Err(error::incorrect("Constraint needs a count range or an explicit drop")),
+                };
+                Declaration::Constraint { name: constraint.name, range }
+            }
             Change::Drop(_) => Declaration::Drop,
             Change::Visibility(value) => Declaration::Visibility(rtdb_tx::transact::Visibility { column: value.column }),
             Change::SingleLabelPerTx(_) => Declaration::SingleLabelPerTx,

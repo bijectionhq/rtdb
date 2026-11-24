@@ -318,6 +318,7 @@ pub const TRANSACT_REQUIRES: &str = "transact.requires";
 pub const RELATIVE_VALID_TIME: &str = "transact.relative-valid-time";
 pub const ROW_CUSTODY: &str = "row-custody";
 pub const PHYSICAL_ERASURE: &str = "erasure";
+pub const COUNT_RANGE_CONSTRAINT: &str = "declare.constraint.count-range";
 pub const REQUIREMENT_FAILED: &str = "rtdb/requirement-failed";
 
 #[derive(Clone, Copy)]

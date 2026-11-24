@@ -74,6 +74,7 @@ pub fn branch_snapshot_with(
             }
             append_lineage(view, &mut buffer)?;
             append_ordered_indexes(view, &mut buffer)?;
+            append_count_constraints(view, &mut buffer)?;
             append_custody_inventory(view, &mut buffer)?;
             append_custody_placements(view, &mut buffer)?;
         }
@@ -136,6 +137,41 @@ fn append_ordered_indexes(view: &BranchView<'_>, buffer: &mut TransactionBuffer)
             ]);
             buffer.put(catalog.clone(), cells, Interval::ALL)?;
         }
+    }
+    Ok(())
+}
+
+fn append_count_constraints(view: &BranchView<'_>, buffer: &mut TransactionBuffer) -> Result<()> {
+    let catalog = TableRef::new("xt", "count_constraints");
+    let text = LogicalType::Scalar(ScalarType::Utf8);
+    let binary = LogicalType::Scalar(ScalarType::Binary);
+    let columns = StructFields::from([
+        ("_id".into(), text.clone()),
+        ("schema_name".into(), text.clone()),
+        ("table_name".into(), text.clone()),
+        ("constraint_name".into(), text.clone()),
+        ("index_name".into(), text),
+        ("lower_key".into(), binary.clone()),
+        ("upper_key".into(), binary),
+        ("valid_at_micros".into(), LogicalType::Scalar(ScalarType::I64)),
+        ("maximum".into(), LogicalType::Scalar(ScalarType::U64)),
+    ]);
+    buffer.declare_table(catalog.clone(), columns.keys().cloned())?;
+    buffer.declare_document_types(&catalog, &columns)?;
+    for (table, name, range) in view.count_constraints() {
+        let id = format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table);
+        let cells = StructFields::from([
+            ("_id".into(), Value::Utf8(id)),
+            ("schema_name".into(), Value::Utf8(table.schema.clone())),
+            ("table_name".into(), Value::Utf8(table.table.clone())),
+            ("constraint_name".into(), Value::Utf8(name.into())),
+            ("index_name".into(), Value::Utf8(range.index.clone())),
+            ("lower_key".into(), range.lower.clone().map_or(Value::Null, Value::Binary)),
+            ("upper_key".into(), range.upper.clone().map_or(Value::Null, Value::Binary)),
+            ("valid_at_micros".into(), range.valid_at.map_or(Value::Null, |at| Value::I64(at.0))),
+            ("maximum".into(), Value::U64(range.n)),
+        ]);
+        buffer.put(catalog.clone(), cells, Interval::ALL)?;
     }
     Ok(())
 }

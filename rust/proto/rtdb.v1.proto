@@ -151,7 +151,21 @@ enum IndexKind {
 }
 message Index { string name = 1; IndexKind kind = 2; repeated string columns = 3; }
 message Ttl { optional uint64 duration_micros = 1; }
-message Constraint { string name = 1; string expression = 2; }
+message CountRangeConstraint {
+  string index = 1;
+  Cell lower = 2;
+  Cell upper = 3;
+  optional sint64 valid_at_micros = 4;
+  uint64 n = 5;
+}
+message Constraint {
+  string name = 1;
+  string expression = 2;
+  oneof change {
+    CountRangeConstraint count_range = 3;
+    google.protobuf.Empty drop = 4;
+  }
+}
 message Visibility { string column = 1; }
 message Declare {
   string table = 1;
