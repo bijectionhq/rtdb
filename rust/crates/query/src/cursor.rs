@@ -1026,7 +1026,7 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20);
         let database = crate::DatabaseSnapshot {
             partitions: Vec::new(),
-            storage: Arc::new(rtdb_storage::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
+            storage: Arc::new(rtdb_storage::cache::BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20)),
         };
         let catalog = crate::CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false)?;
         let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(10), "UTC", crate::QueryOptions::default(),
