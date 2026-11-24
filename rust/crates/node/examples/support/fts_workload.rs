@@ -53,7 +53,8 @@ impl ScanAccelerator for ObservedSearch {
             && let Some(top_k) = &mut scan.top_k {
             top_k.ascending_id = None;
         }
-        let request = ScanRequest { scan: &scan, ..*request };
+        let request = ScanRequest {
+            candidate_iids: None, scan: &scan, ..*request };
         let (picked, plan) = self.0.workload_candidates(&request, policy).await?;
         OBSERVATION.with(|observation| observation.plans.borrow_mut().push(plan));
         Ok(picked)

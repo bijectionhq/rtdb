@@ -20,7 +20,7 @@ use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, sele
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
 use crate::columnar::BatchCursor;
-use crate::{context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
+use crate::{ConstantEvaluator, PreparedSearchQuery, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 struct DataFile {
     storage: Arc<BufferPool>,
@@ -242,7 +242,7 @@ async fn read_metadata(storage: &Arc<BufferPool>, key: &ObjectKey, memory: &Arc<
 /// The events of `keys`, or of every entity, in one primary trie, read from the data pages whose metadata path covers them.
 /// `None` once more than `max_rows` rows would be inspected.
 pub(crate) async fn primary_point_events(
-    request: &crate::ScanRequest<'_>, slug: &TableSlug, trie: &TrieKey, keys: Option<&BTreeSet<Iid>>, max_rows: usize,
+    request: &crate::ScanRequest<'_>, slug: &TableSlug, trie: &TrieKey, keys: Option<crate::IidScope<'_>>, max_rows: usize,
     mut visit: impl FnMut(crate::LocatedHistoryEvent<()>, Option<&[u8]>) -> Result<bool>,
 ) -> Result<Option<usize>> {
     let memory = request.memory;
@@ -254,7 +254,7 @@ pub(crate) async fn primary_point_events(
         if request.cancellation.is_cancelled() { return Err(point_cancelled()); }
         audience_work::scan_items(1)?;
         let (lower, upper) = path_range(&path)?;
-        if keys.is_some_and(|keys| keys.range(lower..=upper).next().is_none()) { continue; }
+        if keys.is_some_and(|keys| !keys.intersects(lower, upper)) { continue; }
         match &metadata.nodes()[node] {
             MetadataNode::Nil => {}
             MetadataNode::Leaf { data_page_index, .. } => { pages.insert(*data_page_index); }
@@ -740,7 +740,12 @@ impl ScanCursor {
     }
     /// A scan of the given partitions of its database, which share `storage`.
     /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
-    async fn over(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
+    async fn over(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
+        database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
+        Self::over_with_queries(scan, execution, pushdowns, database_partitions, storage, accelerate, order, &SearchQueries::default()).await
+    }
+
+    async fn over_with_queries(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>, search_queries: &SearchQueries) -> Result<Self> {
         if !execution.context.catalog.permits_table(&scan.table.name) {
             return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
         }
@@ -779,37 +784,31 @@ impl ScanCursor {
         }
         let name = scan.table.name.database.clone();
         let source = format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table);
+        let constants = ExecutionConstants { execution: &execution, search_queries };
         let mut queries = Vec::with_capacity(scan.matches.len());
         for evaluated in &scan.matches {
-            let constants = crate::accelerate::ExecutionConstants(&execution);
-            queries.push(match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? { Some(Value::Utf8(text)) => Some(text), _ => None });
+            queries.push(constants.search_query(&evaluated.query).await?);
         }
-        let parsed: Vec<_> = queries.iter().map(|query| query.as_deref().map(rtdb_text::Query::parse).map(Arc::new)).collect();
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
         let ranking = if let Some(top) = scan.top_k.as_ref()
             && let Some(output) = top.score
             && let Some(source) = scan.columns.iter().find(|field| field.id == top.column)
         {
-            let constants = crate::accelerate::ExecutionConstants(&execution);
-            let scorer = match crate::ConstantEvaluator::constant(&constants, &top.query).await? {
-                Some(Value::Utf8(query)) => Some(Arc::new(rtdb_text::Scorer::new(rtdb_text::Query::parse(&query), None))),
-                _ => None,
-            };
+            let scorer = constants.search_query(&top.query).await?.map(|query| Arc::clone(query.scorer()));
             Some(RankProjection { output, source: source.name.clone(), scorer, verified: None, live: None })
         } else { None };
         let fragmenter = if virtual_metadata || archive_history { None } else { execution.context.catalog.fragmenter.clone() };
         use futures::TryStreamExt;
         let _verifier_charge = execution.context.memory.reserve(database_partitions.len().saturating_mul(size_of::<ScanVerifier<'_>>()))?;
         let verifiers: Vec<_> = database_partitions.iter().map(|partition| ScanVerifier {
-            scan: &scan, execution: &execution, pushdowns: pushdowns.clone(), partition, storage, canonical_entity_iids, counts: Default::default(),
+            scan: &scan, execution: &execution, constants: &constants, pushdowns: pushdowns.clone(), partition, storage, canonical_entity_iids, counts: Default::default(),
         }).collect();
-        let constants = crate::accelerate::ExecutionConstants(&execution);
         let query_winners = Box::pin(async {
             let Some(top) = scan.top_k.as_ref() else { return Ok(None); };
             if !accelerate || order.is_some() || execution.context.accelerators.is_empty() { return Ok(None); }
             let Some(snapshot) = database_partitions.first() else { return Ok(None); };
             let context = &execution.context;
-            let request = crate::ScanRequest { database: &name, scan: &scan, snapshot, storage,
+            let request = crate::ScanRequest { database: &name, scan: &scan, candidate_iids: None, snapshot, storage,
                 bounds: bounds(&scan, snapshot, &execution).await?, memory: &context.memory, current_time: context.current_time,
                 cancellation: &context.cancellation, constants: &constants, partitions: database_partitions, verifier: &verifiers[0] };
             let Some(limit) = request.ranked_prefix_len(top).await.and_then(std::num::NonZeroUsize::new) else { return Ok(None); };
@@ -843,19 +842,18 @@ impl ScanCursor {
             let snapshot = verifier.partition;
             let winners = winners.as_mut().map(|winners| winners.take_partition(partition));
             let ranked_here = winners.is_some();
-            let (scan, execution, pushdowns, ranking, name, queries, parsed, slots, fragmenter) =
-                (&scan, &execution, &pushdowns, &ranking, &name, &queries, &parsed, &slots, &fragmenter);
+            let (scan, execution, pushdowns, ranking, name, queries, slots, fragmenter, constants) =
+                (&scan, &execution, &pushdowns, &ranking, &name, &queries, &slots, &fragmenter, &constants);
             let (partition, counts) = async move {
                 let mut parts = VecDeque::new();
                 let bounds = bounds(scan, snapshot, execution).await?;
-                let mut narrowed = scan.clone();
                 let mut ranking = ranking.clone();
                 let mut candidate_iids = None;
                 let mut verified = None;
                 if let Some(winners) = winners {
-                    let request = crate::ScanRequest { database: name, scan, snapshot, storage, bounds, memory: &execution.context.memory,
+                    let request = crate::ScanRequest { database: name, scan, candidate_iids: None, snapshot, storage, bounds, memory: &execution.context.memory,
                         current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
-                        constants: &crate::accelerate::ExecutionConstants(execution), verifier, partitions: database_partitions };
+                        constants, verifier, partitions: database_partitions };
                     match request.ranked_selection(winners).await {
                         Ok(Some(selection)) => {
                             candidate_iids = Some(selection.iids);
@@ -876,14 +874,11 @@ impl ScanCursor {
                         return Ok((parts, *verifier.counts.lock()));
                     }
                 }
-                let mut legacy_scope_current = true;
                 for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !fixed_iids && !ranked_here) {
-                    if !legacy_scope_current {
-                        narrowed.iids = candidate_iids.as_ref().map(|iids: &crate::CandidateIids| iids.iter().collect());
-                        legacy_scope_current = true;
-                    }
-                    let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
-                        current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
+                    let legacy = legacy_candidate_scan(scan, candidate_iids.as_ref(), accelerator.as_ref());
+                    let request = crate::ScanRequest { database: name, scan: legacy.as_ref().unwrap_or(scan),
+                        candidate_iids: candidate_iids.as_ref(), snapshot, storage, bounds, memory: &execution.context.memory,
+                        current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants,
                         verifier, partitions: database_partitions };
                     let selection = {
                         let mut selection = accelerator.select_candidates(&request);
@@ -892,10 +887,12 @@ impl ScanCursor {
                         }).await?
                     };
                     if let Some(crate::ScanSelection { iids: mut candidates, scores }) = selection {
-                        if pushdowns.is_some() || narrowed.iids.is_some() {
+                        if pushdowns.is_some() || scan.iids.is_some() || candidate_iids.is_some() {
                             candidates = match candidates.retain(|iid| {
                                 pushdowns.as_ref().is_none_or(|filters| filters.iid_matches(&scan.columns, iid, canonical_entity_iids))
-                                    && narrowed.iids.as_ref().is_none_or(|existing| existing.contains(&iid))
+                                    && candidate_iids.as_ref().map_or_else(
+                                        || scan.iids.as_ref().is_none_or(|existing| existing.contains(&iid)),
+                                        |existing: &crate::CandidateIids| existing.contains(iid))
                             }, &execution.context.memory) {
                                 Err(error) if error.code == "rtdb/memory-budget-exceeded" => continue,
                                 result => result?,
@@ -906,7 +903,6 @@ impl ScanCursor {
                         {
                             ranking.verified = scores;
                         }
-                        legacy_scope_current = false;
                         candidate_iids = Some(candidates);
                     }
                 }
@@ -931,29 +927,34 @@ impl ScanCursor {
                         Err(error) => return Err(error),
                     }
                 }
-                if !legacy_scope_current && queries.iter().any(Option::is_some) {
-                    narrowed.iids = candidate_iids.as_ref().map(|iids| iids.iter().collect());
-                }
                 let mut matches = Vec::with_capacity(scan.matches.len());
-                let request = crate::ScanRequest { database: name, scan: &narrowed, snapshot, storage, bounds, memory: &execution.context.memory,
-                    current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
-                    verifier, partitions: database_partitions };
+                let request = crate::ScanRequest { database: name, scan, candidate_iids: candidate_iids.as_ref(), snapshot, storage, bounds,
+                    memory: &execution.context.memory, current_time: execution.context.current_time,
+                    cancellation: &execution.context.cancellation, constants, verifier, partitions: database_partitions };
                 let live_terms = |column: &str| execution.context.accelerators.iter().filter(|_| accelerate)
                     .find_map(|accelerator| accelerator.live_search_terms(&request, column));
                 if let Some(ranking) = &mut ranking && ranking.scorer.is_some() { ranking.live = live_terms(&ranking.source); }
-                for ((evaluated, query), parsed) in scan.matches.iter().zip(queries).zip(parsed) {
+                for (evaluated, query) in scan.matches.iter().zip(queries) {
                     let mut answers = None;
                     let mut live = None;
                     if let Some(query) = query {
                         live = ranking.as_ref().filter(|ranking| ranking.source == evaluated.column).and_then(|ranking| ranking.live.clone())
                             .or_else(|| live_terms(&evaluated.column));
                         for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !ranked_here) {
-                            if let Some(found) = accelerator.match_answers(&request, &evaluated.column, query).await? { answers = Some(found); break; }
+                            let legacy = legacy_candidate_scan(scan, candidate_iids.as_ref(), accelerator.as_ref());
+                            let request = crate::ScanRequest { database: name, scan: legacy.as_ref().unwrap_or(scan),
+                                candidate_iids: candidate_iids.as_ref(), snapshot, storage, bounds, memory: &execution.context.memory,
+                                current_time: execution.context.current_time, cancellation: &execution.context.cancellation, constants,
+                                verifier, partitions: database_partitions };
+                            if let Some(found) = accelerator.match_answers_prepared(&request, &evaluated.column, query).await? {
+                                answers = Some(found);
+                                break;
+                            }
                         }
                     }
-                    matches.push(ScanMatch { query: parsed.clone(), files: answers, live });
+                    matches.push(ScanMatch { query: query.as_deref().map(PreparedSearchQuery::parsed), files: answers, live });
                 }
-                let mut local_scan = narrowed.clone();
+                let mut local_scan = scan.clone();
                 if candidate_iids.is_some() { local_scan.iids = None; }
                 let partition = |confined, matches| PartitionScan {
                     snapshot: snapshot.clone(), storage: Arc::clone(storage), matches, ranking: ranking.clone(), candidate_iids: candidate_iids.clone(), metadata_time: None,
@@ -965,7 +966,7 @@ impl ScanCursor {
                 };
                 // A scan narrowed to named IIDs reads a few pages wherever they are; only a whole scan of a single-partition database is split.
                 let split = match (fragmenter, snapshot.tx_basis()) {
-                    (Some(fragmenter), Some(basis)) if order.is_none() && candidate_iids.is_none() && narrowed.iids.is_none() && narrowed.matches.is_empty() && ranking.is_none() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
+                    (Some(fragmenter), Some(basis)) if order.is_none() && candidate_iids.is_none() && scan.iids.is_none() && scan.matches.is_empty() && ranking.is_none() && database_partitions.len() == 1 && !snapshot.has_overlays() =>
                         fragmenter.depth(name, &scan.table.name.table, persisted_bytes(snapshot)).map(|depth| (depth, basis)),
                     _ => None,
                 };
@@ -975,7 +976,7 @@ impl ScanCursor {
                         let Ok(confined) = intersect(Some(prefix.range()), interval) else { continue };
                         let fallback = partition(confined, Vec::new());
                         let residence = execution.context.catalog.fragment_residence.clone();
-                        let request = Arc::new(ScanFragment::of(&narrowed, prefix, basis, residence, bounds, &execution.context.timezone));
+                        let request = Arc::new(ScanFragment::of(scan, prefix, basis, residence, bounds, &execution.context.timezone));
                         parts.push_back(Part::Fragment(Fragment { request, fallback, state: FragmentState::Pending }));
                     },
                     None => parts.push_back(Part::Local(partition(interval, matches))),
@@ -1038,6 +1039,11 @@ impl Part {
     fn counts(&self) -> ScanCounts { match self { Self::Local(partition) => partition.counts, Self::Fragment(fragment) => fragment.fallback.counts, Self::Resolved(_) => ScanCounts::default() } }
 }
 
+fn legacy_candidate_scan(scan: &Scan, candidates: Option<&crate::CandidateIids>, accelerator: &dyn crate::ScanAccelerator) -> Option<Scan> {
+    let candidates = candidates.filter(|_| !accelerator.accepts_arrow_iids())?;
+    Some(Scan { iids: Some(candidates.iter().collect()), ..scan.clone() })
+}
+
 fn retained_ranked_batch(scan: &Scan, score: Option<rtdb_plan::ColumnId>, iids: &crate::CandidateIids,
     scores: &crate::CandidateScores, memory: &Arc<MemoryBudget>) -> Result<Option<crate::columnar::ColumnBatch>> {
     if iids.is_empty() { return Ok(None); }
@@ -1072,13 +1078,14 @@ async fn ordered(scan: &Scan, execution: &Execution, window: std::ops::Range<usi
     let database = context.catalog.database(&scan.table.name.database)?;
     let [snapshot] = database.partitions.as_slice() else { return Ok(None); };
     let storage = &database.storage;
-    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false, counts: Default::default() };
+    let search_queries = SearchQueries::default();
+    let constants = &ExecutionConstants { execution, search_queries: &search_queries };
     let bounds = bounds(scan, snapshot, execution).await?;
-    let verifier = ScanVerifier { scan, execution, pushdowns: None, partition: snapshot, storage, bounds, canonical_entity_iids: false, shared_rank: None, counts: Default::default() };
+    let verifier = ScanVerifier { scan, execution, constants, pushdowns: None, partition: snapshot, storage, canonical_entity_iids: false, counts: Default::default() };
     let request = crate::ScanRequest {
         database: &scan.table.name.database, scan, snapshot, storage, bounds, memory: &context.memory,
         current_time: context.current_time, cancellation: &context.cancellation,
-        constants: &crate::accelerate::ExecutionConstants(execution),
+        candidate_iids: None, constants,
         verifier: &verifier, partitions: &database.partitions,
     };
     for accelerator in context.accelerators.iter() {
@@ -1277,9 +1284,10 @@ impl crate::columnar::BatchCursor for OrderedPayload {
                     None => bounds(&scan, snapshot, &self.execution).await?,
                 };
                 if bounds.valid_time.is_point() && bounds.system_time.is_point() {
-                    let verifier = ScanVerifier { scan: &scan, execution: &self.execution, pushdowns: None,
-                        partition: snapshot, storage: &database.storage, bounds, canonical_entity_iids: false,
-                        shared_rank: None, counts: Default::default() };
+                    let search_queries = SearchQueries::default();
+                    let constants = &ExecutionConstants { execution: &self.execution, search_queries: &search_queries };
+                    let verifier = ScanVerifier { scan: &scan, execution: &self.execution, constants, pushdowns: None,
+                        partition: snapshot, storage: &database.storage, canonical_entity_iids: false, counts: Default::default() };
                     point = verifier.point_batch(&scan, bounds, &database.partitions, scan.iids.as_ref().unwrap()).await?;
                 }
             }
@@ -1356,7 +1364,7 @@ impl crate::columnar::BatchCursor for OrderedPayload {
 }
 
 /// Runs the scan itself over one partition, restricted to a batch of IIDs, its predicates applied as the scan's filter applies them; narrowing is skipped because the IIDs are fixed.
-struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
+struct ScanVerifier<'a> { scan: &'a Scan, execution: &'a Execution, constants: &'a ExecutionConstants<'a>, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, partition: &'a Snapshot, storage: &'a Arc<BufferPool>, canonical_entity_iids: bool, counts: parking_lot::Mutex<ScanCounts> }
 
 fn ranked_integer_id(column: &crate::columnar::Column, row: usize) -> Result<Option<i64>> {
     match column.arrow_cell(row) {
@@ -1381,9 +1389,9 @@ impl ScanVerifier<'_> {
     async fn point_batch(&self, scan: &Scan, bounds: TemporalBounds, partitions: &[Snapshot],
         iids: &BTreeSet<Iid>) -> Result<Option<Option<crate::columnar::ColumnBatch>>> {
         let execution = self.execution;
-        let request = crate::ScanRequest { database: &scan.table.name.database, scan, snapshot: self.partition, storage: self.storage,
+        let request = crate::ScanRequest { database: &scan.table.name.database, scan, candidate_iids: None, snapshot: self.partition, storage: self.storage,
             bounds, memory: &execution.context.memory, current_time: execution.context.current_time,
-            cancellation: &execution.context.cancellation, constants: &crate::accelerate::ExecutionConstants(execution),
+            cancellation: &execution.context.cancellation, constants: self.constants,
             verifier: self, partitions };
         let mut resolved = crate::table_point_rows(&request, iids).await?;
         if resolved.is_none() {
@@ -1556,8 +1564,8 @@ impl ScanVerifier<'_> {
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         scan.iids = Some(iids);
-        let mut cursor = Box::pin(ScanCursor::over(scan, self.execution.clone(), self.pushdowns.clone(),
-            std::slice::from_ref(self.partition), self.storage, false, None)).await?;
+        let mut cursor = Box::pin(ScanCursor::over_with_queries(scan, self.execution.clone(), self.pushdowns.clone(),
+            std::slice::from_ref(self.partition), self.storage, false, None, self.constants.search_queries)).await?;
         let mut selected_rows = 0usize;
         while let Some(batch) = cursor.next_batch().await? {
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
@@ -1603,6 +1611,9 @@ impl ScanVerifier<'_> {
                 inputs.entry(trie.clone()).or_default().insert(*page);
             }
         }
+        let put_columns: Vec<_> = scan.columns.iter().map(|field| field.name.clone())
+            .chain(scan.matches.iter().map(|matched| matched.column.clone())).collect();
+        let put_columns = put_columns.as_slice();
         let entry = self.partition.table_entry(table);
         let files = futures::stream::iter(inputs).map(|(trie, pages)| async move {
             self.execution.context.check_cancelled()?;
@@ -1621,7 +1632,7 @@ impl ScanVerifier<'_> {
                         Arc::clone(&cached.batch)
                     }
                     None => {
-                        let (batch, lease) = file.decode_page(page as usize, memory).await?;
+                        let (batch, lease) = file.decode_page_as(page as usize, memory, DataProjection::PutColumns(put_columns)).await?;
                         audience_work::scan_items(batch.num_rows())?;
                         IndexBatch::from_owned(OwnedBatch::with_reservation(batch, lease)?)?
                     }
@@ -1655,17 +1666,13 @@ impl ScanVerifier<'_> {
             }
             resolved.push(ResolvedRow { source: (batch, position), valid_time: row.visibility.valid_time, system_time: row.visibility.system_time });
         }
-        let constants = crate::accelerate::ExecutionConstants(self.execution);
         let mut matches = BTreeMap::new();
         let database = &scan.table.name.database;
-        let request = crate::ScanRequest { database, scan, snapshot: self.partition, storage: self.storage, bounds: bounds(scan, self.partition, self.execution).await?, memory,
+        let request = crate::ScanRequest { database, scan, candidate_iids: None, snapshot: self.partition, storage: self.storage, bounds: bounds(scan, self.partition, self.execution).await?, memory,
             current_time: self.execution.context.current_time, cancellation: &self.execution.context.cancellation,
-            constants: &constants, verifier: self, partitions: &self.execution.context.catalog.database(database)?.partitions };
+            constants: self.constants, verifier: self, partitions: &self.execution.context.catalog.database(database)?.partitions };
         for evaluated in &scan.matches {
-            let query = match crate::ConstantEvaluator::constant(&constants, &evaluated.query).await? {
-                Some(Value::Utf8(text)) => Some(rtdb_text::Query::parse(&text)),
-                _ => None,
-            };
+            let query = self.constants.search_query(&evaluated.query).await?;
             let live = if query.is_none() { None } else {
                 self.execution.context.accelerators.iter().find_map(|accelerator| accelerator.live_search_terms(&request, &evaluated.column))
             };
@@ -1673,7 +1680,7 @@ impl ScanVerifier<'_> {
         }
         let result = crate::columnar::gather(&resolved, &sources, &scan.columns, memory, |position| {
             matches.get(&scan.columns[position].id).map(|(name, query, live)| {
-                resolved_match_column(name, query.as_ref(), &resolved, &sources, memory, |_, row, query| {
+                resolved_match_column(name, query.as_deref().map(PreparedSearchQuery::query), &resolved, &sources, memory, |_, row, query| {
                     live_match(live.as_deref(), row, &sources, query)
                 })
             }).transpose()
@@ -2556,6 +2563,59 @@ mod tests {
     use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
 
+    #[tokio::test]
+    async fn fts_arrow_scan_keeps_shared_queries_and_candidate_vectors_between_accelerators() {
+        use crate::{CandidateIids, ScanAccelerator, ScanRequest, ScanSelection};
+
+        struct Select(Iid);
+        #[async_trait]
+        impl ScanAccelerator for Select {
+            async fn candidate_iids(&self, _: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
+                Ok(Some([self.0].into()))
+            }
+        }
+
+        struct Verify(Iid, Expr);
+        #[async_trait]
+        impl ScanAccelerator for Verify {
+            fn accepts_arrow_iids(&self) -> bool { true }
+
+            async fn candidate_iids(&self, _: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> { Ok(None) }
+
+            async fn select_candidates(&self, request: &ScanRequest<'_>) -> Result<Option<ScanSelection>> {
+                let scope = request.candidate_iids.expect("the previous accelerator selected Arrow candidates");
+                assert!(request.scan.iids.is_none());
+                assert_eq!(scope.iter().collect::<Vec<_>>(), [self.0]);
+                let first = request.constants.search_query(&self.1).await?.unwrap();
+                let second = request.constants.search_query(&self.1).await?.unwrap();
+                assert!(Arc::ptr_eq(&first, &second));
+                assert!(Arc::ptr_eq(first.scorer(), second.scorer()));
+                Ok(Some(ScanSelection { iids: CandidateIids::from_sorted(&[self.0], request.memory)?, scores: None }))
+            }
+
+            async fn match_answers_prepared(&self, request: &ScanRequest<'_>, _: &str, query: &PreparedSearchQuery) -> Result<Option<crate::MatchAnswers>> {
+                let prepared = request.constants.search_query(&self.1).await?.unwrap();
+                assert!(std::ptr::eq(query, prepared.as_ref()));
+                assert!(request.iid_scope().unwrap().contains(&self.0));
+                Ok(None)
+            }
+        }
+
+        let (state, table, events) = live_table();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, mut execution, _) = descriptor_scan(state.value().snapshot(), table, storage);
+        let expression = Expr::Literal(Value::Utf8("v".into()));
+        scan.matches.push(rtdb_plan::ScanMatch { id: ColumnId(99), column: "v".into(), query: expression.clone() });
+        let matched = events[1].iid;
+        let accelerators: Arc<[Arc<dyn ScanAccelerator>]> = Arc::from([Arc::new(Select(matched)) as Arc<dyn ScanAccelerator>, Arc::new(Verify(matched, expression))]);
+        execution.context = execution.context.clone().with_accelerators(accelerators);
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.len, 1);
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::I64(2));
+        assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
     #[test]
     fn ranked_integer_ids_follow_execution_types_and_selected_offsets() {
         use crate::columnar::{Column, SelectedColumn};
@@ -2909,7 +2969,9 @@ mod tests {
             scan.columns[0].expression(), Expr::Literal(Value::Utf8("invoice".into())),
         ], return_type: LogicalType::Scalar(ScalarType::Bool).maybe() });
         let bounds = bounds(&scan, &snapshot, &execution).await.unwrap();
-        let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot, storage: &storage,
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot, storage: &storage,
             canonical_entity_iids: false, counts: Default::default() };
         let source = snapshot.iter_segments(&table).next().unwrap().row(0).unwrap();
         let version = source.header().unwrap().version();
@@ -3336,6 +3398,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fts_arrow_point_scan_gathers_the_selected_persisted_event() {
+        use crate::{ResolvedSearchRow, ScanAccelerator, ScanRequest, SearchRowLocation};
+
+        struct Point { trie: TrieKey, version: rtdb_types::RowVersion }
+        #[async_trait]
+        impl ScanAccelerator for Point {
+            async fn candidate_iids(&self, _: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> { Ok(None) }
+
+            async fn point_rows(&self, request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result<Option<Vec<ResolvedSearchRow>>> {
+                assert_eq!(keys.iter().copied().collect::<Vec<_>>(), [self.version.iid]);
+                Ok(Some(vec![ResolvedSearchRow { version: self.version, origin: None, visibility: request.bounds,
+                    location: SearchRowLocation::Persisted { trie: self.trie.clone(), page: 1, row: 0 } }]))
+            }
+        }
+
+        let (state, table, events, store, _) = persisted_page_fixture().await;
+        let storage = Arc::new(BufferPool::new(store, 1 << 20));
+        let snapshot = state.value().snapshot();
+        let trie = snapshot.trie_catalog().iter_tries(&table).find(|trie| trie.state == TrieState::Live).unwrap().key.clone();
+        let (mut scan, mut execution, _) = descriptor_scan(snapshot, table, storage);
+        let version = events[1].header().version();
+        scan.iids = Some([version.iid].into());
+        scan.valid_time = TemporalFilter::Default;
+        scan.system_time = TemporalFilter::Default;
+        execution.context = execution.context.clone().with_accelerators(Arc::from([Arc::new(Point { trie, version }) as Arc<dyn ScanAccelerator>]));
+        let mut cursor = ScanCursor::new(scan, execution, None).await.unwrap();
+        assert!(matches!(cursor.parts.front(), Some(Part::Resolved(_))));
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.len, 1);
+        assert_eq!(page.columns[0].value(0).unwrap(), Value::I64(2));
+    }
+
+    #[tokio::test]
     async fn a_cold_point_scan_returns_arrow_after_reading_the_selected_page() {
         use std::ops::Range;
         use rtdb_storage::{Result as StorageResult, StoredObject};
@@ -3431,16 +3526,18 @@ mod tests {
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
         let snapshot = value.snapshot();
         let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
-        let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot,
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
             storage: &storage, canonical_entity_iids: false, counts: Default::default() };
         let point = Interval::at(Timestamp(150)).unwrap();
-        let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
+        let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: point, system_time: point }, memory: &memory,
             current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
-            constants: &crate::accelerate::ExecutionConstants(&execution), verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+            constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
         let keys = [events[0].iid].into();
         let mut recorded = Vec::new();
-        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(&keys), usize::MAX, |_, key| {
+        assert_eq!(primary_point_events(&request, &entry.slug, &trie, Some(crate::IidScope::Set(&keys)), usize::MAX, |_, key| {
             recorded.push(key.unwrap().to_vec());
             Ok(true)
         }).await.unwrap(), Some(2));
@@ -3457,12 +3554,14 @@ mod tests {
         let storage = Arc::new(BufferPool::new(store, 1 << 20));
         let snapshot = value.snapshot();
         let (scan, execution, memory) = descriptor_scan(snapshot.clone(), table, storage.clone());
-        let verifier = ScanVerifier { scan: &scan, execution: &execution, pushdowns: None, partition: &snapshot,
+        let search_queries = SearchQueries::default();
+        let constants = &ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants, pushdowns: None, partition: &snapshot,
             storage: &storage, canonical_entity_iids: false, counts: Default::default() };
-        let request = crate::ScanRequest { database: "xtdb", scan: &scan, snapshot: &snapshot, storage: &storage,
+        let request = crate::ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot: &snapshot, storage: &storage,
             bounds: TemporalBounds { valid_time: Interval::ALL, system_time: Interval::ALL }, memory: &memory,
             current_time: execution.context.current_time, cancellation: &execution.context.cancellation,
-            constants: &crate::accelerate::ExecutionConstants(&execution), verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
+            constants, verifier: &verifier, partitions: std::slice::from_ref(&snapshot) };
         let before = memory.used_bytes();
         let mut visited = Vec::new();
         assert_eq!(primary_point_events(&request, &entry.slug, &trie, None, 2, |event, _| {

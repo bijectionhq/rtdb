@@ -64,6 +64,8 @@ async fn collect_candidates(request: &ScanRequest<'_>) -> Result<Option<Vec<Iid>
 
 #[async_trait]
 impl ScanAccelerator for OrderedIndexAccelerator {
+    fn accepts_arrow_iids(&self) -> bool { true }
+
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
         Ok(collect_candidates(request).await?.map(|ids| ids.into_iter().collect()))
     }
@@ -97,7 +99,7 @@ async fn exact(
 ) -> Result<Option<OrderedScan>> {
     let table = &request.scan.table.name.table;
     if table.schema == super::CATALOG.0
-        || request.scan.iids.is_some()
+        || request.iid_scope().is_some()
         || !request.bounds.system_time.is_point()
         || !request.bounds.valid_time.is_point()
         || (request.scan.predicates.is_empty() && request.scan.ordered_top_k.is_none())

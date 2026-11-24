@@ -47,19 +47,22 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
         .flat_map(|definition| definition.columns.iter().map(|column| (&definition.table, column))).collect();
     if columns.is_empty() { return Ok(None); }
 
+    let mut texts = [None; MAX_ROWS];
     let mut rows = 0usize;
     let mut source_bytes = 0usize;
     for (table, column) in &columns {
         let batch = write.tables()[*table].batch().expect("nonempty write has a batch");
-        rows += batch.len();
-        if rows > MAX_ROWS { return Err(invalid("Search delta exceeds its row allowance")); }
-        for row in 0..batch.len() {
+        let end = rows + batch.len();
+        if end > MAX_ROWS { return Err(invalid("Search delta exceeds its row allowance")); }
+        let text = batch.view().put_text_column(column);
+        for (row, slot) in texts[rows..end].iter_mut().enumerate() {
             if cancellation.is_cancelled() { return Err(search_cancelled()); }
-            let event = batch.view().borrow_event(row)?;
-            let text_bytes = match event.put_text(column)? { PutText::Utf8(text) => text.len(), _ => 0 };
-            source_bytes = source_bytes.saturating_add(64 + table.schema.len() + table.table.len() + column.len() + text_bytes);
+            if let (_, PutText::Utf8(value)) = text.read(row)? { *slot = Some(value); }
+            source_bytes = source_bytes.saturating_add(64 + table.schema.len() + table.table.len() + column.len()
+                + slot.map_or(0, str::len));
             if source_bytes > MAX_BYTES { return Err(invalid("Search delta exceeds its input allowance")); }
         }
+        rows = end;
     }
     let mut charge = memory.reserve(16384 + source_bytes * 48)?;
     let mut schemas = StringBuilder::new();
@@ -67,20 +70,18 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
     let mut fields = StringBuilder::new();
     let mut present = BooleanBuilder::new();
     let mut tokens = LargeListBuilder::new(StringBuilder::new()).with_field(Field::new("item", DataType::Utf8, false));
+    let mut texts = texts[..rows].iter();
     for (table, column) in columns {
-        let batch = write.tables()[table].batch().expect("nonempty write has a batch");
-        for row in 0..batch.len() {
+        let rows = write.tables()[table].row_count();
+        for text in texts.by_ref().take(rows) {
             if cancellation.is_cancelled() { return Err(search_cancelled()); }
             schemas.append_value(&table.schema);
             tables.append_value(&table.table);
             fields.append_value(column);
-            let event = batch.view().borrow_event(row)?;
-            if let PutText::Utf8(text) = event.put_text(column)? {
+            if let Some(text) = text {
                 rtdb_text::append_tokens(text, tokens.values());
-                present.append_value(true);
-            } else {
-                present.append_value(false);
             }
+            present.append_value(text.is_some());
             tokens.append(true);
         }
     }
@@ -196,12 +197,12 @@ mod tests {
     use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, Timestamp, TransactionKey, TxId, Value};
 
     #[test]
-    fn arrow_build_delta_preserves_ipc_bytes_and_reuses_token_buffers() {
+    fn fts_arrow_delta_preserves_ipc_bytes_and_commit_row_coverage() {
         let memory = MemoryBudget::new(8 << 20);
         let table = TableRef::new("public", "docs");
         let stored = |id, operation| StoredEvent { position: None, origin: None, entity_key: None, iid: EntityId::Integer(id).iid(),
             system_from: Timestamp(2), commit_position: 0, valid_time: Interval::ALL, operation, recency: None };
-        let events = [stored(1, StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8("Audit report audit".into()))]))),
+        let events = [stored(1, StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8("Audit report audit ΟΣ".into()))]))),
             stored(2, StoredOperation::Delete)];
         let staged = |events: &[StoredEvent]| {
             let batch = IndexBatch::copy_events(events, &StructFields::new(), &memory).unwrap();
@@ -213,7 +214,7 @@ mod tests {
         let write = staged(&events);
         let encoded = prepare(&[definition], &write, &memory, &CancellationToken::new()).unwrap().unwrap();
         let mut previous_tokens = LargeListBuilder::new(StringBuilder::new()).with_field(Field::new("item", DataType::Utf8, false));
-        for term in ["audit", "report", "audit"] { previous_tokens.values().append_value(term); }
+        for term in ["audit", "report", "audit", "ος"] { previous_tokens.values().append_value(term); }
         previous_tokens.append(true);
         previous_tokens.append(true);
         let previous_schema = Arc::new(schema());
@@ -231,7 +232,7 @@ mod tests {
             let (present, lists, rows) = delta.page(&key, 0..2);
             assert!(present.value(rows.start));
             assert!(!present.value(rows.start + 1));
-            assert_eq!(lists.value(0).as_string::<i32>().iter().flatten().collect::<Vec<_>>(), ["audit", "report", "audit"]);
+            assert_eq!(lists.value(0).as_string::<i32>().iter().flatten().collect::<Vec<_>>(), ["audit", "report", "audit", "ος"]);
             lists.values().as_string::<i32>().value_data().as_ptr() as usize
         };
         let replayed = check(Delta::read(encoded.encoded.clone(), &write, &memory).unwrap());

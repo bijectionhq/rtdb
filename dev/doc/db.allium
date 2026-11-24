@@ -2089,6 +2089,7 @@ surface QueryAccess {
         -- Metadata read from a cache-owned immutable object retains its Arrow buffers from that object.
         -- A spatial fallback read projects IIDs from persisted pages.
         -- A spatial refinement scan can project the requested put children from persisted pages.
+        -- A located point read decodes the event headers and the put fields needed by its projection and predicates.
         -- Equality selection on a keyword ID includes the native and reference persisted digests.
         -- For columnar query output, stacked filters apply in plan order to the surviving vectors and row positions.
         -- A columnar limit applies its offset and row count to batches and slices compatible Arrow arrays.

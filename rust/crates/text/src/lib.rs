@@ -157,7 +157,11 @@ pub fn count_tokens(text: &str) -> TokenCount {
 /// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
 /// A document matches when it holds every term, and every phrase as consecutive tokens; an unclosed quote runs to the end.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Query { terms: Vec<String>, phrases: Vec<Vec<String>> }
+pub struct Query {
+    terms: Vec<String>,
+    phrases: Vec<Vec<String>>,
+    term_order: Vec<usize>,
+}
 
 impl Query {
     pub fn parse(text: &str) -> Self {
@@ -168,7 +172,9 @@ impl Query {
             for word in &words { if !terms.contains(word) { terms.push(word.clone()); } }
             if index % 2 == 1 && words.len() > 1 { phrases.push(words); }
         }
-        Self { terms, phrases }
+        let mut term_order: Vec<_> = (0..terms.len()).collect();
+        term_order.sort_unstable_by(|&left, &right| terms[left].cmp(&terms[right]));
+        Self { terms, phrases, term_order }
     }
     pub fn terms(&self) -> &[String] { &self.terms }
     pub fn phrases(&self) -> &[Vec<String>] { &self.phrases }
@@ -189,7 +195,8 @@ impl Query {
         let longest = if match_phrases { self.phrases.iter().map(Vec::len).max().unwrap_or(0) } else { 0 };
         let mut tail = std::collections::VecDeque::with_capacity(longest);
         let visit = |token: &str| {
-            let term = self.terms.iter().position(|term| term == token);
+            let term = self.term_order.binary_search_by(|&index| self.terms[index].as_str().cmp(token))
+                .ok().map(|index| self.term_order[index]);
             if let Some(term) = term { frequencies[term] = frequencies[term].wrapping_add(1); }
             if longest == 0 || found.iter().all(|&matched| matched) { return; }
             if tail.len() == longest { tail.pop_front(); }
@@ -376,7 +383,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arrow_search_streaming_terms_match_arrow_tokens_scores_and_allocation_charge() {
+    fn fts_arrow_streaming_match_and_score_preserve_tokens_and_binary64() {
         let query = Query::parse(r#"paid "a a b" "a b" ος"#);
         let scorer = Scorer::from_frequencies(query.clone(), 11, 231, &[1, 3, 7, 11]);
         let cases = [
@@ -390,8 +397,11 @@ mod tests {
             assert_eq!(count.len(), arrow.len());
             assert_eq!(count.arrow_bytes(), arrow.get_array_memory_size());
             assert_eq!(matched, query.matches_arrow(&arrow));
+            assert_eq!(query.text_terms(&text, false).2,
+                query.terms().iter().all(|term| arrow.iter().any(|value| value == Some(term.as_str()))));
             assert_eq!(scorer.bm25_text(&text).to_bits(), scorer.bm25_arrow(&arrow).to_bits());
         }
+        assert_eq!(tokens("ΟΣ ΟΣΑ İ"), ["ος", "οσα", "i\u{307}"]);
     }
 
     #[test]

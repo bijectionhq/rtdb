@@ -64,7 +64,7 @@ impl PointRanking {
         let mut work = Work::default();
         let table = &request.scan.table.name.table;
         if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point()
-            || request.scan.iids.is_some() || request.snapshot.has_overlays()
+            || request.iid_scope().is_some() || request.snapshot.has_overlays()
             || request.snapshot.iter_segments(table).any(|segment| segment.row_count() > 0) {
             return Ok((Err(Fallback::Visibility), work));
         }

@@ -219,6 +219,10 @@ impl HistoryPage {
 }
 
 pub fn ranges(bytes: &[u8], root: HistoryRoot, owner: [u8; 32], keys: Option<&BTreeSet<Iid>>) -> Result<Vec<HistoryRange>> {
+    ranges_matching(bytes, root, owner, |first, last| keys.is_none_or(|keys| keys.range(first..=last).next().is_some()))
+}
+
+pub fn ranges_matching(bytes: &[u8], root: HistoryRoot, owner: [u8; 32], keep: impl Fn(Iid, Iid) -> bool) -> Result<Vec<HistoryRange>> {
     verify(bytes, root.length, root.digest)?;
     if &bytes[..8] != ROOT_MAGIC || bytes[8..40] != owner {
         return Err(invalid("Entity history directory belongs to another primary trie"));
@@ -249,7 +253,7 @@ pub fn ranges(bytes: &[u8], root: HistoryRoot, owner: [u8; 32], keys: Option<&BT
         previous_page = Some((entry.page, entry.first_row.checked_add(entry.rows).ok_or_else(|| invalid("Entity history row offset overflow"))?));
         previous_end = entry.offset.checked_add(u64::from(entry.length)).filter(|end| *end <= root.offset)
             .ok_or_else(|| invalid("Entity history range extends beyond its directory"))?;
-        if keys.is_none_or(|keys| keys.range(entry.first..=entry.last).next().is_some()) { result.push(entry); }
+        if keep(entry.first, entry.last) { result.push(entry); }
     }
     if previous_end != root.offset { return Err(invalid("Entity history directory omits object ranges")); }
     Ok(result)

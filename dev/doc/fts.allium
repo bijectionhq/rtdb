@@ -332,6 +332,8 @@ rule RepairUnreadableSearchFile {
 --      Unopened sources and live suffixes without a bound, and exact work for uncovered history, have unbounded rank.
 --      Posting windows use a conservative sum of per-term bounds in scoring order.
 --      Ascending integer and UUID identities can strengthen an equal-score bound when the source proves the corresponding SQL identity order.
+--      Admitted live postings supply per-event term frequencies, document lengths and integer tie keys.
+--      Live events beyond the admitted frontier use the analyzer over their primary Arrow text.
 --      Where an earlier selection supplies an IID scope, file and live events outside that scope are discarded before scoring.
 --   2. Workers expand work and nominate candidates under its bound.
 --      A claimed bound covers the work through publication of its children and verified outcomes.
@@ -346,6 +348,7 @@ rule RepairUnreadableSearchFile {
 --      The signed zeroes have equal score order.
 --      An invalid bound keeps the affected work eligible.
 --   4. The scan gathers projected columns for retained versions after deciding the query's prefix.
+--      A located primary page supplies event headers, the projected fields and the fields needed for residual MATCH.
 --      If its final gather exceeds available memory, the scan can stream from the narrowed IID selection.
 --      The SQL sort applies the final ordering and window.
 --
@@ -379,6 +382,9 @@ rule MatchIsAResidualPredicate {
 
 rule MatchEvaluatedByTheScan {
     -- A MATCH with a constant query in a predicate the scan filters by, under NOT and IS NULL as much as bare, is a boolean column the scan evaluates on each resolved row.
+    -- The scan shares its parsed constant queries and scorers between nomination, verification and residual evaluation.
+    -- Narrowing retains its sorted Arrow IID scope for subsequent selection and scan resolution.
+    -- The uncovered live suffix tests analyzer tokens as they are produced from each batch's selected text child.
     -- The text column is then read only for the rows the scan cannot answer otherwise, and projected only if something else needs it.
     -- A row of a trie takes MATCH from its search file for a definition covering the column: true where the document matches, null where the column is null or absent, and false otherwise.
     -- A row in a trie with no readable recorded file can take its answer from the file the node builds.
@@ -501,6 +507,7 @@ contract SearchCorrectness {
         -- A live posting page can retain its token list as a slice of the accepted delta under the delta buffers' reservation.
         -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
         -- A partially admitted segment keeps its coverage frontier.
+        -- Commit deltas and live postings read a selected text child once per Arrow batch and retain the existing input and page admission limits.
         -- If a query cannot cover the frontier within the accelerated tail budget, ordinary SQL evaluation supplies the answer.
 
     @invariant SearchFilesFromTheSnapshot

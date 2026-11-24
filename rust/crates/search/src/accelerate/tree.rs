@@ -155,31 +155,31 @@ fn seed_logical<'a>(runs: impl Iterator<Item = (usize, &'a rtdb_format::log::pro
     }
 }
 
-fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, tokens: &dyn Fn() -> arrow_array::StringArray,
-    request: &ScanRequest<'_>, scorer: &Scorer, order: TreeRankOrder, scope: Option<&BTreeSet<Iid>>) -> Result<Option<Nomination>> {
+fn nominate_live(segment: &rtdb_index::LiveTable, row: u32, matched: crate::runtime::LiveMatch<'_>,
+    request: &ScanRequest<'_>, scorer: &Scorer, order: TreeRankOrder, scope: Option<rtdb_query::IidScope<'_>>) -> Result<Option<Nomination>> {
     if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-    let header = segment.header(row)?;
+    let source = segment.row(row)?;
+    let header = source.header()?;
     if scope.is_some_and(|scope| !scope.contains(&header.iid)) || !may_be_visible(header.valid_time.lower().0,
         header.valid_time.upper().0, header.system_from.0, Timestamp::MAX.0, request.bounds) { return Ok(None); }
-    let score = scorer.bm25_arrow(&tokens());
-    let source = segment.row(row)?;
+    let score = matched.score(scorer);
     let key = match order {
         TreeRankOrder::Integer => {
-            RankKey::integer(score, crate::lane::integer_sql_id(&source.batch.view().borrow_event(source.row)?))
+            RankKey::integer(score, matched.integer_id(segment, row)?)
         }
         TreeRankOrder::Uuid => RankKey::uuid(score, header.iid.0),
         TreeRankOrder::Score => RankKey::integer(score, None),
     };
-    let source = segment.row(row)?;
     Ok(Some(Nomination { key, iid: header.iid, witness: Some(SearchWitness::live(&source)) }))
 }
 
 impl SearchAccelerator {
     pub(super) async fn logical_candidates(&self, request: &ScanRequest<'_>, definition: &SearchDefinition,
-        column: &str, query: &Query, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
+        column: &str, prepared: &rtdb_query::PreparedSearchQuery, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         let Some(mut coverage) = logical_runs(&self.runtime, request, definition) else { return Ok(None); };
         let Some(field) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
-        let Some(scorer) = Arc::new(Scorer::new(query.clone(), None)).for_ranking() else { return Ok(None); };
+        let query = prepared.query();
+        let Some(scorer) = prepared.scorer().for_ranking() else { return Ok(None); };
         let routes = coverage.routes(&self.runtime, request, definition, field, query, &scorer).await?;
         let mut results = BTreeSet::new();
         let mut charge = request.memory.reserve(4096)?;
@@ -196,7 +196,7 @@ impl SearchAccelerator {
                     let mut rank = TreeRanked::open(tree, field, query, &scorer, request.bounds, TreeRankOrder::Score).await?;
                     while rank.bound().is_some() {
                         if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
-                        for candidate in rank.expand(request.scan.iids.as_ref(), &mut examined).await? { results.insert(candidate.iid); }
+                        for candidate in rank.expand(request.iid_scope(), &mut examined).await? { results.insert(candidate.iid); }
                         if examined > self.max_candidates.saturating_mul(8) || results.len() > self.max_candidates { return Ok(false); }
                         reserve_ranking(&mut charge, results.len())?;
                     }
@@ -216,7 +216,7 @@ impl SearchAccelerator {
         }
         if !coverage.complete {
             let available = self.max_candidates.saturating_sub(results.len());
-            let Some(gaps) = rtdb_query::uncovered_history_iids(request, &coverage.covered, request.scan.iids.as_ref(), available).await?
+            let Some(gaps) = rtdb_query::uncovered_history_iids(request, &coverage.covered, request.iid_scope(), available).await?
                 else { work.plain_decline = Some("logical-gap-budget"); return Ok(None); };
             reserve_ranking(&mut charge, results.len().saturating_add(gaps.len()))?;
             results.extend(gaps);
@@ -244,7 +244,7 @@ pub(super) struct PartitionRankSource<'a> {
     ascending_id: Option<ColumnId>,
     order: TreeRankOrder,
     verification_batch: usize,
-    scope: Option<&'a BTreeSet<Iid>>,
+    scope: Option<rtdb_query::IidScope<'a>>,
     sources: Vec<RecordedTree>,
     ranks: Vec<Option<TreeRanked>>,
     legacy: Vec<(FileMembers, crate::file::RankedSource)>,
@@ -255,7 +255,7 @@ pub(super) struct PartitionRankSource<'a> {
     gap_queued: bool,
     segments: Vec<&'a Arc<rtdb_index::LiveTable>>,
     visibility: Option<super::point::PackedVisibility>,
-    points: Option<&'a BTreeSet<Iid>>,
+    points: Option<rtdb_query::IidScope<'a>>,
     checked: BTreeSet<Iid>,
     nominated: usize,
     reservation: Arc<rtdb_columnar::MemoryReservation>,
@@ -264,14 +264,14 @@ pub(super) struct PartitionRankSource<'a> {
 
 impl<'a> PartitionRankSource<'a> {
     pub(super) async fn open(search: &'a SearchAccelerator, request: ScanRequest<'a>, definition: SearchDefinition, column: &str,
-        column_id: ColumnId, matching: Query, scoring: Query, ascending_id: Option<ColumnId>, limit: usize, options: Narrowing<'a>)
+        column_id: ColumnId, matching: Query, scorer: Arc<Scorer>, ascending_id: Option<ColumnId>, limit: usize, options: Narrowing<'a>)
         -> Result<Option<Box<Self>>> {
         if !request.bounds.valid_time.is_point() || !request.bounds.system_time.is_point()
             || definition.table.is_owned_event_data() || TableRef::owned_schema(&definition.table.schema) {
             return Ok(None);
         }
         let Some(column_index) = definition.columns.iter().position(|indexed| indexed == column) else { return Ok(None); };
-        let scope = options.scope.or(request.scan.iids.as_ref());
+        let scope = options.scope.or(request.iid_scope());
         let points = scope.filter(|scope| scope.is_empty() || (!options.omit_logical && scope.len() <= 128
             && crate::lane::LogicalIndex::supports(&definition)));
         let include_packs = !options.omit_packs;
@@ -288,7 +288,6 @@ impl<'a> PartitionRankSource<'a> {
                 sources.clear();
             }
         }
-        let scorer = Arc::new(Scorer::new(scoring, None));
         let Some(ranking) = scorer.for_ranking() else { return Ok(None); };
         let routes = match &logical {
             Some(coverage) => coverage.routes(&search.runtime, &request, &definition, column_index, &matching, &ranking).await?,
@@ -406,7 +405,7 @@ impl RankSource for PartitionRankSource<'_> {
         let mut seed = Vec::new();
         if let Some(points) = self.points {
             if !points.is_empty() {
-                seed.push(RankWork::new(RankKey::unknown(), Task::Verify(points.iter().copied().map(Nomination::unknown).collect())));
+                seed.push(RankWork::new(RankKey::unknown(), Task::Verify(points.iter().map(Nomination::unknown).collect())));
             }
             return Ok(seed);
         }
@@ -545,8 +544,8 @@ impl RankSource for PartitionRankSource<'_> {
                 let mut charge = request.memory.reserve(4096)?;
                 let index = match &task { Task::Live(index, _) | Task::LiveSuffix(index, _) => *index, _ => unreachable!() };
                 let segment = self.segments[index];
-                let visit = |row, tokens: &dyn Fn() -> arrow_array::StringArray| {
-                    if let Some(hit) = nominate_live(segment, row, tokens, request, self.ranking.scorer(), self.order, self.scope)? {
+                let visit = |row, matched| {
+                    if let Some(hit) = nominate_live(segment, row, matched, request, self.ranking.scorer(), self.order, self.scope)? {
                         if nominations.len() % 128 == 0 { reserve_ranking(&mut charge, nominations.len() + 128)?; }
                         nominations.push(hit);
                     }

@@ -178,3 +178,43 @@ impl Layout<'_> {
         }))
     }
 }
+
+
+#[cfg(test)]
+#[test]
+fn fts_arrow_projection_keeps_event_headers_and_only_selected_put_fields() {
+    use crate::{data::{EventBatch, PutText, StoredEvent, StoredOperation, build_event_batch}, ipc::{PageDecoder, write_file}};
+    use rtdb_types::{EntityId, Interval, LogicalType, RunEndWidth, ScalarType, StructFields, Timestamp, Value};
+
+    let event = |id, operation| StoredEvent {
+        position: None, origin: None, entity_key: None, iid: EntityId::Integer(id).iid(),
+        system_from: Timestamp(id), commit_position: 0, valid_time: Interval::ALL, operation, recency: None,
+    };
+    let events = [
+        event(8, StoredOperation::Put(StructFields::from([
+            ("payload".into(), Value::Utf8("large value".repeat(8192))),
+            ("body".into(), Value::Utf8("search text".into())),
+        ]))),
+        event(9, StoredOperation::Delete),
+    ];
+    let utf8 = LogicalType::Scalar(ScalarType::Utf8);
+    let put_fields = StructFields::from([("body".into(), utf8.clone()), ("payload".into(), utf8)]);
+    let batch = build_event_batch(&events, Some(put_fields), Some(RunEndWidth::I32)).unwrap();
+    let file = write_file(&batch.schema(), &[batch]).unwrap();
+    let tail = file.len() - 10;
+    let footer = tail - arrow_ipc::reader::read_footer_length(file[tail..].try_into().unwrap()).unwrap();
+    let decoder = PageDecoder::from_footer(&file[footer..tail], footer as u64, None).unwrap();
+    let range = decoder.page_range(0).unwrap();
+    let bytes = Buffer::from(file[range.start as usize..range.end as usize].to_vec());
+    let full = EventBatch::new(decoder.decode_page(0, bytes.clone()).unwrap()).unwrap();
+    let projected = EventBatch::new(decoder.decode_event_page(0, bytes.clone(), &["body".into()]).unwrap()).unwrap();
+    let headers = EventBatch::new(decoder.decode_event_page(0, bytes, &[]).unwrap()).unwrap();
+    for row in 0..events.len() {
+        assert_eq!(full.header(row).unwrap(), projected.header(row).unwrap());
+        assert_eq!(full.header(row).unwrap(), headers.header(row).unwrap());
+    }
+    let row = projected.borrow_event(0).unwrap();
+    assert!(matches!(row.put_text("body").unwrap(), PutText::Utf8("search text")));
+    assert!(matches!(row.put_text("payload").unwrap(), PutText::Missing));
+    assert!(matches!(headers.borrow_event(0).unwrap().put_text("body").unwrap(), PutText::Missing));
+}

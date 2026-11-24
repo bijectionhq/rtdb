@@ -86,7 +86,7 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
                     Ok(true)
                 };
                 let Some(record) = record else {
-                    crate::scan::primary_point_events(request, &table.slug, &trie.key, Some(keys), usize::MAX, visit).await?;
+                    crate::scan::primary_point_events(request, &table.slug, &trie.key, Some(crate::IidScope::Set(keys)), usize::MAX, visit).await?;
                     return Ok::<_, Anomaly>((rows, reservation, key_bytes));
                 };
                 let root = HistoryRoot::decode(record.stats(), record.file_size())?;
@@ -162,7 +162,7 @@ pub(crate) fn contains(part: &[u8], iid: Iid) -> bool {
 pub(crate) fn cancelled() -> Anomaly { Anomaly::new(AnomalyCategory::Interrupted, "rtdb.query/cancelled", "Entity history read cancelled") }
 
 pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types::BlockIndex>,
-    scope: Option<&BTreeSet<Iid>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
+    scope: Option<crate::IidScope<'_>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
     match read_uncovered(request, covered, scope, limit).await {
         Err(error) if error.category != AnomalyCategory::Interrupted => Ok(None),
         result => result,
@@ -170,7 +170,7 @@ pub async fn uncovered_history_iids(request: &ScanRequest<'_>, covered: &BTreeSe
 }
 
 pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_format::keys::TableSlug,
-    trie: &CatalogTrie, scope: Option<&BTreeSet<Iid>>, max_rows: usize,
+    trie: &CatalogTrie, scope: Option<crate::IidScope<'_>>, max_rows: usize,
     mut visit: impl FnMut(LocatedHistoryEvent<()>, Option<&[u8]>) -> Result<bool>) -> Result<Option<usize>> {
     let Some(record) = trie.artefact(entity_history::KIND, entity_history::ID, entity_history::VERSION) else {
         return crate::scan::primary_point_events(request, slug, &trie.key, scope, max_rows, visit).await;
@@ -180,7 +180,8 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
     let file = HistoryObject::open(request, key, record.file_size()).await?;
     let directory = file.read(root.range()).await?;
     let _directory = request.memory.reserve(directory.as_slice().len().saturating_mul(2).saturating_add(4096))?;
-    let ranges = entity_history::ranges(directory.as_slice(), root, entity_history::owner(slug, &trie.key), scope)?;
+    let ranges = entity_history::ranges_matching(directory.as_slice(), root, entity_history::owner(slug, &trie.key),
+        |first, last| scope.is_none_or(|scope| scope.intersects(first, last)))?;
     let mut inspected = 0usize;
     for range in ranges {
         if request.cancellation.is_cancelled() { return Err(cancelled()); }
@@ -189,7 +190,7 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
         audience_work::scan_items(range.rows as usize)?;
         let bytes = file.read(range.range()).await?;
         let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
-        let page = range.read(bytes.as_slice())?;
+        let page = range.read(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)))?;
         for row in 0..range.rows as usize {
             let (header, origin) = page.event(row)?;
             if scope.is_some_and(|keys| !keys.contains(&header.iid)) { continue; }
@@ -202,8 +203,8 @@ pub(crate) async fn visit_trie_events(request: &ScanRequest<'_>, slug: &rtdb_for
     Ok(Some(inspected))
 }
 
-async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex>,
-    scope: Option<&BTreeSet<Iid>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
+async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<rtdb_types::BlockIndex>,
+    scope: Option<crate::IidScope<'_>>, limit: usize) -> Result<Option<BTreeSet<Iid>>> {
     let table = &request.scan.table.name.table;
     let mut iids = BTreeSet::new();
     let mut charge = request.memory.reserve(4096)?;
@@ -229,7 +230,7 @@ async fn read_uncovered(request: &ScanRequest<'_>, covered: &BTreeSet<BlockIndex
         let is_l0 = trie.key.level() == 0;
         let block = trie.key.block_index();
         if through.is_some_and(|through| block <= through) || (is_l0 && covered.contains(&block)) { continue; }
-        if scope.is_some_and(|keys| !keys.iter().any(|&key| contains(trie.key.part(), key))) { continue; }
+        if scope.is_some_and(|keys| !keys.iter().any(|key| contains(trie.key.part(), key))) { continue; }
         let Some(rows) = visit_trie_events(request, &entry.slug, trie, scope, budget.saturating_sub(inspected), |event, _| {
             if event.origin.is_some_and(|origin| {
                 through.is_some_and(|through| origin.source_block() <= through) || covered.contains(&origin.source_block())

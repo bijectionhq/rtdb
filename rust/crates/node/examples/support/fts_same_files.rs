@@ -155,7 +155,7 @@ impl Fixture<'_> {
         let bounds = TemporalBounds { valid_time: Interval::at(valid).unwrap(), system_time: Interval::at(system).unwrap() };
         let scan = self.scan(snapshot);
         let memory = self.node.query_memory();
-        let request = ScanRequest { database: "xtdb", scan: &scan, snapshot, storage: self.database.storage(), bounds,
+        let request = ScanRequest { database: "xtdb", scan: &scan, candidate_iids: None, snapshot, storage: self.database.storage(), bounds,
             memory: &memory, current_time: self.node.query_instant(), cancellation: self.node.cancellation(),
             constants: &LiteralOnly, partitions: std::slice::from_ref(snapshot), verifier: &LiteralOnly };
         let (hits, work) = ranker.rank(&self.inspection.search, &request, "body", &Query::parse(case.matching),

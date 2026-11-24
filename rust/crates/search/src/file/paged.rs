@@ -328,7 +328,7 @@ impl PagedRanked {
 
     fn block(&self, key: (usize, usize)) -> &Block { &self.terms[key.0].blocks[key.1] }
 
-    pub(super) async fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<ScoredRuns> {
+    pub(super) async fn expand(&mut self, scope: Option<rtdb_query::IidScope<'_>>, examined: &mut usize) -> Result<ScoredRuns> {
         let ranker = &*self;
         let end = self.next.saturating_add(4).min(self.windows.len());
         let windows = &self.windows[self.next..end];

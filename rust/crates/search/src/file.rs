@@ -654,12 +654,12 @@ impl SearchFile {
         Ok(MatchSet { file: Arc::clone(self), column, matching: MatchingDocuments::All(BooleanArray::new(bits.finish(), None)) })
     }
 
-    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: &BTreeSet<Iid>) -> Result<MatchSet> {
+    pub(crate) fn match_selected_iids(self: &Arc<Self>, column: &str, query: &Query, iids: rtdb_query::IidScope<'_>) -> Result<MatchSet> {
         let column = self.column(column);
         let mut documents = BTreeSet::new();
         let mut bits = BooleanBufferBuilder::new(iids.len());
         if let Some(column) = column {
-            for iid in iids {
+            for iid in iids.iter() {
                 for row in self.manifest.rows_of(&iid.0) {
                     if let RowDoc::Run(doc) = self.manifest.row_doc(column, row) {
                         documents.insert(doc);
@@ -829,7 +829,7 @@ impl RankedSource {
         }
     }
 
-    pub async fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Result<ScoredRuns> {
+    pub async fn expand(&mut self, scope: Option<rtdb_query::IidScope<'_>>, examined: &mut usize) -> Result<ScoredRuns> {
         match self {
             Self::Legacy(rank) => rank.expand_in(scope, examined).ok_or_else(|| corrupt("Ranked file has no remaining windows")),
             Self::Paged(rank) => rank.expand(scope, examined).await,
@@ -876,7 +876,7 @@ impl Ranked {
         Ok(self.expand_in(None, &mut 0).map_or_else(Vec::new, |found| found.iter().collect()))
     }
 
-    pub(crate) fn expand_in(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> Option<ScoredRuns> {
+    pub(crate) fn expand_in(&mut self, scope: Option<rtdb_query::IidScope<'_>>, examined: &mut usize) -> Option<ScoredRuns> {
         self.0.as_mut().map(|windows| windows.expand(scope, examined))
     }
 
@@ -884,7 +884,7 @@ impl Ranked {
 }
 
 impl Windows {
-    fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, examined: &mut usize) -> ScoredRuns {
+    fn expand(&mut self, scope: Option<rtdb_query::IidScope<'_>>, examined: &mut usize) -> ScoredRuns {
         let end = self.next.saturating_add(4).min(self.windows.len());
         let mut found = Vec::new();
         let mut scores = Vec::new();
@@ -1252,7 +1252,7 @@ mod tests {
         let file = open(&rows);
         let query = Query::parse("\"overdue invoice\"");
         let iids = BTreeSet::from([Iid(rows[0].iid), Iid(rows[1].iid), Iid(rows[3].iid)]);
-        let selected = file.match_selected_iids("body", &query, &iids).unwrap();
+        let selected = file.match_selected_iids("body", &query, rtdb_query::IidScope::Set(&iids)).unwrap();
         assert_eq!(selected.value(0, 0).unwrap(), Some(true));
         assert_eq!(selected.value(0, 1).unwrap(), Some(false));
         assert!(selected.value(0, 2).is_err());

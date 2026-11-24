@@ -127,13 +127,13 @@ async fn visit_rows(
     read: &DirectoryRead<'_>,
     slug: &TableSlug,
     root: &RootRef,
-    keys: Option<&BTreeSet<Iid>>,
+    keys: Option<crate::IidScope<'_>>,
     mut visit: impl FnMut(LogicalEvent) -> Result<bool> + Send,
 ) -> Result<()> {
     let pages = read.pages(slug);
     let ranges = keys
         .iter()
-        .flat_map(|keys| keys.iter().copied().map(iid_rows))
+        .flat_map(|keys| keys.iter().map(iid_rows))
         .chain(keys.is_none().then(all_rows));
     let mut done = false;
     for range in ranges {
@@ -182,7 +182,7 @@ pub async fn resolve_points(
         Ok(true)
     };
     let read = DirectoryRead::from(request);
-    visit_rows(&read, &entry.slug, &root, Some(keys), |event| {
+    visit_rows(&read, &entry.slug, &root, Some(crate::IidScope::Set(keys)), |event| {
         if event.origin.source_block() > through {
             return Err(invalid("Event lies after the directory boundary"));
         }
@@ -209,7 +209,7 @@ pub async fn resolve_points(
             request,
             &entry.slug,
             trie,
-            Some(keys),
+            Some(crate::IidScope::Set(keys)),
             usize::MAX,
             |event, key| match event.origin {
                 Some(origin) if origin.source_block() <= through => Ok(true),
@@ -296,7 +296,7 @@ pub async fn resolve_points(
                         request,
                         &entry.slug,
                         trie,
-                        Some(&keys),
+                        Some(crate::IidScope::Set(&keys)),
                         usize::MAX,
                         &mut matching,
                     )
@@ -307,7 +307,7 @@ pub async fn resolve_points(
                                 request,
                                 &entry.slug,
                                 &trie.key,
-                                Some(&keys),
+                                Some(crate::IidScope::Set(&keys)),
                                 usize::MAX,
                                 matching,
                             )
@@ -333,7 +333,7 @@ pub async fn resolve_points(
 pub(crate) async fn nominate(
     request: &ScanRequest<'_>,
     covered: &BTreeSet<BlockIndex>,
-    scope: Option<&BTreeSet<Iid>>,
+    scope: Option<crate::IidScope<'_>>,
     limit: usize,
     visit: &mut (impl FnMut(EventHeader, EventOrigin) -> Result<bool> + Send),
 ) -> Result<Option<(BlockIndex, usize)>> {

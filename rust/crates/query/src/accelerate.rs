@@ -17,13 +17,45 @@ use crate::context::Execution;
 #[async_trait]
 pub trait ConstantEvaluator: Send + Sync {
     async fn constant(&self, expression: &Expr) -> Result<Option<Value>>;
+
+    async fn search_query(&self, expression: &Expr) -> Result<Option<Arc<PreparedSearchQuery>>> {
+        Ok(match self.constant(expression).await? {
+            Some(Value::Utf8(text)) => Some(Arc::new(PreparedSearchQuery::new(text))),
+            _ => None,
+        })
+    }
 }
+
+pub struct PreparedSearchQuery {
+    text: String,
+    query: Arc<rtdb_text::Query>,
+    scorer: std::sync::OnceLock<Arc<rtdb_text::Scorer>>,
+}
+
+impl PreparedSearchQuery {
+    pub fn new(text: String) -> Self {
+        let query = Arc::new(rtdb_text::Query::parse(&text));
+        Self { text, query, scorer: Default::default() }
+    }
+
+    pub fn query(&self) -> &rtdb_text::Query { &self.query }
+
+    pub(crate) fn parsed(&self) -> Arc<rtdb_text::Query> { Arc::clone(&self.query) }
+
+    pub fn scorer(&self) -> &Arc<rtdb_text::Scorer> {
+        self.scorer.get_or_init(|| Arc::new(rtdb_text::Scorer::new(self.query.as_ref().clone(), None)))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SearchQueries(tokio::sync::Mutex<Vec<(Expr, Option<Arc<PreparedSearchQuery>>)>>);
 
 /// What an accelerator sees of one partition's scan before it opens.
 #[derive(Clone, Copy)]
 pub struct ScanRequest<'a> {
     pub database: &'a str,
     pub scan: &'a Scan,
+    pub candidate_iids: Option<&'a CandidateIids>,
     pub snapshot: &'a Snapshot,
     pub storage: &'a Arc<BufferPool>,
     pub bounds: TemporalBounds,
@@ -38,6 +70,10 @@ pub struct ScanRequest<'a> {
 }
 
 impl ScanRequest<'_> {
+    pub fn iid_scope(&self) -> Option<IidScope<'_>> {
+        self.candidate_iids.map(IidScope::Arrow).or_else(|| self.scan.iids.as_ref().map(IidScope::Set))
+    }
+
     pub async fn ranked_prefix_len(&self, top: &rtdb_plan::ScanTopK) -> Option<usize> {
         let count = async |expression: &Expr| {
             let value = self.constants.constant(expression).await.ok()??;
@@ -281,6 +317,39 @@ impl CandidateIids {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum IidScope<'a> {
+    Arrow(&'a CandidateIids),
+    Set(&'a BTreeSet<Iid>),
+}
+
+impl<'a> IidScope<'a> {
+    pub fn len(self) -> usize {
+        match self { Self::Arrow(iids) => iids.len(), Self::Set(iids) => iids.len() }
+    }
+
+    pub fn is_empty(self) -> bool { self.len() == 0 }
+
+    pub fn contains(self, iid: &Iid) -> bool {
+        match self { Self::Arrow(iids) => iids.contains(*iid), Self::Set(iids) => iids.contains(iid) }
+    }
+
+    pub fn intersects(self, lower: Iid, upper: Iid) -> bool {
+        match self {
+            Self::Arrow(iids) => iids.intersects(lower, upper),
+            Self::Set(iids) => iids.range(lower..=upper).next().is_some(),
+        }
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Iid> + 'a {
+        let (arrow, set) = match self {
+            Self::Arrow(iids) => (Some(iids), None),
+            Self::Set(iids) => (None, Some(iids)),
+        };
+        arrow.into_iter().flat_map(CandidateIids::iter).chain(set.into_iter().flat_map(|iids| iids.iter().copied()))
+    }
+}
+
 /// Exact ordered output for a point scan in its requested order.
 pub enum OrderedScan {
     Payload { candidates: Box<dyn OrderedCandidates>, verify: bool },
@@ -305,6 +374,8 @@ pub trait OrderedBatches: Send {
 /// The ranked point path may emit the matching rows its verifier already resolved.
 #[async_trait]
 pub trait ScanAccelerator: Send + Sync {
+    fn accepts_arrow_iids(&self) -> bool { false }
+
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>>;
     /// Supplies exact ranking work for a point scan at the given cut.
     async fn rank_source<'a>(&'a self, _request: ScanRequest<'a>) -> Result<Option<Box<dyn crate::RankSource + 'a>>> { Ok(None) }
@@ -329,6 +400,10 @@ pub trait ScanAccelerator: Send + Sync {
     /// Each answer must equal MATCH evaluated on the row.
     async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &str) -> Result<Option<MatchAnswers>> { Ok(None) }
     fn live_search_terms(&self, _request: &ScanRequest<'_>, _column: &str) -> Option<Arc<dyn LiveSearchTerms>> { None }
+    async fn match_answers_prepared(&self, request: &ScanRequest<'_>, column: &str, query: &PreparedSearchQuery) -> Result<Option<MatchAnswers>> {
+        self.match_answers(request, column, &query.text).await
+    }
+
 }
 
 /// Analyzed text from the admitted prefix of the snapshot's live Arrow batches.
@@ -353,14 +428,30 @@ impl MatchAnswers {
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<dyn FileMatches>)> { self.files.iter().map(|(key, matches)| (key.as_str(), matches)) }
 }
 
-pub(crate) struct ExecutionConstants<'a>(pub(crate) &'a Execution);
+pub(crate) struct ExecutionConstants<'a> {
+    pub(crate) execution: &'a Execution,
+    pub(crate) search_queries: &'a SearchQueries,
+}
 
 #[async_trait]
 impl ConstantEvaluator for ExecutionConstants<'_> {
     async fn constant(&self, expression: &Expr) -> Result<Option<Value>> {
         if !matches!(expression, Expr::Literal(_) | Expr::Parameter { .. }) { return Ok(None); }
-        let scope = self.0.scope()?;
-        Ok(Some(self.0.evaluate(&scope, expression, &Schema::default(), &[]).await?))
+        let scope = self.execution.scope()?;
+        Ok(Some(self.execution.evaluate(&scope, expression, &Schema::default(), &[]).await?))
+    }
+
+    async fn search_query(&self, expression: &Expr) -> Result<Option<Arc<PreparedSearchQuery>>> {
+        let mut queries = self.search_queries.0.lock().await;
+        if let Some((_, query)) = queries.iter().find(|(bound, _)| bound == expression) {
+            return Ok(query.clone());
+        }
+        let query = match self.constant(expression).await? {
+            Some(Value::Utf8(text)) => Some(Arc::new(PreparedSearchQuery::new(text))),
+            _ => None,
+        };
+        queries.push((expression.clone(), query.clone()));
+        Ok(query)
     }
 }
 

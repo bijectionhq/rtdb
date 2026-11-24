@@ -245,7 +245,7 @@ impl TreeRanked {
         self.file.find_ordinals(kind, pages).await
     }
 
-    pub async fn expand(&mut self, scope: Option<&BTreeSet<Iid>>, visited: &mut usize) -> Result<Vec<TreeCandidate>> {
+    pub async fn expand(&mut self, scope: Option<rtdb_query::IidScope<'_>>, visited: &mut usize) -> Result<Vec<TreeCandidate>> {
         if let Some(Work { job: Job::Node(node), .. }) = self.ready.peek() {
             let node = *node;
             self.ready.pop();

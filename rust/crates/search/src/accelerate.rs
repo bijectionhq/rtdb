@@ -15,10 +15,10 @@ use rtdb_columnar::{EntityIdRef, OwnedBatch};
 use rtdb_format::{data::PutText, keys::ArtefactOwner};
 use rtdb_index::{Snapshot, TrieState};
 use rtdb_plan::{BinaryOp, Catalog, Expr};
-use rtdb_query::{MatchAnswers, QueryContext, ScanAccelerator, ScanRequest, ScanSelection};
+use rtdb_query::{IidScope, MatchAnswers, PreparedSearchQuery, QueryContext, ScanAccelerator, ScanRequest, ScanSelection};
 use rtdb_storage::ObjectKey;
 use rtdb_text::Query;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TableRef, TemporalBounds, Timestamp, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, EntityId, EventOp, Iid, Interval, OwnedRelation, Result, TableRef, TemporalBounds, Timestamp};
 
 use crate::{KIND, SearchDefinition, SearchFile, rank_cutoff::RankKey, runtime::{Suspect, TrieFile}};
 
@@ -66,6 +66,7 @@ fn optional_build_refused(error: &Anomaly) -> bool {
 
 #[async_trait]
 impl ScanAccelerator for SearchAccelerator {
+    fn accepts_arrow_iids(&self) -> bool { true }
     async fn candidate_iids(&self, request: &ScanRequest<'_>) -> Result<Option<BTreeSet<Iid>>> {
         self.narrow(request, Narrowing::default(), &mut NarrowingWork::default()).await
     }
@@ -88,9 +89,9 @@ impl ScanAccelerator for SearchAccelerator {
         let Some(column) = request.scan.columns.iter().find(|field| field.id == top.column).map(|field| field.name.as_str()) else { return Ok(None); };
         let Some((matched_column, matching, definition)) = self.match_definition(&request).await? else { return Ok(None); };
         if matched_column != column { return Ok(None); }
-        let Some(Value::Utf8(scoring)) = request.constants.constant(&top.query).await? else { return Ok(None); };
+        let Some(scoring) = request.constants.search_query(&top.query).await? else { return Ok(None); };
         let Some(limit) = request.ranked_prefix_len(top).await else { return Ok(None); };
-        let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching, Query::parse(&scoring),
+        let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching.query().clone(), Arc::clone(scoring.scorer()),
             top.ascending_id, limit, Narrowing::default()).await;
         match result {
             Ok(source) => Ok(source.map(|source| source as Box<dyn rtdb_query::RankSource + 'a>)),
@@ -121,14 +122,18 @@ impl ScanAccelerator for SearchAccelerator {
     }
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
+        self.match_answers_prepared(request, column, &PreparedSearchQuery::new(query.to_owned())).await
+    }
+
+    async fn match_answers_prepared(&self, request: &ScanRequest<'_>, column: &str, query: &PreparedSearchQuery) -> Result<Option<MatchAnswers>> {
         if request.storage.prepaid_metadata_budget().is_some() { return Ok(None); }
-        if request.scan.top_k.is_some() && request.scan.iids.as_ref().is_some_and(|iids| iids.len() <= 128) {
+        if request.scan.top_k.is_some() && request.iid_scope().is_some_and(|iids| iids.len() <= 128) {
             return Ok(None);
         }
         let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
         if tree::logical_runs(&self.runtime, request, &definition).is_some() { return Ok(None); }
-        let query = Query::parse(query);
-        let files = match self.trie_files(request, &definition, column, &[&query], LoadSearch::Match, None).await? {
+        let query = query.query();
+        let files = match self.trie_files(request, &definition, column, &[query], LoadSearch::Match, None).await? {
             TrieFiles::Complete(found) | TrieFiles::Partial(found) => found.files,
         };
         let mut answers = MatchAnswers::default();
@@ -137,7 +142,7 @@ impl ScanAccelerator for SearchAccelerator {
             let set = match sets.entry(trie.identity.as_str()) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::btree_map::Entry::Vacant(entry) => entry.insert(
-                    self.runtime.match_set_for_scan(request.database, trie, column, &query, request.scan.iids.as_ref())?,
+                    self.runtime.match_set_for_scan(request.database, trie, column, query, request.iid_scope())?,
                 ),
             };
             answers.insert(&trie.data, Arc::new(set.member(trie.member)?));
@@ -158,7 +163,7 @@ struct Narrowing<'a> {
     estimate_first: bool,
     omit_packs: bool,
     omit_logical: bool,
-    scope: Option<&'a BTreeSet<Iid>>,
+    scope: Option<IidScope<'a>>,
 }
 
 #[derive(Default)]
@@ -195,14 +200,14 @@ impl NarrowingWork {
 }
 
 impl SearchAccelerator {
-    async fn match_definition<'a>(&self, request: &ScanRequest<'a>) -> Result<Option<(&'a str, Query, SearchDefinition)>> {
+    async fn match_definition<'a>(&self, request: &ScanRequest<'a>) -> Result<Option<(&'a str, Arc<rtdb_query::PreparedSearchQuery>, SearchDefinition)>> {
         let scan = request.scan;
         let mut conjuncts = Vec::new();
         for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
         for (column, query) in conjuncts {
-            let Some(Value::Utf8(text)) = request.constants.constant(query).await? else { continue; };
+            let Some(query) = request.constants.search_query(query).await? else { continue; };
             if let Some(definition) = self.definition(request, column).await? {
-                return Ok(Some((column, Query::parse(&text), definition)));
+                return Ok(Some((column, query, definition)));
             }
         }
         Ok(None)
@@ -210,22 +215,23 @@ impl SearchAccelerator {
 
     async fn narrow(&self, request: &ScanRequest<'_>, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
         let scan = request.scan;
-        let Some((column, query, definition)) = self.match_definition(request).await? else { return Ok(None); };
+        let Some((column, prepared, definition)) = self.match_definition(request).await? else { return Ok(None); };
+        let query = prepared.query();
         if query.terms().is_empty() { return Ok(Some(BTreeSet::new())); }
         if options.is_oracle { return Ok(None); }
         if let Some(top_k) = &scan.top_k {
             let ranked = scan.columns.iter().find(|field| field.id == top_k.column).is_some_and(|field| field.name == column);
             if ranked {
                 work.tried_ranking = true;
-                let existing = if options.baseline { None } else { scan.iids.as_ref() };
+                let existing = if options.baseline { None } else { request.iid_scope() };
                 let scope = options.scope.or(existing);
-                work.filter_scope = scope.map(BTreeSet::len);
-                if scope.is_some_and(BTreeSet::is_empty) {
+                work.filter_scope = scope.map(IidScope::len);
+                if scope.is_some_and(IidScope::is_empty) {
                     work.ranked = true;
                     return Ok(Some(BTreeSet::new()));
                 }
                 let ranking = Narrowing { scope, ..options };
-                if let Some(candidates) = self.top_k(request, top_k, column, &query, &definition, ranking, work).await? {
+                if let Some(candidates) = self.top_k(request, top_k, column, query, &definition, ranking, work).await? {
                     work.ranked = true;
                     return Ok(Some(candidates));
                 }
@@ -236,21 +242,21 @@ impl SearchAccelerator {
             }
         }
         if let Some(scope) = options.scope {
-            return Ok(Some(scope.clone()));
+            return Ok(Some(scope.iter().collect()));
         }
-        if !options.omit_packs && !options.omit_logical && let Some(found) = self.logical_candidates(request, &definition, column, &query, work).await? {
+        if !options.omit_packs && !options.omit_logical && let Some(found) = self.logical_candidates(request, &definition, column, &prepared, work).await? {
             return Ok(Some(found));
         }
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition, column, &[&query], LoadSearch::Match, None).await? else {
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, &definition, column, &[query], LoadSearch::Match, None).await? else {
             work.plain_decline = Some("coverage");
             return Ok(None);
         };
         let cutter = Cutter::new(&files, &skipped, request);
-        let Some(mut candidates) = file_candidates(&cutter, column, &query, self.max_candidates, &mut work.plain_events)? else {
+        let Some(mut candidates) = file_candidates(&cutter, column, query, self.max_candidates, &mut work.plain_events)? else {
             work.plain_decline = Some("candidate-budget");
             return Ok(None);
         };
-        candidates.extend(self.live_candidates(request, column, &query)?);
+        candidates.extend(self.live_candidates(request, column, query)?);
         if candidates.len() > self.max_candidates { work.plain_decline = Some("candidate-budget"); return Ok(None); }
         Ok(Some(candidates))
     }
@@ -908,7 +914,7 @@ impl OwnedRankWindow {
 }
 
 fn owned_id_bytes(id: EntityIdRef<'_>) -> usize {
-    size_of::<Value>().saturating_add(id.owned_payload_bytes())
+    size_of::<rtdb_types::Value>().saturating_add(id.owned_payload_bytes())
 }
 
 fn file_candidates(cutter: &Cutter<'_>, column: &str, query: &Query, max_candidates: usize, events: &mut usize) -> Result<Option<BTreeSet<Iid>>> {
@@ -988,7 +994,7 @@ impl Candidates<'_> {
         pending.into_iter().chain(unread).all(|bound| kth.beats(bound))
     }
     /// The next IID, best first, with its best event's score.
-    async fn next(&mut self, scope: Option<&BTreeSet<Iid>>, ascending_id: bool, work: &mut NarrowingWork)
+    async fn next(&mut self, scope: Option<IidScope<'_>>, ascending_id: bool, work: &mut NarrowingWork)
         -> std::result::Result<Option<Pending>, (Option<usize>, Anomaly)> {
         loop {
             if self.scored > self.max_candidates { return Ok(None); }
@@ -1041,15 +1047,15 @@ impl SearchAccelerator {
     /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
-        let Some(Value::Utf8(text)) = request.constants.constant(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
+        let Some(scoring) = request.constants.search_query(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
         let Some(limit) = request.ranked_prefix_len(top_k).await else { work.decline = Some("unsupported-limit"); return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
-        let scoring_query = Query::parse(&text);
+        let scoring = scoring.scorer();
         if !options.estimate_first && !options.baseline {
             let (ranked, io) = crate::file::observe_tree_io(Box::pin(async {
                 let ranking = rtdb_query::QueryRanking::new(std::num::NonZeroUsize::new(limit).expect("nonempty prefix"), 1, request.memory)?;
                 let source = Box::pin(tree::PartitionRankSource::open(self, *request, definition.clone(), column, top_k.column, matching.clone(),
-                    scoring_query.clone(), top_k.ascending_id, limit, options));
+                    Arc::clone(scoring), top_k.ascending_id, limit, options));
                 let Some(source) = rtdb_query::run_rank_partition(&ranking, 0, source, request.cancellation).await?
                     else { return Ok(None); };
                 let tried_ranking = work.tried_ranking;
@@ -1070,11 +1076,11 @@ impl SearchAccelerator {
         }
         let ascending_id = top_k.ascending_id.filter(|&id| request.ranked_id_is_integer(id)
             && request.bounds.valid_time.is_point() && request.bounds.system_time.is_point());
-        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition, column, &[matching, &scoring_query], LoadSearch::Rank, None).await? else {
+        let TrieFiles::Complete(Found { files, skipped }) = self.trie_files(request, definition, column, &[matching, scoring.query()], LoadSearch::Rank, None).await? else {
             work.decline = Some("coverage");
             return Ok(None);
         };
-        if options.estimate_first && options.scope.is_none() && request.scan.iids.is_none() && matching.terms().len() == 1 {
+        if options.estimate_first && options.scope.is_none() && request.iid_scope().is_none() && matching.terms().len() == 1 {
             let term = &matching.terms()[0];
             let mut estimate = 0usize;
             for group in by_file(&files) {
@@ -1089,7 +1095,6 @@ impl SearchAccelerator {
                 return Ok(None);
             }
         }
-        let scoring = Arc::new(rtdb_text::Scorer::new(scoring_query, None));
         let Some(rank_scorer) = scoring.for_ranking() else { work.decline = Some("score-domain"); return Ok(None); };
         let ranked = by_file(&files).map(|selected| {
             Ok((selected.members, selected.file.ranked_for_query(column, matching, &rank_scorer, request.bounds, ascending_id.is_some())?))
@@ -1099,7 +1104,7 @@ impl SearchAccelerator {
             seen: BTreeSet::new(), scored: 0, max_candidates: self.max_candidates, scratch: request.memory.reserve(4096)?,
         };
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
-            let complete = self.runtime.visit_live_matches_at(Some(request.snapshot), request.database, segment, column, matching, true, request.cancellation, |row, tokens| {
+            let complete = self.runtime.visit_live_matches_at(Some(request.snapshot), request.database, segment, column, matching, true, request.cancellation, |row, matched| {
                 if request.cancellation.is_cancelled() { return Err(search_cancelled()); }
                 if cfg!(feature = "experiments") { work.postings_visited += 1; }
                 let header = segment.header(row)?;
@@ -1109,13 +1114,12 @@ impl SearchAccelerator {
                 }
                 if cfg!(feature = "experiments") { work.score_evaluations += 1; }
                 let id = if ascending_id.is_some() {
-                    let source = segment.row(row)?;
-                    crate::lane::integer_sql_id(&source.batch.view().borrow_event(source.row)?)
+                    matched.integer_id(segment, row)?
                 } else { None };
                 if candidates.scored % 128 == 0 {
                     reserve_ranking(&mut candidates.scratch, candidates.scored.saturating_add(128))?;
                 }
-                candidates.push(header.iid, scoring.bm25_arrow(&tokens()), id);
+                candidates.push(header.iid, matched.score(scoring), id);
                 Ok(candidates.scored <= self.max_candidates)
             })?;
             if !complete {
@@ -1160,7 +1164,7 @@ impl SearchAccelerator {
                 let Some(Pending { iid, .. }) = pending else { break };
 
                 handed += 1;
-                if request.scan.iids.as_ref().is_some_and(|scope| !scope.contains(&iid)) { continue; }
+                if request.iid_scope().is_some_and(|scope| !scope.contains(&iid)) { continue; }
                 iids.insert(iid);
             }
             if candidates.scored > self.max_candidates {
@@ -1176,7 +1180,7 @@ impl SearchAccelerator {
             if work.verification_rounds == 16 { work.decline = Some("verification-budget"); return Ok(None); }
             work.verification_rounds += 1;
             if cfg!(feature = "experiments") { work.verifier_rows += iids.len(); }
-            let scores = request.verifier.score_visible(iids, top_k.column, ascending_id, &scoring).await?;
+            let scores = request.verifier.score_visible(iids, top_k.column, ascending_id, scoring).await?;
             verified.extend(scores.ranked().map(|(iid, score, id)| (RankKey::integer(score, id), iid)));
         }
         if let Some(kth) = verified_cutoff(&mut verified, limit) {

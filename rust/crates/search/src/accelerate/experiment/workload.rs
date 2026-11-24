@@ -47,7 +47,7 @@ impl SearchAccelerator {
             Policy::Pack15 => Narrowing { omit_logical: true, ..Default::default() },
             Policy::Exhaustive => Narrowing { is_oracle: true, ..Default::default() },
             Policy::FilterFirst(scope) if request.bounds.valid_time.is_point() && request.bounds.system_time.is_point() => {
-                Narrowing { scope: Some(scope), ..Default::default() }
+                Narrowing { scope: Some(rtdb_query::IidScope::Set(scope)), ..Default::default() }
             }
             Policy::FilterFirst(_) => Narrowing::default(),
             Policy::SkipRetry => Narrowing { baseline: true, skip_retry: true, ..Default::default() },

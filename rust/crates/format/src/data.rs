@@ -4,17 +4,15 @@ mod selected;
 use rtdb_types::StructFields;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, NullArray, RecordBatch, StructArray, TimestampMicrosecondArray, UInt32Array, UnionArray,
+use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, NullArray, RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt32Array, UnionArray,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
 use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array_refs, build_iids, build_struct_array, copy_array_refs, estimate_builder_bytes_refs, struct_field_cell, to_field};
-use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
+use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, Timestamp, Value};
 
 #[cfg(test)]
-use arrow_array::{StringArray, cast::AsArray};
-#[cfg(test)]
-use rtdb_types::ScalarType;
+use arrow_array::cast::AsArray;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredOperation {
@@ -222,6 +220,40 @@ pub struct EventRef<'a> {
 
 pub use rtdb_columnar::TextCell as PutText;
 
+pub struct PutTextColumn<'a> {
+    batch: &'a EventBatch,
+    position: Option<usize>,
+    strings: Option<&'a StringArray>,
+    logical: std::cell::OnceCell<&'a LogicalType>,
+}
+
+impl<'a> PutTextColumn<'a> {
+    pub fn read(&self, row: usize) -> Result<(EventRef<'a>, PutText<'a>)> {
+        let event = self.batch.borrow_event(row)?;
+        let text = self.cell(&event)?;
+        Ok((event, text))
+    }
+
+    fn cell(&self, event: &EventRef<'a>) -> Result<PutText<'a>> {
+        let (Some(put), Some(position)) = (event.put, self.position) else { return Ok(PutText::Missing); };
+        let logical = match self.logical.get() {
+            Some(logical) => *logical,
+            None => {
+                let logical = put.field_type(position)?;
+                self.logical.set(logical).expect("first put field read");
+                logical
+            }
+        };
+        let scalar = match logical { LogicalType::Maybe(inner) => inner.as_ref(), ty => ty };
+        if let Some(strings) = self.strings && *scalar == LogicalType::Scalar(ScalarType::Utf8) {
+            return Ok(if strings.is_null(put.offset) { PutText::Missing } else {
+                PutText::Utf8(strings.value(put.offset))
+            });
+        }
+        rtdb_columnar::text_cell(logical, &put.array.fields()[position], put.array.column(position).as_ref(), put.offset)
+    }
+}
+
 impl<'a> EventRef<'a> {
     pub fn validate_document(&self, memory: &Arc<MemoryBudget>) -> Result<()> {
         let Some(put) = self.put else { return Ok(()); };
@@ -398,6 +430,17 @@ impl EventBatch {
             }
         }
         Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency, entity_keys, commit_positions, origins, event_positions, put_type: Default::default() })
+    }
+
+    pub fn put_text_column(&self, name: &str) -> PutTextColumn<'_> {
+        let field = self.operations().ok().and_then(|operations| {
+            let DataType::Union(fields, _) = operations.data_type() else { return None; };
+            let (id, _) = fields.iter().find(|(_, field)| field.name() == "put")?;
+            operations.child(id).as_any().downcast_ref::<StructArray>()
+        });
+        let position = field.and_then(|array| array.fields().iter().position(|field| field.name() == name));
+        let strings = field.zip(position).and_then(|(array, position)| array.column(position).as_any().downcast_ref::<StringArray>());
+        PutTextColumn { batch: self, position, strings, logical: Default::default() }
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }

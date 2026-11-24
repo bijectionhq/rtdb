@@ -9,10 +9,10 @@ use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use parking_lot::Mutex;
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::data::PutText;
+use rtdb_format::data::{PutText, PutTextColumn};
 use rtdb_index::Snapshot;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{Iid, Instant, Result};
+use rtdb_types::{Instant, Result};
 use tokio_util::sync::CancellationToken;
 
 use crate::{SearchAccelerator, SearchArtefacts, SearchDefinition, SearchFile, definitions_in};
@@ -41,6 +41,7 @@ impl<K: Ord + Clone, V: Clone> Bounded<K, V> {
 }
 
 const LIVE_POSTING_BYTES: usize = 64 << 20;
+const LIVE_PAGE_ROWS: u32 = 1024;
 
 type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
 
@@ -48,12 +49,62 @@ type DefinitionKey = (String, Vec<(Option<(i64, i64)>, Option<i64>)>);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Suspect { pub database: String, pub table: rtdb_types::TableRef, pub owner: rtdb_format::keys::ArtefactOwner, pub artefact_id: String, pub version: i64 }
 
+fn visit_live_rows<'a>(segment: &'a rtdb_index::LiveTable, from: u32, to: u32, column: &str,
+    mut visit: impl FnMut(u32, &PutTextColumn<'a>, usize) -> Result<bool>) -> Result<bool> {
+    let mut row = from;
+    for (batch, start) in segment.batches_from(from) {
+        let end = start + (batch.len() - start).min((to - row) as usize);
+        let column = batch.view().put_text_column(column);
+        for offset in start..end {
+            if !visit(row, &column, offset)? { return Ok(false); }
+            row += 1;
+        }
+        if row == to { break; }
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Copy)]
+struct LiveText<'a> {
+    text: &'a str,
+    integer_id: Option<i64>,
+}
+
+pub(crate) enum LiveMatch<'a> {
+    Posting(&'a LivePostingPage, u32),
+    Text(&'a str),
+}
+
+impl LiveMatch<'_> {
+    pub(crate) fn score(&self, scorer: &rtdb_text::Scorer) -> f64 {
+        match *self {
+            Self::Posting(page, row) => page.score(row, scorer),
+            Self::Text(text) => scorer.bm25_text(text),
+        }
+    }
+
+    pub(crate) fn integer_id(&self, segment: &rtdb_index::LiveTable, row: u32) -> Result<Option<i64>> {
+        match *self {
+            Self::Posting(page, row) => {
+                let row = (row - page.first_row) as usize;
+                Ok(page.ids.is_valid(row).then(|| page.ids.value(row)))
+            }
+            Self::Text(_) => {
+                let row = segment.row(row)?;
+                Ok(crate::lane::integer_sql_id(&row.batch.view().borrow_event(row.row)?))
+            }
+        }
+    }
+}
+
 pub(crate) struct LivePostingPage {
     first_row: u32,
     terms: StringArray,
     rows: LargeListArray,
+    frequencies: UInt32Array,
     tokens: LargeListArray,
     shared_tokens: bool,
+    ids: Int64Array,
     peak_scores: Float64Array,
     peak_ids: Int64Array,
     minimum_id: Option<i64>,
@@ -65,24 +116,40 @@ impl LivePostingPage {
         self.terms.get_array_memory_size() + self.rows.get_array_memory_size()
             + if self.shared_tokens { self.tokens.nulls().map_or(0, |nulls| nulls.buffer().capacity()) }
               else { self.tokens.get_array_memory_size() }
-            + self.peak_scores.get_array_memory_size() + self.peak_ids.get_array_memory_size() + 256
+            + self.peak_scores.get_array_memory_size() + self.peak_ids.get_array_memory_size()
+            + self.frequencies.get_array_memory_size() + self.ids.get_array_memory_size() + 256
     }
 
     fn from_rows(segment: &rtdb_index::LiveTable, column: &str, from: u32, to: u32,
         available: usize, cancellation: &CancellationToken,
         prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>) -> Result<Option<Self>> {
-        let mut builder = prepared.is_none().then(|| LargeListBuilder::new(StringBuilder::new()));
-        let mut ids = Vec::with_capacity((to - from) as usize);
-        let mut minimum_id: Option<i64> = Some(i64::MAX);
+        let mut texts = [None; LIVE_PAGE_ROWS as usize];
         let mut estimated = 4096 + (to - from) as usize * 32;
-        for row in from..to {
+        let complete = visit_live_rows(segment, from, to, column, |row, column, offset| {
+            if cancellation.is_cancelled() { return Ok(false); }
+            if let (event, PutText::Utf8(text)) = column.read(offset)? {
+                estimated = estimated.saturating_add(text.len().saturating_mul(48));
+                if estimated > available { return Ok(false); }
+                texts[(row - from) as usize] = Some(LiveText { text, integer_id: crate::lane::integer_sql_id(&event) });
+            }
+            Ok(true)
+        })?;
+        if !complete { return Ok(None); }
+        Self::from_text(from, &texts[..(to - from) as usize], available, cancellation, prepared)
+    }
+
+    fn from_text(from: u32, texts: &[Option<LiveText<'_>>],
+        available: usize, cancellation: &CancellationToken,
+        prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>) -> Result<Option<Self>> {
+        let mut builder = prepared.is_none().then(|| LargeListBuilder::new(StringBuilder::new()));
+        let mut ids = Vec::with_capacity(texts.len());
+        let mut minimum_id: Option<i64> = Some(i64::MAX);
+        let mut estimated = 4096 + texts.len() * 32;
+        for text in texts {
             if cancellation.is_cancelled() { return Ok(None); }
-            let source = segment.row(row)?;
-            let event = source.batch.view().borrow_event(source.row)?;
-            if let PutText::Utf8(text) = event.put_text(column)? {
+            if let Some(LiveText { text, integer_id: id }) = *text {
                 estimated = estimated.saturating_add(text.len().saturating_mul(48));
                 if estimated > available { return Ok(None); }
-                let id = crate::lane::integer_sql_id(&event);
                 minimum_id = minimum_id.zip(id).map(|(left, right)| left.min(right));
                 if let Some((present, _, range)) = &prepared {
                     if !present.value(range.start + ids.len()) {
@@ -109,7 +176,8 @@ impl LivePostingPage {
         };
         let values = tokens.values().as_string::<i32>();
         let offsets = tokens.value_offsets();
-        let mut postings = BTreeMap::<&str, (Vec<u32>, crate::rank_cutoff::RankKey)>::new();
+        let integer_ids = Int64Array::from_iter(ids.iter().map(|id| id.flatten()));
+        let mut postings = BTreeMap::<&str, (Vec<(u32, u32)>, crate::rank_cutoff::RankKey)>::new();
         for (row, id) in ids.into_iter().enumerate() {
             if cancellation.is_cancelled() { return Ok(None); }
             let Some(id) = id else { continue; };
@@ -122,7 +190,7 @@ impl LivePostingPage {
                 let (rows, peak) = postings.entry(term).or_insert_with(|| {
                     (Vec::new(), crate::rank_cutoff::RankKey::integer(score, id))
                 });
-                rows.push(from + row as u32);
+                rows.push((from + row as u32, frequency));
                 if score > peak.score {
                     *peak = crate::rank_cutoff::RankKey::integer(score, id);
                 } else if score == peak.score {
@@ -134,10 +202,11 @@ impl LivePostingPage {
         let terms = StringArray::from_iter_values(postings.keys().copied());
         let (postings, peaks): (Vec<_>, Vec<_>) = postings.into_values().unzip();
         let offsets = OffsetBuffer::from_lengths(postings.iter().map(Vec::len));
-        let rows = UInt32Array::from_iter_values(postings.into_iter().flatten());
+        let rows = UInt32Array::from_iter_values(postings.iter().flatten().map(|&(row, _)| row));
+        let frequencies = UInt32Array::from_iter_values(postings.into_iter().flatten().map(|(_, frequency)| frequency));
         let field = Arc::new(Field::new("item", DataType::UInt32, false));
         Ok(Some(Self { first_row: from, terms,
-            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens, shared_tokens,
+            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens, shared_tokens, frequencies, ids: integer_ids,
             peak_scores: Float64Array::from_iter_values(peaks.iter().map(|peak| peak.score)),
             peak_ids: Int64Array::from_iter(peaks.into_iter().map(crate::rank_cutoff::RankKey::integer_id)), minimum_id, _reservation: None }))
     }
@@ -152,11 +221,28 @@ impl LivePostingPage {
         (first < self.terms.len() && self.terms.value(first) == term).then_some(first)
     }
 
-    fn postings(&self, term: &str) -> Option<&[u32]> {
-        let first = self.term_index(term)?;
+    fn posting_range(&self, term: &str) -> Option<std::ops::Range<usize>> {
+        let index = self.term_index(term)?;
         let offsets = self.rows.value_offsets();
-        let rows = self.rows.values().as_primitive::<UInt32Type>();
-        Some(&rows.values()[offsets[first] as usize..offsets[first + 1] as usize])
+        Some(offsets[index] as usize..offsets[index + 1] as usize)
+    }
+
+    fn postings(&self, term: &str) -> Option<&[u32]> {
+        let range = self.posting_range(term)?;
+        Some(&self.rows.values().as_primitive::<UInt32Type>().values()[range])
+    }
+
+    fn score(&self, row: u32, scorer: &rtdb_text::Scorer) -> f64 {
+        let offsets = self.tokens.value_offsets();
+        let offset = (row - self.first_row) as usize;
+        let length = rtdb_text::stored_length((offsets[offset + 1] - offsets[offset]) as usize);
+        let rows = self.rows.values().as_primitive::<UInt32Type>().values();
+        scorer.query().terms().iter().enumerate().map(|(index, term)| {
+            let frequency = self.posting_range(term).and_then(|range| {
+                rows[range.clone()].binary_search(&row).ok().map(|offset| self.frequencies.value(range.start + offset))
+            }).unwrap_or(0);
+            scorer.term_score(index, frequency, length)
+        }).fold(-0.0, |total, term| total + term)
     }
 
     pub(crate) fn bound(&self, matching: &rtdb_text::Query, scoring: &rtdb_text::Query, ordered_ids: bool) -> Option<crate::rank_cutoff::RankKey> {
@@ -174,7 +260,7 @@ impl LivePostingPage {
     }
 
     pub(crate) fn visit(&self, query: &rtdb_text::Query, phrases: bool,
-        mut visit: impl FnMut(u32, &dyn Fn() -> StringArray) -> Result<bool>) -> Result<bool> {
+        mut visit: impl FnMut(u32, LiveMatch<'_>) -> Result<bool>) -> Result<bool> {
         let Some(mut lists) = query.terms().iter().map(|term| self.postings(term)).collect::<Option<Vec<_>>>() else { return Ok(true); };
         lists.sort_by_key(|rows| rows.len());
         let Some((shortest, rest)) = lists.split_first() else { return Ok(true); };
@@ -182,7 +268,7 @@ impl LivePostingPage {
             rtdb_storage::audience_work::scan_items(1)?;
             if !rest.iter().all(|other| other.binary_search(&row).is_ok()) { continue; }
             if phrases && !query.matches_arrow(&self.tokens(row)) { continue; }
-            if !visit(row, &|| self.tokens(row))? { return Ok(false); }
+            if !visit(row, LiveMatch::Posting(self, row))? { return Ok(false); }
         }
         Ok(true)
     }
@@ -229,7 +315,7 @@ impl rtdb_query::LiveSearchTerms for ServingTerms {
 
     fn score(&self, batch: &rtdb_index::IndexBatch, row: usize, scorer: &rtdb_text::Scorer) -> Option<f64> {
         let (page, row) = self.covered(batch, row)?;
-        Some(scorer.bm25_arrow(&page.tokens(row)))
+        Some(page.score(row, scorer))
     }
 }
 
@@ -272,17 +358,19 @@ impl ServingPostings {
             while postings.rows < segment.row_count() {
                 if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
                 let from = postings.rows;
-                let to = from.saturating_add(1024).min(segment.row_count());
+                let to = from.saturating_add(LIVE_PAGE_ROWS).min(segment.row_count());
                 let mut bytes = 16_384 + (to - from) as usize * 128;
-                for row in from..to {
-                    let source = segment.row(row)?;
-                    if let PutText::Utf8(value) = source.batch.view().borrow_event(source.row)?.put_text(column)? {
-                        bytes = bytes.saturating_add(value.len().saturating_mul(96));
+                let mut texts = [None; LIVE_PAGE_ROWS as usize];
+                visit_live_rows(segment, from, to, column, |row, column, offset| {
+                    if let (event, PutText::Utf8(text)) = column.read(offset)? {
+                        bytes = bytes.saturating_add(text.len().saturating_mul(96));
+                        texts[(row - from) as usize] = Some(LiveText { text, integer_id: crate::lane::integer_sql_id(&event) });
                     }
-                }
+                    Ok(true)
+                })?;
                 let Ok(mut reservation) = budget.reserve(bytes) else { break; };
                 let prepared = commit.map(|(delta, _)| delta.page(&key, (from - first) as usize..(to - first) as usize));
-                let Some(mut page) = LivePostingPage::from_rows(segment, column, from, to, bytes, cancellation, prepared)? else { break; };
+                let Some(mut page) = LivePostingPage::from_text(from, &texts[..(to - from) as usize], bytes, cancellation, prepared)? else { break; };
                 let retained = page.bytes();
                 if retained > bytes { break; }
                 Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").shrink_to(retained)?;
@@ -334,7 +422,7 @@ impl LivePostings {
     fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str, cancellation: &CancellationToken) -> Result<()> {
         let mut from = self.rows;
         while from < segment.row_count() {
-            let to = from.saturating_add(1024).min(segment.row_count());
+            let to = from.saturating_add(LIVE_PAGE_ROWS).min(segment.row_count());
             let remaining = LIVE_POSTING_BYTES.saturating_sub(self.bytes);
             let Some(page) = LivePostingPage::from_rows(segment, column, from, to, remaining, cancellation, None)? else { break; };
             let bytes = page.bytes();
@@ -505,15 +593,13 @@ impl SearchRuntime {
         if self.write_format < crate::file::PACKED_FORMAT_VERSION { return Ok(true); }
         if segment.row_count().saturating_sub(covered) > 2048 { return Ok(false); }
         let mut bytes = 0usize;
-        for row in covered..segment.row_count() {
-            let source = segment.row(row)?;
+        visit_live_rows(segment, covered, segment.row_count(), column, |_, column, offset| {
             rtdb_storage::audience_work::scan_items(1)?;
-            if let PutText::Utf8(text) = source.batch.view().borrow_event(source.row)?.put_text(column)? {
+            if let (_, PutText::Utf8(text)) = column.read(offset)? {
                 bytes = bytes.saturating_add(text.len());
-                if bytes > 1024 * 1024 { return Ok(false); }
             }
-        }
-        Ok(true)
+            Ok(bytes <= 1024 * 1024)
+        })
     }
 
     pub(crate) async fn tree_file(&self, storage: &Arc<BufferPool>, key: &ObjectKey,
@@ -706,7 +792,7 @@ impl SearchRuntime {
         self.match_set_for_scan(database, trie, column, query, None)
     }
 
-    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query, iids: Option<&BTreeSet<Iid>>) -> Result<Arc<crate::file::MatchSet>> {
+    pub(crate) fn match_set_for_scan(&self, database: &str, trie: &TrieFile, column: &str, query: &rtdb_text::Query, iids: Option<rtdb_query::IidScope<'_>>) -> Result<Arc<crate::file::MatchSet>> {
         let cache_key = (database.to_string(), trie.identity.clone(), column.to_string(), query.clone());
         if let Some((opened, set)) = self.match_sets.lock().get(&cache_key) {
             if opened.upgrade().is_some_and(|opened| Arc::ptr_eq(&opened, &trie.file)) { return Ok(set); }
@@ -810,7 +896,7 @@ impl SearchRuntime {
     }
 
     pub(crate) fn visit_live_matches(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str,
-        query: &rtdb_text::Query, phrases: bool, cancellation: &CancellationToken, visit: impl FnMut(u32, &dyn Fn() -> StringArray) -> Result<bool>,
+        query: &rtdb_text::Query, phrases: bool, cancellation: &CancellationToken, visit: impl FnMut(u32, LiveMatch<'_>) -> Result<bool>,
     ) -> Result<bool> {
         self.visit_live_matches_at(None, database, segment, column, query, phrases, cancellation, visit)
     }
@@ -846,7 +932,7 @@ impl SearchRuntime {
     }
 
     pub(crate) fn visit_live_matches_at(&self, snapshot: Option<&Snapshot>, database: &str, segment: &rtdb_index::LiveTable, column: &str,
-        query: &rtdb_text::Query, phrases: bool, cancellation: &CancellationToken, mut visit: impl FnMut(u32, &dyn Fn() -> StringArray) -> Result<bool>,
+        query: &rtdb_text::Query, phrases: bool, cancellation: &CancellationToken, mut visit: impl FnMut(u32, LiveMatch<'_>) -> Result<bool>,
     ) -> Result<bool> {
         let (pages, covered) = self.live_pages_at(snapshot, database, segment, column);
         if snapshot.is_some() && !self.can_scan_live_gap(segment, column, covered)? { return Ok(false); }
@@ -858,23 +944,17 @@ impl SearchRuntime {
     }
 
     pub(crate) fn visit_live_suffix(segment: &rtdb_index::LiveTable, column: &str, query: &rtdb_text::Query,
-        phrases: bool, covered: u32, cancellation: &CancellationToken, mut visit: impl FnMut(u32, &dyn Fn() -> StringArray) -> Result<bool>,
+        phrases: bool, covered: u32, cancellation: &CancellationToken, mut visit: impl FnMut(u32, LiveMatch<'_>) -> Result<bool>,
     ) -> Result<bool> {
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
         if query.terms().is_empty() { return Ok(true); }
-        for row in covered..segment.row_count() {
+        visit_live_rows(segment, covered, segment.row_count(), column, |row, column, offset| {
             if row % 128 == 0 && cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
             rtdb_storage::audience_work::scan_items(1)?;
-            let source = segment.row(row)?;
-            let event = source.batch.view().borrow_event(source.row)?;
-            let PutText::Utf8(text) = event.put_text(column)? else { continue; };
+            let (_, PutText::Utf8(text)) = column.read(offset)? else { return Ok(true); };
             rtdb_storage::audience_work::decode_bytes(text.len().saturating_mul(32))?;
-            let tokens = rtdb_text::analyze(text);
-            if !query.terms().iter().all(|term| tokens.iter().any(|token| token == Some(term.as_str()))) { continue; }
-            if phrases && !query.matches_arrow(&tokens) { continue; }
-            if !visit(row, &|| tokens.clone())? { return Ok(false); }
-        }
-        Ok(true)
+            if query.text_terms(text, phrases).2 { visit(row, LiveMatch::Text(text)) } else { Ok(true) }
+        })
     }
 
     /// Hands a recorded file a scan could not read to the database's lane.
@@ -1079,7 +1159,7 @@ mod live_coverage_tests {
     use rtdb_types::{BlockIndex, EntityId, Interval, StructFields, TableRef, Timestamp, Value};
 
     #[test]
-    fn arrow_search_live_coverages_reuse_the_prefix_across_merged_chunks_and_reject_a_divergent_suffix() {
+    fn fts_arrow_live_postings_and_uncovered_suffix_match_and_rank_across_merged_chunks() {
         use rtdb_query::LiveSearchTerms;
         let memory = MemoryBudget::new(8 << 20);
         let runtime = SearchRuntime::new(4 << 20);
@@ -1095,8 +1175,8 @@ mod live_coverage_tests {
             let batch = IndexBatch::from_events(&[event], &StructFields::new(), &memory).unwrap();
             table.append(&TableWrite::new(StructFields::new(), Some(batch)), Timestamp(id)).unwrap()
         };
-        let prefix = append(&root, 1, "report paid");
-        let extended = append(&prefix, 2, "report open");
+        let prefix = append(&root, 1, "report report paid");
+        let extended = append(&prefix, 2, "report open paid");
         let divergent = append(&prefix, 2, "novel");
         assert_eq!(extended.batches().count(), 1);
         assert!(!Arc::ptr_eq(prefix.batches().next().unwrap(), extended.batches().next().unwrap()));
@@ -1121,8 +1201,26 @@ mod live_coverage_tests {
         let matching = rtdb_text::Query::parse("report");
         assert_eq!(runtime.live_rows("db", &extended, "body", &matching).unwrap().values(), &[0, 1]);
 
+        let scorer = rtdb_text::Scorer::from_frequencies(rtdb_text::Query::parse("paid absent report"), 8, 42, &[1, 2, 3]);
+        let check = |matching: &rtdb_text::Query, phrases| {
+            let mut scored = Vec::new();
+            runtime.visit_live_matches("db", &extended, "body", matching, phrases, &token, |row, hit| {
+                let text = ["report report paid", "report open paid"][row as usize];
+                assert_eq!(hit.score(&scorer).to_bits(), scorer.bm25_arrow(&rtdb_text::analyze(text)).to_bits());
+                assert_eq!(hit.integer_id(&extended, row).unwrap(), Some(i64::from(row) + 1));
+                scored.push(row);
+                Ok(true)
+            }).unwrap();
+            scored
+        };
+        let phrase = rtdb_text::Query::parse(r#""report paid""#);
+        assert_eq!(check(&phrase, true), [0]);
+        assert_eq!(check(&phrase, false), [0, 1]);
+
         runtime.publish_live("db", &extended, "body", &token).unwrap();
         let (complete, covered) = runtime.live_pages("db", &extended, "body");
+        assert_eq!(check(&phrase, true), [0]);
+        assert_eq!(check(&phrase, false), [0, 1]);
         assert_eq!(covered, 2);
         assert!(Arc::ptr_eq(&complete[0], &initial[0]));
         assert_eq!(runtime.live_pages("db", &prefix, "body").1, 1);

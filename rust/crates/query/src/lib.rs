@@ -58,7 +58,7 @@ mod join_storage;
 mod join_spill;
 mod mark;
 
-pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, LiveSearchTerms, MatchAnswers, OrderedBatches, OrderedCandidates, OrderedScan, ResolvedSearchRow, ScanAccelerator, ScanRequest, ScanSelection, SearchRowLocation, SnapshotRow};
+pub use accelerate::{CandidateIids, CandidateScores, CandidateVerifier, ConstantEvaluator, FileMatches, IidScope, LiveSearchTerms, MatchAnswers, PreparedSearchQuery, OrderedBatches, OrderedCandidates, OrderedScan, ResolvedSearchRow, ScanAccelerator, ScanRequest, ScanSelection, SearchRowLocation, SnapshotRow};
 pub use accelerate::{LocatedHistoryEvent, resolve_located_point};
 mod cow_pages;
 pub use cow_pages::ObjectPageStore;
