@@ -103,6 +103,7 @@ pub fn anomaly(native: Anomaly) -> Status {
     };
     let stable = match native.code.as_str() {
         "rtdb/erased-under-view" => "rtdb/erased-under-view",
+        "rtdb/cursor-expired" => "rtdb/cursor-expired",
         _ => code(category),
     };
     let retry = (category == Category::Busy).then(|| {

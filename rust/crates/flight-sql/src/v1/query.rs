@@ -5,9 +5,10 @@ use std::{
 
 use arrow_flight::FlightData;
 use prost::Message;
+use rtdb_crypt::tokens::{PageToken, TokenAuthority};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy};
 use rtdb_query::{QueryContext, QueryCursor};
-use rtdb_types::{LogicalType, Timestamp};
+use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{Claim, ClaimEvidence, ClaimFootprint, ClaimScope, Layer}};
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -19,7 +20,7 @@ use crate::{
 use super::{
     MAX_PAGE_ROWS, MAX_WAIT, error, head,
     proto::{self, at::Selection},
-    tokens::{self, Continuation, cursor_expired},
+    tokens::{self, cursor_expired},
     trailer,
 };
 
@@ -78,13 +79,23 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     hash.finalize().into()
 }
 
+struct OpenedQuery {
+    cursor: QueryCursor,
+    database: Arc<Database>,
+    authority: Option<TokenAuthority>,
+    page: PageToken,
+    after: Vec<u8>,
+    limit: u64,
+    trailer: proto::QueryTrailer,
+}
+
 impl Service {
     pub(super) async fn v1_query(
         &self,
         call: Call,
         request: proto::QueryRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
-        let (mut cursor, database, page, limit, mut trailer_msg) = self
+        let OpenedQuery { mut cursor, database, authority, page, after, limit, trailer: mut trailer_msg } = self
             .open_v1_query(&call, request)
             .await
             .map_err(|status| call.error(status))?;
@@ -127,12 +138,20 @@ impl Service {
                     yield item;
                 }
                 if more {
-                    let next = Continuation { offset: page.offset.checked_add(sent).ok_or_else(|| error::incorrect("Page offset overflow"))?, ..page };
-                    trailer_msg.next = Some(service.0.v1.tokens.continuation(database.wire_incarnation(), &next));
+                    let next = PageToken { offset: page.offset.checked_add(sent).ok_or_else(|| error::incorrect("Page offset overflow"))?, ..page };
+                    let authority = authority.as_ref().ok_or_else(|| error::unsupported("query.page"))?;
+                    trailer_msg.next = Some(authority.seal_page(&next).await.map_err(error::anomaly)?);
                     break;
                 }
             }
             if skip != 0 { Err(cursor_expired())?; }
+            if let Some(authority) = &authority {
+                if !after.is_empty() { authority.check_page_readable(&after).await.map_err(error::anomaly)?; }
+                if let Some(next) = &trailer_msg.next { authority.check_page_readable(next).await.map_err(error::anomaly)?; }
+                if let Some(claim) = &trailer_msg.claim {
+                    authority.check_claim_readable(&Claim::from_bytes(claim.value.clone())).await.map_err(error::anomaly)?;
+                }
+            }
             service.check_attachment(&call, &database)?;
             call.handoff(cursor.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
@@ -146,16 +165,7 @@ impl Service {
         &self,
         call: &Call,
         request: proto::QueryRequest,
-    ) -> Result<
-        (
-            QueryCursor,
-            Arc<Database>,
-            Continuation,
-            u64,
-            proto::QueryTrailer,
-        ),
-        Status,
-    > {
+    ) -> Result<OpenedQuery, Status> {
         let source = request
             .source
             .as_ref()
@@ -167,8 +177,13 @@ impl Service {
             return Err(error::incorrect("Empty At selector"));
         }
         let database = self.wire_database(call, &source.branch, layer).await?;
-        let tokens = &self.0.v1.tokens;
-        let scope = database.wire_incarnation();
+        let authority = if request.track || request.page.is_some() {
+            if !database.wire_tokens_supported() {
+                return Err(error::unsupported(if request.track { "query.track" } else { "query.page" }));
+            }
+            Some(database.token_authority().await.map_err(error::anomaly)?)
+        } else { None };
+        let scope = database.wire_incarnation().await.map_err(error::anomaly)?;
         let request_hash = fingerprint(&request);
         let (limit, after) = match &request.page {
             Some(page) if (1..=MAX_PAGE_ROWS).contains(&page.limit) => {
@@ -184,7 +199,8 @@ impl Service {
         let continuation = if after.is_empty() {
             None
         } else {
-            let page = tokens.read_continuation(scope, after)?;
+            let authority = authority.as_ref().ok_or_else(|| error::unsupported("query.page"))?;
+            let page = authority.open_page(after).await.map_err(error::anomaly)?;
             if page.request != request_hash {
                 return Err(error::incorrect(
                     "Continuation belongs to a different query",
@@ -192,23 +208,15 @@ impl Service {
             }
             Some(page)
         };
-        if continuation.is_none()
-            && let Some(Selection::AtLeast(basis)) = selection
-        {
-            let minimum = tokens::read_basis(scope, basis)?;
-            if minimum != Timestamp::MIN {
-                self.0
-                    .node
-                    .wire_await_time(
-                        &call.database,
-                        call.session.caller.principal.as_ref(),
-                        minimum,
-                        MAX_WAIT,
-                        &call.cancellation,
-                    )
-                    .await
-                    .map_err(error::anomaly)?;
-            }
+        let minimum = match (continuation, selection) {
+            (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
+            (None, Some(Selection::AtLeast(basis))) => Some(tokens::read_basis(scope, basis)?),
+            _ => None,
+        };
+        if let Some(minimum) = minimum.filter(|minimum| *minimum != Timestamp::MIN) {
+            self.0.node.wire_await_time(
+                &call.database, call.session.caller.principal.as_ref(), minimum, MAX_WAIT, &call.cancellation,
+            ).await.map_err(error::anomaly)?;
         }
         let context = self
             .wire_context(
@@ -232,21 +240,22 @@ impl Service {
                     }
                     _ => (present, now),
                 };
-                Continuation {
-                    cut,
+                PageToken {
+                    basis: tokens::basis(scope, cut),
                     clock,
                     offset: 0,
                     request: request_hash,
                 }
             }
         };
-        if page.cut > present {
+        let cut = tokens::read_basis(scope, &page.basis.into())?;
+        if cut > present {
             return Err(error::unavailable(
                 "Database has not applied the requested basis",
             ));
         }
         let context = context
-            .with_wire_cut(page.cut, page.clock.into())
+            .with_wire_cut(cut, page.clock.into())
             .map_err(error::anomaly)?;
         let parameters = request
             .params_ipc
@@ -261,15 +270,23 @@ impl Service {
             .v1
             .plans
             .prepare(scope, &request.sql, &context, types)?;
-        let cursor = open_query(prepared, context, parameters.as_ref()).await?;
-        let basis = tokens::basis(scope, page.cut);
-        let reply = proto::QueryTrailer {
-            basis: Some(basis.into()),
-            system_time_micros: page.cut.0,
-            claim: request.track.then(|| tokens.claim(basis)).transpose()?,
+        let (cursor, footprint) = open_query(prepared, context, parameters.as_ref(), request.track).await?;
+        let claim = if request.track {
+            let authority = authority.as_ref().ok_or_else(|| error::unsupported("query.track"))?;
+            let evidence = ClaimEvidence {
+                scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: Layer::Merged },
+                footprint,
+            };
+            let value = authority.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
+            Some(proto::Claim { value })
+        } else { None };
+        let trailer = proto::QueryTrailer {
+            basis: Some(page.basis.into()),
+            system_time_micros: cut.0,
+            claim,
             next: None,
         };
-        Ok((cursor, database, page, limit, reply))
+        Ok(OpenedQuery { cursor, database, authority, page, after: after.to_vec(), limit, trailer })
     }
 }
 
@@ -303,33 +320,22 @@ async fn open_query(
     prepared: PreparedSql,
     context: Arc<QueryContext>,
     parameters: Option<&Parameters>,
-) -> Result<QueryCursor, Status> {
-    let Some(parameters) = parameters else {
-        return prepared
-            .open_query_columns_typed(context, Vec::new(), &[])
-            .await
-            .map_err(error::anomaly);
-    };
-    let types = parameters.types.as_slice();
-    let arguments =
-        wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
-    let row = arguments
-        .rows()
-        .next()
-        .ok_or_else(|| error::incorrect("Parameters require one row"))?
-        .map_err(error::anomaly)?;
-    let size = row
-        .iter()
-        .try_fold(1024usize, |bytes, value| {
-            wire::add(
-                wire::add(bytes, std::mem::size_of::<rtdb_types::Value>())?,
-                value.retained_bytes().map_err(error::anomaly)?,
-            )
-        })
-        .map_err(error::map_status)?;
-    let _values = context.memory.reserve(size).map_err(error::anomaly)?;
-    prepared
-        .open_query_columns_typed(context, row.to_vec(), types)
-        .await
-        .map_err(error::anomaly)
+    track: bool,
+) -> Result<(QueryCursor, ClaimFootprint), Status> {
+    let (row, types, _values) = if let Some(parameters) = parameters {
+        let arguments = wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
+        let row = arguments.rows().next().ok_or_else(|| error::incorrect("Parameters require one row"))?
+            .map_err(error::anomaly)?;
+        let size = row.iter().try_fold(1024usize, |bytes, value| {
+            wire::add(wire::add(bytes, std::mem::size_of::<rtdb_types::Value>())?, value.retained_bytes().map_err(error::anomaly)?)
+        }).map_err(error::map_status)?;
+        let values = context.memory.reserve(size).map_err(error::anomaly)?;
+        (row.to_vec(), parameters.types.as_slice(), Some(values))
+    } else { (Vec::new(), &[][..], None) };
+    if track {
+        prepared.open_tracked_query_columns(context, row, types).await.map_err(error::anomaly)
+    } else {
+        let cursor = prepared.open_query_columns_typed(context, row, types).await.map_err(error::anomaly)?;
+        Ok((cursor, ClaimFootprint::default()))
+    }
 }

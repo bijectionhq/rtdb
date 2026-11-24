@@ -30,6 +30,7 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 serde.workspace = true
 rtdb-node.workspace = true
+rtdb-crypt.workspace = true
 rtdb-tx.workspace = true
 rtdb-query.workspace = true
 rtdb-auth.workspace = true

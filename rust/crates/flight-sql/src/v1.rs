@@ -30,7 +30,6 @@ pub(crate) const ACTIONS: [&str; 3] = [
 
 #[derive(Default)]
 pub(crate) struct State {
-    tokens: tokens::Tokens,
     plans: query::PlanCache,
 }
 
@@ -69,8 +68,6 @@ impl Service {
                     features.extend(
                         [
                             "query",
-                            "query.track",
-                            "query.page",
                             "changes",
                             changes::PROGRESS_ONLY,
                             "sql.history",
@@ -81,14 +78,13 @@ impl Service {
                         ]
                         .map(str::to_owned),
                     );
-                    if self
-                        .0
-                        .node
-                        .catalog()
-                        .database(&call.database)
-                        .is_ok_and(|database| database.wire_linearizable_reads())
-                    {
-                        features.push("query.linearizable".into());
+                    if let Ok(database) = self.0.node.catalog().database(&call.database) {
+                        if database.wire_tokens_supported() {
+                            features.extend(["query.track", "query.page"].map(str::to_owned));
+                        }
+                        if database.wire_linearizable_reads() {
+                            features.push("query.linearizable".into());
+                        }
                     }
                 }
                 proto::CapabilitiesResponse {

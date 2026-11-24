@@ -276,6 +276,11 @@ impl BranchIndex {
             };
             for id in view.ids(table) {
                 if matches!(region, ClaimRegion::Row { iid, .. } if *iid != id.iid()) { continue; }
+                if let (ClaimRegion::IidRange { lower, upper, .. }, EntityId::Uuid(bytes)) = (region, id)
+                    && (bytes < &lower.0 || bytes > &upper.0)
+                {
+                    continue;
+                }
                 let history = view.history(table, id);
                 if let Some((column, lower, upper)) = range
                     && !history.iter().filter_map(|event| event.image.as_ref())

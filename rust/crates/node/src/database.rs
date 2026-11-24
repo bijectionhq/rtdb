@@ -19,6 +19,8 @@ use crate::ordered_index::OrderedIndexMaintenance;
 use crate::read_currency::ReadCurrency;
 use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, REPLICA_BEHIND, ReplicaReadIndex, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
+mod tokens;
+
 type OrderedIndexCycle = watch::Sender<Option<CycleHandle>>;
 
 struct ReplicaReadSession(std::sync::Weak<Database>);
@@ -34,6 +36,7 @@ impl Drop for ReplicaReadSession {
 pub struct Database {
     writes_event_history: bool,
     pub(crate) protected_equality_epoch: uuid::Uuid,
+    tokens: tokens::DatabaseTokens,
     name: String,
     configuration: DatabaseConfig,
     read_only: bool,
@@ -64,7 +67,18 @@ impl Database {
     }
     /// Identifies the database attachment that issued a wire token.
     /// A new attachment receives a new identity.
-    pub fn wire_incarnation(&self) -> uuid::Uuid { self.protected_equality_epoch }
+    pub async fn wire_incarnation(&self) -> Result<uuid::Uuid> { self.tokens.incarnation().await }
+    pub async fn token_authority(&self) -> Result<rtdb_crypt::tokens::TokenAuthority> { self.tokens.authority().await }
+    pub fn wire_tokens_supported(&self) -> bool { self.tokens.supported() }
+
+    /// The writer calls this after committing the rotation and recovers using its original deadline.
+    pub async fn apply_token_key_rotation(&self, next: u64, unreadable_by: i64) -> Result<()> {
+        self.tokens.apply_rotation(next, unreadable_by).await
+    }
+
+    pub async fn destroy_retired_token_key(&self, generation: u64) -> Result<()> {
+        self.tokens.destroy_retired(generation).await
+    }
     pub fn wire_linearizable_reads(&self) -> bool {
         self.has_replica_read_index() || (!self.read_only && !self.external_source()
             && !matches!(self.configuration.log, Some(database_config::Log::OtherLog(_))))
@@ -548,7 +562,9 @@ impl DatabaseFactory {
             let fragment_residence = resources.fragment_storage.map(|storage| rtdb_query::FragmentResidence {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
-            let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), name, configuration, read_only, partition, storage, resolve,
+            let tokens = tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
+                self.resources.token_kms(), Arc::clone(&self.clock));
+            let database = Arc::new(Database { writes_event_history: event_history, protected_equality_epoch: uuid::Uuid::new_v4(), tokens, name, configuration, read_only, partition, storage, resolve,
                 audience_storage: resources.audience_storage, logs, replication, replica_read_index: opened_logs.replica_read_index,
                 await_authority: opened_logs.await_authority,
                 transaction_admission: RwLock::default(), submitted_bytes: AtomicU64::new(0), replica_read_sessions: AtomicUsize::new(0),

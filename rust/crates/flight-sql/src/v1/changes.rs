@@ -85,7 +85,8 @@ impl Service {
             .open_change_page(&call, request)
             .await
             .map_err(|status| call.error(status))?;
-        let through = tokens::basis(database.wire_incarnation(), page.through).into();
+        let scope = database.wire_incarnation().await.map_err(error::anomaly)?;
+        let through = tokens::basis(scope, page.through).into();
         let service = self.clone();
         let schema = schema();
         let first = page.readers[0]
@@ -125,7 +126,7 @@ impl Service {
         let database = self
             .wire_database(call, &request.branch, proto::Layer::Merged)
             .await?;
-        let scope = database.wire_incarnation();
+        let scope = database.wire_incarnation().await.map_err(error::anomaly)?;
         let tables = request
             .tables
             .iter()

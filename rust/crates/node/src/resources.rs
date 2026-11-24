@@ -146,6 +146,7 @@ pub trait RemoteStorageFactory: Send + Sync {
 pub trait ResourceFactory: Send + Sync {
     fn table_history(&self, _configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> { Ok(None) }
     fn has_private_storage(&self, _configuration: &DatabaseConfig) -> bool { false }
+    fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { None }
 
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()>;
     /// Opens a fresh database storage region without opening logs; partial failures drain that region.
@@ -186,6 +187,7 @@ pub struct NativeResources {
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
     disk_cache: Option<Arc<DiskCache>>,
     pub(crate) classic_vault: Option<rtdb_storage::sealing::ClassicKeyVault>,
+    token_kms: Option<Arc<dyn rtdb_crypt::Kms>>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
@@ -195,13 +197,17 @@ pub struct NativeResources {
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, io: IoRegion::new(),
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false }
     }
 }
 
 impl NativeResources {
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
+    pub fn with_token_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
+        self.token_kms = Some(kms);
+        self
+    }
     pub fn with_classic_key_vault(mut self, vault: rtdb_storage::sealing::ClassicKeyVault) -> Self {
         self.classic_vault = Some(vault);
         self
@@ -294,6 +300,8 @@ pub(crate) fn validate_database_shape(name: &str, configuration: &DatabaseConfig
 
 #[async_trait]
 impl ResourceFactory for NativeResources {
+    fn token_kms(&self) -> Option<Arc<dyn rtdb_crypt::Kms>> { self.token_kms.clone() }
+
     fn table_history(&self, configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> {
         let Some(database_config::Storage::RemoteStorage(storage)) = &configuration.storage else { return Ok(None); };
         let configuration = storage.object_store.as_ref().ok_or_else(|| invalid("Remote storage has no provider configuration"))?;

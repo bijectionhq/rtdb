@@ -111,7 +111,7 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let (rows, second) = query(&mut other_session, request.clone()).await;
     assert_eq!(ints(&rows), [30]);
     assert_eq!(first.basis, second.basis);
-    assert!(second.claim.is_some());
+    assert_eq!(first.claim, second.claim);
     assert!(second.next.is_none());
 
     let mut exact = input("SELECT n FROM wire_rows WHERE _id = 3");
@@ -174,6 +174,74 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
         "rtdb/invalid-request",
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn rtdb_v1_tokens_survive_database_and_flight_restart() {
+    use rtdb_format::database::proto::{DatabaseConfig, LocalLog, LocalStorage, database_config};
+    use rtdb_types::{EntityId, TableRef, rtdb_v1::{Claim, ClaimRegion}};
+
+    let root = tempfile::tempdir().unwrap();
+    let options = || NodeOptions {
+        membership: Membership::Durable {
+            primary: DatabaseConfig {
+                log: Some(database_config::Log::LocalLog(LocalLog {
+                    path: Some(root.path().join("log").to_string_lossy().into()), ..Default::default()
+                })),
+                storage: Some(database_config::Storage::LocalStorage(LocalStorage {
+                    path: Some(root.path().join("objects").to_string_lossy().into()), ..Default::default()
+                })),
+                ..Default::default()
+            },
+            skipped: Default::default(),
+        },
+        ..Default::default()
+    };
+    let mut request = input("SELECT n FROM wire_rows WHERE _id = 1 OR _id = 2 ORDER BY _id");
+    request.track = true;
+    request.page = Some(v1::Page { limit: 1, after: Vec::new() });
+
+    let first = {
+        let running = Running::start_with_options(None, FlightConfig::default(), &[], None, options()).await;
+        let mut client = Client::connect(&running.server, None).await;
+        client.update("INSERT INTO wire_rows (_id, n) VALUES (1, 10), (2, 20), (3, 30)", None).await;
+        let (rows, first) = query(&mut client, request.clone()).await;
+        assert_eq!(ints(&rows), [10]);
+        let database = running.node.catalog().database("xtdb").unwrap();
+        let authority = database.token_authority().await.unwrap();
+        let claim = Claim::from_bytes(first.claim.clone().unwrap().value);
+        let opened = authority.open_claim(&claim).await.unwrap();
+        let table = TableRef::new("public", "wire_rows");
+        assert_eq!(opened.footprint.regions().unwrap(), &[
+            ClaimRegion::Row { table: table.clone(), iid: EntityId::Integer(1).iid() },
+            ClaimRegion::Row { table, iid: EntityId::Integer(2).iid() },
+        ].into_iter().collect());
+        client.update("UPDATE wire_rows SET n = 200 WHERE _id = 2", None).await;
+        database.apply_token_key_rotation(1, i64::MAX).await.unwrap();
+        running.stop().await;
+        first
+    };
+
+    request.page.as_mut().unwrap().after = first.next.clone().unwrap();
+    let rerouted = Running::start_with_options(None, FlightConfig::default(), &[], None, options()).await;
+    let mut client = Client::connect(&rerouted.server, None).await;
+    let (rows, second) = query(&mut client, request.clone()).await;
+    assert_eq!(ints(&rows), [20]);
+    assert_eq!(first.basis, second.basis);
+    assert!(second.next.is_none());
+    let database = rerouted.node.catalog().database("xtdb").unwrap();
+    let authority = database.token_authority().await.unwrap();
+    let before = Claim::from_bytes(first.claim.unwrap().value);
+    let after = Claim::from_bytes(second.claim.unwrap().value);
+    assert_ne!(before, after);
+    assert_eq!(authority.open_claim(&before).await.unwrap(), authority.open_claim(&after).await.unwrap());
+    rerouted.stop().await;
+
+    let foreign = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&foreign.server, None).await;
+    let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
+    error(status, v1::AnomalyCategory::NotFound, "rtdb/cursor-expired");
+    foreign.stop().await;
 }
 
 #[tokio::test]

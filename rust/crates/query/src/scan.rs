@@ -19,7 +19,7 @@ use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
 use rtdb_types::{ARCHIVE_TX_FROM, ARCHIVE_TX_TO, Anomaly, EntityId, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
-use crate::columnar::BatchCursor;
+use crate::{QueryContext, columnar::BatchCursor};
 use crate::{ConstantEvaluator, PreparedSearchQuery, accelerate::{ExecutionConstants, SearchQueries}, context::Execution, fragment::{ScanFragment, ScanFragmenter}, pages::{OwnedPage,PageBuilder}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
 
 struct DataFile {
@@ -538,6 +538,25 @@ fn id_selection(scan: &Scan, parameters: rtdb_expr::Parameters<'_>) -> Option<st
         }
         Some(iids)
     })
+}
+
+pub(crate) fn claim_regions(scan: &Scan, context: &QueryContext, arguments: &[Value]) -> Vec<rtdb_types::rtdb_v1::ClaimRegion> {
+    use rtdb_types::rtdb_v1::{ClaimRegion, MAX_REGIONS_PER_TABLE};
+
+    let table = &scan.table.name.table;
+    let parameters = rtdb_expr::Parameters::Values(arguments);
+    if let Some(iids) = scan.iids.clone().or_else(|| id_selection(scan, parameters)) {
+        if iids.is_empty() || iids.len() > MAX_REGIONS_PER_TABLE {
+            return vec![ClaimRegion::Table(table.clone())];
+        }
+        return iids.into_iter().map(|iid| ClaimRegion::Row { table: table.clone(), iid }).collect();
+    }
+    if context.catalog.database(&scan.table.name.database).is_ok_and(|database| stores_uuid_ids(table, &database.partitions))
+        && let Ok(Some((lower, upper))) = id_interval(scan, parameters)
+    {
+        return vec![ClaimRegion::IidRange { table: table.clone(), lower, upper }];
+    }
+    vec![ClaimRegion::Table(table.clone())]
 }
 
 fn value_iids(value: &Value) -> Option<(Iid, Option<Iid>)> {

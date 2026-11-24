@@ -80,19 +80,20 @@ pub struct ClaimScope {
 pub enum ClaimRegion {
     Table(TableRef),
     Row { table: TableRef, iid: Iid },
+    IidRange { table: TableRef, lower: Iid, upper: Iid },
     IndexRange { table: TableRef, index: String, lower: Option<Vec<u8>>, upper: Option<Vec<u8>> },
 }
 
 impl ClaimRegion {
     pub fn table(&self) -> &TableRef {
         match self {
-            Self::Table(table) | Self::Row { table, .. } | Self::IndexRange { table, .. } => table,
+            Self::Table(table) | Self::Row { table, .. } | Self::IidRange { table, .. } | Self::IndexRange { table, .. } => table,
         }
     }
 }
 
 const MAX_CLAIM_TABLES: usize = 32;
-const MAX_REGIONS_PER_TABLE: usize = 16;
+pub const MAX_REGIONS_PER_TABLE: usize = 16;
 const MAX_REGION_BYTES: usize = 1024;
 const MAX_FOOTPRINT_BYTES: usize = 16 * 1024;
 pub const MAX_CLAIM_PAYLOAD_BYTES: usize = MAX_FOOTPRINT_BYTES + 2048;
@@ -139,6 +140,7 @@ impl ClaimFootprint {
 }
 
 fn oversized_or_invalid(region: &ClaimRegion) -> bool {
+    if matches!(region, ClaimRegion::IidRange { lower, upper, .. } if lower > upper) { return true; }
     if let ClaimRegion::IndexRange { index, lower, upper, .. } = region
         && (index.len().saturating_add(lower.as_ref().map_or(0, Vec::len))
             .saturating_add(upper.as_ref().map_or(0, Vec::len)) > MAX_REGION_BYTES
@@ -159,7 +161,7 @@ pub struct ClaimEvidence {
     pub footprint: ClaimFootprint,
 }
 
-pub trait ClaimVerifier {
+pub trait ClaimVerifier: Send + Sync {
     fn verify(&self, claim: &Claim) -> Result<ClaimEvidence>;
 }
 
