@@ -6,7 +6,7 @@ use rtdb_node::{
     serving::custody_release::{
         CustodyCarrierAuthority, CustodyContributors, CustodyProviderInstallation,
         CustodyProviderMount, CustodyReleasePhase, CustodyReleaseRegistration,
-        CustodyResponseOwner,
+        CustodyResponseAdmission, CustodyResponseOwner,
     },
 };
 use rtdb_types::{Timestamp, rtdb_v1::Basis};
@@ -105,11 +105,8 @@ enum Request {
     Promote {
         registration: CustodyReleaseRegistration,
     },
-    Check {
-        registrations: Vec<CustodyReleaseRegistration>,
-        frame_sha256: [u8; 32],
-        read_proofs: Vec<Vec<u8>>,
-    },
+    Check(ResponseRequest),
+    Admit(ResponseRequest),
     Cancel {
         registration: CustodyReleaseRegistration,
     },
@@ -124,6 +121,14 @@ enum Request {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponseRequest {
+    registrations: Vec<CustodyReleaseRegistration>,
+    frame_sha256: [u8; 32],
+    read_proofs: Vec<Vec<u8>>,
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Reply {
@@ -132,6 +137,10 @@ enum Reply {
     },
     Ack {
         ok: bool,
+    },
+    Admission {
+        state: &'static str,
+        basis: Vec<u8>,
     },
     Cancelled {
         state: &'static str,
@@ -265,6 +274,7 @@ impl Service {
             .response_release(&SystemClock, &call.cancellation)
             .map_err(error::anomaly)?;
         let release = mounted.release();
+        let admit = matches!(&request, Request::Admit(_));
         let reply = match request {
             Request::Prepare { registration } => Reply::Prepared {
                 registration: release
@@ -283,11 +293,16 @@ impl Service {
                     .map_err(error::anomaly)?;
                 Reply::Ack { ok: true }
             }
-            Request::Check {
+            Request::Check(ResponseRequest {
                 registrations,
                 frame_sha256,
                 read_proofs,
-            } => {
+            })
+            | Request::Admit(ResponseRequest {
+                registrations,
+                frame_sha256,
+                read_proofs,
+            }) => {
                 let first = registrations.first().ok_or_else(unavailable)?;
                 if registrations.len() > 512
                     || first.authority != route.installation.authority
@@ -295,7 +310,7 @@ impl Service {
                 {
                     return Err(unavailable());
                 }
-                let (contributors, generation) = self
+                let (contributors, selected_basis, key_generation) = self
                     .verify_custody_reads(
                         call,
                         &database,
@@ -304,18 +319,33 @@ impl Service {
                         first.expires_at,
                     )
                     .await?;
-                let proof_commitment = read_proofs_commitment(&read_proofs);
-                mounted
-                    .check_registered_response(
-                        &contributors,
-                        generation,
-                        &registrations,
-                        frame_sha256,
-                        Some(proof_commitment),
-                    )
-                    .await
-                    .map_err(error::anomaly)?;
-                Reply::Ack { ok: true }
+                let admission = CustodyResponseAdmission {
+                    registrations,
+                    frame_sha256,
+                    selected_basis,
+                    key_generation,
+                    read_proofs_sha256: Some(read_proofs_commitment(&read_proofs)),
+                };
+                if admit {
+                    let receipt = mounted
+                        .admit_registered_response(&contributors, admission)
+                        .await
+                        .map_err(error::anomaly)?;
+                    Reply::Admission {
+                        state: if receipt.replayed {
+                            "recorded"
+                        } else {
+                            "admitted"
+                        },
+                        basis: receipt.basis.to_bytes().to_vec(),
+                    }
+                } else {
+                    mounted
+                        .check_registered_response(&contributors, &admission)
+                        .await
+                        .map_err(error::anomaly)?;
+                    Reply::Ack { ok: true }
+                }
             }
             Request::Cancel { registration } => {
                 terminal(release.cancel(registration).await.map_err(error::anomaly)?)?
@@ -355,7 +385,7 @@ impl Service {
         owner: [u8; 32],
         proofs: &[Vec<u8>],
         cutoff: Timestamp,
-    ) -> Result<(CustodyContributors, Option<u64>), Status> {
+    ) -> Result<(CustodyContributors, Basis, Option<u64>), Status> {
         if !(1..=MAX_READ_PROOFS).contains(&proofs.len()) {
             return Err(unavailable());
         }
@@ -382,9 +412,40 @@ impl Service {
                 }
             }
         }
-        Ok((
-            contributors,
-            selected.and_then(|(_, generation)| generation),
-        ))
+        let (basis, generation) = selected.ok_or_else(unavailable)?;
+        Ok((contributors, basis, generation))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custody_admit_has_a_distinct_operation_and_reply() {
+        let response = serde_json::json!({
+            "operation": "admit", "registrations": [], "frame_sha256": [1; 32].to_vec(), "read_proofs": []
+        });
+        assert!(matches!(
+            serde_json::from_value::<Request>(response.clone()).unwrap(),
+            Request::Admit(_)
+        ));
+        let mut check = response;
+        check["operation"] = "check".into();
+        assert!(matches!(
+            serde_json::from_value::<Request>(check.clone()).unwrap(),
+            Request::Check(_)
+        ));
+        check["basis"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<Request>(check).is_err());
+        let recorded = serde_json::to_value(Reply::Admission {
+            state: "recorded",
+            basis: vec![2; Basis::WIDTH],
+        })
+        .unwrap();
+        assert_eq!(
+            recorded,
+            serde_json::json!({ "state": "recorded", "basis": vec![2; Basis::WIDTH] })
+        );
     }
 }

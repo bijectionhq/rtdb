@@ -6,7 +6,7 @@ use rtdb_index::{
     Snapshot,
     branches::{BranchCut, BranchIndex, BranchView, BranchWrite, RowImage},
 };
-use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyRelease};
+use rtdb_tx::transact::{CustodyGroupId, CustodyWriterFence, Receipt, Transact, TrustedCustodyCommand};
 pub use rtdb_replication::{NativeCheckpointAuthority, NativeServingAuthority};
 use rtdb_types::{
     EntityId, Interval, Result, TableRef, Timestamp,
@@ -202,7 +202,7 @@ pub trait ServingDriver: Send + Sync {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no ordered custody catalog"))
     }
 
-    async fn submit_custody_release(&self, _command: TrustedCustodyRelease, _cancellation: &CancellationToken) -> Result<Receipt> {
+    async fn submit_custody_release(&self, _command: TrustedCustodyCommand, _cancellation: &CancellationToken) -> Result<Receipt> {
         Err(rtdb_types::Anomaly::unsupported("rtdb/custody-release", "The attachment has no trusted release submission"))
     }
 

@@ -146,6 +146,11 @@ impl Candidate<'_> {
                         self.push(BranchEffect::CustodyRelease(*release))?;
                     }
                 }
+                Op::AdmitCustodyResponse(admission) => {
+                    self.require_unrestricted()?;
+                    // The part receipt records admission while the existing promoted holds keep the drain charged.
+                    self.index.check_custody_response_admission(admission)?;
+                }
             }
         }
         Ok(())

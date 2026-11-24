@@ -19,8 +19,8 @@ The existing hosted assertion-family route continues to own its current consumer
    Register the original carrier receipt for every occurrence, and stage then promote each matching release via the mounted owner.
 4. `handoff_ranked(captured_views, registrations, frame, enqueue)` unions all ranked legs at the same cut and selected generation, checks that the same live mount captured each view, and checks that the registry binds the exact frame and complete set.
    The frame commitment is SHA-256 over `rtdb/v1/custody-response-frame\0` followed by the exact bytes the transport enqueues.
-   It verifies every promoted registration, current writer, group keys and the captured Multi generation before synchronously calling the enqueue callback.
-   The transport owns single admission of the response part and must retain the supplied deadline through its queue and socket handoff.
+   It verifies every promoted registration, current writer, group keys and the captured Multi generation, then orders one admission for the whole part before synchronously calling the enqueue callback.
+   The transport owns the exact one-use queue reservation and retains the supplied deadline through socket handoff.
 5. Keep the original registry evidence until RTDB acknowledges the terminal for each occurrence.
    Use private cancellation only before promotion, or positive durable disposal from the original registry after the transport closes the exact part.
    Mount withdrawal and cutoff expiry close handoff, and an already ordered hold stays in the drain until its exact terminal.
@@ -55,10 +55,14 @@ New admissions require a live original registry observation.
 
 Run `native_original_custody_mount_rechecks_the_writer_and_withdraws_old_owners`, `registered_frame_rejects_omitted_contributors_and_transport_substitution`, and `ranked_capture_retains_inherited_and_shadowing_custody_groups_before_slicing` with the earlier custody and source-intake regressions.
 Run `configured_custody_query_mounts_only_for_the_credentialed_owner`, `trusted_login_has_no_verified_custody_credential`, `provider_attestation_is_bound_to_request_challenge_and_payload`, and `custody_read_proof_preserves_the_full_inventory_and_selected_generation`.
+Run `custody_admission_orders_the_whole_part_and_preserves_its_drain_after_restart` and `trusted_source_release_reopens_only_with_its_canonical_request_and_private_namespace`.
 Exercise both drivers with a mounted live provider, distinct contributing groups on a zero-hit rank, provider or attachment withdrawal at enqueue, selected-generation destruction after capture, and writer displacement during an ordered response transition.
 Use a writer replacement whose valid interval leaves the former writer visible at its configured point.
 Recover a promoted terminal after reply loss and registry removal, and confirm protected export remains refused pending destination custody binding.
-Delay or lose a successful Flight Check reply across revocation or generation withdrawal and assert that protected enqueue stays closed.
+Delay a Flight Check reply across revocation and verify that it cannot enqueue and that a subsequent Admit is refused.
+Lose a fresh Admit reply, checkpoint and restart, and recover the admission and its exact positive terminal without recreating the transport reservation.
+Race Admit with revocation of either of two promoted contributors and with disposal of one contributor.
+Confirm a different frame, reduced contributor set or changed cutoff on the same part cannot get a second admission.
 No builds, tests, code generation or benchmarks ran during this source pass.
 
 ## Cross-process v1 contract for W10b
@@ -110,16 +114,36 @@ It is a private JSON action alongside the ordinary protobuf APIs.
 `cancel` and `dispose` return `{"state":"cancelled"}` or `{"state":"disposed","evidence_sha256":[...]}` from the retained ordered terminal.
 `drained` accepts `authority`, `group`, opaque `revoked_at` Basis and `inventory_sha256` and returns `{"drained":bool}`.
 
-`check` accepts `registrations`, `frame_sha256` and `read_proofs` in addition to `operation`.
+`check` and `admit` accept `registrations`, `frame_sha256` and `read_proofs` in addition to `operation`.
 For native protected reads the query flag `custody_release_evidence` requests a sealed `custody_release_proof` in the Query trailer.
 Preserve those opaque bytes on the same owner Flight session and original provider mount through the preflight.
 Submit one to eight proofs from the same selected Basis and data generation, and register their exact ordered digest in the original response manifest.
 The request body limit is 2 MiB.
 The new custody proof attests the producer's complete protected occurrences and captured key generation.
 The `930e66bec7` receiver clock proof remains separate and supplies no disposal or custody authorization.
-A successful Check reports the state at the producer's barrier.
-Cross-process protected enqueue remains gated until Bijection's single admission and deadline enforcement can share a fence-ordered transport admission or an equivalent final barrier with RTDB.
-Delayed and lost Check replies must close delivery across an intervening revocation or generation withdrawal.
+A successful `check` reports the state at RTDB's barrier and grants no enqueue right.
+`admit` verifies the same exact original manifest, then orders one private receipt for the whole response part under its original writer and immutable cutoff.
+The ordered fold requires every exact contributor's promoted hold and live group at that decision.
+RTDB sorts registrations by `(group, occurrence)` for the receipt and retains the read proof list in its original digest order.
+The receipt key is unique to the response part on the original database, and the canonical request commitment binds the writer, selected cut and generation, exact frame, proof-list digest and all registrations.
+The same key is retained with its immutable receipt through checkpoint and trim.
+One successful promotion per contributor already contributes to the durable drain, so ordering admission keeps those holds counted without acquiring a second set of holds.
+
+#### W10b transport reservation
+
+Before sending `admit`, durably register the exact part, all contributing carrier registrations, frame and proof-list commitments, and fixed cutoff at the original registry.
+Stage the exact frame bytes in one blocked, in-memory transport slot for that part and open connection, with the earlier of its local monotonic bound and immutable registered cutoff.
+Only `{"state":"admitted","basis":[...]}` from that slot's original in-flight call may open the still-pending slot once before its cutoff.
+The `basis` is the opaque ordered admission receipt Basis.
+`{"state":"recorded","basis":[...]}` identifies an exact replay that reached the retained receipt while the live preflight still passed.
+Use replay, refusal, interruption, a missing result or invalid result for cleanup only.
+After disconnect, timeout, lost reply or restart, close that exact reservation and recover using its original carrier registrations and positive disposal evidence.
+Persist the recovery coordinates and disposal evidence, with the blocked slot and its release authority confined to the original process and connection.
+Never create a replacement reservation or send from a retry, a former process, a delayed Check reply, or an Admit reply for a closed slot.
+An admission ordered before revocation remains a pre-fence send in the drain even if its reply was lost.
+An Admit request ordered after revocation of any contributor cannot accept the part.
+Record the positive terminal once the original transport has closed the part and can no longer send it, then retry `dispose` for each exact registration until RTDB acknowledges every terminal.
+Keep W10b delivery and the RTDB custody capability gated until this producer contract and both drivers qualify together.
 
 ### RTDB host activation
 

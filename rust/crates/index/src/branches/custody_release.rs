@@ -89,7 +89,59 @@ pub struct CustodyRelease {
     pub phase: CustodyReleasePhase,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustodyResponseAdmission {
+    pub registrations: Vec<CustodyReleaseRegistration>,
+    pub frame_sha256: [u8; 32],
+    pub read_proofs_sha256: Option<[u8; 32]>,
+    pub selected_basis: Basis,
+    pub key_generation: Option<u64>,
+}
+
+impl CustodyResponseAdmission {
+    pub fn part_key(&self) -> Result<[u8; 32]> {
+        let first = self.registrations.first().ok_or_else(release_conflict)?;
+        let part = first.part;
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/v1/custody-response-admission\0");
+        hash.update(first.authority.incarnation);
+        hash.update(part.transport_history);
+        hash.update(part.producer);
+        hash.update(part.consumer);
+        hash.update(part.response);
+        hash.update(part.ordinal.get().to_be_bytes());
+        Ok(hash.finalize().into())
+    }
+}
+
 impl BranchIndex {
+    pub fn check_custody_response_admission(&self, admission: &CustodyResponseAdmission) -> Result<()> {
+        let first = admission.registrations.first().ok_or_else(release_conflict)?;
+        if admission.registrations.len() > 512 || admission.frame_sha256 == [0; 32]
+            || admission.read_proofs_sha256 == Some([0; 32])
+            || admission.selected_basis.incarnation() != first.authority.incarnation
+            || admission.selected_basis >= self.head.basis
+            || admission.registrations.windows(2).any(|pair| {
+                (pair[0].group, pair[0].occurrence) >= (pair[1].group, pair[1].occurrence)
+            })
+        {
+            return Err(release_conflict());
+        }
+        self.exact(admission.selected_basis)?;
+        first.require_live_time(self.head.system_time)?;
+        for &registration in &admission.registrations {
+            if registration.authority != first.authority || registration.part != first.part
+                || registration.expires_at != first.expires_at
+                || self.custody_release_phase(registration)? != Some(CustodyReleasePhase::Promoted)
+            {
+                return Err(release_conflict());
+            }
+            self.live_custody(registration.group)?;
+        }
+        Ok(())
+    }
+
     pub fn check_custody_release_input(
         &self,
         registration: CustodyReleaseRegistration,

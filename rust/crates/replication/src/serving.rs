@@ -9,7 +9,7 @@ use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchEffect, Bran
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, Decision, Erasure, GROUPED_COUNT_CONSTRAINT, InstalledReceipt, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact,
     TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState,
-    TransactionRecord, TrustedCustodyRelease,
+    TransactionRecord, TrustedCustodyCommand,
 };
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
@@ -242,7 +242,7 @@ impl NativeServingHandle {
         self.submit_admitted(bytes, scope, cancellation).await
     }
 
-    pub async fn submit_custody_release(&self, command: TrustedCustodyRelease, cancellation: &CancellationToken) -> Result<Receipt> {
+    pub async fn submit_custody_release(&self, command: TrustedCustodyCommand, cancellation: &CancellationToken) -> Result<Receipt> {
         if !self.is_compatible() { return Err(incompatible()); }
         let bytes = cancellation.run_until_cancelled(self.source_authority.seal_release(command)).await
             .ok_or_else(interrupted)??;

@@ -18,7 +18,7 @@ mod custody_release;
 mod visibility;
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
 pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyTarget};
-pub use custody_release::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
+pub use custody_release::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart};
 pub use visibility::{VisibleChange, VisibleChangeGroup, VisibleHistory};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

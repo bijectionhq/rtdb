@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rtdb_index::branches::{BranchIndex, CustodyGroupId, CustodyRelease};
-use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, TrustedCustodyRelease};
+use rtdb_tx::transact::{CustodyWriterFence, Outcome, Receipt, TrustedCustodyCommand, TrustedCustodyRelease};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
 use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
@@ -22,7 +22,7 @@ pub use original::{
 };
 
 pub use rtdb_index::branches::{
-    CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart,
+    CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +156,7 @@ impl ResponseRelease<'_> {
         registrations: &[CustodyReleaseRegistration],
     ) -> Result<()> {
         self.check_contributors(expected, registrations, None).await
+            .map(drop)
     }
 
     async fn check_contributors(
@@ -163,7 +164,7 @@ impl ResponseRelease<'_> {
         expected: &CustodyContributors,
         registrations: &[CustodyReleaseRegistration],
         generation: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<CustodyWriterFence> {
         if expected.len() > 512
             || expected.len() != registrations.len()
             || registrations.iter().any(|registration| {
@@ -182,7 +183,7 @@ impl ResponseRelease<'_> {
         promoted: bool,
     ) -> Result<()> {
         self.check_registrations(&[registration], promoted, None)
-            .await
+            .await.map(drop)
     }
 
     async fn check_registrations(
@@ -190,7 +191,7 @@ impl ResponseRelease<'_> {
         registrations: &[CustodyReleaseRegistration],
         promoted: bool,
         generation: Option<u64>,
-    ) -> Result<()> {
+    ) -> Result<CustodyWriterFence> {
         let Some(first) = registrations.first() else {
             return Err(release_unavailable());
         };
@@ -223,7 +224,8 @@ impl ResponseRelease<'_> {
             .check_custody_release_delivery(&groups, &writer, generation, self.cancellation)
             .await?;
         self.require_authority(first.authority)?;
-        first.require_live_time(self.clock.now())
+        first.require_live_time(self.clock.now())?;
+        Ok(writer)
     }
 
     async fn current(&self, authority: CustodyCarrierAuthority) -> Result<BranchIndex> {
@@ -288,19 +290,23 @@ impl ResponseRelease<'_> {
         self.require_authority(registration.authority)?;
         let writer = self.original.writer_fence(self.cancellation).await?;
         self.require_authority(registration.authority)?;
-        let command = TrustedCustodyRelease {
+        let command = TrustedCustodyCommand::Phase(TrustedCustodyRelease {
             release: CustodyRelease {
                 registration,
                 phase,
             },
             writer,
-        };
+        });
+        self.order_command(command).await.map(drop)
+    }
+
+    async fn order_command(&self, command: TrustedCustodyCommand) -> Result<Receipt> {
         let receipt = self
             .driver
             .submit_custody_release(command, self.cancellation)
             .await?;
         match receipt.outcome {
-            Outcome::Then => Ok(()),
+            Outcome::Then => Ok(receipt),
             Outcome::Refused { error } => Err(error),
             Outcome::Otherwise { .. } => Err(Anomaly::fault(
                 "rtdb/custody-release",
@@ -394,10 +400,10 @@ mod tests {
 
         async fn submit_custody_release(
             &self,
-            command: TrustedCustodyRelease,
+            command: TrustedCustodyCommand,
             cancellation: &CancellationToken,
         ) -> Result<Receipt> {
-            self.transact(command.into_request(), cancellation).await
+            self.transact(command.into_request()?, cancellation).await
         }
 
         async fn check_custody_release_delivery(

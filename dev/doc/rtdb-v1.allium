@@ -155,8 +155,11 @@ surface StatelessDatabase {
         -- The response owner holds every group and occurrence in its authenticated contributor inventory through delivery.
         -- A native ranked capture retains protected inputs before ranking or slicing, including inherited and shadowing versions.
         -- Before enqueue the mounted owner rechecks the exact frame commitment, complete promoted inventory, attachment, selected key generation and immutable deadline.
-        -- The ordered release fold serializes private registration, promotion, cancellation and disposal with revocation.
-        -- Final delivery requires a promoted release, current authority, a live group and an unexpired cutoff.
+        -- The ordered release fold serializes private registration, promotion, whole-part admission, cancellation and disposal with revocation.
+        -- Whole-part admission binds one frame and the complete promoted contributor inventory under an immutable cutoff and requires every contributor's group to be live.
+        -- A transport may enqueue once through the original pending reservation using its fresh admission and unexpired cutoff.
+        -- A retained admission replay is available to recovery and grants no enqueue authority.
+        -- Every admitted part stays in each contributing group's drain until the exact original carrier terminal, including across loss of a reply or process restart.
         -- Only private cancellation or authenticated durable transport disposal terminates an admitted release.
         -- Recovery retains the original terminal decision and evidence through checkpoint and trim.
         -- A revoked group's release holds drain before key destruction.

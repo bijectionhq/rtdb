@@ -44,9 +44,36 @@ impl CustodyWriterFence {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TrustedCustodyRelease {
     pub release: CustodyRelease,
     pub writer: CustodyWriterFence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedCustodyAdmission {
+    pub admission: CustodyResponseAdmission,
+    pub writer: CustodyWriterFence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TrustedCustodyCommand {
+    Phase(TrustedCustodyRelease),
+    Admit(TrustedCustodyAdmission),
+}
+
+impl TrustedCustodyCommand {
+    pub fn into_request(self) -> Result<Transact> {
+        Ok(match self {
+            Self::Phase(command) => command.into_request(),
+            Self::Admit(command) => {
+                let key = command.admission.part_key()?.to_vec();
+                request(key, Op::AdmitCustodyResponse(command.admission), command.writer)
+            }
+        })
+    }
 }
 
 impl TrustedCustodyRelease {
@@ -61,16 +88,20 @@ impl TrustedCustodyRelease {
         hash.update(b"rtdb/v1/custody-response-phase\0");
         hash.update(self.release.registration.attempt());
         hash.update([discriminator]);
-        Transact {
-            key: hash.finalize().to_vec(),
-            require: Vec::new(),
-            window: Window::default(),
-            guards: Vec::new(),
-            ops: vec![Op::CustodyRelease(self.release)],
-            otherwise: Vec::new(),
-            requires: vec![self.writer.requirement()],
-            custody_request_digest: None,
-            request_memory: None,
-        }
+        request(hash.finalize().to_vec(), Op::CustodyRelease(self.release), self.writer)
+    }
+}
+
+fn request(key: Vec<u8>, op: Op, writer: CustodyWriterFence) -> Transact {
+    Transact {
+        key,
+        require: Vec::new(),
+        window: Window::default(),
+        guards: Vec::new(),
+        ops: vec![op],
+        otherwise: Vec::new(),
+        requires: vec![writer.requirement()],
+        custody_request_digest: None,
+        request_memory: None,
     }
 }

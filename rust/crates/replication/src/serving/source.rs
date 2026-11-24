@@ -3,7 +3,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rtdb_crypt::{SourceAdmissionKey, tokens::VerifiedClaims};
 use rtdb_storage::{Error, ObjectKey, ObjectStore};
-use rtdb_tx::transact::{CUSTODY_RELEASE_NAMESPACE, Transact, TrustedCustodyRelease};
+use rtdb_tx::transact::{CUSTODY_RELEASE_NAMESPACE, Transact, TrustedCustodyCommand};
 use rtdb_types::{Anomaly, Result, rtdb_v1::{Claim, ClaimEvidence, ClaimVerifier}};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -31,7 +31,7 @@ struct Admission<C> {
 #[derive(Serialize, Deserialize)]
 struct ReleaseAdmission {
     namespace: [u8; 32],
-    command: TrustedCustodyRelease,
+    command: TrustedCustodyCommand,
 }
 
 pub(crate) type SourceRequest = NativeRequest<SourceClaims>;
@@ -79,8 +79,8 @@ impl SourceAuthority {
         self.seal_request(request, None).await
     }
 
-    pub(super) async fn seal_release(&self, command: TrustedCustodyRelease) -> Result<Bytes> {
-        let transaction = command.clone().into_request();
+    pub(super) async fn seal_release(&self, command: TrustedCustodyCommand) -> Result<Bytes> {
+        let transaction = command.clone().into_request()?;
         let release = ReleaseAdmission { namespace: CUSTODY_RELEASE_NAMESPACE, command };
         self.seal_request(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default() }, Some(release)).await
     }
@@ -110,7 +110,7 @@ impl SourceAuthority {
                     {
                         return Err(invalid_release());
                     }
-                    let transaction = release.command.into_request();
+                    let transaction = release.command.into_request()?;
                     if transaction.canonical_request()?.get() != admission.request.get() { return Err(invalid_release()); }
                     transaction
                 }
@@ -199,9 +199,9 @@ mod tests {
 #[cfg(test)]
 mod release_tests {
     use std::num::NonZeroU64;
-    use rtdb_index::branches::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
+    use rtdb_index::branches::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart};
     use rtdb_storage::MemoryStore;
-    use rtdb_tx::transact::CustodyWriterFence;
+    use rtdb_tx::transact::{CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyRelease};
     use rtdb_types::{EntityId, TableRef, Timestamp, rtdb_v1::Basis};
 
     use super::*;
@@ -232,7 +232,7 @@ mod release_tests {
         let request = command.clone().into_request();
         let canonical = request.canonical_request().unwrap();
         assert!(Transact::decode_canonical_request(canonical.get().as_bytes()).is_err());
-        let bytes = submitter.seal_release(command.clone()).await.unwrap();
+        let bytes = submitter.seal_release(TrustedCustodyCommand::Phase(command.clone())).await.unwrap();
         let reopened = writer.open(&bytes).await.unwrap().unwrap();
         assert!(reopened.scope.is_none());
         assert_eq!(reopened.transaction.receipt_namespace(None), Some(CUSTODY_RELEASE_NAMESPACE));
@@ -241,14 +241,28 @@ mod release_tests {
         let request = || NativeRequest { transaction: command.clone().into_request(), scope: None, claims: VerifiedClaims::default() };
         assert!(submitter.seal(request()).await.is_err());
         let mismatched_namespace = submitter.seal_request(request(), Some(ReleaseAdmission {
-            namespace: [0; 32], command: command.clone(),
+            namespace: [0; 32], command: TrustedCustodyCommand::Phase(command.clone()),
         })).await.unwrap();
         assert!(writer.open(&mismatched_namespace).await.unwrap().is_err());
         let mut changed_request = request();
         changed_request.transaction.key = vec![14; 16];
         let changed = submitter.seal_request(changed_request, Some(ReleaseAdmission {
-            namespace: CUSTODY_RELEASE_NAMESPACE, command,
+            namespace: CUSTODY_RELEASE_NAMESPACE, command: TrustedCustodyCommand::Phase(command.clone()),
         })).await.unwrap();
         assert!(writer.open(&changed).await.unwrap().is_err());
+
+        let admit = TrustedCustodyCommand::Admit(TrustedCustodyAdmission {
+            admission: CustodyResponseAdmission { registrations: vec![command.release.registration],
+                frame_sha256: [16; 32], read_proofs_sha256: Some([17; 32]), selected_basis: Basis::new(incarnation, 3), key_generation: None },
+            writer: command.writer,
+        });
+        let transaction = admit.clone().into_request().unwrap();
+        let canonical = transaction.canonical_request().unwrap();
+        assert!(Transact::decode_canonical_request(canonical.get().as_bytes()).is_err());
+        assert!(submitter.seal(NativeRequest { transaction, scope: None, claims: VerifiedClaims::default() }).await.is_err());
+        let sealed = submitter.seal_release(admit).await.unwrap();
+        let reopened = writer.open(&sealed).await.unwrap().unwrap();
+        assert_eq!(reopened.transaction.receipt_namespace(None), Some(CUSTODY_RELEASE_NAMESPACE));
+        assert_eq!(reopened.transaction.canonical_request().unwrap().get(), canonical.get());
     }
 }

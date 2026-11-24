@@ -5,7 +5,7 @@ use rtdb_index::branches::{
     BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage, VisibleHistory,
 };
 pub use rtdb_index::branches::{
-    CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation,
+    CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation, CustodyResponseAdmission,
     CustodyPlacementId, CustodyTarget, GroupedCount, IndexDefinition, Visibility,
 };
 use rtdb_types::{
@@ -21,7 +21,7 @@ mod custody_release;
 mod operations;
 mod pipeline;
 
-pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyRelease};
+pub use custody_release::{CUSTODY_RELEASE_NAMESPACE, CustodyWriterFence, TrustedCustodyAdmission, TrustedCustodyCommand, TrustedCustodyRelease};
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,7 +83,7 @@ impl Transact {
     }
 
     pub fn is_response_release(&self) -> bool {
-        matches!(self.ops.as_slice(), [Op::CustodyRelease(_)])
+        matches!(self.ops.as_slice(), [Op::CustodyRelease(_) | Op::AdmitCustodyResponse(_)])
             && self.otherwise.is_empty() && self.guards.is_empty()
             && matches!(self.requires.as_slice(),
                 [Guard::Version { branch, valid_at: Some(_), expect: Version::Written(_), .. }] if branch == MAIN_BRANCH)
@@ -91,7 +91,7 @@ impl Transact {
     }
 
     pub fn contains_response_release(&self) -> bool {
-        self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::CustodyRelease(_)))
+        self.ops.iter().chain(&self.otherwise).any(|op| matches!(op, Op::CustodyRelease(_) | Op::AdmitCustodyResponse(_)))
     }
 
     pub fn receipt_namespace(&self, scope: Option<[u8; 32]>) -> Option<[u8; 32]> {
@@ -240,6 +240,8 @@ pub enum Op {
     PlaceCustodyRow { branch: Branch, table: TableRef, row: Row, placement: CustodyPlacement },
     #[serde(skip_deserializing)]
     CustodyRelease(CustodyRelease),
+    #[serde(skip_deserializing)]
+    AdmitCustodyResponse(CustodyResponseAdmission),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -270,7 +272,8 @@ impl Op {
     fn uses_custody(&self) -> bool {
         match self {
             Self::CreateCustodyGroup { .. } | Self::RevokeCustodyGroup { .. }
-            | Self::ReserveCustodyPlacement { .. } | Self::PlaceCustodyRow { .. } | Self::CustodyRelease(_) => true,
+            | Self::ReserveCustodyPlacement { .. } | Self::PlaceCustodyRow { .. }
+            | Self::CustodyRelease(_) | Self::AdmitCustodyResponse(_) => true,
             Self::Put { rows, .. } => rows.iter().any(|row| row.custody_group.is_some() || !row.protected_columns.is_empty()),
             _ => false,
         }
@@ -797,6 +800,11 @@ impl TransactState {
             if !response_release && !features.contains(&ROW_CUSTODY) {
                 return Err(feature_required(ROW_CUSTODY));
             }
+        }
+        if let [Op::AdmitCustodyResponse(admission)] = request.ops.as_slice()
+            && request.key.as_slice() != admission.part_key()?.as_slice()
+        {
+            return Err(Anomaly::incorrect("rtdb/custody-release", "Response admission requires the original part key"));
         }
         let Window { not_before, before } = request.window;
         if not_before.zip(before).is_some_and(|(start, end)| start >= end) {

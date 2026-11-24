@@ -888,3 +888,96 @@ fn custody_reservation_activation_and_release_share_the_revocation_order() {
             Resolution::Answer(replay) if replay.replayed && replay.basis == prior.basis && replay.outcome == prior.outcome));
     }
 }
+
+#[test]
+fn custody_admission_orders_the_whole_part_and_preserves_its_drain_after_restart() {
+    use std::num::NonZeroU64;
+    use rtdb_index::branches::{CustodyCarrierAuthority, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponsePart};
+
+    let features = [LINEARIZABLE, ROW_CUSTODY, TRANSACT_REQUIRES];
+    let write = |state: &mut TransactState, at, request: &Transact| {
+        let prepared = plan(state, request, at, at as i64 * 10, &features);
+        apply(state, at, prepared.record()).unwrap()
+    };
+    let writer = CustodyWriterFence { table: table(), id: EntityId::Integer(99), valid_at: Timestamp(10), written: basis(1) };
+    let authority = CustodyCarrierAuthority {
+        incarnation: INCARNATION, source_history: [1; 32], installation: [2; 16], registry: [3; 32], original_writer: [4; 32],
+    };
+    let part = CustodyResponsePart {
+        transport_history: [5; 16], producer: [6; 16], consumer: [7; 16], response: [8; 16], ordinal: NonZeroU64::MIN,
+    };
+    let phase = |registration, phase| TrustedCustodyRelease { release: CustodyRelease { registration, phase }, writer: writer.clone() }.into_request();
+    let mut state = TransactState::new(INCARNATION);
+    assert_eq!(write(&mut state, 1, &request(1, vec![put(MAIN_BRANCH, 99, "writer")])).outcome, Outcome::Then);
+    let mut registrations = Vec::new();
+    for (at, group) in [(2, [11; 16]), (3, [12; 16])] {
+        let placement_id = [at as u8; 16];
+        let placement = Op::PlaceCustodyRow {
+            branch: MAIN_BRANCH.into(), table: table(),
+            row: Row { id: EntityId::Integer(at as i64), valid: Some(Interval::ALL.into()), cells: StructFields::new(),
+                custody_group: Some(group), custody_payload: Some(CustodyPayload { binding: [13; 32], envelope: vec![at as u8] }),
+                protected_columns: vec!["carrier".into()] },
+            placement: CustodyPlacement { placement_id, reservation: None, carrier_column: "carrier".into(),
+                link_column: None, commitments: Some(CustodyPlacementCommitments { carrier_sha256: [14; 32], link_sha256: None }) },
+        };
+        let carrier = write(&mut state, at, &request(at as u8, vec![Op::CreateCustodyGroup { group }, placement]));
+        assert_eq!(carrier.outcome, Outcome::Then);
+        let view = state.index().view(MAIN_BRANCH, At::Latest, Layer::Merged, carrier.system_time).unwrap();
+        let original = view.custody_placements().find(|entry| entry.placement_id == placement_id).unwrap().occurrence.unwrap().commitment(group);
+        registrations.push(CustodyReleaseRegistration { authority, group, original, occurrence: original, part,
+            carrier_receipt_sha256: [at as u8; 32], expires_at: Timestamp(1_000) });
+    }
+    let admission = CustodyResponseAdmission { registrations: registrations.clone(), frame_sha256: [15; 32],
+        read_proofs_sha256: Some([16; 32]), selected_basis: basis(3), key_generation: Some(7) };
+    let admit = |admission| TrustedCustodyCommand::Admit(TrustedCustodyAdmission { admission, writer: writer.clone() }).into_request().unwrap();
+    let exact = admit(admission.clone());
+    assert!(Transact::decode_canonical_request(exact.canonical_request().unwrap().get().as_bytes()).is_err());
+    for (at, registration) in [(4, registrations[0]), (6, registrations[1])] {
+        assert_eq!(write(&mut state, at, &phase(registration, CustodyReleasePhase::Private)).outcome, Outcome::Then);
+        let mut private = state.clone();
+        assert!(matches!(write(&mut private, at + 1, &exact).outcome, Outcome::Refused { .. }));
+        assert_eq!(write(&mut state, at + 1, &phase(registration, CustodyReleasePhase::Promoted)).outcome, Outcome::Then);
+    }
+    let revoke = |state: &TransactState, key, group| {
+        let inventory_sha256 = state.index().custody_inventory(group).unwrap().sha256;
+        request(key, vec![Op::RevokeCustodyGroup { group, inventory_sha256 }])
+    };
+    let mut fence_first = state.clone();
+    let close = revoke(&fence_first, 20, registrations[1].group);
+    assert_eq!(write(&mut fence_first, 8, &close).outcome, Outcome::Then);
+    assert!(matches!(write(&mut fence_first, 9, &exact).outcome, Outcome::Refused { .. }));
+
+    let terminal = CustodyReleasePhase::Disposed { evidence_sha256: [17; 32] };
+    let mut disposed_first = state.clone();
+    assert_eq!(write(&mut disposed_first, 8, &phase(registrations[1], terminal)).outcome, Outcome::Then);
+    assert!(matches!(write(&mut disposed_first, 9, &exact).outcome, Outcome::Refused { .. }));
+    let expired = plan(&state, &exact, 8, 1_000, &features);
+    assert!(matches!(apply(&mut state.clone(), 8, expired.record()).unwrap().outcome,
+        Outcome::Refused { error } if error.code == "rtdb/custody-release-cutoff"));
+
+    let accepted = write(&mut state, 8, &exact);
+    assert_eq!(accepted.outcome, Outcome::Then);
+    assert!(!accepted.replayed);
+    assert!(state.tx_status(&exact.key).is_err());
+    for (at, registration) in [(9, registrations[0]), (10, registrations[1])] {
+        let close = revoke(&state, at as u8, registration.group);
+        assert_eq!(write(&mut state, at, &close).outcome, Outcome::Then);
+        assert!(!state.index().custody_releases_drained(registration.group));
+    }
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    assert!(matches!(state.resolve(&exact, 11, Timestamp(110), &features, &claims()).unwrap(),
+        Resolution::Answer(receipt) if receipt.replayed && receipt.basis == accepted.basis));
+    let changed_frame = admit(CustodyResponseAdmission { frame_sha256: [18; 32], ..admission.clone() });
+    let changed_inventory = admit(CustodyResponseAdmission { registrations: vec![registrations[1]], ..admission });
+    for changed in [changed_frame, changed_inventory] {
+        assert_eq!(changed.key, exact.key);
+        assert_eq!(state.resolve(&changed, 11, Timestamp(110), &features, &claims()).err().unwrap().code, "rtdb/idempotency-key");
+    }
+    for (at, registration) in [(11, registrations[0]), (12, registrations[1])] {
+        assert!(!state.index().custody_releases_drained(registration.group));
+        assert_eq!(write(&mut state, at, &phase(registration, terminal)).outcome, Outcome::Then);
+        assert_eq!(state.index().custody_release_phase(registration).unwrap(), Some(terminal));
+        assert!(state.index().custody_releases_drained(registration.group));
+    }
+}

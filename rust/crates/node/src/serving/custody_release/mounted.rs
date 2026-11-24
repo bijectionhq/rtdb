@@ -5,6 +5,7 @@ use std::{
 
 use parking_lot::Mutex;
 use rtdb_storage::sealing::DeliveryDeadline;
+use rtdb_tx::transact::TrustedCustodyAdmission;
 use rtdb_types::Timestamp;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -327,45 +328,27 @@ impl MountedResponseRelease<'_> {
                 }
             }
         }
-        self.handoff(
-            &contributors,
-            first.view.key_generation,
-            registrations,
-            frame,
-            enqueue,
-        )
-        .await
-    }
-
-    /// The carrier owns the frame and synchronously enqueues it under the supplied transport deadline.
-    async fn handoff(
-        &self,
-        contributors: &CustodyContributors,
-        generation: Option<u64>,
-        registrations: &[CustodyReleaseRegistration],
-        frame: &[u8],
-        enqueue: impl FnOnce(&[u8], DeliveryDeadline) -> Result<()>,
-    ) -> Result<()> {
-        let first = registrations.first().ok_or_else(release_unavailable)?;
-        first.require_live_time(self.clock.now())?;
-        let nanos = u64::try_from(first.expires_at.0)
-            .ok()
-            .and_then(|micros| micros.checked_mul(1_000))
+        let admission = CustodyResponseAdmission {
+            registrations: registrations.to_vec(),
+            frame_sha256: custody_frame_commitment(frame),
+            read_proofs_sha256: None,
+            selected_basis: first.view.cut.basis,
+            key_generation: first.view.key_generation,
+        };
+        let first = admission
+            .registrations
+            .first()
+            .copied()
             .ok_or_else(release_unavailable)?;
-        let deadline = DeliveryDeadline::from_wire_nanos(nanos).ok_or_else(release_unavailable)?;
-        let release = self.release();
-        release.require_authority(first.authority)?;
-        let expected_frame = custody_frame_commitment(frame);
-        self.check_registered_response(
-            contributors,
-            generation,
-            registrations,
-            expected_frame,
-            None,
-        )
-        .await?;
+        let deadline = self.response_deadline(first)?;
+        let receipt = self
+            .admit_registered_response(&contributors, admission)
+            .await?;
+        if receipt.replayed {
+            return Err(release_unavailable());
+        }
         self.owner.with_live_mount(|| {
-            release.require_authority(first.authority)?;
+            self.release().require_authority(first.authority)?;
             first.require_live_time(self.clock.now())?;
             if !deadline.is_live() {
                 return Err(release_unavailable());
@@ -373,46 +356,114 @@ impl MountedResponseRelease<'_> {
             enqueue(frame, deadline)
         })
     }
+
     pub async fn check_registered_response(
         &self,
         contributors: &CustodyContributors,
-        generation: Option<u64>,
-        registrations: &[CustodyReleaseRegistration],
-        frame_sha256: [u8; 32],
-        read_proofs_sha256: Option<[u8; 32]>,
+        admission: &CustodyResponseAdmission,
     ) -> Result<()> {
-        let first = registrations.first().ok_or_else(release_unavailable)?;
-        first.require_live_time(self.clock.now())?;
-        let cutoff = u64::try_from(first.expires_at.0)
-            .ok()
-            .and_then(|micros| micros.checked_mul(1_000))
-            .and_then(DeliveryDeadline::from_wire_nanos)
+        let first = admission
+            .registrations
+            .first()
+            .copied()
             .ok_or_else(release_unavailable)?;
-        let release = self.release();
-        release.require_authority(first.authority)?;
+        let deadline = self.response_deadline(first)?;
         tokio::time::timeout_at(
-            cutoff.instant().into(),
+            deadline.instant().into(),
+            self.while_mounted(self.check_response_writer(first, contributors, admission)),
+        )
+        .await
+        .map_err(|_| release_unavailable())??;
+        self.finish_response(first, deadline)
+    }
+
+    pub async fn admit_registered_response(
+        &self,
+        contributors: &CustodyContributors,
+        mut admission: CustodyResponseAdmission,
+    ) -> Result<Receipt> {
+        admission
+            .registrations
+            .sort_unstable_by_key(|registration| (registration.group, registration.occurrence));
+        let first = admission
+            .registrations
+            .first()
+            .copied()
+            .ok_or_else(release_unavailable)?;
+        let deadline = self.response_deadline(first)?;
+        let receipt = tokio::time::timeout_at(
+            deadline.instant().into(),
             self.while_mounted(async {
-                let manifest = self
-                    .owner
-                    .provider
-                    .installation
-                    .observations
-                    .registered_response(first.authority, first.part, self.cancellation)
+                let writer = self
+                    .check_response_writer(first, contributors, &admission)
                     .await?;
-                manifest.require_frame(*first, contributors, frame_sha256)?;
-                if manifest.read_proofs_sha256 != read_proofs_sha256 {
-                    return Err(release_unavailable());
+                let generation = admission.key_generation;
+                let release = self.release();
+                let receipt = release
+                    .order_command(TrustedCustodyCommand::Admit(TrustedCustodyAdmission {
+                        admission,
+                        writer,
+                    }))
+                    .await?;
+                if !receipt.replayed && generation.is_some() {
+                    release
+                        .driver
+                        .check_read_delivery(generation, &BTreeSet::new(), self.cancellation)
+                        .await?;
                 }
-                release
-                    .check_contributors(contributors, registrations, generation)
-                    .await
+                Ok(receipt)
             }),
         )
         .await
         .map_err(|_| release_unavailable())??;
+        self.finish_response(first, deadline)?;
+        Ok(receipt)
+    }
+
+    fn response_deadline(&self, first: CustodyReleaseRegistration) -> Result<DeliveryDeadline> {
+        first.require_live_time(self.clock.now())?;
+        u64::try_from(first.expires_at.0)
+            .ok()
+            .and_then(|micros| micros.checked_mul(1_000))
+            .and_then(DeliveryDeadline::from_wire_nanos)
+            .ok_or_else(release_unavailable)
+    }
+
+    async fn check_response_writer(
+        &self,
+        first: CustodyReleaseRegistration,
+        contributors: &CustodyContributors,
+        admission: &CustodyResponseAdmission,
+    ) -> Result<CustodyWriterFence> {
+        let release = self.release();
+        release.require_authority(first.authority)?;
+        let manifest = self
+            .owner
+            .provider
+            .installation
+            .observations
+            .registered_response(first.authority, first.part, self.cancellation)
+            .await?;
+        manifest.require_frame(first, contributors, admission.frame_sha256)?;
+        if manifest.read_proofs_sha256 != admission.read_proofs_sha256 {
+            return Err(release_unavailable());
+        }
+        release
+            .check_contributors(
+                contributors,
+                &admission.registrations,
+                admission.key_generation,
+            )
+            .await
+    }
+
+    fn finish_response(
+        &self,
+        first: CustodyReleaseRegistration,
+        cutoff: DeliveryDeadline,
+    ) -> Result<()> {
         self.owner.with_live_mount(|| {
-            release.require_authority(first.authority)?;
+            self.release().require_authority(first.authority)?;
             if !cutoff.is_live() {
                 return Err(release_unavailable());
             }
