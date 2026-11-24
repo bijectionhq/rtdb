@@ -1,0 +1,183 @@
+{
+  "summary": "Exact installed receipt admission, provider retirement and serving-slot retention decisions.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "provider_decision",
+    "--verify-module",
+    "publication_identity",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 16,
+  "controls": {
+    "before_exact_fence": {
+      "defect": "A fence for another publication of this name admits retirement.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "fenced_name@ == name@ && fenced_version@ == version@",
+          "replace": "fenced_name@ == name@"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "same_publication_digest(fenced_name, name) && same_publication_digest(fenced_version, version)",
+          "replace": "same_publication_digest(fenced_name, name)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "retirement_requires_the_exact_logkeeper_fence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "before_custody_drain": {
+      "defect": "An active erasure proceeds without looking up its durable custody join.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "ensures out == (erasure_floor != 0),",
+          "replace": "ensures out == false,"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "    erasure_floor != 0\n",
+          "replace": "    false\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "retirement_requires_custody_join_after_erasure",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "at_trim_floor": {
+      "defect": "A release still at the trim floor is eligible.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "(through as int) < trim_floor as int",
+          "replace": "(through as int) <= trim_floor as int"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "(through as u64) < trim_floor",
+          "replace": "(through as u64) <= trim_floor"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "release_is_strictly_below_the_trim_floor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "version_mismatch": {
+      "defect": "An inventory with no exact matching version instructs the provider to delete instead of settling the absent target.",
+      "mutate": [
+        {
+          "file": "rust/crates/s3/src/versions/retirement_decision.rs",
+          "find": "if target_latest is None { VersionStatus::Absent }",
+          "replace": "if target_latest is None { VersionStatus::SafeToRemove }"
+        },
+        {
+          "file": "rust/crates/s3/src/versions/retirement_decision.rs",
+          "find": "None => VersionStatus::Absent,",
+          "replace": "None => VersionStatus::SafeToRemove,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "version_delete_requires_the_exact_listing",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "retirement_settles_from_exact_absence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 14
+    },
+    "terminal_condition_mismatch": {
+      "defect": "A terminal replacement matches the address while ignoring the exact entity-tag condition.",
+      "mutate": [
+        {
+          "file": "rust/crates/s3/src/versions/retirement_decision.rs",
+          "find": "ensures out == (same_address && same_condition),",
+          "replace": "ensures out == same_address,"
+        },
+        {
+          "file": "rust/crates/s3/src/versions/retirement_decision.rs",
+          "find": "    same_address && same_condition\n",
+          "replace": "    same_address\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "terminal_replacement_requires_the_exact_condition",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "non_last_slot_release": {
+      "defect": "A remaining copy of the original serving attempt fails to retain its slot.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "ensures out == (same_origin && same_attempt),",
+          "replace": "ensures out == (same_origin && !same_attempt),"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "    same_origin && same_attempt\n",
+          "replace": "    same_origin && !same_attempt\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "an_exact_alias_retains_its_serving_slot",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "non_last_scope_release": {
+      "defect": "A deleted peer whose disposal is still pending fails to retain the shared publication scope.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "ensures out == (!deleted || !disposed || !regions_empty),",
+          "replace": "ensures out == (!deleted || !regions_empty),"
+        },
+        {
+          "file": "rust/crates/multi/src/reclamation_decision.rs",
+          "find": "    !deleted || !disposed || !regions_empty\n",
+          "replace": "    !deleted || !regions_empty\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/exact_reclamation/laws.rs",
+          "function": "a_peer_with_custody_retains_the_publication_scope",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    }
+  }
+}
