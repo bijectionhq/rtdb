@@ -47,7 +47,8 @@ pub async fn committed_native_ready(
             let key = ObjectKey::new(table_entry.slug.recorded_artefact_key(&trie.key, record)?)?;
             bytes_read = bytes_read.saturating_add(locator.length);
             if bytes_read > MAX_BYTES { return Ok(false); }
-            let bytes = database.storage.get_fresh_exact_or(&key, locator.length, &context.memory).await?;
+            let Some(bytes) = database.storage.get_published_exact_or(&key, locator.length,
+                record.published_version.as_ref(), &context.memory).await? else { return Ok(false); };
             let _decode = context.memory.reserve(locator.length.saturating_mul(4).saturating_add(4096))?;
             let file = SearchFile::open_located(bytes.into(), &definition.columns, Some(&locator))?;
             if !file.matches_artefact(&identity, definition.version) { return Ok(false); }

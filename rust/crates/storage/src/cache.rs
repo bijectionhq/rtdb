@@ -1,6 +1,7 @@
 use crate::{Error, ObjectKey, ObjectStore, Result, object_store::{ReadReservation, RetainedBytes, ObjectReadAllocation}};
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_format::log::proto::PublishedObjectVersion;
 use std::any::Any;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -513,11 +514,27 @@ impl BufferPool {
 
     /// Reopens the persisted immutable object without using a resident pool allocation.
     pub async fn get_fresh_exact_or(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<CacheLease> {
-        let allocation = self.store.exact_object_allocation(key, length)?;
-        let reservation = reserve_read(length, allocation, |bytes| self.reserve(bytes).or_else(|_| reserve_from(fallback, bytes)))?;
+        let reservation = self.reserve_exact_read(key, length, fallback)?;
         let bytes = reservation.retaining_io(self.store.get_fresh_exact(key, length)).await?;
         let allocation = Arc::new(reservation.finish(bytes)?);
         Ok(CacheLease { allocation, range: 0..length })
+    }
+
+    /// Reopens the recorded publication, checking the provider version on the response that supplies its bytes.
+    pub async fn get_published_exact_or(
+        &self, key: &ObjectKey, length: usize, publication: Option<&PublishedObjectVersion>, fallback: &Arc<MemoryBudget>,
+    ) -> Result<Option<CacheLease>> {
+        let reservation = self.reserve_exact_read(key, length, fallback)?;
+        let observed = reservation.retaining_io(self.store.observe_fresh_exact(key, length)).await?;
+        let observed_publication = observed.version.map(PublishedObjectVersion::from);
+        if observed_publication.as_ref() != publication { return Ok(None); }
+        let allocation = Arc::new(reservation.finish(observed.value)?);
+        Ok(Some(CacheLease { allocation, range: 0..length }))
+    }
+
+    fn reserve_exact_read(&self, key: &ObjectKey, length: usize, fallback: &Arc<MemoryBudget>) -> Result<ReadReservation> {
+        let allocation = self.store.exact_object_allocation(key, length)?;
+        reserve_read(length, allocation, |bytes| self.reserve(bytes).or_else(|_| reserve_from(fallback, bytes)))
     }
 
     /// Tries to cache an exact immutable object using only the shared pool's budget.

@@ -250,7 +250,9 @@ pub async fn committed_native_ready(
             }
             charge_bytes(&mut bytes_read, size, MAX_INDEXED_BYTES)?;
             let key = ObjectKey::new(table_entry.slug.recorded_artefact_key(&trie.key, record)?)?;
-            let bytes = database.storage.get_fresh_exact_or(&key, usize::try_from(size).map_err(|_| postings::work_limit())?, &context.memory).await?;
+            context.check_cancelled()?;
+            let Some(bytes) = database.storage.get_published_exact_or(&key, usize::try_from(size).map_err(|_| postings::work_limit())?,
+                record.published_version.as_ref(), &context.memory).await? else { return Ok(false); };
             let check = || context.check_cancelled();
             postings::verify_digest(bytes.sha256(|bytes| postings::sha256(bytes, &check))?, digest)?;
             postings::candidates(bytes, None, &[geometry::KeyRange { start: i64::MIN, end: i64::MAX }],

@@ -64,7 +64,7 @@ pub(crate) async fn native_build_definitions(
 }
 
 const NATIVE_BUILD_DEFINITIONS: &str = "SELECT index_name || '~native' AS name, schema_name, table_name,
-    columns, version, history, analyzer FROM xt.native_search_builds";
+    columns, version, history, analyzer FROM xt.native_search_builds WHERE history IS NOT NULL AND analyzer IS NOT NULL";
 
 pub(crate) async fn committed_native_definition(
     context: Arc<QueryContext>, table: &TableRef, name: &str,
@@ -76,7 +76,7 @@ pub(crate) async fn committed_native_definition(
         return Ok(None);
     }
     let id = rtdb_types::rtdb_v1::ranked_build_id(table, name);
-    let sql = format!("{NATIVE_BUILD_DEFINITIONS} WHERE _id = $1");
+    let sql = format!("{NATIVE_BUILD_DEFINITIONS} AND _id = $1");
     let mut definitions = read_public_definitions(context, &sql, vec![rtdb_types::Value::Utf8(id)]).await?;
     Ok(definitions.pop().filter(|definition| definitions.is_empty()
         && &definition.table == table && definition.name == format!("{name}~native")))

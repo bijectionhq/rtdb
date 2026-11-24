@@ -37,6 +37,9 @@ Its replica owner pairs the applied native head with the installed physical cata
 Readiness admits the current merged main branch when its exact native cut, clock, and physical catalogue agree.
 The checker retains that catalogue, compares the complete mirrored definition, and reopens each posting file from storage under its recorded trie owner and exact index generation.
 The checker verifies the file length, digest, and Arrow layout within the existing spatial read budget.
+On versioned storage the response supplying the bytes must also carry the exact version in the artefact record.
+An unversioned record can match an unversioned read under its captured owner and content checks.
+Terminal publications need a same-read terminal observation before they can pass this check.
 An empty persisted inventory, a live tail, missing or invalid objects, unmatched cuts, and routes without this association report false.
 
 Multi's committed view returns the native fold and key generation, and the native query snapshot constructs its own live rows.

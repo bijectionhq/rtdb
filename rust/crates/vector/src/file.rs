@@ -517,8 +517,10 @@ mod tests {
         let length = generation.len();
         let key = ObjectKey::new("ready-vector").unwrap();
         store.put(&key, Bytes::from(generation.clone())).await.unwrap();
-        let bytes = pool.get_fresh_exact_or(&key, length, &memory).await.unwrap();
+        let bytes = pool.get_published_exact_or(&key, length, None, &memory).await.unwrap().unwrap();
         verify_generation(bytes, &written.locator, &memory, &cancellation).unwrap();
+        let claimed = rtdb_format::log::proto::PublishedObjectVersion { version: Some("another-version".into()), ..Default::default() };
+        assert!(pool.get_published_exact_or(&key, length, Some(&claimed), &memory).await.unwrap().is_none());
         for (name, offset) in [("bad-cluster", 0), ("bad-footer", length - 1)] {
             let key = ObjectKey::new(name).unwrap();
             let mut altered = generation.clone();

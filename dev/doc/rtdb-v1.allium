@@ -90,6 +90,7 @@ surface StatelessDatabase {
         -- A declaration on an exact-SQL route reports artefacts_ready false for a physical index that the route cannot prove.
         -- VerifyRankedArtefacts checks the storage placement paired with the selected clear exact cut.
         -- Spatial readiness requires a persisted posting file for every selected primary trie in the same placement and declared generation.
+        -- Where a provider version is recorded, the response supplying the persisted file names that exact version.
         -- The serving mode and approximate status describe the permitted query path.
 
     @guarantee CountConstraintCatalog

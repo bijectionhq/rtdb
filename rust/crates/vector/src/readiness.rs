@@ -52,7 +52,8 @@ pub async fn committed_native_ready(
             bytes_read = bytes_read.saturating_add(size);
             if bytes_read > MAX_BYTES { return Ok(false); }
             let key = ObjectKey::new(table_entry.slug.recorded_artefact_key(&trie.key, record)?)?;
-            let bytes = database.storage.get_fresh_exact_or(&key, size as usize, &context.memory).await?;
+            let Some(bytes) = database.storage.get_published_exact_or(&key, size as usize,
+                record.published_version.as_ref(), &context.memory).await? else { return Ok(false); };
             verify_generation(bytes, &locator, &context.memory, &context.cancellation)?;
             found = true;
         }
