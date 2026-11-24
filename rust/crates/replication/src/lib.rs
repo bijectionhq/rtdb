@@ -8,6 +8,7 @@ mod catalog_cut;
 mod checkpoint_discovery;
 mod replay_floor;
 mod driver;
+mod default_erasure;
 mod fact_history;
 mod logs;
 mod maintenance_class;

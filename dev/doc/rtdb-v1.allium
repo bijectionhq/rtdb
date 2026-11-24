@@ -115,6 +115,10 @@ surface StatelessDatabase {
         -- Default requires evidence for the source prefix, replica prefix and every prior recovery dependency.
         -- The clean native recovery cut binds the applied source position, its replica boundary and the exact uploaded block digest.
         -- The selected native checkpoint authenticates under the successor generation and retains the pending receipt at the erased basis.
+        -- The Default writer holds later source decisions while it rewrites the physical main fold at that cut.
+        -- The sealed shared image binds the rewritten table blocks and trie bodies to the exact recovery boundary.
+        -- A term-admitted upload fixes the selected checkpoint before the writer records the original retirement deadline.
+        -- A replacement recovers that deadline from the replica suffix before continuing retirement.
         -- The receipt carries the unreadable-by deadline after the key authority has durably armed it.
         -- A pending erasure receipt stays private to the fold until retirement is armed.
         -- Replayed erase receipts preserve that deadline after trim.

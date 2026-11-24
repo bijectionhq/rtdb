@@ -531,6 +531,8 @@ impl BlockStore {
         }).await
     }
 
+    pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
+
     pub(crate) fn object_store(&self) -> &dyn ObjectStore { self.store.as_ref() }
 
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {

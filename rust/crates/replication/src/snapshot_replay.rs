@@ -296,7 +296,7 @@ impl RecoveredPartition {
     }
 }
 
-fn erasure_targets(write: &StagedWrite, memory: &Arc<MemoryBudget>) -> Result<Vec<ErasureTarget>> {
+pub(crate) fn erasure_targets(write: &StagedWrite, memory: &Arc<MemoryBudget>) -> Result<Vec<ErasureTarget>> {
     let mut targets = Vec::new();
     for (table, write_table) in write.tables() {
         let Some(batch) = write_table.batch() else { continue; };

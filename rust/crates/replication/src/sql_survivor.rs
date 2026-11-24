@@ -18,15 +18,15 @@ use rtdb_format::{
     keys::{TrieKey, block_key},
     metadata::MetadataBuilder,
 };
-use rtdb_index::{BlockPages, CatalogTrie, IndexBatch, LiveTable, TableWrite, TrieCatalog};
+use rtdb_index::{BlockPages, CatalogTrie, IndexBatch, LiveTable, Snapshot, TableWrite, TrieCatalog};
 use rtdb_storage::{IoRegion, MemoryStore, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_trie::{TrieConfig, TrieNode};
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EventOrigin, EventPosition, Iid, LogicalType, Result, StructFields, Value,
+    Anomaly, AnomalyCategory, CatalogCut, EventOrigin, EventPosition, Iid, LogicalType, Result, SourcePosition, StructFields, Value,
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{SqlErasureSource, TermPosition};
+use crate::{ErasureTarget, SqlErasureSource, TermFence, TermPosition};
 use selection::{keep_inherited_event, keep_local_event, write_survivor_trie};
 
 pub struct SqlSurvivor {
@@ -46,7 +46,30 @@ impl SqlErasureSource {
         provider_bytes: u64,
         cancellation: &CancellationToken,
     ) -> Result<SqlSurvivor> {
-        let snapshot = self.snapshot();
+        SurvivorInput {
+            snapshot: self.snapshot(), targets: self.targets(), cut: self.cut(), source_position: self.source_position(),
+            inherited_erasure: self.inherited_erasure.as_ref(), custody: &self.custody, store: self.store.as_ref(),
+            memory: &self.memory, fence: &self.fence, external_token: self.external_token.as_deref(),
+        }.build(provider_bytes, cancellation).await
+    }
+}
+
+pub(crate) struct SurvivorInput<'a> {
+    pub snapshot: &'a Snapshot,
+    pub targets: &'a [ErasureTarget],
+    pub cut: CatalogCut,
+    pub source_position: SourcePosition,
+    pub inherited_erasure: Option<&'a BTreeSet<EventOrigin>>,
+    pub custody: &'a Arc<dyn Send + Sync>,
+    pub store: &'a dyn ObjectStore,
+    pub memory: &'a Arc<MemoryBudget>,
+    pub fence: &'a TermFence,
+    pub external_token: Option<&'a [u8]>,
+}
+
+impl SurvivorInput<'_> {
+    pub(crate) async fn build(self, provider_bytes: u64, cancellation: &CancellationToken) -> Result<SqlSurvivor> {
+        let snapshot = self.snapshot;
         let tx = snapshot
             .tx_basis()
             .ok_or_else(|| invalid("The erasure head has no transaction basis"))?;
@@ -59,7 +82,7 @@ impl SqlErasureSource {
             ));
         }
         if self
-            .targets()
+            .targets
             .iter()
             .any(|target| target.entity_key.is_some())
         {
@@ -81,7 +104,7 @@ impl SqlErasureSource {
         let storage = MemoryStore::default();
         let mut destination = Candidate {
             store: &storage,
-            memory: &self.memory,
+            memory: self.memory,
             remaining: provider_bytes,
         };
         let tables = snapshot.tables();
@@ -99,7 +122,7 @@ impl SqlErasureSource {
         for entry in registry.entries() {
             check_cancelled(cancellation)?;
             let targets = self
-                .targets()
+                .targets
                 .iter()
                 .filter(|target| target.table == entry.table)
                 .fold(
@@ -112,10 +135,10 @@ impl SqlErasureSource {
                     },
                 );
             let mut rows = Events {
-                memory: &self.memory,
+                memory: self.memory,
                 rows: BTreeMap::new(),
                 targets,
-                inherited_erasure: self.inherited_erasure.as_ref(),
+                inherited_erasure: self.inherited_erasure,
             };
             let retired = snapshot.trie_catalog().retired_as_of(&entry.table);
             if retired.is_none() {
@@ -125,8 +148,8 @@ impl SqlErasureSource {
                     let length = usize::try_from(primary.data_file_size)
                         .map_err(|_| invalid("A source trie exceeds addressable memory"))?;
                     IoRegion::retaining(
-                        Arc::clone(&self.custody),
-                        read_trie(self.store.as_ref(), &key, length, &mut rows, cancellation),
+                        Arc::clone(self.custody),
+                        read_trie(self.store, &key, length, &mut rows, cancellation),
                     )
                     .await?;
                 }
@@ -170,7 +193,7 @@ impl SqlErasureSource {
                 .await?;
         }
         let required = self
-            .targets()
+            .targets
             .iter()
             .map(|target| (&target.table, target.iid))
             .collect::<std::collections::BTreeSet<_>>()
@@ -186,13 +209,13 @@ impl SqlErasureSource {
                 tx_id: Some(tx.tx_id.0),
                 system_time: Some(tx.system_time.0),
             }),
-            latest_processed_msg_id: Some(self.source_position().0),
+            latest_processed_msg_id: Some(self.source_position.0),
             table_names: registry
                 .entries()
                 .map(|entry| entry.table.schema_and_table())
                 .collect(),
             tables: registry.entries().map(TableEntry::to_proto).collect(),
-            boundary_replica_msg_id: Some(self.cut().through.0),
+            boundary_replica_msg_id: Some(self.cut.through.0),
             term_id: Some(self.fence.highest_term().0),
             boundary_term_seq: sequence,
             naming_epoch: Some(naming_epoch),

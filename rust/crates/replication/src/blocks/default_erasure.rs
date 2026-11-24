@@ -100,17 +100,6 @@ impl BlockStore {
             {
                 return Err(unsupported_files());
             }
-            for entry in catalog.table_entries()? {
-                let table = tables.get(&entry.table).ok_or_else(invalid_cut)?;
-                if table.row_count() != 0
-                    || !table
-                        .checkpoint_trie_files(&entry, CheckpointContents::Replay)?
-                        .is_empty()
-                {
-                    return Err(unsupported_files());
-                }
-            }
-
             let expected = Generation {
                 database: uuid::Uuid::from_bytes(authority.incarnation),
                 number: next,
@@ -132,6 +121,34 @@ impl BlockStore {
                 || position != cut.basis.position()
             {
                 return Err(invalid_cut());
+            }
+            if let Some(evidence) = crate::serving::checkpoint_rewrite(&image.bytes)? {
+                if evidence.cut.basis != cut.basis
+                    || evidence.cut.source != cut.installed.source
+                    || evidence.cut.replica != cut.installed.replica
+                    || evidence.boundary != checkpoint.boundary
+                    || crate::default_erasure::members_sha256(
+                        self,
+                        self.store.as_ref(),
+                        crate::default_erasure::physical_members(&catalog, &tables)?,
+                        &CancellationToken::new(),
+                    )
+                    .await?
+                        != evidence.members_sha256
+                {
+                    return Err(invalid_cut());
+                }
+            } else {
+                for entry in catalog.table_entries()? {
+                    let table = tables.get(&entry.table).ok_or_else(invalid_cut)?;
+                    if table.row_count() != 0
+                        || !table
+                            .checkpoint_trie_files(&entry, CheckpointContents::Replay)?
+                            .is_empty()
+                    {
+                        return Err(unsupported_files());
+                    }
+                }
             }
             Ok(VerifiedNativeErasureCheckpoint {
                 checkpoint,
