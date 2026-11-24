@@ -254,7 +254,7 @@ pub(super) struct PartitionRankSource<'a> {
     scope: Option<rtdb_query::IidScope<'a>>,
     sources: Vec<RecordedTree>,
     ranks: Vec<Option<TreeRanked>>,
-    legacy: Vec<(FileMembers, crate::file::RankedSource)>,
+    legacy: Vec<(FileMembers<Arc<SearchFile>>, crate::file::RankedSource)>,
     logical: Vec<&'a rtdb_format::log::proto::SearchRun>,
     logical_ranks: Vec<Option<TreeRanked>>,
     logical_seed: Vec<(RankKey, usize)>,
@@ -320,7 +320,7 @@ impl<'a> PartitionRankSource<'a> {
         };
         let legacy = by_file(&files).map(|selected| {
             let rank = selected.file.ranked_for_query(column, &matching, &ranking, request.bounds, integer)?;
-            Ok((selected, rank))
+            Ok((FileMembers { file: Arc::clone(selected.file), members: selected.members }, rank))
         }).collect::<Result<Vec<_>>>()?;
         let ranks = (0..sources.len()).map(|_| None).collect();
         let (logical, coverage, gap_queued) = match logical {

@@ -525,9 +525,9 @@ impl LoadSearch {
 }
 
 /// A shared file's selected members and their positions in the scan's trie list.
-struct FileMembers<'a> { file: &'a Arc<SearchFile>, members: BTreeMap<u32, usize> }
+struct FileMembers<F> { file: F, members: BTreeMap<u32, usize> }
 
-fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<'_>> {
+fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<&Arc<SearchFile>>> {
     let mut grouped = BTreeMap::new();
     for (index, trie) in files.iter().enumerate() {
         let selected = grouped.entry(trie.identity.as_str()).or_insert_with(|| FileMembers { file: &trie.file, members: BTreeMap::new() });
