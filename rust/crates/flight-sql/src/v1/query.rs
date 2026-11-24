@@ -74,17 +74,7 @@ impl PlanCache {
                 return Ok(plan);
             }
         }
-        let options = rtdb_sql::PrepareOptions {
-            parameter_types: types.iter().cloned().enumerate().collect(),
-            ..Default::default()
-        };
-        let prepared = PreparedSql::prepare(sql, context, options, ResultSignaturePolicy::Dynamic)
-            .map_err(error::anomaly)?;
-        if prepared.is_dml() || prepared.selects_read_settings() {
-            return Err(error::incorrect(
-                "Query requires read-only SQL and uses Source for its read settings",
-            ));
-        }
+        let prepared = prepare_read(sql, context, types)?;
         let mut cached = self.0.lock().expect("plan cache lock");
         if cached.len() == 32 {
             cached.pop_front();
@@ -92,6 +82,21 @@ impl PlanCache {
         cached.push_back((scope, prepared.clone()));
         Ok(prepared)
     }
+}
+
+fn prepare_read(sql: &str, context: &Arc<QueryContext>, types: &[LogicalType]) -> Result<PreparedSql, Status> {
+    let options = rtdb_sql::PrepareOptions {
+        parameter_types: types.iter().cloned().enumerate().collect(),
+        ..Default::default()
+    };
+    let prepared = PreparedSql::prepare(sql, context, options, ResultSignaturePolicy::Dynamic)
+        .map_err(error::anomaly)?;
+    if prepared.is_dml() || prepared.selects_read_settings() {
+        return Err(error::incorrect(
+            "Query requires read-only SQL and uses Source for its read settings",
+        ));
+    }
+    Ok(prepared)
 }
 
 fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
@@ -598,7 +603,11 @@ impl Service {
                 Parameters::read(Buffer::from(call.retain_request_bytes(bytes)), &context.memory)
             }).transpose()?;
             let types = parameters.as_ref().map_or(&[][..], |params| params.types.as_slice());
-            let prepared = self.0.v1.plans.prepare(scope, &request.sql, &context, types)?;
+            let prepared = if workload.is_some() {
+                prepare_read(&request.sql, &context, types)?
+            } else {
+                self.0.v1.plans.prepare(scope, &request.sql, &context, types)?
+            };
             let (cursor, footprint) = open_query(prepared, context, parameters.as_ref(), request.track).await?;
             (cursor, footprint, None)
         };

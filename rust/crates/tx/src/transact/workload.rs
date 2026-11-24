@@ -1030,19 +1030,15 @@ impl Point {
         {
             return Err(denied());
         }
-        let placements: BTreeSet<_> = request
-            .ops
-            .iter()
-            .chain(&request.otherwise)
-            .filter_map(|op| {
-                let Op::PlaceCustodyRow { table, row, .. } = op else {
-                    return None;
-                };
-                Some((table, &row.id))
-            })
-            .collect();
+        let mut placements = BTreeMap::<&TableRef, BTreeSet<&EntityId>>::new();
+        for op in request.ops.iter().chain(&request.otherwise) {
+            if let Op::PlaceCustodyRow { table, row, .. } = op {
+                placements.entry(table).or_default().insert(&row.id);
+            }
+        }
         let protected = |table: &TableRef, id: &EntityId| {
-            index.has_custody_address(table, id) || placements.contains(&(table, id))
+            index.has_custody_address(table, id)
+                || placements.get(table).is_some_and(|ids| ids.contains(id))
         };
         for op in request.ops.iter().chain(&request.otherwise) {
             match op {
