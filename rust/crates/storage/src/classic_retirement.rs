@@ -3,8 +3,8 @@ use std::{fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::Arc};
 use fs2::FileExt;
 
 use bytes::Bytes;
-use rtdb_format::{catalog::BlockCatalog, keys::{block_key, is_compacted_catalog_file, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, search_manifest::is_ranged_run, trie_retirement::InstalledRetirement};
-use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, Result, SourcePosition};
+use rtdb_format::{catalog::BlockCatalog, log::proto::PublishedObjectVersion, keys::{block_key, is_compacted_catalog_file, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, search_manifest::is_ranged_run, trie_retirement::InstalledRetirement};
+use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, Result, S3ObjectNamespace, SourcePosition};
 
 use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
     log::{LogOffset, local::{physical_maximum, prefix_end, settle_prefix}}, sealing::{ClassicKeyVault, ClassicObjectKeys, ObjectCipher, UnitOperation}};
@@ -88,18 +88,41 @@ impl<'a> TrieDeletionGrant<'a> {
 }
 
 pub(crate) async fn retire_search_run(
-    store: &dyn ObjectStore, key: &ObjectKey, cut: Option<CatalogCut>, keys: Option<&dyn ObjectCipher>,
+    store: &dyn ObjectStore, key: &ObjectKey, publication: Option<&PublishedObjectVersion>,
+    cut: Option<CatalogCut>, keys: Option<&dyn ObjectCipher>,
 ) -> Result<bool> {
     if !store.defers_trie_releases() {
         store.delete(key).await?;
         return Ok(true);
     }
-    let (Some(local), Some(cut)) = (store.local_maintenance_store(), cut) else { return Ok(false); };
-    let Some(gate) = local.try_lock_recovery_deletion().await? else { return Ok(false); };
-    let path = is_ranged_run(key.as_str()).then_some(key.as_str());
-    if !store.close_classic_trie_admission(cut, &[path]).await?[0] { return Ok(false); }
-    TrieDeletionGrant { store, files: vec![(key.clone(), None)], recovery_gate: Some(gate), remaining: false }
-        .erase(keys).await
+    let Some(cut) = cut else { return Ok(false); };
+    let exact = is_ranged_run(key.as_str());
+    let (recovery_gate, version) = match store.local_maintenance_store() {
+        Some(local) => {
+            let Some(gate) = local.try_lock_recovery_deletion().await? else { return Ok(false); };
+            (Some(gate), None)
+        }
+        None if exact => {
+            let Some(expected) = publication.filter(|publication| publication.terminal.is_none()) else { return Ok(false); };
+            let (Some(bucket), Some(path), Some(version)) = (&expected.bucket, &expected.key, &expected.version)
+                else { return Ok(false); };
+            let observed = PhysicalObjectVersion {
+                namespace: S3ObjectNamespace { bucket: bucket.clone(), endpoint: expected.endpoint.clone(), region: expected.region.clone() },
+                key: path.clone(), version: version.clone(),
+            };
+            if store.s3_publication_address(key).as_ref() != Some(&(observed.namespace.clone(), observed.key.clone())) {
+                return Ok(false);
+            }
+            (None, Some(observed))
+        }
+        None => return Ok(false),
+    };
+    if !store.close_classic_trie_admission(cut, &[exact.then_some(key.as_str())]).await?[0]
+        || !store.classic_trie_retirement_ready(key, version.as_ref()).await?
+    {
+        return Ok(false);
+    }
+    TrieDeletionGrant { store, files: vec![(key.clone(), version)], recovery_gate, remaining: false }.erase(keys).await
 }
 
 struct ClassicLogDeletionGrant {

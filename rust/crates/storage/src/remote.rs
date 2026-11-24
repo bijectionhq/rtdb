@@ -203,6 +203,21 @@ impl ObjectStore for RemoteStore {
         crate::classic_retirement::retire(self, receipt, contents).await
     }
 
+    fn releases_exact_search_runs(&self) -> bool { self.catalog.is_some() && self.classic_versions.is_some() }
+
+    async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+        cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
+        if rtdb_format::search_manifest::is_ranged_run(key.as_str()) && self.releases_exact_search_runs() {
+            return crate::classic_retirement::retire_search_run(self, key, publication, cut, None).await;
+        }
+        if self.catalog.is_some() {
+            let Some(cut) = cut else { return Ok(false); };
+            if !self.advance_catalog_floor(cut).await? { return Ok(false); }
+        }
+        self.delete(key).await?;
+        Ok(true)
+    }
+
     async fn close_classic_trie_admission(&self, cut: rtdb_types::CatalogCut, paths: &[Option<&str>]) -> rtdb_types::Result<Vec<bool>> {
         let Some(ledger) = self.catalog.clone().filter(|_| self.classic_versions.is_some()) else {
             return Ok(vec![self.advance_catalog_floor(cut).await?; paths.len()]);

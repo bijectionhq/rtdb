@@ -403,9 +403,9 @@ impl ObjectStore for EncryptingStore {
         publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>,
     ) -> Result<bool> {
-        if rtdb_format::search_manifest::is_ranged_run(key.as_str()) && self.local_maintenance_store().is_some()
+        if rtdb_format::search_manifest::is_ranged_run(key.as_str()) && self.classic_control.is_some() && self.releases_exact_search_runs()
             && let ObjectKeys::Units(ledger) = &self.keys {
-            return crate::classic_retirement::retire_search_run(self, key, cut, Some(ledger.as_ref())).await;
+            return crate::classic_retirement::retire_search_run(self, key, publication, cut, Some(ledger.as_ref())).await;
         }
         self.inner.release_search_run(key, publication, cut).await
     }

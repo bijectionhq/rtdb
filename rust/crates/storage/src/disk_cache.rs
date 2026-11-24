@@ -310,6 +310,9 @@ impl DiskCachedStore {
 }
 #[async_trait]
 impl ObjectStore for DiskCachedStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        self.remote.s3_publication_address(key)
+    }
     fn permits_shared_read_cache(&self) -> bool { self.remote.permits_shared_read_cache() }
     fn index_page_lifecycle(&self) -> Option<&dyn crate::object_store::IndexPageLifecycle> {
         self.remote.index_page_lifecycle()

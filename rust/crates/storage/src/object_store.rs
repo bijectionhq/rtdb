@@ -676,9 +676,9 @@ impl ObjectStore for LocalStore {
 
     fn releases_exact_search_runs(&self) -> bool { self.catalog.is_some() }
 
-    async fn release_search_run(&self, key: &ObjectKey, _publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
+    async fn release_search_run(&self, key: &ObjectKey, publication: Option<&rtdb_format::log::proto::PublishedObjectVersion>,
         cut: Option<rtdb_types::CatalogCut>) -> rtdb_types::Result<bool> {
-        crate::classic_retirement::retire_search_run(self, key, cut, None).await
+        crate::classic_retirement::retire_search_run(self, key, publication, cut, None).await
     }
 
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
