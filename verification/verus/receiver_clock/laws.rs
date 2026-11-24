@@ -6,7 +6,8 @@ verus! {
 pub fn a_stalled_publisher_cannot_refresh(previous: i64, expiry: i64, observed: i64)
     requires observed <= previous,
 {
-    assert(!advances_frontier(previous, expiry, true, observed));
+    let refreshed = advances_frontier(previous, expiry, true, observed);
+    assert(!refreshed);
 }
 
 pub fn takeover_requires_the_exclusive_prior_expiry(previous: i64, expiry: i64, observed: i64)
@@ -15,7 +16,8 @@ pub fn takeover_requires_the_exclusive_prior_expiry(previous: i64, expiry: i64, 
     let published = advances_frontier(previous, expiry, false, observed);
     assert(published == (observed >= expiry));
     if published {
-        assert(!keeps_epoch(expiry, false, observed));
+        let kept = keeps_epoch(expiry, false, observed);
+        assert(!kept);
         assert(observed > previous);
     }
 }

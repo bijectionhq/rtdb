@@ -10,6 +10,7 @@
   "min_verified_functions": 28,
   "controls": {
     "substitute_the_ordered_funded_booking": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -26,6 +27,7 @@
       ]
     },
     "retime_the_terminal_funded_receipt": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -42,6 +44,7 @@
       ]
     },
     "substitute_the_receiver_clock_domain": {
+      "min_verified_functions": 35,
     "mutate": [
       {
         "file": "rust/crates/tx/src/system_time.rs",
@@ -217,6 +220,7 @@
       "min_verified_functions": 9
     },
     "sql_rejects_a_tie": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -233,6 +237,7 @@
       ]
     },
     "sql_accepts_a_client_time_after_append": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -249,6 +254,7 @@
       ]
     },
     "substitute_append_for_the_receiver_observation": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -265,6 +271,7 @@
       ]
     },
     "include_the_receiver_window_end": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -281,6 +288,7 @@
       ]
     },
     "let_a_prepared_clock_lead_append": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -297,6 +305,7 @@
       ]
     },
     "include_the_exclusive_owned_deadline": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -313,6 +322,7 @@
       ]
     },
     "retime_relative_terms_at_source_append": {
+      "min_verified_functions": 35,
       "mutate": [{
         "file": "rust/crates/tx/src/system_time.rs",
         "find": "    match (slot, observed) {\n        (Some(reading), _) | (None, Some(reading)) => reading,\n        (None, None) => appended,\n    }",
@@ -325,6 +335,7 @@
       }]
     },
     "collapse_equal_history_times": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -341,6 +352,7 @@
       ]
     },
     "omit_grid_alignment": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",
@@ -357,6 +369,7 @@
       ]
     },
     "substitute_whole_root_progress_for_the_prepared_floor": {
+      "min_verified_functions": 35,
       "mutate": [
         {
           "file": "rust/crates/tx/src/system_time.rs",

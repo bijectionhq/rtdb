@@ -4,6 +4,7 @@
   "min_verified_functions": 6,
   "controls": {
     "refresh_a_stalled_clock": {
+      "min_verified_functions": 5,
       "mutate": [{
         "file": "rust/crates/directory/src/receiver_clock_step.rs",
         "find": "    observed > previous && (same_publisher || observed >= expires)",
@@ -12,6 +13,7 @@
       "expect": [{"file": "rust/crates/directory/src/receiver_clock_step.rs", "function": "advances_frontier", "category": "postcondition not satisfied"}]
     },
     "permit_early_takeover": {
+      "min_verified_functions": 5,
       "mutate": [{
         "file": "rust/crates/directory/src/receiver_clock_step.rs",
         "find": "    observed > previous && (same_publisher || observed >= expires)",
@@ -20,6 +22,7 @@
       "expect": [{"file": "rust/crates/directory/src/receiver_clock_step.rs", "function": "advances_frontier", "category": "postcondition not satisfied"}]
     },
     "admit_an_expired_sample": {
+      "min_verified_functions": 5,
       "mutate": [{
         "file": "rust/crates/directory/src/receiver_clock_step.rs",
         "find": "    instant <= elapsed && elapsed < expires",

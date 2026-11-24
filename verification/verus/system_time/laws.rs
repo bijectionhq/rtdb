@@ -103,8 +103,11 @@ pub fn equal_receiver_observations_keep_the_same_deadline_verdict(
 )
     requires left == right,
 {
-    assert(owned_deadline_is_live(left, deadline) == owned_deadline_is_live(right, deadline));
-    assert(!owned_deadline_is_live(deadline, deadline));
+    let left_live = owned_deadline_is_live(left, deadline);
+    let right_live = owned_deadline_is_live(right, deadline);
+    let at_deadline = owned_deadline_is_live(deadline, deadline);
+    assert(left_live == right_live);
+    assert(!at_deadline);
 }
 
 // V4. Hidden appends cannot retime explicitly acceptance-relative effects.
@@ -127,8 +130,10 @@ pub fn a_tied_history_coordinate_does_not_match_another_assertion(
 )
     requires before < after,
 {
-    assert(!owned_point_matches(Some((before, ordinal, history)), Some((after, ordinal, history))));
-    assert(!owned_point_matches(Some((before, 0, history)), Some((before, 1, history))));
+    let other_position = owned_point_matches(Some((before, ordinal, history)), Some((after, ordinal, history)));
+    let other_ordinal = owned_point_matches(Some((before, 0, history)), Some((before, 1, history)));
+    assert(!other_position);
+    assert(!other_ordinal);
 }
 
 // The paired check assumes that both paths reached their original prepared cut
@@ -140,30 +145,42 @@ pub fn the_prepared_clock_verdict_does_not_depend_on_extra_predecessors(
     requires through <= left_predecessor, through <= right_predecessor,
         reading <= left_append, reading <= right_append,
 {
-    assert(clock_slot_admits(through, left_predecessor, reading, left_append, observed)
-        == clock_slot_admits(through, right_predecessor, reading, right_append, observed));
+    let left = clock_slot_admits(through, left_predecessor, reading, left_append, observed);
+    let right = clock_slot_admits(through, right_predecessor, reading, right_append, observed);
+    assert(left == right);
 }
 
 pub fn an_advertised_reading_is_on_the_receiver_grid(observed: i64) {
     if let Some(reading) = next_grid_reading(observed) {
-        assert(clock_slot_admits(1, 1, reading, reading, reading));
+        let admitted = clock_slot_admits(1, 1, reading, reading, reading);
+        assert(admitted);
     }
 }
 
 pub fn the_offered_reading_requires_the_original_clock_lineage() {
-    assert(!accepts_clock_lineage(false, 3, 2, 8, 5, 1_100_000, 200_000));
-    assert(!accepts_clock_lineage(true, 1, 2, 8, 5, 1_100_000, 200_000));
-    assert(!accepts_clock_lineage(true, 3, 2, 4, 5, 1_100_000, 200_000));
-    assert(!accepts_clock_lineage(true, 2, 2, 5, 5, 1_100_000, 200_000));
-    assert(accepts_clock_lineage(true, 3, 2, 8, 5, 1_100_000, 200_000));
+    let other_domain = accepts_clock_lineage(false, 3, 2, 8, 5, 1_100_000, 200_000);
+    let older_epoch = accepts_clock_lineage(true, 1, 2, 8, 5, 1_100_000, 200_000);
+    let earlier_frontier = accepts_clock_lineage(true, 3, 2, 4, 5, 1_100_000, 200_000);
+    let stale_lineage = accepts_clock_lineage(true, 2, 2, 5, 5, 1_100_000, 200_000);
+    let original = accepts_clock_lineage(true, 3, 2, 8, 5, 1_100_000, 200_000);
+    assert(!other_domain);
+    assert(!older_epoch);
+    assert(!earlier_frontier);
+    assert(!stale_lineage);
+    assert(original);
 }
 
 pub fn funded_seat_and_receipt_name_one_advertised_reading() {
-    assert(original_funded_seat(1_000_000, 1_000_000, 2_000_000, true, true));
-    assert(!original_funded_seat(1_000_000, 1_000_001, 2_000_000, true, true));
-    assert(!original_funded_seat(1_000_000, 1_000_000, 2_000_000, true, false));
-    assert(!original_funded_seat(1_000_000, 1_000_000, 2_000_000, false, true));
-    assert(!original_funded_seat(1_000_000, 1_000_000, 2_000_001, true, true));
+    let original = original_funded_seat(1_000_000, 1_000_000, 2_000_000, true, true);
+    let other_reading = original_funded_seat(1_000_000, 1_000_001, 2_000_000, true, true);
+    let foreign_booking = original_funded_seat(1_000_000, 1_000_000, 2_000_000, true, false);
+    let unbooked = original_funded_seat(1_000_000, 1_000_000, 2_000_000, false, true);
+    let other_window = original_funded_seat(1_000_000, 1_000_000, 2_000_001, true, true);
+    assert(original);
+    assert(!other_reading);
+    assert(!foreign_booking);
+    assert(!unbooked);
+    assert(!other_window);
 }
 
 pub fn distinct_publications_on_the_same_grid_materialize_the_same_terms(
@@ -175,8 +192,9 @@ pub fn distinct_publications_on_the_same_grid_materialize_the_same_terms(
     let left = clock_slot_admits(1, left_predecessor, 1_000_000, left_append, 1_000_001);
     let right = clock_slot_admits(1, right_predecessor, 1_000_000, right_append, 1_899_999);
     assert(left && right);
-    assert(acceptance_relative_time(Some(1_000_000), Some(1_000_001), left_append)
-        == acceptance_relative_time(Some(1_000_000), Some(1_899_999), right_append));
+    let left_term = acceptance_relative_time(Some(1_000_000), Some(1_000_001), left_append);
+    let right_term = acceptance_relative_time(Some(1_000_000), Some(1_899_999), right_append);
+    assert(left_term == right_term);
 }
 
 

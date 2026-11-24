@@ -12,6 +12,7 @@
   "min_verified_functions": 11,
   "controls": {
     "replay_the_range_anchor_as_a_change": {
+    "min_verified_functions": 10,
     "defect": "Treat an earlier or repeated publication as a new intervening change when SQL history times tie.",
     "mutate": [
       {
@@ -88,6 +89,7 @@
       "min_verified_functions": 6
     },
     "include_a_later_original_position": {
+      "min_verified_functions": 10,
       "mutate": [
         {
           "file": "rust/crates/temporal/src/event_step.rs",
@@ -104,6 +106,7 @@
       ]
     },
     "exclude_erasure_from_position_cut": {
+      "min_verified_functions": 10,
       "mutate": [
         {
           "file": "rust/crates/temporal/src/event_step.rs",
