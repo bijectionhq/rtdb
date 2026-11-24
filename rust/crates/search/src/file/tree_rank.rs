@@ -1,13 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, StructArray, cast::AsArray, types::{Int64Type, UInt32Type}};
 use rtdb_columnar::EntityIdRef;
 use rtdb_text::{Query, RankScorer, stored_length};
-use rtdb_types::{Iid, Result, TemporalBounds};
+use rtdb_types::{Iid, MemoryBudget, MemoryReservation, Result, TemporalBounds};
 
-use super::{corrupt, meets, layout::{Table, table}, paged::{self, Block, Frequencies}, postings::Impact, rank_tree::{self, RankLeaf, RankNode, WindowIds},
-    tree_file::{DOCUMENT, DOCUMENT_ROWS, POSTING, TreeFile}};
+use super::{corrupt, meets, layout::{PageRef, Table, table}, paged::{self, Frequencies, PostingBlock},
+    rank_tree::{self, RankLeaf, RankNode, RankWindow}, tree_file::{DOCUMENT, DOCUMENT_ROWS, POSTING, TreeFile}};
 use crate::{member_bounds::{MemberStart, document_member}, rank_cutoff::RankKey, rank_windows::document_range};
 
 struct Term {
@@ -15,8 +16,6 @@ struct Term {
     inline: Option<Arc<RankLeaf>>,
     frequency: u32,
 }
-
-type RankBlock = (Arc<Block>, Impact, WindowIds);
 
 impl Term {
     fn read(page: Option<arrow_array::RecordBatch>, column: u32, text: &str) -> Result<Option<Self>> {
@@ -30,39 +29,91 @@ impl Term {
         let inline = if node.page.is_none() {
             let blocks = table(&page, Table::Blocks);
             let ids = table(&page, Table::ImpactIds);
-            Some(Arc::new(RankLeaf::read(blocks.column(0).as_list::<i64>(), ids.column(0).as_list::<i64>(), row)?))
+            Some(Arc::new(RankLeaf::read(blocks.column(0).as_list::<i64>(), ids.column(0).as_list::<i64>(), row, None)?))
         } else { None };
         Ok(Some(Self { node, inline, frequency: terms.column(4).as_primitive::<UInt32Type>().value(row) }))
     }
+}
 
-    async fn leaf(&self, file: &TreeFile, node: RankNode) -> Result<Arc<RankLeaf>> {
-        if let Some(leaf) = &self.inline { return Ok(Arc::clone(leaf)); }
+struct LeafCache {
+    entries: VecDeque<(PageRef, Arc<RankLeaf>)>,
+    memory: Arc<MemoryBudget>,
+}
+
+impl LeafCache {
+    async fn read(&mut self, file: &TreeFile, node: RankNode, reuse: bool) -> Result<Arc<RankLeaf>> {
+        const MAX_CACHED_LEAVES: usize = 16;
+        let page = node.page.ok_or_else(|| corrupt("Search rank leaf is inline"))?;
+        if let Some(index) = self.entries.iter().position(|(cached, _)| *cached == page) {
+            let entry = self.entries.remove(index).expect("cached rank leaf");
+            let leaf = Arc::clone(&entry.1);
+            self.entries.push_back(entry);
+            return Ok(leaf);
+        }
         let (blocks, ids) = rank_tree::leaf_arrays(file.reader(), node).await?;
-        Ok(Arc::new(RankLeaf::read(blocks.column(0).as_list::<i64>(), ids.column(0).as_list::<i64>(), 0)?))
+        if reuse && self.entries.len() == MAX_CACHED_LEAVES { self.entries.pop_front(); }
+        let blocks = blocks.column(0).as_list::<i64>();
+        let ids = ids.column(0).as_list::<i64>();
+        let leaf = self.admit(|memory| RankLeaf::read(blocks, ids, 0, Some(memory)))?;
+        let leaf = Arc::new(leaf);
+        if reuse { self.entries.push_back((page, Arc::clone(&leaf))); }
+        Ok(leaf)
     }
 
-    async fn windows(&self, file: &TreeFile, first: u32, last: u32) -> Result<BTreeMap<u32, RankBlock>> {
-        let mut windows = BTreeMap::new();
-        for node in rank_tree::leaves(file.reader(), self.node, first, last).await? {
-            let leaf = self.leaf(file, node).await?;
-            append_windows(&mut windows, &leaf, first, last);
+    fn admit<T>(&mut self, allocate: impl Fn(&Arc<MemoryBudget>) -> Result<T>) -> Result<T> {
+        match allocate(&self.memory) {
+            Err(error) if error.code == "rtdb/memory-budget-exceeded" && !self.entries.is_empty() => {
+                self.entries.clear();
+                allocate(&self.memory)
+            }
+            result => result,
         }
-        Ok(windows)
     }
 }
 
-fn append_windows(windows: &mut BTreeMap<u32, RankBlock>, leaf: &RankLeaf, first: u32, last: u32) {
-    let blocks = leaf.postings.blocks.iter().cloned().map(Arc::new).collect::<Vec<_>>();
-    for (&(window, block, impact), &ids) in leaf.postings.windows.iter().zip(&leaf.ids) {
-        if (first..=last).contains(&window) {
-            windows.insert(window, (Arc::clone(&blocks[block]), impact, ids));
+struct WindowRef {
+    leaf: Arc<RankLeaf>,
+    index: usize,
+}
+
+impl WindowRef {
+    fn entry(&self) -> &RankWindow { &self.leaf.windows[self.index] }
+
+    fn block(&self) -> BlockRef { BlockRef { leaf: Arc::clone(&self.leaf), block: self.entry().block } }
+}
+
+fn append_windows(windows: &mut BTreeMap<u32, WindowRef>, leaf: &Arc<RankLeaf>, leading: &[RankWindow]) {
+    let first = leaf.windows[0].window;
+    let last = leaf.windows.last().expect("a rank leaf contains a window").window;
+    let start = leading.partition_point(|entry| entry.window < first);
+    for entry in leading[start..].iter().take_while(|entry| entry.window <= last) {
+        if let Ok(index) = leaf.windows.binary_search_by_key(&entry.window, |entry| entry.window) {
+            windows.insert(entry.window, WindowRef { leaf: Arc::clone(leaf), index });
         }
     }
+}
+
+struct BlockRef {
+    leaf: Arc<RankLeaf>,
+    block: usize,
+}
+
+impl BlockRef {
+    fn posting(&self) -> PostingBlock { self.leaf.blocks[self.block].posting }
+
+    fn windows(&self) -> impl Iterator<Item = u32> + '_ {
+        self.leaf.windows[self.leaf.blocks[self.block].windows.clone()].iter().map(|entry| entry.window)
+    }
+}
+
+struct WindowWork {
+    blocks: Vec<Option<BlockRef>>,
+    _reservation: Arc<MemoryReservation>,
 }
 
 enum Job {
     Node(RankNode),
-    Windows(Vec<Option<Arc<Block>>>),
+    Window(WindowWork),
 }
 
 struct Work {
@@ -89,6 +140,7 @@ pub(crate) struct TreeRanked {
     phrases: Vec<Vec<usize>>,
     scorer: RankScorer,
     ready: BinaryHeap<Work>,
+    leaves: LeafCache,
     members: Vec<MemberStart>,
     documents: u32,
     bounds: TemporalBounds,
@@ -111,7 +163,7 @@ pub(crate) struct TreeCandidate {
 
 impl TreeRanked {
     pub async fn open(file: Arc<TreeFile>, column: usize, matching: &Query, scoring: &RankScorer,
-        bounds: TemporalBounds, order: TreeRankOrder) -> Result<Self> {
+        bounds: TemporalBounds, order: TreeRankOrder, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let term_ids: BTreeMap<_, _> = matching.terms().iter().chain(scoring.scorer().query().terms())
             .collect::<BTreeSet<_>>().into_iter().enumerate().map(|(index, term)| (term.as_str(), index)).collect();
         let names = term_ids.keys().map(|term| term.to_string()).collect::<Vec<_>>();
@@ -138,7 +190,7 @@ impl TreeRanked {
         let sparse = file.format() == super::LOGICAL_FORMAT_VERSION && (matching.len() > 1 || !phrases.is_empty())
             && leading.is_some_and(|index| terms[index].as_ref().is_some_and(|term| term.frequency <= 1024));
         let mut rank = Self { file, terms, leading, matching, scoring: score_terms, phrases, scorer: scoring.clone(),
-            ready: BinaryHeap::new(), members, documents, bounds, order,
+            ready: BinaryHeap::new(), leaves: LeafCache { entries: VecDeque::new(), memory: Arc::clone(memory) }, members, documents, bounds, order,
             checked_frequencies: BTreeSet::new(), checked_positions: BTreeSet::new(), sparse };
         if let Some(leading) = leading {
             let node = rank.terms[leading].as_ref().expect("leading term is present").node;
@@ -181,36 +233,53 @@ impl TreeRanked {
             for child in children { self.push_node(leading, child, floors.get(&child.first).copied())?; }
             return Ok(());
         }
-        let leaf = self.terms[leading].as_ref().expect("leading term is present").leaf(&self.file, node).await?;
+        let term = self.terms[leading].as_ref().expect("leading term is present");
+        let leading_leaf = if let Some(inline) = &term.inline { Arc::clone(inline) }
+            else { self.leaves.read(&self.file, node, false).await? };
+        let start = leading_leaf.windows.partition_point(|entry| entry.window < node.first);
+        let end = leading_leaf.windows.partition_point(|entry| entry.window <= node.last);
+        let leading_windows = &leading_leaf.windows[start..end];
         let mut windows = Vec::with_capacity(self.terms.len());
         for (index, term) in self.terms.iter().enumerate() {
-            let bound = if index == leading {
-                let mut windows = BTreeMap::new();
-                append_windows(&mut windows, &leaf, node.first, node.last);
-                windows
-            } else if let Some(term) = term {
-                term.windows(&self.file, node.first, node.last).await?
-            } else { BTreeMap::new() };
-            windows.push(bound);
+            let mut selected = BTreeMap::new();
+            if index != leading && let Some(term) = term {
+                for leaf in rank_tree::leaves(self.file.reader(), term.node, node.first, node.last).await? {
+                    let leaf = if let Some(inline) = &term.inline { Arc::clone(inline) }
+                        else { self.leaves.read(&self.file, leaf, true).await? };
+                    append_windows(&mut selected, &leaf, leading_windows);
+                }
+            }
+            windows.push(selected);
         }
         let matching = &self.matching;
-        let matching_windows = || windows[leading].iter()
-            .filter(|&(&window, _)| matching.iter().all(|&term| windows[term].contains_key(&window)));
-        let floors = self.uuid_floors(matching_windows().map(|(&window, _)| window)).await?;
-        for (&window, (_, _, ids)) in matching_windows() {
+        let matching_windows = || leading_windows.iter()
+            .filter(|entry| matching.iter().all(|&term| term == leading || windows[term].contains_key(&entry.window)));
+        let count = matching_windows().count();
+        if count == 0 { return Ok(()); }
+        let floors = self.uuid_floors(matching_windows().map(|entry| entry.window)).await?;
+        let bytes = 256usize.saturating_add(count.saturating_mul(self.terms.len()).saturating_mul(size_of::<Option<BlockRef>>()));
+        let reservation = self.leaves.admit(|memory| memory.reserve(bytes))?;
+        for lead in matching_windows() {
+            let window = lead.window;
+            let entry = |term: usize| if term == leading { Some(lead) }
+                else { windows[term].get(&window).map(WindowRef::entry) };
             let mut score = 0.0;
             for (index, &term) in self.scoring.iter().enumerate() {
-                if let Some((_, impact, _)) = windows[term].get(&window) {
-                    score += self.term_score(index, impact.max_unit_score, impact.frequency, impact.length);
+                if let Some(entry) = entry(term) {
+                    score += self.term_score(index, entry.unit_score, entry.frequency, entry.length);
                 }
             }
             let integer = match self.scoring.as_slice() {
                 [term] if self.scorer.scorer().uses_unit_term_scores() && score > 0.0 =>
-                    windows[*term].get(&window).and_then(|(_, _, ids)| ids.peak).or(ids.minimum),
-                _ => ids.minimum,
+                    entry(*term).and_then(|entry| entry.peak).or(lead.minimum),
+                _ => lead.minimum,
             };
-            let blocks = windows.iter().map(|term| term.get(&window).map(|(block, _, _)| Arc::clone(block))).collect();
-            self.ready.push(Work { key: self.key(score, integer, floors.get(&window).copied()), first: window, job: Job::Windows(blocks) });
+            let blocks = windows.iter().enumerate().map(|(term, windows)| {
+                if term == leading { Some(BlockRef { leaf: Arc::clone(&leading_leaf), block: lead.block }) }
+                else { windows.get(&window).map(WindowRef::block) }
+            }).collect();
+            self.ready.push(Work { key: self.key(score, integer, floors.get(&window).copied()), first: window,
+                job: Job::Window(WindowWork { blocks, _reservation: Arc::clone(&reservation) }) });
         }
         Ok(())
     }
@@ -256,24 +325,31 @@ impl TreeRanked {
             } else {
                 self.open_node(node).await?;
             }
+            if self.sparse || self.ready.is_empty() { self.leaves.entries.clear(); }
             return Ok(Vec::new());
         }
         let mut windows = BTreeMap::new();
         let batch = if self.order == TreeRankOrder::Uuid { 1 } else if self.sparse { 16 } else { 4 };
-        while windows.len() < batch && self.ready.peek().is_some_and(|work| matches!(work.job, Job::Windows(_))) {
-            let Some(Work { first, job: Job::Windows(blocks), .. }) = self.ready.pop() else { unreachable!() };
-            windows.insert(first, blocks);
+        while windows.len() < batch && self.ready.peek().is_some_and(|work| matches!(work.job, Job::Window(_))) {
+            let Some(Work { first, job: Job::Window(window), .. }) = self.ready.pop() else { unreachable!() };
+            windows.insert(first, window);
         }
-        let key = |block: &Block| (block.page, block.slot);
-        let blocks = windows.values().flatten().flatten().map(|block| (key(block), block.as_ref())).collect::<BTreeMap<_, _>>();
+        if self.ready.is_empty() { self.leaves.entries.clear(); }
+        let key = |block: &BlockRef| {
+            let posting = block.posting();
+            (posting.page, posting.slot)
+        };
+        let blocks = windows.values().flat_map(|window| window.blocks.iter().flatten())
+            .map(|block| (key(block), block)).collect::<BTreeMap<_, _>>();
         let frequency_pages = self.pages(POSTING, blocks.keys().map(|&(page, _)| page).collect()).await?;
         let mut frequency = BTreeMap::new();
         for (&address, block) in &blocks {
             let checked = was_checked(&mut self.checked_frequencies, address);
-            let postings = Frequencies::checked_batch(&frequency_pages[&block.page], block, self.documents, checked)?;
+            let posting = block.posting();
+            let postings = Frequencies::checked_batch(&frequency_pages[&posting.page], posting, block.windows(), self.documents, checked)?;
             frequency.insert(address, postings);
         }
-        let in_window = |term: usize, window| windows[&window][term].as_ref().map(|block| &frequency[&key(block)]);
+        let in_window = |term: usize, window| windows[&window].blocks[term].as_ref().map(|block| &frequency[&key(block)]);
         let mut nominated = Vec::new();
         for window in windows.keys().copied() {
             let (start, end) = document_range(window);
@@ -291,19 +367,19 @@ impl TreeRanked {
         if !self.phrases.is_empty() {
             let phrases: BTreeSet<_> = self.phrases.iter().flatten().copied().collect();
             let position_keys: BTreeSet<_> = nominated.iter().flat_map(|&(window, _)| {
-                let blocks = &windows[&window];
+                let blocks = &windows[&window].blocks;
                 phrases.iter().filter_map(move |&term| blocks[term].as_ref().map(|block| key(block)))
             }).collect();
             let position_pages = self.pages(POSTING, position_keys.iter().map(|&(page, _)| page + 1).collect()).await?;
             let mut positions = BTreeMap::new();
             for address in position_keys {
-                let block = blocks[&address];
+                let (page, slot) = address;
                 let checked = was_checked(&mut self.checked_positions, address);
-                positions.insert(address, frequency[&address].checked_positions(&position_pages[&(block.page + 1)], block, checked)?);
+                positions.insert(address, frequency[&address].checked_positions(&position_pages[&(page + 1)], slot, checked)?);
             }
             nominated.retain(|&(window, doc)| {
                 let occurrences = |term: usize| {
-                    let block = windows[&window][term].as_ref().expect("phrase terms occur in this window");
+                    let block = windows[&window].blocks[term].as_ref().expect("phrase terms occur in this window");
                     let address = key(block);
                     let row = frequency[&address].index(doc).expect("phrase terms occur in this document");
                     paged::position_values(&positions[&address], row)

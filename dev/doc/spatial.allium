@@ -59,6 +59,8 @@ entity SpatialPostings {
 -- The live tail contributes candidate IIDs from its held event batches.
 -- One read budget covers all candidate sources and all refined rows.
 -- Any candidate set contains every IID whose visible row matches the requested partition and predicate.
+-- The held relation scan shares an admitted Arrow selection of the physical candidate IIDs.
+-- Candidate discovery releases its working storage once the scan selection is ready.
 -- A complete typed identity contributes at most one result at the chosen valid instant.
 -- Complete row history, including delete and erase events, determines visibility before exact geometry refinement.
 -- Only visible rows supply geometry to the read's exact predicate.

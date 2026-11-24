@@ -11,6 +11,28 @@ fn page() -> RecordBatch {
 }
 
 #[test]
+fn uncompressed_ipc_refuses_span_lengths_that_differ_from_the_descriptor() {
+    use arrow_schema::ArrowError;
+    use rtdb_format::ipc::{UncompressedBuffer::{Slice, Spans}, write_uncompressed_stream_from_buffers};
+
+    let schema = Schema::new(vec![Field::new("n", DataType::Int64, false)]);
+    let values = [7u8; 8];
+    let mut expected = Vec::new();
+    write_uncompressed_stream_from_buffers(&mut expected, &schema, 1, &[1], &mut [Slice(&[]), Slice(&values)]).unwrap();
+    let body_start = expected.len() - 64 - 8;
+
+    for (tail, written) in [(&values[..4], 7), (&values[..6], 3)] {
+        let mut spans = [&values[..3], tail].into_iter();
+        let mut output = Vec::new();
+        let error = write_uncompressed_stream_from_buffers(&mut output, &schema, 1, &[1], &mut [
+            Slice(&[]), Spans { length: values.len(), spans: &mut spans },
+        ]).unwrap_err();
+        assert!(matches!(error, ArrowError::InvalidArgumentError(_)));
+        assert_eq!(output.as_slice(), &expected[..body_start + written]);
+    }
+}
+
+#[test]
 fn owned_ipc_reuses_aligned_message_values_and_retains_their_reservation() {
     use arrow_buffer::Buffer;
     use rtdb_columnar::MemoryBudget;

@@ -5,7 +5,6 @@
 //! The artefact record's stats carry the footer and the directory digest, so a reader opens the directory
 //! with one range read and checks every byte it uses.
 
-use std::borrow::Cow;
 use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use arrow_ipc::{Message, Precision, reader::read_record_batch, root_as_message};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::ipc::write_uncompressed_stream_from_buffers;
+use rtdb_format::ipc::{UncompressedBuffer, write_uncompressed_stream_from_buffers};
 use rtdb_types::{Anomaly, Iid, Result};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -150,7 +149,8 @@ pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, c
     ];
     let directory_offset = written;
     let (directory_len, digest) = write_counted_stream(
-        output, &directory, count, &[count, count, centroids.len(), count, count, count, count], &buffers,
+        output, &directory, count, &[count, count, centroids.len(), count, count, count, count],
+        &mut buffers.map(UncompressedBuffer::Slice),
     )?;
     written += directory_len;
     let locator = Locator { directory: (directory_offset, directory_len), dimensions: dimensions_u32, digest };
@@ -162,6 +162,8 @@ pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, c
 fn write_block(
     output: &mut impl Write, schema: &Schema, rows: &IndexedRows, selected: &[&IndexedRow],
 ) -> Result<(u64, [u8; 32])> {
+    use UncompressedBuffer::{Slice, Spans};
+
     let count = selected.len();
     let mut iids = Vec::with_capacity(count * 16);
     let mut valid_from = Vec::with_capacity(count);
@@ -173,26 +175,20 @@ fn write_block(
         valid_to.push(row.valid_to);
         system_from.push(row.system_from);
     }
-    let units = match rows.contiguous_units(selected) {
-        Some(units) => Cow::Borrowed(units),
-        None => {
-            let mut units = Vec::with_capacity(count * rows.dimensions());
-            for row in selected { units.extend_from_slice(rows.unit(row)); }
-            Cow::Owned(units)
-        }
-    };
-    let buffers: [&[u8]; 11] = [
-        &[], &iids,
-        &[], valid_from.to_byte_slice(),
-        &[], valid_to.to_byte_slice(),
-        &[], system_from.to_byte_slice(),
-        &[], &[], units.as_ref().to_byte_slice(),
+    let unit_count = count * rows.dimensions();
+    let mut unit_spans = rows.unit_spans(selected).map(|span| span.to_byte_slice());
+    let mut buffers = [
+        Slice(&[]), Slice(&iids),
+        Slice(&[]), Slice(valid_from.to_byte_slice()),
+        Slice(&[]), Slice(valid_to.to_byte_slice()),
+        Slice(&[]), Slice(system_from.to_byte_slice()),
+        Slice(&[]), Slice(&[]), Spans { length: unit_count * size_of::<f32>(), spans: &mut unit_spans },
     ];
-    write_counted_stream(output, schema, count, &[count, count, count, count, count, units.len()], &buffers)
+    write_counted_stream(output, schema, count, &[count, count, count, count, count, unit_count], &mut buffers)
 }
 
 fn write_counted_stream(
-    output: &mut impl Write, schema: &Schema, rows: usize, node_lengths: &[usize], buffers: &[&[u8]],
+    output: &mut impl Write, schema: &Schema, rows: usize, node_lengths: &[usize], buffers: &mut [UncompressedBuffer<'_, '_>],
 ) -> Result<(u64, [u8; 32])> {
     let mut output = HashingWriter { output, length: 0, digest: Sha256::new() };
     write_uncompressed_stream_from_buffers(&mut output, schema, rows, node_lengths, buffers).map_err(|error| match error {
@@ -529,21 +525,26 @@ mod tests {
     fn cluster_stream_uses_the_selected_unit_order() {
         let rows = rows([0, 2, 4, 6]);
         let source = rows.rows();
-        let contiguous = [&source[1], &source[2]];
-        let reordered = [&source[2], &source[1]];
-        let gapped = [&source[1], &source[3]];
-        let units = rows.contiguous_units(&contiguous).unwrap();
-        assert_eq!(units.as_ptr(), rows.unit(&source[1]).as_ptr());
-        assert_eq!(units.len(), 4);
-        assert!(rows.contiguous_units(&reordered).is_none());
-        assert!(rows.contiguous_units(&gapped).is_none());
+        let contiguous = [&source[1], &source[2], &source[3]];
+        let reordered = [&source[3], &source[1], &source[2]];
+        let gapped = [&source[0], &source[2], &source[3]];
 
         let schema = block_schema(2).unwrap();
         let memory = MemoryBudget::new(1 << 20);
-        for selected in [contiguous, reordered, gapped] {
+        for (selected, run_lengths) in [(contiguous, &[3][..]), (reordered, &[1, 2][..]), (gapped, &[1, 2][..])] {
+            let mut spans = rows.unit_spans(&selected);
+            let mut start = 0;
+            for &run_length in run_lengths {
+                let span = spans.next().unwrap();
+                assert_eq!(span.as_ptr(), rows.unit(selected[start]).as_ptr());
+                assert_eq!(span.len(), run_length * rows.dimensions());
+                start += run_length;
+            }
+            assert!(spans.next().is_none());
+
             let mut bytes = Vec::new();
             let (length, digest) = write_block(&mut bytes, &schema, &rows, &selected).unwrap();
-            let cluster = Cluster { range: 0..length, rows: 2, digest };
+            let cluster = Cluster { range: 0..length, rows: selected.len() as u32, digest };
             let buffer = Buffer::from_vec(bytes);
             let batch = decode(StoredBytes(buffer.clone()), || Ok(Arc::clone(&schema)), Some(selected.len()), &memory).unwrap();
             assert_eq!(buffer.as_slice(), encode(&schema, batch.batch).unwrap().as_slice());

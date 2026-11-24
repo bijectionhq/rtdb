@@ -26,7 +26,7 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBufferBuilder, Buffer};
 use arrow_schema::Schema;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, shared_allocation_size};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, shared_allocation_size, shared_batches_allocation_size};
 use rtdb_text::{Corpus, Query, RankScorer, Scorer, stored_length};
 use rtdb_types::{Anomaly, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, Result, TemporalBounds, Timestamp};
 use sha2::{Digest, Sha256};
@@ -306,14 +306,26 @@ pub fn write_search_file(columns: &[String], pages: impl IntoIterator<Item = Res
 
 pub(crate) fn build_query_pages<I: SearchPage>(
     columns: &[String], pages: impl IntoIterator<Item = Result<I>>, ceiling: Option<i64>,
-    reservation: Arc<rtdb_columnar::MemoryReservation>,
-) -> Result<(SearchFile, usize)> {
-    let pages = write::query_batches(columns, pages, ceiling, reservation)?;
-    let size = pages.iter().try_fold(0usize, |bytes, page| {
-        bytes.checked_add(rtdb_columnar::shared_allocation_size(page)?)
-            .ok_or_else(|| fault("Search index allocation exceeds addressable memory"))
-    })?;
-    Ok((SearchFile::open_reader(Reader::from_checked_batches(pages, FORMAT_VERSION), columns)?, size))
+    reservation: Arc<MemoryReservation>, admit_shared: impl FnOnce(usize) -> Option<Arc<MemoryReservation>>,
+) -> Result<(SearchFile, Option<usize>)> {
+    let mut batches = write::query_batches(columns, pages, ceiling, reservation)?;
+    let size = shared_batches_allocation_size(&batches.pages)?;
+    let build = Arc::get_mut(&mut batches.reservation).expect("Query build owns its reservation");
+    if size > build.bytes() { build.grow_to(size)?; }
+
+    let shared = admit_shared(size);
+    let weight = shared.as_ref().map(|_| size);
+    let retained = if let Some(shared) = shared {
+        shared
+    } else {
+        build.shrink_to(size)?;
+        Arc::clone(&batches.reservation)
+    };
+    let pages = batches.pages.into_iter()
+        .map(|page| Ok(OwnedBatch::with_reservation(page, Arc::clone(&retained))?.batch().clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let file = SearchFile::open_reader(Reader::from_checked_batches(pages, FORMAT_VERSION), columns)?;
+    Ok((file.with_reservation(retained), weight))
 }
 
 /// Writes one Arrow search file over the members in bucket order with a shared recency ceiling.
@@ -496,7 +508,10 @@ impl SearchFile {
         Self { reader, columns: columns.to_vec(), manifest, validated_postings, _reservation: None }
     }
 
-    pub(crate) fn is_query_tree(&self) -> bool { self.reader.format >= TREE_FORMAT_VERSION }
+    pub(crate) fn cache_match_sets(&self) -> bool {
+        // A cached match set would keep a built file's reservation past file eviction.
+        self.reader.format < TREE_FORMAT_VERSION && self._reservation.is_none()
+    }
 
     fn column(&self, column: &str) -> Option<usize> { self.columns.iter().position(|candidate| candidate == column) }
 
@@ -993,7 +1008,7 @@ mod tests {
     async fn arrow_build_query_and_legacy_files_open_from_the_same_typed_pages_as_disk() -> Result<()> {
         let columns = columns();
         let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
-        let (built, bytes) = build_query_pages(&columns, [Ok(rows())], None, memory.reserve(1 << 20)?)?;
+        let (built, weight) = build_query_pages(&columns, [Ok(rows())], None, memory.reserve(1 << 20)?, |_| None)?;
         let on_disk = SearchFile::open(build_search_file(&columns, &rows(), "built")?, &columns)?;
         let compare = |typed: &SearchFile, on_disk: &SearchFile| -> Result<()> {
             assert_eq!(typed.reader.len(), on_disk.reader.len());
@@ -1012,8 +1027,15 @@ mod tests {
             assert_eq!(scores(typed)?, scores(on_disk)?);
             Ok(())
         };
-        assert!(bytes > 0);
+        assert_eq!(weight, None);
+        let retained = memory.used_bytes();
+        assert!(retained > 0 && retained < 1 << 20);
         compare(&built, &on_disk)?;
+        let page = built.reader.page(0)?;
+        drop(built);
+        assert_eq!(memory.used_bytes(), retained);
+        drop(page);
+        assert_eq!(memory.used_bytes(), 0);
 
         let mut bundle = Vec::new();
         write_versioned_group(&columns, [[Ok(rows())]], "legacy", 1, None, &mut bundle, None, TANTIVY_FORMAT_VERSION)?;
@@ -1048,7 +1070,7 @@ mod tests {
         let columns = columns();
         let rows = rows();
         let memory = rtdb_columnar::MemoryBudget::new(8 << 20);
-        let (built, _) = build_query_pages(&columns, [Ok(rows.clone())], None, memory.reserve(4 << 20)?)?;
+        let (built, _) = build_query_pages(&columns, [Ok(rows.clone())], None, memory.reserve(4 << 20)?, |_| None)?;
         let durable = SearchFile::open(build_search_file(&columns, &rows, "durable")?, &columns)?;
         let matching = Query::parse("\"invoice is overdue\"");
         let scoring = Query::parse("invoice overdue");
@@ -1584,7 +1606,8 @@ mod tests {
         let tree = Arc::new(TreeFile::remote(pool.clone(), key.clone(), cache.clone(), &locator, &columns, "remote-v14", 42, None).await.unwrap());
         let term = Query::parse("invoice");
         let scoring = Arc::new(Scorer::new(term.clone(), None)).for_ranking().unwrap();
-        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let mut rank = TreeRanked::open(tree.clone(), 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer, &memory).await.unwrap();
         assert_eq!(rank.bound().unwrap().integer_id(), Some(0));
         assert!(rank.expand(None, &mut 0).await.unwrap().is_empty());
         let mut hits = Vec::new();
@@ -1626,7 +1649,7 @@ mod tests {
         let bad_key = ObjectKey::new("search/bad-tree").unwrap();
         store.put(&bad_key, damaged.into()).await.unwrap();
         let bad = Arc::new(TreeFile::remote(pool.clone(), bad_key, cache, &locator, &columns, "remote-v14", 42, None).await.unwrap());
-        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer).await.is_err());
+        assert!(TreeRanked::open(bad, 0, &term, &scoring, at(2, 2), TreeRankOrder::Integer, &memory).await.is_err());
     }
 
     #[test]
