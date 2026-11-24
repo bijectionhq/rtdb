@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use ring::{
     digest::{SHA256, digest},
-    signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey},
+    signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey},
 };
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
@@ -282,9 +282,7 @@ pub struct DestructionStatement {
 
 impl DestructionStatement {
     pub fn signing_bytes(&self) -> Result<Vec<u8>> {
-        let mut message = b"rtdb.multi/assertion-destruction-attestation/v1\0".to_vec();
-        message.extend_from_slice(&encode(self)?);
-        Ok(message)
+        signed_message(b"rtdb.multi/assertion-destruction-attestation/v1\0", self)
     }
 }
 
@@ -293,6 +291,53 @@ impl DestructionStatement {
 pub struct SignedDestruction {
     pub statement: DestructionStatement,
     pub signature: Vec<u8>,
+}
+
+/// The closed population for one original deadline in one custody domain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadlineCohort {
+    pub domain: Uuid,
+    pub original_by_ms: u64,
+    pub orders: Vec<Uuid>,
+}
+
+impl DeadlineCohort {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        if self.domain.is_nil() || self.original_by_ms < FIXED_DEADLINE_MS
+            || self.orders.is_empty() || self.orders.iter().any(Uuid::is_nil)
+            || self.orders.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid("The deadline cohort requires a closed, ordered set of original orders"));
+        }
+        signed_message(b"rtdb.multi/assertion-deadline-cohort/v1\0", self)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedDeadlineCohort {
+    pub cohort: DeadlineCohort,
+    pub signature: Vec<u8>,
+}
+
+/// A private audit report. Every member has a durable, independently
+/// checkable destruction statement including the effective deadline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeadlineAttestation {
+    pub cohort: SignedDeadlineCohort,
+    pub dispositions: Vec<SignedDestruction>,
+    pub signature: Vec<u8>,
+}
+
+impl DeadlineAttestation {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>> {
+        signed_message(
+            b"rtdb.multi/assertion-deadline-attestation/v1\0",
+            &(&self.cohort, &self.dispositions),
+        )
+    }
 }
 
 /// Original authority storage. Compare-and-set and reads must survive failover
@@ -452,6 +497,36 @@ impl<'a> AssertionDeadline<'a> {
         Ok(self.read(id).await?.ok_or_else(changed)?.0.attestation)
     }
 
+    /// The installed source chooses the closed cohort in its own order.
+    /// The caller supplies its configured verification key, and the original
+    /// custody signing key held by the audit authority.
+    pub async fn attest_deadline(
+        &self, cohort: SignedDeadlineCohort, source_key: &[u8; 32],
+        custody_signer: &Ed25519KeyPair,
+    ) -> Result<Option<DeadlineAttestation>> {
+        UnparsedPublicKey::new(&ED25519, source_key)
+            .verify(&cohort.cohort.signing_bytes()?, &cohort.signature)
+            .map_err(|_| invalid("The original source did not authenticate the deadline cohort"))?;
+
+        let mut dispositions = Vec::with_capacity(cohort.cohort.orders.len());
+        for &id in &cohort.cohort.orders {
+            let Some(report) = self.attest(id).await? else { return Ok(None); };
+            if report.statement.order != id
+                || report.statement.domain != cohort.cohort.domain
+                || report.statement.original_by_ms != cohort.cohort.original_by_ms
+            {
+                return Err(invalid("The disposition belongs to a different original deadline or order"));
+            }
+            UnparsedPublicKey::new(&ED25519, custody_signer.public_key().as_ref())
+                .verify(&report.statement.signing_bytes()?, &report.signature)
+                .map_err(|_| invalid("The original custody authority did not sign the disposition"))?;
+            dispositions.push(report);
+        }
+        let mut report = DeadlineAttestation { cohort, dispositions, signature: Vec::new() };
+        report.signature = custody_signer.sign(&report.signing_bytes()?).as_ref().to_vec();
+        Ok(Some(report))
+    }
+
     async fn read(&self, id: Uuid) -> Result<Option<(Record, String)>> {
         let Some((bytes, version)) = self.journal.read(id).await? else { return Ok(None); };
         let record: Record = serde_json::from_slice(&bytes)
@@ -482,6 +557,12 @@ fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
         .map_err(|error| Anomaly::fault("rtdb.multi/assertion-deadline-journal", error.to_string()))
 }
 
+fn signed_message(domain: &[u8], value: &impl Serialize) -> Result<Vec<u8>> {
+    let mut message = domain.to_vec();
+    message.extend_from_slice(&encode(value)?);
+    Ok(message)
+}
+
 fn hash(value: &impl Serialize) -> Result<[u8; 32]> {
     Ok(digest(&SHA256, &encode(value)?).as_ref().try_into().expect("SHA-256 width"))
 }
@@ -502,7 +583,6 @@ fn changed() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ring::signature::KeyPair;
 
     fn signer() -> Ed25519KeyPair {
         Ed25519KeyPair::from_seed_unchecked(&[73; 32]).unwrap()
@@ -576,4 +656,59 @@ mod tests {
             .verify(&signed.statement.signing_bytes()?, &signed.signature).is_ok());
         Ok(())
     }
+
+    struct RetainedEvidence(BTreeMap<Uuid, Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl DeadlineJournal for RetainedEvidence {
+        async fn read(&self, order: Uuid) -> Result<Option<(Vec<u8>, String)>> {
+            Ok(self.0.get(&order).map(|bytes| (bytes.clone(), "retained".into())))
+        }
+
+        async fn compare_and_set(&self, _: Uuid, _: Option<&str>, _: Vec<u8>) -> Result<bool> {
+            unreachable!("audit reads do not change custody")
+        }
+
+        async fn page(&self, _: Option<Uuid>) -> Result<Vec<Uuid>> {
+            unreachable!("audit reads the exact signed cohort")
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_report_requires_every_member_of_the_signed_cohort() -> Result<()> {
+        let source = Ed25519KeyPair::from_seed_unchecked(&[41; 32]).unwrap();
+        let source_key = source.public_key().as_ref().try_into().unwrap();
+        let custody = signer();
+        let mut settled = Record::new(order(&custody));
+        let ordered_at_ms = READER_DRAIN_LIMIT_MS + settled.order.committed_at_ms;
+        settled.begin(ordered_at_ms)?;
+        for obligation in settled.order.obligations.clone() {
+            let mut receipt = Settlement {
+                obligation, observed_at_ms: ordered_at_ms, disposition: [19; 32], signature: Vec::new(),
+            };
+            receipt.signature = custody.sign(&receipt.signing_bytes(&settled.order, ordered_at_ms)?)
+                .as_ref().to_vec();
+            settled.join(receipt, ordered_at_ms)?;
+        }
+        settled.attestation = settled.report(&custody)?;
+
+        let mut later = order(&custody);
+        later.id = Uuid::from_u128(7);
+        let journal = RetainedEvidence(BTreeMap::from([
+            (settled.order.id, encode(&settled)?),
+            (later.id, encode(&Record::new(later.clone()))?),
+        ]));
+        let deadline = AssertionDeadline::new(&journal);
+        let cohort = DeadlineCohort {
+            domain: settled.order.domain, original_by_ms: settled.order.acceptance()?.physical_by_ms,
+            orders: vec![settled.order.id, later.id],
+        };
+        let signature = source.sign(&cohort.signing_bytes()?).as_ref().to_vec();
+        let mut selection = SignedDeadlineCohort { cohort, signature };
+        assert!(deadline.attest_deadline(selection.clone(), &source_key, &custody).await?.is_none());
+        selection.cohort.orders.pop();
+        assert!(deadline.attest_deadline(selection, &source_key, &custody).await.is_err());
+        Ok(())
+    }
+
 }

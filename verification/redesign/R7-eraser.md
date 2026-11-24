@@ -74,7 +74,9 @@ Raw deployment-key transfer cannot install an assertion stage. Restoring a passi
 
 Native ordered sealed ingress, the exact original fence and roster, current release admission, and installed holder adapters are required before operating this profile.
 The scheduler supports bounded page reads and exact retry, while a configured capacity and fault envelope has yet to establish a service bound.
-A per-deadline cohort report also needs an authenticated closed roster of orders for that cohort and an authorized audit route.
+The per-deadline cohort report verifies source-signed membership and includes the original custody authority's attestation for each member.
+The installed source still needs to close and sign the cohort and the auditor needs an authorized route to read it.
+A signed cohort with a pending member cannot produce a destruction attestation.
 
 ## Operation-only capture revocation
 
