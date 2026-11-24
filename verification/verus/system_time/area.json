@@ -280,6 +280,18 @@
         }
       ]
     },
+    "retime_relative_terms_at_source_append": {
+      "mutate": [{
+        "file": "rust/crates/tx/src/system_time.rs",
+        "find": "    match (slot, observed) {\n        (Some(reading), _) | (None, Some(reading)) => reading,\n        (None, None) => appended,\n    }",
+        "replace": "    match slot {\n        Some(reading) => reading,\n        None => appended,\n    }"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/system_time.rs",
+        "function": "acceptance_relative_time",
+        "category": "postcondition not satisfied"
+      }]
+    },
     "collapse_equal_history_times": {
       "mutate": [
         {

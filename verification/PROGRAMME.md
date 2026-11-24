@@ -33,6 +33,7 @@ The second review narrows the fork decision to shared custody and defines how er
 | Forks | Erasure reaches shared history within its key custody domain. Independently keyed copies have their own erasure authority. |
 | Future system time | Explicit system time lies between the preceding SQL system time and the original source-log append observation, inclusive. SQL system time may tie. Live decisions use the independent installed clock. |
 | Retry identities | An exact transaction retry is scoped to its registered receiver, database and principal, with a body digest and a conflict outcome. An owned publication orders its separate slot witness with the guarded decision and effects. Business intent and application command comparison belong to the application boundary. |
+| Acceptance-relative periods | The placed resolver instantiates explicit relative periods from the original receiver observation or the advertised prepared reading. A local receiver without that authority uses the original source append sample. The replica stores concrete effects and recovery carries those effects forward. The system-time harness checks the production selection and substitutes append time as a negative control. |
 | Transaction metadata | Retained only for the receipt window, and erasable with its unit before then (R8). |
 | Physical erasure and non-interference | OPT-2 is in scope with the declared bound; OPT-3 only for rows and search scores of fresh views. |
 | XTDB compatibility | Not a constraint. |

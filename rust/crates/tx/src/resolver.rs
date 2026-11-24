@@ -365,11 +365,15 @@ impl TxResolver {
             tx_id: TxId(position.0),
             system_time: Timestamp(selected_time.as_ref().copied().unwrap_or(default_time.0)),
         };
-        let terms_time = slot_time.as_ref().ok().copied().flatten().unwrap_or(key.system_time);
+        let slot_reading = slot_time.as_ref().ok().copied().flatten();
+        let terms_time = slot_reading.unwrap_or(key.system_time);
+        let acceptance_relative = Timestamp(crate::system_time::acceptance_relative_time(
+            slot_reading.map(|reading| reading.0), decision.map(|sample| sample.instant.0), log_time.0,
+        ));
         let placed_periods = request.guard.is_none() && request.idempotency_key().is_none()
             && attempt.map(PlacedAttempt::scope) == context.owned_witness_scope;
         let placement = if selected_time.is_ok() && slot_time.is_ok() {
-            request.place_owned_periods(terms_time, placed_periods)
+            request.place_owned_periods(acceptance_relative, placed_periods)
                 .and_then(|()| request.place_proposal_keys(terms_time, placed_periods))
         } else {
             Ok(())

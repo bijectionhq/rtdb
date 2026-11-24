@@ -100,6 +100,21 @@ pub(crate) fn owned_deadline_is_live(observed: i64, exclusive_deadline: i64) -> 
     observed < exclusive_deadline
 }
 
+/// Selects the origin for explicit acceptance-relative terms. Local receivers
+/// without hosted clock evidence use the original append sample.
+#[cfg_attr(verus_keep_ghost, verus_spec(selected =>
+    ensures selected == match (slot, observed) {
+        (Some(reading), _) | (None, Some(reading)) => reading,
+        (None, None) => appended,
+    },
+))]
+pub(crate) fn acceptance_relative_time(slot: Option<i64>, observed: Option<i64>, appended: i64) -> i64 {
+    match (slot, observed) {
+        (Some(reading), _) | (None, Some(reading)) => reading,
+        (None, None) => appended,
+    }
+}
+
 /// Compares the full assertion identity. History is authenticated separately
 /// because it still supplies the business-time projection used by some guards.
 #[cfg_attr(verus_keep_ghost, verus_spec(matches =>

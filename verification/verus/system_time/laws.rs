@@ -1,4 +1,4 @@
-use crate::production::{accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{acceptance_relative_time, accepts_clock_lineage, clock_slot_admits, next_grid_reading, owned_deadline_is_live, owned_point_matches, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
 use vstd::prelude::*;
 
 verus! {
@@ -105,6 +105,20 @@ pub fn equal_receiver_observations_keep_the_same_deadline_verdict(
 {
     assert(owned_deadline_is_live(left, deadline) == owned_deadline_is_live(right, deadline));
     assert(!owned_deadline_is_live(deadline, deadline));
+}
+
+// V4. Hidden appends cannot retime explicitly acceptance-relative effects.
+pub fn recorded_receiver_reading_materializes_relative_terms(observed: i64, left_append: i64, right_append: i64) {
+    let left = acceptance_relative_time(None, Some(observed), left_append);
+    let right = acceptance_relative_time(None, Some(observed), right_append);
+    assert(left == observed && left == right);
+}
+
+pub fn the_original_advertised_reading_materializes_prepared_terms(
+    reading: i64, observed: i64, appended: i64,
+) {
+    let selected = acceptance_relative_time(Some(reading), Some(observed), appended);
+    assert(selected == reading);
 }
 
 // V12. Two different original events cannot spend the same point witness.
