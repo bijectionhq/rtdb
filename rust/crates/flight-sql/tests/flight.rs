@@ -1820,8 +1820,18 @@ async fn check_spatial_pages_at_the_original_cut() {
         assert!(empty.next().is_none());
     }
     let request = query(hold, path, valid, None, &point(2.0), "intersects", Some(select(&[])));
-    let replies = client.action(projected, request).await.unwrap();
-    let batch = StreamReader::try_new(replies[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
+    let mut input = client.request(Action { r#type: projected.into(), body: request });
+    input.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
+    let reply = client.client.do_action(input).await.unwrap();
+    assert_eq!(reply.metadata().get("x-rtdb-owned-ipc").unwrap(), "stream-v1");
+    let frames: Vec<_> = reply.into_inner().try_collect().await.unwrap();
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames.last().unwrap().body.as_ref(), &[255, 255, 255, 255, 0, 0, 0, 0]);
+    let encoded = frames.iter().flat_map(|frame| frame.body.iter().copied()).collect::<Vec<_>>();
+    let mut streamed = StreamReader::try_new(encoded.as_slice(), None).unwrap();
+    assert_eq!(streamed.schema().metadata()["rtdb.owned.present_micros"], valid.to_string());
+    let batch = streamed.next().unwrap().unwrap();
+    assert!(streamed.next().is_none());
     let document = batch.column(2).as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
     assert_eq!(document.column_names(), ["_system_from"]);
     let ids = batch.column(0).as_any().downcast_ref::<UnionArray>().unwrap();
@@ -2658,6 +2668,33 @@ async fn held_read_batch_reuses_scalar_results_authentication_and_failure_order(
     let empty = client.action(full, full_range(selector(Arc::new(Int64Array::from(vec![9])))))
         .await.unwrap().remove(0).body;
     assert!(StreamReader::try_new(empty.as_ref(), None).unwrap().next().is_none());
+
+    for (after, unary, frame_count) in [
+        (Arc::new(NullArray::new(1)) as ArrayRef, first, 3),
+        (selector(Arc::new(Int64Array::from(vec![9]))), empty, 2),
+    ] {
+        let mut input = client.request(Action { r#type: full.into(), body: full_range(after) });
+        input.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
+        let reply = client.client.do_action(input).await.unwrap();
+        assert_eq!(reply.metadata().get("x-rtdb-owned-ipc").unwrap(), "stream-v1");
+        let frames: Vec<_> = reply.into_inner().try_collect().await.unwrap();
+        assert_eq!(frames.len(), frame_count);
+        assert_eq!(frames.last().unwrap().body.as_ref(), &[255, 255, 255, 255, 0, 0, 0, 0]);
+        let encoded = frames.iter().flat_map(|frame| frame.body.iter().copied()).collect::<Vec<_>>();
+        let mut original = StreamReader::try_new(unary.as_ref(), None).unwrap();
+        let mut streamed = StreamReader::try_new(encoded.as_slice(), None).unwrap();
+        assert_eq!(original.schema().fields(), streamed.schema().fields());
+        let coordinates = ["rtdb.owned.present_micros", "rtdb.owned.valid_micros"];
+        for key in coordinates {
+            assert_eq!(original.schema().metadata().get(key), streamed.schema().metadata().get(key));
+        }
+        match (original.next(), streamed.next()) {
+            (Some(original), Some(streamed)) => assert_eq!(original.unwrap().columns(), streamed.unwrap().columns()),
+            (None, None) => {},
+            _ => panic!("Negotiated range changed the number of record batches"),
+        }
+        assert!(original.next().is_none() && streamed.next().is_none());
+    }
 
     let valid = i64::from_be_bytes(opened[16..24].try_into().unwrap());
     let aggregate = |lower: ArrayRef| request(&range_prefix, vec![

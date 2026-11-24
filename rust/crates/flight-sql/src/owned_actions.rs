@@ -3062,7 +3062,7 @@ impl Service {
         self.owned_stream_reply(&schema, &response)
     }
 
-    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_range_action(&self, call: &Call, body: &[u8], version: HeldRangeFormat, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let audience = call.session.audience_source().is_some();
         if audience && (!matches!(version, HeldRangeFormat::Full) || body.len() > 16 * 1024) {
@@ -3144,8 +3144,8 @@ impl Service {
         let present = system.unwrap_or(held.snapshot.present().system_time);
         let observed = witnessed_schema(call, &held, &relation, &page.schema, evidence)?;
         let schema = observed.as_ref().map_or(page.schema.as_ref(), |(schema, _)| schema);
-        let reply = self.owned_point_reply_until(schema, page.batch.as_ref().map(OwnedBatch::batch),
-            present, valid_at.unwrap_or(present), None, expiry)?;
+        let reply = self.owned_point_reply_in(self.memory(), schema, page.batch.as_ref().map(OwnedBatch::batch),
+            present, valid_at.unwrap_or(present), None, expiry, reply_format)?;
         if system.is_none() && !matches!(version, HeldRangeFormat::Leading) {
             held.snapshot.check_lifetime_range_release(&relation, expiry).map_err(status)?;
         } else {
@@ -3211,7 +3211,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_ordered_action(&self, call: &Call, body: &[u8], order: WorldOrder, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world range handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3285,7 +3285,8 @@ impl Service {
         }
         let schema = schema.as_ref().clone().with_metadata(metadata);
         let rows = count_rows.as_ref().or_else(|| page.as_ref().map(OwnedBatch::batch));
-        let reply = self.owned_point_reply(&schema, rows, system.unwrap_or_else(|| held.snapshot.present()), valid_at, None)?;
+        let reply = self.owned_point_reply_in(self.memory(), &schema, rows,
+            system.unwrap_or_else(|| held.snapshot.present()), valid_at, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -3312,7 +3313,7 @@ impl Service {
         self.owned_point_reply(batch.schema_ref(), Some(&batch), present, present, None)
     }
 
-    pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire) -> Result<ActionResult, Status> {
+    pub(crate) async fn spatial_held_owned_action(&self, call: &Call, body: &Bytes, wire: SpatialHeldWire, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held spatial read has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3426,7 +3427,7 @@ impl Service {
             retained = Some((guard, reservation));
             token = Some(nonce);
         }
-        let reply = self.spatial_reply(call, &held, &relation, valid_at, &page, witness, selected_documents, token, prepared.as_ref())?;
+        let reply = self.spatial_reply(call, &held, &relation, valid_at, &page, witness, selected_documents, token, prepared.as_ref(), ipc_stream)?;
         if let (Some((mut filters, reservation)), Some(token), Some(query)) = (retained, token, prepared) {
             filters.insert(token, Arc::new(RetainedSpatialFilter {
                 relation, batch, query, valid_at, _reservation: reservation,
@@ -3435,7 +3436,7 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8], ranked: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn next_spatial_owned_action(&self, call: &Call, body: &[u8], ranked: bool, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (held, token, body) = self.spatial_capability(call, body)?;
         let (header, after) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Spatial continuation has no page controls"))?;
@@ -3503,10 +3504,10 @@ impl Service {
             }
             _ => return Err(invalid("Spatial continuation uses another query order")),
         }.map_err(status)?;
-        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, &page, witness, true, Some(token), Some(&filter.query))
+        self.spatial_reply(call, &held, &filter.relation, filter.valid_at, &page, witness, true, Some(token), Some(&filter.query), ipc_stream)
     }
 
-    pub(crate) async fn gather_spatial_owned_action(&self, call: &Call, body: &Bytes) -> Result<ActionResult, Status> {
+    pub(crate) async fn gather_spatial_owned_action(&self, call: &Call, body: &Bytes, ipc_stream: bool) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Spatial gather has no hold"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
@@ -3527,7 +3528,7 @@ impl Service {
             .ok_or_else(|| invalid("Spatial gather has no revision"))?;
         let page = held.snapshot.gather_spatial_document(&relation, id, Timestamp(revision.value(row)), &columns)
             .await.map_err(status)?;
-        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), &page, None, true, None, None)
+        self.spatial_reply(call, &held, &relation, held.snapshot.system_time(), &page, None, true, None, None, ipc_stream)
     }
 
     pub(crate) fn close_spatial_owned_action(&self, call: &Call, body: &[u8]) -> Result<(), Status> {
@@ -3550,8 +3551,8 @@ impl Service {
     fn spatial_reply(
         &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
         page: &rtdb_spatial::Page, witness: Option<OwnedRangeWitness>, selected_documents: bool, token: Option<Uuid>,
-        query: Option<&RetainedSpatialQuery>,
-    ) -> Result<ActionResult, Status> {
+        query: Option<&RetainedSpatialQuery>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let witness = match witness {
             Some(witness) => {
                 let nonce = match held.remember(call, relation, witness.clone()) {
@@ -3566,7 +3567,7 @@ impl Service {
             }
             None => None,
         };
-        let encode = || self.encode_spatial_reply(call, held, relation, valid_at, page, witness, selected_documents, token);
+        let encode = || self.encode_spatial_reply(call, held, relation, valid_at, page, witness, selected_documents, token, ipc_stream);
         match encode() {
             Err(error) if spatial_memory_refusal(&error)
                 && query.map(RetainedSpatialQuery::discard_probe_matches).transpose()? == Some(true) => encode(),
@@ -3576,8 +3577,8 @@ impl Service {
 
     fn encode_spatial_reply(
         &self, call: &Call, held: &OwnedReadResource, relation: &OwnedRelation, valid_at: Timestamp,
-        page: &rtdb_spatial::Page, witness: Option<Uuid>, selected_documents: bool, token: Option<Uuid>,
-    ) -> Result<ActionResult, Status> {
+        page: &rtdb_spatial::Page, witness: Option<Uuid>, selected_documents: bool, token: Option<Uuid>, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let present = held.snapshot.system_time();
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("rtdb.owned.spatial_more".into(), if page.more { "1" } else { "0" }.into());
@@ -3643,7 +3644,8 @@ impl Service {
             }
             Some(RecordBatch::try_new(Arc::clone(&schema), columns).map_err(arrow)?)
         } else { None };
-        let reply = self.owned_point_reply(&schema, output.as_ref(), present, valid_at, None)?;
+        let format = if ipc_stream { OwnedReplyFormat::StreamV1 } else { OwnedReplyFormat::Unary };
+        let reply = self.owned_point_reply_in(self.memory(), &schema, output.as_ref(), present, valid_at, None, None, format)?;
         drop(charge);
         held.snapshot.check_relations([relation]).map_err(status)?;
         Ok(reply)
