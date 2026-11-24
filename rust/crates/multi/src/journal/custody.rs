@@ -700,6 +700,19 @@ impl CheckpointCustody {
     }
 }
 
+impl CheckpointCustody {
+    pub(super) fn erasure_generation_records(&self, placement: Placement, generation: u64) -> Result<ErasureRecords<'_>> {
+        if self.placement != placement || generation == 0 {
+            return Err(invalid("The custody generation belongs to another placement"));
+        }
+        Ok(ErasureRecords {
+            provider: self,
+            scope: format!("{}/{}/{}/erasure-roster/{}/{generation}", self.prefix.as_str(), placement.deployment,
+                placement.incarnation, placement.generation),
+        })
+    }
+}
+
 impl ErasureRecords<'_> {
     fn ledger(&self, io: Arc<IoRegion>) -> UnitLedger {
         let scope = UnitScope::new(self.provider.placement, b"erasure-evidence", self.scope.as_bytes());
@@ -723,6 +736,21 @@ impl ErasureRecords<'_> {
         let allocation = local.acquire(&self.scope, false).await?;
         let store = allocation.read_store(self.ledger(allocation.region()))?;
         CheckpointCustody::metadata(store.as_ref(), &key).await
+    }
+
+    pub(super) async fn names(&self, directory: &str) -> Result<Vec<String>> {
+        let prefix = self.key(directory)?;
+        let store: Arc<dyn ObjectStore> = if let Some(local) = &self.provider.local {
+            let allocation = local.acquire(&self.scope, false).await?;
+            allocation.read_store(self.ledger(allocation.region()))?
+        } else {
+            Arc::new(self.store())
+        };
+        let base = format!("{}/", self.scope);
+        store.list(Some(&prefix)).await?.into_iter().map(|object| {
+            object.key.as_str().strip_prefix(&base).map(str::to_owned)
+                .ok_or_else(|| invalid("The provider returned an erasure record outside its scope"))
+        }).collect()
     }
 
     pub(super) async fn put(&self, name: &str, bytes: Bytes) -> Result<()> {

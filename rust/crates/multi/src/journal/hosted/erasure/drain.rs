@@ -10,7 +10,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::journal::custody::{CheckpointCustody, ErasureRecords};
 
-use super::{CustodyWork, DrainParticipant, DrainedWork, ErasureCommit, drain_inventory, invalid};
+use super::{
+    CleanRecoverySlots, CustodyWork, DrainParticipant, DrainedWork, ErasureCommit, drain_inventory,
+    invalid,
+};
+use ordered_logkeeper::ordered::Placement;
 
 /// Binds one named duty to the credential that can attest its terminal drain.
 /// A worker can register multiple independently tracked duties.
@@ -39,6 +43,83 @@ impl DrainRegistration {
             identity: hash.finish().as_ref().try_into().expect("SHA-256 width"),
         })
     }
+}
+
+pub(super) async fn register(
+    provider: &CheckpointCustody,
+    placement: Placement,
+    generation: u64,
+    registration: DrainRegistration,
+) -> Result<()> {
+    let records = provider.erasure_generation_records(placement, generation)?;
+    let participant = registration.participant()?;
+    let name = registration_name(participant);
+    records.put(&name, encode(&registration)?).await
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisteredRoster {
+    switch: [u8; 32],
+    registrations: Vec<DrainRegistration>,
+}
+
+pub(super) async fn freeze(
+    provider: &CheckpointCustody,
+    ready: &CleanRecoverySlots,
+) -> Result<Vec<DrainRegistration>> {
+    use std::collections::BTreeMap;
+
+    let erasure = ready.prepared().erasure;
+    let records = provider.erasure_records(erasure.placement, erasure.operation)?;
+    let switch = ready.binding();
+    if let Some(bytes) = records.get("registered-roster").await? {
+        let roster: RegisteredRoster = serde_json::from_slice(&bytes).map_err(serialization)?;
+        if roster.switch != switch {
+            return Err(invalid(
+                "A different ordered decision froze the custody roster",
+            ));
+        }
+        return Ok(roster.registrations);
+    }
+
+    // Work is allowed only after its registration is durable and the actor
+    // has rechecked the incumbent grant. Any later registration cannot have
+    // started work and cannot invalidate this first census.
+    let mut registrations = BTreeMap::new();
+    let generation =
+        provider.erasure_generation_records(erasure.placement, erasure.incumbent.key_generation)?;
+    for name in generation.names("registered").await? {
+        let bytes = generation
+            .get(&name)
+            .await?
+            .ok_or_else(|| invalid("An admitted drain registration disappeared"))?;
+        let registration: DrainRegistration =
+            serde_json::from_slice(&bytes).map_err(serialization)?;
+        let participant = registration.participant()?;
+        if registration_name(participant) != name
+            || registrations.insert(participant, registration).is_some()
+        {
+            return Err(invalid(
+                "The drain registration has a different durable identity",
+            ));
+        }
+    }
+    let roster = RegisteredRoster {
+        switch,
+        registrations: registrations.into_values().collect(),
+    };
+    records.put("registered-roster", encode(&roster)?).await?;
+    Ok(roster.registrations)
+}
+
+fn registration_name(participant: DrainParticipant) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    format!(
+        "registered/{}/{}",
+        participant.kind as u8,
+        URL_SAFE_NO_PAD.encode(participant.identity)
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -310,6 +310,27 @@ impl<'a> ErasureCoordinator<'a> {
         coordinate(self, self.keys, custody, erasure, self.authority.as_ref()).await
     }
 
+    /// Register a worker or copy before admitting access to old plaintext.
+    /// The caller may start work only after the original writer grant is rechecked.
+    pub async fn register_drain_work(&self, incumbent: Grant, registration: DrainRegistration) -> Result<()> {
+        let still_incumbent = || async {
+            let route = self.custodian.route().await?;
+            if route.writer.grant != Some(incumbent) {
+                return Err(invalid("The ordered switch has closed admission to the old custody"));
+            }
+            Ok(())
+        };
+        still_incumbent().await?;
+        drain::register(self.provider, self.worker.placement(), incumbent.key_generation, registration).await?;
+        still_incumbent().await
+    }
+
+    /// Returns the immutable custody census for the certified decision.
+    pub async fn registered_drain_roster(&self, ready: &CleanRecoverySlots) -> Result<Vec<DrainRegistration>> {
+        self.require_incumbent(ready.prepared().erasure)?;
+        drain::freeze(self.provider, ready).await
+    }
+
     /// Retain the authoritative roster after the certified switch closes
     /// admission. The returned journal can receive the registered workers'
     /// authenticated observations without retaining their plaintext.
@@ -318,13 +339,13 @@ impl<'a> ErasureCoordinator<'a> {
         ready: &CleanRecoverySlots,
         commit: ErasureCommit,
         closed_at_ms: u64,
-        roster: Vec<DrainRegistration>,
     ) -> Result<ErasureDrainJournal<'_>> {
         self.require_incumbent(ready.prepared().erasure)?;
         validate_commit(ready.prepared(), commit, Some(ready.binding()), self.authority.as_ref())?;
         if ready.deadline().is_some_and(|reservation| !matches_reservation(reservation, commit)) {
             return Err(invalid("The durable drain differs from the reserved custody roster"));
         }
+        let roster = self.registered_drain_roster(ready).await?;
         ErasureDrainJournal::close(self.provider, commit, closed_at_ms, roster).await
     }
 
