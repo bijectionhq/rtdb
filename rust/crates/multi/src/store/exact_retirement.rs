@@ -890,16 +890,12 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         _ => return Err(changed()),
     };
     if observed != *chosen { return Ok(None); }
-    for record in deployments.iter().filter(|record| record.lineage == lineage && record.lifecycle != Lifecycle::Deleted) {
-        for referrer in stores(bucket, &record.storage_prefix()).await? {
-            let base = Base::load(bucket, &referrer).await?;
-            let retained = match &retirement.work {
-                RetirementWork::S3 { version, release_version, .. } =>
-                    base.retains_version(&store, relative, version) || base.retains_version(&store, release_name, release_version),
-                _ => base.objects.get(relative) == Some(&store) || base.objects.get(release_name) == Some(&store),
-            };
-            if retained { return Ok(None); }
-        }
+    let (version, release_version) = match &retirement.work {
+        RetirementWork::S3 { version, release_version, .. } => (Some(version), Some(release_version)),
+        _ => (None, None),
+    };
+    if reference_retains(bucket, &deployments, lineage, &store, &[(relative, version), (release_name, release_version)]).await? {
+        return Ok(None);
     }
 
     if pack.is_some() {
@@ -944,20 +940,14 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
         {
             return Err(changed());
         }
-        if record.storage_regions.values().any(|region| match region {
-            StorageRegion::ReferenceRead { object, archive_source: None, .. } =>
-                object.as_deref().is_none_or(|key| key == target.as_str() || key == release.as_str()),
-            StorageRegion::Remote { archive: Some(_), archive_source: None, .. }
-            | StorageRegion::Local { archive: Some(_), .. } => true,
-            _ => false,
-        }) { return Err(changed()); }
+        if general_reference_holds(record, &[target, release]) { return Err(changed()); }
         if record.storage_regions.values().any(|region| match region {
             StorageRegion::Remote { publications, .. } => publications.values().any(|upload| {
                 upload.key == target.as_str() || upload.key == release.as_str()
             }),
             _ => false,
         }) { return Err(changed()); }
-        if record.storage_regions.values().any(|region| archived_source_holds(region, &retirement.work)) {
+        if record.storage_regions.values().any(|region| archived_source_holds(region, &[version, release_version])) {
             return Err(Anomaly::new(AnomalyCategory::Busy, ARCHIVE_SOURCE_HELD, "An admitted archive copy retains this publication"));
         }
         if let Some(PackReadiness::Covered { block, youngest }) = pack {
@@ -994,14 +984,36 @@ async fn prepare(directory: &dyn Directory, bucket: &dyn ObjectStore, provider: 
 
 const ARCHIVE_SOURCE_HELD: &str = "rtdb.multi/archive-source-held";
 
-fn archived_source_holds(region: &StorageRegion, work: &RetirementWork) -> bool {
+async fn reference_retains(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], lineage: &str,
+    store: &str, files: &[(&str, Option<&PhysicalObjectVersion>)]) -> Result<bool> {
+    for record in deployments.iter().filter(|record| record.lineage == lineage && record.lifecycle != Lifecycle::Deleted) {
+        for referrer in stores(bucket, &record.storage_prefix()).await? {
+            let base = Base::load(bucket, &referrer).await?;
+            if files.iter().any(|(name, version)| match version {
+                Some(version) => base.retains_version(store, name, version),
+                None => base.objects.get(*name).is_some_and(|owner| owner == store),
+            }) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn general_reference_holds(record: &DeploymentRecord, targets: &[&ObjectKey]) -> bool {
+    record.storage_regions.values().any(|region| match region {
+        StorageRegion::ReferenceRead { object, archive_source: None, .. } =>
+            object.as_deref().is_none_or(|key| targets.iter().any(|target| target.as_str() == key)),
+        StorageRegion::Remote { archive: Some(_), archive_source: None, .. }
+        | StorageRegion::Local { archive: Some(_), .. } => true,
+        _ => false,
+    })
+}
+
+fn archived_source_holds(region: &StorageRegion, versions: &[Option<&PhysicalObjectVersion>]) -> bool {
     let (StorageRegion::Remote { archive_source: Some(hold), .. }
         | StorageRegion::ReferenceRead { archive_source: Some(hold), .. }) = region else { return false; };
-    match work {
-        RetirementWork::S3 { version, release_version, .. } =>
-            !hold.permits_retirement(version) || !hold.permits_retirement(release_version),
-        _ => true,
-    }
+    versions.iter().any(|version| version.is_none_or(|version| !hold.permits_retirement(version)))
 }
 
 fn changed() -> Anomaly {
