@@ -56,4 +56,10 @@ surface StatelessDatabase {
     @guarantee ChangesProgress
         -- Where advertised, progress-only Changes returns the schema and coverage trailer for the request.
         -- The same table admission, group limits, wait and coverage rules apply to a progress-only request.
+
+    @guarantee ScopedVisibilityCapability
+        -- Scoped visibility is a target capability specified by ScopedRowVisibility in allium/rtdb-multi.allium.
+        -- A route without an applied scoped projection omits row-visibility from Capabilities.
+        -- An OIDC label scope binds its credential to the verified database name and incarnation.
+        -- A scoped credential requires a route that enforces that scope for every admitted operation.
 }

@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, HttpTransport, MethodRule, Principal, Secret, forbidden};
+use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, HttpTransport, MethodRule, Principal, Secret, VerifiedLabelScope, forbidden};
 
 #[derive(Clone, Debug)]
 pub struct OidcConfig {
@@ -21,6 +21,7 @@ pub struct OidcConfig {
 }
 
 pub(crate) struct Provider {
+    issuer: Url,
     token_endpoint: Url,
     userinfo_endpoint: Url,
     device_endpoint: Option<Url>,
@@ -58,7 +59,7 @@ pub(crate) struct Credentials {
     token: Mutex<Token>,
 }
 impl Credentials {
-    pub async fn revalidate(&self, now: Timestamp) -> Result<()> {
+    pub async fn revalidate(&self, now: Timestamp, subject: &str) -> Result<()> {
         let mut token = self.token.lock().await;
         if !token.expired(now) { return Ok(()); }
         let fields = match &self.grant {
@@ -73,6 +74,12 @@ impl Credentials {
         if response.status != 200 { return Err(refresh_failed(Some(response.status))); }
         let old_refresh = match &self.grant { RefreshGrant::Password => token.refresh.as_ref(), _ => None };
         let next = Token::parse(&response.body, self.provider.clock.now(), old_refresh, &self.provider.memory).map_err(|_| refresh_failed(Some(response.status)))?;
+        let userinfo = self.provider.userinfo(&next).await.map_err(|_| refresh_failed(None))?;
+        if userinfo.status != 200 || string(&userinfo.body, "sub").ok() != Some(subject)
+            || userinfo.body.get("rtdb_label_scope").is_some()
+        {
+            return Err(refresh_failed(Some(userinfo.status)));
+        }
         *token = next;
         Ok(())
     }
@@ -90,7 +97,7 @@ impl Provider {
             Url::parse(value).map_err(|_| discovery_failed(format!("OIDC configuration contains invalid {name}")))
         };
         let device_endpoint = response.body.get("device_authorization_endpoint").map(|_| endpoint("device_authorization_endpoint")).transpose()?;
-        Ok(Arc::new(Self { token_endpoint: endpoint("token_endpoint")?, userinfo_endpoint: endpoint("userinfo_endpoint")?, device_endpoint,
+        Ok(Arc::new(Self { issuer: config.issuer_url, token_endpoint: endpoint("token_endpoint")?, userinfo_endpoint: endpoint("userinfo_endpoint")?, device_endpoint,
             client_id: config.client_id, client_secret: config.client_secret, rules: config.rules, clock, http, memory }))
     }
     fn base_fields(&self) -> BTreeMap<String, Secret> { fields([("client_id", self.client_id.as_str()), ("client_secret", self.client_secret.expose())]) }
@@ -98,12 +105,21 @@ impl Provider {
         let mut body = self.base_fields(); body.extend(fields);
         self.http.request(HttpRequest::Form { url: self.token_endpoint.clone(), fields: body }).await
     }
+    async fn userinfo(&self, token: &Token) -> Result<HttpResponse> {
+        self.http.request(HttpRequest::Get { url: self.userinfo_endpoint.clone(), bearer: Some(token.access.clone()) }).await
+    }
     async fn principal(self: &Arc<Self>, token: Token, grant: RefreshGrant) -> Result<Arc<Principal>> {
-        let response = self.http.request(HttpRequest::Get { url: self.userinfo_endpoint.clone(), bearer: Some(token.access.clone()) }).await?;
+        let response = self.userinfo(&token).await?;
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Failed to obtain user info from {}", self.userinfo_endpoint)).with_context("status", response.status.into())); }
         let user = string(&response.body, "sub")?;
-        let reservation = self.memory.reserve(user.len().checked_add(std::mem::size_of::<Principal>()).ok_or_else(|| invalid("Principal identity is too large"))?)?;
-        Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials: PrincipalCredentials::Oidc(Credentials { provider: Arc::clone(self), grant, token: Mutex::new(token) }), grants: None, _reservation: reservation }))
+        let label_scope = response.body.get("rtdb_label_scope").map(|claim| {
+            VerifiedLabelScope::from_userinfo(claim, self.issuer.as_str(), user, token.expires_at, self.clock.now())
+        }).transpose()?;
+        let bytes = user.len().checked_add(std::mem::size_of::<Principal>())
+            .and_then(|bytes| bytes.checked_add(label_scope.as_ref().map_or(0, VerifiedLabelScope::memory_bytes)))
+            .ok_or_else(|| invalid("Principal identity is too large"))?;
+        let reservation = self.memory.reserve(bytes)?;
+        Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials: PrincipalCredentials::Oidc(Credentials { provider: Arc::clone(self), grant, token: Mutex::new(token) }), grants: None, label_scope, _reservation: reservation }))
     }
     pub async fn password(self: &Arc<Self>, user: &str, password: &str) -> Result<Arc<Principal>> {
         let response = self.token(fields([("grant_type", "password"), ("scope", "openid"), ("username", user), ("password", password)])).await?;

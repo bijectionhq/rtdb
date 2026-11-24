@@ -53,6 +53,7 @@ async fn simultaneous_revalidations_refresh_once_and_exact_expiry_is_still_valid
         (200, json!({"access_token":"access-0", "refresh_token":"refresh-0", "expires_in":1})),
         (200, json!({"sub":"subject"})),
         (200, json!({"access_token":"access-1", "refresh_token":"refresh-1", "expires_in":3600})),
+        (200, json!({"sub":"subject"})),
     ], true).await;
     let principal = auth.verify_password("login", "secret").await.unwrap();
     assert_eq!(principal.user_id(), Some("subject"));
@@ -73,9 +74,12 @@ async fn refresh_rotation_omission_and_failure_leave_a_retryable_complete_token(
         (200, json!({"access_token":"access-0", "refresh_token":"refresh-0", "expires_in":0})),
         (200, json!({"sub":"subject"})),
         (200, json!({"access_token":"access-1", "refresh_token":"refresh-1", "expires_in":0})),
+        (200, json!({"sub":"subject"})),
         (400, json!({"error":"temporarily_unavailable"})),
         (200, json!({"access_token":"access-2", "expires_in":0})),
+        (200, json!({"sub":"subject"})),
         (200, json!({"access_token":"access-3", "expires_in":100})),
+        (200, json!({"sub":"subject"})),
     ], false).await;
     let principal = auth.verify_password("login", "secret").await.unwrap();
     clock.0.store(1_000_000, Ordering::SeqCst);
@@ -94,6 +98,7 @@ async fn client_credentials_refreshes_with_its_own_client_and_no_expiry_never_re
     let (auth, script, clock) = setup(vec![
         (200, json!({"access_token":"access-0", "expires_in":0})), (200, json!({"sub":"service-subject"})),
         (200, json!({"access_token":"access-1"})),
+        (200, json!({"sub":"service-subject"})),
     ], false).await;
     let principal = auth.verify_client_credentials("service", "service-secret").await.unwrap();
     clock.0.store(1_000_000, Ordering::SeqCst);
@@ -104,6 +109,60 @@ async fn client_credentials_refreshes_with_its_own_client_and_no_expiry_never_re
         assert!(fields.contains(&("client_secret".into(), "service-secret".into())));
     }
     assert!(!auth.is_superuser("xtdb"));
+}
+
+#[tokio::test]
+async fn label_scope_is_bound_to_the_issuer_database_and_incarnation() {
+    let incarnation = [7; 16];
+    let claim = json!({"database":"catalog", "incarnation":incarnation, "read":[[1, 2]], "write":[[3]]});
+    let (auth, script, _) = setup(vec![
+        (200, json!({"access_token":"scoped", "expires_in":1})),
+        (200, json!({"sub":"service", "rtdb_label_scope":claim})),
+    ], false).await;
+    let principal = auth.verify_client_credentials("client", "secret").await.unwrap();
+    let scope = principal.label_scope().unwrap();
+    scope.admit("catalog", [7; 16]).unwrap();
+    assert!(scope.admit("catalog", [8; 16]).is_err());
+    assert!(scope.admit("another", [7; 16]).is_err());
+    assert!(scope.labels().read.contains(&[1, 2][..]));
+    assert!(scope.labels().write.contains(&[3][..]));
+    assert!(principal.authorize_database("catalog", rtdb_node::DatabaseAccess::Read).is_err());
+    principal.revalidate(Timestamp(999_999)).await.unwrap();
+    assert!(principal.revalidate(Timestamp(1_000_000)).await.is_err());
+    assert_eq!(script.forms.lock().await.len(), 1);
+}
+
+#[tokio::test]
+async fn label_scope_rejects_an_invalid_claim_or_a_token_without_expiry() {
+    let incarnation = [7; 16];
+    let valid = json!({"database":"catalog", "incarnation": incarnation, "read":[], "write":[]});
+    let invalid = json!({"database":"catalog", "incarnation": incarnation, "read":[[]], "write":[]});
+    for (grant, claim) in [(json!({"access_token":"scoped"}), valid),
+        (json!({"access_token":"scoped", "expires_in":1}), invalid)]
+    {
+        let (auth, _, _) = setup(vec![
+            (200, grant),
+            (200, json!({"sub":"service", "rtdb_label_scope":claim})),
+        ], false).await;
+        let error = auth.verify_client_credentials("client", "secret").await.err().unwrap();
+        assert_eq!(error.code, "rtdb.auth/label-scope");
+    }
+}
+
+#[tokio::test]
+async fn label_scope_requires_a_new_session_if_assigned_during_refresh() {
+    let incarnation = [7; 16];
+    let scope = json!({"database":"catalog", "incarnation":incarnation, "read":[[1]], "write":[]});
+    let (auth, _, clock) = setup(vec![
+        (200, json!({"access_token":"original", "expires_in":0})),
+        (200, json!({"sub":"service"})),
+        (200, json!({"access_token":"replacement", "expires_in":60})),
+        (200, json!({"sub":"service", "rtdb_label_scope":scope})),
+    ], false).await;
+    let principal = auth.verify_client_credentials("client", "secret").await.unwrap();
+    assert!(principal.label_scope().is_none());
+    clock.0.store(1_000_000, Ordering::SeqCst);
+    assert_eq!(principal.revalidate(Timestamp(1_000_000)).await.unwrap_err().code, "xtdb.authn/refresh-failed");
 }
 
 #[tokio::test]
