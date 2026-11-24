@@ -265,15 +265,21 @@ fn decode(bytes: Buffer, schema: &SchemaRef, expected_rows: Option<usize>) -> Re
 
 /// One cluster as the directory names it.
 pub(crate) struct Cluster {
-    pub(crate) partition: Partition,
-    pub(crate) centroid: Range<usize>,
     pub(crate) range: Range<u64>,
     pub(crate) rows: u32,
     pub(crate) digest: [u8; 32],
 }
 
 /// A generation's directory: its clusters and their unit centroids.
-pub(crate) struct Directory { pub(crate) dimensions: usize, pub(crate) clusters: Vec<Cluster>, centroids: Float32Array }
+pub(crate) struct Directory {
+    pub(crate) dimensions: usize,
+    partitions: FixedSizeBinaryArray,
+    centroids: Float32Array,
+    offsets: UInt64Array,
+    lengths: UInt64Array,
+    counts: UInt32Array,
+    digests: FixedSizeBinaryArray,
+}
 
 impl Directory {
     /// Decodes directory bytes, checking them against the locator's digest.
@@ -292,22 +298,39 @@ impl Directory {
         let digests = column(5).as_any().downcast_ref::<FixedSizeBinaryArray>().ok_or_else(|| corrupt("digest"))?;
         let values = centroids.values().as_any().downcast_ref::<Float32Array>().ok_or_else(|| corrupt("centroid"))?.clone();
         if batch.num_rows().checked_mul(dimensions) != Some(values.len()) { return Err(corrupt("centroid width")); }
-        let clusters = (0..batch.num_rows()).map(|row| {
-            let offset = offsets.value(row);
-            let end = offset.checked_add(lengths.value(row))
+        if partitions.value_length() != 32 || digests.value_length() != 32 {
+            return Err(corrupt("A cluster has an invalid partition or digest width"));
+        }
+        for (&offset, &length) in offsets.values().iter().zip(lengths.values().iter()) {
+            offset.checked_add(length)
                 .filter(|end| offset.is_multiple_of(ALIGNMENT) && offset < *end && *end <= locator.directory.0)
                 .ok_or_else(|| corrupt("A cluster has an invalid range"))?;
-            Ok(Cluster {
-                partition: Partition(partitions.value(row).try_into().map_err(|_| corrupt("partition"))?),
-                centroid: row * dimensions..(row + 1) * dimensions,
-                range: offset..end, rows: counts.value(row),
-                digest: digests.value(row).try_into().map_err(|_| corrupt("digest"))?,
-            })
-        }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { dimensions, clusters, centroids: values })
+        }
+        Ok(Self {
+            dimensions, partitions: partitions.clone(), centroids: values,
+            offsets: offsets.clone(), lengths: lengths.clone(), counts: counts.clone(),
+            digests: digests.clone(),
+        })
     }
 
-    pub(crate) fn centroid(&self, cluster: &Cluster) -> &[f32] { &self.centroids.values()[cluster.centroid.clone()] }
+    pub(crate) fn len(&self) -> usize { self.offsets.len() }
+
+    pub(crate) fn partition(&self, row: usize) -> Partition {
+        Partition(self.partitions.value(row).try_into().expect("validated partition width"))
+    }
+
+    pub(crate) fn centroid(&self, row: usize) -> &[f32] {
+        &self.centroids.values()[row * self.dimensions..(row + 1) * self.dimensions]
+    }
+
+    pub(crate) fn cluster(&self, row: usize) -> Cluster {
+        let start = self.offsets.value(row);
+        Cluster {
+            range: start..start + self.lengths.value(row),
+            rows: self.counts.value(row),
+            digest: self.digests.value(row).try_into().expect("validated digest width"),
+        }
+    }
 }
 
 /// One cluster's rows.
@@ -388,11 +411,11 @@ mod tests {
         let directory_batch = decode(directory_bytes.clone(), &directory_layout, None).unwrap();
         assert_eq!(directory_bytes.as_slice(), encode(&directory_layout, directory_batch).unwrap().as_slice());
         let directory = Directory::read(directory_bytes, &locator).unwrap();
-        let total: u32 = directory.clusters.iter().map(|cluster| cluster.rows).sum();
+        let total: u32 = (0..directory.len()).map(|row| directory.cluster(row).rows).sum();
         assert_eq!(total, 1_000);
         let schema = block_schema(2).unwrap();
         let mut previous_end = 0u64;
-        for cluster in &directory.clusters {
+        for cluster in (0..directory.len()).map(|row| directory.cluster(row)) {
             let start = cluster.range.start;
             assert_eq!(start, previous_end.next_multiple_of(ALIGNMENT));
             assert!(first[previous_end as usize..start as usize].iter().all(|&byte| byte == 0));
@@ -400,7 +423,7 @@ mod tests {
             let range = bytes.slice_with_length(start as usize, (cluster.range.end - start) as usize);
             let batch = decode(range.clone(), &schema, Some(cluster.rows as usize)).unwrap();
             assert_eq!(range.as_slice(), encode(&schema, batch).unwrap().as_slice());
-            let block = Block::read(range, cluster, 2).unwrap();
+            let block = Block::read(range, &cluster, 2).unwrap();
             assert_eq!(block.len(), cluster.rows as usize);
             for row in 0..block.len() {
                 let (_, _, seed) = block.extent(row);
@@ -489,14 +512,14 @@ mod tests {
         let lease = pool.get_range_or(&key, locator.directory_range(), &memory).await.unwrap();
         let directory_bytes = lease.as_slice().as_ptr_range();
         let directory = Directory::read(Buffer::from(Bytes::from_owner(lease)), &locator).unwrap();
-        let cluster = &directory.clusters[0];
-        assert!(directory_bytes.contains(&directory.centroid(cluster).as_ptr().cast::<u8>()));
+        let cluster = directory.cluster(0);
+        assert!(directory_bytes.contains(&directory.centroid(0).as_ptr().cast::<u8>()));
         assert_eq!(memory.used_bytes(), locator.directory.1 as usize);
 
         let lease = pool.get_range_or(&key, cluster.range.clone(), &memory).await.unwrap();
         let cluster_bytes = lease.as_slice().as_ptr_range();
         let cluster_len = lease.as_slice().len();
-        let block = Block::read(Buffer::from(Bytes::from_owner(lease)), cluster, 2).unwrap();
+        let block = Block::read(Buffer::from(Bytes::from_owner(lease)), &cluster, 2).unwrap();
         assert!(cluster_bytes.contains(&block.unit(0).as_ptr().cast::<u8>()));
         assert_eq!(memory.used_bytes(), locator.directory.1 as usize + cluster_len);
         drop(directory);
@@ -511,22 +534,22 @@ mod tests {
         let locator = write_generation(rows(0..4), &mut bytes, &CancellationToken::new()).unwrap().locator;
         let aligned = Buffer::from_slice_ref(&bytes);
         let directory = Directory::read(aligned.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize), &locator).unwrap();
-        let cluster = &directory.clusters[0];
+        let cluster = directory.cluster(0);
         let mut shifted = vec![0];
         shifted.extend_from_slice(&bytes[cluster.range.start as usize..cluster.range.end as usize]);
         let range = Buffer::from_slice_ref(&shifted).slice(1);
-        let block = Block::read(range.clone(), cluster, 2).unwrap();
+        let block = Block::read(range.clone(), &cluster, 2).unwrap();
         assert_eq!(block.len(), cluster.rows as usize);
         assert!(!range.as_ptr_range().contains(&block.unit(0).as_ptr().cast::<u8>()));
 
-        let bad_rows = Cluster { rows: cluster.rows + 1, range: cluster.range.clone(), centroid: cluster.centroid.clone(), ..*cluster };
-        let bad_digest = Cluster { digest: [0; 32], range: cluster.range.clone(), centroid: cluster.centroid.clone(), ..*cluster };
-        let bad_length = Cluster { range: cluster.range.start..cluster.range.end + 1, centroid: cluster.centroid.clone(), ..*cluster };
+        let bad_rows = Cluster { rows: cluster.rows + 1, range: cluster.range.clone(), ..cluster };
+        let bad_digest = Cluster { digest: [0; 32], range: cluster.range.clone(), ..cluster };
+        let bad_length = Cluster { range: cluster.range.start..cluster.range.end + 1, ..cluster };
         for record in [&bad_rows, &bad_digest, &bad_length] {
             let error = Block::read(range.clone(), record, 2).err().unwrap();
             assert!(crate::shortlist::declined(&error));
         }
-        let error = Block::read(range, cluster, 3).err().unwrap();
+        let error = Block::read(range, &cluster, 3).err().unwrap();
         assert!(crate::shortlist::declined(&error));
     }
 }
