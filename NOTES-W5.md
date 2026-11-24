@@ -77,7 +77,9 @@ The staged private generation and any staging limit for large replay payloads re
 
 No existing code was deleted.
 The legacy `NativeActions` and replay formats still call the hosted resolver.
-Their `constraint_receipt` checks bind legacy refusal and registration shapes, the hosted-control checks authenticate installed authority and source replay, and `WorldClockMode` still decodes retained, held and proposal history.
+`tx/src/resolver/constraint_receipt.rs` binds legacy refusal and registration shapes.
+`tx/src/hosted_control.rs` and `tx/src/resolver/hosted_control.rs` authenticate installed authority and source replay.
+`WorldClockMode` still decodes retained, held and proposal history used by the owned reads, archives and replica replay.
 Remove those paths together with their wire and archive consumers after Bijection switches.
 The new transaction resolver uses only generic guards, operations and records.
 
@@ -96,6 +98,9 @@ The new transaction resolver uses only generic guards, operations and records.
   Earlier guarded builds exposed range comparison and record decode typing errors, which were fixed before the passing run.
   The passing run reported existing warnings in other code.
 - The focused `rtdb-types` claim codec regression passed before the guarded build instruction arrived.
+- `guarded-cargo.py rtdb test --locked --workspace` failed during compilation of the unchanged `rtdb-logkeeper` unit tests.
+  At `rust/crates/logkeeper/src/client/writer.rs:1413`, the assertion compares the `(i64, i64)` returned by `seal_recover_committed` with an `i64`.
+  Both the assertion and signature are present at the upstream base.
 - Scope coverage includes both capability configurations against the shared fold.
   Kafka, the new Logkeeper adapter, wire routing, native branch search and spatial ranking, and physical erasure have no end-to-end W5 result.
 - No Gradle tasks or Bijection builds or tests ran.
