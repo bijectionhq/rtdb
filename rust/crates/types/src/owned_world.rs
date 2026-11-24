@@ -493,7 +493,7 @@ impl OwnedWorld {
             && self.pin != next.pin
             && !self.dropped && !next.dropped
             && self.mode == WorldClockMode::Retained && next.mode == WorldClockMode::Retained
-            && self.basis.system_time < next.basis.system_time
+            && self.basis.system_time <= next.basis.system_time
             && self.basis.tx_id < next.basis.tx_id
     }
 
