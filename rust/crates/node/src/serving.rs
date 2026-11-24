@@ -9,6 +9,9 @@ use rtdb_types::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod visibility;
+pub use visibility::{ScopedSubmission, ServingScope, ROW_VISIBILITY};
+
 pub struct QuerySource {
     pub branch: Branch,
     pub at: At,
@@ -79,6 +82,28 @@ pub struct ChangeRow {
 pub trait ServingDriver: Send + Sync {
     fn incarnation(&self) -> [u8; 16];
     fn features(&self) -> &[&str];
+
+    fn supports_row_visibility(&self) -> bool { false }
+
+    async fn query_scoped(&self, _source: QuerySource, _track: bool, _now: Timestamp,
+                          _scope: &ServingScope, _cancellation: &CancellationToken) -> Result<QueryView> {
+        Err(visibility::unsupported())
+    }
+
+    async fn transact_scoped(&self, _request: ScopedSubmission, _scope: ServingScope,
+                             _cancellation: &CancellationToken) -> Result<Receipt> {
+        Err(visibility::unsupported())
+    }
+
+    async fn tx_status_scoped(&self, _key: &[u8], _scope: &ServingScope,
+                              _cancellation: &CancellationToken) -> Result<Receipt> {
+        Err(visibility::unsupported())
+    }
+
+    async fn changes_scoped(&self, _request: Changes, _scope: &ServingScope,
+                            _cancellation: &CancellationToken) -> Result<ChangePage> {
+        Err(visibility::unsupported())
+    }
 
     async fn query(
         &self,
