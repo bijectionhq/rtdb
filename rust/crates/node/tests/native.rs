@@ -5886,6 +5886,20 @@ async fn derived_owned_root_points_use_the_visible_marker_and_a_closed_scope() {
     assert!(first.committed() && second.committed());
 
     let fresh = session.open_owned_read().await.unwrap();
+    use rtdb_node::OwnedPublicationLookup;
+    assert_eq!(fresh.lookup_publication(&facts, OwnedPublicationLookup::Latest).await.unwrap(),
+        Some((3, second.tx_key())));
+    assert_eq!(fresh.lookup_publication(&facts, OwnedPublicationLookup::Sequence(2)).await.unwrap(),
+        Some((2, subsequent.tx_key())));
+    let wrong_history = rtdb_types::TransactionKey { system_time: first.tx_key().system_time, ..subsequent.tx_key() };
+    assert!(fresh.lookup_publication(&facts, OwnedPublicationLookup::Position(wrong_history)).await.unwrap().is_none());
+    let exact = fresh.derive_at_publication(first.tx_key(), &publications, &marker,
+        vec![publications.clone(), facts.clone()]).await.unwrap().unwrap();
+    assert_eq!(exact.historical_publication(), Some(first.tx_key()));
+    assert_eq!(exact.lookup_publication(&facts, OwnedPublicationLookup::Latest).await.unwrap(),
+        Some((1, first.tx_key())));
+    assert!(exact.lookup_publication(&facts, OwnedPublicationLookup::Sequence(2)).await.unwrap().is_none());
+    drop(exact);
     let scope = vec![publications.clone(), facts.clone()];
     assert!(fresh.derive_as_of(Timestamp::MIN, &publications, &marker, scope.clone()).await.unwrap().is_none());
     assert!(fresh.derive_as_of(intermediate.system_time, &publications, &marker, vec![facts.clone()]).await.is_err());

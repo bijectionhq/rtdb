@@ -227,6 +227,7 @@ fn owned_groups(body: &[u8], require_writes: bool, ordered: bool) -> Result<Vec<
 pub(crate) const READ_OWNED_V1: &str = "rtdb.owned.ReadPoint.v1";
 pub(crate) const OPEN_OWNED_SCOPED_READ_V2: &str = "rtdb.owned.OpenOwnedScopedRead.v2";
 pub(crate) const OPEN_OWNED_READ_AS_OF_V2: &str = "rtdb.owned.OpenReadAsOf.v2";
+pub(crate) const OPEN_OWNED_READ_AT_PUBLICATION_V1: &str = "rtdb.owned.OpenReadAtPublication.v1";
 pub(crate) const OPEN_OWNED_READ_V3: &str = "rtdb.owned.OpenRead.v3";
 pub(crate) const OPEN_FRESH_OWNED_READ_V2: &str = "rtdb.owned.OpenFreshRead.v2";
 pub(crate) const OPEN_APPLIED_OWNED_READ_V5: &str = "rtdb.owned.OpenAppliedRead.v5";
@@ -322,6 +323,7 @@ pub(crate) const HELD_OWNED_STORAGE_USAGE_V1: &str = "rtdb.owned.ReadHeldStorage
 pub(crate) const HELD_OWNED_MERGED_CHANGES_DESCENDING_V2: &str = "rtdb.owned.ReadHeldMergedChangesDescending.v2";
 pub(crate) const HELD_OWNED_MERGED_CHANGES_V4: &str = "rtdb.owned.ReadHeldMergedChanges.v4";
 pub(crate) const HELD_TABLE_PUBLICATION_SEQUENCE_V1: &str = "rtdb.owned.ReadHeldTablePublicationSequence.v1";
+pub(crate) const HELD_LOOKUP_PUBLICATION_V1: &str = "rtdb.owned.LookupHeldPublication.v1";
 pub(crate) const READ_HELD_EXPIRY_CANDIDATES_V1: &str = "rtdb.owned.ReadHeldExpiryCandidates.v1";
 pub(crate) const APPLY_HELD_EXPIRY_V1: &str = "rtdb.owned.ApplyHeldExpiry.v1";
 pub(crate) const NOMINATE_HELD_EXPIRY_V1: &str = "rtdb.owned.NominateHeldExpiry.v1";
@@ -1863,10 +1865,16 @@ impl Service {
         self.retain_owned_read(call, snapshot, Some(permit), 0)
     }
 
-    pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn open_owned_read_as_of_action(&self, call: &Call, body: &[u8], positioned: bool) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Historical read requires an existing held handle"))?;
-        let (requested, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical read requires a requested system time"))?;
+        let (system, exact, body) = if positioned {
+            let (cut, body) = split_world_publication(body)?;
+            (cut.system_time, Some(cut), body)
+        } else {
+            let (requested, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Historical read requires a requested system time"))?;
+            (Timestamp(i64::from_be_bytes(*requested)), None, body)
+        };
         let (publication, body) = split_relation(body)?;
         let (length, body) = body.split_first_chunk::<2>().ok_or_else(|| invalid("Historical read requires a publication marker"))?;
         let length = usize::from(u16::from_be_bytes(*length));
@@ -1888,8 +1896,10 @@ impl Service {
         let permit = Arc::clone(&self.0.owned_read_slots).try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("The node has too many retained owned reads"))?;
         let marker = EntityId::String(marker.to_owned());
-        let snapshot = held.snapshot.derive_as_of(Timestamp(i64::from_be_bytes(*requested)), &publication, &marker, relations)
-            .await.map_err(status)?;
+        let snapshot = match exact {
+            Some(cut) => held.snapshot.derive_at_publication(cut, &publication, &marker, relations).await,
+            None => held.snapshot.derive_as_of(system, &publication, &marker, relations).await,
+        }.map_err(status)?;
         held.snapshot.check_relation(&publication).map_err(status)?;
         match snapshot {
             Some(snapshot) => self.retain_owned_read(call, snapshot, Some(permit), 0),
@@ -3395,6 +3405,41 @@ impl Service {
         let sequence = held.snapshot.table_publication_sequence(&relation, publication).await.map_err(status)?;
         held.snapshot.check().map_err(status)?;
         Ok(ActionResult { body: wire::retain(sequence.to_be_bytes().to_vec(), call.reserve(8)?) })
+    }
+
+    pub(crate) async fn held_lookup_publication_action(
+        &self, call: &Call, body: &[u8],
+    ) -> Result<ActionResult, Status> {
+        use rtdb_node::OwnedPublicationLookup;
+
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>()
+            .ok_or_else(|| invalid("Publication lookup requires a held handle"))?;
+        let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
+        let (relation, request) = split_relation(request)?;
+        let selector = match request.split_first() {
+            Some((0, [])) => OwnedPublicationLookup::Latest,
+            Some((1, sequence)) => OwnedPublicationLookup::Sequence(u64::from_be_bytes(
+                sequence.try_into().map_err(|_| invalid("Invalid publication sequence"))?,
+            )),
+            Some((2, position)) => {
+                let (key, trailing) = split_world_publication(position)?;
+                if !trailing.is_empty() { return Err(invalid("Invalid publication position")); }
+                OwnedPublicationLookup::Position(key)
+            },
+            Some((3, time)) => OwnedPublicationLookup::AtOrBefore(Timestamp(i64::from_be_bytes(
+                time.try_into().map_err(|_| invalid("Invalid publication history cap"))?,
+            ))),
+            _ => return Err(invalid("Invalid publication selector")),
+        };
+        let selected = held.snapshot.lookup_publication(&relation, selector).await.map_err(status)?;
+        let mut reply = Vec::with_capacity(24);
+        if let Some((sequence, key)) = selected {
+            reply.extend_from_slice(&sequence.to_be_bytes());
+            reply.extend_from_slice(&key.tx_id.0.to_be_bytes());
+            reply.extend_from_slice(&key.system_time.0.to_be_bytes());
+        }
+        Ok(ActionResult { body: wire::retain(reply, call.reserve(24)?) })
     }
 
     pub(crate) async fn held_owned_merged_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {

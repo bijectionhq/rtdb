@@ -56,6 +56,15 @@ impl OwnedChangeEdge {
     }
 }
 
+/// Selector in one admitted relation's publication journal.
+#[derive(Clone, Copy)]
+pub enum OwnedPublicationLookup {
+    Latest,
+    Sequence(u64),
+    Position(TransactionKey),
+    AtOrBefore(Timestamp),
+}
+
 pub struct OwnedMergedChanges {
     pub commits: Vec<OwnedChangeCommit>,
     pub retained_bytes: usize,
@@ -554,6 +563,51 @@ impl OwnedReadSession {
         }
         self.check_live_change_relations(std::slice::from_ref(relation))?;
         u64::try_from(journal.head_revision).map_err(|_| change_feed_uncovered())
+    }
+
+    /// Resolve a relation-local version on the same held journal in either direction.
+    pub async fn lookup_publication(
+        &self, relation: &OwnedRelation, lookup: OwnedPublicationLookup,
+    ) -> Result<Option<(u64, TransactionKey)>> {
+        self.admit_access().await?;
+        self.require_scoped_relation(relation)?;
+        if relation.world().is_some() || relation.is_world_catalog() { return Err(change_feed_uncovered()); }
+        let context = self.journal_context(relation)?;
+        let database = context.catalog.database(&self.database)?;
+        let [snapshot] = database.partitions.as_slice() else { return Err(change_feed_uncovered()); };
+        let Some(journal) = self.covered_journal(snapshot, relation, self.present.system_time).await?
+        else { return Ok(None); };
+        let position_limit = self.historical_publication().unwrap_or(self.present);
+        let sequence = match lookup {
+            OwnedPublicationLookup::Latest => journal_boundary_for(
+                &context, &self.owner, relation, &journal,
+                |entry| entry.publication.at_or_before(position_limit),
+            ).await? - 1,
+            OwnedPublicationLookup::AtOrBefore(time) => journal_boundary_for(
+                &context, &self.owner, relation, &journal,
+                |entry| entry.publication.system_time <= time && entry.publication.at_or_before(position_limit),
+            ).await? - 1,
+            OwnedPublicationLookup::Sequence(sequence) =>
+                i64::try_from(sequence).map_err(|_| change_feed_uncovered())?,
+            OwnedPublicationLookup::Position(position) => {
+                journal_boundary_for(&context, &self.owner, relation, &journal,
+                    |entry| entry.publication.tx_id < position.tx_id).await?
+            }
+        };
+        if !(1..=journal.head_revision).contains(&sequence) { return Ok(None); }
+        let header = self.journal_header(relation, sequence).await?;
+        if !ordered_or_same(journal.head_revision, sequence, journal.head, header)
+            || !ordered_or_same(sequence, 1, header, journal.first)
+        {
+            return Err(change_feed_uncovered());
+        }
+        self.check_live_change_relations(std::slice::from_ref(relation))?;
+        if !header.publication.at_or_before(position_limit) || matches!(
+            lookup, OwnedPublicationLookup::Position(position) if position != header.publication
+        ) {
+            return Ok(None);
+        }
+        Ok(Some((u64::try_from(sequence).map_err(|_| change_feed_uncovered())?, header.publication)))
     }
 
     pub fn check_live_change_relations(&self, relations: &[OwnedRelation]) -> Result<()> {

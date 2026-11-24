@@ -931,6 +931,19 @@ It carries no commit evidence.
 
 The corresponding Root path touch action `rtdb.owned.ReadHeldPathTouch.v2` places the signed 64-bit transaction position immediately after the handle. It certifies the addressed touch from the selected journal group and checks the path declaration across the two positioned reads.
 
+`rtdb.owned.LookupHeldPublication.v1` takes the original 16-byte handle, relation prefix and a selector byte.
+Selector 0 uses the latest publication of the relation in the hold.
+Selector 1 carries a relation-local unsigned 64-bit journal sequence.
+Selector 2 carries a signed 64-bit transaction position and history time and requires an exact match.
+Selector 3 carries a signed 64-bit history cap and selects the last eligible entry in the hold.
+All fields are big endian.
+The result is empty for a covered absence or carries the unsigned 64-bit sequence, signed 64-bit position and history time.
+The journal inventory and read entitlement govern lookup.
+
+`rtdb.owned.OpenReadAtPublication.v1` uses a signed 64-bit position followed by history time in place of the requested time in `OpenReadAsOf.v2`.
+The selected marker must exist at exactly the requested position.
+The hold and result fields follow `OpenReadAsOf.v2`.
+
 === Fixed-valid range observations
 
 `rtdb.owned.DeclareFixedRange.v1` takes the relation prefix and one terminated Arrow IPC batch with one row.

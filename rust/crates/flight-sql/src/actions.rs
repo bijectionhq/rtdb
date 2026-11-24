@@ -18,6 +18,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | READ_HELD_ROOT_CATALOG_V1
         | OPEN_OWNED_SCOPED_READ_V2
         | OPEN_OWNED_READ_AS_OF_V2
+        | OPEN_OWNED_READ_AT_PUBLICATION_V1
         | SEAL_HOSTED_RANGES_V1
         | VALIDATE_FRESH_HOSTED_V1
         | OPEN_FRESH_OWNED_READ_V2
@@ -43,6 +44,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | HELD_OWNED_MERGED_CHANGES_DESCENDING_V2
         | HELD_OWNED_MERGED_CHANGES_V4
         | HELD_TABLE_PUBLICATION_SEQUENCE_V1
+        | HELD_LOOKUP_PUBLICATION_V1
         | HELD_OWNED_CHANGES_V3
         | READ_HELD_UNIQUE_V1
         | READ_HELD_UNIQUE_WINDOW_V1
@@ -163,7 +165,8 @@ impl Service {
                 }
                 crate::owned_actions::COMMIT_OWNED_V7 => Ok(vec![Ok(self.commit_owned_counted_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_OWNED_SCOPED_READ_V2 => Ok(vec![Ok(self.open_owned_scoped_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V2 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_AS_OF_V2 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, false).await?)]),
+                crate::owned_actions::OPEN_OWNED_READ_AT_PUBLICATION_V1 => Ok(vec![Ok(self.open_owned_read_as_of_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::OPEN_OWNED_READ_V3 => Ok(vec![Ok(self.open_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_FRESH_OWNED_READ_V2 => Ok(vec![Ok(self.open_fresh_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SPATIAL_NEXT_OWNED | crate::owned_actions::SPATIAL_RANK_NEXT_OWNED => {
@@ -200,6 +203,7 @@ impl Service {
                 crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 => Ok(vec![Ok(self.held_world_region_changes_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 => Ok(vec![Ok(self.held_owned_storage_usage_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_LOOKUP_PUBLICATION_V1 => Ok(vec![Ok(self.held_lookup_publication_action(&call, &action.body).await?)]),
                 HELD_TABLE_PUBLICATION_SEQUENCE_V1 => Ok(vec![Ok(self.held_table_publication_sequence_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V4 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 => Ok(vec![Ok(self.held_expiry_candidates_action(&call, &action.body).await?)]),

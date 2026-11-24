@@ -24,6 +24,29 @@ impl OwnedReadSession {
         marker: &EntityId,
         relations: Vec<OwnedRelation>,
     ) -> Result<Option<Self>> {
+        self.derive_publication(requested, None, publication, marker, relations).await
+    }
+
+    /// Reopen the original marker at its named position in this captured generation.
+    pub async fn derive_at_publication(
+        &self,
+        selected: TransactionKey,
+        publication: &OwnedRelation,
+        marker: &EntityId,
+        relations: Vec<OwnedRelation>,
+    ) -> Result<Option<Self>> {
+        if !selected.at_or_before(self.present) { return Err(unavailable()); }
+        self.derive_publication(selected.system_time, Some(selected), publication, marker, relations).await
+    }
+
+    async fn derive_publication(
+        &self,
+        requested: Timestamp,
+        exact: Option<TransactionKey>,
+        publication: &OwnedRelation,
+        marker: &EntityId,
+        relations: Vec<OwnedRelation>,
+    ) -> Result<Option<Self>> {
         self.require_unscoped_root()?;
         self.admit_read().await?;
         if self.is_applied() || requested > self.present.system_time
@@ -58,10 +81,11 @@ impl OwnedReadSession {
         }
 
         let cancellation = self.session_cancellation.child_token();
-        let requested_cut = self.guard_context(
-            self.context.with_owned_system_cut(requested, &cancellation)?,
-            &relations,
-        )?;
+        let context = match exact {
+            Some(key) => self.context.with_owned_transaction_cut(key, &cancellation)?,
+            None => self.context.with_owned_system_cut(requested, &cancellation)?,
+        };
+        let requested_cut = self.guard_context(context, &relations)?;
         let Some(selected) = self
             .publication_at(requested_cut, publication, marker)
             .await?
@@ -69,7 +93,9 @@ impl OwnedReadSession {
             self.check_relations(&relations)?;
             return Ok(None);
         };
-        if !selected.at_or_before(self.present) || selected.system_time > requested {
+        if !selected.at_or_before(self.present) || selected.system_time > requested
+            || exact.is_some_and(|exact| selected != exact)
+        {
             return Err(unavailable());
         }
         if let Some(floor) = floor.filter(|floor| selected.system_time < *floor) {
