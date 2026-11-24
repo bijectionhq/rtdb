@@ -31,6 +31,7 @@ pub(crate) use usage::{Inventory, owned_file_bytes};
 
 use rtdb_format::keys::ORDERED_INDEX_ROOT as INDEX_ROOT;
 const PAGE_LAYOUT_VERSION: u8 = 11;
+const ARROW_ONLY_DIRECTORY_VERSION: u8 = 12;
 const CATALOG: (&str, &str) = ("xt", "ordered_indexes");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -42,7 +43,12 @@ struct Definition {
 }
 
 impl Definition {
-    fn directory(&self) -> Result<ObjectKey> {
+    fn directory(&self, storage: &BufferPool) -> Result<ObjectKey> {
+        let layout = if storage.object_store().ordered_index_arrow_only() {
+            ARROW_ONLY_DIRECTORY_VERSION
+        } else {
+            PAGE_LAYOUT_VERSION
+        };
         let mut digest = Sha256::new();
         serde_json::to_writer(
             &mut digest,
@@ -51,7 +57,7 @@ impl Definition {
                 &self.table.table,
                 &self.name,
                 self.version,
-                PAGE_LAYOUT_VERSION,
+                layout,
             ),
         )
         .map_err(format_error)?;
@@ -821,7 +827,8 @@ mod tests {
             definition.version,
             Sha256::digest(&preimage),
         ))?;
-        assert_eq!(definition.directory()?, legacy);
+        let storage = BufferPool::new(Arc::new(rtdb_storage::MemoryStore::default()), 1 << 20);
+        assert_eq!(definition.directory(&storage)?, legacy);
         Ok(())
     }
 }

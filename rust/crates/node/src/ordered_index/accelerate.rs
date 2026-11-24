@@ -668,7 +668,7 @@ async fn use_index(
         }));
     }
 
-    let directory = definition.directory()?;
+    let directory = definition.directory(request.storage)?;
     let through = source_frontier(request.snapshot, &definition.table);
     let checkpoint =
         checkpoint::latest(request.storage, &directory, request.memory, through).await?;
@@ -753,7 +753,7 @@ async fn covered_root(
     present: Timestamp,
 ) -> Result<(Tree, Root)> {
     let through = source_frontier(snapshot, &definition.table);
-    let directory = definition.directory()?;
+    let directory = definition.directory(storage)?;
     let checkpoint = checkpoint::latest(storage, &directory, &context.memory, through).await?;
     let durable_rows = source_rows(snapshot, &definition.table);
     let covered_rows = checkpoint

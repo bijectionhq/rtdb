@@ -5,6 +5,7 @@ pub(super) struct Source {
     pub(super) keys: Arc<dyn KeyService>,
     pub(super) io: Arc<IoRegion>,
     pub(super) tasks: tokio_util::task::TaskTracker,
+    pub(super) ordered_index_arrow_only: bool,
 }
 
 impl Source {
@@ -65,6 +66,7 @@ impl Source {
         Ok(Arc::new(SnapshotStore {
             checkpoint, objects, files, scope, allocation,
             placement: Arc::clone(&self.placement), tasks: self.tasks.clone(),
+            ordered_index_arrow_only: self.ordered_index_arrow_only,
         }))
     }
 }
@@ -78,6 +80,7 @@ struct SnapshotStore {
     allocation: Arc<dyn ObjectStore>,
     placement: Arc<super::super::Placement>,
     tasks: tokio_util::task::TaskTracker,
+    ordered_index_arrow_only: bool,
 }
 
 impl SnapshotStore {
@@ -116,6 +119,8 @@ fn read_only() -> Error { Error::Closed("An exact snapshot store is read-only".i
 
 #[async_trait]
 impl ObjectStore for SnapshotStore {
+    fn ordered_index_arrow_only(&self) -> bool { self.ordered_index_arrow_only }
+
     async fn catalog_delivery_lease(&self) -> Result<Option<Arc<ReadLease>>> {
         Ok(Some(Arc::new(ReadLease::until(self.scope.serving().await?))))
     }

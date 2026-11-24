@@ -59,15 +59,16 @@ Seeks compare cells in the leaf's Arrow buffers.
 A rewrite gathers surviving and edited key rows in tree order, reconciling plain and dense-union columns by key kind.
 Contiguous selections may share compact backing buffers already owned by the index.
 Each rebuilt slot uses the kinds present in the selected rows, with dense-union offsets assigned in selection order.
-Readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
+Shared-format readers support JSON and Arrow IPC references in branch pages, revision directories, and checkpoint manifests.
 Private in-memory stores publish Arrow references by default.
-Hosted Multi nodes using `--ecs-cluster` and runtime-installed journal routes (`--installed-cell`) also publish Arrow references by default.
-The link:rtdb-multi-installed-journal.md[installed journal contract] requires workers compatible with those routes, which were introduced after dual-format decoding.
-Other durable and shared stores default to JSON.
-Set `orderedIndexArrowReferences: true` on writers after upgrading every node that reads ordered-index objects in the installation.
-Set `orderedIndexArrowReferences: false` to select JSON on any store.
+Other stores using the shared layout default to JSON.
+On the shared layout, set `orderedIndexArrowReferences: true` on writers after upgrading every reader, or set it to `false` to select JSON.
 A legacy manifest's checksum binds the canonical JSON bytes of its layout.
-A new Arrow page can refer to an existing JSON page.
+A shared-format Arrow page can refer to an existing JSON page.
+The link:rtdb-multi-installed-journal.md[runtime-installed journal profile] (`--installed-cell`) opens and publishes only Arrow manifests and pages, including on readers attached to an exact recovered snapshot.
+That profile derives a fresh ordered-index directory per definition so the first maintenance cycle can rebuild from captured sources at the same frontier.
+Ordered-index storage paths and cleanup use the existing definition and erase-scope fences.
+The shared-layout YAML preference applies only to shared-format publication.
 Arrow references preserve complete key fences, entry counts, and measured subtree coefficients.
 Correction spans refer to rows of index-owned Arrow key batches.
 A correction page persists only its own spans as Arrow columns for validity endpoints and keys, with an IID and span count for each row group.

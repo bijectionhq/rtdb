@@ -225,6 +225,7 @@ impl RemoteStorageFactory for StoreFactory {
             upper,
             snapshot: Some(snapshot::Source {
                 placement, keys: Arc::clone(&self.keys), io: Arc::clone(&io), tasks: self.releases.clone(),
+                ordered_index_arrow_only: self.routes.is_runtime(),
             }),
             reader: None,
             writer: Some(ServingWriter {
@@ -316,7 +317,10 @@ impl StoreFactory {
         };
         let store = Arc::new(ServingStore {
             lower, upper, writer: None, reader: Some(ServingReader { scope, objects }),
-            snapshot: Some(snapshot::Source { placement, keys: Arc::clone(&self.keys), io, tasks: self.releases.clone() }),
+            snapshot: Some(snapshot::Source {
+                placement, keys: Arc::clone(&self.keys), io, tasks: self.releases.clone(),
+                ordered_index_arrow_only: self.routes.is_runtime(),
+            }),
         });
         Ok(OpenedRecoveryStore { store, blocks, audience: None, checkpoint_metadata: None, fragment_storage: None, publication_sealing: None })
     }
@@ -598,6 +602,10 @@ where
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    fn ordered_index_arrow_only(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(|source| source.ordered_index_arrow_only)
+    }
+
     async fn catalog_delivery_lease(&self) -> Result<Option<Arc<ReadLease>>> {
         Ok(self.serving_deadline().await?.map(|deadline| Arc::new(ReadLease::until(deadline))))
     }

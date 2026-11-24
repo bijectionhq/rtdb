@@ -13,6 +13,8 @@ Route the installation through the installed manifest when the initial group, st
 ## Install hosted tenants at runtime
 
 Start the gateway and nodes with `--installed-cell FILE` and the cell route secret.
+Runtime-installed nodes rebuild derived ordered-index checkpoints from captured sources when the new layout has no checkpoint. [Ordered-index layout](ordered-index.adoc)
+Use workers that agree on the ordered-index layout throughout the cutover.
 Use the gateway's existing installation listener and lifecycle credentials.
 Initialize each voter's media before it starts with an empty `groups` list.
 Give the voters a common `management` array of administrator, route reader and worker certificate pins using the same role objects as the group `clients` array.
