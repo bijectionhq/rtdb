@@ -13,7 +13,13 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
     report.authentication = Some(match &config.auth {
         AuthConfig::SingleRootUser { password } => json!({"kind":"single-root-user", "password_present": password.is_some()}),
         AuthConfig::UserList { users, rules, grants } => json!({"kind":"user-list", "users":users.keys().collect::<Vec<_>>(), "rules":rules, "grants":grants.iter().map(|(user, databases)| (user.clone(), databases.iter().map(|(database, access)| (database.clone(), access.as_str())).collect::<BTreeMap<_, _>>())).collect::<BTreeMap<_, _>>()}),
-        AuthConfig::OpenIdConnect(oidc) => json!({"kind":"openid-connect", "issuer":endpoint(oidc.issuer_url.as_str(), "authn.issuerUrl", report), "client_id":oidc.client_id, "client_secret":"[redacted]", "rules":oidc.rules}),
+        AuthConfig::OpenIdConnect(oidc) => {
+            let mut authentication = json!({"kind":"openid-connect", "issuer":endpoint(oidc.issuer_url.as_str(), "authn.issuerUrl", report), "client_id":oidc.client_id, "client_secret":"[redacted]", "rules":oidc.rules});
+            if let Some(grants) = &oidc.workload_grants {
+                authentication["workload_grants"] = json!({"audience":grants.audience(), "client_id_prefix":grants.client_id_prefix()});
+            }
+            authentication
+        }
     });
     for (name, remote) in &config.remotes {
         let path = format!("remotes.{name}");

@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, HttpTransport, MethodRule, Principal, Secret, VerifiedLabelScope, forbidden};
+use crate::{Credentials as PrincipalCredentials, HttpRequest, HttpResponse, HttpTransport, MethodRule, Principal, Scope, Secret, VerifiedLabelScope, VerifiedWorkloadGrant, WorkloadGrantConfig, forbidden, workload_grant};
 
 #[derive(Clone, Debug)]
 pub struct OidcConfig {
@@ -18,6 +18,7 @@ pub struct OidcConfig {
     pub client_id: String,
     pub client_secret: Secret,
     pub rules: Vec<MethodRule>,
+    pub workload_grants: Option<WorkloadGrantConfig>,
 }
 
 pub(crate) struct Provider {
@@ -28,6 +29,7 @@ pub(crate) struct Provider {
     client_id: String,
     client_secret: Secret,
     pub rules: Vec<MethodRule>,
+    workload_grants: Option<WorkloadGrantConfig>,
     clock: Arc<dyn Clock>,
     http: Arc<dyn HttpTransport>,
     memory: Arc<MemoryBudget>,
@@ -77,6 +79,7 @@ impl Credentials {
         let userinfo = self.provider.userinfo(&next).await.map_err(|_| refresh_failed(None))?;
         if userinfo.status != 200 || string(&userinfo.body, "sub").ok() != Some(subject)
             || userinfo.body.get("rtdb_label_scope").is_some()
+            || userinfo.body.get(workload_grant::CLAIM).is_some()
         {
             return Err(refresh_failed(Some(userinfo.status)));
         }
@@ -87,6 +90,11 @@ impl Credentials {
 
 impl Provider {
     pub async fn open(config: OidcConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
+        if config.workload_grants.is_some()
+            && (!https_endpoint(&config.issuer_url) || config.issuer_url.query().is_some())
+        {
+            return Err(discovery_failed("Workload grants require an HTTPS issuer"));
+        }
         let discovery_url = Url::parse(&format!("{}/.well-known/openid-configuration", config.issuer_url.as_str().trim_end_matches('/')))
             .map_err(|_| discovery_failed("Invalid OIDC discovery URL"))?;
         let response = http.request(HttpRequest::Get { url: discovery_url.clone(), bearer: None }).await
@@ -97,8 +105,21 @@ impl Provider {
             Url::parse(value).map_err(|_| discovery_failed(format!("OIDC configuration contains invalid {name}")))
         };
         let device_endpoint = response.body.get("device_authorization_endpoint").map(|_| endpoint("device_authorization_endpoint")).transpose()?;
-        Ok(Arc::new(Self { issuer: config.issuer_url, token_endpoint: endpoint("token_endpoint")?, userinfo_endpoint: endpoint("userinfo_endpoint")?, device_endpoint,
-            client_id: config.client_id, client_secret: config.client_secret, rules: config.rules, clock, http, memory }))
+        let token_endpoint = endpoint("token_endpoint")?;
+        let userinfo_endpoint = endpoint("userinfo_endpoint")?;
+        if config.workload_grants.is_some() {
+            if endpoint("issuer")? != config.issuer_url {
+                return Err(discovery_failed("The discovery issuer does not match the configured workload issuer"));
+            }
+            for endpoint in [&token_endpoint, &userinfo_endpoint] {
+                if !https_endpoint(endpoint) || endpoint.origin() != config.issuer_url.origin() {
+                    return Err(discovery_failed("Workload grants require issuer-origin HTTPS token and UserInfo endpoints"));
+                }
+            }
+        }
+        Ok(Arc::new(Self { issuer: config.issuer_url, token_endpoint, userinfo_endpoint, device_endpoint,
+            client_id: config.client_id, client_secret: config.client_secret, rules: config.rules,
+            workload_grants: config.workload_grants, clock, http, memory }))
     }
     fn base_fields(&self) -> BTreeMap<String, Secret> { fields([("client_id", self.client_id.as_str()), ("client_secret", self.client_secret.expose())]) }
     async fn token(&self, fields: BTreeMap<String, Secret>) -> Result<HttpResponse> {
@@ -108,29 +129,65 @@ impl Provider {
     async fn userinfo(&self, token: &Token) -> Result<HttpResponse> {
         self.http.request(HttpRequest::Get { url: self.userinfo_endpoint.clone(), bearer: Some(token.access.clone()) }).await
     }
+    fn workload_config(&self, client_id: &str) -> Option<&WorkloadGrantConfig> {
+        self.workload_grants.as_ref().filter(|config| client_id.starts_with(config.client_id_prefix()))
+    }
     async fn principal(self: &Arc<Self>, token: Token, grant: RefreshGrant) -> Result<Arc<Principal>> {
         let response = self.userinfo(&token).await?;
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Failed to obtain user info from {}", self.userinfo_endpoint)).with_context("status", response.status.into())); }
         let user = string(&response.body, "sub")?;
-        let label_scope = response.body.get("rtdb_label_scope").map(|claim| {
-            VerifiedLabelScope::from_userinfo(claim, self.issuer.as_str(), user, token.expires_at, self.clock.now())
-        }).transpose()?;
+        let labels = response.body.get("rtdb_label_scope");
+        let workload = match &grant {
+            RefreshGrant::ClientCredentials { id, .. } => self.workload_config(id),
+            RefreshGrant::Password => None,
+        };
+        let scope = match (workload, response.body.get(workload_grant::CLAIM), labels) {
+            (Some(config), Some(claim), None) => {
+                let expiry = token.expires_at.ok_or_else(workload_grant::invalid_grant)?;
+                Some(Scope::Workload(VerifiedWorkloadGrant::from_userinfo(
+                    claim, self.issuer.as_str(), config.audience(), user, expiry, self.clock.now(),
+                )?))
+            }
+            (Some(_), _, _) | (None, Some(_), _) => return Err(workload_grant::invalid_grant()),
+            (None, None, Some(claim)) => Some(Scope::Labels(VerifiedLabelScope::from_userinfo(
+                claim, self.issuer.as_str(), user, token.expires_at, self.clock.now(),
+            )?)),
+            (None, None, None) => None,
+        };
         let bytes = user.len().checked_add(std::mem::size_of::<Principal>())
-            .and_then(|bytes| bytes.checked_add(label_scope.as_ref().map_or(0, VerifiedLabelScope::memory_bytes)))
+            .and_then(|bytes| bytes.checked_add(scope.as_ref().map_or(0, Scope::memory_bytes)))
             .ok_or_else(|| invalid("Principal identity is too large"))?;
         let reservation = self.memory.reserve(bytes)?;
-        Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials: PrincipalCredentials::Oidc(Credentials { provider: Arc::clone(self), grant, token: Mutex::new(token) }), grants: None, label_scope, _reservation: reservation }))
+        let credentials = match scope {
+            Some(scope) => PrincipalCredentials::ScopedOidc(scope),
+            None => PrincipalCredentials::Oidc(Credentials { provider: Arc::clone(self), grant, token: Mutex::new(token) }),
+        };
+        Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials, static_grants: None, _reservation: reservation }))
     }
     pub async fn password(self: &Arc<Self>, user: &str, password: &str) -> Result<Arc<Principal>> {
+        if self.workload_config(user).is_some() {
+            return Err(workload_grant::invalid_grant());
+        }
         let response = self.token(fields([("grant_type", "password"), ("scope", "openid"), ("username", user), ("password", password)])).await?;
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Password authentication failed for user: {user}")).with_context("status", response.status.into())); }
         self.principal(Token::parse(&response.body, self.clock.now(), None, &self.memory)?, RefreshGrant::Password).await
     }
     pub async fn client_credentials(self: &Arc<Self>, id: &str, secret: &str) -> Result<Arc<Principal>> {
+        let workload_started = self.workload_config(id).map(|_| self.clock.now());
         let response = self.token(fields([("grant_type", "client_credentials"), ("scope", "openid"), ("client_id", id), ("client_secret", secret)])).await?;
         if response.status != 200 { return Err(forbidden("xtdb.authn/failed", format!("Client credentials authentication failed for client: {id}")).with_context("status", response.status.into())); }
+        let token_time = if let Some(started) = workload_started {
+            if !response.body.get("expires_in").and_then(Value::as_i64).is_some_and(|seconds| {
+                (1..=workload_grant::MAX_LIFETIME_MICROS / 1_000_000).contains(&seconds)
+            }) {
+                return Err(workload_grant::invalid_grant());
+            }
+            started
+        } else {
+            self.clock.now()
+        };
         let reservation = self.memory.reserve(id.len().checked_add(secret.len()).and_then(|bytes| bytes.checked_add(std::mem::size_of::<RefreshGrant>())).ok_or_else(|| invalid("Client credentials are too large"))?)?;
-        self.principal(Token::parse(&response.body, self.clock.now(), None, &self.memory)?, RefreshGrant::ClientCredentials { id: id.into(), secret: Secret::new(secret), _reservation: reservation }).await
+        self.principal(Token::parse(&response.body, token_time, None, &self.memory)?, RefreshGrant::ClientCredentials { id: id.into(), secret: Secret::new(secret), _reservation: reservation }).await
     }
     pub async fn device(self: &Arc<Self>) -> Result<DeviceAuthorization> {
         let endpoint = self.device_endpoint.as_ref().ok_or_else(|| Anomaly::unsupported("xtdb.authn/device-auth-unsupported", "OIDC provider does not support device authorization flow - missing device_authorization_endpoint"))?;
@@ -183,6 +240,10 @@ fn expires_at(body: &Value, now: Timestamp) -> Result<Option<Timestamp>> {
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.auth/invalid-response", message) }
 fn discovery_failed(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.authn/oidc-discovery-failed", message) }
+fn https_endpoint(url: &Url) -> bool {
+    url.scheme() == "https" && url.host_str().is_some() && url.username().is_empty()
+        && url.password().is_none() && url.fragment().is_none()
+}
 fn refresh_failed(status: Option<u16>) -> Anomaly {
     let error = forbidden("xtdb.authn/refresh-failed", "Failed to refresh OAuth token");
     match status { Some(status) => error.with_context("status", status.into()), None => error }

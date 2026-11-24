@@ -46,6 +46,128 @@ async fn checkpoint_administration_requires_a_verified_unscoped_credential() {
     running.stop().await;
 }
 
+#[cfg(feature = "multi")]
+#[tokio::test]
+async fn managed_workload_can_only_create_and_reopen_its_exact_deployment() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use rtdb_auth::{Method, MethodRule, OidcConfig, WorkloadGrantConfig};
+    use rtdb_flight_sql::rtdb::admin::v1::{CreateDeploymentRequest, Deployment};
+    use serde_json::json;
+    use tokio::sync::Mutex;
+
+    struct Issuer(Arc<MemoryBudget>);
+
+    #[async_trait]
+    impl HttpTransport for Issuer {
+        async fn request(&self, request: HttpRequest) -> Result<HttpResponse> {
+            let body = match request {
+                HttpRequest::Get { bearer: None, .. } => json!({
+                    "issuer": "https://issuer.example",
+                    "token_endpoint": "https://issuer.example/token",
+                    "userinfo_endpoint": "https://issuer.example/userinfo",
+                }),
+                HttpRequest::Form { fields, .. } => {
+                    assert_eq!(fields["client_id"].expose(), "workload-create");
+                    json!({"access_token": "scoped", "expires_in": 60})
+                }
+                HttpRequest::Get { bearer: Some(_), .. } => {
+                    let grant_id = [17; 16];
+                    json!({"sub": "provisioner", "rtdb_workload_grant": {
+                        "version": 1, "audience": "cell", "database": "reports",
+                        "incarnation": FIXTURE_INCARNATION, "grant_id": grant_id,
+                        "expires_at_micros": 60_000_000, "operations": ["create-deployment"],
+                    }})
+                }
+            };
+            HttpResponse::new(200, body, &self.0)
+        }
+    }
+
+    let memory = MemoryBudget::new(64 << 20);
+    let clock = Arc::new(ManualClock(AtomicI64::new(1_000_000)));
+    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig {
+        issuer_url: "https://issuer.example".parse().unwrap(),
+        client_id: "rtdb".into(),
+        client_secret: Secret::new("configured"),
+        rules: vec![MethodRule::any(Method::ClientCredentials)],
+        workload_grants: Some(WorkloadGrantConfig::new("cell".into(), "workload-".into()).unwrap()),
+    }), memory.clone(), clock.clone(), Arc::new(Issuer(memory.clone()))).await.unwrap();
+    let uuid = uuid::Uuid::from_bytes(FIXTURE_INCARNATION);
+    let kms: Arc<dyn rtdb_crypt::Kms> = Arc::new(rtdb_crypt::LocalKms::new(|| 0));
+    let key = rtdb_crypt::tokens::TokenKey::create(kms.as_ref(), rtdb_crypt::Generation { database: uuid, number: 0 }).await.unwrap();
+    let tokens = rtdb_crypt::tokens::TokenAuthority::new(uuid, kms, Arc::new(FixtureTokenKeys(key)));
+    let provisioned = Arc::new(Mutex::new(Vec::new()));
+    let resources = Arc::new(AppliedFixtureResources {
+        native: Default::default(),
+        driver: Arc::new(AppliedFixture {
+            state: std::sync::Mutex::new(rtdb_tx::transact::TransactState::new(FIXTURE_INCARNATION)),
+            tokens,
+            memory,
+            admission: Default::default(),
+            hold_first: Default::default(),
+            waiting: Default::default(),
+            release: Default::default(),
+        }),
+        provisioned: Some(provisioned.clone()),
+    });
+    let options = NodeOptions {
+        membership: Membership::Managed(Default::default()),
+        automatic_compaction: false,
+        automatic_gc: false,
+        ..Default::default()
+    };
+    let services = NodeServices {
+        clock: clock.clone(),
+        resources,
+        ..NodeServices::local(auth.clone(), Arc::new(Observer), auth.clone(), Arc::new(Metrics))
+    };
+    let (node, driver) = Node::open(options, services).await.unwrap();
+    let node_task = tokio::spawn(driver.run());
+    let config = FlightConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    let (server, driver) = ServerDriver::bind_with_clock(config, node.clone(), auth, clock.clone()).await.unwrap();
+    let server_task = tokio::spawn(driver.run());
+    let running = Running { node, node_task, server, server_task, clock };
+    let channel = Channel::from_shared(format!("http://{}", running.server.address())).unwrap().connect().await.unwrap();
+    let mut client = Client { client: FlightServiceClient::new(channel), headers: MetadataMap::new() };
+    client.headers.insert("authorization", format!("Client {}", STANDARD.encode("workload-create:secret")).parse().unwrap());
+    let create = "rtdb.admin.v1.CreateDeployment";
+    let request = |name: &str, incarnation| Bytes::from(CreateDeploymentRequest {
+        deployment: name.into(),
+        incarnation,
+    }.encode_to_vec());
+    for (action, body) in [
+        (create, request("reports", None)),
+        (create, request("other", Some(FIXTURE_INCARNATION.to_vec()))),
+        (create, request("reports", Some(vec![7; 16]))),
+        ("rtdb.admin.v1.DeleteDeployment", Bytes::new()),
+        ("rtdb.v1.Transact", Bytes::new()),
+        ("rtdb.v1.TxStatus", Bytes::new()),
+        ("BeginTransaction", Bytes::new()),
+    ] {
+        assert!(client.action(action, body).await.is_err(), "{action}");
+    }
+    assert!(provisioned.lock().await.is_empty());
+
+    let body = request("reports", Some(FIXTURE_INCARNATION.to_vec()));
+    let first = client.action(create, body.clone()).await.unwrap();
+    let handshake = client.request(futures::stream::iter([arrow_flight::HandshakeRequest::default()]));
+    let response = client.client.handshake(handshake).await.unwrap();
+    client.headers.insert("authorization", response.metadata().get("authorization").unwrap().clone());
+    let _: Vec<_> = response.into_inner().try_collect().await.unwrap();
+    assert!(client.action("rtdb.v1.Capabilities", Bytes::new()).await.is_err());
+    let replay = client.action(create, body.clone()).await.unwrap();
+    let deployment = Deployment::decode(first[0].body.clone()).unwrap();
+    assert_eq!(deployment.deployment, "reports");
+    assert_eq!(deployment.incarnation, FIXTURE_INCARNATION);
+    assert_eq!(replay[0].body, first[0].body);
+    assert_eq!(*provisioned.lock().await, [(String::from("reports"), uuid), (String::from("reports"), uuid)]);
+
+    running.clock.0.store(60_000_000, Ordering::Relaxed);
+    assert!(client.action(create, body).await.is_err());
+    assert_eq!(provisioned.lock().await.len(), 2);
+    running.stop().await;
+}
+
 fn input(sql: &str) -> v1::QueryRequest {
     v1::QueryRequest {
         source: Some(v1::Source {
@@ -1350,10 +1472,22 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
 struct AppliedFixtureResources {
     native: rtdb_node::NativeResources,
     driver: Arc<AppliedFixture>,
+    provisioned: Option<Arc<tokio::sync::Mutex<Vec<(String, uuid::Uuid)>>>>,
 }
 
 #[async_trait]
 impl rtdb_node::ResourceFactory for AppliedFixtureResources {
+    async fn provision_managed_database(
+        &self,
+        name: &str,
+        expected: Option<uuid::Uuid>,
+    ) -> Result<(rtdb_format::database::proto::DatabaseConfig, uuid::Uuid)> {
+        let provisioned = self.provisioned.as_ref().unwrap();
+        let incarnation = expected.unwrap();
+        provisioned.lock().await.push((name.into(), incarnation));
+        Ok((Default::default(), incarnation))
+    }
+
     fn serving_driver(
         &self,
         _: &str,
@@ -1709,6 +1843,7 @@ async fn rtdb_v1_serving_driver_uses_one_applied_basis_for_query_claim_write_and
     let resources = Arc::new(AppliedFixtureResources {
         native: Default::default(),
         driver: driver.clone(),
+        provisioned: None,
     });
     let running = Running::start_with_resources(
         None,

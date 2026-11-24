@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use prost::Message;
-use rtdb_auth::Principal;
+use rtdb_auth::{Principal, WorkloadOperation};
 use rtdb_types::{Timestamp, rtdb_v1::Basis};
 use tonic::Status;
 use uuid::Uuid;
@@ -14,7 +14,7 @@ use crate::{
 pub(crate) const EXPORT: &str = "rtdb.admin.v1.ExportCheckpoint";
 pub(crate) const RESTORE: &str = "rtdb.admin.v1.RestoreDeployment";
 pub(crate) const FORK: &str = "rtdb.admin.v1.ForkDeployment";
-pub(crate) const CREATE: &str = "rtdb.admin.v1.CreateDeployment";
+pub(crate) use crate::v1::MANAGED_CREATE as CREATE;
 pub(crate) const DELETE: &str = "rtdb.admin.v1.DeleteDeployment";
 pub(crate) const ACTIONS: [&str; 5] = [CREATE, DELETE, FORK, EXPORT, RESTORE];
 
@@ -69,6 +69,7 @@ impl Service {
             && call.session.caller.verified_credential
             && principal.user_id().is_some()
             && principal.label_scope().is_none()
+            && principal.workload_grant().is_none()
             && call.session.audience_source().is_none()
             && !call.session.fresh_replica
     }
@@ -79,6 +80,29 @@ impl Service {
         name: &str,
         body: Bytes,
     ) -> Result<Vec<u8>, Status> {
+        let principal = &call.session.caller.principal;
+        let catalog = self.0.node.catalog();
+        if let Some(grant) = principal.workload_grant() {
+            if name != CREATE
+                || !catalog.is_managed()
+                || !call.session.caller.verified_credential
+                || call.session.audience_source().is_some()
+                || call.session.fresh_replica
+            {
+                return Err(Status::permission_denied("The session cannot create a managed deployment"));
+            }
+            let request: proto::CreateDeploymentRequest = decode(body)?;
+            let incarnation = request.incarnation.as_deref().ok_or_else(|| {
+                error::incorrect("An explicit deployment incarnation is required for this grant")
+            }).and_then(deployment_incarnation)?;
+            grant.admit(
+                WorkloadOperation::CreateDeployment,
+                &request.deployment,
+                *incarnation.as_bytes(),
+                self.0.node.now(),
+            ).map_err(error::anomaly)?;
+            return self.create_deployment(request.deployment, Some(incarnation)).await;
+        }
         let authority = self
             .0
             .config
@@ -90,8 +114,6 @@ impl Service {
                 "The session cannot administer deployments",
             ));
         }
-        let principal = &call.session.caller.principal;
-        let catalog = self.0.node.catalog();
         match name {
             CREATE => {
                 let request: proto::CreateDeploymentRequest = decode(body)?;
@@ -104,17 +126,7 @@ impl Service {
                     )
                     .map_err(error::anomaly)?;
                 let expected = request.incarnation.as_deref().map(deployment_incarnation).transpose()?;
-                let incarnation = self.0
-                    .node
-                    .create_managed_deployment(request.deployment.clone(), expected)
-                    .await
-                    .map_err(error::anomaly)?;
-                Ok(proto::Deployment {
-                    deployment: request.deployment,
-                    basis: None,
-                    incarnation: incarnation.as_bytes().to_vec(),
-                }
-                .encode_to_vec())
+                self.create_deployment(request.deployment, expected).await
             }
             DELETE => {
                 let request: proto::DeleteDeploymentRequest = decode(body)?;
@@ -326,6 +338,16 @@ impl Service {
             }
             _ => Err(error::unsupported("admin")),
         }
+    }
+
+    async fn create_deployment(&self, deployment: String, expected: Option<Uuid>) -> Result<Vec<u8>, Status> {
+        let incarnation = self.0.node.create_managed_deployment(deployment.clone(), expected)
+            .await.map_err(error::anomaly)?;
+        Ok(proto::Deployment {
+            deployment,
+            basis: None,
+            incarnation: incarnation.as_bytes().to_vec(),
+        }.encode_to_vec())
     }
 
     fn default_restore_directory(&self) -> Result<&std::path::Path, Status> {

@@ -2,6 +2,7 @@ mod http;
 mod oidc;
 mod password;
 mod visibility_scope;
+mod workload_grant;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,6 +21,7 @@ pub use http::{HttpRequest, HttpResponse, HttpTransport, NativeHttp};
 pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
 pub use visibility_scope::VerifiedLabelScope;
+pub use workload_grant::{VerifiedWorkloadGrant, WorkloadGrantConfig, WorkloadOperation};
 
 #[derive(Clone)]
 pub struct Secret(Zeroizing<String>);
@@ -195,14 +197,26 @@ impl rtdb_plan::CatalogUsers for Authenticator {
     }
 }
 
-enum Credentials { Static, Oidc(oidc::Credentials) }
+enum Credentials { Static, Oidc(oidc::Credentials), ScopedOidc(Scope) }
+
+enum Scope {
+    Labels(VerifiedLabelScope),
+    Workload(VerifiedWorkloadGrant),
+}
+
+impl Scope {
+    fn memory_bytes(&self) -> usize {
+        match self {
+            Self::Labels(scope) => scope.memory_bytes(),
+            Self::Workload(grant) => grant.memory_bytes(),
+        }
+    }
+}
 
 pub struct Principal {
     user: Option<String>,
     credentials: Credentials,
-    /// The databases this principal may use and how, if it is limited to some.
-    grants: Option<BTreeMap<String, GrantedAccess>>,
-    label_scope: Option<VerifiedLabelScope>,
+    static_grants: Option<BTreeMap<String, GrantedAccess>>,
     _reservation: Arc<MemoryReservation>,
 }
 impl Principal {
@@ -210,27 +224,33 @@ impl Principal {
         let granted = grants.iter().flatten().try_fold(0usize, |bytes, (database, _)| bytes.checked_add(database.len() + 64));
         let bytes = granted.and_then(|granted| user.map_or(0, str::len).checked_add(granted)?.checked_add(std::mem::size_of::<Self>())).ok_or_else(|| Anomaly::incorrect("rtdb.auth/principal-allocation", "Principal allocation exceeds addressable memory"))?;
         let reservation = memory.reserve(bytes)?;
-        Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, grants, label_scope: None, _reservation: reservation }))
+        Ok(Arc::new(Self { user: user.map(str::to_owned), credentials: Credentials::Static, static_grants: grants, _reservation: reservation }))
     }
     pub fn user_id(&self) -> Option<&str> { self.user.as_deref() }
-    pub fn label_scope(&self) -> Option<&VerifiedLabelScope> { self.label_scope.as_ref() }
+    pub fn label_scope(&self) -> Option<&VerifiedLabelScope> {
+        match &self.credentials { Credentials::ScopedOidc(Scope::Labels(scope)) => Some(scope), _ => None }
+    }
+    pub fn workload_grant(&self) -> Option<&VerifiedWorkloadGrant> {
+        match &self.credentials { Credentials::ScopedOidc(Scope::Workload(grant)) => Some(grant), _ => None }
+    }
 }
 #[async_trait]
 impl SessionIdentity for Principal {
     fn user(&self) -> Option<&str> { self.user.as_deref() }
     async fn revalidate(&self, now: Timestamp) -> Result<()> {
-        if let Some(scope) = &self.label_scope { return scope.revalidate(now); }
         match &self.credentials {
             Credentials::Static => Ok(()),
             Credentials::Oidc(credentials) => credentials.revalidate(now, self.user.as_deref().unwrap_or_default()).await,
+            Credentials::ScopedOidc(Scope::Labels(scope)) => scope.revalidate(now),
+            Credentials::ScopedOidc(Scope::Workload(grant)) => grant.revalidate(now),
         }
     }
     fn delegable(&self) -> bool { matches!(self.credentials, Credentials::Static) }
     fn authorize_database(&self, database: &str, access: DatabaseAccess) -> Result<()> {
-        if self.label_scope.is_some() {
+        if matches!(self.credentials, Credentials::ScopedOidc(_)) {
             return Err(forbidden("rtdb.auth/scoped-route", "The credential requires a scoped database route"));
         }
-        let Some(grants) = &self.grants else { return Ok(()) };
+        let Some(grants) = &self.static_grants else { return Ok(()) };
         match (grants.get(database).or_else(|| grants.get("*")), access) {
             (Some(GrantedAccess::Write), _) | (Some(GrantedAccess::Read), DatabaseAccess::Read) => Ok(()),
             (Some(GrantedAccess::Read), DatabaseAccess::Write) => Err(forbidden("xtdb.authz/read-only-grant", format!("{} may only read database '{database}'", self.user.as_deref().unwrap_or_default()))),

@@ -36,14 +36,18 @@ impl HttpTransport for Script {
 }
 
 async fn setup(extra: Vec<(u16, Value)>, gate: bool) -> (Arc<Authenticator>, Arc<Script>, Arc<TestClock>) {
+    setup_with_workload(extra, gate, None).await
+}
+
+async fn setup_with_workload(extra: Vec<(u16, Value)>, gate: bool, workload_grants: Option<WorkloadGrantConfig>) -> (Arc<Authenticator>, Arc<Script>, Arc<TestClock>) {
     let memory = MemoryBudget::new(8 << 20);
     let mut responses = VecDeque::from([
-        (200, json!({"token_endpoint":"https://issuer.example/token", "userinfo_endpoint":"https://issuer.example/userinfo", "device_authorization_endpoint":"https://issuer.example/device"})),
+        (200, json!({"issuer":"https://issuer.example", "token_endpoint":"https://issuer.example/token", "userinfo_endpoint":"https://issuer.example/userinfo", "device_authorization_endpoint":"https://issuer.example/device"})),
     ]);
     responses.extend(extra);
     let script = Arc::new(Script { memory: Arc::clone(&memory), responses: Mutex::new(responses), forms: Mutex::new(Vec::new()), refreshes: AtomicUsize::new(0), refresh_gate: gate.then(|| Semaphore::new(0)) });
     let clock = Arc::new(TestClock(AtomicI64::new(0)));
-    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig { issuer_url: "https://issuer.example".parse().unwrap(), client_id: "configured-client".into(), client_secret: Secret::new("configured-secret"), rules: vec![MethodRule::any(Method::Password)] }), memory, clock.clone(), script.clone()).await.unwrap();
+    let auth = Authenticator::open(AuthConfig::OpenIdConnect(OidcConfig { issuer_url: "https://issuer.example".parse().unwrap(), client_id: "configured-client".into(), client_secret: Secret::new("configured-secret"), rules: vec![MethodRule::any(Method::Password)], workload_grants }), memory, clock.clone(), script.clone()).await.unwrap();
     (auth, script, clock)
 }
 
@@ -163,6 +167,102 @@ async fn label_scope_requires_a_new_session_if_assigned_during_refresh() {
     assert!(principal.label_scope().is_none());
     clock.0.store(1_000_000, Ordering::SeqCst);
     assert_eq!(principal.revalidate(Timestamp(1_000_000)).await.unwrap_err().code, "xtdb.authn/refresh-failed");
+}
+
+fn create_claim(grant_id: [u8; 16], expires_at_micros: i64) -> Value {
+    let incarnation = [7; 16];
+    json!({
+        "version": 1, "audience": "cell", "database": "catalog", "incarnation": incarnation,
+        "grant_id": grant_id, "expires_at_micros": expires_at_micros, "operations": ["create-deployment"],
+    })
+}
+
+fn workload_config() -> WorkloadGrantConfig {
+    WorkloadGrantConfig::new("cell".into(), "workload-".into()).unwrap()
+}
+
+#[tokio::test]
+async fn workload_grant_binds_exact_target_and_keeps_receipts_across_reauthentication() {
+    let mut responses = Vec::new();
+    for (id, expiry) in [([8; 16], 1_000_000), ([8; 16], 3_000_000), ([9; 16], 3_000_000)] {
+        responses.push((200, json!({"access_token":"scoped", "expires_in":2})));
+        responses.push((200, json!({"sub":"stable-subject", "rtdb_workload_grant":create_claim(id, expiry)})));
+    }
+    let (auth, _, clock) = setup_with_workload(responses, false, Some(workload_config())).await;
+    let first = auth.verify_client_credentials("workload-0", "first-secret").await.unwrap();
+    let grant = first.workload_grant().unwrap();
+    let operation = WorkloadOperation::CreateDeployment;
+    grant.admit(operation, "catalog", [7; 16], Timestamp(999_999)).unwrap();
+    assert!(grant.admit(operation, "another", [7; 16], Timestamp(0)).is_err());
+    assert!(grant.admit(operation, "catalog", [9; 16], Timestamp(0)).is_err());
+    assert!(first.label_scope().is_none());
+    assert!(!first.delegable());
+    assert!(first.authorize_database("catalog", rtdb_node::DatabaseAccess::Read).is_err());
+    assert!(first.authorize_database("catalog", rtdb_node::DatabaseAccess::Write).is_err());
+    clock.0.store(1_000_000, Ordering::SeqCst);
+    assert!(first.revalidate(clock.now()).await.is_err());
+    let renewed = auth.verify_client_credentials("workload-1", "next-secret").await.unwrap();
+    assert_eq!(grant.receipt_namespace(), renewed.workload_grant().unwrap().receipt_namespace());
+    assert!(renewed.revalidate(Timestamp(3_000_000)).await.is_err());
+    let other = auth.verify_client_credentials("workload-2", "next-secret").await.unwrap();
+    assert_ne!(grant.receipt_namespace(), other.workload_grant().unwrap().receipt_namespace());
+}
+
+#[tokio::test]
+async fn workload_enrollment_refuses_missing_invalid_and_mixed_claims() {
+    let valid = create_claim([8; 16], 1_000_000);
+    let mut userinfo = vec![
+        json!({"sub":"subject"}),
+        json!({"sub":"subject", "rtdb_workload_grant":null}),
+        json!({"sub":"subject", "rtdb_workload_grant":valid.clone(), "rtdb_label_scope":null}),
+    ];
+    let zero = [0; 16];
+    for (key, wrong) in [
+        ("version", json!(2)),
+        ("audience", json!("another")),
+        ("database", json!("*")),
+        ("incarnation", json!([7])),
+        ("grant_id", json!(zero)),
+        ("expires_at_micros", json!(0)),
+        ("expires_at_micros", json!(300_000_001)),
+        ("operations", json!(["transact"])),
+        ("operations", json!([])),
+        ("operations", json!(["create-deployment", "create-deployment"])),
+        ("extra", json!(1)),
+    ] {
+        let mut claim = valid.clone();
+        claim[key] = wrong;
+        userinfo.push(json!({"sub":"subject", "rtdb_workload_grant":claim}));
+    }
+    for response in userinfo {
+        let (auth, _, _) = setup_with_workload(vec![
+            (200, json!({"access_token":"token", "expires_in":60})),
+            (200, response),
+        ], false, Some(workload_config())).await;
+        assert_eq!(auth.verify_client_credentials("workload-0", "secret").await.err().unwrap().code, "rtdb.auth/workload-grant");
+    }
+}
+
+#[tokio::test]
+async fn workload_claims_cannot_be_used_on_a_legacy_login_or_an_unbounded_token() {
+    let info = json!({"sub":"subject", "rtdb_workload_grant":create_claim([8; 16], 1_000_000)});
+    let token = json!({"access_token":"token", "expires_in":60});
+    for (client, config) in [("legacy", Some(workload_config())), ("workload-0", None)] {
+        let (auth, _, _) = setup_with_workload(vec![(200, token.clone()), (200, info.clone())], false, config).await;
+        assert!(auth.verify_client_credentials(client, "secret").await.is_err());
+    }
+    let (auth, _, _) = setup_with_workload(vec![(200, token.clone()), (200, info)], false, Some(workload_config())).await;
+    assert!(auth.verify_password("legacy-user", "secret").await.is_err());
+    let (auth, _, _) = setup_with_workload(vec![], false, Some(workload_config())).await;
+    assert!(auth.verify_password("workload-0", "secret").await.is_err());
+    for response in [json!({"access_token":"token"}), json!({"access_token":"token", "expires_in":301})] {
+        let (auth, _, _) = setup_with_workload(vec![(200, response)], false, Some(workload_config())).await;
+        assert!(auth.verify_client_credentials("workload-0", "secret").await.is_err());
+    }
+    let (auth, _, _) = setup_with_workload(vec![(200, token), (200, json!({"sub":"legacy"}))], false, Some(workload_config())).await;
+    let legacy = auth.verify_client_credentials("legacy", "secret").await.unwrap();
+    assert!(legacy.workload_grant().is_none());
+    legacy.authorize_database("catalog", rtdb_node::DatabaseAccess::Write).unwrap();
 }
 
 #[tokio::test]

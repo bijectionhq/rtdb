@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use rtdb_auth::{AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret};
+use rtdb_auth::{AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret, WorkloadGrantConfig};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
 use rtdb_types::{Anomaly, Result};
 use super::invalid;
@@ -41,12 +41,24 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
         "!OpenIdConnect" => AuthConfig::OpenIdConnect(OidcConfig {
             issuer_url: fields.required_string("issuerUrl")?.parse().map_err(|_| invalid("issuerUrl must be an absolute URL"))?,
             client_id: fields.required_string("clientId")?, client_secret: Secret::new(fields.required_string("clientSecret")?), rules: rules(fields.sequence("rules")?, Method::Trust)?,
+            workload_grants: fields.take("workloadGrants").map(workload_grants).transpose()?,
         }),
         _ => return Err(invalid(format!("Unknown authentication configuration tag '{tag}'"))),
     };
     fields.finish()?;
     Ok(config)
 }
+
+fn workload_grants(value: Yaml) -> Result<WorkloadGrantConfig> {
+    let mut fields = YamlFields::new(value, "workloadGrants")?;
+    let config = WorkloadGrantConfig::new(
+        fields.required_string("audience")?,
+        fields.required_string("clientIdPrefix")?,
+    )?;
+    fields.finish()?;
+    Ok(config)
+}
+
 fn rules(values: Option<Vec<Yaml>>, default: Method) -> Result<Vec<MethodRule>> {
     values.map(|values| values.into_iter().map(|value| {
         let mut fields = YamlFields::new(value, "authentication rule")?;

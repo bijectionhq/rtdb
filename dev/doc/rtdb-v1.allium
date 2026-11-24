@@ -2,7 +2,8 @@
 -- The consumer boundary for a database served by the default or Multi driver.
 -- Multi deployment registration uses an internal journal stream. Its writer reserves the name and incarnation before provisioning the data stream.
 -- The writer orders readiness after observing the selected data stream and key authority. Nodes attach the ready incarnation and recover it on restart.
--- Flight administration requires an installed deployment authorizer and a verified credential. The authority sees both names for restore and fork.
+-- Flight administration requires a verified credential and an authority for the action and resources it names.
+-- The installed administrative authorizer sees both resources for restore and fork.
 -- Multi deletion first orders a terminal in the settled deployment stream. The catalog retains the incarnation, terminal, key generation and immutable retirement cutoff.
 -- Key destruction and permanent journal deletion complete before the catalog records and authenticates erasure evidence.
 -- A retirement with live dependent pins or unverified independent custody keys cannot close the deployment.
@@ -35,6 +36,13 @@ surface StatelessDatabase {
         -- A caller learns which operations and optional features the selected route can serve.
         -- An unavailable optional feature returns its name for comparison with Capabilities.
         -- A default attachment can serve guarded v1 writes over Classic effects covered by the shared main-branch fold.
+
+    @guarantee ManagedWorkloadCreate
+        -- A managed route accepts workload credentials from its configured issuer for its own audience.
+        -- A workload credential binds one operation to an exact deployment name and incarnation for a bounded lifetime.
+        -- Managed Create requires the explicit name and incarnation authorized by the credential.
+        -- The catalog orders that identity before provisioning and the reply confirms the current matching attachment.
+        -- A retry with a renewed grant can recover the same ordered identity.
 
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.

@@ -1,0 +1,174 @@
+= Managed workload grants
+
+Use a managed workload grant to provision one reserved database incarnation through the ordinary Flight listener of a managed Multi runtime.
+The issuer authenticates the workload and derives its grant from the accepted installation intent for that cell.
+The intent supplies the deployment name and the reserved UUID.
+Caller inputs can select an existing intent but cannot establish its authority or change its resource.
+
+== Operator configuration
+
+Add the optional `workloadGrants` mapping to the existing native `!OpenIdConnect` configuration.
+The issuer URL, service credential, audience, and dedicated workload client ID prefix are operator inputs.
+Use an authenticated Flight HTTPS endpoint and an audience unique to the intended RTDB service.
+Use distinct issuer credentials for distinct grants, even when one workload can provision several databases.
+
+[source,yaml]
+----
+authn: !OpenIdConnect
+  issuerUrl: https://identity.example/realm
+  clientId: rtdb
+  clientSecret: !Env RTDB_OIDC_CLIENT_SECRET
+  workloadGrants:
+    audience: rtdb-cell.example
+    clientIdPrefix: managed-
+  rules:
+    - method: CLIENT_CREDENTIALS
+----
+
+Discovery must identify the configured issuer.
+The token and UserInfo endpoints must use HTTPS at the issuer's origin.
+The configured issuer authenticates the exact client and returns a UserInfo grant computed by trusted issuer policy.
+Keep the grant out of self-editable profile attributes, tenant settings, and request-controlled claims.
+Reserve the configured prefix at the issuer and provision only grant-bearing client identities under it.
+Use the same enrollment policy on every listener where these credentials can authenticate.
+Keep these credentials exclusive to the client-credentials flow.
+The example admits only client credentials.
+An operator with other authenticated users can supply the listener's existing ordered OIDC rules.
+
+== Issuer and Flight contract
+
+Authenticate with the existing Flight `Authorization: Client <base64(client_id:client_secret)>` header.
+RTDB uses the existing OIDC client-credentials request with `scope=openid`, then reads UserInfo with the returned access token.
+The token response must carry integer `expires_in` from 1 through 300 seconds.
+The issuer returns the authoritative `sub` and one `rtdb_workload_grant` object in the authenticated UserInfo response.
+
+[source,json]
+----
+{
+  "sub": "provisioner-subject",
+  "rtdb_workload_grant": {
+    "version": 1,
+    "audience": "rtdb-cell.example",
+    "database": "example",
+    "incarnation": [19, 18, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+    "grant_id": [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36],
+    "expires_at_micros": 1800000000000000,
+    "operations": ["create-deployment"]
+  }
+}
+----
+
+Supply exactly those grant fields.
+The audience, database name, and subject are nonempty UTF-8 strings of at most 255 bytes, without control characters or surrounding whitespace.
+The database is a literal name and cannot be `*`.
+The client ID prefix is 1 to 128 visible ASCII bytes and excludes `:`.
+The two identifiers are nonzero 16-byte arrays of integers from 0 through 255.
+The operation array contains exactly `create-deployment` in this version.
+The absolute expiry is a signed Unix microsecond timestamp in the next 300 seconds.
+The earlier of the absolute grant expiry and the token expiry is exclusive.
+Matching client IDs require a valid grant on every login.
+RTDB rejects a grant outside that enrollment and rejects any UserInfo response combining it with `rtdb_label_scope`.
+
+Send the existing `rtdb.admin.v1.CreateDeployment` action with an explicit `deployment` and 16-byte `incarnation`.
+If the call supplies `x-xtdb-database`, it must equal the granted name.
+The request body must independently match both grant coordinates.
+The managed catalog orders the name-to-incarnation reservation and verifies the current attachment before replying with both values.
+Verify both reply fields before accepting Create confirmation.
+After a lost reply, resubmit exactly the same pair with a current grant.
+The durable reservation preserves that pair across retries and a different incarnation conflicts.
+The grant is checked at call admission, and a catalog decision already admitted can finish after the credential's expiry.
+
+Treat the Flight bearer session as bounded by the same grant.
+Obtain a new session through client-credentials authentication on renewal.
+Keep the issuer, subject, audience, exact database and incarnation, and `grant_id` stable for the same authority across renewal or process replacement.
+Use an independently issued grant ID for a different installation intent or assignment.
+RTDB derives the stable receipt namespace as SHA-256 of the ASCII bytes `rtdb.v1/workload-receipt`, a single zero byte, the incarnation, the grant ID, and the issuer, audience, subject and database in that order.
+Each string uses UTF-8 bytes prefixed by its unsigned 64-bit big-endian byte length.
+The issuer string is the configured URL in RTDB's parsed URL form.
+Create retries use the existing exact catalog reservation.
+The workload namespace is available for future keyed operations on the original database.
+
+Workload sessions admit the Create action and the existing authentication handshake on the ordinary managed listener.
+Legacy unscoped principals use the existing configured authorization policy.
+W13 label principals continue to use their existing projection, expiry and receipt namespace.
+
+== Required ordered interface for placement and assignment
+
+Placement, transaction, status, recovery, checkpoint and custody actions require separate permission and a route with the corresponding exact admission and retained-receipt contract.
+The interface below defines inputs and results for the original writer integration.
+It is a handoff for a future wire version.
+
+[source,text]
+----
+ordered_submit(
+    verified_grant: { database, incarnation, grant_id, namespace, expires_at, authority },
+    key: bytes[16..64],
+    operation: AdvancePlacement { expected_fence, next, predecessor_closure }
+             | ClaimWriter { expected_fence, claim }
+             | CloseWriter { expected_fence, writer, closure }
+             | Write { expected_fence, writer, transaction }
+             | SettleAttempt { attempt, request_digest }
+) -> retained_receipt
+
+ordered_status(
+    verified_grant: { database, incarnation, grant_id, namespace, expires_at, authority },
+    key: bytes[16..64]
+) -> retained_receipt | unknown
+
+ordered_predecessor_evidence(
+    verified_grant: { database, incarnation, expires_at, authority },
+    predecessor: { retired_assignment, original_writer, writer_receipt, close_receipt }
+) -> exact_cut_evidence
+
+authority = PlacementAdvance { installation_intent, expected_fence, next }
+          | WriterClaim { assignment, fence_basis }
+          | WriterClose { assignment, fence_basis, original_writer }
+          | WriterWrite { assignment, fence_basis, original_writer }
+          | ReceiptRecovery { original_namespace, operation_family }
+          | AttemptSettlement { original_namespace, attempt, request_digest }
+          | PredecessorEvidence { exact_predecessor }
+assignment = { placement_epoch, assignment_id, holder }
+expected_fence = { assignment, written_basis }
+predecessor_closure = { retired_assignment, original_writer, applied_receipt }
+writer = {
+    point: { configured_relation, exact_row_id, valid_at_micros },
+    applied_receipt: { key, basis, system_time_micros }
+}
+----
+
+* Build `verified_grant` only from a configured issuer's authenticated authorization.
+For an assignment, bind the accepted holder, placement epoch and assignment to the grant.
+Match the submitted expected fence and original writer to that authority.
+Resolve the writer point from the original attachment's trusted configuration.
+The request cannot choose a relation, row or branch that satisfies its own authorization.
+Use the original database and branch and treat Basis values as opaque RTDB bytes.
+* Give placement advance, writer claim, writer close, assignment mutation, receipt access and recovery distinct typed permissions.
+A placement advance compares the exact predecessor fence version and requires the original writer's positive ordered closure evidence when displacing a holder.
+The first placement uses an explicit empty predecessor, and a confirmed vacancy carries its own ordered evidence.
+The new fence and its receipt publish together on the original database.
+A writer claim compares the exact accepted assignment and fence version and binds its original applied receipt.
+A close compares that same fence and original writer and records the closed state and its receipt in one decision.
+An assignment data mutation must preserve the fence and writer authority rows.
+Check permission for every operation in each arm before either arm can produce effects.
+* For each new assignment decision, compare the exact epoch, assignment, holder and fence written Basis at the ordered writer cut.
+Authenticate the original writer's applied receipt by key, Basis and system time and compare that written version at the configured valid-time point and the current decision-time point.
+Require a live writer and an unexpired grant at the ordered decision.
+Closure and replacement share that order with mutation, so a delayed former-holder request fails even while its credential remains valid.
+An out-of-band preflight can guide the caller, and admission depends on the same-order comparison.
+The route must enforce expiry and the fence at the last decision that can admit an effect, including eventual timed settlement, before admitting timed writes.
+* Bind the canonical operation and its immutable assignment evidence to the retained result under `(namespace, key)`.
+An exact retry may return its original result under the same receipt authority and applies no new effects.
+A changed operation or immutable evidence under the same key conflicts.
+Retain this mapping through writer replacement, checkpoint and trim.
+Status is an explicit recovery permission for the original namespace and incarnation.
+An issuer may continue authorizing receipt recovery for a closed assignment independently of fresh write admission.
+Credential expiry and replacement token identity stay outside the canonical operation so a renewed grant can recover its receipt.
+* Scope predecessor evidence to the named predecessor, its exact writer and close receipts, and the original row images at their applied cuts.
+The issuer can give this narrow permission to the placement authority and accepted successor.
+* An unknown submit can be settled only under explicit authority for that original attempt and canonical commitment.
+Settle on the original writer's order, under the same durable attempt identity as the positive submission.
+Return the existing result if that submission already won.
+If settlement wins, retain a negative outcome and refuse a later positive submission for that attempt.
+
+Qualify the interface against old-grant races across ordered closure, replacement and restart, including a displaced writer version still visible at its original valid time.
+Also qualify cross-incarnation and cross-assignment status, partial attempts and lost replies across a checkpoint, and each operation that could modify fence or writer authority.

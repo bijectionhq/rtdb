@@ -30,6 +30,7 @@ const MAX_PAGE_ROWS: u32 = 4096;
 const MAX_CHANGE_GROUPS: u32 = 256;
 const MAX_WAIT: Duration = Duration::from_secs(30);
 pub(crate) const CAPABILITIES: &str = "rtdb.v1.Capabilities";
+pub(crate) const MANAGED_CREATE: &str = "rtdb.admin.v1.CreateDeployment";
 pub(crate) const ACTIONS: [&str; 3] = [
     CAPABILITIES,
     "rtdb.v1.Transact",

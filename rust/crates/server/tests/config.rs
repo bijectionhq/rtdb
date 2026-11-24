@@ -123,6 +123,19 @@ fn startup_auth_rules_remain_ordered_and_default_oidc_to_reference_trust() {
     let config = decode("authn: !OpenIdConnect\n  issuerUrl: http://localhost:8080/realm\n  clientId: db\n  clientSecret: secret").unwrap();
     let AuthConfig::OpenIdConnect(config) = config.auth else { panic!() };
     assert_eq!(config.rules[0].method, Method::Trust);
+    assert!(config.workload_grants.is_none());
+}
+
+#[test]
+fn startup_configures_an_explicit_workload_audience_and_client_prefix() {
+    let oidc = "authn: !OpenIdConnect\n  issuerUrl: https://issuer.example/realm\n  clientId: db\n  clientSecret: secret";
+    let config = decode(&format!("{oidc}\n  workloadGrants: {{audience: cell, clientIdPrefix: workload-}}")).unwrap();
+    let AuthConfig::OpenIdConnect(config) = config.auth else { panic!() };
+    let grants = config.workload_grants.unwrap();
+    assert_eq!(grants.audience(), "cell");
+    assert_eq!(grants.client_id_prefix(), "workload-");
+    assert!(decode(&format!("{oidc}\n  workloadGrants: {{audience: cell}}")).is_err());
+    assert!(decode(&format!("{oidc}\n  workloadGrants: {{audience: cell, clientIdPrefix: '', extra: true}}")).is_err());
 }
 
 #[test]

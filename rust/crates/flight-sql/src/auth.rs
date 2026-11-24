@@ -100,6 +100,7 @@ mod tests {
             client_id: "rtdb".into(),
             client_secret: Secret::new("configured"),
             rules: vec![MethodRule::any(Method::ClientCredentials)],
+            workload_grants: None,
         }), memory.clone(), Arc::new(rtdb_node::SystemClock), Arc::new(Issuer(memory))).await.unwrap();
         let mut request = Request::new(());
         request.metadata_mut().insert("authorization", "Client Y2xpZW50OnNlY3JldA==".parse().unwrap());

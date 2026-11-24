@@ -59,7 +59,7 @@ struct AudienceSessionSeat {
 }
 
 #[derive(Clone, Copy)]
-enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action }
+enum CallKind { Ordinary, Handshake, Action, AudienceCleanup, V1Query, V1Changes, V1Capabilities, V1Action, ManagedCreate }
 
 impl CallKind {
     fn allows_label_scope(self) -> bool {
@@ -68,6 +68,10 @@ impl CallKind {
 
     fn serves_assigned_follower(self) -> bool {
         matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities)
+    }
+
+    fn allows_workload_grant(self) -> bool {
+        matches!(self, Self::Handshake | Self::ManagedCreate)
     }
 
     fn action(audience: bool, name: &str) -> Self {
@@ -303,6 +307,21 @@ impl Service {
             (Some(follower.select(request.metadata()).map_err(crate::v1::error::follower)?), Some(follower.current(&self.0.node).map_err(crate::v1::error::follower)?))
         } else { (requested_database, follower_attachment) };
         let forwarded_peer = request.metadata().get(FORWARDED_PEER_HEADER);
+        let admit_workload = |principal: &rtdb_auth::Principal, fresh_replica| {
+            if let Some(grant) = principal.workload_grant() {
+                if !kind.allows_workload_grant()
+                    || audience.is_some()
+                    || self.follower_only()
+                    || fresh_replica
+                    || forwarded_peer.is_some()
+                    || requested_database.is_some_and(|name| name != grant.database())
+                    || !self.0.node.catalog().is_managed()
+                {
+                    return Err(Status::permission_denied("The credential requires its exact managed workload route"));
+                }
+            }
+            Ok(())
+        };
         let credentials = Credentials::parse(request)?;
         let cookie = auth::cookie(request); let bearer = credentials.bearer();
         if let (Some(cookie), Some(bearer)) = (cookie, bearer) { if !auth::equal(cookie.as_bytes(), bearer.as_bytes()) { return Err(auth::unauthenticated("the session cookie and bearer token name different sessions")); } }
@@ -336,6 +355,7 @@ impl Service {
                 self.retire_session(&session);
                 return Err(auth::auth_error(error));
             }
+            admit_workload(&session.caller.principal, session.fresh_replica)?;
             (session, false, lease)
         } else {
             if audience_source.is_some() && (!matches!(kind, CallKind::Handshake) || forwarded_peer.is_none()) {
@@ -361,6 +381,7 @@ impl Service {
             if self.follower_only() && (!caller.verified_credential || caller.principal.label_scope().is_some()) {
                 return Err(auth::unauthenticated("The assigned follower requires verified unscoped credentials"));
             }
+            admit_workload(&caller.principal, fresh_replica)?;
             if let Some(scope) = caller.principal.label_scope() {
                 if !kind.allows_label_scope() || audience.is_some() || fresh_replica {
                     return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
@@ -478,6 +499,8 @@ impl Service {
         if session.caller.principal.label_scope().is_some() && !kind.allows_label_scope() {
             return Err(Status::permission_denied("The credential requires the scoped RTDB v1 route"));
         }
+        let requested_database = requested_database
+            .or_else(|| session.caller.principal.workload_grant().map(|grant| grant.database()));
         let (database, attachment) = if matches!(kind, CallKind::AudienceCleanup) {
             let original = session.placed_database().ok_or_else(unsupported)?;
             if requested_database.is_some_and(|requested| requested != original) {
@@ -698,7 +721,11 @@ impl FlightService for Service {
     async fn do_action(&self, request: Request<flight::Action>) -> Result<Response<Self::DoActionStream>, Status> {
         let name = request.get_ref().r#type.as_str();
         if crate::v1::is_action(name) {
-            let kind = if name == crate::v1::CAPABILITIES { CallKind::V1Capabilities } else { CallKind::V1Action };
+            let kind = match name {
+                crate::v1::CAPABILITIES => CallKind::V1Capabilities,
+                crate::v1::MANAGED_CREATE => CallKind::ManagedCreate,
+                _ => CallKind::V1Action,
+            };
             let call = self.call_with_kind(&request, request.get_ref().encoded_len(), kind)
                 .await.map_err(crate::v1::error::map_status)?;
             return self.v1_action(call, request.into_inner()).await;
@@ -730,7 +757,7 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
             assert!(kind.allows_label_scope());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::ManagedCreate] {
             assert!(!kind.allows_label_scope());
         }
     }
@@ -740,8 +767,18 @@ mod tests {
         for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities] {
             assert!(kind.serves_assigned_follower());
         }
-        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action] {
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedCreate] {
             assert!(!kind.serves_assigned_follower());
+        }
+    }
+
+    #[test]
+    fn workload_scope_is_only_admitted_to_managed_create_and_handshake() {
+        for kind in [CallKind::Handshake, CallKind::ManagedCreate] {
+            assert!(kind.allows_workload_grant());
+        }
+        for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities, CallKind::V1Action] {
+            assert!(!kind.allows_workload_grant());
         }
     }
 
