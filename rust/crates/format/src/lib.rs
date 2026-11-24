@@ -17,6 +17,7 @@ pub mod memory_trie;
 pub mod metadata;
 mod statistics;
 mod publication_identity;
+mod certified_checkpoint;
 pub mod temporal_text;
 pub mod transit;
 pub mod trie_retirement;

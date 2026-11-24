@@ -1,0 +1,69 @@
+{
+  "summary": "Certified checkpoint startup and ordered upload admission bind the original manifest and the exact selected table digest.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "publication_identity",
+    "--verify-module",
+    "certified_checkpoint",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "admit_missing_manifest": {
+      "defect": "A certified catalog can omit the manifest that binds its table blocks.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/certified_checkpoint.rs",
+          "find": "    if requires_manifest && !has_manifest {\n        return false;\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/certified_checkpoint.rs",
+          "function": "matches_catalog",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "substitute_root_digest": {
+      "defect": "A catalog from another certified root is accepted because the stored digest is compared with itself.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/certified_checkpoint.rs",
+          "find": "    matches_table(stored, chosen)\n",
+          "replace": "    match stored { Some(digest) => matches_table(stored, digest), None => false }\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/certified_checkpoint.rs",
+          "function": "matches_catalog",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "substitute_table_digest": {
+      "defect": "A different table body can be accepted as an entry of the chosen manifest.",
+      "mutate": [
+        {
+          "file": "rust/crates/format/src/certified_checkpoint.rs",
+          "find": "        Some(digest) => same_publication_digest(digest, loaded),\n",
+          "replace": "        Some(digest) => same_publication_digest(digest, digest),\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/format/src/certified_checkpoint.rs",
+          "function": "matches_table",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}

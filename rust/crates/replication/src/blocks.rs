@@ -168,7 +168,7 @@ pub(crate) fn checkpoint_digest(catalog: &BlockCatalog) -> Result<[u8; 32]> {
 
 pub(crate) fn validate_uploaded_root(catalog: &BlockCatalog, upload: &proto::BlockUploaded, required: bool) -> Result<()> {
     match upload.catalog_sha256.as_deref() {
-        Some(chosen) if chosen == checkpoint_digest(catalog)?.as_slice() => Ok(()),
+        Some(chosen) if <[u8; 32]>::try_from(chosen).is_ok_and(|root| catalog.matches_checkpoint_root(root, required)) => Ok(()),
         None if !required => Ok(()),
         _ => Err(Anomaly::fault("rtdb.replication/checkpoint-digest", "The accepted upload does not certify the exact stored catalog")),
     }
@@ -508,8 +508,8 @@ impl BlockStore {
 
     async fn load_checkpoint(&self, index: BlockIndex, published: Option<PublishedCheckpoint>, root_sha256: Option<[u8; 32]>) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
         let block = self.load_fresh_catalog(index).await?;
-        if root_sha256.is_some_and(|expected| block.publication_sha256() != Some(expected)) {
-            return Err(invalid("The stored checkpoint root does not match the directory receipt"));
+        if root_sha256.is_some_and(|expected| !block.matches_checkpoint_root(expected, true)) {
+            return Err(invalid("The stored checkpoint root or manifest does not match the directory receipt"));
         }
         if published.is_some_and(|expected| !expected.accepts(&block)) {
             return Err(invalid("The stored checkpoint does not match or advance the admitted checkpoint in its replica journal"));
