@@ -303,7 +303,8 @@ impl Service {
         let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
         if request.custody_review.is_some() && (
             !request.custody_release_evidence || !request.track || request.page.is_some()
-                || claim_layer != Layer::Merged || !matches!(selection, Some(Selection::Exactly(_)))
+                || visibility.is_some() || claim_layer != Layer::Merged
+                || !matches!(selection, Some(Selection::Exactly(_)))
                 || driver.is_none_or(|driver| !driver.features().contains(&rtdb_tx::transact::ROW_CUSTODY))
         ) {
             return Err(error::unsupported(rtdb_tx::transact::REVIEWED_CUSTODY_PLACEMENT));

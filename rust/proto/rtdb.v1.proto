@@ -76,7 +76,7 @@ message QueryRequest {
   // clear, exact merged main; SQL, params_ipc, Page and field 10 are absent.
   RankedIvf ranked_ivf = 11;
   // Select reviewed occurrences from this same exact merged custody Query.
-  CustodyReviewSelection custody_review = 12;
+  CustodyReviewSelection custody_review = 13;
 }
 message RankedIvf {
   string schema = 1;
