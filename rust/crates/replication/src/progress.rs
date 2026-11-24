@@ -5,6 +5,8 @@ use rtdb_types::{Anomaly, AnomalyCategory, PlacedAttempt, PlacedDecision, Placed
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::replay_progress::{Regression, applied_update};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppliedTransaction {
     result: Arc<TransactionResult>,
@@ -68,6 +70,7 @@ impl ProgressMonitor {
     }
     pub fn current(&self) -> AppliedProgress { self.state.borrow().applied.clone() }
     pub fn fault(&self) -> Option<Anomaly> { self.state.borrow().fault.clone() }
+    pub(crate) fn source_position(&self) -> SourcePosition { self.state.borrow().applied.source_position }
 
     pub(crate) fn reserved(&self, reservation: PlacedReservation) -> Result<()> {
         let mut conflict = false;
@@ -92,25 +95,33 @@ impl ProgressMonitor {
         self.state.send_modify(|state| {
             if let Some(error) = &state.fault { failure = Some(error.clone()); return; }
             if state.stopped { failure = Some(stopped()); return; }
-            if source.is_some_and(|source| source < state.applied.source_position) {
-                failure = Some(Anomaly::fault("rtdb.replication/source-regression", "Applied source watermark moved backwards"));
-                return;
-            }
-            if result.as_ref().is_some_and(|result| result.result.tx_key().tx_id <= state.applied.tx_id()) {
-                failure = Some(Anomaly::fault("rtdb.replication/tx-regression", "Applied transaction ID did not advance"));
-                return;
-            }
+            let update = match applied_update(
+                state.applied.source_position.0,
+                state.applied.tx_id().0,
+                source.map(|position| position.0),
+                result.map(|receipt| (receipt.result.tx_key().tx_id.0, receipt)),
+            ) {
+                Ok(update) => update,
+                Err(Regression::Source) => {
+                    failure = Some(Anomaly::fault("rtdb.replication/source-regression", "Applied source watermark moved backwards"));
+                    return;
+                }
+                Err(Regression::Transaction) => {
+                    failure = Some(Anomaly::fault("rtdb.replication/tx-regression", "Applied transaction ID did not advance"));
+                    return;
+                }
+            };
             if let Some(placed) = state.placed
                 && source.is_some_and(|source| source >= placed.attempt.position())
             {
-                if result.as_ref().is_none_or(|result| result.attempt != Some(placed.attempt)) {
+                if update.completed.as_ref().is_none_or(|(_, result)| result.attempt != Some(placed.attempt)) {
                     failure = Some(Anomaly::fault("rtdb.replication/placed-slot-bypass", "Applied source progress bypassed its receiver slot"));
                     return;
                 }
                 state.placed = None;
             }
-            if let Some(source) = source { state.applied.source_position = source; }
-            if let Some(result) = result { state.applied.tx_key = Some(result.result.tx_key()); state.applied.latest_result = Some(result); }
+            state.applied.source_position = SourcePosition(update.source);
+            if let Some((_, result)) = update.completed { state.applied.tx_key = Some(result.result.tx_key()); state.applied.latest_result = Some(result); }
             if let Some(token) = token { state.applied.external_token = Some(token.into()); }
         });
         failure.map_or(Ok(()), Err)
