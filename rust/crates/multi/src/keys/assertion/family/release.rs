@@ -340,11 +340,18 @@ impl<'a> AssertionFamilies<'a> {
     }
 
     pub async fn cancel_private_family_release(&self, registration: FamilyReleaseRegistration) -> Result<()> {
+        if let Some(prior) = self.confirmed_terminal(registration).await? {
+            if prior != ReleasePhase::Cancelled { return Err(conflict()); }
+            return self.prune_terminal_hold(registration).await;
+        }
         self.require_release_observation(registration, FamilyReleaseObservation::Live).await?;
         self.finish_family_release(registration, ReleasePhase::Cancelled).await
     }
 
     pub async fn settle_family_release(&self, registration: FamilyReleaseRegistration) -> Result<()> {
+        if self.confirmed_terminal(registration).await?.is_some() {
+            return self.prune_terminal_hold(registration).await;
+        }
         self.require_release_observation(registration, FamilyReleaseObservation::Disposed).await?;
         self.finish_family_release(registration, ReleasePhase::Disposed).await
     }
@@ -421,6 +428,13 @@ impl<'a> AssertionFamilies<'a> {
             if self.write(registration.family(), Some(&etag), &family).await? { return Ok(()); }
         }
         Err(contention())
+    }
+
+    async fn confirmed_terminal(&self, registration: FamilyReleaseRegistration) -> Result<Option<ReleasePhase>> {
+        let authority = self.release_authority.ok_or_else(unavailable)?;
+        self.require_release_owner(registration.owner)?;
+        if authority.identity() != registration.owner { return Err(unavailable()); }
+        self.read_release_terminal(registration).await
     }
 
     async fn read_release_terminal(&self, registration: FamilyReleaseRegistration) -> Result<Option<ReleasePhase>> {
