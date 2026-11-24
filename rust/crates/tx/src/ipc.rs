@@ -98,11 +98,13 @@ fn replay_ipc_buffers_keep_the_source_allocation_and_its_charge() {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7, -4]))]).unwrap();
     let bytes = encode(batch.schema_ref(), [&batch], &memory).unwrap();
-    assert_eq!(bytes.as_slice(), rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap());
     let input_charge = memory.used_bytes();
     let inside = bytes.as_slice().as_ptr() as usize..bytes.as_slice().as_ptr() as usize + bytes.as_slice().len();
     let bytes = bytes.into_bytes();
     let pages = decode(&bytes, &memory).unwrap();
+    let reencoded = rtdb_format::ipc::write_stream_to(batch.schema_ref(), pages.iter().map(OwnedBatch::batch), Vec::new()).unwrap();
+    assert_eq!(bytes.as_ref(), reencoded.as_slice());
+
     let values = Arc::clone(pages[0].batch().column(0));
     let both_charges = memory.used_bytes();
 
