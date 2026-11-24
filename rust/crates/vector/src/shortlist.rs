@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::sync::Arc;
 
 use arrow_buffer::Buffer;
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::data::{EncodedEvent, EventBatch};
+use rtdb_format::{data::{EncodedEvent, EventBatch}, ipc::{ArrowFile, inspect_file_reserved}};
 use rtdb_index::{CatalogTrie, Snapshot, TrieState};
-use rtdb_maintenance::input;
 use rtdb_query::IidScope;
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TemporalBounds};
@@ -168,7 +168,7 @@ impl FrontierRanker<'_> {
         for source in sources {
             let Source::Frontier { data } = source else { continue };
             let lease = cut.storage.get_or(data, cut.memory).await?;
-            let (mut reader, _metadata) = input::open_input(std::io::Cursor::new(lease), cut.memory)?;
+            let (mut reader, _metadata) = open_frontier_file(Bytes::from_owner(lease), cut.memory)?;
             let columns = definition.put_columns();
             for page in 0..reader.page_count() {
                 if cut.cancellation.is_cancelled() { return Err(crate::kmeans::cancelled()); }
@@ -202,6 +202,17 @@ impl FrontierRanker<'_> {
         }
         Ok(())
     }
+}
+
+fn open_frontier_file(bytes: Bytes, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
+    let layout = inspect_file_reserved(&mut Cursor::new(bytes.as_ref()), |bytes| memory.reserve(bytes))?;
+    let opening = memory.reserve(layout.opening_allocation_bound()?)?;
+    let reader = if layout.uncompressed && layout.dictionary_encoded_bytes == 0 {
+        ArrowFile::from_inspected_buffer(Buffer::from(bytes), None, layout)?
+    } else {
+        ArrowFile::from_inspected_reader(Cursor::new(bytes), None, layout)?
+    };
+    Ok((reader, opening))
 }
 
 struct Scores {
@@ -332,6 +343,26 @@ mod tests {
         ranker.rank_batch(&batch(&[put(1, [0.0, -0.0], Value::F64(1.0))], ScalarType::F64)?)?;
         let batch = batch(&[put(1, [1.0, 0.0], Value::F64(1.0))], ScalarType::F64)?;
         assert_eq!(ranker.rank_batch(&batch).unwrap_err().code, "rtdb.vector/partition-type");
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_file_reads_plain_arrow_from_its_original_owner() -> Result<()> {
+        use arrow_array::{ArrayRef, RecordBatch, StringArray};
+
+        let input = RecordBatch::try_from_iter([(
+            "text", Arc::new(StringArray::from(vec!["retained payload"])) as ArrayRef,
+        )]).unwrap();
+        let bytes = Bytes::from(rtdb_format::ipc::write_file(input.schema_ref(), std::slice::from_ref(&input))?);
+        let start = bytes.as_ptr() as usize;
+        let source = start..start + bytes.len();
+        let memory = MemoryBudget::new(1 << 20);
+        let (mut reader, _opening) = open_frontier_file(bytes, &memory)?;
+        let _page = memory.reserve(reader.page_allocation_bound(0)?)?;
+        let page = reader.read_page(0)?;
+        let text = page.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0);
+        assert_eq!(text, "retained payload");
+        assert!(source.contains(&(text.as_ptr() as usize)));
         Ok(())
     }
 
