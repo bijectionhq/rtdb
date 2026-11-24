@@ -102,6 +102,11 @@ contract DurableTotalOrder {
         -- Delivery advances the reader's position.
         -- An unavailable delivery reservation is a read error at the current position.
 
+    @invariant OrderedRecoveryUsesTheCertifiedSuffix
+        -- The ordered reader opens the certified checkpoint and advances one record at a time inside its held suffix.
+        -- Renewal starts at the same authenticated cut, and delivery matches the prepared head and the hold's checkpoint and terminal cut.
+        -- A grant holder requires a recognized prefix before an empty read can trigger promotion.
+
     @invariant EmptyReadMeansTheTipWasReached
         -- A read returns empty only when the reader that issued it has reached the log's tip.
         --   This is the observation a claim is made on, and it is the reader's own: it had to ask.

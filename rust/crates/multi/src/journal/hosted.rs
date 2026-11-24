@@ -1325,7 +1325,7 @@ pub(crate) fn checkpoint_for_block(
     })
 }
 
-fn genesis(checkpoint: Checkpoint) -> bool {
+pub(crate) fn genesis(checkpoint: Checkpoint) -> bool {
     checkpoint.cut.next_lsn == 0
         && checkpoint.custody.revision == 1
         && checkpoint.custody.provider == [0; 32]

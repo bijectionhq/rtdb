@@ -18,6 +18,7 @@ pub mod custody;
 pub mod hosted;
 mod prefix_retirement;
 mod log;
+pub(crate) mod replay_cursor;
 pub(crate) use log::{Held, JournalLog};
 use ordered_logkeeper::ordered::TrimResult;
 use rtdb_directory::DeploymentRecord;

@@ -246,6 +246,17 @@ pub(crate) async fn ordered_opened(
 ) -> Result<OpenedLogs> {
     let epoch = StorageEpoch(record.log_epoch);
     let opened = ordered.latest()?;
+    let chosen = admission.recovery.checkpoint;
+    if !crate::journal::replay_cursor::recovery_coordinates_match(
+        opened.0,
+        admission.recovery.through.next_lsn,
+        chosen.cut.next_lsn,
+        crate::journal::hosted::genesis(chosen),
+        checkpoint.map(|block| block.boundary),
+        checkpoint.is_some_and(|block| block.root_sha256 == Some(chosen.root)),
+    ) {
+        return Err(Anomaly::fault("rtdb.multi/recovery-coordinates", "The opened logs differ from the certified checkpoint or suffix"));
+    }
     let scope = PlacedAttemptScope::new(&record.stream("replica"), admission.grant.epoch)?;
     let replica: Arc<dyn Log> = ordered.clone();
     let terminal = record.checkpoint_transfer_activation.as_ref()
