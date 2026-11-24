@@ -51,11 +51,6 @@ def verify_catalogs(catalogs):
                                 "exact retirement path is reachable by an observed catalog hold")
 
 
-def physical_retirement(event):
-    return (*scope(event, ("lineage", "residence", "retirement", "key")),
-            json.dumps(event["publication"], sort_keys=True))
-
-
 def ordered_object_fence(event):
     require(digest(event["name"]) and digest(event["version"]), "object fence lacks exact publication fingerprints")
     placement = scope(event, ("deployment", "incarnation", "group", "generation"))
@@ -138,11 +133,47 @@ def verify_certified_reads(events):
     return answers
 
 
+def detached_effect(event):
+    return event["residence"].startswith("replay-bodies/")
+
+
+def detached_candidate(event, residence):
+    version = event["publication"]
+    provider_key = unquote(version["key"])
+    require(event["key"].startswith(residence + "/oversized/") and version["namespace"]["bucket"]
+            and version["version"] and (provider_key == event["key"] or provider_key.endswith("/" + event["key"]))
+            and type(event["position"]) is int and event["position"] >= 0 and digest(event["frame"]),
+            "detached effect lacks its exact provider publication and sealed frame")
+    return (event["key"], json.dumps(version, sort_keys=True), event["position"], tuple(event["frame"]))
+
+
+def detached_fence(event):
+    start, through = event["interval"]
+    checkpoint = event["checkpoint"]
+    require(0 <= start <= through < checkpoint["boundary"] and event["revision"] > 0
+            and digest(event["anchor"]) and digest(event["manifest"]) and digest(checkpoint["root_sha256"]),
+            "detached recovery fence has no covering checkpoint")
+    return (*replica_scope(event), *scope(event, ("lineage", "residence", "generation")),
+            start, through, tuple(event["anchor"]))
+
+
+def detached_attempt(event):
+    require(event["retirement"] and event["revision"] > 0, "detached effect lacks its durable grant")
+    return (*replica_scope(event), *scope(event, ("lineage", "residence", "generation", "retirement")),
+            detached_candidate(event, event["residence"]), event["revision"])
+
+
+def detached_checkpoint(event):
+    checkpoint = event["checkpoint"]
+    return exact_checkpoint(event, {"block": checkpoint["block"], "through": checkpoint["boundary"],
+                                   "root": checkpoint["root_sha256"]}, event["manifest"])
+
+
 def verify_native(events, *, verify_catalog_history=True, verify_certificate_history=True):
     require(events, "the native trace is empty")
     deletes, trims, catalogs, captures, holds, attempts, reads = {}, set(), {}, {}, {}, {}, set()
     published_decisions, installed_grants, certificates = set(), set(), set()
-    certified_stages = {}
+    certified_stages, detached_stages = {}, {}
     preceding_stage = {
         "certified-catalog-capture": "certified-read-index",
         "certified-answer": "certified-catalog-capture",
@@ -150,7 +181,30 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
     for index, event in enumerate(events):
         try:
             kind = event["event"]
-            if kind in {"authorize-version", "remove-version", "authorize-tombstones", "remove-tombstones",
+            if kind in {"retirement-recovery-dependency", "withdraw-detached-key", "settle-detached-version"} \
+                    or (kind == "remove-version" and detached_effect(event)):
+                attempt = detached_attempt(event)
+                detached_stages.setdefault((kind, attempt), index)
+                if kind == "retirement-recovery-dependency":
+                    detached_fence(event)
+                    start, through = event["interval"]
+                    require(start <= event["position"] <= through and digest(event["decision"]),
+                            "detached retirement lacks its certified recovery exclusion")
+                    require(not event["uploads"] and all(first <= end and not first <= event["position"] <= end
+                                                        for first, end in event["requires"]),
+                            "detached retirement intersects a live read or upload")
+                if kind == "settle-detached-version":
+                    require(event["settled_revision"] >= event["revision"], "detached settlement precedes its grant")
+            elif kind == "detached-recovery-fence":
+                detached_fence(event)
+                require(detached_effect(event) and event["root_incarnation"] == event["incarnation"],
+                        "detached fence crosses a recovery history")
+                require(event["candidates"], "detached fence has no recorded publication census")
+                for candidate in event["candidates"]:
+                    detached_candidate(candidate, event["residence"])
+                    require(event["interval"][0] <= candidate["position"] <= event["interval"][1],
+                            "detached census includes a position outside the fence")
+            elif kind in {"authorize-version", "remove-version", "authorize-tombstones", "remove-tombstones",
                         "authorize-replay-pack", "remove-replay-pack"}:
                 action, effect = kind.split("-", 1)
                 require(event["key"].startswith(event["residence"] + "/"), "deletion targets another residence")
@@ -187,11 +241,6 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
                             tuple(fingerprint) if fingerprint is not None else None)
                 require(decision in published_decisions and 0 <= event["through"] <= event["decision_through"],
                         "append receipt precedes its observed quorum publication")
-            elif kind == "retirement-recovery-dependency":
-                require(digest(event["anchor"]) and digest(event["frame"]) and 0 <= event["position"] <= event["trim_through"],
-                        "retirement has no matching recovery exclusion")
-                require(event["key"].startswith(event["residence"] + "/") and event["publication"]["version"],
-                        "retirement has no exact physical publication")
             elif kind == "authorize-trim":
                 checkpoint = event["checkpoint"]
                 require(digest(event["manifest"]) and digest(checkpoint["root_sha256"])
@@ -266,6 +315,14 @@ def verify_native(events, *, verify_catalog_history=True, verify_certificate_his
         prior = certified_stages.get((preceding_stage.get(kind), identity))
         # An independently captured owner may supply the earlier stage in its own file.
         require(prior is None or prior < index, f"{kind} precedes its exact prerequisite in the same capture")
+    for (kind, identity), index in detached_stages.items():
+        prerequisite = {
+            "withdraw-detached-key": "retirement-recovery-dependency",
+            "remove-version": "withdraw-detached-key",
+            "settle-detached-version": "remove-version",
+        }.get(kind)
+        prior = detached_stages.get((prerequisite, identity))
+        require(prior is None or prior < index, f"{kind} precedes its detached deletion prerequisite")
     if verify_catalog_history:
         verify_catalogs(catalogs)
     if verify_certificate_history:
@@ -293,19 +350,26 @@ def verify_joined(captures):
     for events in captures:
         verify_native(events, verify_catalog_history=False, verify_certificate_history=False)
     events = [event for capture in captures for event in capture]
-    published, catalogs, recovery_fences, dependencies, replay_holds, exclusions = {}, {}, {}, {}, {}, {}
+    published, published_certified, catalogs, replay_holds, exclusions = {}, {}, {}, {}, {}
+    censuses, fences_by_residence, grants, withdrawals, removals = {}, {}, {}, set(), set()
     certified_pointers = set()
     for event in events:
         kind = event["event"]
         if kind == "publish-checkpoint":
             identity = exact_checkpoint(event, event, event["manifest"])
             published[identity] = min(event["revision"], published.get(identity, event["revision"]))
+            if event.get("decision") is not None:
+                key = (identity, tuple(event["decision"]))
+                published_certified[key] = min(event["revision"], published_certified.get(key, event["revision"]))
         elif kind in {"advance-floor", "close-catalog-admission", "catalog-hold", "catalog-release"}:
             catalogs.setdefault(scoped_catalog(event), []).append(event)
-        elif kind == "authorize-trim":
-            key = (*replica_scope(event), event["through"], tuple(event["anchor"]))
-            revision = event["revision"]
-            recovery_fences[key] = min(revision, recovery_fences.get(key, revision))
+        elif kind == "detached-recovery-fence":
+            fence = detached_fence(event)
+            key = (*replica_scope(event), event["lineage"], event["residence"])
+            fences_by_residence.setdefault(key, []).append((*event["interval"], event["revision"]))
+            for candidate in event["candidates"]:
+                entry = (*fence, detached_candidate(candidate, event["residence"]))
+                censuses[entry] = min(event["revision"], censuses.get(entry, event["revision"]))
         elif kind == "broker-certified-pointer":
             certified_pointers.add((*broker_pointer(event), event["revision"]))
         elif kind == "admit-recovery":
@@ -313,15 +377,21 @@ def verify_joined(captures):
             hold = scope(event, ("first_required", "through", "revision"))
             require(replay_holds.setdefault(key, hold) == hold, "replay hold changed its admitted range")
         elif kind == "retirement-recovery-dependency":
-            key = physical_retirement(event)
-            dependency = (*replica_scope(event), event["position"], tuple(event["frame"]))
-            require(dependencies.setdefault(key, dependency) == dependency,
-                    "retirement changed its certified replica dependency")
-            publication = (*replica_scope(event), event["key"], key[-1])
+            attempt = detached_attempt(event)
+            grant, candidate = attempt[:-2], attempt[-2]
+            require(grants.setdefault(grant, candidate) == candidate,
+                    "the detached grant changed its sealed frame or publication")
+            publication = (*replica_scope(event), event["key"], candidate[1])
             exclusions[publication] = min(event["revision"], exclusions.get(publication, event["revision"]))
+        elif kind == "withdraw-detached-key":
+            withdrawals.add(detached_attempt(event))
+        elif kind == "remove-version" and detached_effect(event):
+            removals.add(detached_attempt(event))
     verify_catalogs(catalogs)
     ordered_fences = {ordered_object_fence(event) for event in events if event["event"] == "ordered-object-fence"}
     joined = verify_certified_reads(events)
+    attempts = {detached_attempt(event) for event in events if event["event"] == "retirement-recovery-dependency"}
+    require(removals <= attempts & withdrawals, "detached provider removal lacks its exact grant and key withdrawal")
     for event in events:
         kind = event["event"]
         if kind == "authorize-trim":
@@ -331,10 +401,27 @@ def verify_joined(captures):
             }, event["manifest"])
         elif kind == "hosted-recovery-closure":
             identity = exact_checkpoint(event, event, event["manifest"])
+        elif kind == "detached-recovery-fence":
+            identity = detached_checkpoint(event)
         elif kind == "retirement-recovery-dependency":
-            trim = (*replica_scope(event), event["trim_through"], tuple(event["anchor"]))
-            require(trim in recovery_fences and recovery_fences[trim] <= event["revision"],
-                    "dependent retirement lacks the exact installed recovery exclusion")
+            candidate = detached_candidate(event, event["residence"])
+            entry = (*detached_fence(event), candidate)
+            require(entry in censuses and censuses[entry] <= event["revision"],
+                    "dependent retirement lacks its exact installed census and recovery exclusion")
+            checkpoint = (detached_checkpoint(event), tuple(event["decision"]))
+            require(checkpoint in published_certified and published_certified[checkpoint] <= event["revision"],
+                    "detached retirement lacks its exact certified replacement checkpoint")
+            joined += 1
+            continue
+        elif kind == "withdraw-detached-key":
+            require(detached_attempt(event) in attempts, "key withdrawal lacks its exact detached grant")
+            joined += 1
+            continue
+        elif kind == "remove-version" and detached_effect(event):
+            joined += 1
+            continue
+        elif kind == "settle-detached-version":
+            require(detached_attempt(event) in removals, "detached settlement lacks its exact provider removal")
             joined += 1
             continue
         elif kind == "read-retained-payload":
@@ -346,6 +433,10 @@ def verify_joined(captures):
             if event.get("frame") is not None:
                 require((*broker_pointer(event), event["revision"]) in certified_pointers,
                         "broker read lacks the exact certified pointer")
+                fence_scope = (*replica_scope(event), event["lineage"], event["residence"])
+                require(all(not first <= event["position"] <= through or event["revision"] < revision
+                            for first, through, revision in fences_by_residence.get(fence_scope, [])),
+                        "broker read follows the recovery fence for its exact position")
             source = event.get("source_hold")
             if source is not None:
                 require(digest(event["frame"]), "broker read lacks its certified sealed frame")
@@ -363,10 +454,6 @@ def verify_joined(captures):
         elif kind == "remove-installed-publication":
             require(ordered_object_fence(event) in ordered_fences,
                     "installed deletion lacks the matching ordered recovery exclusion")
-            joined += 1
-            continue
-        elif kind == "remove-version" and "/oversized/" in event["key"]:
-            require(physical_retirement(event) in dependencies, "payload removal lacks a matching recovery dependency")
             joined += 1
             continue
         else:

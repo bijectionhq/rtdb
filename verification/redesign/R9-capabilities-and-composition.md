@@ -193,4 +193,9 @@ The checker joins that admission to the origin replay ticket and requires a matc
 Installed receipt reclamation emits the ordered journal's withdrawal position and exact provider path and publication fingerprints.
 The provider trace joins those fingerprints with the placement and withdrawal position before validating physical removal.
 This covers installed receipt publications for which the runtime can obtain an exact object fence.
-The complete T2 replay requires the full reachable-publication census and a recovery exclusion that can settle the detached version independently of physical trim. The broker serves normal tails and ranges. Administrative and transfer access and hosted credential provisioning remain relevant to closing the full recovery inventory.
+The detached broker now has a native deletion replay for its certified contiguous recovery fence.
+The directory records the covered positions and exact versioned publication candidates when it installs the fence.
+The trace joins the retained T1 checkpoint decision and manifest to the broker's exact grant and recorded intervals and upload census.
+The provider effect follows the matching key withdrawal, and observed provider absence precedes directory settlement.
+The native source fixture exercises the journal, directory and broker with a controlled provider effect, before physical trim.
+The general reachability design still needs to advance past unrelated finite holds while preserving their positions.

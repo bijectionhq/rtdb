@@ -5094,6 +5094,7 @@ def verify_native_recovery_trace(args, source):
 
     validate_recovery_revisions(args, label, trace)
     verify_native_payload_replay(args, source)
+    verify_native_detached_deletion(args, source)
 
 
 def verify_native_payload_replay(args, source):
@@ -5145,6 +5146,63 @@ def verify_native_payload_replay(args, source):
             raise
     else:
         raise ValueError(f"{label}: accepted a substituted originating hold")
+
+
+def verify_native_detached_deletion(args, source):
+    import copy
+
+    label = "rust-detached-deletion"
+    fixture = "replay_broker::tests::detached_version_settles_under_its_certified_fence_before_physical_trim"
+    command = ["cargo", "test", "--locked", "-p", "rtdb-multi", "--lib", fixture, "--", "--exact"]
+    with tempfile.TemporaryDirectory(prefix="rtdb-detached-deletion-") as temporary:
+        path = Path(temporary) / "residence.jsonl"
+        env = os.environ | {
+            "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")),
+            "CARGO_PROFILE_DEV_DEBUG": "0",
+            "CARGO_PROFILE_TEST_DEBUG": "0",
+            "CARGO_INCREMENTAL": "0",
+            "RTDB_RESIDENCE_TRACE_PATH": str(path),
+        }
+        result = run_case(command, source / "rust", args.evidence, label, env)
+        if result.returncode or f"{fixture} ... ok" not in result.stdout:
+            raise ValueError(f"{label}: the native broker did not settle a detached publication")
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        shutil.copyfile(path, args.evidence / f"{label}.jsonl")
+
+    required = {"publish-checkpoint", "detached-recovery-fence", "retirement-recovery-dependency",
+                "withdraw-detached-key", "remove-version", "settle-detached-version"}
+    kinds = {event["event"] for event in events}
+    if not required.issubset(kinds) or "apply-trim" in kinds:
+        raise ValueError(f"{label}: expected a complete settlement without a physical trim")
+
+    broker_kinds = {"retirement-recovery-dependency", "withdraw-detached-key"}
+    directory = [event for event in events if event["event"] not in broker_kinds | {"remove-version"}]
+    broker = [event for event in events if event["event"] in broker_kinds]
+    provider = [event for event in events if event["event"] == "remove-version"]
+    verify_joined([directory, broker, provider])
+
+    replacement = copy.deepcopy(provider)
+    replacement[0]["publication"]["version"] = "another-exact-version"
+    held = copy.deepcopy(broker)
+    position = next(event["position"] for event in held if event["event"] == "retirement-recovery-dependency")
+    next(event for event in held if event["event"] == "retirement-recovery-dependency")["requires"] = [[position, position]]
+    wrong_checkpoint = copy.deepcopy(broker)
+    next(event for event in wrong_checkpoint if event["event"] == "retirement-recovery-dependency")["decision"][0] ^= 1
+    controls = (
+        ([event for event in directory if event["event"] != "detached-recovery-fence"], broker, provider,
+         "dependent retirement lacks its exact installed census"),
+        (directory, held, provider, "detached retirement intersects a live read or upload"),
+        (directory, wrong_checkpoint, provider, "detached retirement lacks its exact certified replacement checkpoint"),
+        (directory, broker, replacement, "detached provider removal lacks its exact grant"),
+    )
+    for directory_events, broker_events, provider_events, message in controls:
+        try:
+            verify_joined([directory_events, broker_events, provider_events])
+        except ValueError as error:
+            if message not in str(error):
+                raise
+        else:
+            raise ValueError(f"{label}: expected rejection for {message}")
 
 
 def capture_native_recovery(args, source, label, trace, observations):

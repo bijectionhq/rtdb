@@ -387,7 +387,6 @@ impl Service {
     async fn reclaim_one(
         &self, inventory: &rtdb_s3::VersionedInventory, record: &DeploymentRecord, candidate: &ReplicaPayloadCandidate,
     ) -> Result<()> {
-        let history = History::of(record)?;
         let logical = ObjectKey::new(&candidate.key)?;
         check_publish_key(&logical)?;
         let residence = residence(record);
@@ -397,9 +396,20 @@ impl Service {
         {
             return Ok(());
         }
+        self.settle_candidate(record, candidate, logical, physical, |key, version| async move {
+            inventory.retire_observed_version(&key, &version).await
+        }).await
+    }
+
+    async fn settle_candidate<R: Future<Output = Result<()>>>(
+        &self, record: &DeploymentRecord, candidate: &ReplicaPayloadCandidate, logical: ObjectKey, physical: ObjectKey,
+        remove: impl FnOnce(ObjectKey, PhysicalObjectVersion) -> R,
+    ) -> Result<()> {
+        let history = History::of(record)?;
+        let residence = residence(record);
         let token = Uuid::new_v4();
         let owner = crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
-            if !history.matches(current) || !permits_release(current, candidate)? {
+            if !history.matches(current) || !permits_release(current, candidate, rtdb_directory::now_ms())? {
                 return Ok(());
             }
             if let Some(chosen) = current.replica_payload_trim.as_mut().and_then(|work|
@@ -409,29 +419,39 @@ impl Service {
             }
             Ok(())
         }).await?;
-        if !history.matches(&owner) { return Ok(()); }
+        let sampled = rtdb_directory::now_ms();
+        if !history.matches(&owner) || !permits_release(&owner, candidate, sampled)? { return Ok(()); }
         let Some(grant) = owner.replica_payload_trim.as_ref().and_then(|work| work.candidates.iter()
             .find(|chosen| same_candidate(candidate, chosen))).and_then(|chosen| chosen.grant)
         else { return Ok(()); };
         let anchor = owner.replica_anchor.as_deref().ok_or_else(refused)?;
-        crate::residence_trace::record("retirement-recovery-dependency", || serde_json::json!({
+        let decision = crate::hosted_recovery::checkpoint_decision(&owner)?.ok_or_else(refused)?;
+        let effect = || serde_json::json!({
             "lineage": owner.lineage, "installation": owner.id, "incarnation": owner.incarnation,
-            "epoch": owner.log_epoch, "stream": owner.stream("replica"), "revision": owner.version,
-            "residence": residence, "retirement": grant, "key": physical.as_str(),
+            "epoch": owner.log_epoch, "stream": owner.stream("replica"), "generation": owner.storage_generation,
+            "revision": owner.version, "residence": residence, "retirement": grant, "key": physical.as_str(),
             "publication": candidate.version, "position": candidate.position, "frame": candidate.frame_sha256,
-            "trim_through": anchor.interval[1], "anchor": anchor.digest,
-        }));
+        });
+        crate::residence_trace::record("retirement-recovery-dependency", || {
+            let mut observation = effect();
+            observation["interval"] = serde_json::json!(anchor.interval);
+            observation["anchor"] = serde_json::json!(anchor.digest);
+            observation["checkpoint"] = serde_json::json!(owner.checkpoint);
+            observation["manifest"] = serde_json::json!(owner.recovery_manifest_sha256);
+            observation["decision"] = serde_json::json!(decision.certificate.statement.fingerprint());
+            observation["requires"] = serde_json::json!(owner.replica_dependency_intervals(sampled).collect::<Vec<_>>());
+            observation["uploads"] = serde_json::json!(publication_retaining(&owner, &candidate.key).collect::<Vec<_>>());
+            observation
+        });
         let io = IoRegion::new();
         let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, owner.log_epoch), Arc::clone(&io));
         let withdrawn = ledger.withdraw(&logical).await;
         io.close_and_wait().await;
         withdrawn?;
-        inventory.retire_observed_version(&physical, &candidate.version).await?;
-        crate::residence_trace::record("remove-version", || serde_json::json!({
-            "installation": owner.id, "incarnation": owner.incarnation, "epoch": owner.log_epoch, "lineage": owner.lineage,
-            "residence": residence, "retirement": grant, "key": physical.as_str(), "publication": candidate.version,
-        }));
-        crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
+        crate::residence_trace::record("withdraw-detached-key", || effect());
+        remove(physical.clone(), candidate.version.clone()).await?;
+        crate::residence_trace::record("remove-version", || effect());
+        let settled = crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
             if history.matches(current)
                 && let Some(work) = current.replica_payload_trim.as_mut()
             {
@@ -439,6 +459,15 @@ impl Service {
             }
             Ok(())
         }).await?;
+        if history.matches(&settled) && settled.replica_payload_trim.as_ref().is_none_or(|work| {
+            work.candidates.iter().all(|chosen| chosen.grant != Some(grant) || !same_candidate(candidate, chosen))
+        }) {
+            crate::residence_trace::record("settle-detached-version", || {
+                let mut observation = effect();
+                observation["settled_revision"] = serde_json::json!(settled.version);
+                observation
+            });
+        }
         Ok(())
     }
 
@@ -681,7 +710,13 @@ fn same_candidate(left: &ReplicaPayloadCandidate, right: &ReplicaPayloadCandidat
         && left.frame_sha256 == right.frame_sha256 && left.version == right.version
 }
 
-fn permits_release(record: &DeploymentRecord, candidate: &ReplicaPayloadCandidate) -> Result<bool> {
+fn publication_retaining<'a>(record: &'a DeploymentRecord, logical: &'a str) -> impl Iterator<Item = Uuid> + 'a {
+    record.storage_regions.iter().filter_map(move |(&id, region)| {
+        matches!(region, StorageRegion::ReplicaPublication { key, .. } if key == logical).then_some(id)
+    })
+}
+
+fn permits_release(record: &DeploymentRecord, candidate: &ReplicaPayloadCandidate, now_ms: i64) -> Result<bool> {
     Ok(matches!(record.lifecycle, Lifecycle::Live | Lifecycle::Quarantined)
         && candidate.position >= 0 && candidate.frame_sha256 != [0; 32]
         && crate::hosted_recovery::checkpoint_decision(record)?.is_some()
@@ -690,10 +725,8 @@ fn permits_release(record: &DeploymentRecord, candidate: &ReplicaPayloadCandidat
             anchor.root_incarnation == record.incarnation && (anchor.interval[0]..=anchor.interval[1]).contains(&candidate.position))
         && record.replica_payload_trim.as_ref().is_some_and(|work| work.belongs_to(record)
             && work.candidates.iter().any(|chosen| same_candidate(candidate, chosen)))
-        && !record.requires_replica_offset(candidate.position, rtdb_directory::now_ms())
-        && !record.storage_regions.values().any(|region| {
-            matches!(region, StorageRegion::ReplicaPublication { key, .. } if key == &candidate.key)
-        }))
+        && !record.requires_replica_offset(candidate.position, now_ms)
+        && publication_retaining(record, &candidate.key).next().is_none())
 }
 
 struct BrokerUpload {
@@ -882,6 +915,111 @@ fn transport(error: impl std::fmt::Display) -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn detached_version_settles_under_its_certified_fence_before_physical_trim() {
+        use crate::{hosted_recovery::{ReplicaTrimPlan, observe_checkpoint}, keys::LocalKeyService, lease::LeaseOptions,
+            logs::JournalUnits, process};
+        use rtdb_directory::{Checkpoint, CheckpointDecision, MemberId, MemoryDirectory};
+        use rtdb_format::log::proto::NoOp;
+        use rtdb_storage::log::{Log, LogOffset};
+        use rtdb_types::{BlockIndex, S3ObjectNamespace, Term, TermSequence, Timestamp};
+
+        let data = tempfile::tempdir().unwrap();
+        let directory = MemoryDirectory::new();
+        let journal = process::start_logkeeper(directory.clone(), process::LogkeeperSettings {
+            listen: "127.0.0.1:0".parse().unwrap(), advertise_host: None, authority: None,
+            data_dir: data.path().join("journal"), fsync: true, cache_bytes: 1 << 20,
+            availability_zone: "local".into(), lease: LeaseOptions::default(),
+        }).await.unwrap();
+        let mut record = crate::admin::create_deployment(directory.as_ref(), "shop", "acme", 1).await.unwrap();
+        record.holder = Some(MemberId("writer".into()));
+        record.epoch = 1;
+        record.lifecycle = Lifecycle::Live;
+        let record = directory.replace_deployment(record.clone(), record.version).await.unwrap();
+        let Cas::Applied(mut record) = record else { panic!("the directory refused the test holder"); };
+        let stream = crate::admin::administration_stream(directory.as_ref(), &record, process::MAXIMUM_LOG_MESSAGE_BYTES).await.unwrap();
+        let shutdown = CancellationToken::new();
+        let writer = rtdb_logkeeper::open_writer(stream, record.epoch, shutdown.clone()).await.unwrap();
+        let keys = Arc::new(LocalKeyService::new(data.path().join("journal-keys")).unwrap());
+        keys.key(&record.key_id()).await.unwrap();
+        let io = IoRegion::new();
+        let slots = JournalUnits::open(keys.as_ref(), &record.key_id(), &record.replica_seal_scope(), io.clone()).await.unwrap();
+
+        let allocation = Uuid::new_v4().to_string();
+        let relative = oversized_key(BlockIndex(0), &allocation).unwrap();
+        let key = ObjectKey::new(format!("{}/{relative}", residence(&record))).unwrap();
+        let version = PhysicalObjectVersion {
+            namespace: S3ObjectNamespace { bucket: "detached-fixture".into(), endpoint: None, region: None },
+            key: key.to_string(), version: "exact-version".into(),
+        };
+        let data_frame = ReplicaEnvelope {
+            term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(NoOp::default()),
+        };
+        let body = Bytes::from(data_frame.encode());
+        let broker = Service::open(directory.clone(), CellStorage::Local { root: data.path().join("detached") },
+            &CellStorage::Local { root: data.path().join("serving") },
+            Arc::new(LocalKeyService::new(data.path().join("detached-keys")).unwrap()), None, None, None).unwrap();
+        let relative = ObjectKey::new(relative).unwrap();
+        let opened = broker.open_store(&record, io.clone()).await.unwrap();
+        opened.put(&relative, body.clone()).await.unwrap();
+        let mut pointer = data_frame.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(0), allocation, &body);
+        pointer.bind_offload_publication(version.clone()).unwrap();
+        for (lsn, frame) in [Bytes::from(pointer.encode()), body.clone(), body.clone()].into_iter().enumerate() {
+            let sealed = slots.seed(lsn as i64, frame).await.unwrap();
+            let receipt = writer.enqueue(sealed, Timestamp(lsn as i64)).await.unwrap().durable().await.unwrap();
+            assert_eq!(receipt.offset, LogOffset(lsn as i64));
+        }
+        let read = writer.read_index(record.epoch).await.unwrap();
+        let decision = read.decision().unwrap();
+        let checkpoint = Checkpoint { block: 0, boundary: 1, source: -1, system_time: 0, root_sha256: Some([9; 32]) };
+        let manifest = [7; 32];
+        let fingerprint = decision.certificate.statement.fingerprint();
+        record.checkpoint = Some(checkpoint);
+        record.recovery_manifest_sha256 = Some(manifest);
+        record.checkpoint_decision = Some(Box::new(CheckpointDecision {
+            checkpoint, manifest, stable: prost::Message::encode_to_vec(decision),
+        }));
+        let installed = directory.replace_deployment(record.clone(), record.version).await.unwrap();
+        let Cas::Applied(record) = installed else { panic!("the directory refused the checkpoint"); };
+        observe_checkpoint(&record, checkpoint, manifest, Some(fingerprint));
+
+        let mut held = record.clone();
+        held.storage_regions.insert(Uuid::new_v4(), StorageRegion::ReplicaReplay {
+            first_required: 0, through: 0, custody: ReplayCustody::Local,
+        });
+        assert!(ReplicaTrimPlan::new(held, checkpoint.boundary, -1, 0).is_none());
+        let members = directory.members().await.unwrap().into_iter().map(|member| (member.id.clone(), member)).collect();
+        let plan = ReplicaTrimPlan::new(record.clone(), checkpoint.boundary, -1, 0).unwrap();
+        let _trim = plan.authorize(directory.as_ref(), &members, keys.as_ref(), true).await.unwrap().unwrap();
+
+        let later = Uuid::new_v4();
+        let record = crate::admin::update_installation(directory.as_ref(), &record.id, |record| {
+            record.storage_regions.insert(later, StorageRegion::ReplicaReplay {
+                first_required: 1, through: 1, custody: ReplayCustody::Local,
+            });
+            Ok(())
+        }).await.unwrap();
+        let candidate = &record.replica_payload_trim.as_ref().unwrap().candidates[0];
+        assert_eq!(candidate.version, version);
+        broker.settle_candidate(&record, candidate, relative.clone(), key.clone(), |selected_key, selected_version| {
+            let (broker, io, opened, relative) = (&broker, &io, &opened, &relative);
+            async move {
+                assert_eq!(selected_key, key);
+                assert_eq!(selected_version, version);
+                assert!(matches!(opened.get(relative).await, Err(rtdb_storage::Error::ErasedUnderView)));
+                let store = broker.storage.bucket(io.clone()).await?;
+                store.delete(&selected_key).await?;
+                Ok(())
+            }
+        }).await.unwrap();
+        let settled = directory.deployment(&record.id).await.unwrap().unwrap();
+        assert!(settled.replica_payload_trim.unwrap().candidates.is_empty());
+        assert_eq!(writer.read_range(LogOffset(0), LogOffset(1)).await.unwrap().len(), 1);
+        io.close_and_wait().await;
+        shutdown.cancel();
+        journal.stop().await.unwrap();
+    }
 
     #[test]
     fn broker_publication_follows_the_exact_installed_epoch_and_residence() {

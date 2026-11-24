@@ -573,12 +573,17 @@ impl StorageRegion {
         }
     }
 
-    pub fn requires_replica_offset(&self, offset: i64) -> bool {
+    pub fn replica_dependency_interval(&self) -> Option<[i64; 2]> {
         match self {
-            Self::ReplicaReplay { first_required, through, .. } =>
-                *first_required < 0 || *through < *first_required || (*first_required..=*through).contains(&offset),
-            region => region.first_required_replica().is_some_and(|first| first <= offset),
+            Self::ReplicaReplay { first_required, through, .. } if *first_required < 0 || *through < *first_required =>
+                Some([i64::MIN, i64::MAX]),
+            Self::ReplicaReplay { first_required, through, .. } => Some([*first_required, *through]),
+            region => region.first_required_replica().map(|first| [first, i64::MAX]),
         }
+    }
+
+    pub fn requires_replica_offset(&self, offset: i64) -> bool {
+        self.replica_dependency_interval().is_some_and(|[first, through]| (first..=through).contains(&offset))
     }
 
     pub fn tracks_ordered_index_pages(&self) -> bool {
@@ -1153,13 +1158,17 @@ impl DeploymentRecord {
                 .map(|pin| self.verified_suffix_interval(pin).map_or(0, |interval| interval[0])))
     }
 
+    /// The intervals for the currently eligible recovery dependencies at this directory revision.
+    pub fn replica_dependency_intervals(&self, now_ms: i64) -> impl Iterator<Item = [i64; 2]> + '_ {
+        self.storage_regions.values().filter_map(StorageRegion::replica_dependency_interval)
+            .chain(self.capture_replica_offsets().map(|first| [first, i64::MAX]))
+            .chain(self.live_replica_suffixes(now_ms)
+                .map(|pin| self.verified_suffix_interval(pin).unwrap_or([i64::MIN, i64::MAX])))
+    }
+
     /// Whether an eligible recovery dependency can still open this position.
     pub fn requires_replica_offset(&self, offset: i64, now_ms: i64) -> bool {
-        self.storage_regions.values().any(|region| region.requires_replica_offset(offset))
-            || self.capture_replica_offsets().any(|first| first <= offset)
-            || self.live_replica_suffixes(now_ms).any(|pin| {
-                self.verified_suffix_interval(pin).is_none_or(|[first, through]| (first..=through).contains(&offset))
-            })
+        self.replica_dependency_intervals(now_ms).any(|[first, through]| (first..=through).contains(&offset))
     }
 
     fn capture_replica_offsets(&self) -> impl Iterator<Item = i64> + '_ {

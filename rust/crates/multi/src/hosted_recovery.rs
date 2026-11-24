@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rtdb_directory::{Cas, DeploymentRecord, Directory, JournalAnchor, MemberId, MemberRecord, ReplicaJournalUnit, ReplicaPayloadCandidate, ReplicaPayloadTrim};
+use rtdb_directory::{Cas, Checkpoint, DeploymentRecord, Directory, JournalAnchor, MemberId, MemberRecord, ReplicaJournalUnit, ReplicaPayloadCandidate, ReplicaPayloadTrim};
 use rtdb_format::{envelope::ReplicaEnvelope, keys::CURRENT_STORAGE_VERSION};
 use rtdb_logkeeper::{JournalDigest, StreamConfig};
 use rtdb_storage::{Error, IoRegion, log::LogOffset};
@@ -42,6 +42,17 @@ pub(crate) fn checkpoint_decision(record: &DeploymentRecord) -> Result<Option<rt
         return Err(invalid().into());
     }
     Ok(Some(proof))
+}
+
+pub(crate) fn observe_checkpoint(
+    stored: &DeploymentRecord, checkpoint: Checkpoint, manifest: [u8; 32], decision: Option<[u8; 32]>,
+) {
+    crate::residence_trace::record("publish-checkpoint", || serde_json::json!({
+        "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+        "revision": stored.version, "writer_epoch": stored.epoch, "epoch": stored.log_epoch,
+        "stream": stored.stream("replica"), "block": checkpoint.block, "through": checkpoint.boundary,
+        "root": checkpoint.root_sha256, "manifest": manifest, "decision": decision,
+    }));
 }
 
 pub(crate) struct ReplicaTrimPlan {
@@ -175,6 +186,22 @@ impl ReplicaTrimPlan {
             "anchor": scope.anchor, "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
             "first_required": stored.required_replica_offsets(rtdb_directory::now_ms()).collect::<Vec<_>>(),
         }));
+        if let Some(work) = stored.replica_payload_trim.as_ref().filter(|work| {
+            work.belongs_to(&stored) && work.through == anchor.interval[1] && !work.candidates.is_empty()
+        }) {
+            let residence = crate::replay_broker::residence(&stored);
+            crate::residence_trace::record("detached-recovery-fence", || serde_json::json!({
+                "lineage": stored.lineage, "installation": stored.id, "incarnation": stored.incarnation,
+                "stream": stream.stream, "epoch": stored.log_epoch, "generation": stored.storage_generation,
+                "residence": residence, "revision": stored.version, "interval": anchor.interval,
+                "root_incarnation": anchor.root_incarnation, "anchor": anchor.digest,
+                "checkpoint": stored.checkpoint, "manifest": stored.recovery_manifest_sha256,
+                "candidates": work.candidates.iter().map(|candidate| serde_json::json!({
+                    "key": format!("{residence}/{}", candidate.key), "publication": candidate.version,
+                    "position": candidate.position, "frame": candidate.frame_sha256,
+                })).collect::<Vec<_>>(),
+            }));
+        }
         Ok(Some(ReplicaTrimGrant {
             stream, through: self.through, retirement, scope, residence_key: stored.key_id(),
         }))

@@ -268,8 +268,10 @@ Held-world replies carry the original replay dependencies across the archive wor
 Hosted PostgreSQL feedback follows the exact published recovery root.
 The bounded replay includes quorum publication before acknowledgement, recovery exclusion before deletion, and refusal of a paused answer at its transport deadline.
 Native replay joins portable T1 decisions to the applied catalog and frontend answer, and checks the covering decision for directory checkpoint publication.
-It correlates broker reads with both replay holds, checkpoint publication and trim with dependent version removal, and installed receipt removal with the exact journal fence.
-General T2 reachability and recovery exclusion and execution evidence remain open.
+It correlates broker reads with both replay holds and installed receipt removal with the exact journal fence.
+For detached bodies, it joins the certified replacement checkpoint and persisted recovery census to the broker grant, key withdrawal, exact provider version removal, and directory settlement.
+Detached replay requires the recovery fence and can finish before physical journal trim.
+General reachability beyond the contiguous recovery fence and execution evidence remain open.
 Cross-host cutoff checks rely on a consistent wall-clock domain, and remote vault settlement retains its clock-rate margin.
 |===
 
