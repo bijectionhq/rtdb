@@ -590,6 +590,8 @@ contract LogService {
         -- An exact copy terminal can release the export pin and its copy holds while the installed destination remains subject to the original family fence.
 
     @invariant ClassicMigrationSourceSeal
+        -- The authenticated recovery observer returns the exact capture, the current checkpoint and the live writer epoch from the same directory observation.
+        -- A seal request overtaken by a later checkpoint can return its exact scratch closure once the directory excludes a fence for that attempt.
         -- The operator selects the original deployment, residence, log epoch, writer epoch, retained capture, attempt and native destination identity.
         -- The Classic holder closes its submission gate and waits for admitted transactions to apply before the directory orders the fence.
         -- The directory retains the applied source frontier with the fence and keeps the selected capture and scratch stage pinned.

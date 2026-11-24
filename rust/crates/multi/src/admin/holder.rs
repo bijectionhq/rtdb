@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use rtdb_directory::{Directory, MemberId, effective_holder, now_ms};
+use rtdb_directory::{DeploymentRecord, Directory, MemberId, effective_holder, now_ms};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,14 @@ pub async fn observe_holder(
     authority: uuid::Uuid,
     incarnation: u64,
 ) -> Result<HolderObservation> {
+    observe_holder_record(directory, authority, incarnation).await.map(|(holder, _)| holder)
+}
+
+pub(crate) async fn observe_holder_record(
+    directory: &dyn Directory,
+    authority: uuid::Uuid,
+    incarnation: u64,
+) -> Result<(HolderObservation, DeploymentRecord)> {
     let id = authority.to_string();
     let missing = || unavailable("The original database placement is unavailable");
     for _ in 0..4 {
@@ -55,7 +63,7 @@ pub async fn observe_holder(
             return Err(missing());
         }
         let member = &members[holder];
-        return Ok(HolderObservation {
+        let observed = HolderObservation {
             authority,
             incarnation,
             log_epoch: after.log_epoch,
@@ -66,7 +74,8 @@ pub async fn observe_holder(
             member_version: member.version,
             observed_at_ms,
             lease_expires_at_ms: member.lease_expires_at_ms,
-        });
+        };
+        return Ok((observed, after));
     }
     Err(unavailable(
         "The writer placement changed while observing its original lease",

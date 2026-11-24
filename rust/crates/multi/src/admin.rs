@@ -22,6 +22,7 @@ pub(crate) use cell_attempts::{dispose_generations, has_pending_disposal};
 
 mod holder;
 pub use holder::{HolderObservation, observe_holder};
+pub(crate) use holder::observe_holder_record;
 mod holder_handoff;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(35);

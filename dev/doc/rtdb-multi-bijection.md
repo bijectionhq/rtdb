@@ -409,7 +409,15 @@ These are recorded as open questions in `rtdb-multi.allium`, to be folded into i
 The authenticated Classic recovery listener accepts `seal_classic_migration_source` for a directory-backed Classic deployment.
 Close application write and protected delivery admission and settle their outstanding work before selecting the capture.
 `capture_checkpoint` returns the capture operation, source residence and log epoch, exact checkpoint coordinates and manifest digest.
-The operator uses the current Classic holder's directory writer epoch.
+Use `observe_classic_migration_source` under that recovery envelope with `source_manifest_sha256` to get the live Classic directory writer epoch.
+The positive `classic_migration_source_observed` reply carries `point`, `manifest_sha256`, `source` (`incarnation`, `log_epoch`, `writer_epoch`), `current_checkpoint` and `directory_version` for the exact installation.
+Compare `current_checkpoint` with `point.checkpoint` before the first seal send.
+If a maintenance flush already advanced the checkpoint and no seal was sent, retain the outer migration intent and reserve a new capture and scratch attempt.
+If a seal may have been sent, recover the same seal request.
+An observation is a preflight snapshot, and the directory fence still checks the exact current checkpoint.
+If the seal returns `classic_migration_capture_overtaken` for the exact selector, the directory has durably closed that scratch identity before a fence could select it.
+Keep the outer migration intent and reserve a new capture and scratch attempt after that outcome.
+Generic refusal, deferral and transport errors leave the attempt unresolved.
 
 Send the ordinary recovery envelope with the exact source `name`, `authority` and `capture`.
 The action carries `destination` (the expected native UUID), `stage_operation` (the stable attempt UUID), `source_manifest_sha256` and `source` with `incarnation`, `log_epoch` and `writer_epoch`.
