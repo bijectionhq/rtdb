@@ -138,12 +138,70 @@ theorem decodedAcknowledgement (binding : Binding source append tx) :
   | detached proxy fetched digest inner =>
     simp [proxy, fetched, resolveDetached, digest, inner, decodeFrame, decodedEvent]
 
+theorem resolved_frame_has_binding
+    (resolved : source.frameFor append = some (decodeFrame (some term) sequence (some (.resolvedTx tx)))) :
+    Nonempty (Binding source append tx) := by
+  cases selected : source.chosenPayload append with
+  | none =>
+    simp [DecodeSource.frameFor, DecodeSource.openedFrame, selected] at resolved
+  | some payload =>
+    cases decrypted : source.openPayload (recordedKey append payload) payload.ciphertext with
+    | none =>
+      simp [DecodeSource.frameFor, DecodeSource.openedFrame, selected, decrypted] at resolved
+    | some plaintext =>
+      cases decoded : source.decode plaintext with
+      | none =>
+        simp [DecodeSource.frameFor, DecodeSource.openedFrame, selected, decrypted, decoded] at resolved
+      | some proxy =>
+        have opened : source.openedFrame append = some proxy := by
+          simp [DecodeSource.openedFrame, selected, decrypted, decoded]
+        unfold DecodeSource.frameFor at resolved
+        rw [opened] at resolved
+        change (match proxy.body with
+          | some (.oversized digest) => (source.detachedBytes append).bind fun bytes =>
+              resolveDetached source proxy digest bytes
+          | _ => some proxy) = _ at resolved
+        split at resolved
+        · rename_i digest shape
+          cases fetched : source.detachedBytes append with
+          | none => simp [fetched] at resolved
+          | some bytes =>
+            simp only [fetched, Option.bind_some, resolveDetached] at resolved
+            split at resolved
+            · contradiction
+            · rename_i digestMatches
+              cases innerDecoded : source.decode bytes with
+              | none => simp [innerDecoded] at resolved
+              | some inner =>
+                rw [innerDecoded] at resolved
+                change (if inner.term != proxy.term || inner.termSequence != proxy.termSequence then none
+                  else match inner.body with
+                    | some (.resolvedTx _) | some .control => some inner
+                    | _ => none) = _ at resolved
+                split at resolved
+                · contradiction
+                · rename_i coordinateMatches
+                  have innerFrame : inner = decodeFrame (some term) sequence (some (.resolvedTx tx)) := by
+                    split at resolved <;> first | exact Option.some.inj resolved | contradiction
+                  have sameCoordinates : inner.term = proxy.term ∧ inner.termSequence = proxy.termSequence := by
+                    simpa [Bool.or_eq_false_iff] using coordinateMatches
+                  refine ⟨⟨payload, selected, plaintext, decrypted,
+                    .detached (term := some term) (sequence := sequence) (digest := digest) ?_ fetched ?_ ?_⟩⟩
+                  · rw [decoded]
+                    rw [innerFrame] at sameCoordinates
+                    cases proxy
+                    simp_all [decodeFrame]
+                  · simpa using digestMatches
+                  · exact innerDecoded.trans (congrArg some innerFrame)
+        · exact ⟨⟨payload, selected, plaintext, decrypted, .inline (decoded.trans resolved)⟩⟩
+
 theorem decode_frame_preserves_resolved_event (term : Option Int) (sequence : Option Int) (tx : Tx) :
     decodedEvent (decodeFrame term sequence (some (.resolvedTx tx))) = some tx := rfl
 
 #print axioms openedFrame_of_chosen_payload
 #print axioms resolveDetached_preserves_body
 #print axioms decodedAcknowledgement
+#print axioms resolved_frame_has_binding
 #print axioms decode_frame_preserves_resolved_event
 
 end RTDB.Recovery.NativeAppend

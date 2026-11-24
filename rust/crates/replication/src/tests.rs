@@ -3071,3 +3071,6 @@ async fn fenced_appends_charge_only_boundaries_and_uploads_to_maintenance() {
         assert_eq!(fenced.maintenance.load(std::sync::atomic::Ordering::SeqCst), maintenance);
     }
 }
+
+#[path = "driver_trace_tests.rs"]
+mod driver_trace_tests;

@@ -137,6 +137,11 @@ Equal dependency sets can coexist with different logical contents.
 The Lean controls cover a wrong decision position, a changed chosen debit, wrong key or ciphertext, a modified detached digest, an alien journal cut at the same frontier, a foreign placement, a stale admission head, and a missing event on either side of the checkpoint split.
 The reachability witnesses include a detached transaction selected through two cohort repairs and a chosen writer replacement, and a nonempty restored checkpoint containing the chosen transaction.
 
+## R14 · Installed replication driver
+
+The [replication driver study](REPLICATION-DRIVER.md) checks step-or-stutter refinement for the resolved-transaction lane and projects the original chosen receipt for PX1 under explicit provider premises.
+It also checks five recorded Rust driver executions and three rejected controls against the executable Lean transition function.
+
 ## Hypotheses and evidence
 
 A named Lean witness establishes the result in the reference model.
@@ -146,7 +151,7 @@ The inventory identifiers have their definitions in Logkeeper's `verification/fo
 
 | Lean hypothesis or remaining obligation | Reference discharge, production evidence, or environment premise |
 | --- | --- |
-| `ChosenAppend`, `DecodeSource`, `NativeAppend.Binding` | L2, R12, X2. Lean derives the modeled receipt insertion and decoded acknowledgement. PR12 covers exact read-back and the successful-apply decision. H4 checks exact result guards, selected ciphertext and grant, key identity and detached decode. The authenticated result and replay page must project to the actual certified decision and payload. Key-service opening, exact-version provider redemption and the logical interpretation of resolved transaction bytes remain premises. |
+| `ChosenAppend`, `DecodeSource`, `NativeAppend.Binding` | L2, R12, X2. Lean derives the modeled receipt insertion and decoded acknowledgement. PR12 covers exact read-back and the successful-apply decision. H4 checks exact result guards, selected ciphertext and grant, key identity and detached decode. R14 derives a receipt and native binding in its asynchronous model given the exact provider certificate and resolved frame. The authenticated result and replay page must project to the actual certified decision and payload. Key-service opening, exact-version provider redemption and the logical interpretation of resolved transaction bytes remain premises. |
 | `chosenPath`, including each `Protocol.Evidence`, `Transfer.exactImage`, and seal/install ordering | L1, L3, L4, L11, L12, X2. The Lean agreement and transfer lemmas give prefix persistence. Logkeeper `a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_window` and RTDB `funded_control_reconciles_lost_appends_and_releases_lost_reads_through_trim_and_repair` exercise recovery, repair, and receipt identity. Mapping ordered reducer decisions, compacted images, durable replies, and authenticated repair into the same ledger remains open. |
 | `complete`, `chosenEntry`, `retained`, `roster`, `ab`, `ac`, `bc` | L11 and environment. `JournalRefinement.any_recovery_quorum_can_read_exact_entry` supplies the intersection proof. Deployment must qualify three distinct current voters on three independent AZs and a complete cut of durable copies at every installation, including repaired cohorts. The actual retained record bytes must project to the exact suffix selected for this read. Qualify by losing each AZ at commit, publication, and repair boundaries and reopening the surviving media. |
 | `journalPath`, `journalInvariant`, and `read.admitted` | L1, L5, R2, R4, R10, X3. `OrderedJournal.protected_through_trace` proves the modeled floor and hold invariant and `CanServe` provides application readiness. RTDB `replica_admission` checks displaced terms and sequence classification. `a_journal_fenced_term_opens_without_a_claim_or_maintenance_record_across_replacements`, `a_worker_without_the_current_grant_never_leads_a_journal_fenced_term`, and the installed lost-read/repair test are native slices. Mapping the full grant, fresh barrier, hold release, and trim transitions remains open. |

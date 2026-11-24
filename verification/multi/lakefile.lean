@@ -23,4 +23,5 @@ lean_lib ReaderRetention where
 lean_lib RecoveryComposition where
   srcDir := "compose"
   roots := #[`InstalledRead, `NativeAppend, `RecoveryComposition, `ReplayCertificate, `AcknowledgedRecovery, `AcknowledgedRecoveryControls,
-    `InstalledJournalProgress, `NativeAcknowledgement, `ExactReclamation, `SurvivorCheckpoint, `ForkCustody]
+    `InstalledJournalProgress, `NativeAcknowledgement, `ExactReclamation, `SurvivorCheckpoint, `ForkCustody,
+    `ReplicationDriver, `ReplicationDriverTraces]

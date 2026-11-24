@@ -36,4 +36,8 @@ Binding the replica frame to the exact chosen Logkeeper `Protocol.Append`, estab
 The proof treats returned fingerprints as byte values and relies on the journal delivery and hash binding contracts.
 The async queue, one-shot delivery, storage effects, semantic replay and query materialization are outside the verified functions.
 
+The [R14 driver model](../../multi/compose/REPLICATION-DRIVER.md) uses `ExactReadback` in its application state and derives `nativeAcknowledgement` in `acknowledge_after_apply`.
+It proves one-shot routing over executable model traces and constructs PX1's original `RecordedAppend` given authenticated choice and frame-opening evidence.
+The production action boundaries listed there remain Rust refinement obligations.
+
 The Lean mutation runner rejects a completion decision that acknowledges enqueue, at `enqueued_does_not_acknowledge` and `enqueue_only_acknowledgement_is_invalid`.
