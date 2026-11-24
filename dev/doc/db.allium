@@ -465,6 +465,7 @@ variant TxMessage : SourceMessage {
     -- An ADBC bind with multiple Arrow pages and one document schema submits them in one transaction in page order.
     -- Compatible clear Root writes replay their Arrow document columns with exact field presence and complete identity.
     -- Source decoding retains the Arrow columns and presence policy for compatible legacy Root, publication, and world shadow writes.
+    -- The private Original World replay operand carries complete typed handles for copied shadows and keeps their original assertion positions.
     -- The legacy source writer derives compatible structured document types from selected Arrow cells and aligns dense union tags to the source schema.
     -- It preserves the canonical union padding beneath null parent cells.
     -- A legacy document page with a stable logical layout can share a source leg with authored Arrow documents.

@@ -13,7 +13,7 @@ use super::WorldReadmission;
 pub(super) const CHUNK_BYTES: usize = 256 * 1024;
 // Match the owned Flight request envelope. Each control cell is bounded separately.
 pub(super) const MAX_BYTES: usize = (64 << 20) - 1024;
-const MAGIC: &[u8] = b"BJWP7";
+const MAGIC: &[u8] = b"BJWP8";
 const MAX_EFFECTS: usize = 4096;
 
 #[derive(Default)]
@@ -163,9 +163,10 @@ impl ReplayWorlds {
             let position = input.position(&mut positions)?;
             let world = Iid(input.fixed()?);
             let relation = OwnedRelation::new(input.text()?)?;
-            let id = input.text()?;
+            let handle = input.frame()?;
+            let id = EntityId::from_handle_bytes(handle).map_err(|_| invalid())?;
             let valid = Interval::new(Timestamp(input.number()?), Timestamp(input.number()?))?;
-            if world.0 == [0; 16] || !relation.is_root_data() || id.is_empty() {
+            if world.0 == [0; 16] || !relation.is_root_data() || handle.len() == 1 {
                 return Err(invalid());
             }
             let size = u16::from_be_bytes(input.fixed()?);
@@ -200,7 +201,7 @@ impl ReplayWorlds {
                 position,
                 world,
                 relation,
-                id: EntityId::String(id.into()),
+                id,
                 valid,
                 fields,
             });
@@ -295,7 +296,7 @@ mod tests {
         body.extend_from_slice(&1u32.to_be_bytes());
         body.extend_from_slice(&[1; 16]);
         frame(&mut body, "facts");
-        frame(&mut body, "key");
+        frame(&mut body, "\0key");
         body.extend_from_slice(&10i64.to_be_bytes());
         body.extend_from_slice(&20i64.to_be_bytes());
         body.extend_from_slice(&4u16.to_be_bytes());
@@ -313,12 +314,65 @@ mod tests {
         body.extend_from_slice(&0u32.to_be_bytes());
 
         let replay = ReplayWorlds::decode(&body).unwrap();
+        assert_eq!(replay.shadows[0].id, EntityId::String("key".into()));
         let fields = replay.shadows[0].fields.as_ref().unwrap();
         assert_eq!(fields.get("body"), Some(&fact_text(Value::Utf8("café\0🙂".into()))));
         assert_eq!(fields.get("null"), Some(&fact_text(Value::Null)));
         assert_eq!(fields.get("legacy"), Some(&Value::Utf8("legacy".into())));
         assert_eq!(fields.get("sealed_world_projection"), Some(&Value::Binary(b"BJWP1".to_vec())));
         assert!(fields.get("missing").is_none());
+    }
+
+    #[test]
+    fn replay_world_shadows_keep_binary_identity_and_original_positions() {
+        let mut body = b"BJWP8".to_vec();
+        for count in [0u32, 0, 2] {
+            body.extend_from_slice(&count.to_be_bytes());
+        }
+        let first = body.len();
+        for (position, handle, fields) in [
+            (8u32, &[4, 0, 255][..], u16::MAX),
+            (5, &[4, 0, 255, 0][..], 0),
+        ] {
+            body.extend_from_slice(&position.to_be_bytes());
+            body.extend_from_slice(&[1; 16]);
+            body.extend_from_slice(&5u32.to_be_bytes());
+            body.extend_from_slice(b"facts");
+            body.extend_from_slice(&(handle.len() as u32).to_be_bytes());
+            body.extend_from_slice(handle);
+            body.extend_from_slice(&10i64.to_be_bytes());
+            body.extend_from_slice(&20i64.to_be_bytes());
+            body.extend_from_slice(&fields.to_be_bytes());
+        }
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.extend_from_slice(&3u32.to_be_bytes());
+        body.extend_from_slice(&[2; 16]);
+
+        let replay = ReplayWorlds::decode(&body).unwrap();
+        let [deleted, present] = replay.shadows.as_slice() else { panic!("expected two shadows"); };
+        assert_eq!(deleted.id, EntityId::Binary(vec![0, 255]));
+        assert_eq!(present.id, EntityId::Binary(vec![0, 255, 0]));
+        assert_eq!(deleted.position, NonZeroU32::new(8));
+        assert_eq!(present.position, NonZeroU32::new(5));
+        assert_eq!(deleted.valid, Interval::from_micros(10, 20).unwrap());
+        assert_eq!(present.valid, deleted.valid);
+        assert!(deleted.fields.is_none());
+        assert!(present.fields.as_ref().unwrap().is_empty());
+        assert_eq!(replay.omitted_shadows[&NonZeroU32::new(3).unwrap()], Iid([2; 16]));
+
+        let mut old = body.clone();
+        old[..5].copy_from_slice(b"BJWP7");
+        assert_eq!(ReplayWorlds::decode(&old).err().unwrap().code, "rtdb.hosted/world-replay");
+
+        let mut untagged = body.clone();
+        let handle = first + 4 + 16 + 4 + b"facts".len() + 4;
+        untagged[handle..handle + 3].copy_from_slice(b"0ff");
+        assert_eq!(ReplayWorlds::decode(&untagged[..handle + 3]).err().unwrap().code, "rtdb.hosted/world-replay");
+        assert!(ReplayWorlds::decode(&untagged).is_err());
+
+        let omission = body.len() - 20;
+        body[omission..omission + 4].copy_from_slice(&8u32.to_be_bytes());
+        assert!(ReplayWorlds::decode(&body).is_err());
     }
 
     #[test]

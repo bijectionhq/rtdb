@@ -1,7 +1,8 @@
 = FactStore Binary identity cutover
 
 This is the private RTDB source contract for Bijection's FactStore adapter.
-The Bijection caller inventory was read at main commit `ec376fb543478a96ec8399f6014e9aed3ac0cbc1`.
+The initial Bijection caller inventory was read at main commit `ec376fb543478a96ec8399f6014e9aed3ac0cbc1`.
+The applied confirmation, unique window and World archive callers were traced at Bijection main commit `8083ed015a0428fcd375f660fb8ad631a5d1da92`.
 
 == Address bytes
 
@@ -75,6 +76,21 @@ In `fact_points/ordered.rs`, update `unique_window_projection` to select the act
 For a Binary fact route require the Binary child and decode its raw bytes with `AddressRef::decode`.
 Keep validating the expected table, complete claim key and clipped interval, and retain the caller's overlap checks.
 The request, reply's remaining Binary `key` and two Int64 validity columns, and held witness metadata keep their existing framing.
+
+== Archived World shadows
+
+In Bijection's `recovery/owned_archive/catalog/proposals.rs`, make `WorldEffects::finish` emit ASCII `BJWP8` for every nonempty private World effects body.
+This is the sole accepted header for this Bijection-private replay body.
+In `require_overlay`, replace the `owned_string_id()` frame with the validated original complete `_entity_key` handle from `recovery/owned_archive/events.rs`.
+Validate the handle against the original IID and the active Arrow `_id` cell before copying the shadow.
+For ordinary facts send `04` followed by the exact Binary identity.
+For text control or carrier rows send `00` followed by the existing Utf8 bytes.
+The existing big-endian u32 frame length includes the tag.
+The frame follows the original u32 assertion position, 16-byte World ID, and length-prefixed text relation name.
+The signed i64 validity endpoints, field count or tombstone marker, subsequent field frames, omitted positions, topology and assertion-line evidence keep their existing encoding.
+Replay uses the same original ordinal on the destination transaction and still refuses duplicate or unqualified positions.
+The `BJWP8` header governs the private restore operand.
+Already resolved replicas carry their own typed entity keys and replay through the ordinary replica format.
 
 == Bijection source work
 

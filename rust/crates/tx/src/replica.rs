@@ -635,7 +635,7 @@ mod tests {
             "assertion_lines": {"lines": [vec![1; 16], vec![2; 16]], "by_position": [0, 1, 0]},
         }).to_string().into_bytes();
         let hold = TableRef::new("public", crate::hosted_control::RESTORE);
-        let original = EntityId::String("place".into());
+        let original = EntityId::Binary(vec![0, 255, 0]);
         for (copied, copied_line, omitted, omitted_line, clock_line, clock_id, source_id, valid) in [
             (1u32, 1, 2u32, 2, 1, 1, Some(3i64), true),
             (3, 1, 2, 2, 1, 1, Some(3), false),
@@ -688,6 +688,10 @@ mod tests {
                 ]), Interval::new(Timestamp(0), Timestamp::MAX)?)?;
             }
             let staged = transaction.stage()?;
+            let shadow = staged.tables()[&overlay].batch().unwrap().view().borrow_event(0)?;
+            assert_eq!(shadow.header().commit_position, copied);
+            assert_eq!(shadow.physical_entity_key(), Some(original.handle_bytes().as_slice()));
+            assert_eq!(shadow.put_identity()?, Some(rtdb_columnar::EntityIdRef::from(&original)));
             assert_eq!(verify_archive_replay(staged.tables(), key, &memory).is_ok(), valid);
         }
         Ok(())
