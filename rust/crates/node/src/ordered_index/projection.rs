@@ -513,6 +513,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn world_projection_keeps_selected_puts_and_shadows_older_keys() -> Result<()> {
+        use rtdb_types::EntityId;
+
+        let world_put = |id, system, valid, shadow: WorldShadow| -> Result<_> {
+            let mut event = put(id, system, valid, 0);
+            let id = EntityId::Integer(id);
+            event.entity_key = Some(id.handle_bytes().into());
+            event.operation = StoredOperation::Put(shadow.record(&id)?);
+            Ok(event)
+        };
+        let present = |id, key, label: Option<Value>| {
+            let mut row = StructFields::from([("_id".into(), Value::I64(id)), ("key".into(), key)]);
+            if let Some(label) = label {
+                row.insert("label".into(), label);
+            }
+            WorldShadow::Present(row)
+        };
+        let events = [
+            world_put(7, 0, Interval::ALL, present(7, Value::I64(7), None))?,
+            world_put(1, 0, Interval::ALL, present(1, Value::U32(u32::MAX), None))?,
+            world_put(1, 1, Interval::from_micros(5, 10)?, WorldShadow::Deleted)?,
+            world_put(8, 1, Interval::ALL, present(8, Value::I64(8), None))?,
+            world_put(2, 1, Interval::ALL, present(2, Value::I64(9), Some(Value::Binary(vec![1, 2]))))?,
+        ];
+        let memory = MemoryBudget::new(32 << 20);
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
+        let tree = Tree::new(&storage, &ObjectKey::new("world-index")?, &memory, 0).await?;
+        let token = CancellationToken::new();
+        let batch = IndexBatch::from_events(&events, &StructFields::new(), &memory)?;
+        let mut changes = Changes::default();
+        changes.add_batch(
+            batch.view(), 1, &["key".into(), "label".into(), "absent".into()],
+            &memory, &token, KeyLayout::World, |_, address| address.iid != events[3].iid,
+        )?;
+        let mut roots = RevisionRoots::default();
+        roots.apply(&tree, changes, EventOrder::OldestFirst, &token).await?;
+        let (_, before) = roots.at(&tree, IndexRevision::through_time(Timestamp(0))).await?.unwrap();
+        let (_, after) = roots.at(&tree, IndexRevision::through_time(Timestamp(1))).await?.unwrap();
+        assert_eq!(keys(&tree, before, Timestamp(6)).await, [(-1, events[1].iid)]);
+        assert_eq!(keys(&tree, after.clone(), Timestamp(6)).await, [(9, events[4].iid)]);
+        assert_eq!(
+            keys(&tree, after.clone(), Timestamp(4)).await,
+            [(-1, events[1].iid), (9, events[4].iid)],
+        );
+        let address = Address { iid: events[4].iid, key: events[4].entity_key.as_deref().unwrap().to_vec() };
+        let spans = tree.spans(&after, &address).await?;
+        assert_eq!(spans[0].tuple.view().cell(1), AtomRef::Binary(&[1, 2]));
+        assert_eq!(spans[0].tuple.view().cell(2), AtomRef::Null);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_correction_retracts_the_original_bucket_and_a_pin_keeps_its_root() {
         let directory = ObjectKey::new("index").unwrap();
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 8 << 20));
