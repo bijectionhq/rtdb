@@ -247,7 +247,7 @@ pub(crate) enum Syntax {
     Records { patch: bool, table: ast::ObjectName, records: Vec<ast::Expr> },
     CreateTable { table: ast::ObjectName, columns: Vec<(Identifier, Option<ast::DataType>)> },
     GrantRole { user: Identifier, role: Identifier, revoke: bool },
-    CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, history: bool, if_not_exists: bool },
+    CreateSearchIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, analyzer: rtdb_plan::Analyzer, history: bool, if_not_exists: bool },
     DropSearchIndex { name: Identifier },
     CreateOrderedIndex { name: Identifier, table: ast::ObjectName, columns: Vec<Identifier>, if_not_exists: bool },
     DropOrderedIndex { name: Identifier },
@@ -469,19 +469,30 @@ pub(super) fn parse_statement_syntax<'input>(
             if parser.consume_token(&Token::RParen) { break; }
             parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
         }
-        let mut history = true;
+        let (mut history, mut analyzer) = (None, None);
         if search && word(Some(&parser.peek_token()), "WITH") {
             parser.next_token();
             parser.expect_token(&Token::LParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
-            let option = parser.next_token();
-            if !word(Some(&option), "HISTORY") { return Err(sql_error("The only search index option is history", sql, option.span)); }
-            parser.expect_token(&Token::Eq).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
-            let value = parser.next_token();
-            history = if word(Some(&value), "TRUE") { true } else if word(Some(&value), "FALSE") { false } else { return Err(sql_error("Expected TRUE or FALSE for history", sql, value.span)) };
-            parser.expect_token(&Token::RParen).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+            loop {
+                let option = parser.next_token();
+                parser.expect_token(&Token::Eq).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+                let value = parser.next_token();
+                if word(Some(&option), "HISTORY") && history.is_none() {
+                    history = Some(if word(Some(&value), "TRUE") { true } else if word(Some(&value), "FALSE") { false }
+                        else { return Err(sql_error("Expected TRUE or FALSE for history", sql, value.span)) });
+                } else if word(Some(&option), "ANALYZER") && analyzer.is_none() {
+                    let Token::SingleQuotedString(name) = &value.token else { return Err(sql_error("Expected a quoted analyzer name", sql, value.span)); };
+                    analyzer = Some(rtdb_plan::parse_analyzer(name).map_err(|error| sql_error(error.message.unwrap_or_default(), sql, value.span))?);
+                } else {
+                    return Err(sql_error("Search index options are history and analyzer, each given once", sql, option.span));
+                }
+                if parser.consume_token(&Token::RParen) { break; }
+                parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
+            }
         }
+        let (history, analyzer) = (history.unwrap_or(true), analyzer.unwrap_or_default());
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after index definition", sql, parser.peek_token().span)); }
-        if search { Syntax::CreateSearchIndex { name, table, columns, history, if_not_exists } }
+        if search { Syntax::CreateSearchIndex { name, table, columns, analyzer, history, if_not_exists } }
         else { Syntax::CreateOrderedIndex { name, table, columns, if_not_exists } }
     } else if word(tokens.first(), "DROP")
         && (word(tokens.get(1), "INDEX") || (word(tokens.get(1), "SEARCH") && word(tokens.get(2), "INDEX"))) {

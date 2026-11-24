@@ -18,7 +18,12 @@ pub enum Dml {
     CreateTable { table: QualifiedTable, columns: Vec<(String, LogicalType)> },
     GrantRole { user: String, role: String, revoke: bool },
     /// `history` is false when the index covers only the current side (fts.allium: SearchIndexDefinition).
-    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool, if_not_exists: bool },
+    CreateSearchIndex {
+        name: String, table: QualifiedTable, columns: Vec<String>,
+        #[serde(with = "crate::relation::analyzer_name")]
+        analyzer: rtdb_text::Analyzer,
+        history: bool, if_not_exists: bool,
+    },
     DropSearchIndex { name: String },
     CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },

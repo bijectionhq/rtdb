@@ -46,13 +46,14 @@ fn evaluate_matches(scan: &mut rtdb_plan::Scan, ids: &mut Ids) -> Result<bool> {
     for predicate in &mut scan.predicates {
         predicate.rewrite(&mut |expression| {
             let Expr::Call { name, args, .. } = expression else { return };
-            let ([Expr::Column { id, .. }, query], true) = (args.as_slice(), name.eq_ignore_ascii_case("match")) else { return };
+            let ([Expr::Column { id, .. }, query, ..], true) = (args.as_slice(), name.eq_ignore_ascii_case("match")) else { return };
             if !matches!(query, Expr::Literal(_) | Expr::Parameter { .. }) { return; }
+            let Ok(analyzer) = rtdb_plan::call_analyzer(name, args) else { return };
             let Some(column) = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.clone()) else { return };
             let id = match ids.next() { Ok(id) => id, Err(error) => { failure = Some(error); return; } };
             let data_type = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Bool).maybe();
             added.push((rtdb_plan::Field { id, name: format!("match({column})"), qualifier: None, qualified_only: true, unnamed: true, data_type: data_type.clone() },
-                rtdb_plan::ScanMatch { id, column, query: query.clone() }));
+                rtdb_plan::ScanMatch { id, column, query: query.clone(), analyzer }));
             *expression = Expr::Column { id, data_type };
         });
     }
@@ -180,13 +181,17 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
             } else {
                 if distinct || !residuals.is_empty() { return Ok(None); }
                 let Expr::Call { name, args, .. } = &first.expr else { return Ok(None) };
-                let [Expr::Column { id, .. }, query] = args.as_slice() else { return Ok(None) };
+                let [Expr::Column { id, .. }, query, ..] = args.as_slice() else { return Ok(None) };
+                if !matches!(args.len(), 2 | 3) { return Ok(None) }
+                let Ok(analyzer) = rtdb_plan::call_analyzer(name, args) else { return Ok(None) };
                 if !first.descending || !name.eq_ignore_ascii_case("search_score")
                     || !matches!(query, Expr::Literal(_) | Expr::Parameter { .. })
                     || !scan.columns.iter().any(|field| field.id == *id) { return Ok(None); }
                 let name = scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
-                let evaluated: Vec<ColumnId> = scan.matches.iter().filter(|evaluated| Some(evaluated.column.as_str()) == name).map(|evaluated| evaluated.id).collect();
-                if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id, &evaluated)) { return Ok(None); }
+                let evaluated: Vec<ColumnId> = scan.matches.iter()
+                    .filter(|evaluated| Some(evaluated.column.as_str()) == name && evaluated.analyzer == analyzer)
+                    .map(|evaluated| evaluated.id).collect();
+                if !scan.predicates.iter().any(|predicate| has_match_on(predicate, *id, analyzer, &evaluated)) { return Ok(None); }
                 let ascending_id = match order {
                     [_, tie, ..] if !tie.descending => match &tie.expr {
                         Expr::Column { id, .. } if scan.columns.iter().any(|field| field.id == *id && field.name == "_id") => Some(*id),
@@ -195,7 +200,7 @@ fn push_top_k(relation: &Arc<Relation>, order: &[rtdb_plan::SortExpr], limit: &E
                     _ => None,
                 };
                 scan.top_k = Some(rtdb_plan::ScanTopK {
-                    column: *id, query: query.clone(), limit: limit.clone(), offset: offset.cloned(), score: None, ascending_id,
+                    column: *id, query: query.clone(), analyzer, limit: limit.clone(), offset: offset.cloned(), score: None, ascending_id,
                 });
             }
             return Ok(Some(Arc::new(Relation::scan(scan)?)));
@@ -230,7 +235,9 @@ fn add_ranked_score(
             let Some(top_k) = &mut scan.top_k else { return Ok(None); };
             let Expr::Call { name, args, return_type } = expression else { return Ok(None); };
             if !name.eq_ignore_ascii_case("search_score")
-                || !matches!(args.as_slice(), [Expr::Column { id, .. }, query] if *id == top_k.column && query == &top_k.query)
+                || !matches!(args.as_slice(), [Expr::Column { id, .. }, query, ..] if *id == top_k.column && query == &top_k.query)
+                || !matches!(args.len(), 2 | 3)
+                || rtdb_plan::call_analyzer(name, args).ok() != Some(top_k.analyzer)
             {
                 return Ok(None);
             }
@@ -275,11 +282,12 @@ fn ordered_index_filter(expression: &Expr) -> bool {
     matches!(op, BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) && operand(left) && operand(right)
 }
 
-/// Whether a conjunct of the predicate is a MATCH on `column`, or one of the scan's own columns evaluating such a MATCH.
-fn has_match_on(predicate: &Expr, column: ColumnId, evaluated: &[ColumnId]) -> bool {
+/// Whether a conjunct of the predicate is a MATCH on `column` under `analyzer`, or one of the scan's own columns evaluating such a MATCH.
+fn has_match_on(predicate: &Expr, column: ColumnId, analyzer: rtdb_text::Analyzer, evaluated: &[ColumnId]) -> bool {
     match predicate {
-        Expr::Binary { op: BinaryOp::And, left, right } => has_match_on(left, column, evaluated) || has_match_on(right, column, evaluated),
-        Expr::Call { name, args, .. } => name.eq_ignore_ascii_case("match") && matches!(args.first(), Some(Expr::Column { id, .. }) if *id == column),
+        Expr::Binary { op: BinaryOp::And, left, right } => has_match_on(left, column, analyzer, evaluated) || has_match_on(right, column, analyzer, evaluated),
+        Expr::Call { name, args, .. } => name.eq_ignore_ascii_case("match") && matches!(args.first(), Some(Expr::Column { id, .. }) if *id == column)
+            && rtdb_plan::call_analyzer(name, args).ok() == Some(analyzer),
         Expr::Column { id, .. } => evaluated.contains(id),
         _ => false,
     }

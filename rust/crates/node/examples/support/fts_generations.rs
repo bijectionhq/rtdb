@@ -11,7 +11,7 @@ use rtdb_format::keys::TableSlug;
 use rtdb_node::{NativeSession, Node};
 use rtdb_search::{SearchFile, SearchRow, build_search_file};
 use rtdb_storage::{ObjectKey, ObjectStore, StoredObject};
-use rtdb_text::{Corpus, Query, tokens};
+use rtdb_text::{Corpus, Query};
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{EntityId, EventOp, Interval, StructFields, TableRef, TemporalBounds, Timestamp, Value};
 use serde_json::{Value as Json, json};
@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Identity, TickClock, bench_options, bench_services, body, commit, flush, query, sql, where_ids};
 use super::corpus_checkpoint::{as_of, exhaustive_corpus, id};
+
+fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
 
 const LIMIT: usize = 20;
 const RANGE_BLOCK_BYTES: usize = 64 * 1024;

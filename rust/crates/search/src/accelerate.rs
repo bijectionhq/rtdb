@@ -39,15 +39,21 @@ impl Default for SearchAccelerator {
     fn default() -> Self { Self::with_runtime(crate::SearchRuntime::new(256 << 20)) }
 }
 
-/// The column and query of each MATCH conjunct, whether a predicate calls it or a column the scan evaluates holds it.
-fn match_conjuncts<'a>(scan: &'a rtdb_plan::Scan, expression: &'a Expr, found: &mut Vec<(&'a str, &'a Expr)>) {
+/// The column, query and analyzer of each MATCH conjunct, whether a predicate calls it or a column the scan evaluates holds it.
+fn match_conjuncts<'a>(scan: &'a rtdb_plan::Scan, expression: &'a Expr, found: &mut Vec<(&'a str, &'a Expr, rtdb_text::Analyzer)>) {
     let name = |id: &rtdb_plan::ColumnId| scan.columns.iter().find(|field| field.id == *id).map(|field| field.name.as_str());
     match expression {
         Expr::Binary { op: BinaryOp::And, left, right } => { match_conjuncts(scan, left, found); match_conjuncts(scan, right, found); }
-        Expr::Call { name: function, args, .. } if function.eq_ignore_ascii_case("match") && args.len() == 2 => {
-            if let Some(column) = match &args[0] { Expr::Column { id, .. } => name(id), _ => None } { found.push((column, &args[1])); }
+        Expr::Call { name: function, args, .. } if function.eq_ignore_ascii_case("match") && matches!(args.len(), 2 | 3) => {
+            if let Some(column) = match &args[0] { Expr::Column { id, .. } => name(id), _ => None }
+                && let Ok(analyzer) = rtdb_plan::call_analyzer(function, args)
+            {
+                found.push((column, &args[1], analyzer));
+            }
         }
-        Expr::Column { id, .. } => if let Some(evaluated) = scan.matches.iter().find(|evaluated| evaluated.id == *id) { found.push((&evaluated.column, &evaluated.query)); },
+        Expr::Column { id, .. } => if let Some(evaluated) = scan.matches.iter().find(|evaluated| evaluated.id == *id) {
+            found.push((&evaluated.column, &evaluated.query, evaluated.analyzer));
+        },
         _ => {}
     }
 }
@@ -89,7 +95,8 @@ impl ScanAccelerator for SearchAccelerator {
         let Some(column) = request.scan.columns.iter().find(|field| field.id == top.column).map(|field| field.name.as_str()) else { return Ok(None); };
         let Some((matched_column, matching, definition)) = self.match_definition(&request).await? else { return Ok(None); };
         if matched_column != column { return Ok(None); }
-        let Some(scoring) = request.constants.search_query(&top.query).await? else { return Ok(None); };
+        let Some(scoring) = request.constants.search_query(&top.query, top.analyzer).await? else { return Ok(None); };
+        if top.analyzer != definition.analyzer { return Ok(None); }
         let Some(limit) = request.ranked_prefix_len(top).await else { return Ok(None); };
         let result = tree::PartitionRankSource::open(self, request, definition, column, top.column, matching.query().clone(), Arc::clone(scoring.scorer()),
             top.ascending_id, limit, Narrowing::default()).await;
@@ -110,7 +117,7 @@ impl ScanAccelerator for SearchAccelerator {
                 request.current_time, request.cancellation).await?;
             let Some(definition) = definitions.iter().find(|definition| &definition.table == table
                 && !definition.columns.is_empty() && crate::lane::LogicalIndex::supports(definition)) else { return Ok(None); };
-            let sources = tree::RecordedTree::select(&self.runtime, request, definition, 0, &Query::parse(""), true, true)?;
+            let sources = tree::RecordedTree::select(&self.runtime, request, definition, 0, &Query::analyzed(definition.analyzer, ""), true, true)?;
             let history = point::PackedVisibility::new(request, table, &sources, 0, true);
             history.resolve(&self.runtime, request, definition, &sources, iids).await
                 .map(|result| result.map(|rows| rows.into_iter().map(|row| row.row).collect()))
@@ -122,7 +129,7 @@ impl ScanAccelerator for SearchAccelerator {
     }
 
     async fn match_answers(&self, request: &ScanRequest<'_>, column: &str, query: &str) -> Result<Option<MatchAnswers>> {
-        self.match_answers_prepared(request, column, &PreparedSearchQuery::new(query.to_owned())).await
+        self.match_answers_prepared(request, column, &PreparedSearchQuery::new(query.to_owned(), rtdb_text::Analyzer::Simple)).await
     }
 
     async fn match_answers_prepared(&self, request: &ScanRequest<'_>, column: &str, query: &PreparedSearchQuery) -> Result<Option<MatchAnswers>> {
@@ -130,7 +137,7 @@ impl ScanAccelerator for SearchAccelerator {
         if request.scan.top_k.is_some() && request.iid_scope().is_some_and(|iids| iids.len() <= 128) {
             return Ok(None);
         }
-        let Some(definition) = self.definition(request, column).await? else { return Ok(None) };
+        let Some(definition) = self.definition(request, column, query.query().analyzer()).await? else { return Ok(None) };
         if tree::logical_runs(&self.runtime, request, &definition).is_some() { return Ok(None); }
         let query = query.query();
         let files = match self.trie_files(request, &definition, column, &[query], LoadSearch::Match, None).await? {
@@ -150,8 +157,8 @@ impl ScanAccelerator for SearchAccelerator {
         Ok((!answers.is_empty()).then_some(answers))
     }
 
-    fn live_search_terms(&self, request: &ScanRequest<'_>, column: &str) -> Option<Arc<dyn rtdb_query::LiveSearchTerms>> {
-        self.runtime.serving_terms(request, column)
+    fn live_search_terms(&self, request: &ScanRequest<'_>, column: &str, analyzer: rtdb_text::Analyzer) -> Option<Arc<dyn rtdb_query::LiveSearchTerms>> {
+        self.runtime.serving_terms(request, column, analyzer)
     }
 }
 
@@ -204,9 +211,9 @@ impl SearchAccelerator {
         let scan = request.scan;
         let mut conjuncts = Vec::new();
         for predicate in &scan.predicates { match_conjuncts(scan, predicate, &mut conjuncts); }
-        for (column, query) in conjuncts {
-            let Some(query) = request.constants.search_query(query).await? else { continue; };
-            if let Some(definition) = self.definition(request, column).await? {
+        for (column, query, analyzer) in conjuncts {
+            let Some(query) = request.constants.search_query(query, analyzer).await? else { continue; };
+            if let Some(definition) = self.definition(request, column, query.query().analyzer()).await? {
                 return Ok(Some((column, query, definition)));
             }
         }
@@ -331,10 +338,11 @@ fn cut(rectangles: &mut Vec<[i64; 4]>, events: impl IntoIterator<Item = crate::f
 }
 
 impl SearchAccelerator {
-    async fn definition(&self, request: &ScanRequest<'_>, column: &str) -> Result<Option<SearchDefinition>> {
+    /// The definition in force whose files hold `column` under the query's analyzer; a column indexed only under another analyzer is scanned.
+    async fn definition(&self, request: &ScanRequest<'_>, column: &str, analyzer: rtdb_text::Analyzer) -> Result<Option<SearchDefinition>> {
         let definitions = self.runtime.definitions(request.database, request.partitions, request.storage, request.memory, request.current_time, request.cancellation).await?;
         let table = &request.scan.table.name.table;
-        Ok(definitions.iter().find(|definition| &definition.table == table && definition.columns.iter().any(|indexed| indexed == column)).cloned())
+        Ok(definitions.iter().find(|definition| definition.serves(table, column, analyzer)).cloned())
     }
 
     /// Where a trie's recorded search file is, if it has one: its key, the trie or partition group it was built over, and which member of it the trie is.
@@ -457,7 +465,7 @@ impl SearchAccelerator {
         }
         if unindexed > self.max_unindexed_bytes { return Ok(TrieFiles::Partial(Found { files, skipped })); }
         for (trie, data) in unbuilt {
-            match self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, request.memory, request.cancellation).await {
+            match self.runtime.built(request.database, request.storage, &trie, &data, &definition.columns, definition.analyzer, request.memory, request.cancellation).await {
                 Ok(file) => files.push(file),
                 Err(error) if optional_build_refused(&error) => {
                     return Ok(TrieFiles::Partial(Found { files, skipped }));
@@ -1080,7 +1088,8 @@ impl SearchAccelerator {
     /// The IIDs that can hold one of the `limit` best-scoring visible rows, or `None` to narrow as an unranked MATCH does.
     /// Every matching event is scored exactly, and an IID's best event bounds every row it can resolve to.
     async fn top_k(&self, request: &ScanRequest<'_>, top_k: &rtdb_plan::ScanTopK, column: &str, matching: &Query, definition: &SearchDefinition, options: Narrowing<'_>, work: &mut NarrowingWork) -> Result<Option<BTreeSet<Iid>>> {
-        let Some(scoring) = request.constants.search_query(&top_k.query).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
+        if top_k.analyzer != definition.analyzer { work.decline = Some("unsupported-order"); return Ok(None) }
+        let Some(scoring) = request.constants.search_query(&top_k.query, top_k.analyzer).await? else { work.decline = Some("unsupported-order"); return Ok(None) };
         let Some(limit) = request.ranked_prefix_len(top_k).await else { work.decline = Some("unsupported-limit"); return Ok(None) };
         if limit == 0 { return Ok(Some(BTreeSet::new())); }
         let scoring = scoring.scorer();
@@ -1262,7 +1271,7 @@ mod tests {
         let row = |id: u8, body: &str| crate::SearchRow {
             position: None,
             identity: None, iid: [id; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
-            op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens(body))],
+            op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::Analyzer::Simple.tokens(body))],
         };
         let mut bytes = Vec::new();
         let members = [vec![Ok(vec![row(1, "overdue invoice")])], vec![Ok(vec![row(64, "overdue")])], Vec::new(), Vec::new()];
@@ -1313,7 +1322,7 @@ mod tests {
         let row = |system_from, valid_to, text: &str| crate::SearchRow {
             position: None,
             identity: None, iid, system_from, valid_from: 0, valid_to, op: rtdb_types::EventOp::Put,
-            values: vec![Some(rtdb_text::tokens(text))],
+            values: vec![Some(rtdb_text::Analyzer::Simple.tokens(text))],
         };
         let trie = |key: &str, rows: &[crate::SearchRow]| {
             let bytes = crate::build_search_file(&columns, rows, key).unwrap();

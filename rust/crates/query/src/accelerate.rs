@@ -18,9 +18,10 @@ use crate::context::Execution;
 pub trait ConstantEvaluator: Send + Sync {
     async fn constant(&self, expression: &Expr) -> Result<Option<Value>>;
 
-    async fn search_query(&self, expression: &Expr) -> Result<Option<Arc<PreparedSearchQuery>>> {
+    /// The query a constant expression holds, tokenised by `analyzer`.
+    async fn search_query(&self, expression: &Expr, analyzer: rtdb_text::Analyzer) -> Result<Option<Arc<PreparedSearchQuery>>> {
         Ok(match self.constant(expression).await? {
-            Some(Value::Utf8(text)) => Some(Arc::new(PreparedSearchQuery::new(text))),
+            Some(Value::Utf8(text)) => Some(Arc::new(PreparedSearchQuery::new(text, analyzer))),
             _ => None,
         })
     }
@@ -33,8 +34,8 @@ pub struct PreparedSearchQuery {
 }
 
 impl PreparedSearchQuery {
-    pub fn new(text: String) -> Self {
-        let query = Arc::new(rtdb_text::Query::parse(&text));
+    pub fn new(text: String, analyzer: rtdb_text::Analyzer) -> Self {
+        let query = Arc::new(rtdb_text::Query::analyzed(analyzer, &text));
         Self { text, query, scorer: Default::default() }
     }
 
@@ -48,7 +49,7 @@ impl PreparedSearchQuery {
 }
 
 #[derive(Default)]
-pub(crate) struct SearchQueries(tokio::sync::Mutex<Vec<(Expr, Option<Arc<PreparedSearchQuery>>)>>);
+pub(crate) struct SearchQueries(tokio::sync::Mutex<Vec<((Expr, rtdb_text::Analyzer), Option<Arc<PreparedSearchQuery>>)>>);
 
 /// What an accelerator sees of one partition's scan before it opens.
 #[derive(Clone, Copy)]
@@ -399,11 +400,13 @@ pub trait ScanAccelerator: Send + Sync {
     /// A payload seek leaves windowing to the scan after any table predicates are checked.
     /// A distinct seek emits one representative of each qualifying SQL key.
     async fn ordered(&self, _request: &ScanRequest<'_>, _window: std::ops::Range<usize>, _projection: &[usize]) -> Result<Option<OrderedScan>> { Ok(None) }
-    /// The values of `match(column, query)` on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
+    /// The values of `match(column, query)` under the simple analyzer on the rows of whichever of the scan's data files the accelerator can answer for, so the scan reads no text there.
     /// Each answer must equal MATCH evaluated on the row.
     async fn match_answers(&self, _request: &ScanRequest<'_>, _column: &str, _query: &str) -> Result<Option<MatchAnswers>> { Ok(None) }
-    fn live_search_terms(&self, _request: &ScanRequest<'_>, _column: &str) -> Option<Arc<dyn LiveSearchTerms>> { None }
+    /// Live postings of the column under the analyzer of the MATCH they answer.
+    fn live_search_terms(&self, _request: &ScanRequest<'_>, _column: &str, _analyzer: rtdb_text::Analyzer) -> Option<Arc<dyn LiveSearchTerms>> { None }
     async fn match_answers_prepared(&self, request: &ScanRequest<'_>, column: &str, query: &PreparedSearchQuery) -> Result<Option<MatchAnswers>> {
+        if query.query().analyzer() != rtdb_text::Analyzer::Simple { return Ok(None); }
         self.match_answers(request, column, &query.text).await
     }
 
@@ -444,16 +447,16 @@ impl ConstantEvaluator for ExecutionConstants<'_> {
         Ok(Some(self.execution.evaluate(&scope, expression, &Schema::default(), &[]).await?))
     }
 
-    async fn search_query(&self, expression: &Expr) -> Result<Option<Arc<PreparedSearchQuery>>> {
+    async fn search_query(&self, expression: &Expr, analyzer: rtdb_text::Analyzer) -> Result<Option<Arc<PreparedSearchQuery>>> {
         let mut queries = self.search_queries.0.lock().await;
-        if let Some((_, query)) = queries.iter().find(|(bound, _)| bound == expression) {
+        if let Some((_, query)) = queries.iter().find(|((bound, prepared), _)| bound == expression && *prepared == analyzer) {
             return Ok(query.clone());
         }
         let query = match self.constant(expression).await? {
-            Some(Value::Utf8(text)) => Some(Arc::new(PreparedSearchQuery::new(text))),
+            Some(Value::Utf8(text)) => Some(Arc::new(PreparedSearchQuery::new(text, analyzer))),
             _ => None,
         };
-        queries.push((expression.clone(), query.clone()));
+        queries.push(((expression.clone(), analyzer), query.clone()));
         Ok(query)
     }
 }

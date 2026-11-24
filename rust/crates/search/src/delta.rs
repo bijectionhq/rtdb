@@ -15,16 +15,18 @@ use crate::{SearchDefinition, accelerate::search_cancelled, lane::LogicalIndex};
 pub(crate) const MAX_BYTES: usize = 1 << 20;
 const MAX_ROWS: usize = 2048;
 
-pub(crate) type Column = (TableRef, String);
+/// A table column under one analyzer: definitions with different analyzers on one column keep separate tokens.
+pub(crate) type Column = (TableRef, String, rtdb_text::Analyzer);
 
 fn schema() -> Schema {
     Schema::new_with_metadata(vec![
         Field::new("schema", DataType::Utf8, false),
         Field::new("table", DataType::Utf8, false),
         Field::new("column", DataType::Utf8, false),
+        Field::new("analyzer", DataType::Utf8, false),
         Field::new("text", DataType::Boolean, false),
         Field::new("tokens", DataType::LargeList(Arc::new(Field::new("item", DataType::Utf8, false))), false),
-    ], [("rtdb.search.delta".into(), format!("1/{}", rtdb_text::ANALYZER_VERSION))].into())
+    ], [("rtdb.search.delta".into(), format!("2/{}", rtdb_text::ANALYZER_VERSION))].into())
 }
 
 fn invalid(reason: impl std::fmt::Display) -> Anomaly {
@@ -44,13 +46,13 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
     cancellation: &CancellationToken) -> Result<Option<PreparedSearchDelta>> {
     let columns: BTreeSet<_> = definitions.iter().filter(|definition| LogicalIndex::supports(definition))
         .filter(|definition| write.tables().get(&definition.table).is_some_and(|write| write.row_count() > 0))
-        .flat_map(|definition| definition.columns.iter().map(|column| (&definition.table, column))).collect();
+        .flat_map(|definition| definition.columns.iter().map(|column| (&definition.table, column, definition.analyzer))).collect();
     if columns.is_empty() { return Ok(None); }
 
     let mut texts = [None; MAX_ROWS];
     let mut rows = 0usize;
     let mut source_bytes = 0usize;
-    for (table, column) in &columns {
+    for (table, column, _) in &columns {
         let batch = write.tables()[*table].batch().expect("nonempty write has a batch");
         let end = rows + batch.len();
         if end > MAX_ROWS { return Err(invalid("Search delta exceeds its row allowance")); }
@@ -58,7 +60,7 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
         for (row, slot) in texts[rows..end].iter_mut().enumerate() {
             if cancellation.is_cancelled() { return Err(search_cancelled()); }
             if let (_, PutText::Utf8(value)) = text.read(row)? { *slot = Some(value); }
-            source_bytes = source_bytes.saturating_add(64 + table.schema.len() + table.table.len() + column.len()
+            source_bytes = source_bytes.saturating_add(80 + table.schema.len() + table.table.len() + column.len()
                 + slot.map_or(0, str::len));
             if source_bytes > MAX_BYTES { return Err(invalid("Search delta exceeds its input allowance")); }
         }
@@ -68,18 +70,20 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
     let mut schemas = StringBuilder::new();
     let mut tables = StringBuilder::new();
     let mut fields = StringBuilder::new();
+    let mut analyzers = StringBuilder::new();
     let mut present = BooleanBuilder::new();
     let mut tokens = LargeListBuilder::new(StringBuilder::new()).with_field(Field::new("item", DataType::Utf8, false));
     let mut texts = texts[..rows].iter();
-    for (table, column) in columns {
+    for (table, column, analyzer) in columns {
         let rows = write.tables()[table].row_count();
         for text in texts.by_ref().take(rows) {
             if cancellation.is_cancelled() { return Err(search_cancelled()); }
             schemas.append_value(&table.schema);
             tables.append_value(&table.table);
             fields.append_value(column);
+            analyzers.append_value(analyzer.name());
             if let Some(text) = text {
-                rtdb_text::append_tokens(text, tokens.values());
+                analyzer.append_tokens(text, tokens.values());
             }
             present.append_value(text.is_some());
             tokens.append(true);
@@ -87,7 +91,7 @@ pub(crate) fn prepare(definitions: &[SearchDefinition], write: &StagedWrite, mem
     }
     let schema = Arc::new(schema());
     let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(schemas.finish()), Arc::new(tables.finish()),
-        Arc::new(fields.finish()), Arc::new(present.finish()), Arc::new(tokens.finish())]).map_err(invalid)?;
+        Arc::new(fields.finish()), Arc::new(analyzers.finish()), Arc::new(present.finish()), Arc::new(tokens.finish())]).map_err(invalid)?;
     let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), &schema).map_err(invalid)?;
     writer.write(&batch).map_err(invalid)?;
     let encoded = writer.into_inner().map_err(invalid)?;
@@ -120,20 +124,22 @@ impl Delta {
             return Err(invalid("Search delta has the wrong schema or page count"));
         }
         if batch.num_rows() > MAX_ROWS || batch.columns().iter().any(|column| column.null_count() != 0)
-            || batch.column(4).as_list::<i64>().values().null_count() != 0 {
+            || batch.column(5).as_list::<i64>().values().null_count() != 0 {
             return Err(invalid("Search delta has invalid rows"));
         }
         let schemas = batch.column(0).as_string::<i32>();
         let tables = batch.column(1).as_string::<i32>();
         let fields = batch.column(2).as_string::<i32>();
+        let analyzers = batch.column(3).as_string::<i32>();
         let mut columns = BTreeMap::new();
         let mut first = 0;
         while first < batch.num_rows() {
-            let key = (TableRef::new(schemas.value(first), tables.value(first)), fields.value(first).to_owned());
+            let analyzer = rtdb_text::Analyzer::parse(analyzers.value(first)).ok_or_else(|| invalid("Search delta names an unknown analyzer"))?;
+            let key = (TableRef::new(schemas.value(first), tables.value(first)), fields.value(first).to_owned(), analyzer);
             let rows = write.tables().get(&key.0).map_or(0, |table| table.row_count());
             let last = first + rows;
             if rows == 0 || last > batch.num_rows() || (first..last).any(|row| schemas.value(row) != key.0.schema
-                || tables.value(row) != key.0.table || fields.value(row) != key.1)
+                || tables.value(row) != key.0.table || fields.value(row) != key.1 || analyzers.value(row) != analyzer.name())
                 || columns.insert(key, first..last).is_some() {
                 return Err(invalid("Search delta does not cover the accepted transaction's rows"));
             }
@@ -149,8 +155,8 @@ impl Delta {
         let range = column.start + rows.start..column.start + rows.end;
         assert!(range.end <= column.end);
         let batch = self.batch.batch();
-        let present = batch.column(3).as_boolean();
-        let lists = batch.column(4).as_list::<i64>().slice(range.start, range.len());
+        let present = batch.column(4).as_boolean();
+        let lists = batch.column(5).as_list::<i64>().slice(range.start, range.len());
         (present, lists, range)
     }
 }
@@ -210,7 +216,7 @@ mod tests {
             StagedWrite::new(TransactionKey { tx_id: TxId(1), system_time: Timestamp(2) }, None, BlockIndex(0),
                 BTreeMap::from([(table.clone(), write)])).unwrap()
         };
-        let definition = SearchDefinition { name: "body".into(), table: table.clone(), columns: vec!["body".into()], version: 1, history: true };
+        let definition = SearchDefinition { name: "body".into(), table: table.clone(), columns: vec!["body".into()], analyzer: rtdb_text::Analyzer::Simple, version: 1, history: true };
         let write = staged(&events);
         let encoded = prepare(&[definition], &write, &memory, &CancellationToken::new()).unwrap().unwrap();
         let mut previous_tokens = LargeListBuilder::new(StringBuilder::new()).with_field(Field::new("item", DataType::Utf8, false));
@@ -220,14 +226,14 @@ mod tests {
         let previous_schema = Arc::new(schema());
         let previous = RecordBatch::try_new(Arc::clone(&previous_schema), vec![
             Arc::new(StringArray::from(vec!["public"; 2])), Arc::new(StringArray::from(vec!["docs"; 2])),
-            Arc::new(StringArray::from(vec!["body"; 2])), Arc::new(BooleanArray::from(vec![true, false])),
+            Arc::new(StringArray::from(vec!["body"; 2])), Arc::new(StringArray::from(vec!["simple"; 2])), Arc::new(BooleanArray::from(vec![true, false])),
             Arc::new(previous_tokens.finish()),
         ]).unwrap();
         let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), &previous_schema).unwrap();
         writer.write(&previous).unwrap();
         assert_eq!(encoded.encoded.as_ref(), writer.into_inner().unwrap());
 
-        let key = (table.clone(), "body".into());
+        let key = (table.clone(), "body".into(), rtdb_text::Analyzer::Simple);
         let check = |delta: Delta| {
             let (present, lists, rows) = delta.page(&key, 0..2);
             assert!(present.value(rows.start));
@@ -239,7 +245,7 @@ mod tests {
         let start = encoded.encoded.as_ptr() as usize;
         assert!((start..start + encoded.encoded.len()).contains(&replayed));
         let prepared = check(Delta::new(encoded.batch.clone(), &write).unwrap());
-        assert_eq!(prepared, encoded.batch.batch().column(4).as_list::<i64>().values().as_string::<i32>().value_data().as_ptr() as usize);
+        assert_eq!(prepared, encoded.batch.batch().column(5).as_list::<i64>().values().as_string::<i32>().value_data().as_ptr() as usize);
         assert!(Delta::read(encoded.encoded, &staged(&events[..1]), &memory).is_err());
     }
 }

@@ -96,10 +96,11 @@ fn scrub_documents(documents: &mut Vec<LogicalDocument>, erases: &Erases) -> boo
 
 fn needs_order_replay(run: &SearchRun) -> bool { run.allocation.is_none() && run.has_erases() }
 
-fn revision_hasher() -> Sha256 {
+fn revision_hasher(analyzer: rtdb_text::Analyzer) -> Sha256 {
     let mut digest = Sha256::new();
     digest.update(b"rtdb/search/token-revision");
     digest.update(rtdb_text::ANALYZER_VERSION.to_le_bytes());
+    hash_term(&mut digest, analyzer.name());
     digest
 }
 
@@ -108,14 +109,15 @@ fn hash_term(digest: &mut Sha256, term: &str) {
     digest.update(term.as_bytes());
 }
 
-pub(crate) fn text_revision(value: &str) -> TextRevision {
-    let mut digest = revision_hasher();
-    rtdb_text::visit_tokens(value, |term| hash_term(&mut digest, term));
+pub(crate) fn text_revision(analyzer: rtdb_text::Analyzer, value: &str) -> TextRevision {
+    let mut digest = revision_hasher(analyzer);
+    analyzer.visit_tokens(value, |term| hash_term(&mut digest, term));
     digest.finalize().into()
 }
 
-pub(super) fn revision_of(tokens: &arrow_array::StringArray) -> TextRevision {
-    let mut digest = revision_hasher();
+/// The revision of `tokens` that `analyzer` produced.
+pub(super) fn revision_of(analyzer: rtdb_text::Analyzer, tokens: &arrow_array::StringArray) -> TextRevision {
+    let mut digest = revision_hasher(analyzer);
     for term in tokens.iter().flatten() { hash_term(&mut digest, term); }
     digest.finalize().into()
 }
@@ -134,6 +136,7 @@ pub(crate) struct LogicalIndex {
     table: TableRef,
     id: String,
     version: i64,
+    analyzer: rtdb_text::Analyzer,
 }
 
 impl LogicalIndex {
@@ -142,11 +145,12 @@ impl LogicalIndex {
     }
 
     fn of(definition: &SearchDefinition) -> Self {
-        Self { table: definition.table.clone(), id: definition.artefact_id_for(LOGICAL_FORMAT_VERSION), version: definition.version }
+        Self { table: definition.table.clone(), id: definition.artefact_id_for(LOGICAL_FORMAT_VERSION), version: definition.version,
+            analyzer: definition.analyzer }
     }
 
-    pub fn from_history(definition: &ArtefactDefinition) -> Self {
-        Self { table: definition.table.clone(), id: definition.id.trim_end_matches('w').to_owned(), version: definition.version }
+    pub fn from_history(definition: &ArtefactDefinition, analyzer: rtdb_text::Analyzer) -> Self {
+        Self { table: definition.table.clone(), id: definition.id.trim_end_matches('w').to_owned(), version: definition.version, analyzer }
     }
 
     fn owns(&self, run: &SearchRun) -> bool {
@@ -170,15 +174,15 @@ pub(super) fn posting_position(header: EventHeader, origin: Option<rtdb_types::E
     }
 }
 
-fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], include_documents: bool,
+fn record_source(batch: &rtdb_format::data::EventBatch, columns: &[String], analyzer: rtdb_text::Analyzer, include_documents: bool,
     contents: &mut RunContents, charge: &mut Arc<rtdb_types::MemoryReservation>, cancellation: &CancellationToken) -> Result<()> {
     for row in 0..batch.len() {
-        record_history_row(HistoryRow::Stored { batch, row }, columns, include_documents, contents, charge, cancellation)?;
+        record_history_row(HistoryRow::Stored { batch, row }, columns, analyzer, include_documents, contents, charge, cancellation)?;
     }
     Ok(())
 }
 
-fn record_history_row(source: HistoryRow<'_>, columns: &[String], include_documents: bool, contents: &mut RunContents,
+fn record_history_row(source: HistoryRow<'_>, columns: &[String], analyzer: rtdb_text::Analyzer, include_documents: bool, contents: &mut RunContents,
     charge: &mut Arc<rtdb_types::MemoryReservation>, cancellation: &CancellationToken) -> Result<()> {
     if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
     let (mut header, origin, row) = match source {
@@ -203,10 +207,10 @@ fn record_history_row(source: HistoryRow<'_>, columns: &[String], include_docume
             if let rtdb_format::data::PutText::Utf8(text) = event.put_text(column)? {
                 let reservation = Arc::get_mut(charge).expect("Search repair owns its scratch");
                 let _scratch = reservation.budget().reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                let tokens = rtdb_text::analyze(text);
+                let tokens = analyzer.analyze(text);
                 let retained = tokens.get_array_memory_size().saturating_add(256);
                 reservation.grow_to(reservation.bytes().saturating_add(retained))?;
-                contents.documents.push(LogicalDocument { iid: header.iid, field, revision: revision_of(&tokens),
+                contents.documents.push(LogicalDocument { iid: header.iid, field, revision: revision_of(analyzer, &tokens),
                     sql_id, tokens, position: search_position(header) });
             }
         }
@@ -268,7 +272,7 @@ impl SearchBuilder {
         let view = snapshot.snapshot();
         let seal = view.iter_segments(&index.table).next().cloned().map(|segment| (view.clone(), segment));
         let history_id = format!("{}w", index.id);
-        let columns = self.columns.lock().get(&(index.table.clone(), history_id, index.version)).cloned()
+        let (columns, _) = self.columns.lock().get(&(index.table.clone(), history_id, index.version)).cloned()
             .ok_or_else(|| fault("Logical search definition has no fields"))?;
         let entry = view.table_entry(&index.table).ok_or_else(|| fault("Logical search table has no slug"))?;
         let owner = forward_owner(&entry.slug, trie, &definition.id, definition.version);
@@ -303,9 +307,9 @@ impl SearchBuilder {
             if blocks.binary_search(&block.0).is_ok() {
                 observed.insert(block.0);
                 selected = selected.checked_add(1).ok_or_else(|| fault("Search extent row count overflow"))?;
-                record_history_row(row, columns, true, &mut contents, &mut charge, cancellation)?;
+                record_history_row(row, columns, index.analyzer, true, &mut contents, &mut charge, cancellation)?;
             } else {
-                record_history_row(row, columns, false, &mut outside, &mut charge, cancellation)?;
+                record_history_row(row, columns, index.analyzer, false, &mut outside, &mut charge, cancellation)?;
             }
             Ok(())
         }).await? else { return Ok(None); };
@@ -374,13 +378,13 @@ impl SearchBuilder {
         let blocks = vec![block.0];
         let allocation = *uuid::Uuid::new_v4().as_bytes();
         let identity = run_identity(&entry.slug, &index.id, index.version, &blocks, 0, &allocation);
-        let (budget, token, columns, version) = (Arc::clone(&self.memory), cancellation.clone(), columns.to_vec(), index.version);
+        let (budget, token, columns, version, analyzer) = (Arc::clone(&self.memory), cancellation.clone(), columns.to_vec(), index.version, index.analyzer);
         let indexing = self.memory.reserve(indexing_allowance(size))?;
         let ((locator, digest), source_rows, has_erases, summaries, forward) = tokio::task::spawn_blocking(move || {
             let build = |forward_owner: Option<[u8; 32]>, indexing| {
                 let forward = RefCell::new(forward_owner.and_then(|owner| ForwardOutput::new(owner, &budget).ok()));
                 let (reader, opening) = open_search_input(input.try_clone().map_err(fault)?, &columns, &budget)?;
-                let mut pages = PageRows::new(reader, opening, Arc::clone(&budget), token.clone(), false);
+                let mut pages = PageRows::new(reader, opening, Arc::clone(&budget), token.clone(), analyzer, false);
                 pages.mode = BuildMode::Postings;
                 pages.seal = seal.clone();
                 let output = BufWriter::new(File::create(&file).map_err(fault)?);
@@ -558,7 +562,9 @@ impl SearchBuilder {
                     && definition.artefact_id_for(LOGICAL_FORMAT_VERSION) == run.definition_id() && definition.version == run.definition_version()) {
                     continue;
                 }
-                let index = LogicalIndex { table: table.clone(), id: run.definition_id().to_owned(), version: run.definition_version() };
+                // Retiring a run reads none of its tokens, so its analyzer plays no part.
+                let index = LogicalIndex { table: table.clone(), id: run.definition_id().to_owned(), version: run.definition_version(),
+                    analyzer: rtdb_text::Analyzer::Simple };
                 publish_change(publisher, storage, &index, SearchRunChange {
                     run: Some(run.clone()), retire_only: Some(true), ..Default::default()
                 }).await?;
@@ -702,7 +708,7 @@ impl SearchBuilder {
         Ok(())
     }
 
-    async fn read_l0_contents(&self, slug: &TableSlug, blocks: &[i64], columns: &[String], documents: bool,
+    async fn read_l0_contents(&self, slug: &TableSlug, blocks: &[i64], columns: &[String], analyzer: rtdb_text::Analyzer, documents: bool,
         cancellation: &CancellationToken) -> Result<(RunContents, Arc<rtdb_types::MemoryReservation>, i64)> {
         let mut contents = RunContents::default();
         let mut charge = self.memory.reserve(4096)?;
@@ -721,7 +727,7 @@ impl SearchBuilder {
                     let batch = rtdb_maintenance::input::read_page(&mut reader, page, &memory)?;
                     let batch = rtdb_format::data::EventBatch::new(batch.batch().clone())?;
                     count = count.checked_add(batch.len() as i64).ok_or_else(|| fault("Search repair row count overflow"))?;
-                    record_source(&batch, &columns, documents, &mut contents, &mut charge, &token)?;
+                    record_source(&batch, &columns, analyzer, documents, &mut contents, &mut charge, &token)?;
                 }
                 Ok::<_, rtdb_types::Anomaly>((contents, charge, count))
             }).await.map_err(fault)??;
@@ -771,7 +777,7 @@ impl SearchBuilder {
                     Ok(Some(RecoveredRun { contents, charge, receipt })) => (contents, charge, receipt.source_rows(), Some(receipt)),
                     Err(error) if !super::is_search_gap(&error, cancellation) => return Err(error),
                     Ok(None) | Err(_) => {
-                        let (mut contents, charge, source_rows) = self.read_l0_contents(&entry.slug, &blocks, &definition.columns, true, cancellation).await?;
+                        let (mut contents, charge, source_rows) = self.read_l0_contents(&entry.slug, &blocks, &definition.columns, definition.analyzer, true, cancellation).await?;
                         if source_rows != target.source_rows() { return Err(fault("Search repair covers a different number of source events")); }
                         for run in index.records(&snapshot).into_iter().filter(|run| run.has_erases() && run.digest() != target.digest()) {
                             let erases = async {
@@ -781,7 +787,7 @@ impl SearchBuilder {
                             match erases {
                                 Ok((erases, _charge)) => scrub_documents(&mut contents.documents, &erases),
                                 Err(error) if super::is_search_gap(&error, cancellation) => {
-                                    let (restored, _charge, rows) = self.read_l0_contents(&entry.slug, &run.blocks, &[], false, cancellation).await?;
+                                    let (restored, _charge, rows) = self.read_l0_contents(&entry.slug, &run.blocks, &[], definition.analyzer, false, cancellation).await?;
                                     if rows != run.source_rows() { return Err(fault("Search erase replay covers a different number of source events")); }
                                     scrub_documents(&mut contents.documents, &restored.erases)
                                 }
@@ -959,10 +965,10 @@ fn an_intact_legacy_erase_run_requires_reconstruction() {
 #[cfg(test)]
 #[test]
 fn normalized_revisions_preserve_order_and_frequency() {
-    assert_eq!(text_revision("Quarterly Audit—REPORT"), text_revision("quarterly audit report"));
-    assert_ne!(text_revision("report audit"), text_revision("audit report"));
-    assert_ne!(text_revision("audit report"), text_revision("audit audit report"));
-    assert_ne!(text_revision("a bc"), text_revision("ab c"));
+    assert_eq!(text_revision(rtdb_text::Analyzer::Simple, "Quarterly Audit—REPORT"), text_revision(rtdb_text::Analyzer::Simple, "quarterly audit report"));
+    assert_ne!(text_revision(rtdb_text::Analyzer::Simple, "report audit"), text_revision(rtdb_text::Analyzer::Simple, "audit report"));
+    assert_ne!(text_revision(rtdb_text::Analyzer::Simple, "audit report"), text_revision(rtdb_text::Analyzer::Simple, "audit audit report"));
+    assert_ne!(text_revision(rtdb_text::Analyzer::Simple, "a bc"), text_revision(rtdb_text::Analyzer::Simple, "ab c"));
 }
 
 #[cfg(test)]
@@ -1063,7 +1069,7 @@ mod tests {
     async fn rejected_search_repair_stays_suspect_while_another_definition_repairs() {
         let builder = replay_builder(&[StoredOperation::Erase]);
         let definitions = ["a_docs", "z_docs"].map(|name| SearchDefinition { name: name.into(), table: TableRef::new("public", name),
-            columns: vec!["body".into()], version: 1, history: true });
+            columns: vec!["body".into()], analyzer: rtdb_text::Analyzer::Simple, version: 1, history: true });
         let inputs = definitions.each_ref().map(|definition| {
             let index = LogicalIndex::of(definition);
             let run = SearchRun { has_erases: Some(true), ..recorded_run(&index, 0) };
@@ -1095,7 +1101,7 @@ mod tests {
     async fn mixed_search_run_merge_replays_and_receipts_the_complete_union() {
         let events = ["repaired text", "sealed text"].map(|body| StoredOperation::Put(StructFields::from([("body".into(), Value::Utf8(body.into()))])));
         let builder = replay_builder(&events);
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let prior = SourceReceipt { lineage: Some("native/journal".into()), checkpoint_boundary: Some(-1), suffix_through: Some(5),
             table: Some(index.table.schema_and_table()), shard_range: Some(rtdb_format::search_manifest::FULL_SHARD_RANGE.to_vec()),
             source_rows: Some(1), erase_frontier_digest: Some(Sha256::digest([]).to_vec()), blocks: vec![0], ..Default::default() };
@@ -1119,7 +1125,7 @@ mod tests {
         let slug = &snapshot.table_entry(&index.table).unwrap().slug;
         let file = builder.runtime.logical_file(&builder.storage, slug, runs[0], &columns).await.unwrap();
         assert_eq!(file.documents().await.unwrap().into_iter().map(|doc| doc.revision).collect::<Vec<_>>(),
-            [text_revision("repaired text"), text_revision("sealed text")]);
+            [text_revision(rtdb_text::Analyzer::Simple, "repaired text"), text_revision(rtdb_text::Analyzer::Simple, "sealed text")]);
     }
 
     struct RecordedReplay(TableReplay, parking_lot::Mutex<Vec<Vec<i64>>>);
@@ -1143,7 +1149,7 @@ mod tests {
             EventBatch::new(build_event_batch(&[event], fields, None).unwrap()).unwrap()
         }).collect()), Default::default()));
         let builder = builder(Arc::new(MemoryStore::default())).with_history(Some(source.clone()));
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let prior = SourceReceipt { lineage: Some("native/another-journal".into()), checkpoint_boundary: Some(-1), suffix_through: Some(5),
             table: Some(index.table.schema_and_table()), shard_range: Some(rtdb_format::search_manifest::FULL_SHARD_RANGE.to_vec()),
             source_rows: Some(1), erase_frontier_digest: Some(Sha256::digest([]).to_vec()), blocks: vec![0], ..Default::default() };
@@ -1169,7 +1175,7 @@ mod tests {
     async fn unmergeable_overflow_rotates_replays_across_ordered_sweeps() {
         let source = Arc::new(RecordedReplay(TableReplay(Vec::new()), Default::default()));
         let builder = builder(Arc::new(MemoryStore::default())).with_history(Some(source.clone()));
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let last = MAX_UNMERGEABLE_PAIRS as i64 + 1;
         let inputs = (0..=last).map(|block| {
             let mut run = recorded_run(&index, block);
@@ -1198,7 +1204,7 @@ mod tests {
 
     #[tokio::test]
     async fn unmergeable_pair_is_removed_when_either_input_retires() {
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let runs = [0, 1].map(|block| recorded_run(&index, block));
         let pair = runs.each_ref().map(|run| run.identity().unwrap());
         let inputs = runs.clone().map(|run| (index.table.clone(), run));
@@ -1224,7 +1230,7 @@ mod tests {
 
     #[test]
     fn unmergeable_pairs_belong_to_one_definition_generation() {
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let inputs = [0, 1].map(|block| (index.table.clone(), recorded_run(&index, block)));
         let pair = inputs.each_ref().map(|(_, run)| run.identity().unwrap());
         let partition = replay_partition(&inputs, 1);
@@ -1248,7 +1254,7 @@ mod tests {
 
     #[test]
     fn unmergeable_pairs_are_bounded_across_generations() {
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let second_index = LogicalIndex { version: 2, ..index.clone() };
         let pair = |value: usize| {
             let mut right = [0; 32];
@@ -1294,8 +1300,8 @@ mod tests {
         let memory = MemoryBudget::new(64 << 20);
         let builder = SearchBuilder::new("xtdb".into(), store, cache, memory.clone(), Arc::new(|| Timestamp(0).into()),
             crate::SearchRuntime::with_logical_search(1 << 20));
-        let document = LogicalDocument { iid: Iid([1; 16]), sql_id: None, field: 0, revision: text_revision("body"),
-            tokens: rtdb_text::analyze("body"), position: (Timestamp(1), None, 1) };
+        let document = LogicalDocument { iid: Iid([1; 16]), sql_id: None, field: 0, revision: text_revision(rtdb_text::Analyzer::Simple, "body"),
+            tokens: rtdb_text::Analyzer::Simple.analyze("body"), position: (Timestamp(1), None, 1) };
         let contents = RunContents { documents: vec![document], erases: Erases::new() };
         builder.store_documents(index, &["body".into()], slug, vec![0], 0, 1, contents,
             memory.reserve(32 << 20).unwrap(), None, &CancellationToken::new()).await.map(|prepared| prepared.run)
@@ -1305,7 +1311,7 @@ mod tests {
     async fn adoption_fails_when_a_required_provider_publication_is_missing() {
         use rtdb_format::search_manifest::{pending_prefix, run_prefix};
         let store = Arc::new(PublicationRequired::default());
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "bodyf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "bodyf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let slug = TableSlug::for_unrecorded_table(&index.table).unwrap();
         assert_eq!(upload_for_adoption(store.clone(), &index, &slug).await.unwrap_err().message.as_deref(),
             Some("Search upload returned no immutable provider publication"));
@@ -1317,7 +1323,7 @@ mod tests {
     async fn adoption_accepts_a_native_local_publication_without_a_provider_version() {
         let files = tempfile::tempdir().unwrap();
         let store = Arc::new(LocalStore::open(files.path()).unwrap().with_catalog_ledger(StorageEpoch(0)));
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "bodyf16".into(), version: 1 };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "bodyf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
         let slug = TableSlug::for_unrecorded_table(&index.table).unwrap();
         let run = upload_for_adoption(store.clone(), &index, &slug).await.unwrap();
         assert!(run.publication.is_none());
@@ -1357,9 +1363,9 @@ mod tests {
     }
 
     async fn write_run(builder: &SearchBuilder, slug: &TableSlug) -> Result<SearchRun> {
-        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
-        let document = LogicalDocument { iid: Iid([1; 16]), field: 0, revision: text_revision("test"),
-            sql_id: Some(1), tokens: rtdb_text::analyze("test"), position: (Timestamp(1), None, 1) };
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1, analyzer: rtdb_text::Analyzer::Simple };
+        let document = LogicalDocument { iid: Iid([1; 16]), field: 0, revision: text_revision(rtdb_text::Analyzer::Simple, "test"),
+            sql_id: Some(1), tokens: rtdb_text::Analyzer::Simple.analyze("test"), position: (Timestamp(1), None, 1) };
         let contents = RunContents { documents: vec![document], ..Default::default() };
         builder.store_documents(&index, &["body".into()], slug, vec![0], 0, 1, contents,
             builder.memory.reserve(indexing_allowance(0))?, None, &CancellationToken::new()).await.map(|prepared| prepared.run)
@@ -1429,7 +1435,7 @@ mod tests {
         let fields = StructFields::from([("body".into(), LogicalType::Scalar(ScalarType::Utf8))]);
         let batch = build_event_batch(&rows, Some(fields), None)?;
         let events = EventBatch::new(batch.clone())?;
-        let page = ArrowSearchPage { events: EventBatch::new(batch.clone())?,
+        let page = ArrowSearchPage { events: EventBatch::new(batch.clone())?, analyzer: rtdb_text::Analyzer::Simple,
             _owned: rtdb_columnar::OwnedBatch::new(batch, &memory)?, with_identity: false,
             uuid_iids: None, seal: None, mode: BuildMode::Postings };
         let owner = [9; 32];
@@ -1437,13 +1443,13 @@ mod tests {
         let mut posting = PostingPage { page, number: 3, columns: columns.len(), forward: &forward,
             revisions: Vec::new(), _scratch: Some(memory.reserve(4096)?) };
         let indexed = posting.row(0, &columns)?;
-        assert_eq!(indexed.revisions, [Some(revision_of(indexed.values[0].as_ref().unwrap())), None]);
+        assert_eq!(indexed.revisions, [Some(revision_of(rtdb_text::Analyzer::Simple, indexed.values[0].as_ref().unwrap())), None]);
         posting.complete();
         let merged = forward.into_inner().unwrap().finish()?;
 
         let mut previous = HistoryWriter::new(Vec::new(), owner, &memory)?;
         previous.append_forward(3, &events, &columns, |text| Ok(match text {
-            rtdb_format::data::PutText::Utf8(text) => Some(revision_of(&rtdb_text::analyze(text))),
+            rtdb_format::data::PutText::Utf8(text) => Some(revision_of(rtdb_text::Analyzer::Simple, &rtdb_text::Analyzer::Simple.analyze(text))),
             _ => None,
         }))?;
         let (previous, root) = previous.finish()?;
@@ -1456,13 +1462,13 @@ mod tests {
     fn an_erase_scrubs_older_text_and_keeps_later_reuse_at_the_same_system_time() {
         let iid = Iid([1; 16]);
         let document = |text: &str, position| LogicalDocument {
-            iid, sql_id: None, field: 0, revision: text_revision(text), tokens: rtdb_text::analyze(text), position
+            iid, sql_id: None, field: 0, revision: text_revision(rtdb_text::Analyzer::Simple, text), tokens: rtdb_text::Analyzer::Simple.analyze(text), position
         };
         let mut documents = vec![document("shared text", (Timestamp(1), None, 0)),
             document("old text", (Timestamp(2), None, 2)), document("shared text", (Timestamp(2), None, 4))];
         assert!(scrub_documents(&mut documents, &Erases::from([(iid, (Timestamp(2), None, 3))])));
         assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].revision, text_revision("shared text"));
+        assert_eq!(documents[0].revision, text_revision(rtdb_text::Analyzer::Simple, "shared text"));
         assert_eq!(documents[0].position, (Timestamp(2), None, 4));
     }
 }

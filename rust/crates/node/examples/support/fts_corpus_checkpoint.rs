@@ -7,13 +7,15 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray,
     builder::{ListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::{Int64Type, UInt32Type}};
 use arrow_schema::Schema;
 use rtdb_node::{NativeSession, Node};
-use rtdb_text::{Corpus, Query, bm25, stored_length, tokens};
+use rtdb_text::{Corpus, Query, bm25, stored_length};
 use rtdb_tx::{Documents, TxOp};
 use rtdb_types::{StructFields, TableRef, Timestamp, Value};
 use serde_json::{Value as Json, json};
 use tokio_util::sync::CancellationToken;
 
 use super::{Identity, TickClock, bench_options, bench_services, commit, flush, query, sql, where_ids};
+
+fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Contribution {

@@ -5104,6 +5104,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "rtdb-columnar",
+ "rtdb-text",
  "rtdb-types",
  "serde",
  "serde_json",
@@ -5407,6 +5408,9 @@ name = "rtdb-text"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "rust-stemmers",
+ "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -5454,7 +5458,6 @@ dependencies = [
  "rtdb-spatial",
  "rtdb-sql",
  "rtdb-storage",
- "rtdb-text",
  "rtdb-trie",
  "rtdb-types",
  "serde",
@@ -5585,6 +5588,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
 ]
 
 [[package]]

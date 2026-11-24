@@ -64,7 +64,7 @@ impl super::SearchBuilder {
         let definition = &job.definition;
         let ArtefactOwner::Trie(trie) = &job.owner else { return Err(fault("Forward witnesses cover one primary trie")); };
         let entry = snapshot.table_catalog().entry(&definition.table).ok_or_else(|| fault("Forward witness table has no slug"))?;
-        let columns = self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned()
+        let (columns, analyzer) = self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned()
             .ok_or_else(|| fault("Forward witness definition has no fields"))?;
         let directory = tempfile::tempdir().map_err(fault)?;
         let input = match source {
@@ -87,7 +87,7 @@ impl super::SearchBuilder {
                     |text| Ok(match text {
                         PutText::Utf8(text) => {
                             let _scratch = memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                            Some(super::logical::text_revision(text))
+                            Some(super::logical::text_revision(analyzer, text))
                         }
                         _ => None,
                     }))?;

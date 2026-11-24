@@ -223,7 +223,7 @@ impl SearchAccelerator {
         }
         work.plain_events += examined;
         for segment in request.snapshot.iter_segments(&definition.table) {
-            let (_, covered) = self.runtime.live_pages_at(Some(request.snapshot), request.database, segment, column);
+            let (_, covered) = self.runtime.live_pages_at(Some(request.snapshot), request.database, segment, column, definition.analyzer);
             if !self.runtime.can_scan_live_gap(segment, column, covered)? { return Ok(None); }
         }
         results.extend(self.live_candidates(request, column, query)?);
@@ -419,7 +419,7 @@ impl RankSource for PartitionRankSource<'_> {
         seed.extend(std::mem::take(&mut self.logical_seed).into_iter().map(|(bound, index)| RankWork::new(bound, Task::OpenLogical(index))));
         if self.gap_queued { seed.push(RankWork::new(RankKey::unknown(), Task::Gap)); }
         for (index, segment) in self.segments.iter().enumerate() {
-            let (pages, covered) = self.search.runtime.live_pages_at(Some(self.request.snapshot), self.request.database, segment, &self.column);
+            let (pages, covered) = self.search.runtime.live_pages_at(Some(self.request.snapshot), self.request.database, segment, &self.column, self.definition.analyzer);
             for page in pages {
                 if let Some(bound) = page.bound(&self.matching, self.ranking.scorer().query(), self.order == TreeRankOrder::Integer) {
                     seed.push(RankWork::new(bound, Task::Live(index, page)));

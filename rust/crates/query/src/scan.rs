@@ -787,14 +787,14 @@ impl ScanCursor {
         let constants = ExecutionConstants { execution: &execution, search_queries };
         let mut queries = Vec::with_capacity(scan.matches.len());
         for evaluated in &scan.matches {
-            queries.push(constants.search_query(&evaluated.query).await?);
+            queries.push(constants.search_query(&evaluated.query, evaluated.analyzer).await?);
         }
         let slots: Vec<Option<usize>> = scan.columns.iter().map(|field| scan.matches.iter().position(|evaluated| evaluated.id == field.id)).collect();
         let ranking = if let Some(top) = scan.top_k.as_ref()
             && let Some(output) = top.score
             && let Some(source) = scan.columns.iter().find(|field| field.id == top.column)
         {
-            let scorer = constants.search_query(&top.query).await?.map(|query| Arc::clone(query.scorer()));
+            let scorer = constants.search_query(&top.query, top.analyzer).await?.map(|query| Arc::clone(query.scorer()));
             Some(RankProjection { output, source: source.name.clone(), scorer, verified: None, live: None })
         } else { None };
         let fragmenter = if virtual_metadata || archive_history { None } else { execution.context.catalog.fragmenter.clone() };
@@ -931,15 +931,17 @@ impl ScanCursor {
                 let request = crate::ScanRequest { database: name, scan, candidate_iids: candidate_iids.as_ref(), snapshot, storage, bounds,
                     memory: &execution.context.memory, current_time: execution.context.current_time,
                     cancellation: &execution.context.cancellation, constants, verifier, partitions: database_partitions };
-                let live_terms = |column: &str| execution.context.accelerators.iter().filter(|_| accelerate)
-                    .find_map(|accelerator| accelerator.live_search_terms(&request, column));
-                if let Some(ranking) = &mut ranking && ranking.scorer.is_some() { ranking.live = live_terms(&ranking.source); }
+                let live_terms = |column: &str, analyzer| execution.context.accelerators.iter().filter(|_| accelerate)
+                    .find_map(|accelerator| accelerator.live_search_terms(&request, column, analyzer));
+                let ranked_analyzer = ranking.as_ref().and_then(|ranking| ranking.scorer.as_ref()).map(|scorer| scorer.query().analyzer());
+                if let Some(ranking) = &mut ranking && let Some(analyzer) = ranked_analyzer { ranking.live = live_terms(&ranking.source, analyzer); }
                 for (evaluated, query) in scan.matches.iter().zip(queries) {
                     let mut answers = None;
                     let mut live = None;
                     if let Some(query) = query {
-                        live = ranking.as_ref().filter(|ranking| ranking.source == evaluated.column).and_then(|ranking| ranking.live.clone())
-                            .or_else(|| live_terms(&evaluated.column));
+                        live = ranking.as_ref().filter(|ranking| ranking.source == evaluated.column && ranked_analyzer == Some(evaluated.analyzer))
+                            .and_then(|ranking| ranking.live.clone())
+                            .or_else(|| live_terms(&evaluated.column, evaluated.analyzer));
                         for accelerator in execution.context.accelerators.iter().filter(|_| accelerate && !ranked_here) {
                             let legacy = legacy_candidate_scan(scan, candidate_iids.as_ref(), accelerator.as_ref());
                             let request = crate::ScanRequest { database: name, scan: legacy.as_ref().unwrap_or(scan),
@@ -1706,9 +1708,9 @@ impl ScanVerifier<'_> {
             current_time: self.execution.context.current_time, cancellation: &self.execution.context.cancellation,
             constants: self.constants, verifier: self, partitions: &self.execution.context.catalog.database(database)?.partitions };
         for evaluated in &scan.matches {
-            let query = self.constants.search_query(&evaluated.query).await?;
+            let query = self.constants.search_query(&evaluated.query, evaluated.analyzer).await?;
             let live = if query.is_none() { None } else {
-                self.execution.context.accelerators.iter().find_map(|accelerator| accelerator.live_search_terms(&request, &evaluated.column))
+                self.execution.context.accelerators.iter().find_map(|accelerator| accelerator.live_search_terms(&request, &evaluated.column, evaluated.analyzer))
             };
             matches.insert(evaluated.id, (&evaluated.column, query, live));
         }
@@ -2620,15 +2622,15 @@ mod tests {
                 let scope = request.candidate_iids.expect("the previous accelerator selected Arrow candidates");
                 assert!(request.scan.iids.is_none());
                 assert_eq!(scope.iter().collect::<Vec<_>>(), [self.0]);
-                let first = request.constants.search_query(&self.1).await?.unwrap();
-                let second = request.constants.search_query(&self.1).await?.unwrap();
+                let first = request.constants.search_query(&self.1, rtdb_text::Analyzer::Simple).await?.unwrap();
+                let second = request.constants.search_query(&self.1, rtdb_text::Analyzer::Simple).await?.unwrap();
                 assert!(Arc::ptr_eq(&first, &second));
                 assert!(Arc::ptr_eq(first.scorer(), second.scorer()));
                 Ok(Some(ScanSelection { iids: CandidateIids::from_sorted(&[self.0], request.memory)?, scores: None }))
             }
 
             async fn match_answers_prepared(&self, request: &ScanRequest<'_>, _: &str, query: &PreparedSearchQuery) -> Result<Option<crate::MatchAnswers>> {
-                let prepared = request.constants.search_query(&self.1).await?.unwrap();
+                let prepared = request.constants.search_query(&self.1, rtdb_text::Analyzer::Simple).await?.unwrap();
                 assert!(std::ptr::eq(query, prepared.as_ref()));
                 assert!(request.iid_scope().unwrap().contains(&self.0));
                 Ok(None)
@@ -2639,7 +2641,7 @@ mod tests {
         let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
         let (mut scan, mut execution, _) = descriptor_scan(state.value().snapshot(), table, storage);
         let expression = Expr::Literal(Value::Utf8("v".into()));
-        scan.matches.push(rtdb_plan::ScanMatch { id: ColumnId(99), column: "v".into(), query: expression.clone() });
+        scan.matches.push(rtdb_plan::ScanMatch { id: ColumnId(99), column: "v".into(), query: expression.clone(), analyzer: rtdb_text::Analyzer::Simple });
         let matched = events[1].iid;
         let accelerators: Arc<[Arc<dyn ScanAccelerator>]> = Arc::from([Arc::new(Select(matched)) as Arc<dyn ScanAccelerator>, Arc::new(Verify(matched, expression))]);
         execution.context = execution.context.clone().with_accelerators(accelerators);
@@ -3011,7 +3013,7 @@ mod tests {
         let version = source.header().unwrap().version();
         let row = crate::ResolvedSearchRow { version, origin: None, location: crate::SearchRowLocation::Live(source), visibility: bounds };
         let scorer = rtdb_text::Scorer::new(query.clone(), None);
-        let expected = scorer.bm25_arrow(&rtdb_text::analyze("open invoice"));
+        let expected = scorer.bm25_arrow(&rtdb_text::Analyzer::Simple.analyze("open invoice"));
         let result = verifier.verify_ranked(&BTreeSet::from([version.iid]), Some(vec![row]), ColumnId(0), None, &scorer)
             .await.unwrap().unwrap();
         assert_eq!(result.len(), 1);

@@ -17,6 +17,7 @@
 -- An owned declaration can name an ordinary UTF-8 column or an optional fact struct with a single required, nullable UTF-8 value field.
 -- The fact wrapper distinguishes a missing fact field from a present null, and both contribute no search text.
 -- The owned path keeps its declared column and carrier when the relation declaration is widened.
+-- An owned search path declares no analyzer and uses the simple one.
 -- Root and world replay keep the original carrier, including the distinction between an omitted field and its present null value.
 -- Published files include the ordered definition version, artifact identity, and exact token length of each run.
 -- Owned ranking uses published files covering the held cut or a bounded projection of its exact visible identities and declared text.
@@ -64,6 +65,7 @@ value SearchIndexDefinition {
     table: trie_cat/TableRef
     -- Only the UTF-8 leg of each named column is indexed; other legs of the same column contribute no terms.
     columns: List<String>
+    -- The analyzer that tokenises the indexed columns: `WITH (analyzer = '...')`, `simple` when the document names none (Analyzer).
     analyzer: String
     -- The defining transaction's id, so redefining an index under its name is a new version.
     version: Integer
@@ -71,8 +73,18 @@ value SearchIndexDefinition {
     history: Boolean
 
     -- Derived
-    -- The artefact definition id distinguishes analyzer versions and search file formats so their files can coexist.
-    artefact_id: "{name}~a{analyzer_version}p{event_layout_version}f{format_version}"
+    -- The artefact definition id distinguishes analyzers, analyzer versions and search file formats so their files can coexist.
+    -- Redefining an index with another analyzer, or a build with another analyzer version, makes new ids, so the earlier files retire (RetireSearchFiles).
+    artefact_id: "{name}~{analyzer}.a{analyzer_version}p{event_layout_version}f{format_version}"
+}
+
+value Analyzer {
+    -- How an index and the queries against it turn text into tokens; one version (rtdb_text::ANALYZER_VERSION) covers every analyzer, its pinned Unicode tables, stop word lists and stemmers.
+    -- `simple`: runs of alphanumeric characters, lowercased.
+    -- `standard`: Unicode words (UAX #29), NFKC-normalized, lowercased, with sharp s folded to ss and final sigma to sigma.
+    -- `dutch`, `english`, `french`, `german`, `italian`, `portuguese`, `spanish`: standard tokens without French or Italian elided articles, then Snowball-stemmed.
+    -- Each language analyzer has a `_stop` form that also drops the language's stop words before stemming.
+    name: String
 }
 
 value SearchDoc {
@@ -155,7 +167,8 @@ config {
 ------------------------------------------------------------
 
 rule DefineSearchIndex {
-    -- CREATE SEARCH INDEX name ON table (column, ...) [WITH (history = true | false)] is a transaction; the indexer writes its document at the transaction's system time, valid from then on.
+    -- CREATE SEARCH INDEX name ON table (column, ...) [WITH (history = true | false, analyzer = 'name')] is a transaction; the indexer writes its document at the transaction's system time, valid from then on.
+    -- An unknown analyzer name is refused.
     -- An index covers history by default; without it, the lane builds no historical trie's search file, and a past query reads those tries through files its node builds.
     when: SearchIndexDefined(definition)
 
@@ -307,7 +320,9 @@ rule RepairUnreadableSearchFile {
 -- Rules: Query
 ------------------------------------------------------------
 
--- MATCH(column, query) holds when the column's UTF-8 value holds every term of the query, tokenised by the analyzer, and every phrase of it (terms between double quotes) as consecutive tokens.
+-- MATCH(column, query[, analyzer]) holds when the column's UTF-8 value holds every term of the query, both tokenised by the named analyzer (`simple` when none is named), and every phrase of it (terms between double quotes) as consecutive tokens.
+-- The analyzer is a string literal, so MATCH and SEARCH_SCORE stay functions of their arguments; every search function takes it as an optional last argument.
+-- RTDB_SEARCH(table, column, query[, analyzer]) ranks with the same analyzer.
 -- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
 -- SEARCH_SCORE(column, query) sums BM25 term-frequency contributions with unit weights and unit length normalization.
 -- The five-argument form computes BM25 from its document count, total stored length and document frequencies.
@@ -319,6 +334,10 @@ rule RepairUnreadableSearchFile {
 -- Its Arrow inputs supply each pair from the selected UTF-8 positions.
 -- Each id and body is prefixed with its byte length so the input has one spelling.
 -- Ranked pruning applies to the two-argument form.
+--
+-- A definition covers a MATCH when it indexes the MATCH's column under the MATCH's analyzer; a column indexed only under another analyzer is scanned.
+-- Live postings, the commit's search delta and serving postings are kept per table, column and analyzer.
+-- A ranked scan uses a definition only when its SEARCH_SCORE names the analyzer of its MATCH.
 --
 -- A scan with a MATCH conjunct on a column that a definition in force covers is narrowed before it opens:
 --

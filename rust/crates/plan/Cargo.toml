@@ -10,6 +10,7 @@ stacker.workspace = true
 async-trait.workspace = true
 rtdb-types.workspace = true
 rtdb-columnar.workspace = true
+rtdb-text.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

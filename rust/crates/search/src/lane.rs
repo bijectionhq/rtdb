@@ -52,7 +52,8 @@ pub struct SearchBuilder {
     memory: Arc<MemoryBudget>,
     clock: Arc<dyn Fn() -> rtdb_types::Instant + Send + Sync>,
     runtime: Arc<crate::SearchRuntime>,
-    columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), Vec<String>>>,
+    /// Each artefact id's indexed columns and analyzer, by table, id and definition version.
+    columns: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), (Vec<String>, rtdb_text::Analyzer)>>,
     history: Option<Arc<dyn rtdb_maintenance::TableHistorySource>>,
     scrubbed: Mutex<BTreeMap<(rtdb_types::TableRef, String, i64), [u8; 32]>>,
     unmergeable: Mutex<logical::UnmergeablePairs>,
@@ -154,8 +155,9 @@ impl ArtefactBuilder for SearchBuilder {
         };
         let mut records = Vec::new();
         for definition in definitions.into_iter().filter(|definition| &definition.table == table) {
-            if definition.id.ends_with("f16w") {
-                let public = logical::LogicalIndex::from_history(&definition);
+            let analyzer = self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).map(|(_, analyzer)| *analyzer);
+            if definition.id.ends_with("f16w") && let Some(analyzer) = analyzer {
+                let public = logical::LogicalIndex::from_history(&definition, analyzer);
                 match self.seal_logical(&public, &definition, snapshot, trie, file, size, cancellation).await {
                     Ok(Some((record, forward))) => {
                         records.push(record);
@@ -203,7 +205,7 @@ impl ArtefactBuilder for SearchBuilder {
                 for segment in snapshot.iter_segments(&definition.table) {
                     for column in &definition.columns {
                         if cancellation.is_cancelled() { return Ok(()); }
-                        runtime.publish_live(&database, segment, column, &cancellation)?;
+                        runtime.publish_live(&database, segment, column, definition.analyzer, &cancellation)?;
                     }
                 }
             }
@@ -219,10 +221,10 @@ impl ArtefactBuilder for SearchBuilder {
             let format = if logical { crate::file::LOGICAL_FORMAT_VERSION } else { self.runtime.write_format().min(crate::file::PACKED_FORMAT_VERSION) };
             let id = if logical { forward_id(definition) } else { definition.artefact_id_for(format) };
             for format in [crate::file::TANTIVY_FORMAT_VERSION, crate::file::LEGACY_FORMAT_VERSION, crate::file::FORMAT_VERSION, crate::file::TREE_FORMAT_VERSION, crate::file::PACKED_FORMAT_VERSION] {
-                columns.insert((definition.table.clone(), definition.artefact_id_for(format), definition.version), definition.columns.clone());
+                columns.insert((definition.table.clone(), definition.artefact_id_for(format), definition.version), (definition.columns.clone(), definition.analyzer));
             }
             for id in [logical::history_id(definition), forward_id(definition)] {
-                columns.insert((definition.table.clone(), id, definition.version), definition.columns.clone());
+                columns.insert((definition.table.clone(), id, definition.version), (definition.columns.clone(), definition.analyzer));
             }
             ArtefactDefinition { table: definition.table.clone(), kind: KIND.into(), id, version: definition.version,
                 historical: definition.history, group_bytes: (!logical).then(|| group_bytes(&self.memory)), packed: self.prepares_serving_search() }
@@ -285,7 +287,7 @@ impl ArtefactBuilder for SearchBuilder {
             })
         };
         let known = self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned();
-        let columns = match known { Some(columns) => columns, None => {
+        let (columns, analyzer) = match known { Some(known) => known, None => {
             self.definitions(snapshot, cancellation).await?;
             self.columns.lock().get(&(definition.table.clone(), definition.id.clone(), definition.version)).cloned().ok_or_else(|| Anomaly::incorrect("rtdb.search/definition-dropped", "The search index definition is no longer in force"))?
         } };
@@ -385,7 +387,7 @@ impl ArtefactBuilder for SearchBuilder {
             let file = std::io::BufWriter::new(std::fs::File::create(&output).map_err(fault)?);
             let uuid_iids = (format >= crate::file::TREE_FORMAT_VERSION && !owned).then(|| Arc::new(AtomicBool::new(true)));
             let members = opened.into_iter().map(|(reader, opening)| {
-                let mut rows = PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), owned);
+                let mut rows = PageRows::new(reader, opening, Arc::clone(&memory), token.clone(), analyzer, owned);
                 rows.uuid_iids.clone_from(&uuid_iids);
                 rows.seal = seal.clone();
                 if history { rows.mode = crate::file::BuildMode::History; }
@@ -425,7 +427,7 @@ fn is_search_gap(error: &Anomaly, cancellation: &CancellationToken) -> bool {
     !cancellation.is_cancelled() && error.category != rtdb_types::AnomalyCategory::Interrupted
 }
 
-fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
+fn search_row<'a>(event: EventRef<'a>, columns: &[String], analyzer: rtdb_text::Analyzer, with_identity: bool,
     seal: Option<&(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>, mode: crate::file::BuildMode) -> Result<IndexedRow<'a>> {
     let header = event.header();
     let cached = seal.and_then(|(snapshot, segment)| {
@@ -438,18 +440,18 @@ fn search_row<'a>(event: EventRef<'a>, columns: &[String], with_identity: bool,
     for column in columns {
         let text = event.put_search_text(column, with_identity)?;
         if mode == crate::file::BuildMode::History {
-            revisions.push(match text { PutText::Utf8(text) => Some(logical::text_revision(text)), _ => None });
+            revisions.push(match text { PutText::Utf8(text) => Some(logical::text_revision(analyzer, text)), _ => None });
             continue;
         }
         let tokens = match text {
             PutText::Missing => None,
             PutText::Other if mode == crate::file::BuildMode::Postings => None,
-            PutText::Utf8(text) => Some(cached.and_then(|(postings, segment, row)| postings.tokens_for_row(segment, column, row))
-                .unwrap_or_else(|| rtdb_text::analyze(text))),
+            PutText::Utf8(text) => Some(cached.and_then(|(postings, segment, row)| postings.tokens_for_row(segment, column, analyzer, row))
+                .unwrap_or_else(|| analyzer.analyze(text))),
             PutText::Other => Some(arrow_array::StringArray::from(Vec::<&str>::new())),
         };
         if mode == crate::file::BuildMode::Postings {
-            revisions.push(tokens.as_ref().map(logical::revision_of));
+            revisions.push(tokens.as_ref().map(|tokens| logical::revision_of(analyzer, tokens)));
         }
         values.push(tokens);
     }
@@ -493,11 +495,12 @@ pub(crate) fn test_row(row: IndexedRow<'_>) -> Result<SearchRow> {
 
 #[cfg(test)]
 fn search_batch(batch: &EventBatch, columns: &[String], owned: bool) -> Result<Vec<SearchRow>> {
-    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, owned, None, crate::file::BuildMode::Combined).and_then(test_row)).collect()
+    (0..batch.len()).map(|row| search_row(batch.borrow_event(row)?, columns, rtdb_text::Analyzer::Simple, owned, None, crate::file::BuildMode::Combined).and_then(test_row)).collect()
 }
 
 pub(crate) struct ArrowSearchPage {
     events: EventBatch,
+    analyzer: rtdb_text::Analyzer,
     _owned: OwnedBatch,
     with_identity: bool,
     uuid_iids: Option<Arc<AtomicBool>>,
@@ -516,7 +519,7 @@ impl SearchPage for ArrowSearchPage {
             proof.store(false, Ordering::Relaxed);
         }
         let origin = event.origin();
-        let mut indexed = search_row(event, columns, self.with_identity, self.seal.as_ref(), self.mode)?;
+        let mut indexed = search_row(event, columns, self.analyzer, self.with_identity, self.seal.as_ref(), self.mode)?;
         if self.mode == crate::file::BuildMode::Postings && indexed.header.position.is_none() {
             indexed.header.commit_position = logical::posting_position(indexed.header, origin, row)?;
         }
@@ -530,6 +533,7 @@ pub(crate) struct PageRows {
     memory: Arc<MemoryBudget>,
     cancellation: CancellationToken,
     page: usize,
+    analyzer: rtdb_text::Analyzer,
     with_identity: bool,
     uuid_iids: Option<Arc<AtomicBool>>,
     seal: Option<(rtdb_index::Snapshot, Arc<rtdb_index::LiveTable>)>,
@@ -538,8 +542,8 @@ pub(crate) struct PageRows {
 
 impl PageRows {
     fn new(reader: ArrowFile, opening: Arc<MemoryReservation>, memory: Arc<MemoryBudget>,
-           cancellation: CancellationToken, with_identity: bool) -> Self {
-        Self { reader, _opening: opening, memory, cancellation, page: 0, with_identity, uuid_iids: None, seal: None, mode: crate::file::BuildMode::Combined }
+           cancellation: CancellationToken, analyzer: rtdb_text::Analyzer, with_identity: bool) -> Self {
+        Self { reader, _opening: opening, memory, cancellation, page: 0, analyzer, with_identity, uuid_iids: None, seal: None, mode: crate::file::BuildMode::Combined }
     }
 }
 
@@ -555,14 +559,14 @@ impl Iterator for PageRows {
         self.page += 1;
         Some(read_page(&mut self.reader, page, &self.memory).and_then(|owned| {
             let events = EventBatch::new(owned.batch().clone())?;
-            Ok(ArrowSearchPage { events, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone(), seal: self.seal.clone(), mode: self.mode })
+            Ok(ArrowSearchPage { events, analyzer: self.analyzer, _owned: owned, with_identity: self.with_identity, uuid_iids: self.uuid_iids.clone(), seal: self.seal.clone(), mode: self.mode })
         }))
     }
 }
 
 /// Reads a data file's indexed rows for diagnostics and fixtures.
-pub fn search_pages<'a>(data: &[u8], columns: &'a [String], cancellation: &CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
-    let pages = search_pages_from_buffer(arrow_buffer::Buffer::from(data), columns, cancellation.clone(), MemoryBudget::new(usize::MAX))?;
+pub fn search_pages<'a>(data: &[u8], columns: &'a [String], analyzer: rtdb_text::Analyzer, cancellation: &CancellationToken) -> Result<impl Iterator<Item = Result<Vec<SearchRow>>> + 'a> {
+    let pages = search_pages_from_buffer(arrow_buffer::Buffer::from(data), columns, analyzer, cancellation.clone(), MemoryBudget::new(usize::MAX))?;
     Ok(pages.map(move |page| {
         let mut page = page?;
         (0..page.len()).map(|row| page.row(row, columns).and_then(test_row)).collect()
@@ -578,14 +582,14 @@ fn open_search_input(
 }
 
 pub(crate) fn search_pages_from_buffer(
-    buffer: arrow_buffer::Buffer, columns: &[String], cancellation: CancellationToken, memory: Arc<MemoryBudget>,
+    buffer: arrow_buffer::Buffer, columns: &[String], analyzer: rtdb_text::Analyzer, cancellation: CancellationToken, memory: Arc<MemoryBudget>,
 ) -> Result<PageRows> {
     let mut cursor = std::io::Cursor::new(buffer.as_slice());
     let layout = rtdb_format::ipc::inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes))?;
     let opening = memory.reserve(layout.opening_allocation_bound()?)?;
     let mut reader = ArrowFile::from_inspected_buffer(buffer, None, layout)?;
     reader.project_event_payload(columns);
-    Ok(PageRows::new(reader, opening, memory, cancellation, false))
+    Ok(PageRows::new(reader, opening, memory, cancellation, analyzer, false))
 }
 
 #[cfg(test)]
@@ -656,7 +660,7 @@ mod tests {
             let document = match &event.operation { StoredOperation::Put(document) => Some(document), _ => None };
             let values = columns.iter().map(|name| match document.and_then(|document| document.get(name)) {
                 None | Some(Value::Null | Value::Undefined) => None,
-                Some(Value::Utf8(text)) => Some(rtdb_text::tokens(text)),
+                Some(Value::Utf8(text)) => Some(rtdb_text::Analyzer::Simple.tokens(text)),
                 Some(_) => Some(vec![]),
             }).collect();
             SearchRow {

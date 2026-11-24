@@ -43,6 +43,8 @@ pub struct Scan {
 pub struct ScanTopK {
     pub column: ColumnId,
     pub query: Expr,
+    #[serde(with = "analyzer_name")]
+    pub analyzer: rtdb_text::Analyzer,
     pub limit: Expr,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<Expr>,
@@ -60,9 +62,27 @@ pub struct OrderedTopK {
     pub distinct: bool,
 }
 
-/// `match(column, query)` with a constant query, as the scan's column `id`: the scan may answer it from an index, reading no text.
+/// `match(column, query[, analyzer])` with a constant query, as the scan's column `id`: the scan may answer it from an index under the same analyzer, reading no text.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ScanMatch { pub id: ColumnId, pub column: String, pub query: Expr }
+pub struct ScanMatch {
+    pub id: ColumnId, pub column: String, pub query: Expr,
+    #[serde(with = "analyzer_name")]
+    pub analyzer: rtdb_text::Analyzer,
+}
+
+/// Serializes a search analyzer as its name.
+pub(crate) mod analyzer_name {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(crate) fn serialize<S: Serializer>(analyzer: &rtdb_text::Analyzer, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(analyzer.name())
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<rtdb_text::Analyzer, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        rtdb_text::Analyzer::parse(&name).ok_or_else(|| D::Error::custom(format!("unknown search analyzer {name}")))
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NamedExpr { pub field: Field, pub expr: Expr }

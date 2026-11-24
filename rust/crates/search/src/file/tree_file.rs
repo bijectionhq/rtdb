@@ -779,7 +779,8 @@ fn lower_bound(len: usize, before: impl Fn(usize) -> bool) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtdb_text::{Query, Scorer, tokens};
+    use rtdb_text::{Query, Scorer};
+    fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Interval, TemporalBounds, Timestamp};
 
     #[tokio::test]

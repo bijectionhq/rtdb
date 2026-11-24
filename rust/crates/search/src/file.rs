@@ -968,7 +968,7 @@ impl Windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rtdb_text::tokens;
+    fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::Interval;
     use crate::rank_windows::window_of;
 
@@ -1255,7 +1255,7 @@ mod tests {
         let scorer = Scorer::from_frequencies(Query::parse(r#""a b" a"#), 7, 61, &[4, 3]);
         let scores = file.matched_scores("body", &scorer, at(1, 11), None).unwrap()
             .map(|(doc, score)| (doc.iid[0], score.to_bits())).collect::<Vec<_>>();
-        assert_eq!(scores, [0usize, 2].map(|id| (id as u8 + 1, scorer.bm25_arrow(&rtdb_text::analyze(bodies[id])).to_bits())));
+        assert_eq!(scores, [0usize, 2].map(|id| (id as u8 + 1, scorer.bm25_arrow(&rtdb_text::Analyzer::Simple.analyze(bodies[id])).to_bits())));
     }
 
     #[test]

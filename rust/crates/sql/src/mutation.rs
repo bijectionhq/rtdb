@@ -12,7 +12,7 @@ pub enum Mutation {
     Assert { input: Arc<Relation>, message: Option<String> },
     CreateTable { table: QualifiedTable, columns: Vec<(String, LogicalType)> },
     GrantRole { user: String, role: String, revoke: bool },
-    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, history: bool, if_not_exists: bool },
+    CreateSearchIndex { name: String, table: QualifiedTable, columns: Vec<String>, analyzer: rtdb_plan::Analyzer, history: bool, if_not_exists: bool },
     DropSearchIndex { name: String },
     CreateOrderedIndex { name: String, table: QualifiedTable, columns: Vec<String>, if_not_exists: bool },
     DropOrderedIndex { name: String },
@@ -139,7 +139,7 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
         }
         Dml::CreateTable { table, columns } => Mutation::CreateTable { table, columns },
         Dml::GrantRole { user, role, revoke } => Mutation::GrantRole { user, role, revoke },
-        Dml::CreateSearchIndex { name, table, columns, history, if_not_exists } => Mutation::CreateSearchIndex { name, table, columns, history, if_not_exists },
+        Dml::CreateSearchIndex { name, table, columns, analyzer, history, if_not_exists } => Mutation::CreateSearchIndex { name, table, columns, analyzer, history, if_not_exists },
         Dml::DropSearchIndex { name } => Mutation::DropSearchIndex { name },
         Dml::CreateOrderedIndex { name, table, columns, if_not_exists } => Mutation::CreateOrderedIndex { name, table, columns, if_not_exists },
         Dml::DropOrderedIndex { name } => Mutation::DropOrderedIndex { name },

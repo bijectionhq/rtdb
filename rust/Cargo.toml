@@ -98,6 +98,8 @@ num-traits = "0.2.19"
 regex = "1"
 regex-syntax = "=0.8.11"
 unicode-normalization = { version = "=0.1.24", default-features = false }
+unicode-segmentation = "=1.13.3"
+rust-stemmers = "=1.2.0"
 fancy-regex = { version = "=0.16.2", path = "vendor/fancy-regex" }
 futures = "0.3"
 fs2 = "0.4"

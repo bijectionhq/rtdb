@@ -102,7 +102,8 @@ mod tests {
 
     use super::{Bound, WindowSummary};
     use crate::{SearchFile, SearchRow, build_search_file};
-    use rtdb_text::{Query, Scorer, tokens};
+    use rtdb_text::{Query, Scorer};
+    fn tokens(text: &str) -> Vec<String> { rtdb_text::Analyzer::Simple.tokens(text) }
     use rtdb_types::{EntityId, EventOp, Iid, Interval, TemporalBounds, Timestamp};
 
     #[test]

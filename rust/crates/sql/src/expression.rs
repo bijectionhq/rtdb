@@ -574,10 +574,12 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
         "octet_length" | "length" | "cardinality" | "abs" | "log10" | "ln" | "exp" | "sqrt"
         | "floor" | "ceil" | "ceiling" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh"
         | "asin" | "acos" | "atan" | "lower_inf" | "lower" | "upper" | "upper_inf"
-        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" | "epoch_nanos_be" | "search_length" | "search_terms" => 1..=1,
+        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" | "epoch_nanos_be" => 1..=1,
+        "search_length" | "search_terms" => 1..=2,
         "array_upper" | "array_lower" | "array_length" | "mod" | "log" | "power" | "age"
-        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "match" | "search_corpus_fingerprint" | "cosine_distance" => 2..=2,
-        "search_score" => 2..=5,
+        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" | "search_corpus_fingerprint" | "cosine_distance" => 2..=2,
+        "match" => 2..=3,
+        "search_score" => 2..=6,
         "approximate_nearest" => 3..=3,
         "round" => 1..=2,
         "least" | "greatest" | "str" | "format" | "concat" => 1..=usize::MAX,
@@ -586,6 +588,8 @@ fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>>
 }
 
 pub(crate) fn call(name: String, args: Vec<Expr>) -> Result<Expr> {
+    // A search analyzer is part of the plan, so it is named by a known literal.
+    rtdb_plan::call_analyzer(&name, &args)?;
     let return_type = rtdb_plan::function_type_with_args(&name, &args)?;
     Ok(Expr::Call { name, args, return_type })
 }

@@ -1,7 +1,7 @@
 use crate::EvalContext;
 use crate::compare::nullish;
 use crate::numeric::integer;
-use rtdb_text::{Corpus, Query, Scorer, count_tokens, stored_length};
+use rtdb_text::{Analyzer, Corpus, Query, Scorer, stored_length};
 use rtdb_types::{Anomaly, Result, Value, text_pair_fingerprint};
 
 /// Only the UTF-8 leg of a column is indexed, so any other value matches nothing and scores nothing.
@@ -16,15 +16,22 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
         if args.iter().any(nullish) {
             return Ok(Value::Null);
         }
+        let (analyzer, args) = match rtdb_plan::analyzer_index(name, args.len()) {
+            Some(index) => match &args[index] {
+                Value::Utf8(analyzer) => (rtdb_plan::parse_analyzer(analyzer)?, &args[..index]),
+                _ => return Err(Anomaly::incorrect("xtdb.expression/type-error", format!("The analyzer argument to `{name}` must be a string"))),
+            },
+            None => (Analyzer::Simple, args),
+        };
         match (name, args) {
             ("search_terms", [Value::Utf8(query)]) => {
-                let query = parse_query(query, context)?;
+                let query = parse_query(query, analyzer, context)?;
                 Ok(Value::list(
                     query.terms().iter().cloned().map(Value::Utf8).collect(),
                 ))
             }
             ("search_length", [Value::Utf8(text)]) => {
-                let count = count_tokens(text);
+                let count = analyzer.count_tokens(text);
                 context.reserve(count.arrow_bytes().saturating_add(256))?;
                 Ok(Value::I64(i64::from(stored_length(count.len()))))
             }
@@ -37,16 +44,16 @@ pub(crate) fn call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Opt
                 Ok(Value::Binary(text_pair_fingerprint(pairs)?.into()))
             }
             ("match", [text, Value::Utf8(query)]) => {
-                let (_, _, matched) = document_terms(&Query::parse(query), text, true, context)?;
+                let (_, _, matched) = document_terms(&Query::analyzed(analyzer, query), text, true, context)?;
                 Ok(Value::Bool(matched))
             }
             ("search_score", [text, Value::Utf8(query)]) => {
-                let query = Query::parse(query);
+                let query = Query::analyzed(analyzer, query);
                 let (length, frequencies, _) = document_terms(&query, text, false, context)?;
                 Ok(Value::F64(Scorer::new(query, None).score(&frequencies, length)))
             }
             ("search_score", [text, Value::Utf8(query), documents, total, frequencies]) => {
-                let query = parse_query(query, context)?;
+                let query = parse_query(query, analyzer, context)?;
                 let (length, counts, _) = document_terms(&query, text, false, context)?;
                 let corpus = explicit_corpus(&query, documents, total, frequencies)?;
                 Ok(Value::F64(Scorer::new(query, Some(&corpus)).score(&counts, length)))
@@ -70,9 +77,9 @@ fn document_terms(query: &Query, value: &Value, phrases: bool, context: &EvalCon
     Ok((stored_length(count.len()), frequencies, matched))
 }
 
-fn parse_query(text: &str, context: &EvalContext<'_>) -> Result<Query> {
+fn parse_query(text: &str, analyzer: Analyzer, context: &EvalContext<'_>) -> Result<Query> {
     context.reserve(text.len().saturating_mul(128).saturating_add(256))?;
-    Ok(Query::parse(text))
+    Ok(Query::analyzed(analyzer, text))
 }
 
 fn explicit_corpus(
@@ -142,9 +149,21 @@ mod tests {
     }
 
     #[test]
+    fn a_named_analyzer_tokenises_both_the_query_and_the_document() {
+        let context = EvalContext::default();
+        let text = |value: &str| Value::Utf8(value.into());
+        let call = |name: &str, args: &[Value]| call(name, args, &context).unwrap();
+        assert_eq!(call("match", &[text("The runners ran"), text("runner"), text("english")]).unwrap(), Value::Bool(true));
+        assert_eq!(call("match", &[text("The runners ran"), text("runner")]).unwrap(), Value::Bool(false));
+        assert_eq!(call("search_terms", &[text("The runners"), text("english_stop")]).unwrap(), Value::list(vec![text("runner")]));
+        assert_eq!(call("search_length", &[text("the a an runners"), text("english_stop")]).unwrap(), Value::I64(1));
+        assert!(call("match", &[text("text"), text("text"), text("klingon")]).is_err());
+    }
+
+    #[test]
     fn arrow_search_scalar_uses_the_token_vector_charge_and_exact_score() {
         let document = "ΟΤΕ a b a b ".repeat(1030);
-        let tokens = rtdb_text::analyze(&document);
+        let tokens = rtdb_text::Analyzer::Simple.analyze(&document);
         let charge = 4096 + 512 + tokens.get_array_memory_size();
         let query = r#""a b" οτε"#;
         let args = [Value::Utf8(document), Value::Utf8(query.into())];

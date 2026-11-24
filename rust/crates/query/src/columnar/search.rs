@@ -9,7 +9,7 @@ use arrow_schema::{DataType as Type, Field};
 use rtdb_columnar::{TextCell, from_field, text_cell};
 use rtdb_expr::Parameters;
 use rtdb_plan::{Expr, Schema};
-use rtdb_text::{Query, Scorer, count_tokens, stored_length};
+use rtdb_text::{Query, Scorer, stored_length};
 use rtdb_types::{Anomaly, LogicalType, Result, Value, text_pair_fingerprint};
 
 use super::{Column, ColumnBatch};
@@ -168,7 +168,9 @@ enum Function {
 }
 
 impl Function {
+    /// The function of a call and its arity without the analyzer argument.
     fn of(name: &str, arity: usize) -> Option<Self> {
+        let arity = rtdb_plan::analyzer_index(name, arity).unwrap_or(arity);
         Some(match (name, arity) {
             ("match", 2) => Self::Match,
             ("search_score", 2 | 5) => Self::Score,
@@ -250,6 +252,8 @@ fn output_column(name: &str, array: ArrayRef) -> Result<Column> {
 pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: Parameters<'_>, context: &QueryContext) -> Result<Option<Column>> {
     let Expr::Call { name, args, .. } = expr else { return Ok(None) };
     let Some(function) = Function::of(name, args.len()) else { return Ok(None) };
+    let analyzer = rtdb_plan::call_analyzer(name, args)?;
+    let args = &args[..rtdb_plan::analyzer_index(name, args.len()).unwrap_or(args.len())];
     let mut retained = context.memory.reserve(4096usize.saturating_add(batch.len.saturating_mul(16)))?;
     let mut computed = Vec::with_capacity(args.len());
     for arg in args {
@@ -293,9 +297,9 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
                         .saturating_add(first.map_or(0, |text| text.len().saturating_mul(32))))?;
                     let varying;
                     let query = if matches!(inputs[1], Input::Constant(_)) {
-                        parsed.get_or_insert_with(|| Query::parse(query))
+                        parsed.get_or_insert_with(|| Query::analyzed(analyzer, query))
                     } else {
-                        varying = Query::parse(query);
+                        varying = Query::analyzed(analyzer, query);
                         &varying
                     };
                     Ok::<_, Anomaly>(match function {
@@ -331,7 +335,7 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
             Function::Length => {
                 let count = first.map(|text| {
                     let _scratch = context.memory.reserve(256usize.saturating_add(text.len().saturating_mul(32)))?;
-                    Ok::<_, Anomaly>(i64::from(stored_length(count_tokens(text).len())))
+                    Ok::<_, Anomaly>(i64::from(stored_length(analyzer.count_tokens(text).len())))
                 }).transpose()?;
                 length.append_option(count);
             }
@@ -341,9 +345,9 @@ pub(super) fn column(expr: &Expr, schema: &Schema, batch: &ColumnBatch, params: 
                     owner.grow_to(owner.bytes().saturating_add(text.len().saturating_mul(16)))?;
                     let varying;
                     let query = if matches!(inputs[0], Input::Constant(_)) {
-                        parsed.get_or_insert_with(|| Query::parse(text))
+                        parsed.get_or_insert_with(|| Query::analyzed(analyzer, text))
                     } else {
-                        varying = Query::parse(text);
+                        varying = Query::analyzed(analyzer, text);
                         &varying
                     };
                     for term in query.terms() { terms.values().append_value(term); }
@@ -423,7 +427,7 @@ mod tests {
         assert!(output.is_null(0));
         assert!((0..4).all(|index| params.known(index).is_none()));
         for (row, text) in ["invoice paid", "invoice invoice"].into_iter().enumerate() {
-            assert_eq!(output.value(row + 1).to_bits(), scorer.bm25_arrow(&rtdb_text::analyze(text)).to_bits());
+            assert_eq!(output.value(row + 1).to_bits(), scorer.bm25_arrow(&rtdb_text::Analyzer::Simple.analyze(text)).to_bits());
         }
     }
 }

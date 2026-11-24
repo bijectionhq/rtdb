@@ -13,6 +13,8 @@ mod trace;
 mod temporal;
 mod period;
 mod search;
+pub use search::{analyzer_index, call_analyzer, parse_analyzer};
+pub use rtdb_text::Analyzer;
 mod string;
 mod regex;
 mod regex_replace;

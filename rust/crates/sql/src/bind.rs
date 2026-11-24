@@ -322,11 +322,11 @@ impl Context<'_> {
                 Ok(Statement::Dml(Dml::CreateTable { table: self.target(table)?, columns }))
             }
             Syntax::GrantRole { user, role, revoke } => Ok(Statement::Dml(Dml::GrantRole { user: user.normalized(), role: role.normalized(), revoke: *revoke })),
-            Syntax::CreateSearchIndex { name, table, columns, history, if_not_exists } => {
+            Syntax::CreateSearchIndex { name, table, columns, analyzer, history, if_not_exists } => {
                 let columns: Vec<_> = columns.iter().map(Identifier::normalized).collect();
                 if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() { return Err(error("CREATE SEARCH INDEX repeats a column")); }
                 if columns.iter().any(|name| name.starts_with('_')) { return Err(error("CREATE SEARCH INDEX cannot index internal columns")); }
-                Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns, history: *history, if_not_exists: *if_not_exists }))
+                Ok(Statement::Dml(Dml::CreateSearchIndex { name: name.normalized(), table: self.target(table)?, columns, analyzer: *analyzer, history: *history, if_not_exists: *if_not_exists }))
             }
             Syntax::DropSearchIndex { name } => Ok(Statement::Dml(Dml::DropSearchIndex { name: name.normalized() })),
             Syntax::CreateOrderedIndex { name, table, columns, if_not_exists } => {
@@ -1205,10 +1205,11 @@ impl Context<'_> {
             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(expr),
             _ => Err(grammar_rejected("Ranked table function argument")),
         }).collect::<Result<Vec<_>>>()?;
-        let (table, column, probe, fetch, rank_name, function, descending) = match (ranked, expressions.as_slice()) {
-            (RankedTable::Search, [table, column, probe]) => (table, column, probe, None, "_score", "search_score", true),
-            (RankedTable::Nearest, [table, column, probe, limit]) => (table, column, probe, Some(*limit), "_distance", "cosine_distance", false),
-            _ => return Err(error("RTDB_SEARCH requires a table, column and query. RTDB_NEAREST also requires a limit")),
+        let (table, column, probe, analyzer, fetch, rank_name, function, descending) = match (ranked, expressions.as_slice()) {
+            (RankedTable::Search, [table, column, probe]) => (table, column, probe, None, None, "_score", "search_score", true),
+            (RankedTable::Search, [table, column, probe, analyzer]) => (table, column, probe, Some(*analyzer), None, "_score", "search_score", true),
+            (RankedTable::Nearest, [table, column, probe, limit]) => (table, column, probe, None, Some(*limit), "_distance", "cosine_distance", false),
+            _ => return Err(error("RTDB_SEARCH requires a table, column, query and an optional analyzer. RTDB_NEAREST requires a table, column, probe and limit")),
         };
         let parts = match table {
             ast::Expr::Identifier(part) => vec![part.clone()],
@@ -1228,7 +1229,8 @@ impl Context<'_> {
         if field(rank_name).is_some() { return Err(error(format!("Ranked table output already has a column named {rank_name}"))); }
         let probe = self.expr(probe, &Schema::default(), &BTreeMap::new())?;
         let fetch = fetch.map(|value| self.expr(value, &Schema::default(), &BTreeMap::new())).transpose()?;
-        let arguments = vec![source.expression(), probe];
+        let mut arguments = vec![source.expression(), probe];
+        if let Some(analyzer) = analyzer { arguments.push(self.expr(analyzer, &Schema::default(), &BTreeMap::new())?); }
         let rank = crate::expression::call(function.into(), arguments.clone())?;
         let mut rank_field = self.binder.field(rank_name, None, rank.data_type())?;
         rank_field.qualifier = source.qualifier.clone();

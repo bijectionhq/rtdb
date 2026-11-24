@@ -248,7 +248,7 @@ mod tests {
         let page = corpus.finish(1, 1).unwrap();
         assert_eq!(page.total, 3);
         assert_eq!(page.hits[0].id, EntityId::Integer(2));
-        assert_eq!(page.hits[0].score.to_bits(), scorer.bm25_arrow(&rtdb_text::analyze("a b")).to_bits());
+        assert_eq!(page.hits[0].score.to_bits(), scorer.bm25_arrow(&rtdb_text::Analyzer::Simple.analyze("a b")).to_bits());
     }
 
     #[test]

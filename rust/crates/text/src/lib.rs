@@ -1,20 +1,197 @@
 //! Text analysis shared by full-text search's index and its residual check, so that both see the same tokens.
 //! Behavioural spec: dev/doc/fts.allium.
 
+mod stop_words;
+
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
 use arrow_array::{Array, StringArray, builder::StringBuilder};
+use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
 
-pub const SIMPLE_ANALYZER: &str = "simple";
-
-/// Bumped whenever tokenisation changes, so that search files built by an earlier analyzer are never read by a later one.
-pub const ANALYZER_VERSION: i32 = 2;
+/// Bumped whenever any analyzer's tokenisation changes, the pinned segmentation, normalization and stemming tables included,
+/// so that search files built by an earlier analyzer are never read by a later one.
+pub const ANALYZER_VERSION: i32 = 3;
 
 /// The maximum UTF-8 byte length of one token for this analyzer version.
 pub const MAX_TOKEN_BYTES: usize = 65_530;
 
-fn tokenize(text: &str, mut output: impl TokenOutput) {
+/// A language with a Snowball stemmer and a stop word list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Language { Dutch, English, French, German, Italian, Portuguese, Spanish }
+
+impl Language {
+    fn algorithm(self) -> rust_stemmers::Algorithm {
+        use rust_stemmers::Algorithm;
+        match self {
+            Self::Dutch => Algorithm::Dutch,
+            Self::English => Algorithm::English,
+            Self::French => Algorithm::French,
+            Self::German => Algorithm::German,
+            Self::Italian => Algorithm::Italian,
+            Self::Portuguese => Algorithm::Portuguese,
+            Self::Spanish => Algorithm::Spanish,
+        }
+    }
+
+    fn stop_words(self) -> &'static [&'static str] {
+        match self {
+            Self::Dutch => stop_words::DUTCH,
+            Self::English => stop_words::ENGLISH,
+            Self::French => stop_words::FRENCH,
+            Self::German => stop_words::GERMAN,
+            Self::Italian => stop_words::ITALIAN,
+            Self::Portuguese => stop_words::PORTUGUESE,
+            Self::Spanish => stop_words::SPANISH,
+        }
+    }
+
+    /// The elided article or pronoun a French or Italian word may start with, up to and including its apostrophe.
+    fn elisions(self) -> &'static [&'static str] {
+        match self {
+            Self::French => &["c", "d", "j", "jusqu", "l", "lorsqu", "m", "n", "puisqu", "qu", "quoiqu", "s", "t"],
+            Self::Italian => &["agl", "all", "c", "coll", "d", "dagl", "dall", "degl", "dell", "gl", "l", "m", "negl", "nell",
+                "pell", "s", "sugl", "sull", "t", "un", "v"],
+            _ => &[],
+        }
+    }
+
+    fn strip_elision(self, word: &str) -> &str {
+        let Some(apostrophe) = word.find(['\'', '\u{2019}']) else { return word; };
+        if self.elisions().binary_search(&&word[..apostrophe]).is_err() { return word; }
+        &word[apostrophe + word[apostrophe..].chars().next().map_or(0, char::len_utf8)..]
+    }
+}
+
+/// How a search index and the queries against it turn text into tokens.
+/// An analyzer is named in its index definition and in each MATCH and SEARCH_SCORE, and is part of its search files' artefact id.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Analyzer {
+    /// Runs of alphanumeric characters, lowercased.
+    #[default]
+    Simple,
+    /// Unicode words (UAX #29), NFKC-normalized and case-folded.
+    Standard,
+    /// Standard tokens with the language's elisions removed, optionally without its stop words, then Snowball-stemmed.
+    Language { language: Language, stop_words: bool },
+}
+
+const ANALYZERS: [(&str, Analyzer); 16] = {
+    use Language::*;
+    const fn stemmed(language: Language, stop_words: bool) -> Analyzer { Analyzer::Language { language, stop_words } }
+    [
+        ("dutch", stemmed(Dutch, false)), ("dutch_stop", stemmed(Dutch, true)),
+        ("english", stemmed(English, false)), ("english_stop", stemmed(English, true)),
+        ("french", stemmed(French, false)), ("french_stop", stemmed(French, true)),
+        ("german", stemmed(German, false)), ("german_stop", stemmed(German, true)),
+        ("italian", stemmed(Italian, false)), ("italian_stop", stemmed(Italian, true)),
+        ("portuguese", stemmed(Portuguese, false)), ("portuguese_stop", stemmed(Portuguese, true)),
+        ("simple", Analyzer::Simple),
+        ("spanish", stemmed(Spanish, false)), ("spanish_stop", stemmed(Spanish, true)),
+        ("standard", Analyzer::Standard),
+    ]
+};
+
+impl Analyzer {
+    /// The analyzer a definition or query names; names are lowercase and exact.
+    pub fn parse(name: &str) -> Option<Self> {
+        ANALYZERS.iter().find(|(known, _)| *known == name).map(|&(_, analyzer)| analyzer)
+    }
+
+    pub fn name(self) -> &'static str {
+        ANALYZERS.iter().find(|(_, known)| *known == self).map(|&(name, _)| name).expect("every analyzer is named")
+    }
+
+    pub fn names() -> impl Iterator<Item = &'static str> { ANALYZERS.iter().map(|&(name, _)| name) }
+
+    fn tokenize(self, text: &str, mut output: impl TokenOutput) {
+        match self {
+            Self::Simple => simple_tokens(text, output),
+            Self::Standard => {
+                let mut folded = String::new();
+                for word in text.unicode_words() {
+                    folded.clear();
+                    fold(word, &mut folded);
+                    bounded_token(&folded, &mut output);
+                }
+            }
+            Self::Language { language, stop_words } => {
+                let stemmer = rust_stemmers::Stemmer::create(language.algorithm());
+                let mut folded = String::new();
+                for word in text.unicode_words() {
+                    folded.clear();
+                    fold(word, &mut folded);
+                    let word = language.strip_elision(&folded);
+                    if word.is_empty() || (stop_words && language.stop_words().binary_search(&word).is_ok()) { continue; }
+                    let stemmed: Cow<'_, str> = stemmer.stem(word);
+                    bounded_token(&stemmed, &mut output);
+                }
+            }
+        }
+    }
+
+    pub fn visit_tokens(self, text: &str, visit: impl FnMut(&str)) {
+        self.tokenize(text, TokenVisitor { token: String::new(), visit });
+    }
+
+    pub fn tokens(self, text: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        self.visit_tokens(text, |word| tokens.push(word.to_owned()));
+        tokens
+    }
+
+    pub fn append_tokens(self, text: &str, builder: &mut StringBuilder) {
+        self.tokenize(text, builder);
+    }
+
+    /// Analyzes a document into an Arrow string vector in token order.
+    pub fn analyze(self, text: &str) -> StringArray {
+        let mut tokens = StringBuilder::new();
+        self.append_tokens(text, &mut tokens);
+        tokens.finish()
+    }
+
+    pub fn count_tokens(self, text: &str) -> TokenCount {
+        let mut count = TokenCount::new();
+        self.tokenize(text, &mut count);
+        count
+    }
+}
+
+impl std::fmt::Display for Analyzer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(self.name()) }
+}
+
+/// NFKC, then the Unicode lowercase mapping with the full case folding of sharp s and final sigma.
+fn fold(word: &str, folded: &mut String) {
+    for character in word.nfkc() {
+        for lower in character.to_lowercase() {
+            match lower {
+                'ß' => folded.push_str("ss"),
+                'ς' => folded.push('σ'),
+                lower => folded.push(lower),
+            }
+        }
+    }
+}
+
+/// Splits a token longer than the index's longest token at character boundaries.
+fn bounded_token(token: &str, output: &mut impl TokenOutput) {
+    let mut length = 0;
+    for character in token.chars() {
+        if length + character.len_utf8() > MAX_TOKEN_BYTES {
+            output.end_token();
+            length = 0;
+        }
+        output.write_char(character).unwrap();
+        length += character.len_utf8();
+    }
+    output.end_token();
+}
+
+fn simple_tokens(text: &str, mut output: impl TokenOutput) {
     let words = text.split(|character: char| !character.is_alphanumeric()).filter(|word| !word.is_empty());
     for word in words {
         if word.is_ascii() {
@@ -75,27 +252,6 @@ impl<F: FnMut(&str)> TokenOutput for TokenVisitor<F> {
     }
 }
 
-pub fn visit_tokens(text: &str, visit: impl FnMut(&str)) {
-    tokenize(text, TokenVisitor { token: String::new(), visit });
-}
-
-pub fn tokens(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    visit_tokens(text, |word| tokens.push(word.to_owned()));
-    tokens
-}
-
-pub fn append_tokens(text: &str, builder: &mut StringBuilder) {
-    tokenize(text, builder);
-}
-
-/// Analyzes a document into an Arrow string vector in token order.
-pub fn analyze(text: &str) -> StringArray {
-    let mut tokens = StringBuilder::new();
-    append_tokens(text, &mut tokens);
-    tokens.finish()
-}
-
 #[derive(Clone, Copy)]
 pub struct TokenCount {
     len: usize,
@@ -148,34 +304,34 @@ impl<F: FnMut(&str)> TokenOutput for CountedTokens<'_, F> {
     }
 }
 
-pub fn count_tokens(text: &str) -> TokenCount {
-    let mut count = TokenCount::new();
-    tokenize(text, &mut count);
-    count
-}
-
 /// A query's distinct terms, in first-occurrence order, and its phrases: runs of terms written between double quotes.
 /// A document matches when it holds every term, and every phrase as consecutive tokens; an unclosed quote runs to the end.
+/// The query's analyzer tokenises both the query and every document it is tested against.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Query {
+    analyzer: Analyzer,
     terms: Vec<String>,
     phrases: Vec<Vec<String>>,
     term_order: Vec<usize>,
 }
 
 impl Query {
-    pub fn parse(text: &str) -> Self {
+    /// A query under the simple analyzer.
+    pub fn parse(text: &str) -> Self { Self::analyzed(Analyzer::Simple, text) }
+
+    pub fn analyzed(analyzer: Analyzer, text: &str) -> Self {
         let mut terms = Vec::new();
         let mut phrases = Vec::new();
         for (index, part) in text.split('"').enumerate() {
-            let words = tokens(part);
+            let words = analyzer.tokens(part);
             for word in &words { if !terms.contains(word) { terms.push(word.clone()); } }
             if index % 2 == 1 && words.len() > 1 { phrases.push(words); }
         }
         let mut term_order: Vec<_> = (0..terms.len()).collect();
         term_order.sort_unstable_by(|&left, &right| terms[left].cmp(&terms[right]));
-        Self { terms, phrases, term_order }
+        Self { analyzer, terms, phrases, term_order }
     }
+    pub fn analyzer(&self) -> Analyzer { self.analyzer }
     pub fn terms(&self) -> &[String] { &self.terms }
     pub fn phrases(&self) -> &[Vec<String>] { &self.phrases }
     /// A query with no terms matches nothing.
@@ -209,7 +365,7 @@ impl Query {
                 }
             }
         };
-        tokenize(text, CountedTokens {
+        self.analyzer.tokenize(text, CountedTokens {
             count: &mut count,
             visitor: TokenVisitor { token: String::new(), visit },
         });
@@ -381,6 +537,54 @@ pub fn bm25(query: &Query, document: &[String], corpus: Option<&Corpus>) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tokens(text: &str) -> Vec<String> { Analyzer::Simple.tokens(text) }
+    fn analyze(text: &str) -> StringArray { Analyzer::Simple.analyze(text) }
+    fn append_tokens(text: &str, builder: &mut StringBuilder) { Analyzer::Simple.append_tokens(text, builder) }
+
+    fn analyzed(name: &str, text: &str) -> Vec<String> { Analyzer::parse(name).unwrap().tokens(text) }
+
+    #[test]
+    fn analyzer_names_round_trip_and_unknown_names_are_refused() {
+        for name in Analyzer::names() { assert_eq!(Analyzer::parse(name).unwrap().name(), name); }
+        assert_eq!(Analyzer::default(), Analyzer::Simple);
+        assert!(Analyzer::parse("English").is_none());
+        assert!(Analyzer::parse("klingon").is_none());
+    }
+
+    #[test]
+    fn standard_tokens_are_unicode_words_normalized_and_case_folded() {
+        assert_eq!(analyzed("standard", "Straße ﬁle ΟΣ don't U.S.A. 3.14 — 🙂"), ["strasse", "file", "οσ", "don't", "u.s.a", "3.14"]);
+    }
+
+    #[test]
+    fn language_analyzers_stem_and_optionally_drop_stop_words() {
+        assert_eq!(analyzed("english", "The runners were running"), ["the", "runner", "were", "run"]);
+        assert_eq!(analyzed("english_stop", "The runners were running"), ["runner", "were", "run"]);
+        assert_eq!(analyzed("french_stop", "L'homme et les maisons"), ["homm", "maison"]);
+        assert_eq!(analyzed("italian", "dell'amica"), ["amic"]);
+        assert_eq!(analyzed("german_stop", "Die Häuser und die Bäume"), ["haus", "baum"]);
+        for name in Analyzer::names() {
+            let analyzer = Analyzer::parse(name).unwrap();
+            let query = Query::analyzed(analyzer, "Running HOUSES");
+            assert_eq!(query.analyzer(), analyzer);
+            assert!(query.matches_text("the houses kept running"), "{name}");
+        }
+    }
+
+    #[test]
+    fn stop_word_lists_are_sorted_and_folded() {
+        for language in [Language::Dutch, Language::English, Language::French, Language::German, Language::Italian, Language::Portuguese, Language::Spanish] {
+            let words = language.stop_words();
+            assert!(words.windows(2).all(|pair| pair[0] < pair[1]), "{language:?}");
+            for word in words {
+                let mut folded = String::new();
+                fold(word, &mut folded);
+                assert_eq!(&folded, word);
+            }
+            assert!(language.elisions().windows(2).all(|pair| pair[0] < pair[1]), "{language:?}");
+        }
+    }
 
     #[test]
     fn fts_arrow_streaming_match_and_score_preserve_tokens_and_binary64() {

@@ -11,14 +11,21 @@ use tokio_util::sync::CancellationToken;
 
 /// One version of a search index definition, as `xt.search_indexes` holds it (fts.allium: SearchIndexDefinition).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SearchDefinition { pub name: String, pub table: TableRef, pub columns: Vec<String>, pub version: i64, pub history: bool }
+pub struct SearchDefinition {
+    pub name: String, pub table: TableRef, pub columns: Vec<String>, pub analyzer: rtdb_text::Analyzer, pub version: i64, pub history: bool,
+}
 
 impl SearchDefinition {
-    /// The artefact ID for the default paged writer and the current analyzer.
+    /// The artefact ID for the default paged writer and the definition's analyzer at its current version.
     pub fn artefact_id(&self) -> String { self.artefact_id_for(crate::file::FORMAT_VERSION) }
 
     pub(crate) fn artefact_id_for(&self, format: i32) -> String {
-        format!("{}~a{}p2f{}", self.name, rtdb_text::ANALYZER_VERSION, format)
+        format!("{}~{}.a{}p2f{}", self.name, self.analyzer, rtdb_text::ANALYZER_VERSION, format)
+    }
+
+    /// Whether the definition's files answer `query` on `column`: they hold the column's tokens under the query's analyzer.
+    pub fn serves(&self, table: &TableRef, column: &str, analyzer: rtdb_text::Analyzer) -> bool {
+        &self.table == table && self.analyzer == analyzer && self.columns.iter().any(|indexed| indexed == column)
     }
 }
 
@@ -39,7 +46,7 @@ pub async fn definitions_in(database: &str, partitions: Vec<Snapshot>, storage: 
     if !partitions.iter().any(|snapshot| snapshot.contains_table(&table)) { return Ok(Vec::new()); }
     let catalog = CatalogSnapshot::new(database, BTreeMap::from([(database.to_string(), DatabaseSnapshot { partitions, storage })]), false)?;
     let context = QueryContext::new(catalog, Arc::clone(&memory), now, "UTC", QueryOptions::default(), cancellation)?;
-    let sql = "SELECT _id, schema_name, table_name, columns, version, history FROM xt.search_indexes";
+    let sql = "SELECT _id, schema_name, table_name, columns, version, history, analyzer FROM xt.search_indexes";
     let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &rtdb_sql::PrepareOptions::default(), &memory)?;
     let cursor = PreparedQuery::from_prepared(prepared, &memory)?.execute(context, Vec::new()).await?;
     read_definitions(cursor, None).await
@@ -118,11 +125,22 @@ async fn read_definitions(
                         .ok_or_else(|| malformed("history"))?.value(position),
                 }
             };
-            definitions.push(SearchDefinition { name: text(0)?.to_owned(), table, columns, version, history });
+            // An owned search path declares no analyzer and uses the simple one.
+            let analyzer = if owned_catalog.is_some() { rtdb_text::Analyzer::Simple } else { optional_analyzer(cell(6), row)? };
+            definitions.push(SearchDefinition { name: text(0)?.to_owned(), table, columns, analyzer, version, history });
         }
     }
     definitions.sort();
     Ok(definitions)
+}
+
+/// A definition without an analyzer uses the simple one.
+fn optional_analyzer((field, array): (&arrow_schema::Field, &dyn arrow_array::Array), row: usize) -> Result<rtdb_text::Analyzer> {
+    match text_cell(&from_field(field)?, field, array, row)? {
+        TextCell::Utf8(name) => rtdb_text::Analyzer::parse(name).ok_or_else(|| malformed("analyzer")),
+        TextCell::Missing => Ok(rtdb_text::Analyzer::Simple),
+        TextCell::Other => Err(malformed("analyzer")),
+    }
 }
 
 fn malformed(column: &str) -> Anomaly {

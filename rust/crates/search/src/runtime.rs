@@ -120,7 +120,7 @@ impl LivePostingPage {
             + self.frequencies.get_array_memory_size() + self.ids.get_array_memory_size() + 256
     }
 
-    fn from_rows(segment: &rtdb_index::LiveTable, column: &str, from: u32, to: u32,
+    fn from_rows(segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer, from: u32, to: u32,
         available: usize, cancellation: &CancellationToken,
         prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>) -> Result<Option<Self>> {
         let mut texts = [None; LIVE_PAGE_ROWS as usize];
@@ -135,10 +135,10 @@ impl LivePostingPage {
             Ok(true)
         })?;
         if !complete { return Ok(None); }
-        Self::from_text(from, &texts[..(to - from) as usize], available, cancellation, prepared)
+        Self::from_text(from, &texts[..(to - from) as usize], analyzer, available, cancellation, prepared)
     }
 
-    fn from_text(from: u32, texts: &[Option<LiveText<'_>>],
+    fn from_text(from: u32, texts: &[Option<LiveText<'_>>], analyzer: rtdb_text::Analyzer,
         available: usize, cancellation: &CancellationToken,
         prepared: Option<(&BooleanArray, LargeListArray, std::ops::Range<usize>)>) -> Result<Option<Self>> {
         let mut builder = prepared.is_none().then(|| LargeListBuilder::new(StringBuilder::new()));
@@ -156,7 +156,7 @@ impl LivePostingPage {
                         return Err(rtdb_types::Anomaly::fault("rtdb.search/invalid-delta", "Committed text row has no token sequence"));
                     }
                 } else if let Some(builder) = &mut builder {
-                    rtdb_text::append_tokens(text, builder.values());
+                    analyzer.append_tokens(text, builder.values());
                     builder.append(true);
                 }
                 ids.push(Some(id));
@@ -282,6 +282,7 @@ impl LivePostingPage {
 }
 
 struct ServingTerms {
+    analyzer: rtdb_text::Analyzer,
     batches: BTreeMap<usize, ServingBatch>,
     _reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
@@ -306,6 +307,7 @@ impl ServingTerms {
 
 impl rtdb_query::LiveSearchTerms for ServingTerms {
     fn matches(&self, batch: &rtdb_index::IndexBatch, row: usize, query: &rtdb_text::Query) -> Option<bool> {
+        if query.analyzer() != self.analyzer { return None; }
         let (page, row) = self.covered(batch, row)?;
         let matched = !query.terms().is_empty() && query.terms().iter().all(|term| {
             page.postings(term).is_some_and(|rows| rows.binary_search(&row).is_ok())
@@ -314,6 +316,7 @@ impl rtdb_query::LiveSearchTerms for ServingTerms {
     }
 
     fn score(&self, batch: &rtdb_index::IndexBatch, row: usize, scorer: &rtdb_text::Scorer) -> Option<f64> {
+        if scorer.query().analyzer() != self.analyzer { return None; }
         let (page, row) = self.covered(batch, row)?;
         Some(page.score(row, scorer))
     }
@@ -327,14 +330,14 @@ struct ServingColumn {
 
 pub(crate) struct ServingPostings {
     block: rtdb_types::BlockIndex,
-    columns: BTreeMap<(rtdb_types::TableRef, String), ServingColumn>,
+    columns: BTreeMap<crate::delta::Column, ServingColumn>,
 }
 
 impl ServingPostings {
     pub fn prepare(snapshot: &Snapshot, definitions: &[SearchDefinition], budget: &Arc<MemoryBudget>,
         cancellation: &CancellationToken) -> Result<Self> {
         let columns: BTreeSet<_> = definitions.iter().flat_map(|definition| {
-            definition.columns.iter().map(|column| (definition.table.clone(), column.clone()))
+            definition.columns.iter().map(|column| (definition.table.clone(), column.clone(), definition.analyzer))
         }).collect();
         Self::extend(snapshot, columns, None, budget, cancellation)
     }
@@ -346,7 +349,7 @@ impl ServingPostings {
         let previous = snapshot.serving_search::<Self>().filter(|previous| previous.block == block);
         let mut indexed = if commit.is_some() { Self::preserve(snapshot).columns } else { BTreeMap::new() };
         for key in columns {
-            let (table, column) = &key;
+            let (table, column, analyzer) = &key;
             let Some(segment) = snapshot.iter_segments(table).next() else { continue; };
             let mut postings = previous.and_then(|previous| previous.columns.get(&key)).map(|entry| entry.postings.clone()).unwrap_or_default();
             let first = match commit {
@@ -370,7 +373,7 @@ impl ServingPostings {
                 })?;
                 let Ok(mut reservation) = budget.reserve(bytes) else { break; };
                 let prepared = commit.map(|(delta, _)| delta.page(&key, (from - first) as usize..(to - first) as usize));
-                let Some(mut page) = LivePostingPage::from_text(from, &texts[..(to - from) as usize], bytes, cancellation, prepared)? else { break; };
+                let Some(mut page) = LivePostingPage::from_text(from, &texts[..(to - from) as usize], *analyzer, bytes, cancellation, prepared)? else { break; };
                 let retained = page.bytes();
                 if retained > bytes { break; }
                 Arc::get_mut(&mut reservation).expect("unpublished search page owns its reservation").shrink_to(retained)?;
@@ -395,14 +398,14 @@ impl ServingPostings {
         Self { block, columns }
     }
 
-    fn pages(&self, segment: &rtdb_index::LiveTable, column: &str) -> Option<(Vec<Arc<LivePostingPage>>, u32)> {
-        let entry = self.columns.get(&(segment.table().clone(), column.to_owned()))?;
+    fn pages(&self, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer) -> Option<(Vec<Arc<LivePostingPage>>, u32)> {
+        let entry = self.columns.get(&(segment.table().clone(), column.to_owned(), analyzer))?;
         if !std::ptr::eq(entry.segment.as_ptr(), segment) { return None; }
         Some((entry.postings.pages.clone(), entry.postings.rows))
     }
 
-    pub(crate) fn tokens_for_row(&self, segment: &rtdb_index::LiveTable, column: &str, row: u32) -> Option<StringArray> {
-        let entry = self.columns.get(&(segment.table().clone(), column.to_owned()))?;
+    pub(crate) fn tokens_for_row(&self, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer, row: u32) -> Option<StringArray> {
+        let entry = self.columns.get(&(segment.table().clone(), column.to_owned(), analyzer))?;
         if !std::ptr::eq(entry.segment.as_ptr(), segment) || row >= entry.postings.rows { return None; }
         let index = entry.postings.pages.partition_point(|page| page.first_row <= row).checked_sub(1)?;
         let page = &entry.postings.pages[index];
@@ -419,12 +422,12 @@ struct LivePostings {
 }
 
 impl LivePostings {
-    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str, cancellation: &CancellationToken) -> Result<()> {
+    fn extend(&mut self, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer, cancellation: &CancellationToken) -> Result<()> {
         let mut from = self.rows;
         while from < segment.row_count() {
             let to = from.saturating_add(LIVE_PAGE_ROWS).min(segment.row_count());
             let remaining = LIVE_POSTING_BYTES.saturating_sub(self.bytes);
-            let Some(page) = LivePostingPage::from_rows(segment, column, from, to, remaining, cancellation, None)? else { break; };
+            let Some(page) = LivePostingPage::from_rows(segment, column, analyzer, from, to, remaining, cancellation, None)? else { break; };
             let bytes = page.bytes();
             if bytes > remaining { break; }
             self.pages.push(Arc::new(page));
@@ -437,7 +440,7 @@ impl LivePostings {
     }
 }
 
-type LiveKey = (String, rtdb_types::TableRef, String, usize);
+type LiveKey = (String, rtdb_types::TableRef, String, rtdb_text::Analyzer, usize);
 
 /// Why a recorded search file could not be used; only a file that is gone or whose bytes are wrong is worth rebuilding.
 #[derive(Debug)]
@@ -799,8 +802,9 @@ impl SearchRuntime {
 
     /// A search file built on this node from the data file of a trie the lane has not indexed; a data file is immutable, so a kept one is never stale.
     /// The build is charged to `memory` while it runs; the files kept are bounded apart from the recorded ones, so building never evicts those.
-    pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String], memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
-        let identity = format!("{data}#{columns:?}");
+    pub async fn built(&self, database: &str, storage: &Arc<BufferPool>, trie: &rtdb_format::keys::TrieKey, data: &rtdb_storage::ObjectKey, columns: &[String],
+        analyzer: rtdb_text::Analyzer, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<TrieFile> {
+        let identity = format!("{data}#{columns:?}#{analyzer}");
         let share = storage.prepaid_metadata_budget().is_none();
         let cache_key = (database.to_string(), identity.clone());
         let build_key = (Arc::as_ptr(storage) as usize, database.to_string(), identity.clone());
@@ -818,7 +822,7 @@ impl SearchRuntime {
             let input_memory = Arc::clone(memory);
             let (mut file, size) = tokio::task::spawn_blocking(move || {
                 let pages = crate::lane::search_pages_from_buffer(
-                    arrow_buffer::Buffer::from(bytes::Bytes::from_owner(lease)), &indexed, token, input_memory)?;
+                    arrow_buffer::Buffer::from(bytes::Bytes::from_owner(lease)), &indexed, analyzer, token, input_memory)?;
                 crate::file::build_query_pages(&indexed, pages, ceiling, indexing)
             }).await.map_err(|error| rtdb_types::Anomaly::fault("rtdb.search/build", error.to_string()))??;
             if !share { file = file.with_reservation(memory.reserve(size)?); }
@@ -851,18 +855,19 @@ impl SearchRuntime {
         Ok(matching.finish())
     }
 
-    fn live_key(database: &str, segment: &rtdb_index::LiveTable, column: &str) -> LiveKey {
-        (database.to_string(), segment.table().clone(), column.to_string(), segment.row_lineage().generation_address())
+    fn live_key(database: &str, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer) -> LiveKey {
+        (database.to_string(), segment.table().clone(), column.to_string(), analyzer, segment.row_lineage().generation_address())
     }
 
-    pub(crate) fn publish_live(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str, cancellation: &CancellationToken) -> Result<()> {
-        let key = Self::live_key(database, segment, column);
+    pub(crate) fn publish_live(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer,
+        cancellation: &CancellationToken) -> Result<()> {
+        let key = Self::live_key(database, segment, column, analyzer);
         let lineage = segment.row_lineage();
         let cached = self.live.lock().get(&key);
         let mut next = cached.as_deref().filter(|cached| cached.lineage.as_ref().is_some_and(|prefix| prefix.is_prefix_of(lineage)))
             .cloned().unwrap_or_default();
         if next.rows >= segment.row_count() { return Ok(()); }
-        next.extend(segment, column, cancellation)?;
+        next.extend(segment, column, analyzer, cancellation)?;
         if cancellation.is_cancelled() || next.rows == 0 { return Ok(()); }
         let weight = next.bytes.max(1);
         let mut live = self.live.lock();
@@ -874,10 +879,10 @@ impl SearchRuntime {
         Ok(())
     }
 
-    pub(crate) fn live_pages(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str)
+    pub(crate) fn live_pages(&self, database: &str, segment: &rtdb_index::LiveTable, column: &str, analyzer: rtdb_text::Analyzer)
         -> (Vec<Arc<LivePostingPage>>, u32) {
         let lineage = segment.row_lineage();
-        let postings = self.live.lock().get(&Self::live_key(database, segment, column)).filter(|entry| {
+        let postings = self.live.lock().get(&Self::live_key(database, segment, column, analyzer)).filter(|entry| {
             entry.lineage.as_ref().is_some_and(|cached| cached.admits(lineage))
         });
         let visible = segment.row_count();
@@ -893,19 +898,22 @@ impl SearchRuntime {
         self.visit_live_matches_at(None, database, segment, column, query, phrases, cancellation, visit)
     }
 
-    pub(crate) fn live_pages_at(&self, snapshot: Option<&Snapshot>, database: &str, segment: &rtdb_index::LiveTable, column: &str)
-        -> (Vec<Arc<LivePostingPage>>, u32) {
+    pub(crate) fn live_pages_at(&self, snapshot: Option<&Snapshot>, database: &str, segment: &rtdb_index::LiveTable, column: &str,
+        analyzer: rtdb_text::Analyzer) -> (Vec<Arc<LivePostingPage>>, u32) {
         snapshot.and_then(Snapshot::serving_search::<ServingPostings>)
-            .and_then(|search| search.pages(segment, column)).unwrap_or_else(|| self.live_pages(database, segment, column))
+            .and_then(|search| search.pages(segment, column, analyzer))
+            .unwrap_or_else(|| self.live_pages(database, segment, column, analyzer))
     }
 
-    pub(crate) fn serving_terms(&self, request: &rtdb_query::ScanRequest<'_>, column: &str) -> Option<Arc<dyn rtdb_query::LiveSearchTerms>> {
+    /// The serving postings of a column under the analyzer of the query they answer.
+    pub(crate) fn serving_terms(&self, request: &rtdb_query::ScanRequest<'_>, column: &str, analyzer: rtdb_text::Analyzer)
+        -> Option<Arc<dyn rtdb_query::LiveSearchTerms>> {
         if request.memory.is_prepaid() { return None; }
         let serving = request.snapshot.serving_search::<ServingPostings>()?;
         let mut reservation = request.memory.reserve(256).ok()?;
         let mut batches = BTreeMap::new();
         for segment in request.snapshot.iter_segments(&request.scan.table.name.table) {
-            let Some((pages, covered)) = serving.pages(segment, column) else { continue; };
+            let Some((pages, covered)) = serving.pages(segment, column, analyzer) else { continue; };
             if covered == 0 { continue; }
             let lease = Arc::get_mut(&mut reservation).expect("Serving terms own their allocation");
             lease.grow_to(lease.bytes().saturating_add(64 + pages.len().saturating_mul(16))).ok()?;
@@ -920,13 +928,13 @@ impl SearchRuntime {
                 first += u32::try_from(batch.len()).ok()?;
             }
         }
-        (!batches.is_empty()).then(|| Arc::new(ServingTerms { batches, _reservation: reservation }) as Arc<dyn rtdb_query::LiveSearchTerms>)
+        (!batches.is_empty()).then(|| Arc::new(ServingTerms { analyzer, batches, _reservation: reservation }) as Arc<dyn rtdb_query::LiveSearchTerms>)
     }
 
     pub(crate) fn visit_live_matches_at(&self, snapshot: Option<&Snapshot>, database: &str, segment: &rtdb_index::LiveTable, column: &str,
         query: &rtdb_text::Query, phrases: bool, cancellation: &CancellationToken, mut visit: impl FnMut(u32, LiveMatch<'_>) -> Result<bool>,
     ) -> Result<bool> {
-        let (pages, covered) = self.live_pages_at(snapshot, database, segment, column);
+        let (pages, covered) = self.live_pages_at(snapshot, database, segment, column, query.analyzer());
         if snapshot.is_some() && !self.can_scan_live_gap(segment, column, covered)? { return Ok(false); }
         for page in pages {
             if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
@@ -1024,13 +1032,13 @@ mod tests {
             BTreeMap::from([(table.clone(), TableWrite::new(StructFields::new(), Some(batch)))])).unwrap();
         let live = LiveIndex::new(BlockIndex(0), None, Default::default()).apply(&write).unwrap();
         let segment = &live.tables()[&table];
-        let definition = SearchDefinition { name: "docs".into(), table: table.clone(), columns: vec!["body".into()], version: 1, history: true };
+        let definition = SearchDefinition { name: "docs".into(), table: table.clone(), columns: vec!["body".into()], analyzer: rtdb_text::Analyzer::Simple, version: 1, history: true };
         let encoded = crate::delta::prepare(&[definition], &write, &delta_memory, &cancellation).unwrap().unwrap();
         let delta = crate::delta::Delta::new(encoded.batch, &write).unwrap();
-        let key = (table, "body".into());
+        let key = (table, "body".into(), rtdb_text::Analyzer::Simple);
         let input = delta.page(&key, 1..3);
         let child = input.1.values().as_string::<i32>().value_data().as_ptr();
-        let page = LivePostingPage::from_rows(segment, "body", 1, 3, 1 << 20, &cancellation, Some(input)).unwrap().unwrap();
+        let page = LivePostingPage::from_rows(segment, "body", rtdb_text::Analyzer::Simple, 1, 3, 1 << 20, &cancellation, Some(input)).unwrap().unwrap();
         drop(delta);
         drop(encoded.encoded);
         assert_eq!(page.tokens.values().as_string::<i32>().value_data().as_ptr(), child);
@@ -1064,7 +1072,7 @@ mod tests {
         let store = Arc::new(LocalStore::open(directory.path()).unwrap());
         let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
         let columns = vec!["body".to_string()];
-        let rows = vec![crate::SearchRow { position: None, identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens("an overdue invoice"))] }];
+        let rows = vec![crate::SearchRow { position: None, identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::Analyzer::Simple.tokens("an overdue invoice"))] }];
         let key = ObjectKey::new("tables/docs/artefacts/l01-rc-b00/search/docs~a2f3-v1.bin").unwrap();
         store.put(&key, crate::build_search_file(&columns, &rows, "job").unwrap().into()).await.unwrap();
         let runtime = SearchRuntime::new(1 << 20);
@@ -1085,7 +1093,7 @@ mod tests {
         let pool = Arc::new(BufferPool::new(store.clone(), 1 << 24));
         let columns = vec!["body".to_string()];
         let row = crate::SearchRow { position: None, identity: None, iid: [1; 16], system_from: 0, valid_from: 0, valid_to: i64::MAX,
-            op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::tokens("an overdue invoice"))] };
+            op: rtdb_types::EventOp::Put, values: vec![Some(rtdb_text::Analyzer::Simple.tokens("an overdue invoice"))] };
         let key = ObjectKey::new("tables/docs/artefacts/l01-rc-b00/search/docs~a2f11-v1.bin").unwrap();
         let mut bundle = Vec::new();
         crate::file::write_versioned_group(&columns, [[Ok(vec![row])]], "job", 1, None, &mut bundle, None, crate::file::TANTIVY_FORMAT_VERSION).unwrap();
@@ -1134,15 +1142,15 @@ mod tests {
         let columns = vec!["body".to_string()];
         let runtime = SearchRuntime::new(1 << 20);
         let trie: rtdb_format::keys::TrieKey = "l00-rc-b00".parse().unwrap();
-        let (first, second) = tokio::join!(runtime.built("xtdb", &pool, &trie, &data, &columns, &memory, &cancellation), runtime.built("xtdb", &pool, &trie, &data, &columns, &memory, &cancellation));
+        let (first, second) = tokio::join!(runtime.built("xtdb", &pool, &trie, &data, &columns, rtdb_text::Analyzer::Simple, &memory, &cancellation), runtime.built("xtdb", &pool, &trie, &data, &columns, rtdb_text::Analyzer::Simple, &memory, &cancellation));
         assert!(Arc::ptr_eq(&first.unwrap().file, &second.unwrap().file));
         assert!(runtime.building.lock().is_empty(), "a finished build leaves nothing in flight");
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let other = ObjectKey::new("tables/docs/data/l00-rc-b01.arrow").unwrap();
         store.put(&other, data_file()).await.unwrap();
-        let _ = runtime.built("xtdb", &pool, &"l00-rc-b01".parse().unwrap(), &other, &columns, &memory, &cancelled).await;
-        assert!(runtime.built("xtdb", &pool, &"l00-rc-b01".parse().unwrap(), &other, &columns, &memory, &cancellation).await.is_ok(), "a cancelled build leaves the next caller free to build");
+        let _ = runtime.built("xtdb", &pool, &"l00-rc-b01".parse().unwrap(), &other, &columns, rtdb_text::Analyzer::Simple, &memory, &cancelled).await;
+        assert!(runtime.built("xtdb", &pool, &"l00-rc-b01".parse().unwrap(), &other, &columns, rtdb_text::Analyzer::Simple, &memory, &cancellation).await.is_ok(), "a cancelled build leaves the next caller free to build");
     }
 
     #[tokio::test]
@@ -1151,7 +1159,7 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let columns = vec!["body".to_string()];
         let rows: Vec<_> = (0..3000).map(|index| crate::SearchRow { position: None, identity: None, iid: [(index / 12) as u8; 16], system_from: -(index as i64), valid_from: 0, valid_to: i64::MAX, op: rtdb_types::EventOp::Put,
-            values: vec![Some(rtdb_text::tokens(&format!("word{index} another{} overdue", index * 7)))] }).collect();
+            values: vec![Some(rtdb_text::Analyzer::Simple.tokens(&format!("word{index} another{} overdue", index * 7)))] }).collect();
         let bytes = crate::build_search_file(&columns, &rows, "job").unwrap();
         let pool = Arc::new(BufferPool::new(store.clone(), bytes.len() * 2 + bytes.len() / 2));
         let runtime = SearchRuntime::new(1 << 30);
@@ -1212,8 +1220,8 @@ mod live_coverage_tests {
         assert_eq!(extended.batches().count(), 1);
         assert!(!Arc::ptr_eq(prefix.batches().next().unwrap(), extended.batches().next().unwrap()));
 
-        runtime.publish_live("db", &prefix, "body", &token).unwrap();
-        let (initial, covered) = runtime.live_pages("db", &extended, "body");
+        runtime.publish_live("db", &prefix, "body", rtdb_text::Analyzer::Simple, &token).unwrap();
+        let (initial, covered) = runtime.live_pages("db", &extended, "body", rtdb_text::Analyzer::Simple);
         assert_eq!(covered, 1);
         let batch = extended.batches().next().unwrap();
         let terms = ServingTerms {
@@ -1237,7 +1245,7 @@ mod live_coverage_tests {
             let mut scored = Vec::new();
             runtime.visit_live_matches("db", &extended, "body", matching, phrases, &token, |row, hit| {
                 let text = ["report report paid", "report open paid"][row as usize];
-                assert_eq!(hit.score(&scorer).to_bits(), scorer.bm25_arrow(&rtdb_text::analyze(text)).to_bits());
+                assert_eq!(hit.score(&scorer).to_bits(), scorer.bm25_arrow(&rtdb_text::Analyzer::Simple.analyze(text)).to_bits());
                 assert_eq!(hit.integer_id(&extended, row).unwrap(), Some(i64::from(row) + 1));
                 scored.push(row);
                 Ok(true)
@@ -1248,14 +1256,14 @@ mod live_coverage_tests {
         assert_eq!(check(&phrase, true), [0]);
         assert_eq!(check(&phrase, false), [0, 1]);
 
-        runtime.publish_live("db", &extended, "body", &token).unwrap();
-        let (complete, covered) = runtime.live_pages("db", &extended, "body");
+        runtime.publish_live("db", &extended, "body", rtdb_text::Analyzer::Simple, &token).unwrap();
+        let (complete, covered) = runtime.live_pages("db", &extended, "body", rtdb_text::Analyzer::Simple);
         assert_eq!(check(&phrase, true), [0]);
         assert_eq!(check(&phrase, false), [0, 1]);
         assert_eq!(covered, 2);
         assert!(Arc::ptr_eq(&complete[0], &initial[0]));
-        assert_eq!(runtime.live_pages("db", &prefix, "body").1, 1);
-        assert_eq!(runtime.live_pages("db", &divergent, "body").1, 0);
+        assert_eq!(runtime.live_pages("db", &prefix, "body", rtdb_text::Analyzer::Simple).1, 1);
+        assert_eq!(runtime.live_pages("db", &divergent, "body", rtdb_text::Analyzer::Simple).1, 0);
         assert_eq!(runtime.live_rows("db", &divergent, "body", &matching).unwrap().values(), &[0]);
         token.cancel();
         let query = rtdb_text::Query::parse("absent");

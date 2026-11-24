@@ -285,7 +285,7 @@ mod tests {
             let bounds: BTreeMap<_, _> = routes.iter().collect();
             assert!(!bounds.contains_key(&runs[&prefix_only]));
             for (run, document) in [(first, "audit audit report memo"), (first, "audit report"), (second, "audit report report")] {
-                let tokens = rtdb_text::tokens(document);
+                let tokens = rtdb_text::Analyzer::Simple.tokens(document);
                 assert!(matching.matches(&tokens));
                 assert!(scorer.bm25(&tokens) <= bounds[&runs[&run]]);
             }
