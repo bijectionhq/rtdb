@@ -1,7 +1,6 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     future::Future,
-    io::Cursor,
     ops::Range,
     pin::Pin,
     sync::{Arc, LazyLock},
@@ -11,7 +10,12 @@ use arrow_array::{
     Array, BinaryArray, FixedSizeBinaryArray, RecordBatch, UInt64Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder},
 };
-use arrow_ipc::{reader::FileReader, writer::FileWriter};
+use arrow_buffer::Buffer;
+use arrow_ipc::{
+    MetadataVersion,
+    reader::{read_footer_length, read_record_batch},
+    writer::FileWriter,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -70,11 +74,15 @@ impl RootRef {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.height > MAX_HEIGHT || !(1..=MAX_PAGE_BYTES).contains(&self.length) {
-            return Err(invalid("Page reference exceeds the tree limits"));
-        }
-        Ok(())
+        validate_reference(self.height, self.length)
     }
+}
+
+fn validate_reference(height: u8, length: u64) -> Result<()> {
+    if height > MAX_HEIGHT || !(1..=MAX_PAGE_BYTES).contains(&length) {
+        return Err(invalid("Page reference exceeds the tree limits"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,35 +218,216 @@ fn encode(page: &Page, height: u8, generation: Option<PageGeneration>) -> Result
     Ok(bytes.into())
 }
 
-fn decode(bytes: &Bytes, height: u8) -> Result<Page> {
-    let mut reader = FileReader::try_new(Cursor::new(bytes.as_ref()), None).map_err(invalid)?;
-    let actual = reader.schema();
-    if actual.fields() != schema(height).fields()
-        || reader.num_batches() != 1
+enum DecodedPage {
+    Leaf(LeafRows),
+    Branch(BranchRows),
+}
+
+impl DecodedPage {
+    fn fences(&self) -> (&[u8], &[u8]) {
+        match self {
+            Self::Leaf(rows) => (rows.keys.value(0), rows.keys.value(rows.keys.len() - 1)),
+            Self::Branch(rows) => (rows.firsts.value(0), rows.lasts.value(rows.lasts.len() - 1)),
+        }
+    }
+}
+
+struct LeafRows {
+    keys: BinaryArray,
+    values: BinaryArray,
+}
+
+impl LeafRows {
+    fn lower_bound(&self, key: &[u8]) -> usize {
+        let (mut start, mut end) = (0, self.keys.len());
+        while start < end {
+            let mid = start + (end - start) / 2;
+            if self.keys.value(mid) < key {
+                start = mid + 1;
+            } else {
+                end = mid;
+            }
+        }
+        start
+    }
+
+    fn into_rows(self, range: Option<&Range<Vec<u8>>>) -> Vec<Row> {
+        let indices = range.map_or(0..self.keys.len(), |range| {
+            self.lower_bound(&range.start)..self.lower_bound(&range.end)
+        });
+        indices
+            .map(|row| Row {
+                key: self.keys.value(row).to_vec(),
+                value: self.values.value(row).to_vec(),
+            })
+            .collect()
+    }
+}
+
+struct BranchRows {
+    firsts: BinaryArray,
+    lasts: BinaryArray,
+    digests: FixedSizeBinaryArray,
+    lengths: UInt64Array,
+    summaries: BinaryArray,
+    child_height: u8,
+}
+
+impl BranchRows {
+    fn into_edges(self, range: Option<&Range<Vec<u8>>>) -> Vec<Edge> {
+        (0..self.firsts.len())
+            .filter_map(|row| {
+                let (first, last) = (self.firsts.value(row), self.lasts.value(row));
+                if range.is_some_and(|range| {
+                    last < range.start.as_slice() || first >= range.end.as_slice()
+                }) {
+                    return None;
+                }
+                Some(Edge {
+                    first: first.to_vec(),
+                    last: last.to_vec(),
+                    root: RootRef {
+                        digest: PageDigest(
+                            self.digests.value(row).try_into().expect("digest width"),
+                        ),
+                        length: self.lengths.value(row),
+                        height: self.child_height,
+                        summary: self.summaries.value(row).to_vec(),
+                    },
+                })
+            })
+            .collect()
+    }
+}
+
+fn decode_batch(bytes: Buffer, height: u8) -> Result<RecordBatch> {
+    let footer_end = bytes
+        .len()
+        .checked_sub(10)
+        .ok_or_else(|| invalid("Arrow file is shorter than its footer"))?;
+    let footer_length = read_footer_length(
+        bytes[footer_end..]
+            .try_into()
+            .expect("Arrow footer tail width"),
+    )
+    .map_err(invalid)?;
+    let footer_start = footer_end
+        .checked_sub(footer_length)
+        .ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
+    let footer = arrow_ipc::root_as_footer(&bytes[footer_start..footer_end]).map_err(invalid)?;
+    let ipc_schema = footer
+        .schema()
+        .ok_or_else(|| invalid("Arrow footer has no schema"))?;
+    if !ipc_schema.endianness().equals_to_target_endianness() {
+        return Err(invalid("Arrow file endianness differs from the host"));
+    }
+    let blocks = footer
+        .recordBatches()
+        .ok_or_else(|| invalid("Arrow footer has no record batches"))?;
+    let expected = schema(height).fields();
+    if ipc_schema
+        .fields()
+        .is_none_or(|fields| fields.len() != expected.len())
+    {
+        return Err(invalid("Unexpected Arrow page layout"));
+    }
+    let actual = Arc::new(arrow_ipc::convert::fb_to_schema(ipc_schema));
+    if actual.fields() != expected
+        || blocks.len() != 1
+        || footer
+            .dictionaries()
+            .is_some_and(|dictionaries| !dictionaries.is_empty())
         || (!actual.metadata().is_empty()
             && (actual.metadata().len() != 1
                 || !actual
                     .metadata()
                     .get(PAGE_GENERATION)
-                    .is_some_and(|generation| generation.parse::<i64>().is_ok() || Uuid::parse_str(generation).is_ok())))
+                    .is_some_and(|generation| {
+                        generation.parse::<i64>().is_ok() || Uuid::parse_str(generation).is_ok()
+                    })))
     {
         return Err(invalid("Unexpected Arrow page layout"));
     }
-    let batch = reader
-        .next()
-        .ok_or_else(|| invalid("Missing Arrow batch"))?
-        .map_err(invalid)?;
-    let count = batch.num_rows();
+    let block = blocks.get(0);
+    let start = usize::try_from(block.offset()).map_err(invalid)?;
+    let metadata_length = usize::try_from(block.metaDataLength()).map_err(invalid)?;
+    let body_length = usize::try_from(block.bodyLength()).map_err(invalid)?;
+    let body_start = start
+        .checked_add(metadata_length)
+        .ok_or_else(|| invalid("Arrow block offset overflow"))?;
+    if start < 8
+        || body_start
+            .checked_add(body_length)
+            .is_none_or(|end| end > footer_start)
+    {
+        return Err(invalid("Arrow block exceeds its file's data region"));
+    }
+    let metadata = &bytes[start..body_start];
+    let prefix = if metadata.starts_with(&[0xff; 4]) {
+        4
+    } else {
+        0
+    };
+    let length = metadata
+        .get(prefix..prefix + 4)
+        .ok_or_else(|| invalid("Arrow block has a truncated prefix"))?;
+    let length = usize::try_from(i32::from_le_bytes(
+        length.try_into().expect("Arrow prefix width"),
+    ))
+    .map_err(invalid)?;
+    let header = metadata[prefix + 4..]
+        .get(..length)
+        .ok_or_else(|| invalid("Arrow block header exceeds its metadata"))?;
+    let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
+    if (footer.version() != MetadataVersion::V1 && message.version() != footer.version())
+        || usize::try_from(message.bodyLength()).ok() != Some(body_length)
+    {
+        return Err(invalid("Arrow block differs from its footer"));
+    }
+    let batch = message
+        .header_as_record_batch()
+        .ok_or_else(|| invalid("Missing Arrow batch"))?;
     let max_rows = if height == 0 {
         MAX_LEAF_ROWS
     } else {
         MAX_FANOUT
     };
-    if !(1..=max_rows).contains(&count)
+    if !usize::try_from(batch.length()).is_ok_and(|rows| (1..=max_rows).contains(&rows))
         || batch
-            .columns()
-            .iter()
-            .any(|column| column.null_count() != 0)
+            .variadicBufferCounts()
+            .is_some_and(|counts| !counts.is_empty())
+    {
+        return Err(invalid("Invalid Arrow page rows"));
+    }
+    for buffer in batch.buffers().into_iter().flatten() {
+        let offset = usize::try_from(buffer.offset()).map_err(invalid)?;
+        let length = usize::try_from(buffer.length()).map_err(invalid)?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > body_length)
+        {
+            return Err(invalid("Arrow buffer exceeds its message body"));
+        }
+    }
+    let body = bytes.slice_with_length(body_start, body_length);
+    read_record_batch(
+        &body,
+        batch,
+        actual,
+        &HashMap::new(),
+        None,
+        &message.version(),
+    )
+    .map_err(invalid)
+}
+
+fn decode(bytes: Bytes, height: u8) -> Result<DecodedPage> {
+    let batch = decode_batch(Buffer::from(bytes), height)?;
+    let count = batch.num_rows();
+    if batch
+        .columns()
+        .iter()
+        .any(|column| column.null_count() != 0)
     {
         return Err(invalid("Invalid Arrow page rows"));
     }
@@ -254,14 +443,10 @@ fn decode(bytes: &Bytes, height: u8) -> Result<Page> {
         if (1..count).any(|row| keys.value(row - 1) >= keys.value(row)) {
             return Err(invalid("Leaf keys are out of order"));
         }
-        return Ok(Page::Leaf(
-            (0..count)
-                .map(|row| Row {
-                    key: keys.value(row).to_vec(),
-                    value: values.value(row).to_vec(),
-                })
-                .collect(),
-        ));
+        return Ok(DecodedPage::Leaf(LeafRows {
+            keys: keys.clone(),
+            values: values.clone(),
+        }));
     }
     let (firsts, lasts, summaries) = (binary(0), binary(1), binary(4));
     let digests = batch
@@ -274,26 +459,22 @@ fn decode(bytes: &Bytes, height: u8) -> Result<Page> {
         .as_any()
         .downcast_ref::<UInt64Array>()
         .expect("validated length column");
-    let mut children = Vec::with_capacity(count);
+    let child_height = height - 1;
     for row in 0..count {
         let (first, last) = (firsts.value(row), lasts.value(row));
         if first > last || (row > 0 && lasts.value(row - 1) >= first) {
             return Err(invalid("Branch fences overlap or are out of order"));
         }
-        let root = RootRef {
-            digest: PageDigest(digests.value(row).try_into().expect("digest width")),
-            length: lengths.value(row),
-            height: height - 1,
-            summary: summaries.value(row).to_vec(),
-        };
-        root.validate()?;
-        children.push(Edge {
-            first: first.to_vec(),
-            last: last.to_vec(),
-            root,
-        });
+        validate_reference(child_height, lengths.value(row))?;
     }
-    Ok(Page::Branch(children))
+    Ok(DecodedPage::Branch(BranchRows {
+        firsts: firsts.clone(),
+        lasts: lasts.clone(),
+        digests: digests.clone(),
+        lengths: lengths.clone(),
+        summaries: summaries.clone(),
+        child_height,
+    }))
 }
 
 async fn load(
@@ -301,7 +482,7 @@ async fn load(
     root: &RootRef,
     edge: Option<&Edge>,
     memory: Option<&Arc<MemoryBudget>>,
-) -> Result<(Page, Option<Arc<MemoryReservation>>)> {
+) -> Result<(DecodedPage, Option<Arc<MemoryReservation>>)> {
     root.validate()?;
     let charge = memory
         .map(|memory| {
@@ -316,7 +497,7 @@ async fn load(
     if bytes.len() as u64 != root.length || digest(&bytes) != root.digest {
         return Err(invalid("Page digest or length differs from its reference"));
     }
-    let page = decode(&bytes, root.height)?;
+    let page = decode(bytes, root.height)?;
     if let Some(edge) = edge
         && page.fences() != (edge.first.as_slice(), edge.last.as_slice())
     {
@@ -453,8 +634,12 @@ impl Writer<'_> {
         Box::pin(async move {
             let (page, _charge) = load(self.store, root, edge, Some(self.memory)).await?;
             let children = match page {
-                Page::Branch(children) => children,
-                Page::Leaf(rows) => return self.leaves(merge(rows, edits), Some(root)).await,
+                DecodedPage::Branch(children) => children.into_edges(None),
+                DecodedPage::Leaf(rows) => {
+                    return self
+                        .leaves(merge(rows.into_rows(None), edits), Some(root))
+                        .await;
+                }
             };
             let mut updated = Vec::new();
             let mut remaining = edits;
@@ -472,24 +657,24 @@ impl Writer<'_> {
                 if child.root.height == 0
                     && touching.iter().any(|edit| matches!(edit, Edit::Delete(_)))
                 {
-                    let (Page::Leaf(rows), _left) =
+                    let (DecodedPage::Leaf(rows), _left) =
                         load(self.store, &child.root, Some(&child), Some(self.memory)).await?
                     else {
                         unreachable!()
                     };
-                    let mut rows = merge(rows, touching);
+                    let mut rows = merge(rows.into_rows(None), touching);
                     if !rows.is_empty()
                         && rows.len() < MAX_LEAF_ROWS / 2
                         && let Some(next) = children.peek()
                         && remaining.is_empty()
                     {
-                        let (Page::Leaf(right), _right) =
+                        let (DecodedPage::Leaf(right), _right) =
                             load(self.store, &next.root, Some(next), Some(self.memory)).await?
                         else {
                             unreachable!()
                         };
-                        if rows.len() + right.len() <= MAX_LEAF_ROWS {
-                            rows.extend(right);
+                        if rows.len() + right.keys.len() <= MAX_LEAF_ROWS {
+                            rows.extend(right.into_rows(None));
                             children.next();
                             updated.extend(self.leaves(rows, None).await?);
                             continue;
@@ -651,21 +836,18 @@ fn visit_page<'a, F: FnMut(Row) -> Result<bool> + Send + 'a>(
     Box::pin(async move {
         let (page, _charge) = load(store, root, edge, Some(memory)).await?;
         match page {
-            Page::Leaf(rows) => {
-                let start = rows.partition_point(|row| row.key < range.start);
-                let end = rows.partition_point(|row| row.key < range.end);
-                for value in rows.into_iter().skip(start).take(end - start) {
+            DecodedPage::Leaf(rows) => {
+                // Release the page owner's storage reservation before the visitor does its own admission.
+                for value in rows.into_rows(Some(range)) {
                     if !row(value)? {
                         return Ok(false);
                     }
                 }
             }
-            Page::Branch(children) => {
-                for child in children.iter().filter(|child| {
-                    child.last >= range.start
-                        && child.first < range.end
-                        && admit(&child.root.summary)
-                }) {
+            DecodedPage::Branch(children) => {
+                // Child fetches may need the cache reservation released by consuming the branch.
+                let children = children.into_edges(Some(range));
+                for child in children.iter().filter(|child| admit(&child.root.summary)) {
                     if !visit_page(store, &child.root, Some(child), range, admit, memory, row)
                         .await?
                     {
@@ -695,12 +877,13 @@ async fn walk(store: &dyn PageStore, root: &RootRef, skip_released: bool) -> Res
             continue;
         }
         match load(store, &reference, edge.as_ref(), None).await {
-            Ok((Page::Branch(children), _)) => pending.extend(
+            Ok((DecodedPage::Branch(children), _)) => pending.extend(
                 children
+                    .into_edges(None)
                     .into_iter()
                     .map(|edge| (edge.root.clone(), Some(edge))),
             ),
-            Ok((Page::Leaf(_), _)) => {}
+            Ok((DecodedPage::Leaf(_), _)) => {}
             Err(error) if skip_released && error.category == AnomalyCategory::NotFound => {
                 seen.remove(&reference.digest);
             }
@@ -727,15 +910,16 @@ pub async fn retirement_order(
             continue;
         }
         match load(store, &reference, edge.as_ref(), None).await {
-            Ok((Page::Branch(children), _)) => {
+            Ok((DecodedPage::Branch(children), _)) => {
                 pending.push((reference, None, true));
                 pending.extend(
                     children
+                        .into_edges(None)
                         .into_iter()
                         .map(|edge| (edge.root.clone(), Some(edge), false)),
                 );
             }
-            Ok((Page::Leaf(_), _)) => pages.push(reference.digest),
+            Ok((DecodedPage::Leaf(_), _)) => pages.push(reference.digest),
             // A prior pass releases descendants before their parent.
             Err(error) if error.category == AnomalyCategory::NotFound => {}
             Err(error) => return Err(error),
@@ -786,6 +970,70 @@ mod tests {
             key: key(i),
             value: key(i),
         })
+    }
+
+    #[tokio::test]
+    async fn leaf_cells_borrow_the_file_and_owned_scan_results_require_admission() {
+        let store = Pages::default();
+        let page = Page::Leaf(
+            (0..4)
+                .map(|i| Row {
+                    key: key(i),
+                    value: key(i + 10),
+                })
+                .collect(),
+        );
+        let bytes = encode(&page, 0, None).unwrap();
+        let root = RootRef {
+            digest: digest(&bytes),
+            length: bytes.len() as u64,
+            height: 0,
+            summary: Vec::new(),
+        };
+        store.put(root.digest, bytes.clone()).await.unwrap();
+        let address = bytes.as_ptr() as usize;
+        let file = address..address + bytes.len();
+        let DecodedPage::Leaf(leaf) = decode(bytes.clone(), 0).unwrap() else {
+            panic!("expected a leaf")
+        };
+        assert!(file.contains(&(leaf.keys.value(1).as_ptr() as usize)));
+        assert!(file.contains(&(leaf.values.value(1).as_ptr() as usize)));
+        assert_eq!(
+            leaf.into_rows(Some(&(key(1)..key(3)))),
+            [
+                Row {
+                    key: key(1),
+                    value: key(11)
+                },
+                Row {
+                    key: key(2),
+                    value: key(12)
+                },
+            ]
+        );
+        let page_only = MemoryBudget::new(bytes.len() * 4 + 4096);
+        assert!(
+            scan(&store, &root, key(1)..key(3), &page_only)
+                .await
+                .is_err()
+        );
+        assert_eq!(page_only.used_bytes(), 0);
+    }
+
+    #[test]
+    fn a_retained_file_rejects_a_batch_header_that_exceeds_its_metadata() {
+        let page = Page::Leaf(vec![Row {
+            key: key(0),
+            value: key(1),
+        }]);
+        let mut bytes = encode(&page, 0, None).unwrap().to_vec();
+        let tail = bytes.len() - 10;
+        let footer_length = read_footer_length(bytes[tail..].try_into().unwrap()).unwrap();
+        let footer = arrow_ipc::root_as_footer(&bytes[tail - footer_length..tail]).unwrap();
+        let start = footer.recordBatches().unwrap().get(0).offset() as usize;
+        assert_eq!(&bytes[start..start + 4], &[0xff; 4]);
+        bytes[start + 4..start + 8].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(decode(bytes.into(), 0).is_err());
     }
 
     #[tokio::test]
