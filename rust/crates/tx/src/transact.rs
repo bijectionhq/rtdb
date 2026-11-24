@@ -394,8 +394,20 @@ impl TransactState {
     /// A checkpoint can replace the settled prefix once the mode installs its manifest.
     pub fn encode_checkpoint(&self) -> Result<Bytes> {
         if self.pending.is_some() { return Err(pending_error()); }
-        let receipts = self.receipts.values().flat_map(|namespace| namespace.values()).collect::<Vec<_>>();
-        serde_json::to_vec(&(RECORD_VERSION, &self.index, receipts)).map(Bytes::from)
+        self.encode_checkpoint_index(&self.index)
+    }
+
+    /// Export the selected cut while retaining its branch ancestry and prior receipts.
+    pub fn encode_checkpoint_at(&self, basis: Basis) -> Result<Bytes> {
+        if self.pending.is_some() { return Err(pending_error()); }
+        let index = self.index.checkpoint_at(basis)?;
+        self.encode_checkpoint_index(&index)
+    }
+
+    fn encode_checkpoint_index(&self, index: &BranchIndex) -> Result<Bytes> {
+        let receipts = self.receipts.values().flat_map(|namespace| namespace.values())
+            .filter(|stored| stored.receipt.basis <= index.head().basis).collect::<Vec<_>>();
+        serde_json::to_vec(&(RECORD_VERSION, index, receipts)).map(Bytes::from)
             .map_err(|error| Anomaly::fault("rtdb/transaction-checkpoint", error.to_string()))
     }
 

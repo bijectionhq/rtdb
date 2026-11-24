@@ -250,6 +250,40 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
 }
 
 #[tokio::test]
+async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(Identity(1))));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let original = writer.transact(&put(1, 1, "parent row")).await.unwrap();
+    let selected = writer.transact(&request(2, Op::Fork {
+        child: "report".into(), from: (MAIN_BRANCH.into(), original.basis), writable: true, expires_at: None,
+    })).await.unwrap();
+    let future = writer.transact(&put(3, 1, "later row")).await.unwrap();
+    writer.transact(&request(4, Op::DropBranch { branch: "report".into() })).await.unwrap();
+    writer.checkpoint(Vec::new()).await.unwrap();
+
+    let id = Uuid::from_u128(7);
+    let pin = writer.pin_checkpoint_at(id, selected.basis, None).await.unwrap();
+    assert_eq!(writer.pin_checkpoint_at(id, selected.basis, None).await.unwrap(), pin);
+    assert_eq!(writer.pin_checkpoint_at(id, future.basis, None).await.unwrap_err().code, "rtdb/pin-id");
+    writer.checkpoint(Vec::new()).await.unwrap();
+
+    let export = writer.open_export(id).await.unwrap();
+    let (cut, checkpoint) = export.exact_checkpoint().await.unwrap();
+    assert_eq!(cut.basis, selected.basis);
+    let view = checkpoint.index().view("report", At::Exactly(cut.basis), Layer::Merged, cut.system_time).unwrap();
+    assert_eq!(view.base(), Some(&(MAIN_BRANCH.into(), original.basis)));
+    assert_eq!(view.row(&table(), &EntityId::Integer(1), cut.system_time)
+        .and_then(|row| row.image_at(cut.system_time)).and_then(|image| image.cells.get("text")),
+        Some(&Value::Utf8("parent row".into())));
+    assert_eq!(checkpoint.tx_status(&[1; 16]).unwrap().basis, original.basis);
+    assert_eq!(checkpoint.tx_status(&[3; 16]).unwrap_err().code, "rtdb/unknown-transaction");
+    assert_eq!(checkpoint.index().exact(future.basis).unwrap_err().code, "rtdb/unknown-basis");
+}
+
+#[tokio::test]
 async fn multi_driver_replacement_refuses_a_timed_tx_after_its_reply_is_lost() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();

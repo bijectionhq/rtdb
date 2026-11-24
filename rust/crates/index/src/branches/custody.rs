@@ -45,6 +45,17 @@ pub(super) struct RetiredLabel {
 }
 
 impl CustodyGroup {
+    pub(super) fn checkpoint_at(&self, at: Basis) -> Option<Self> {
+        if self.created.is_some_and(|created| created > at) {
+            return None;
+        }
+        Some(Self {
+            created: self.created,
+            revoked: self.revoked,
+            members: self.members.iter().filter(|member| member.written <= at).cloned().collect(),
+        })
+    }
+
     fn inventory(&self, group: CustodyGroupId, at: Basis) -> Option<CustodyInventory> {
         if self.created.is_some_and(|created| created > at) { return None; }
         let mut hash = Sha256::new();
