@@ -61,6 +61,17 @@ impl UnitScope {
         Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
     }
 
+    pub(crate) fn ordered_index(residence: &str, index: &str, generation: u64) -> Self {
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"rtdb.multi/ordered-index-key-scope/v1\0");
+        digest.update(residence.as_bytes());
+        digest.update(b"\0");
+        digest.update(index.as_bytes());
+        digest.update(b"\0");
+        digest.update(&generation.to_be_bytes());
+        Self(digest.finish().as_ref().try_into().expect("SHA-256 width"))
+    }
+
     pub(super) fn slot(self, object: &ObjectKey) -> UnitSlot {
         let name = digest(&SHA256, object.as_str().as_bytes());
         UnitSlot {

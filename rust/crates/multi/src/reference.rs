@@ -150,6 +150,9 @@ impl PrefixedStore {
 
 #[async_trait]
 impl ObjectStore for PrefixedStore {
+    fn s3_publication_address(&self, key: &ObjectKey) -> Option<(rtdb_types::S3ObjectNamespace, String)> {
+        self.bucket.s3_publication_address(&self.full(key).ok()?)
+    }
     fn permits_shared_read_cache(&self) -> bool { self.bucket.permits_shared_read_cache() }
     fn supports_scan_ranges(&self, key: &ObjectKey) -> bool { self.full(key).is_ok_and(|key| self.bucket.supports_scan_ranges(&key)) }
     fn supports_observed_scan_ranges(&self, key: &ObjectKey) -> bool {

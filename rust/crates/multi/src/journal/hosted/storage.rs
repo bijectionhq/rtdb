@@ -566,6 +566,9 @@ where F: std::future::Future<Output = rtdb_storage::Result<T>> {
 
 #[async_trait]
 impl ObjectStore for ServingStore {
+    async fn replica_publication_address(&self, key: &ObjectKey) -> rtdb_storage::Result<Option<(rtdb_types::S3ObjectNamespace, String)>> {
+        self.read(key, |store| store.replica_publication_address(key)).await
+    }
     fn defers_trie_releases(&self) -> bool {
         self.writer.is_some()
     }

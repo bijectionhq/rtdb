@@ -1940,6 +1940,7 @@ async fn sign_disposal(
     fenced: &DeploymentRecord, keys: &dyn KeyService, namespaces: StorageNamespaces,
     inventory: DeletionInventory, first_empty_observed_at_ms: Option<i64>, objects_erased_at_ms: i64,
 ) -> Result<DeletionRecord> {
+    crate::ordered_index_storage::withdraw_residence_keys(keys, fenced).await?;
     if fenced.checkpoint_stage.is_some() || fenced.checkpoint_transfer_activation.is_some() {
         keys.withdraw_archive_key(&crate::archive::stage::staged_key_id(fenced)).await?;
     }

@@ -123,33 +123,32 @@ impl Checkpoint {
         let managed = store.index_page_lifecycle();
         if let Some(lifecycle) = managed {
             lifecycle.retire_before(tree.page_scope()).await?;
-        }
-        for object in objects {
-            if cancellation.is_cancelled() {
-                return Err(cancelled());
+        } else {
+            for object in objects {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                let Some((scope, _)) = object
+                    .key
+                    .as_str()
+                    .strip_prefix(generations.as_str())
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .and_then(|suffix| suffix.split_once('/'))
+                else {
+                    continue;
+                };
+                let Ok(scope) = u64::from_str_radix(scope, 16) else {
+                    continue;
+                };
+                let block = page_block(&object.key, &prefix);
+                if scope < self.scope
+                    || (block.is_some_and(|block| block <= self.through)
+                        && !reachable.keys.contains(&object.key))
+                {
+                    store.delete(&object.key).await?;
+                    tree.storage.invalidate(&object.key).await?;
+                }
             }
-            let Some((scope, _)) = object
-                .key
-                .as_str()
-                .strip_prefix(generations.as_str())
-                .and_then(|suffix| suffix.strip_prefix('/'))
-                .and_then(|suffix| suffix.split_once('/'))
-            else {
-                continue;
-            };
-            let Ok(scope) = u64::from_str_radix(scope, 16) else {
-                continue;
-            };
-            let block = page_block(&object.key, &prefix);
-            if (managed.is_none() && scope < self.scope)
-                || (block.is_some_and(|block| block <= self.through)
-                    && !reachable.keys.contains(&object.key))
-            {
-                store.delete(&object.key).await?;
-                tree.storage.invalidate(&object.key).await?;
-            }
-        }
-        if managed.is_none() {
             let legacy = key(&tree.directory, "pages")?;
             for object in store.list(Some(&legacy)).await? {
                 if cancellation.is_cancelled() {

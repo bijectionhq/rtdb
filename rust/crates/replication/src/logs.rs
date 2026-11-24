@@ -91,6 +91,19 @@ impl PartitionLogs {
     }
 
     pub fn source_floor(&self) -> Result<SourcePosition> { SourcePosition::from_epoch_offset(self.source_epoch, -1) }
+    pub fn install_replica_reference_source(
+        &self, checkpoint: Option<rtdb_format::catalog::BlockCatalog>, file_size_target: i64,
+    ) -> Result<()> {
+        Ok(self.replica.install_replica_reference_source(rtdb_storage::log::ReplicaReferenceSource {
+            store: Arc::clone(&self.store),
+            cache: Arc::clone(&self.cache),
+            memory: Arc::clone(&self.memory),
+            checkpoint,
+            version: self.storage_version,
+            epoch: self.storage_epoch,
+            file_size_target,
+        })?)
+    }
     pub fn replica_floor(&self) -> Result<ReplicaPosition> { ReplicaPosition::from_epoch_offset(self.replica_epoch, -1) }
     pub(crate) fn storage(&self) -> &Arc<dyn ObjectStore> { &self.store }
     pub(crate) fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
