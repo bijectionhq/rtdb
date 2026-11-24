@@ -93,11 +93,11 @@ Restore must validate the exact original scope and use the original event positi
 Switch only from an empty shared-carrier population or a paired cutover that accounts for every provider and retained cut before serving v2.
 The v2 receiver has no hex carrier reader.
 
-Source inspection of Bijection audit `33943dad6d9` found two outstanding live erasure dependencies.
-The shared-carrier retirement caller submits `erase` through ordinary `DecideHosted.v4`, whose RTDB decoder admits the operation only in Original replay or the existing assertion-family fence route.
-Generic `Commit.v4` remains fenced off for installed hosted fact writes.
+The shared-carrier retirement caller submits its current carrier check, erase and create-only receipt through `DecideHosted.v4` with its installed writer checks.
+The live admission verifies the complete Binary carrier and ciphertext, its original ordered membership and the later unit fence against the same predecessor before applying the erase and receipt together.
+Original replay still uses its archive admission.
 The sealed search inventory caller invokes the protected-carrier page against `fact_sealed_search_unit_rows`, outside the protected-carrier page's installed relation scope even in v1.
-The paired integration needs authorized routes for both before publication of the live retirement path.
+The paired integration needs a scoped inventory read before publishing the live retirement path.
 
 == Unique window replies
 

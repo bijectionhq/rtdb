@@ -156,6 +156,11 @@ impl CommitEffects {
     fn allows_spatial_requirement(self) -> bool {
         matches!(self, Self::HostedRoot | Self::HostedCatalog)
     }
+
+    fn allows_erase(self, relation: &OwnedRelation) -> bool {
+        relation.is_root_data() && (matches!(self, Self::Replay | Self::FamilyFence)
+            || matches!(self, Self::HostedRoot) && relation.name() == SHARED_COLUMN_CARRIERS)
+    }
 }
 
 struct CommitRequest<'a> {
@@ -2064,7 +2069,7 @@ impl Service {
                 }
                 replay_residue(relation, own_id()?, archive_origin, valid_from, valid_to)?
             }
-            "erase" if relation.is_root_data() && matches!(effects, CommitEffects::Replay | CommitEffects::FamilyFence) => {
+            "erase" if effects.allows_erase(relation) => {
                 if valid_from.is_some() || valid_to.is_some() || has_payload()? {
                     return Err(invalid("Owned erase requires only a typed identity and optional observation"));
                 }
@@ -2151,7 +2156,7 @@ impl Service {
                     }
                     replay_residue(relation, id, archive_origin.as_deref(), valid_from, valid_to)?
                 }
-                "erase" if relation.is_root_data() && matches!(effects, CommitEffects::Replay | CommitEffects::FamilyFence) => {
+                "erase" if effects.allows_erase(relation) => {
                     if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
                         return Err(invalid("Owned erase requires only a typed identity and optional observation"));
                     }

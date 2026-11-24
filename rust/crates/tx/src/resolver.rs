@@ -2578,6 +2578,7 @@ impl<'a> OpenTransaction<'a> {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.owned/stale-point", "The owned point observation changed before ordering"));
             }
         }
+        self.check_shared_column_retirement(owner, operations, archive_replay).await?;
         self.claim_assertion_family_fences(owner, operations, archive_replay).await
     }
 
