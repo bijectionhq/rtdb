@@ -239,8 +239,8 @@
                                 (map (fn [[id price]] {:xt/id (name id), :price (long price)})) (:prices transaction))
                     "delete" [:delete-docs {:from :products, :valid-from (instant (:valid_from transaction))} (:id transaction)]
                     "erase" [:erase-docs :products (:id transaction)])
-        ^TransactionKey key (xt/execute-tx node [operation] {:system-time time, :default-tz "UTC"})]
-    (when-not (= time (.getSystemTime key)) (throw (ex-info "Transaction did not commit at the requested system time" {})))
+        ^TransactionKey key (xt/execute-tx node [operation] {:default-tz "UTC"})]
+    (when-not (= time (.getSystemTime key)) (throw (ex-info "Transaction did not commit at the fixture clock reading" {})))
     {:tx_id (.getTxId key), :system_time_micros (micros time), :committed true}))
 
 (defn- open-node ^Xtdb [^Path directory clock]

@@ -78,16 +78,15 @@
                                              :compactor-threads 0, :gc? false, :default-tz (ZoneId/of "UTC")})]
         (let [^Database database (db/primary-db node)
               put-op (into [:put-docs :docs] (map (fn [id] {:xt/id (keyword id)})) put_keyword_ids)
-              ^TransactionKey put (xt/execute-tx node [put-op] {:system-time put-time})]
+              ^TransactionKey put (xt/execute-tx node [put-op])]
           (when-not (= put-time (.getSystemTime put))
-            (throw (ex-info "Erase fixture put did not commit at its requested system time" {})))
+            (throw (ex-info "Erase fixture put did not commit at its fixture clock reading" {})))
           (flush! node database)
           (let [put-block (require-layout! database put false)
                 _ (reset! clock erase-time)
-                ^TransactionKey erase (xt/execute-tx node [[:erase-docs :docs (keyword erase_keyword_id)]]
-                                                     {:system-time erase-time})]
+                ^TransactionKey erase (xt/execute-tx node [[:erase-docs :docs (keyword erase_keyword_id)]])]
             (when-not (= erase-time (.getSystemTime erase))
-              (throw (ex-info "Erase fixture erase did not commit at its requested system time" {})))
+              (throw (ex-info "Erase fixture erase did not commit at its fixture clock reading" {})))
             (when-not (= put-block (require-layout! database erase true))
               (throw (ex-info "Erase fixture moved to a later block before its live queries" {})))
             (let [live (mapv #(observe-query node % query-time true) queries)]
