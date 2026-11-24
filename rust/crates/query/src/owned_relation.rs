@@ -1060,6 +1060,7 @@ pub async fn open_owned_path_catalog(
 async fn open_private_catalog(
     context: Arc<QueryContext>, catalog: TableRef, fields: &[&str], iid: Option<rtdb_types::Iid>,
 ) -> Result<Option<QueryCursor>> {
+    let ordered = catalog.is_owned_path_catalog();
     let name = QualifiedTable { database: context.catalog.default_database().to_owned(), table: catalog };
     let context = context.for_owned_relation(name.clone(), None);
     let Some(table) = context.catalog.table(&name)? else { return Ok(None); };
@@ -1073,7 +1074,11 @@ async fn open_private_catalog(
         predicates: Vec::new(), matches: Vec::new(), top_k: None, ordered_top_k: None,
     })?);
     let query = PreparedQuery::new_in(scan, &context.memory)?;
-    query.execute(context, Vec::new()).await.map(Some)
+    if ordered {
+        query.execute_columns(context, Vec::new()).await.map(Some)
+    } else {
+        query.execute(context, Vec::new()).await.map(Some)
+    }
 }
 
 pub async fn read_owned_world_clock(

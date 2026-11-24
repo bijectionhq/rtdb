@@ -15,6 +15,7 @@ mod usage;
 
 use std::{collections::BTreeMap, sync::Arc};
 
+use arrow_array::RecordBatch;
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation, read_value};
 use rtdb_index::Snapshot;
 use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable, Relation, Scan, TemporalFilter};
@@ -42,20 +43,50 @@ struct Definition {
 
 impl Definition {
     fn directory(&self) -> Result<ObjectKey> {
-        let digest = Sha256::digest(
-            serde_json::to_vec(&(
+        let mut digest = Sha256::new();
+        serde_json::to_writer(
+            &mut digest,
+            &(
                 &self.table.schema,
                 &self.table.table,
                 &self.name,
                 self.version,
                 PAGE_LAYOUT_VERSION,
-            ))
-            .map_err(format_error)?,
-        );
+            ),
+        )
+        .map_err(format_error)?;
+        let digest = digest.finalize();
         Ok(ObjectKey::new(format!(
             "{INDEX_ROOT}/{:016x}-{digest:x}",
             self.version
         ))?)
+    }
+
+    fn from_row(batch: &RecordBatch, row: usize) -> Result<Self> {
+        let cell = |name| ArrowCell::named(batch, name, row);
+        let text = |name| {
+            cell(name)
+                .and_then(ArrowCell::utf8)
+                .ok_or_else(|| format_error("Expected an index name or column"))
+        };
+        let columns = cell("columns")
+            .and_then(ArrowCell::list)
+            .ok_or_else(|| format_error("Expected index columns"))?;
+        let version = cell("version")
+            .and_then(ArrowCell::int64)
+            .ok_or_else(|| format_error("Expected an index version"))?;
+        Ok(Self {
+            name: text("_id")?.to_owned(),
+            table: TableRef::new(text("schema_name")?, text("table_name")?),
+            columns: columns
+                .map(|cell| {
+                    cell.utf8()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format_error("Expected an index name or column"))
+                })
+                .collect::<Result<_>>()?,
+            version,
+        })
     }
 }
 
@@ -197,26 +228,17 @@ async fn read_definitions(mut cursor: rtdb_query::QueryCursor) -> Result<Vec<Def
     let mut definitions = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
-        let schema = batch.schema();
         for row in 0..batch.num_rows() {
-            let arrow = |column| ArrowCell { field: schema.field(column), array: batch.column(column).as_ref(), row };
+            if let Ok(definition) = Definition::from_row(batch, row) {
+                definitions.push(definition);
+                continue;
+            }
+            let schema = batch.schema_ref();
             let cell = |column| read_value(schema.field(column), batch.column(column).as_ref(), row);
             let text = |value| match value {
                 Value::Utf8(value) => Ok(value),
                 _ => Err(format_error("Expected an index name or column")),
             };
-            if let (Some(columns), Some(version), Some(name), Some(schema_name), Some(table_name)) =
-                (arrow(3).list(), arrow(4).int64(), arrow(0).utf8(), arrow(1).utf8(), arrow(2).utf8())
-                && let Some(columns) = columns.map(|column| column.utf8().map(str::to_owned)).collect::<Option<Vec<_>>>()
-            {
-                definitions.push(Definition {
-                    name: name.to_owned(),
-                    table: TableRef::new(schema_name, table_name),
-                    columns,
-                    version,
-                });
-                continue;
-            }
             let Value::List(columns) = cell(3)? else {
                 return Err(format_error("Expected index columns"));
             };
@@ -499,4 +521,70 @@ async fn owned_definition(
 
 fn format_error(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::fault("rtdb.ordered-index/format", error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordered_definition_admits_text_and_i64_from_selected_union_legs() -> Result<()> {
+        let cells = [
+            ("_id", [Value::Utf8("by_key".into()), Value::Utf8("bad_columns".into()), Value::I64(0)]),
+            ("schema_name", std::array::from_fn(|_| Value::Utf8("public".into()))),
+            ("table_name", std::array::from_fn(|_| Value::Utf8("events".into()))),
+            ("columns", [
+                Value::list(vec![Value::Utf8("key".into()), Value::Utf8("_id".into())]),
+                Value::list(vec![Value::Utf8("other".into()), Value::Null]),
+                Value::list(vec![Value::Utf8("_id".into())]),
+            ]),
+            ("version", [Value::I64(12), Value::I64(13), Value::I32(14)]),
+        ];
+        let mut fields = Vec::new();
+        let mut columns = Vec::new();
+        for (name, values) in cells {
+            let ty = LogicalType::join_all(&values.each_ref().map(Value::logical_type));
+            fields.push(rtdb_columnar::to_field(name, &ty)?);
+            columns.push(rtdb_columnar::build_array(&ty, &values)?);
+        }
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+            .map_err(format_error)?;
+        assert_eq!(
+            Definition::from_row(&batch, 0)?,
+            Definition {
+                name: "by_key".into(),
+                table: TableRef::new("public", "events"),
+                columns: vec!["key".into(), "_id".into()],
+                version: 12,
+            },
+        );
+        assert!(Definition::from_row(&batch, 1).is_err());
+        assert!(Definition::from_row(&batch, 2).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn definition_directory_matches_the_legacy_json_preimage() -> Result<()> {
+        let definition = Definition {
+            name: "path / \\ \" é".into(),
+            table: TableRef::new("quoted\n", "表"),
+            columns: vec!["key".into(), "_id".into()],
+            version: 12345,
+        };
+        let preimage = serde_json::to_vec(&(
+            &definition.table.schema,
+            &definition.table.table,
+            &definition.name,
+            definition.version,
+            PAGE_LAYOUT_VERSION,
+        ))
+        .map_err(format_error)?;
+        let legacy = ObjectKey::new(format!(
+            "{INDEX_ROOT}/{:016x}-{:x}",
+            definition.version,
+            Sha256::digest(&preimage),
+        ))?;
+        assert_eq!(definition.directory()?, legacy);
+        Ok(())
+    }
 }
