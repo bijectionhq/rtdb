@@ -1,0 +1,25 @@
+{
+  "summary": "The shipped prepared Proposal switch requires the complete original predecessor, physical catalog and assigned system time for either prepared outcome.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 2,
+  "controls": {
+    "substitute-predecessor": {
+      "defect": "A prepared generation can switch after another source transaction advances its predecessor.",
+      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "    prepared.predecessor_id == installed.predecessor_id\n        && prepared.predecessor_time", "replace": "    prepared.predecessor_time"}],
+      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 1
+    },
+    "substitute-replica-epoch": {
+      "defect": "A prepared generation can cross an unrelated replica epoch with numerically equal coordinates.",
+      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared.replica_epoch == installed.replica_epoch\n", "replace": ""}],
+      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 1
+    },
+    "substitute-assigned-clock": {
+      "defect": "A prepared generation can switch with an assigned clock different from the time at which it computed effects.",
+      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_time == assigned_time\n", "replace": ""}],
+      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 1
+    }
+  }
+}
