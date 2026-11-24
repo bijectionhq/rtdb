@@ -141,12 +141,7 @@ impl UnitLedger {
         if now >= deadline {
             return Err(expired());
         }
-        let budget = deadline
-            .duration_since(now)
-            .as_micros()
-            .min(i64::MAX as u128) as i64;
-        let clock = Arc::new(move || now.elapsed().as_micros().min(i64::MAX as u128) as i64);
-        let lease = Arc::new(rtdb_storage::ReadLease::new(Some(budget), clock));
+        let lease = Arc::new(rtdb_storage::ReadLease::until(deadline));
         let result = tokio::time::timeout_at(deadline.into(), IoRegion::leased(Some(lease), work))
             .await
             .map_err(|_| expired())?;

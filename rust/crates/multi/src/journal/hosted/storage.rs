@@ -559,10 +559,7 @@ impl ServingStore {
 
 async fn with_read_lease<T, F>(deadline: Instant, work: impl FnOnce(Instant) -> F) -> rtdb_storage::Result<T>
 where F: std::future::Future<Output = rtdb_storage::Result<T>> {
-    let started = Instant::now();
-    let micros = |length: Duration| length.as_micros().min(i64::MAX as u128) as i64;
-    let length = micros(deadline.saturating_duration_since(started));
-    let lease = Arc::new(ReadLease::new(Some(length), Arc::new(move || micros(started.elapsed()))));
+    let lease = Arc::new(ReadLease::until(deadline));
     let result = tokio::time::timeout_at(deadline.into(), IoRegion::leased(Some(Arc::clone(&lease)), work(deadline))).await;
     lease.check()?;
     result.map_err(|_| Error::Closed("The installed serving lease expired".into()))?

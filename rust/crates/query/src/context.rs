@@ -308,7 +308,8 @@ impl QueryContext {
         let view = self.owner_cancellation.run_until_cancelled(
             self.cancellation.run_until_cancelled(self.catalog.held_view()),
         ).await.flatten().ok_or_else(cancelled)??;
-        let work = rtdb_storage::IoRegion::retaining(self.clone(), rtdb_storage::IoRegion::leased(self.catalog.read_lease(), work));
+        let lease = self.catalog.read_lease();
+        let work = rtdb_storage::IoRegion::retaining(self.clone(), rtdb_storage::IoRegion::leased(lease.clone(), work));
         let plaintext = self.plaintext.clone().unwrap_or_else(|| PlaintextView::new(Arc::clone(&self.memory)));
         let work = plaintext.reading(async {
             for partition in self.catalog.databases.values().flat_map(|database| &database.partitions) {
@@ -316,7 +317,15 @@ impl QueryContext {
                     PlaintextView::track_certified_read(read)?;
                 }
             }
-            let answer = work.await?;
+            let work = self.owner_cancellation.run_until_cancelled(self.cancellation.run_until_cancelled(work));
+            let answer = if let Some(lease) = lease {
+                let deadline = lease.local_cutoff()?;
+                tokio::time::timeout_at(deadline.into(), work).await.map_err(|_| {
+                    Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.storage/read-lease-expired", "The read lease expired while computing the answer")
+                })?
+            } else {
+                work.await
+            }.flatten().ok_or_else(cancelled)??;
             self.grant_delivery(&plaintext).await?;
             Ok(answer)
         });
