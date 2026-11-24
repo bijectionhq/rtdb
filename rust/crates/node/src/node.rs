@@ -1525,6 +1525,7 @@ impl OwnedReadSession {
         }
         Ok(OwnedForkCut {
             root_point: None,
+            public_root: false,
             basis: self.system_time(),
             live: self.historical.is_none().then_some(self.present),
             issued_on: self.present,
@@ -1536,10 +1537,14 @@ impl OwnedReadSession {
         })
     }
 
-    pub async fn root_point_at(&self, valid_at: Timestamp) -> Result<Option<rtdb_types::OwnedPointVersion>> {
+    pub async fn root_point_at(&self, valid_at: Timestamp, public: bool) -> Result<Option<rtdb_types::OwnedPointVersion>> {
         self.require_unscoped_root()?;
         self.admit_access().await?;
-        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?;
+        let relation = rtdb_types::OwnedRelation::new(if public {
+            rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION
+        } else {
+            rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+        })?;
         rtdb_query::read_owned_point_version(Arc::clone(&self.context), &self.owner, &relation,
             &rtdb_types::EntityId::String("head".into()), Interval::at(valid_at)?).await
     }
@@ -1555,6 +1560,27 @@ impl OwnedReadSession {
         self.check()?;
         cut.basis = publication.system_time;
         cut.publication = Some(publication);
+        Ok(cut)
+    }
+
+    /// Admit a pin at the current public version of the caller's original hold.
+    pub async fn fork_public_version_cut(
+        &self, scope: rtdb_types::PlacedAttemptScope, publication: TransactionKey,
+    ) -> Result<OwnedForkCut> {
+        let unavailable = rtdb_types::OwnedWorld::unavailable;
+        let mut cut = self.fork_cut(scope).await?;
+        let head = cut.live.take().ok_or_else(unavailable)?;
+        let relation = rtdb_types::OwnedRelation::new(rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION)?;
+        if !publication.at_or_before(head)
+            || self.lookup_publication(&relation, OwnedPublicationLookup::Latest).await?
+                .is_none_or(|(_, selected)| selected != publication)
+        {
+            return Err(unavailable());
+        }
+        self.check()?;
+        cut.basis = publication.system_time;
+        cut.publication = Some(publication);
+        cut.public_root = true;
         Ok(cut)
     }
 
@@ -3027,6 +3053,7 @@ fn world_create_absence_matches_the_observed_valid_instant() {
 
 pub struct OwnedForkCut {
     root_point: Option<rtdb_types::OwnedPointVersion>,
+    public_root: bool,
     basis: Timestamp,
     live: Option<TransactionKey>,
     issued_on: TransactionKey,
@@ -3330,7 +3357,11 @@ impl NativeSession {
                 return Err(rtdb_types::OwnedWorld::unavailable());
             }
             ops.push(TxOp::OwnedCheck {
-                relation: rtdb_types::OwnedRelation::new(rtdb_types::OWNED_ROOT_PUBLICATION_RELATION)?,
+                relation: rtdb_types::OwnedRelation::new(if fork.cut.public_root {
+                    rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION
+                } else {
+                    rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+                })?,
                 id: rtdb_types::EntityId::String("head".into()),
                 valid_at: record.basis.system_time,
                 expected: fork.cut.root_point,

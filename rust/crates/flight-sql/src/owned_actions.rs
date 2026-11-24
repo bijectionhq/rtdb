@@ -4135,7 +4135,8 @@ impl Service {
         let (until, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no expiry"))?;
         let (deadline, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("World fork has no deadline"))?;
         let ([mode], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("World fork has no clock mode"))?;
-        let select_publication = matches!(*mode, 4 | 5) && publish_root;
+        let select_publication = matches!(*mode, 4 | 5 | 11) && publish_root;
+        let public_version = *mode == 11 && publish_root;
         let proposed_publication = *mode == 5 && publish_root;
         let held_publication = *mode == 10 && publish_root;
         if held_publication && (*previous_handle != [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
@@ -4148,6 +4149,12 @@ impl Service {
         if renewal && (*previous_handle == [0; 16] || *capture != [0; 16] || *suffix != [0; 16]) {
             return Err(invalid("An authored renewal requires its original retained handle and derives its archive"));
         }
+        let (public_basis, rest) = if public_version {
+            let (publication, rest) = split_world_publication(rest)?;
+            (Some(publication), rest)
+        } else {
+            (None, rest)
+        };
         let (held_basis, rest) = if held_publication {
             let (basis, rest) = rest.split_first_chunk::<8>()
                 .ok_or_else(|| invalid("Held Root fork has no exact publication"))?;
@@ -4160,7 +4167,7 @@ impl Service {
             0 => (rtdb_node::WorldClockRequest::Retained, rest),
             8 | 9 if proposal_hold => (rtdb_node::WorldClockRequest::Proposal, rest),
             6 | 7 if renewal => (rtdb_node::WorldClockRequest::Retained, rest),
-            4 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
+            4 | 11 if select_publication => (rtdb_node::WorldClockRequest::Retained, rest),
             5 if proposed_publication => (rtdb_node::WorldClockRequest::Proposal, rest),
             1 => (rtdb_node::WorldClockRequest::Held { start: None }, rest),
             2 => {
@@ -4179,7 +4186,9 @@ impl Service {
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
         let policy = self.hosted_control_policy(call)?;
         let scope = self.hosted_control_scope(call).await?;
-        let cut = if let Some(basis) = held_basis {
+        let cut = if let Some(basis) = public_basis {
+            held.snapshot.fork_public_version_cut(scope, basis).await.map_err(status)?
+        } else if let Some(basis) = held_basis {
             held.snapshot.fork_held_root_publication_cut(scope, basis).await.map_err(status)?
         } else if select_publication {
             held.snapshot.fork_publication_cut(scope).await.map_err(status)?
@@ -4217,7 +4226,7 @@ impl Service {
         } else {
             cut
         };
-        let root_point = held.snapshot.root_point_at(cut.basis()).await.map_err(status)?;
+        let root_point = held.snapshot.root_point_at(cut.basis(), public_version).await.map_err(status)?;
         cut.original_root_point(root_point);
         // Deadline, registration, one immutable attempt and a Root head
         // (or the standalone fork's optional tip check).

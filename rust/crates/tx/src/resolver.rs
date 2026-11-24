@@ -1855,9 +1855,11 @@ impl<'a> OpenTransaction<'a> {
                         root_rows = root_rows.saturating_add(1);
                     }
                     Operation::Public(TxOp::OwnedCheck { relation, id: rtdb_types::EntityId::String(id), valid_at, expected })
-                        if relation.name() == rtdb_types::OWNED_ROOT_PUBLICATION_RELATION && id == "head"
-                            && checked_tip.is_none() => {
-                        checked_tip = Some((*valid_at, *expected));
+                        if matches!(relation.name(), rtdb_types::OWNED_ROOT_PUBLICATION_RELATION
+                            | rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION)
+                            && id == "head" && checked_tip.is_none() => {
+                        checked_tip = Some((*valid_at, *expected,
+                            relation.name() == rtdb_types::OWNED_PUBLIC_ROOT_VERSIONS_RELATION));
                     }
                     Operation::Public(TxOp::OwnedForkWorld { record, previous, sibling, overlay_source, .. }) => {
                         let world = rtdb_types::OwnedWorld::from_record(record)?;
@@ -1964,9 +1966,13 @@ impl<'a> OpenTransaction<'a> {
             )));
             let tip_matches = match (expected_tip, checked_tip) {
                 (None, None) => true,
-                (Some((basis, publication)), Some((valid_at, observed))) => {
+                (Some((basis, publication)), Some((valid_at, observed, public))) => {
                     valid_at == basis.system_time && observed.map(|point| point.history) == publication
-                        && observed.is_none_or(|point| point.position.transaction <= basis.tx_id)
+                        && if public {
+                            observed.is_some_and(|point| point.position.transaction == basis.tx_id)
+                        } else {
+                            observed.is_none_or(|point| point.position.transaction <= basis.tx_id)
+                        }
                 }
                 _ => false,
             };
