@@ -109,6 +109,7 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
         hash.update(b"custody-review");
         hash.update(Sha256::digest(review.encode_to_vec()));
     }
+    if let Some(hold) = &query.scoped_hold { hash.update(b"scoped-hold"); hash.update(hold); }
     if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
     if query.observe_applied_position { hash.update(b"observe-applied-position"); }
     if query.verify_ranked_artefacts { hash.update(b"ranked-artefact-readiness"); }
@@ -129,6 +130,7 @@ struct OpenedQuery {
     trailer: proto::QueryTrailer,
     custody_groups: BTreeSet<CustodyGroupId>,
     key_generation: Option<u64>,
+    scoped_hold_until: Option<Timestamp>,
 }
 
 impl Service {
@@ -177,7 +179,7 @@ impl Service {
         call: Call,
         request: proto::QueryRequest,
     ) -> Result<Response<Output<FlightData>>, Status> {
-        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg, custody_groups, key_generation } = self
+        let OpenedQuery { mut cursor, database, issuer, labels, page, limit, trailer: mut trailer_msg, custody_groups, key_generation, scoped_hold_until } = self
             .open_v1_query(&call, request)
             .await
             .map_err(|status| call.error(status))?;
@@ -193,6 +195,7 @@ impl Service {
             let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
             service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
+            service.check_hold_deadline(scoped_hold_until)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
             yield schema_frame;
             let mut skip = page.offset;
@@ -221,6 +224,7 @@ impl Service {
                     let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
                     service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
                     service.check_attachment(&call, &database)?;
+                    service.check_hold_deadline(scoped_hold_until)?;
                     call.handoff(grant, cutoff).map_err(error::map_status)?;
                     yield item;
                 }
@@ -236,12 +240,20 @@ impl Service {
             let grant = cursor.delivery_grant().await.map_err(error::anomaly)?;
             service.check_query_delivery(&call, &database, page.basis, key_generation, &custody_groups).await?;
             service.check_attachment(&call, &database)?;
+            service.check_hold_deadline(scoped_hold_until)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(trailer_msg);
         });
         let mut response = Response::new(stream);
         *response.metadata_mut() = headers;
         Ok(response)
+    }
+
+    fn check_hold_deadline(&self, deadline: Option<Timestamp>) -> Result<(), Status> {
+        if deadline.is_some_and(|deadline| self.0.node.now() >= deadline) {
+            return Err(super::scoped_hold::hold_unavailable());
+        }
+        Ok(())
     }
 
     pub(super) async fn check_query_delivery(&self, call: &Call, database: &Database, _basis: Basis, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
@@ -295,12 +307,22 @@ impl Service {
                 return Err(error::unsupported("query.follower-authority"));
             }
         }
-        if request.custody_release_evidence {
-            self.custody_route(call)?;
-        }
         let database = self.wire_database(call, &source.branch, layer).await?;
         let driver = database.serving_driver();
-        let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
+        let mut visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
+        let scoped_hold = match request.scoped_hold.as_deref() {
+            Some(handle) => {
+                let driver = driver.ok_or_else(super::scoped_hold::hold_unavailable)?;
+                let scope = visibility.as_ref().ok_or_else(super::scoped_hold::hold_unavailable)?;
+                let Some(Selection::Exactly(basis)) = selection else { return Err(super::scoped_hold::hold_unavailable()); };
+                let hold = self.read_scoped_hold(call, &database, driver, scope, handle).await?;
+                if basis.value.as_slice() != hold.basis.to_bytes() {
+                    return Err(super::scoped_hold::hold_unavailable());
+                }
+                Some(hold)
+            }
+            None => None,
+        };
         if request.custody_review.is_some() && (
             !request.custody_release_evidence || !request.track || request.page.is_some()
                 || visibility.is_some() || claim_layer != Layer::Merged
@@ -349,12 +371,21 @@ impl Service {
         ) {
             return Err(error::unsupported(super::APPLIED_POSITION));
         }
-        if request.custody_release_evidence && (
-            driver.is_none_or(|driver| !driver.supports_query_tokens()) || visibility.is_some() || !database.wire_tokens_supported()
-        ) {
-            return Err(error::unsupported("custody release proof"));
+        if request.custody_release_evidence {
+            if visibility.is_some() {
+                self.authorize_scoped_custody(call)?;
+            } else {
+                self.custody_route(call)?;
+                if driver.is_none_or(|driver| !driver.supports_query_tokens()) || !database.wire_tokens_supported() {
+                    return Err(error::unsupported("custody release proof"));
+                }
+            }
         }
-        let authority = if request.track || request.page.is_some() || request.observe_receiver_clock || request.custody_release_evidence {
+        if let Some(scope) = &mut visibility {
+            scope.custody_evidence = request.custody_release_evidence;
+            scope.hold = scoped_hold.as_ref().map(|hold| hold.id);
+        }
+        let authority = if request.track || request.page.is_some() || request.observe_receiver_clock || request.custody_release_evidence && visibility.is_none() {
             if !database.wire_tokens_supported() || driver.is_some_and(|driver| !driver.supports_query_tokens()) {
                 return Err(error::unsupported(if request.track { "query.track" } else { "query.page" }));
             }
@@ -404,7 +435,7 @@ impl Service {
             None => (None, None),
         };
         let mut ranked_catalog = None;
-        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, follower_evidence) = if let Some(driver) = driver {
+        let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, scoped_source_basis, follower_evidence) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
@@ -423,7 +454,7 @@ impl Service {
                     .with_wire_cut(cut, cut.into()).map_err(error::anomaly)?;
                 (context, cut)
             } else if visibility.is_some() {
-                let clock = continuation.map_or(now, |page| page.clock);
+                let clock = scoped_hold.as_ref().map_or_else(|| continuation.map_or(now, |page| page.clock), |hold| hold.valid_at);
                 let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
                 let context = self.scoped_wire_context(call, snapshot, clock)?
                     .with_wire_cut(cut, clock.into()).map_err(error::anomaly)?;
@@ -439,7 +470,7 @@ impl Service {
                 (context, clock)
             };
             let page = PageToken { basis: view.cut.basis, clock, offset, request: request_hash };
-            (context, page, cut, view.claim, view.custody_groups, view.key_generation, view.custody_contributors, follower_evidence)
+            (context, page, cut, view.claim, view.custody_groups, view.key_generation, view.custody_contributors, view.scoped_source_basis, follower_evidence)
         } else {
             let minimum = match (continuation, selection) {
                 (Some(page), _) => Some(tokens::read_basis(scope, &page.basis.into())?),
@@ -490,7 +521,7 @@ impl Service {
             let context = context
                 .with_wire_cut(cut, page.clock.into())
                 .map_err(error::anomaly)?;
-            (context, page, cut, None, BTreeSet::new(), None, None, None)
+            (context, page, cut, None, BTreeSet::new(), None, None, None, None)
         };
         if request.require_clear_rank_input && (
             !custody_groups.is_empty() || !custody_contributors.as_ref().is_some_and(BTreeSet::is_empty)
@@ -543,11 +574,17 @@ impl Service {
             Some(proto::ReceiverClockObservation { observed_at_micros: observed_at.0, proof })
         } else { None };
         let (custody_release_proof, custody_release_inventory) = if request.custody_release_evidence {
-            let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("custody release proof"))?;
             let contributors = custody_contributors.ok_or_else(|| error::unsupported("complete custody release inventory"))?;
-            let review = request.custody_review.as_ref().map(|review| (source.branch.as_str(), review));
-            let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors, review).await?;
-            (Some(proof), Some(inventory))
+            if visibility.is_some() {
+                let source = scoped_source_basis.ok_or_else(|| error::unsupported("complete custody release inventory"))?;
+                let proof = self.scoped_custody_read(call, &database, page.basis, source, key_generation, contributors).await?;
+                (Some(proof), None)
+            } else {
+                let issuer = issuer.as_ref().ok_or_else(|| error::unsupported("custody release proof"))?;
+                let review = request.custody_review.as_ref().map(|review| (source.branch.as_str(), review));
+                let (proof, inventory) = self.custody_read_proof(call, &database, issuer, page.basis, key_generation, contributors, review).await?;
+                (Some(proof), Some(inventory))
+            }
         } else { (None, None) };
         let (applied_position, follower_progress) = match follower_evidence {
             Some((position, progress)) => (Some(position), Some(progress)),
@@ -565,7 +602,7 @@ impl Service {
             follower_progress,
             ranked_ivf: ranked_result,
         };
-        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
+        Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation, scoped_hold_until: scoped_hold.map(|hold| hold.expires_at) })
     }
 }
 

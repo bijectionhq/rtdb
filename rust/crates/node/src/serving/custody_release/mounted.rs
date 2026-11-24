@@ -366,6 +366,26 @@ impl MountedResponseRelease<'_> {
         })
     }
 
+    pub async fn check_clear_response(
+        &self, part: CustodyResponsePart, frame_sha256: [u8; 32],
+        read_proofs_sha256: [u8; 32], proof_expires_at: Timestamp,
+    ) -> Result<()> {
+        let installation = &self.owner.provider.installation;
+        let authority = installation.authority;
+        self.while_mounted(async {
+            self.require_original_writer().await?;
+            let frame = installation.observations.registered_response(authority, part, self.cancellation).await?;
+            if frame.authority != authority || frame.part != part || frame.frame_sha256 != frame_sha256
+                || frame.read_proofs_sha256 != Some(read_proofs_sha256) || !frame.contributors.is_empty()
+                || frame.expires_at > proof_expires_at || frame.expires_at <= self.clock.now()
+            {
+                return Err(release_unavailable());
+            }
+            Ok(())
+        }).await?;
+        self.owner.with_live_mount(|| self.release().require_authority(authority))
+    }
+
     pub async fn check_registered_response(
         &self,
         contributors: &CustodyContributors,

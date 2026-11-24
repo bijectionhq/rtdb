@@ -2,9 +2,9 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::CustodyVault;
-use rtdb_index::{Snapshot, branches::{BranchIndex, BranchView}};
+use rtdb_index::{Snapshot, branches::{BranchEvent, BranchIndex, BranchView}};
 use rtdb_tx::transact::{Cell, CustodyGroupId, CustodyPayload, CustodyPlacement, CustodyPlacementCommitments, Op, Row, Transact};
-use rtdb_types::{Anomaly, Result, StructFields, Timestamp, Value};
+use rtdb_types::{Anomaly, Result, StructFields, TableRef, Timestamp, Value};
 use sha2::{Digest, Sha256};
 
 use super::{ChangePage, custody_release::CustodyContributors};
@@ -107,6 +107,13 @@ pub(crate) async fn open(vault: &CustodyVault, group: [u8; 16], stored: &Custody
 pub(crate) async fn snapshot(
     view: &BranchView<'_>, memory: &Arc<MemoryBudget>, vault: &CustodyVault,
 ) -> Result<(Snapshot, BTreeSet<CustodyGroupId>, Option<CustodyContributors>)> {
+    snapshot_with_contributors(view, memory, vault, |table, event| view.custody_event_contributor(table, event)).await
+}
+
+pub(crate) async fn snapshot_with_contributors(
+    view: &BranchView<'_>, memory: &Arc<MemoryBudget>, vault: &CustodyVault,
+    contributor: impl Fn(&TableRef, &BranchEvent) -> Option<(CustodyGroupId, [u8; 32])>,
+) -> Result<(Snapshot, BTreeSet<CustodyGroupId>, Option<CustodyContributors>)> {
     let mut opened = BTreeMap::new();
     let mut groups = BTreeSet::new();
     let mut contributors = Some(CustodyContributors::new());
@@ -117,7 +124,7 @@ pub(crate) async fn snapshot(
                 let Some(group) = image.custody_group else { continue };
                 groups.insert(group);
                 if let Some(selected) = &mut contributors {
-                    match view.custody_event_contributor(table, event) {
+                    match contributor(table, event) {
                         Some(contributor) if selected.len() < 512 || selected.contains(&contributor) => { selected.insert(contributor); }
                         _ => contributors = None,
                     }
@@ -256,6 +263,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_capture_uses_real_occurrences_for_visible_query_and_change_images() {
+        use rtdb_tx::transact::{Declaration, Visibility};
+        use rtdb_types::rtdb_v1::LabelScope;
+        use crate::serving::{ChangeImages, ChangeOrder, Changes, QuerySource, ServingScope};
+
+        let incarnation = [4; 16];
+        let visible = [5; 16];
+        let hidden = [6; 16];
+        let table = TableRef::new("public", "docs");
+        let vault = CustodyVault::new(Uuid::from_bytes(incarnation), Arc::new(LocalKms::new(|| 10)));
+        let claims = ClaimSealer::new(incarnation, [7; 32]);
+        let place = |id, label, group: CustodyGroupId| Op::PlaceCustodyRow {
+            branch: MAIN_BRANCH.into(), table: table.clone(),
+            row: Row {
+                id: EntityId::Integer(id), valid: Some(rtdb_types::Interval::ALL.into()),
+                cells: StructFields::from([
+                    ("label".into(), Cell::Value(Value::Binary(vec![label]))),
+                    ("carrier".into(), Cell::Value(Value::Binary(group.to_vec()))),
+                ]),
+                custody_group: Some(group), protected_columns: vec!["carrier".into()], custody_payload: None,
+            },
+            placement: CustodyPlacement {
+                placement_id: group, reservation: None, derived: None, carrier_column: "carrier".into(),
+                link_column: None, commitments: None,
+            },
+        };
+        let mut request = Transact {
+            key: vec![1; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), requires: Vec::new(),
+            ops: vec![
+                Op::Declare { table: table.clone(), change: Declaration::Visibility(Visibility { column: "label".into() }) },
+                Op::CreateCustodyGroup { group: visible }, Op::CreateCustodyGroup { group: hidden },
+                place(1, 1, visible), place(2, 2, hidden),
+            ],
+            otherwise: Vec::new(), custody_request_digest: None, request_memory: None,
+        };
+        let mut state = TransactState::new(incarnation);
+        prepare(&mut request, &vault).await.unwrap();
+        let Resolution::Append(append) = state.resolve(&request, 1, Timestamp(10), &[ROW_CUSTODY], &claims).unwrap()
+            else { panic!("the placements must order"); };
+        assert_eq!(state.apply(1, append.into_record()).unwrap().unwrap().outcome, Outcome::Then);
+        let index = state.index();
+        let expected: CustodyContributors = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(11)).unwrap()
+            .custody_placements().filter(|entry| entry.group == visible)
+            .map(|entry| (entry.group, entry.occurrence.unwrap().commitment(entry.group))).collect();
+        assert_eq!(expected.len(), 1);
+        let scope = ServingScope {
+            labels: LabelScope { read: BTreeSet::from([vec![1]]), ..Default::default() },
+            receipt_namespace: [8; 32], custody_evidence: true, hold: None,
+        };
+        let source = QuerySource { branch: MAIN_BRANCH.into(), at: At::Latest, layer: Layer::Merged };
+        let (view, _) = scope.query(index, source, Timestamp(11), &MemoryBudget::new(1 << 22), Some(&vault)).await.unwrap();
+        assert_eq!(view.custody_contributors, Some(expected.clone()));
+        let mut changes = Changes {
+            branch: MAIN_BRANCH.into(), tables: BTreeSet::new(), after: None, until: None,
+            order: ChangeOrder::Ascending, images: ChangeImages::Both, limit: 8, wait: std::time::Duration::ZERO,
+        };
+        let page = scope.changes(index, &changes).unwrap();
+        assert_eq!(page.scoped_custody, Some((index.head().basis, expected)));
+        changes.images = ChangeImages::None;
+        let progress = scope.changes(index, &changes).unwrap();
+        assert_eq!(progress.scoped_custody, Some((index.head().basis, CustodyContributors::new())));
+    }
+
+    #[tokio::test]
     async fn placement_preparation_commits_the_exact_binary_carrier_and_link() {
         let group = [5; 16];
         let vault = CustodyVault::new(Uuid::from_bytes([4; 16]), Arc::new(LocalKms::new(|| 11)));
@@ -341,6 +412,7 @@ mod tests {
         check_delivery(state.index(), &vault, &groups).await.unwrap();
         let page = || ChangePage {
             read_custody: None,
+            scoped_custody: None,
             groups: vec![ChangeGroup {
                 cut: row.cut,
                 rows: vec![ChangeRow {

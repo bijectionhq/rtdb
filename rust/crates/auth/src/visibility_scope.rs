@@ -11,6 +11,8 @@ struct ScopeClaim {
     incarnation: [u8; 16],
     read: BTreeSet<Vec<u8>>,
     write: BTreeSet<Vec<u8>>,
+    #[serde(default)]
+    protected_reads: bool,
 }
 
 pub struct VerifiedLabelScope {
@@ -19,6 +21,7 @@ pub struct VerifiedLabelScope {
     labels: LabelScope,
     receipt_namespace: [u8; 32],
     expires_at: Timestamp,
+    protected_reads: bool,
 }
 
 impl VerifiedLabelScope {
@@ -68,12 +71,15 @@ impl VerifiedLabelScope {
             },
             receipt_namespace: hash.finalize().into(),
             expires_at,
+            protected_reads: claim.protected_reads,
         })
     }
 
     pub fn labels(&self) -> &LabelScope {
         &self.labels
     }
+
+    pub fn permits_protected_reads(&self) -> bool { self.protected_reads }
 
     pub fn receipt_namespace(&self) -> [u8; 32] {
         self.receipt_namespace

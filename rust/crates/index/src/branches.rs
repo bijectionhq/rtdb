@@ -16,7 +16,9 @@ mod custody;
 mod custody_placement;
 mod custody_release;
 mod custody_transfer;
+mod scoped_hold;
 mod visibility;
+pub use scoped_hold::{ScopedHold, ScopedHoldCommand};
 pub use custody::{CustodyGroupId, CustodyInventory, CustodyPayload};
 pub use custody_placement::{CustodyOccurrence, CustodyPlacementEntry, CustodyReservation, CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, ReviewedCustodyReservation};
 pub use custody_release::{CustodyCarrierAuthority, CustodyRelease, CustodyReleasePhase, CustodyReleaseRegistration, CustodyResponseAdmission, CustodyResponsePart};
@@ -190,6 +192,7 @@ pub enum BranchEffect {
     ActivateDerivedCustodyOccurrence { group: CustodyGroupId, occurrence: CustodyOccurrence, reservation: DerivedCustodyReservation },
     CustodyRelease(CustodyRelease),
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
+    ScopedHold { command: ScopedHoldCommand, observed_at: Timestamp },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,6 +224,8 @@ struct BranchRows {
     erased: Map<EntityId, Basis>,
     #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
     retired_labels: Map<EntityId, Arc<BTreeMap<usize, custody::RetiredLabel>>>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    visibility_erasures: Map<EntityId, Arc<Vec<visibility::VisibilityErasure>>>,
 }
 
 impl BranchData {
@@ -257,6 +262,8 @@ pub struct BranchIndex {
     latest_custody_revocation: Option<Basis>,
     #[serde(default, skip_serializing_if = "imbl::OrdSet::is_empty")]
     used_custody_placements: imbl::OrdSet<CustodyPlacementId>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    scoped_holds: Map<([u8; 32], [u8; 16]), ScopedHold>,
     changed_catalog: Option<Basis>,
     erased: Option<Basis>,
     #[serde(skip)]
@@ -282,7 +289,7 @@ impl BranchIndex {
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
             catalog: Map::new(), classic_iids: Map::new(), custody: Map::new(), latest_custody_revocation: None,
             custody_transfers: Map::new(), inherited_custody: None,
-            changed_catalog: None, erased: None, writes: Arc::default(),
+            scoped_holds: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
             visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
         }
     }
@@ -328,6 +335,7 @@ impl BranchIndex {
         }
 
         let mut retained = self.clone();
+        retained.scoped_holds.clear();
         retained.head = head;
         retained.writes = Arc::default();
         retained.times = self.times.range(..=at.position()).map(|(&position, &time)| (position, time)).collect();
@@ -363,6 +371,7 @@ impl BranchIndex {
         self.erased = self.erased.map(rebase);
         self.changed_catalog = self.changed_catalog.map(rebase);
         self.writes = Arc::default();
+        self.scoped_holds.clear();
         for table in self.catalog.keys().cloned().collect::<Vec<_>>() {
             let definitions = self.catalog.get_mut(&table).expect("listed table");
             for (written, _) in Arc::make_mut(definitions) {
@@ -379,6 +388,12 @@ impl BranchIndex {
             for table in branch.tables.keys().cloned().collect::<Vec<_>>() {
                 let rows = Arc::make_mut(branch.tables.get_mut(&table).expect("listed branch table"));
                 rows.erased = rows.erased.iter().map(|(id, &written)| (id.clone(), rebase(written))).collect();
+                for id in rows.visibility_erasures.keys().cloned().collect::<Vec<_>>() {
+                    let history = rows.visibility_erasures.get_mut(&id).expect("listed erased entity");
+                    for erasure in Arc::make_mut(history) {
+                        erasure.rebase(rebase);
+                    }
+                }
                 for id in rows.events.keys().cloned().collect::<Vec<_>>() {
                     let events = rows.events.get_mut(&id).expect("listed entity");
                     for (_, event) in Arc::make_mut(events) {
@@ -729,6 +744,9 @@ impl BranchIndex {
                     .filter(|name| branch.as_ref().is_none_or(|branch| branch == *name))
                     .cloned().collect::<Vec<_>>();
                 for name in names {
+                    if name == MAIN_BRANCH && !self.visibility_projection {
+                        self.record_visibility_erasure(&table, &id, basis);
+                    }
                     let data = Arc::make_mut(self.branches.get_mut(&name).expect("listed branch"));
                     let rows = Arc::make_mut(data.tables.entry(table.clone()).or_default());
                     rows.events.remove(&id);
@@ -753,6 +771,7 @@ impl BranchIndex {
             }
             BranchEffect::CustodyRelease(release) => self.apply_custody_release(release)?,
             BranchEffect::NativeCustodyTransfer { custody, destination } => self.apply_native_custody_transfer(custody, destination)?,
+            BranchEffect::ScopedHold { command, observed_at } => self.apply_scoped_hold(command, observed_at),
         }
         Ok(())
     }
@@ -798,6 +817,7 @@ impl BranchRows {
             // The export admission already excluded cuts preceding an erasure.
             erased: self.erased.clone(),
             retired_labels: self.retired_labels.clone(),
+            visibility_erasures: self.visibility_erasures.clone(),
         }
     }
 }

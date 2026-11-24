@@ -131,7 +131,7 @@ impl MultiFollower {
             let snapshot = rtdb_query::branch_snapshot(&view, &self.serving.memory)?;
             Ok((QueryView {
                 snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
-                custody_contributors: Some(BTreeSet::new()), key_generation: Some(generation),
+                custody_contributors: Some(BTreeSet::new()), scoped_source_basis: None, key_generation: Some(generation),
             }, progress))
         }).await.ok_or_else(interrupted)?
     }
@@ -548,6 +548,7 @@ impl ServingDriver for MultiServing {
                     claim,
                     custody_groups,
                     custody_contributors,
+                    scoped_source_basis: None,
                     key_generation: Some(generation),
                 })
             })
@@ -591,6 +592,7 @@ impl ServingDriver for MultiServing {
                 claim: None,
                 custody_groups: BTreeSet::new(),
                 custody_contributors: Some(BTreeSet::new()),
+                scoped_source_basis: None,
                 key_generation: Some(generation),
             })
         }).await.ok_or_else(interrupted)?
@@ -875,6 +877,7 @@ fn changes_page(
     };
     Ok(ChangePage {
             read_custody: None,
+        scoped_custody: None,
         groups: page,
         through: Basis::new(incarnation, through),
         complete: next.is_none() && until.is_none_or(|until| until <= history.through),
@@ -1250,7 +1253,7 @@ mod tests {
         };
         let scope = ServingScope {
             labels: LabelScope { read: BTreeSet::from([vec![1]]), write: BTreeSet::from([vec![1]]) },
-            receipt_namespace: [7; 32],
+            receipt_namespace: [7; 32], custody_evidence: false, hold: None,
         };
         let receipt = driver.transact_scoped(labelled(2, 1, 1), scope.clone(), &cancel).await.unwrap();
         assert_eq!(receipt.outcome, Outcome::Then);

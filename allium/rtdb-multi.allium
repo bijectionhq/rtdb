@@ -3921,6 +3921,20 @@ surface ScopedRowVisibility {
         -- This property holds for successful calls at corresponding admitted prefixes and a common valid-time observation.
         -- Explicit guard outcomes, resource use and service latency have their own contracts.
 
+    @guarantee ProjectedRetention
+        -- The writer orders a bounded lease for a selected projected cut and a clear publication row at its fixed valid observation.
+        -- The lease belongs to its verified issuing scope and database incarnation.
+        -- Both serving layouts retain the projected cut in the native recoverable history until exclusive expiry, release or applicable erasure.
+        -- A hidden-only erasure preserves the visible effect sequence and previously issued projected coordinates.
+        -- An erasure affecting retained visible history closes that exact view and redacts its historical images.
+
+    @guarantee ScopedProtectedRelease
+        -- The issuer separately authorizes scoped protected reads.
+        -- A protected Query or Changes page captures provenance from the same projected input and returns an opaque complete proof, including when its contributor set is empty.
+        -- Only the checked Original owner resolves the proof into exact enrolled occurrences and native receipts.
+        -- An application response selects its exact promoted registrations and frame through the checked Original provider.
+        -- The original writer orders nonempty response admission and retains each occurrence in the drain through a positive terminal.
+
     @guarantee ScopedWrites
         -- The transaction resolver enforces the write scope and any SingleLabelPerTx declaration in both modes.
         -- dev/doc/tx.allium defines label checks, claim validation and guard outcomes.

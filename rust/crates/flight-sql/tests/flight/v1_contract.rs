@@ -1382,6 +1382,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
         Ok(rtdb_node::serving::QueryView {
             custody_groups: Default::default(),
             custody_contributors: None,
+            scoped_source_basis: None,
             key_generation: None,
             snapshot: rtdb_query::branch_snapshot(&view, &self.memory)?,
             cut: view.cut(),
@@ -1451,6 +1452,7 @@ impl rtdb_node::serving::ServingDriver for AppliedFixture {
         }
         Ok(ChangePage {
             read_custody: None,
+            scoped_custody: None,
             groups: vec![ChangeGroup {
                 cut,
                 rows: vec![ChangeRow {

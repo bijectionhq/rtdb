@@ -345,6 +345,8 @@ impl Peer {
                         scope.map(|scope| ServingScope {
                             labels: scope.labels,
                             receipt_namespace: scope.namespace,
+                            custody_evidence: false,
+                            hold: None,
                         }),
                     )
                     .await

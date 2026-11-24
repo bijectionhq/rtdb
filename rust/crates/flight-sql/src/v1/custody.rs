@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use rtdb_crypt::tokens::CustodyReadProof;
 use rtdb_node::{
@@ -7,7 +7,7 @@ use rtdb_node::{
     serving::custody_release::{
         CustodyCarrierAuthority, CustodyContributors, CustodyProviderInstallation,
         CustodyProviderMount, CustodyReleasePhase, CustodyReleaseRegistration,
-        CustodyResponseAdmission, CustodyResponseOwner,
+        CustodyResponseAdmission, CustodyResponseOwner, CustodyResponsePart,
     },
 };
 use rtdb_tx::transact::{CustodyGroupId, CustodyOccurrence, Op, Outcome, Transact};
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tonic::Status;
+use uuid::Uuid;
 
 use super::{error, proto};
 use crate::service::{Call, Service};
@@ -23,6 +24,60 @@ use crate::service::{Call, Service};
 pub(crate) const RELEASE: &str = "rtdb.custody.v1.Release";
 const MAX_RELEASE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_READ_PROOFS: usize = 8;
+const MAX_SCOPED_READS: usize = 1024;
+const MAX_SCOPED_READ_MICROS: i64 = 120_000_000;
+pub(super) const SCOPED_CUSTODY: &str = "row-visibility.custody-release";
+
+#[derive(Default)]
+pub(super) struct ScopedReads(Mutex<HashMap<Uuid, ScopedRead>>);
+
+#[derive(Clone)]
+struct ScopedRead {
+    owner: [u8; 32],
+    scope: [u8; 32],
+    projected: Basis,
+    source: Basis,
+    generation: Option<u64>,
+    expires_at: Timestamp,
+    contributors: CustodyContributors,
+}
+
+impl ScopedReads {
+    async fn register(&self, now: Timestamp, read: ScopedRead) -> Result<Vec<u8>, Status> {
+        let mut reads = self.0.lock().await;
+        reads.retain(|_, read| read.expires_at > now);
+        if reads.len() >= MAX_SCOPED_READS {
+            return Err(Status::resource_exhausted("The scoped custody read limit is reached"));
+        }
+        let handle = Uuid::new_v4();
+        reads.insert(handle, read);
+        Ok(handle.as_bytes().to_vec())
+    }
+
+    async fn resolve(&self, now: Timestamp, owner: [u8; 32], proofs: &[Vec<u8>]) -> Result<ScopedRead, Status> {
+        if !(1..=MAX_READ_PROOFS).contains(&proofs.len()) {
+            return Err(unavailable());
+        }
+        let reads = self.0.lock().await;
+        let get = |proof: &[u8]| {
+            Uuid::from_slice(proof).ok().and_then(|handle| reads.get(&handle))
+                .filter(|read| read.owner == owner && read.expires_at > now)
+                .ok_or_else(unavailable)
+        };
+        let mut selected = get(&proofs[0])?.clone();
+        for proof in &proofs[1..] {
+            let read = get(proof)?;
+            if (read.scope, read.projected, read.generation) != (selected.scope, selected.projected, selected.generation) {
+                return Err(unavailable());
+            }
+            selected.source = selected.source.max(read.source);
+            selected.expires_at = selected.expires_at.min(read.expires_at);
+            selected.contributors.extend(&read.contributors);
+            if selected.contributors.len() > 512 { return Err(unavailable()); }
+        }
+        Ok(selected)
+    }
+}
 
 pub struct CustodyProviderRoute {
     installation: CustodyProviderInstallation,
@@ -120,6 +175,9 @@ enum Request {
     },
     Check(ResponseRequest),
     Admit(ResponseRequest),
+    ResolveScoped { read_proofs: Vec<Vec<u8>> },
+    CheckScoped(ScopedResponseRequest),
+    AdmitScoped(ScopedResponseRequest),
     Cancel {
         registration: CustodyReleaseRegistration,
     },
@@ -142,6 +200,24 @@ struct ResponseRequest {
     read_proofs: Vec<Vec<u8>>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopedResponseRequest {
+    part: CustodyResponsePart,
+    frame_sha256: [u8; 32],
+    read_proofs: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+struct OriginalContributor {
+    group: [u8; 16],
+    original: [u8; 32],
+    occurrence: [u8; 32],
+    receipt_key: Vec<u8>,
+    written_basis: Vec<u8>,
+    system_time_micros: i64,
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum Reply {
@@ -155,6 +231,8 @@ enum Reply {
         state: &'static str,
         basis: Vec<u8>,
     },
+    ScopedAdmission { state: &'static str },
+    ResolvedScoped { contributors: Vec<OriginalContributor> },
     Cancelled {
         state: &'static str,
     },
@@ -330,6 +408,68 @@ impl Service {
         self.check_attachment(call, database)
     }
 
+    pub(super) fn authorize_scoped_custody(&self, call: &Call) -> Result<&CustodyProviderRoute, Status> {
+        let caller = &call.session.caller;
+        if !caller.verified_credential
+            || !caller.principal.label_scope().is_some_and(|scope| scope.permits_protected_reads())
+        {
+            return Err(Status::permission_denied("The scope does not authorize protected reads"));
+        }
+        self.0.config.custody_providers.get(&call.database).map(Arc::as_ref).ok_or_else(unavailable)
+    }
+
+    pub(super) async fn scoped_custody_read(
+        &self, call: &Call, database: &Arc<Database>, projected: Basis, source: Basis,
+        generation: Option<u64>, contributors: CustodyContributors,
+    ) -> Result<Vec<u8>, Status> {
+        let route = self.authorize_scoped_custody(call)?;
+        let scope = call.session.caller.principal.label_scope().ok_or_else(unavailable)?;
+        let owner = route.acquire(self, call, database).await.map_err(|_| unavailable())?;
+        let release = owner.response_release(&SystemClock, &call.cancellation).map_err(|_| unavailable())?;
+        release.require_original_writer().await.map_err(|_| unavailable())?;
+        if source.incarnation() != route.installation.authority.incarnation
+            || projected.incarnation() != scope.labels().main_read_incarnation(source.incarnation())
+            || !contributors.is_empty() && generation.is_none()
+        {
+            return Err(unavailable());
+        }
+        let now = self.0.node.now();
+        let expires_at = now.0.checked_add(MAX_SCOPED_READ_MICROS).map(Timestamp).ok_or_else(unavailable)?;
+        let read = ScopedRead {
+            owner: route.proof_owner(&owner), scope: scope.receipt_namespace(), projected, source,
+            generation, expires_at, contributors,
+        };
+        if !read.contributors.is_empty() {
+            self.resolve_scoped_contributors(call, database, &read).await.map_err(|_| unavailable())?;
+        }
+        self.0.v1.scoped_reads.register(now, read).await
+    }
+
+    async fn resolve_scoped_contributors(
+        &self, call: &Call, database: &Database, read: &ScopedRead,
+    ) -> Result<Vec<OriginalContributor>, Status> {
+        let driver = database.serving_driver().ok_or_else(unavailable)?;
+        let index = driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+        let mut resolved = Vec::with_capacity(read.contributors.len());
+        for &(group, commitment) in &read.contributors {
+            let (original, occurrence) = index.custody_read_occurrence(read.source, group, commitment)
+                .map_err(error::anomaly)?;
+            let written = index.exact(occurrence.written).map_err(error::anomaly)?;
+            let receipt = driver.original_custody_receipt(&occurrence.receipt_key, occurrence.written, &call.cancellation)
+                .await.map_err(error::anomaly)?;
+            if receipt.key != occurrence.receipt_key || receipt.basis != written.basis
+                || receipt.system_time != written.system_time || matches!(receipt.outcome, Outcome::Refused { .. })
+            {
+                return Err(unavailable());
+            }
+            resolved.push(OriginalContributor {
+                group, original, occurrence: commitment, receipt_key: receipt.key,
+                written_basis: receipt.basis.to_bytes().to_vec(), system_time_micros: receipt.system_time.0,
+            });
+        }
+        Ok(resolved)
+    }
+
     pub(super) async fn custody_release_action(
         &self,
         call: &Call,
@@ -350,7 +490,7 @@ impl Service {
             .response_release(&SystemClock, &call.cancellation)
             .map_err(error::anomaly)?;
         let release = mounted.release();
-        let admit = matches!(&request, Request::Admit(_));
+        let admit = matches!(&request, Request::Admit(_) | Request::AdmitScoped(_));
         let reply = match request {
             Request::Prepare { registration } => Reply::Prepared {
                 registration: release
@@ -421,6 +561,42 @@ impl Service {
                         .await
                         .map_err(error::anomaly)?;
                     Reply::Ack { ok: true }
+                }
+            }
+            Request::ResolveScoped { read_proofs } => {
+                mounted.require_original_writer().await.map_err(error::anomaly)?;
+                let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
+                Reply::ResolvedScoped { contributors: self.resolve_scoped_contributors(call, &database, &read).await? }
+            }
+            Request::CheckScoped(ScopedResponseRequest { part, frame_sha256, read_proofs })
+            | Request::AdmitScoped(ScopedResponseRequest { part, frame_sha256, read_proofs }) => {
+                if frame_sha256 == [0; 32] { return Err(unavailable()); }
+                let read = self.0.v1.scoped_reads.resolve(self.0.node.now(), route.proof_owner(&owner), &read_proofs).await?;
+                let proof_commitment = read_proofs_commitment(&read_proofs);
+                if read.contributors.is_empty() {
+                    mounted.check_clear_response(part, frame_sha256, proof_commitment, read.expires_at)
+                        .await.map_err(error::anomaly)?;
+                    Reply::ScopedAdmission { state: "clear" }
+                } else {
+                    let index = release.driver.current_custody(&call.cancellation).await.map_err(error::anomaly)?;
+                    let registrations = index.promoted_custody_registrations(route.installation.authority, part, &read.contributors)
+                        .map_err(error::anomaly)?;
+                    if registrations.iter().any(|registration| registration.expires_at > read.expires_at) {
+                        return Err(unavailable());
+                    }
+                    let admission = CustodyResponseAdmission {
+                        registrations, frame_sha256, selected_basis: read.source,
+                        key_generation: read.generation.ok_or_else(unavailable)?,
+                        read_proofs_sha256: Some(proof_commitment),
+                    };
+                    if admit {
+                        let receipt = mounted.admit_registered_response(&read.contributors, admission)
+                            .await.map_err(error::anomaly)?;
+                        Reply::ScopedAdmission { state: if receipt.replayed { "recorded" } else { "admitted" } }
+                    } else {
+                        mounted.check_registered_response(&read.contributors, &admission).await.map_err(error::anomaly)?;
+                        Reply::Ack { ok: true }
+                    }
                 }
             }
             Request::Cancel { registration } => {
@@ -519,6 +695,25 @@ async fn confirmed_occurrence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_proof_is_opaque_and_binds_mount_scope_and_expiry() {
+        let reads = ScopedReads::default();
+        let read = ScopedRead {
+            owner: [1; 32], scope: [2; 32], projected: Basis::new([3; 16], 1),
+            source: Basis::new([4; 16], 900), generation: Some(700), expires_at: Timestamp(50),
+            contributors: CustodyContributors::new(),
+        };
+        let first = reads.register(Timestamp(10), read.clone()).await.unwrap();
+        let other_scope = reads.register(Timestamp(10), ScopedRead { scope: [5; 32], ..read }).await.unwrap();
+        assert_eq!(first.len(), 16);
+        assert_ne!(first, other_scope);
+        let resolved = reads.resolve(Timestamp(49), [1; 32], std::slice::from_ref(&first)).await.unwrap();
+        assert!(resolved.contributors.is_empty());
+        assert!(reads.resolve(Timestamp(49), [8; 32], std::slice::from_ref(&first)).await.is_err());
+        assert!(reads.resolve(Timestamp(50), [1; 32], std::slice::from_ref(&first)).await.is_err());
+        assert!(reads.resolve(Timestamp(49), [1; 32], &[first, other_scope]).await.is_err());
+    }
 
     #[test]
     fn custody_admit_has_a_distinct_operation_and_reply() {

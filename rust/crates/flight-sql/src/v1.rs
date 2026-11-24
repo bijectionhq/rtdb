@@ -19,6 +19,7 @@ mod changes;
 pub(crate) mod custody;
 pub(crate) mod error;
 mod query;
+mod scoped_hold;
 mod tokens;
 mod transact;
 mod workload;
@@ -44,6 +45,7 @@ pub(crate) const ACTIONS: [&str; 4] = [
 #[derive(Default)]
 pub(crate) struct State {
     plans: query::PlanCache,
+    scoped_reads: custody::ScopedReads,
 }
 
 pub(crate) enum Ticket {
@@ -61,7 +63,7 @@ pub(crate) fn ticket(bytes: &Bytes) -> Option<Ticket> {
 }
 
 pub(crate) fn is_action(name: &str) -> bool {
-    ACTIONS.contains(&name) || name == custody::RELEASE || name.starts_with("rtdb.admin.v1.")
+    ACTIONS.contains(&name) || name == custody::RELEASE || name == scoped_hold::ACTION || name.starts_with("rtdb.admin.v1.")
 }
 
 fn decode<M: Message + Default + Name>(bytes: Bytes) -> Result<M, Status> {
@@ -176,6 +178,12 @@ impl Service {
                     features.retain(|feature| admitted && matches!(feature.as_str(), ROW_VISIBILITY | "query" |
                         "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" |
                         TIMED_TRANSACT | TRANSACT_REQUIRES | PHYSICAL_ERASURE | rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS | "tx-status" | "sql.history"));
+                    if admitted && features.iter().any(|feature| feature == "transact") {
+                        features.push(scoped_hold::FEATURE.into());
+                    }
+                    if admitted && self.authorize_scoped_custody(&call).is_ok() {
+                        features.push(custody::SCOPED_CUSTODY.into());
+                    }
                 }
                 proto::CapabilitiesResponse {
                     api: API.into(),
@@ -191,6 +199,7 @@ impl Service {
                 }
                 .encode_to_vec()
             }),
+            scoped_hold::ACTION => self.scoped_hold_action(&call, &action.body).await,
             custody::RELEASE => self.custody_release_action(&call, &action.body).await,
             "rtdb.v1.Transact" => self.v1_transact(&call, action.body).await,
             MANAGED_WORKLOAD => self.managed_workload_action(&call, action.body).await,
@@ -344,7 +353,7 @@ impl Service {
         scope.admit(&call.database, driver.incarnation()).map_err(error::anomaly)?;
         scope.revalidate(self.0.node.now()).map_err(error::anomaly)?;
         if !driver.supports_row_visibility() { return Err(error::unsupported(ROW_VISIBILITY)); }
-        Ok(Some(ServingScope { labels: scope.labels().clone(), receipt_namespace: scope.receipt_namespace() }))
+        Ok(Some(ServingScope { labels: scope.labels().clone(), receipt_namespace: scope.receipt_namespace(), custody_evidence: false, hold: None }))
     }
 
     fn scoped_wire_context(&self, call: &Call, snapshot: DatabaseSnapshot, clock: Timestamp) -> Result<Arc<QueryContext>, Status> {

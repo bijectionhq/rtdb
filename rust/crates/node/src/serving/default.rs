@@ -91,7 +91,7 @@ impl DefaultServing {
             }
             let (snapshot, cut) = self.handle.classic_read(source.at, cancellation).await?;
             let snapshot = rtdb_query::retain_catalog_snapshot(snapshot, &self.storage).await?;
-            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(), custody_contributors: None, key_generation: None });
+            return Ok(QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(), custody_contributors: None, scoped_source_basis: None, key_generation: None });
         }
         let snapshot = self.handle.view(source.at, cancellation).await?;
         let at = if source.at == At::Linearizable { At::Latest } else { source.at };
@@ -127,7 +127,7 @@ impl DefaultServing {
             }
             None => snapshot,
         };
-        Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, key_generation })
+        Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, scoped_source_basis: None, key_generation })
     }
 }
 
@@ -183,7 +183,7 @@ impl ServingDriver for DefaultServing {
         let catalog_cut = physical.catalog_cut().ok_or_else(ranked_ivf::uncovered)?;
         let snapshot = rtdb_query::retain_catalog_snapshot(physical, &self.storage).await?;
         let view = QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
-            custody_contributors: Some(BTreeSet::new()), key_generation: selected.key_generation };
+            custody_contributors: Some(BTreeSet::new()), scoped_source_basis: None, key_generation: selected.key_generation };
         let catalog = ranked_ivf::Catalog { target: target.clone(), declaration: declaration.clone(),
             physical: catalog_cut, storage: Arc::clone(&self.storage), mounted: false };
         Ok((view, catalog))
@@ -399,5 +399,5 @@ fn change_page(view: &NativeServingView, request: &Changes, after: Basis, now: T
         }
         Ok(ChangeGroup { cut: *cut, rows })
     }).collect::<Result<_>>()?;
-    Ok(ChangePage { read_custody: None, groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new(), key_generation: None })
+    Ok(ChangePage { read_custody: None, scoped_custody: None, groups, through, complete: !more && request.until.is_none_or(|until| until <= head), custody_groups: BTreeSet::new(), key_generation: None })
 }

@@ -8,7 +8,7 @@ pub use rtdb_index::branches::{
     CountRange, CustodyGroupId, CustodyOccurrence, CustodyPayload, CustodyRelease, CustodyReservation, CustodyResponseAdmission,
     CustodyPlacementId, CustodyReview, CustodyTarget, DerivedCustodyReservation, GroupedCount, IndexDefinition,
     ReviewedCustodyReservation, Visibility,
-    RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind,
+    RankedIndexDeclaration, RankedIndexDefinition, RankedIndexKind, ScopedHoldCommand,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, ReplicaPosition, Result, SourcePosition, StructFields, TableRef,
@@ -121,6 +121,18 @@ impl Transact {
         }
     }
 
+    pub fn scoped_hold(command: ScopedHoldCommand) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb/v1/projected-hold\0");
+        hash.update(command.id());
+        hash.update([u8::from(matches!(&command, ScopedHoldCommand::Release { .. }))]);
+        Self {
+            key: hash.finalize().to_vec(), require: Vec::new(), window: Window::default(), guards: Vec::new(),
+            ops: vec![Op::ScopedHold(command)], otherwise: Vec::new(), requires: Vec::new(),
+            custody_request_digest: None, request_memory: None,
+        }
+    }
+
     pub fn require_sealed_custody(&self, features: &[&str]) -> Result<()> {
         if !self.has_unsealed_custody() { return Ok(()); }
         Err(if features.contains(&ROW_CUSTODY) {
@@ -226,6 +238,11 @@ pub enum Op {
     AdmitCustodyResponse(CustodyResponseAdmission),
     #[serde(skip_deserializing)]
     NativeCustodyTransfer { custody: NativeCheckpointCustody, destination: Option<Basis> },
+    ScopedHold(ScopedHoldCommand),
+}
+
+fn invalid_scoped_hold() -> Anomaly {
+    Anomaly::incorrect("rtdb/scoped-hold", "Projected retention requires the exact verified scope")
 }
 
 fn native_custody_key(custody: &NativeCheckpointCustody, installed: bool) -> Vec<u8> {
@@ -784,6 +801,16 @@ impl TransactState {
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         view.index.require_local_custody()?;
         validate_key(&request.key)?;
+        let hold = if request.ops.iter().chain(&request.otherwise).any(|op| matches!(op, Op::ScopedHold(_))) {
+            let [Op::ScopedHold(command)] = request.ops.as_slice() else { return Err(invalid_scoped_hold()); };
+            if authority.is_none_or(|authority| authority.receipt_namespace != command.owner())
+                || workload.is_some() || request.canonical_request()?.get() != Transact::scoped_hold(command.clone()).canonical_request()?.get()
+                || request.custody_request_digest.is_some()
+            {
+                return Err(invalid_scoped_hold());
+            }
+            Some(command)
+        } else { None };
         let receipt_namespace = request.receipt_namespace(
             workload.map(|admission| admission.namespace).or(authority.map(|authority| authority.receipt_namespace))
         );
@@ -853,7 +880,14 @@ impl TransactState {
         let decision_time = now.max(cut.system_time);
         let advanced = base.clone();
         let scope = authority.map(|authority| authority.labels);
-        let result = if let Some(outcome) = workload.and_then(workload::Admission::settlement) {
+        let result = if let Some(command) = hold {
+            let labels = scope.ok_or_else(invalid_scoped_hold)?;
+            base.check_scoped_hold(command, labels, now).and_then(|()| {
+                let effect = BranchEffect::ScopedHold { command: command.clone(), observed_at: now };
+                base.apply(effect.clone())?;
+                Ok((Outcome::Then, vec![effect], base))
+            })
+        } else if let Some(outcome) = workload.and_then(workload::Admission::settlement) {
             Ok((outcome, Vec::new(), base))
         } else if workload.is_some() && before.is_some_and(|deadline| decision_time >= deadline) {
             return Err(workload::denied());

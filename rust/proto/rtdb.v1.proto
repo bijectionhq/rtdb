@@ -63,7 +63,7 @@ message QueryRequest {
   Page page = 5;
   // Ask for an authenticated receiver sample on the first page of this read.
   bool observe_receiver_clock = 6;
-  // Request a custody proof on the configured original owner route.
+  // Request a custody proof on the Original owner route or the protected scoped route.
   bool custody_release_evidence = 7;
   // Require a tracked exact cut whose full applied branch view is proved clear.
   bool require_clear_rank_input = 8;
@@ -75,6 +75,8 @@ message QueryRequest {
   // Execute a bounded rank on a proved native IVF generation. Requires tracked,
   // clear, exact merged main; SQL, params_ipc, Page and field 10 are absent.
   RankedIvf ranked_ivf = 11;
+  // Reopen the held projected Exactly basis at its original valid observation.
+  optional bytes scoped_hold = 12;
   // Select reviewed occurrences from this same exact merged custody Query.
   CustodyReviewSelection custody_review = 13;
 }
@@ -121,6 +123,7 @@ message QueryTrailer {
   Claim claim = 3;
   optional bytes next = 4;
   ReceiverClockObservation receiver_clock = 5;
+  // On a scoped route this is an opaque handle available only to the Original.
   optional bytes custody_release_proof = 6;
   // Present only on the authenticated Original owner's proof route. The
   // sealed proof and this inventory cover the same complete contributor set.
@@ -529,6 +532,7 @@ message ChangesRequest {
   // Append the native applied_position to each row on an unscoped route.
   // Positions are comparable within the issuing database incarnation and branch.
   bool observe_applied_positions = 10;
+  bool custody_release_evidence = 11;
 }
 message ChangesTrailer {
   // For ascending pages this is the next exclusive lower bound.
@@ -536,6 +540,7 @@ message ChangesTrailer {
   Basis through = 1;
   // The requested interval is covered, up to the captured head when until is absent.
   bool complete = 2;
+  optional bytes custody_release_proof = 3;
 }
 message ChangesFrame {
   oneof frame {

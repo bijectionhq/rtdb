@@ -303,3 +303,36 @@ Qualify `native_checkpoint_keeps_original_occurrences_and_fences_reads_until_the
 At the installed boundary, lose replies after the source pin, destination append, reverse-vault terminal and source unpin, and recover the same terminal from trimmed history.
 Exercise multiple original families and ranked derivatives, an unknown group or missing source carrier, a substituted row slot, wrong source and destination incarnations, a changed reservation Basis, and a concurrent fence of each contributing family.
 Rotate the destination generation between protected opening and delivery, and verify that late replies cannot admit a send, that settled send evidence survives restart, and that ordinary export and unpin cannot bypass the managed fence.
+
+## Scoped v1 reads and exact holds
+
+The credential issuer may include `protected_reads: true` inside `rtdb_label_scope`.
+On the configured Original attachment, `row-visibility.custody-release` allows `custody_release_evidence` in Query and Changes.
+The trailer carries a single opaque `custody_release_proof` for the same projected input, including a complete empty inventory.
+A scoped Query trailer omits `custody_release_inventory`.
+A Query conservatively captures the complete protected history of the scoped input view before SQL evaluation and pagination.
+Changes captures only the selected, live before and after images in the page.
+The handles are local to the serving attachment and expire within 120 seconds.
+
+Only the configured Original owner may call `rtdb.custody.v1.Release` with the scoped operations.
+Send `resolve_scoped` with `read_proofs` to check and recover the actual Original contributor registrations' coordinates.
+The Original registers and promotes those occurrences through its existing receipt checks and binds the exact transport frame and opaque proof list to its independent response registry.
+Send `check_scoped` or `admit_scoped` with `part`, `frame_sha256` and `read_proofs`.
+RTDB reads the exact promoted registrations and verifies the Original registry, current writer, selected generation and group fences before ordering admission.
+A fresh `admitted` permits the same one-use transport reservation and cutoff as the unscoped action.
+`recorded` is recovery evidence.
+`clear` confirms an empty contributor inventory against the Original registry.
+The Original still uses its exact authenticated disposal and drain operations when the transport closes a protected reservation.
+
+A scoped client can negotiate `row-visibility.exact-hold` and use the JSON Flight action `rtdb.v1.ScopedHold`.
+`retain` takes `hold_id` as 16 random bytes, `basis` as 24 projected Basis bytes, `valid_at_micros`, `expires_at_micros`, and `publication` containing `table`, `row_id` and `written_basis`.
+Use a qualified table, canonical entity handle and scoped written Basis for the clear publication row seen at that observation.
+`reopen` and `release` take the same `hold_id`.
+Retain and reopen return the hold ID, projected Basis and original valid observation and expiry.
+Send the same hold ID in Query field 12, `scoped_hold`, with that projected Exactly basis to fix the valid observation across queries and pages.
+The lease is exclusive at expiry, has a maximum duration of one hour and is charged to the verified scope and database.
+Database and scope protection can close the lease early when the retained visible history is erased.
+
+Before enabling a Bijection consumer, qualify the paired wire and Original provider in both serving modes.
+Existing checkpoints that already erased labelled history without projection metadata cannot reconstruct that history from the clean fold.
+Application funded-offer admission, cross-incarnation projected continuation, and hosted consumers with a separate Original provider attachment need their own evidence and qualification.

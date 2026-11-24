@@ -20,6 +20,7 @@ pub(crate) mod default;
 pub mod ranked_ivf;
 mod visibility;
 pub use visibility::{ServingScope, ROW_VISIBILITY};
+pub use rtdb_index::branches::ScopedHold;
 
 #[derive(Clone)]
 pub struct QuerySource {
@@ -39,6 +40,7 @@ pub struct QueryView {
     pub claim: Option<Claim>,
     pub custody_groups: BTreeSet<CustodyGroupId>,
     pub custody_contributors: Option<custody_release::CustodyContributors>,
+    pub scoped_source_basis: Option<Basis>,
     pub key_generation: Option<u64>,
 }
 
@@ -71,6 +73,7 @@ pub struct Changes {
 
 pub struct ChangePage {
     pub read_custody: Option<Arc<rtdb_replication::LocalErasureRead>>,
+    pub scoped_custody: Option<(Basis, custody_release::CustodyContributors)>,
     pub groups: Vec<ChangeGroup>,
     pub through: Basis,
     pub complete: bool,

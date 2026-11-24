@@ -139,6 +139,39 @@ fn declare_visibility() -> Op {
 }
 
 #[test]
+fn projected_hold_reopens_same_publication_after_checkpoint_and_hidden_write() {
+    use rtdb_index::branches::ScopedHold;
+
+    let mut state = TransactState::new(INCARNATION);
+    let labels = LabelScope { read: BTreeSet::from([vec![1]]), ..Default::default() };
+    let owner = [9; 32];
+    let id = [8; 16];
+    let authority = ScopedTransact { labels: &labels, receipt_namespace: owner };
+    commit(&mut state, 1, &request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL)]));
+    let projected = state.index().project_main_visibility(&labels).unwrap().index().head().basis;
+    let hold = ScopedHold {
+        id, owner, basis: projected, valid_at: Timestamp(50), expires_at: Timestamp(120),
+        publication_table: table(), publication_id: EntityId::Integer(1), publication_written: projected,
+    };
+    let request_hold = Transact::scoped_hold(ScopedHoldCommand::Retain(hold.clone()));
+    assert!(state.resolve(&request_hold, 2, Timestamp(20), &[], &claims()).is_err());
+    let Resolution::Append(append) = state.resolve_scoped(&request_hold, 2, Timestamp(20), &[], &claims(), authority).unwrap()
+        else { panic!("the authorized hold must order"); };
+    assert_eq!(apply(&mut state, 2, append.record()).unwrap().outcome, Outcome::Then);
+    commit(&mut state, 3, &request(3, vec![labelled_put(MAIN_BRANCH, 2, 2, Interval::ALL)]));
+    let checkpoint = state.encode_checkpoint().unwrap();
+    let mut state = TransactState::decode_checkpoint(&checkpoint, state.index().head()).unwrap();
+    assert_eq!(state.index().open_scoped_hold(id, owner, &labels, Timestamp(119)).unwrap(), &hold);
+    assert!(state.index().open_scoped_hold(id, [6; 32], &labels, Timestamp(119)).is_err());
+    assert!(state.index().open_scoped_hold(id, owner, &labels, Timestamp(120)).is_err());
+    let release = Transact::scoped_hold(ScopedHoldCommand::Release { id, owner });
+    let Resolution::Append(append) = state.resolve_scoped(&release, 4, Timestamp(40), &[], &claims(), authority).unwrap()
+        else { panic!("the authorized release must order"); };
+    assert_eq!(apply(&mut state, 4, append.record()).unwrap().outcome, Outcome::Then);
+    assert!(state.index().open_scoped_hold(id, owner, &labels, Timestamp(40)).is_err());
+}
+
+#[test]
 fn projected_custody_keeps_issued_bases_and_masks_the_revoked_versions() {
     let public = [21; 16];
     let hidden = [22; 16];

@@ -116,6 +116,21 @@ impl CustodyResponseAdmission {
 }
 
 impl BranchIndex {
+    pub fn promoted_custody_registrations(
+        &self, authority: CustodyCarrierAuthority, part: CustodyResponsePart,
+        contributors: &BTreeSet<(CustodyGroupId, [u8; 32])>,
+    ) -> Result<Vec<CustodyReleaseRegistration>> {
+        contributors.iter().map(|&(group, occurrence)| {
+            let record = self.live_custody(group)?;
+            record.releases.values().find_map(|release| {
+                let registration = release.registration;
+                (release.phase == CustodyReleasePhase::Promoted
+                    && registration.authority == authority && registration.part == part
+                    && registration.occurrence == occurrence).then_some(registration)
+            }).ok_or_else(release_conflict)
+        }).collect()
+    }
+
     pub fn check_custody_response_admission(&self, admission: &CustodyResponseAdmission) -> Result<()> {
         let first = admission.registrations.first().ok_or_else(release_conflict)?;
         if admission.registrations.len() > 512 || admission.frame_sha256 == [0; 32]

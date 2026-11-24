@@ -772,6 +772,9 @@ impl Service {
         if request.observe_applied_positions {
             return Err(call.error(error::unsupported(APPLIED_POSITIONS)));
         }
+        if request.custody_release_evidence {
+            return Err(call.error(error::unsupported(super::custody::SCOPED_CUSTODY)));
+        }
         let (database, page) = self
             .open_change_page(&call, database, request, shared_images)
             .await
@@ -805,7 +808,7 @@ impl Service {
             for reader in page.readers {
                 call.handoff(reader.delivery_grant().await.map_err(error::anomaly)?, cutoff).map_err(error::map_status)?;
             }
-            yield trailer(proto::ChangesTrailer { through: Some(through), complete: page.complete });
+            yield trailer(proto::ChangesTrailer { through: Some(through), complete: page.complete, custody_release_proof: None });
         });
         let mut response = Response::new(stream);
         *response.metadata_mut() = headers;
@@ -909,9 +912,14 @@ impl Service {
     ) -> Result<Response<Output<FlightData>>, Status> {
         let progress_only = request.progress_only;
         let observe_positions = request.observe_applied_positions;
-        let (page, images, context, initial, headers, cutoff) = async {
+        let (page, images, context, initial, headers, cutoff, custody_release_proof) = async {
             let driver = database.serving_driver().expect("checked serving driver");
-            let visibility = self.serving_scope(&call, driver)?;
+            let mut visibility = self.serving_scope(&call, driver)?;
+            if request.custody_release_evidence {
+                self.authorize_scoped_custody(&call)?;
+                visibility.as_mut().ok_or_else(|| error::unsupported(super::custody::SCOPED_CUSTODY))?
+                    .custody_evidence = true;
+            }
             if observe_positions && (
                 !call.session.caller.verified_credential || visibility.is_some()
                     || call.session.audience_source().is_some() || call.session.fresh_replica
@@ -992,17 +1000,20 @@ impl Service {
             } else if let Some(scope) = &visibility {
                 let now = self.0.node.now();
                 let page = driver.changes_scoped(change, scope, &call.cancellation).await.map_err(error::anomaly)?;
-                let source = rtdb_node::serving::QuerySource {
-                    branch: rtdb_types::rtdb_v1::MAIN_BRANCH.into(), at: rtdb_types::rtdb_v1::At::Latest,
-                    layer: rtdb_types::rtdb_v1::Layer::Merged,
-                };
-                let view = driver.query_scoped(source, false, now, scope, &call.cancellation).await.map_err(error::anomaly)?;
-                let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
+                let snapshot = rtdb_query::DatabaseSnapshot { partitions: Vec::new(), storage: Arc::clone(database.storage()) };
                 (page, self.scoped_wire_context(&call, snapshot, now)?.with_plaintext())
             } else {
                 let context = self.wire_context(&call, &database, false).await?.with_plaintext();
                 let page = context.reading(driver.changes(change, &call.cancellation)).await.map_err(error::anomaly)?;
                 (page, context)
+            };
+            let mut page = page;
+            let custody_release_proof = if request.custody_release_evidence {
+                let (source, contributors) = page.scoped_custody.take()
+                    .ok_or_else(|| error::unsupported("complete custody release inventory"))?;
+                Some(self.scoped_custody_read(&call, &database, page.through, source, page.key_generation, contributors).await?)
+            } else {
+                None
             };
             self.check_attachment(&call, &database)?;
             let context = match page.read_custody.clone() {
@@ -1016,7 +1027,7 @@ impl Service {
             let (headers, cutoff) = call
                 .delivery_headers(&initial, true)
                 .map_err(error::map_status)?;
-            Ok((page, images, context, initial, headers, cutoff))
+            Ok((page, images, context, initial, headers, cutoff, custody_release_proof))
         }
         .await
         .map_err(|status| call.error(status))?;
@@ -1081,7 +1092,7 @@ impl Service {
             service.check_query_delivery(&call, &database, page.through, page.key_generation, &page.custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
-            yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete });
+            yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete, custody_release_proof });
         });
         let mut response = Response::new(stream);
         *response.metadata_mut() = headers;

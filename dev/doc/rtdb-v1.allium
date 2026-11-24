@@ -226,7 +226,7 @@ surface StatelessDatabase {
         -- The accepting arm checks the retained reservation receipt and the current writer, source and group inventory, then places the protected main rows and drops the reviewed branch together.
         -- Exact placement and branch catalogue readback at the accepted basis pairs the retained activation with its keyed transaction receipt after branch drop.
         -- Revocation masks the matching occurrences through all retained ancestor views and drains their existing release holds before native key destruction.
-        -- Scoped readers receive no placement or release inventory.
+        -- Scoped readers receive custody evidence as an opaque read handle.
 
     @guarantee ProtectedResponseRelease
         -- The installed original carrier journal authenticates the exact attachment, original writer, response part, admitted occurrence and immutable cutoff.
@@ -238,7 +238,7 @@ surface StatelessDatabase {
         -- An authenticated host mount pins the original writer and provider to the live writable database attachment.
         -- The cross-process provider response authenticates its exact challenge, operation, authority and payload with the configured registry signing key.
         -- The configured original owner may request a sealed read proof bound to its authenticated session, attachment mount, selected basis and key generation.
-        -- The same Query reports each contributor's physical authoring branch, ordinal and exact retained placement receipt, including inherited contributors and dependencies absent from the result.
+        -- The same unscoped Original owner Query reports each contributor's physical authoring branch, ordinal and exact retained placement receipt, including inherited contributors and dependencies absent from the result.
         -- The contributor inventory requires an unambiguous enrolled write and a retained applied receipt at its written basis and clock.
         -- A private release preflight binds the exact proof list, full contributor inventory and frame commitment to the independently observed original response part.
         -- Removing the mount or detaching its database closes new handoffs and preserves already ordered release evidence.
@@ -278,6 +278,20 @@ surface StatelessDatabase {
         -- Default mode and Multi use the same scoped projection for Query, Changes, and transaction receipts.
         -- Changes waits for progress observable by the selected scope or the requested deadline.
         -- Put rows can supply literal signed-microsecond valid-time bounds in _valid_from and _valid_to.
+
+    @guarantee ScopedExactHold
+        -- A route advertising row-visibility.exact-hold accepts the authenticated ScopedHold action.
+        -- Retain positively orders a quota-accounted lease for the projected cut and its clear publication version at the supplied valid instant.
+        -- Query scoped_hold selects the same projected Exactly cut and fixed valid instant on every page.
+        -- Reopen authenticates the issuing scope and checks the exclusive deadline and live retained publication.
+        -- The retain and release transitions persist in both native transaction folds.
+
+    @guarantee ScopedCustodyEvidence
+        -- A protected scoped route advertising row-visibility.custody-release accepts custody_release_evidence on Query and Changes.
+        -- The trailer includes a single opaque proof handle for the captured contributor set, including a complete empty set.
+        -- The checked Original action confirms the private native occurrence receipts and exact registered frame.
+        -- A successful scoped admission response returns only the application response state.
+        -- Positive Original disposal settles promoted registrations independently of the read-proof lifetime.
 
     @guarantee ChangesImages
         -- Changes image columns carry individual Arrow IPC streams by default.

@@ -283,6 +283,7 @@ fn query_view(snapshot: Snapshot, cut: BranchCut, generation: u64) -> QueryView 
         claim: None,
         custody_groups: BTreeSet::new(),
         custody_contributors: Some(BTreeSet::new()),
+        scoped_source_basis: None,
         key_generation: Some(generation),
     }
 }
