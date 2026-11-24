@@ -53,6 +53,16 @@ pub(crate) fn reserve_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> 
 pub(crate) fn batch_bound(batch: &RecordBatch) -> Result<usize, Status> {
     add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)
 }
+
+struct EncodedIpcBytes {
+    bytes: Vec<u8>,
+    _reservation: Arc<std::sync::OnceLock<MemoryReservation>>,
+}
+
+impl AsRef<[u8]> for EncodedIpcBytes {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
 pub(crate) struct Encoder { schema: SchemaRef, _reservation: Arc<MemoryReservation>, dictionaries: DictionaryTracker, compression: CompressionContext }
 impl Encoder {
     pub fn new(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
@@ -73,8 +83,38 @@ impl Encoder {
         self.encode_reserved(batch, charge)
     }
     fn encode_reserved(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
-        let (dictionaries, data) = IpcDataGenerator::default().encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression).map_err(arrow)?;
-        Ok(dictionaries.into_iter().chain(std::iter::once(data)).map(|encoded| { let mut data: FlightData = encoded.into(); data.data_header = retain(data.data_header, Arc::clone(&charge)); data.data_body = retain(data.data_body, Arc::clone(&charge)); data }).collect())
+        use std::{mem::size_of, sync::OnceLock};
+
+        let mut charge = Arc::try_unwrap(charge)
+            .map_err(|_| Status::internal("Flight batch encoding requires an exclusive reservation"))?;
+        let (dictionaries, data) = IpcDataGenerator::default()
+            .encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression)
+            .map_err(arrow)?;
+
+        let reservation = Arc::new(OnceLock::new());
+        let mut frames = Vec::with_capacity(add(dictionaries.len(), 1)?);
+        let bytes_owner = size_of::<EncodedIpcBytes>() + size_of::<usize>();
+        let reservation_owner = size_of::<OnceLock<MemoryReservation>>() + 2 * size_of::<usize>();
+        let mut retained = add(mul(frames.capacity(), size_of::<FlightData>())?, reservation_owner)?;
+        for encoded in dictionaries.into_iter().chain(std::iter::once(data)) {
+            retained = add(retained, add(encoded.ipc_message.capacity(), encoded.arrow_data.capacity())?)?;
+            retained = add(retained, 2 * bytes_owner)?;
+            frames.push(FlightData {
+                data_header: Bytes::from_owner(EncodedIpcBytes {
+                    bytes: encoded.ipc_message,
+                    _reservation: Arc::clone(&reservation),
+                }),
+                data_body: Bytes::from_owner(EncodedIpcBytes {
+                    bytes: encoded.arrow_data,
+                    _reservation: Arc::clone(&reservation),
+                }),
+                ..Default::default()
+            });
+        }
+        charge.shrink_to(retained)
+            .map_err(|_| Status::internal("Flight IPC output exceeds its encoding reservation"))?;
+        reservation.set(charge).expect("Flight IPC output reservation is installed once");
+        Ok(frames)
     }
 }
 struct UploadSchema {
