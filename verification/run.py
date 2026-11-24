@@ -1898,24 +1898,30 @@ def verify_fenced_replica_lean(args, scratch):
         },
         5,
     )
+    package = Path("verification/multi/.lake/packages/logkeeper/verification/111-maintenance-liveness/MaintenanceBound.lean")
+    dependencies = scratch / "maintenance-reference"
+    dependencies.mkdir()
+    reference = clone_file(package, dependencies)
+    compiled = run_case(
+        [args.lean, "-o", str(dependencies / "MaintenanceBound.olean"), str(reference.relative_to(dependencies))],
+        dependencies, args.evidence, "lean-maintenance-reference",
+    )
+    if compiled.returncode:
+        raise ValueError("Logkeeper Study 111 did not compile")
     verify_lean_model(
-        args, scratch, models / "MaintenanceBound.lean", "maintenance-bound",
+        args, scratch, models / "MaintenanceClassification.lean", "maintenance-classification",
         {
-            "charge-on-regrant": (
-                "grant := lane.grant + 1 }", "grant := lane.grant + 1, used := lane.used + 1 }",
-                ["every_reachable_lane_has_its_phase_shape"],
-            ),
             "charge-noop": (
                 "| .noOp | .ordinary => false", "| .noOp => true\n  | .ordinary => false",
                 ["classifier_refines_three_record_bound"],
             ),
-            "publish-without-trim": (
-                "Step lane { lane with used := 1, phase := .idle }",
-                "Step lane { lane with phase := .idle }",
-                ["every_reachable_lane_has_its_phase_shape"],
+            "omit-upload-charge": (
+                "| .blockBoundary | .blockUploaded => true", "| .blockBoundary => true\n  | .blockUploaded => false",
+                ["classifier_charges_checkpoint_progress"],
             ),
         },
-        6,
+        3,
+        os.environ | {"LEAN_PATH": str(dependencies)},
     )
 
 

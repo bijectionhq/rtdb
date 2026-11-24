@@ -119,7 +119,7 @@ private def read : ReadProjection (List Nat) serving where
   usesSelectedCut := rfl
 
 private def base : ReplayClosure.Checkpoint := ⟨0, []⟩
-private def plan : Selection := ⟨base, ⟨1, 1⟩, [], [.oversized 9 .resolvedTx]⟩
+private def plan : Selection := ⟨some base, ⟨1, 1⟩, [], [.oversized 9 .resolvedTx]⟩
 private def scope : Scope := ⟨1, 1, 2⟩
 private def decodeTx (append : Protocol.Append) : Option Nat := some append.receipt.outcomeDigest
 private def noErasure (_ _ : Nat) : Bool := false
@@ -150,7 +150,7 @@ private def projection : RecoveryProjection semantics last.decisions plan scope 
     intro key member
     simp at member
     rcases member with rfl | rfl
-    · exact .inl (.inl rfl)
+    · exact .inl ⟨base, rfl, .inl rfl⟩
     · refine .inr ⟨_, .step .start (.admit (Replay.start plan) (.oversized 9 .resolvedTx) [] rfl rfl), ?_⟩
       simp [Replay.start, payloadKeys]
 
@@ -293,7 +293,7 @@ theorem a_stale_or_alien_applied_cut_cannot_serve :
 
 theorem omitting_a_tail_payload_loses_a_reachable_dependency :
     ∃ replay, Reaches plan replay ∧ Key.tailPayload 9 ∈ replay.demands ∧
-      Key.tailPayload 9 ∉ baseKeys plan.checkpoint := by
+      Key.tailPayload 9 ∉ baseKeys base := by
   refine ⟨_, .step .start (.admit (Replay.start plan) (.oversized 9 .resolvedTx) [] rfl rfl), ?_, ?_⟩
   · simp [Replay.start, payloadKeys]
   · decide

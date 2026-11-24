@@ -7,7 +7,7 @@ Block boundaries and uploads project to the corresponding Lean kinds, no-ops pro
 The append path queries the fence mode for no-ops, the only variant whose classification depends on the mode.
 The append path chooses the class from the original body and reuses it if the payload is offloaded.
 
-[MaintenanceBound](../../multi/lean/MaintenanceBound.lean) ports the lane model from Logkeeper Study 111.
+[MaintenanceClassification](../../multi/lean/MaintenanceClassification.lean) imports the pinned Logkeeper Study 111 lane model `MaintenanceBound`.
 The Verus law `classifier_refines_three_record_bound` equates the production charge to Lean's `record_charge` for fenced bodies outside placed receiver transfer settlement.
 The production classifier also charges fenced receiver terminals to maintenance.
 The bound takes the absence of those terminals as a premise.

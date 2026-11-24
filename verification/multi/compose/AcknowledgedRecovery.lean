@@ -185,21 +185,21 @@ structure RecoveryProjection (semantics : ReplaySemantics Tx) (history : List Pr
   exactReadCut : read.cut = semantics.dataCut history
   journalAgreesAtReadCut : state.chosen read.cut.next = some (projectCut read.cut)
   exactScopeCut : scope.orderedCut = read.cut.next
-  selectedRoot : selected.checkpoint.root = read.hold.base.root
+  selectedRoot : (selected.checkpoint.map (·.root)).getD 0 = read.hold.base.root
   authenticPlan : semantics.authenticatesPlan scope read.hold.base read.cut selected
   nativeReadKeys : List Key
-  typedReads : ∀ key ∈ nativeReadKeys, BaseRead selected.checkpoint key ∨
+  typedReads : ∀ key ∈ nativeReadKeys, (∃ base, selected.checkpoint = some base ∧ BaseRead base key) ∨
     ∃ replay, Reaches selected replay ∧ key ∈ replay.demands
-  checkpointFidelity : semantics.checkpointEvents selected.checkpoint =
+  checkpointFidelity : (selected.checkpoint.map semantics.checkpointEvents).getD [] =
     (history.take checkpointDecisionCount).foldl
       (applyDecision semantics.decodeTx semantics.committedTargets) []
   suffixFidelity :
-    semantics.replayEvents selected (semantics.checkpointEvents selected.checkpoint) =
+    semantics.replayEvents selected (((selected.checkpoint.map semantics.checkpointEvents).getD [])) =
       (history.drop checkpointDecisionCount).foldl
         (applyDecision semantics.decodeTx semantics.committedTargets)
-        (semantics.checkpointEvents selected.checkpoint)
+        (((selected.checkpoint.map semantics.checkpointEvents).getD []))
   readUsesReplay : read.stateMeaning read.cut =
-    semantics.replayEvents selected (semantics.checkpointEvents selected.checkpoint)
+    semantics.replayEvents selected (((selected.checkpoint.map semantics.checkpointEvents).getD []))
 
 theorem recovery_read_is_exact_history
     {semantics : ReplaySemantics Tx} {read : ReadProjection (List Tx) state}
