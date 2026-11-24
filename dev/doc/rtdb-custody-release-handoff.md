@@ -237,12 +237,24 @@ Without an applied restore terminal, an interrupted or abandoned claim stays pri
 Protected readers call `ManagedCheckpointProvider::require_read` with the selected destination generation, exact branch, table, row ID and outer ciphertext inside a `PlaintextView` delivery scope.
 It authenticates the physical slot and original capability, checks the complete vault agreement, and attaches all original contributor fences and the selected destination generation to the final delivery checks.
 The consumer still owns protected opening and the existing ordered response admission and durable release for the output.
-Peer/admin dispatch, private-to-ready activation and the mounted consumer are integration work.
-Generic v1 row-custody groups, uncatalogued owned payloads, rewritten world members, external checkpoint files, and governed Root carriers remain closed.
+The installed v1 Multi host exposes the transfer to trusted in-process callers through `DeploymentTransfer::ManagedFork`.
+The existing Flight administration codecs continue to select the ordinary fork and restore routes.
+Where the legacy placed Original still exists, construct `ManagedFamilyTransferSource::from_placed_original` with its authenticated owner session, current directory record and existing independent vault.
+Install that source through `MultiRuntime::with_managed_checkpoint_source` for the matching v1 incarnation on each participating host before opening the server.
+The stock `rtdb start-multi` process has no placed Original reader or family vault mount and therefore leaves the protected route unavailable.
+The ordered catalog checks the exact private reservation at the selected writer for pin, install and release, and preserves the manifest-binding Basis after readiness.
+The destination confirms the reciprocal provider terminal before the source writer releases its pin, and readiness follows the positive release acknowledgement.
+A lost reply after the applied restore or source release recovers the same backing and terminal without repinning.
+A trusted reader uses `Node::check_managed_checkpoint_read` in its `PlaintextView` with the already held carrier slot and destination generation before opening through the Original capability.
+Delivery rechecks the attachment, destination generation and tracked Original contributor fences after opening, and the transport still requires its existing ordered hold and release.
+Generic v1 row-custody groups require an independent destination authority that preserves the complete placement and release inventory, original key access, revocation and read generation through export, import and delivery.
+The existing `BranchIndex::checkpoint_at` and `restore_in` fences still refuse those groups.
+Uncatalogued owned payloads, rewritten world members, external checkpoint files, and governed Root carriers remain closed.
 Root-derived rows need an authenticated dependent erasure projection and settlement before inherited reads can open.
 `FamilyFence.transfers` exposes the exact forward roster to that projection, while the installed Flight fence reply retains its existing shape.
 
 Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
+Qualify `managed_catalog_waits_for_confirmation_and_drains_and_recovers_a_lost_unpin_reply` for the private catalog and mounted destination attachment gates.
 At the installed boundary, lose replies after the source pin, destination append, reverse-vault terminal and source unpin, and recover the same terminal from trimmed history.
 Exercise multiple original families and ranked derivatives, an unknown group or missing source carrier, a substituted row slot, wrong source and destination incarnations, a changed reservation Basis, and a concurrent fence of each contributing family.
 Rotate the destination generation between protected opening and delivery, and verify that late replies cannot admit a send, that settled send evidence survives restart, and that ordinary export and unpin cannot bypass the managed fence.

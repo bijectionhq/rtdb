@@ -486,7 +486,8 @@ Every contributing family stores the same forward agreement in its fence invento
 An agreement with unbound contributors supplies no access.
 A positive copy terminal independently proves that both source and destination copy work have drained before permitting source pin cleanup, including after a family fence has won.
 The installed destination continues to resolve and recheck the same independent original vault before releasing protected data.
-The installed hosted fork and generic checkpoint routes still decline protected transfers pending the provider and reader wiring described in the custody handoff.
+The private v1 Multi route uses the existing placed Original where the host can mount its reader and vault.
+The custody handoff describes the installed scope and the outstanding generic placement and Root obligations.
 
 ## Errors
 

@@ -39,6 +39,13 @@ impl rtdb_query::QueryDeliveryGuard for MultiSqlDelivery {
     }
 }
 
+#[async_trait]
+impl rtdb_storage::sealing::PlaintextReleaseCheck for MultiSqlDelivery {
+    async fn require_current(&self) -> Result<()> {
+        rtdb_query::QueryDeliveryGuard::check(self, &CancellationToken::new()).await
+    }
+}
+
 pub struct MultiServing {
     database: Arc<Mutex<MultiDatabase>>,
     writes: WritePipeline,
@@ -65,6 +72,15 @@ pub trait ManagedCheckpointProvider: Send + Sync {
     async fn release_source(&self, source: &MultiServing) -> Result<()>;
 }
 
+/// The runtime mounts the original source authority for one source incarnation.
+pub trait ManagedCheckpointSource: Send + Sync {
+    fn bind<'a>(
+        &'a self,
+        reservation: ManagedCheckpointReservation,
+        cancellation: &'a CancellationToken,
+    ) -> Result<Box<dyn ManagedCheckpointProvider + 'a>>;
+}
+
 /// The host can route an already authorized write to the node appointed for this incarnation.
 #[async_trait]
 pub trait MultiWriteRoute: Send + Sync {
@@ -83,8 +99,18 @@ impl MultiServing {
         self.database.lock().await.restored_checkpoint_basis(manifest_digest).await
     }
 
-    pub async fn pin_managed_checkpoint(&self, pin: uuid::Uuid, basis: Basis, target: ManagedCheckpointTarget) -> Result<PinnedCheckpointIdentity> {
-        self.database.lock().await.pin_managed_checkpoint(pin, basis, target).await
+    pub async fn pin_managed_checkpoint(
+        &self, pin: uuid::Uuid, basis: Basis, target: ManagedCheckpointTarget,
+        require_unbound: impl Future<Output = Result<()>> + Send,
+    ) -> Result<PinnedCheckpointIdentity> {
+        let mut database = self.database.lock().await;
+        // The reservation check and pin share the writer lock with release, so a stale retry cannot repin.
+        require_unbound.await?;
+        database.pin_managed_checkpoint(pin, basis, target).await
+    }
+
+    pub async fn require_managed_checkpoint_writer(&self) -> Result<()> {
+        self.database.lock().await.require_managed_checkpoint_writer().await
     }
 
     pub async fn open_managed_checkpoint(&self, reservation: ManagedCheckpointReservation) -> Result<PinnedExport> {

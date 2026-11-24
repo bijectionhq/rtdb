@@ -5,7 +5,8 @@ use rtdb_db::{DeploymentRetirement, MultiDatabase};
 use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Receipt, Row, Transact, Version, Window};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Result, StructFields, TableRef, Timestamp, Value,
-    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, Basis, Layer, MAIN_BRANCH, ManagedCheckpointReservation,
+        ManagedCheckpointTarget, PinnedCheckpointIdentity},
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -33,6 +34,7 @@ pub(super) enum Status {
         request: [u8; 32],
         basis: Basis,
     },
+    ManagedTransferReady { transfer: ManagedTransfer, basis: Basis },
     Retiring(Retirement),
     Erased {
         retirement: Retirement,
@@ -42,7 +44,7 @@ pub(super) enum Status {
 
 impl Status {
     pub fn ready(&self) -> bool {
-        matches!(self, Self::Ready | Self::TransferReady { .. })
+        matches!(self, Self::Ready | Self::TransferReady { .. } | Self::ManagedTransferReady { .. })
     }
 }
 
@@ -65,6 +67,39 @@ pub(super) enum TransferExport {
         manifest: [u8; 32],
         ticket: Vec<u8>,
     },
+    Managed {
+        pin: Uuid,
+        basis: Basis,
+        manifest: Option<[u8; 32]>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ManagedTransfer {
+    pub source: String,
+    pub reservation: ManagedCheckpointReservation,
+}
+
+impl Deployment {
+    pub(super) fn managed_transfer(&self) -> Result<ManagedTransfer> {
+        match &self.status {
+            Status::ManagedTransferReady { transfer, .. } => Ok(transfer.clone()),
+            Status::TransferPending(Transfer {
+                request, source, incarnation,
+                export: TransferExport::Managed { pin, basis, manifest: Some(manifest) },
+            }) if basis.incarnation() == *incarnation.as_bytes() => Ok(ManagedTransfer {
+                source: source.clone(),
+                reservation: ManagedCheckpointReservation {
+                    source: PinnedCheckpointIdentity {
+                        basis: *basis, pin: *pin.as_bytes(), manifest_sha256: *manifest, until: None,
+                    },
+                    target: ManagedCheckpointTarget { incarnation: *self.database.as_bytes(), request: *request },
+                    reserved_at: self.written,
+                },
+            }),
+            _ => Err(conflict()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Transfer {
@@ -146,6 +181,10 @@ impl Catalog {
         live: &std::collections::BTreeSet<std::net::IpAddr>,
     ) -> Result<rtdb_db::Role> {
         self.database.lock().await.tick(live).await
+    }
+
+    pub(super) async fn is_writer(&self) -> bool {
+        matches!(self.database.lock().await.role(), rtdb_db::Role::Writer(_))
     }
 
     pub(super) async fn read(&self) -> Result<BTreeMap<String, Deployment>> {
@@ -249,15 +288,10 @@ impl Catalog {
             Status::TransferPending(pending) if pending.request == request => pending.clone(),
             _ => return Err(conflict()),
         };
-        if let TransferExport::Ticket {
-            manifest: prior, ..
-        } = pending.export
-        {
-            return if prior == manifest {
-                Ok(selected.status)
-            } else {
-                Err(conflict())
-            };
+        match pending.export {
+            TransferExport::Fork { .. } => (),
+            TransferExport::Ticket { manifest: prior, .. } if prior == manifest => return Ok(selected.status),
+            _ => return Err(conflict()),
         }
         pending.export = TransferExport::Ticket { manifest, ticket };
         write(
@@ -283,6 +317,66 @@ impl Catalog {
             _ => return Err(conflict()),
         }
         Ok(selected.status)
+    }
+
+    pub(super) async fn bind_managed_transfer(
+        &self, name: &str, target: ManagedCheckpointTarget, identity: PinnedCheckpointIdentity,
+    ) -> Result<Deployment> {
+        if identity.until.is_some() || identity.manifest_sha256 == [0; 32] {
+            return Err(conflict());
+        }
+        let database = Uuid::from_bytes(target.incarnation);
+        let mut control = self.database.lock().await;
+        let mut selected = check_identity(find(&mut control, name).await?, database)?;
+        if let Status::TransferPending(pending) = &selected.status
+            && let TransferExport::Managed { pin, basis, manifest: None } = pending.export
+        {
+            if pending.request != target.request || identity.pin != *pin.as_bytes()
+                || identity.basis != basis || basis.incarnation() != *pending.incarnation.as_bytes()
+            {
+                return Err(conflict());
+            }
+            let bound = Transfer {
+                export: TransferExport::Managed { pin, basis, manifest: Some(identity.manifest_sha256) },
+                ..pending.clone()
+            };
+            write(self, &mut control, name, database, Status::TransferPending(bound), Version::Written(selected.written)).await?;
+            selected = check_identity(find(&mut control, name).await?, database)?;
+        }
+        let reservation = selected.managed_transfer()?.reservation;
+        if reservation.source != identity || reservation.target != target {
+            return Err(conflict());
+        }
+        Ok(selected)
+    }
+
+    pub(super) async fn mark_managed_transfer_ready(
+        &self, name: &str, transfer: ManagedTransfer, basis: Basis,
+    ) -> Result<()> {
+        let reservation = transfer.reservation;
+        let database = Uuid::from_bytes(reservation.target.incarnation);
+        if basis.incarnation() != reservation.target.incarnation
+            || basis.position() != reservation.source.basis.position()
+            || reservation.reserved_at.incarnation() != *self.incarnation.as_bytes()
+        {
+            return Err(conflict());
+        }
+        let mut control = self.database.lock().await;
+        let selected = check_identity(find(&mut control, name).await?, database)?;
+        if selected.managed_transfer()? != transfer {
+            return Err(conflict());
+        }
+        let ready = Status::ManagedTransferReady { transfer, basis };
+        if selected.status != ready {
+            if selected.written != reservation.reserved_at || !matches!(selected.status, Status::TransferPending(_)) {
+                return Err(conflict());
+            }
+            write(self, &mut control, name, database, ready.clone(), Version::Written(reservation.reserved_at)).await?;
+        }
+        if check_identity(find(&mut control, name).await?, database)?.status != ready {
+            return Err(conflict());
+        }
+        Ok(())
     }
 
     /// Called only after the provisioner observes the reserved stream and its key authority.
@@ -440,11 +534,18 @@ async fn read(control: &mut MultiDatabase) -> Result<BTreeMap<String, Deployment
         else {
             return Err(invalid_catalog());
         };
+        let status = decode_status(*ready, *database, &image.cells)?;
+        if let Status::ManagedTransferReady { transfer, .. } = &status {
+            let reserved_at = transfer.reservation.reserved_at;
+            if reserved_at.incarnation() != row.cut.basis.incarnation() || reserved_at >= row.cut.basis {
+                return Err(invalid_catalog());
+            }
+        }
         entries.insert(
             name.clone(),
             Deployment {
                 database: Uuid::from_bytes(*database),
-                status: decode_status(*ready, &image.cells)?,
+                status,
                 written: row.cut.basis,
             },
         );
@@ -463,7 +564,7 @@ async fn find(control: &mut MultiDatabase, name: &str) -> Result<Deployment> {
     })
 }
 
-fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
+fn decode_status(ready: bool, database: [u8; 16], cells: &StructFields<Value>) -> Result<Status> {
     if let Some(request) = cells.get("transfer_request") {
         let Value::Binary(request) = request else {
             return Err(invalid_catalog());
@@ -472,6 +573,12 @@ fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
             .as_slice()
             .try_into()
             .map_err(|_| invalid_catalog())?;
+        if let Some(managed) = cells.get("transfer_managed") {
+            if *managed != Value::Bool(true) {
+                return Err(invalid_catalog());
+            }
+            return decode_managed_transfer(ready, database, request, cells);
+        }
         return match (
             ready,
             cells.get("transfer_basis"),
@@ -492,6 +599,9 @@ fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
             }
             _ => Err(invalid_catalog()),
         };
+    }
+    if cells.get("transfer_managed").is_some() {
+        return Err(invalid_catalog());
     }
     let retirement = match (
         cells.get("terminal"),
@@ -522,6 +632,58 @@ fn decode_status(ready: bool, cells: &StructFields<Value>) -> Result<Status> {
             Ok(Status::Erased {
                 retirement,
                 confirmed: Timestamp(*confirmed),
+            })
+        }
+        _ => Err(invalid_catalog()),
+    }
+}
+
+fn decode_managed_transfer(
+    ready: bool, database: [u8; 16], request: [u8; 32], cells: &StructFields<Value>,
+) -> Result<Status> {
+    let (Some(Value::Utf8(source)), Some(Value::Uuid(incarnation)),
+        Some(Value::Uuid(pin)), Some(Value::Binary(basis))) = (
+        cells.get("transfer_source"), cells.get("transfer_incarnation"),
+        cells.get("transfer_pin"), cells.get("transfer_fork_basis"),
+    ) else {
+        return Err(invalid_catalog());
+    };
+    let basis = Basis::from_bytes(basis)?;
+    if *incarnation == database || basis.incarnation() != *incarnation || *pin == [0; 16]
+        || request == [0; 32] || cells.get("transfer_ticket").is_some()
+        || cells.get("transfer_retain_until").is_some()
+    {
+        return Err(invalid_catalog());
+    }
+    let manifest: Option<[u8; 32]> = match cells.get("transfer_manifest") {
+        None => None,
+        Some(Value::Binary(bytes)) => Some(bytes.as_slice().try_into().map_err(|_| invalid_catalog())?),
+        _ => return Err(invalid_catalog()),
+    };
+    if manifest == Some([0; 32]) {
+        return Err(invalid_catalog());
+    }
+    match (ready, cells.get("transfer_reserved_at"), cells.get("transfer_basis"), manifest) {
+        (false, None, None, manifest) => Ok(Status::TransferPending(Transfer {
+            request, source: source.clone(), incarnation: Uuid::from_bytes(*incarnation),
+            export: TransferExport::Managed { pin: Uuid::from_bytes(*pin), basis, manifest },
+        })),
+        (true, Some(Value::Binary(reserved_at)), Some(Value::Binary(installed)), Some(manifest)) => {
+            let reserved_at = Basis::from_bytes(reserved_at)?;
+            let installed = Basis::from_bytes(installed)?;
+            if reserved_at.position() == 0 || installed != Basis::new(database, basis.position()) {
+                return Err(invalid_catalog());
+            }
+            Ok(Status::ManagedTransferReady {
+                transfer: ManagedTransfer {
+                    source: source.clone(),
+                    reservation: ManagedCheckpointReservation {
+                        source: PinnedCheckpointIdentity { basis, pin: *pin, manifest_sha256: manifest, until: None },
+                        target: ManagedCheckpointTarget { incarnation: database, request },
+                        reserved_at,
+                    },
+                },
+                basis: installed,
             })
         }
         _ => Err(invalid_catalog()),
@@ -623,6 +785,14 @@ async fn write(
                     cells.insert("transfer_ticket".into(), Cell::Value(Value::Binary(ticket)));
                     b"transfer-ticket".to_vec()
                 }
+                TransferExport::Managed { pin, basis, manifest } => {
+                    add_managed_export(&mut cells, *pin.as_bytes(), basis, manifest);
+                    if manifest.is_some() {
+                        b"transfer-managed-bound".to_vec()
+                    } else {
+                        b"transfer-managed-reserve".to_vec()
+                    }
+                }
             }
         }
         Status::TransferReady { request, basis } => {
@@ -635,6 +805,16 @@ async fn write(
                 Cell::Value(Value::Binary(basis.to_bytes().to_vec())),
             );
             b"transfer-ready".to_vec()
+        }
+        Status::ManagedTransferReady { transfer, basis } => {
+            let reservation = transfer.reservation;
+            cells.insert("transfer_request".into(), Cell::Value(Value::Binary(reservation.target.request.to_vec())));
+            cells.insert("transfer_source".into(), Cell::Value(Value::Utf8(transfer.source)));
+            cells.insert("transfer_incarnation".into(), Cell::Value(Value::Uuid(reservation.source.basis.incarnation())));
+            cells.insert("transfer_reserved_at".into(), Cell::Value(Value::Binary(reservation.reserved_at.to_bytes().to_vec())));
+            cells.insert("transfer_basis".into(), Cell::Value(Value::Binary(basis.to_bytes().to_vec())));
+            add_managed_export(&mut cells, reservation.source.pin, reservation.source.basis, Some(reservation.source.manifest_sha256));
+            b"transfer-managed-ready".to_vec()
         }
         Status::Retiring(retirement) => {
             add_retirement(&mut cells, retirement);
@@ -719,6 +899,15 @@ async fn write(
     match receipt.outcome {
         Outcome::Then | Outcome::Otherwise { .. } => Ok(()),
         Outcome::Refused { error } => Err(error),
+    }
+}
+
+fn add_managed_export(cells: &mut StructFields<Cell>, pin: [u8; 16], basis: Basis, manifest: Option<[u8; 32]>) {
+    cells.insert("transfer_managed".into(), Cell::Value(Value::Bool(true)));
+    cells.insert("transfer_pin".into(), Cell::Value(Value::Uuid(pin)));
+    cells.insert("transfer_fork_basis".into(), Cell::Value(Value::Binary(basis.to_bytes().to_vec())));
+    if let Some(manifest) = manifest {
+        cells.insert("transfer_manifest".into(), Cell::Value(Value::Binary(manifest.to_vec())));
     }
 }
 

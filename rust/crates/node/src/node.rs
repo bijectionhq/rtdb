@@ -1242,6 +1242,34 @@ impl Node {
         self.catalog.with_current_attachment(&database, || Ok(basis))
     }
 
+    /// Checks a held inherited carrier before the Original owner opens it for delivery.
+    #[cfg(feature = "multi")]
+    pub async fn check_managed_checkpoint_read(
+        &self, destination: &str, read: crate::ManagedCheckpointRead<'_>, cancellation: &CancellationToken,
+    ) -> Result<()> {
+        use rtdb_storage::sealing::PlaintextView;
+        use sha2::{Digest, Sha256};
+
+        self.ensure_open()?;
+        let unavailable = || Anomaly::unsupported("rtdb/managed-checkpoint-read", "A managed carrier needs its held destination and plaintext delivery scope");
+        if !PlaintextView::has_delivery_scope() { return Err(unavailable()); }
+        let attachment = self.catalog.database(destination)?;
+        self.catalog.with_current_attachment(&attachment, || Ok(()))?;
+        let incarnation = attachment.serving_driver().ok_or_else(unavailable)?.incarnation();
+        let generation = read.generation;
+        self.factory.resources.check_managed_checkpoint_read(destination, incarnation, read, cancellation).await?;
+        let mut key = Sha256::new();
+        key.update(b"rtdb.multi/managed-checkpoint-attachment/v1\0");
+        key.update(incarnation);
+        key.update(generation.to_be_bytes());
+        self.catalog.with_current_attachment(&attachment, || {
+            PlaintextView::track_release_check(key.finalize().into(), Arc::new(crate::multi_serving::MultiSqlDelivery {
+                catalog: Arc::clone(&self.catalog), attachment: Arc::downgrade(&attachment),
+                generation: Some(generation), groups: BTreeSet::new(),
+            }))
+        })
+    }
+
     /// Returns the durable erasure evidence after the deployment host settles its storage custody.
     pub async fn erase_managed_deployment(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
         self.ensure_open()?;

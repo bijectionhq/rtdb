@@ -6,7 +6,7 @@ mod managed;
 mod transfer;
 
 pub use release::{CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
-pub use managed::ManagedFamilyTransfer;
+pub use managed::{ManagedFamilyTransfer, ManagedFamilyTransferSource};
 pub use transfer::{FamilyTransfer, FamilyTransferArtifact, FamilyTransferAuthority, FamilyTransferContributor, FamilyTransferDestination,
     FamilyTransferDestinationObservation, FamilyTransferDestinationState, FamilyTransferFanout, FamilyTransferSource,
     FamilyTransferRead, FamilyTransferSourceDrain, FamilyTransferSourceObservation};

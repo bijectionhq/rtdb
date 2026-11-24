@@ -224,6 +224,13 @@ impl MultiDatabase {
         self.restore_exact_export(export, true).await
     }
 
+    pub async fn require_managed_checkpoint_writer(&mut self) -> Result<()> {
+        self.refresh().await?;
+        self.require_active()?;
+        self.authority()?;
+        Ok(())
+    }
+
     /// The host holds the private catalog reservation while checking this writer.
     pub async fn require_managed_checkpoint_destination(&mut self, reservation: ManagedCheckpointReservation) -> Result<()> {
         self.refresh().await?;

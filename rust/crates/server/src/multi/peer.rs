@@ -14,7 +14,7 @@ use rtdb_node::{
 use rtdb_tx::transact::{Receipt, Transact};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
-    rtdb_v1::{Basis, LabelScope},
+    rtdb_v1::{Basis, LabelScope, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -27,7 +27,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{CLOCK_DRIFT_MICROS, MultiRuntime};
+use super::{CLOCK_DRIFT_MICROS, MultiRuntime, managed_transfer::reservation_conflict};
 
 pub(super) const PORT: u16 = 3001;
 const MAX_FRAME_BYTES: usize = MAX_PEER_MESSAGE_BYTES + 128;
@@ -73,6 +73,14 @@ enum Admission {
     Restore {
         request: [u8; 32],
     },
+    ManagedPin {
+        destination: String,
+        target: ManagedCheckpointTarget,
+        pin: Uuid,
+        basis: Basis,
+    },
+    ManagedInstall { reservation: ManagedCheckpointReservation },
+    ManagedRelease { destination: String, reservation: ManagedCheckpointReservation },
     Retire,
 }
 
@@ -93,6 +101,8 @@ enum Answer {
     Receipt(Receipt),
     Ticket(Vec<u8>),
     Installed(Basis),
+    ManagedPinned(PinnedCheckpointIdentity),
+    ManagedReleased,
     Retired {
         terminal: u64,
         generation: u64,
@@ -226,6 +236,27 @@ impl Peer {
                     .await?;
                 return Ok(Answer::Installed(basis));
             }
+            Admission::ManagedPin { destination, target, pin, basis } => {
+                if frame.request.is_some() || basis.incarnation() != frame.incarnation {
+                    return Err(reservation_conflict());
+                }
+                let identity = runtime.pin_peer_managed_transfer(name, incarnation, &destination, target, pin, basis).await?;
+                return Ok(Answer::ManagedPinned(identity));
+            }
+            Admission::ManagedInstall { reservation } => {
+                if frame.request.is_some() || reservation.target.incarnation != frame.incarnation {
+                    return Err(reservation_conflict());
+                }
+                let basis = runtime.install_peer_managed_transfer(name, reservation).await?;
+                return Ok(Answer::Installed(basis));
+            }
+            Admission::ManagedRelease { destination, reservation } => {
+                if frame.request.is_some() || reservation.source.basis.incarnation() != frame.incarnation {
+                    return Err(reservation_conflict());
+                }
+                runtime.release_peer_managed_transfer(name, &destination, reservation).await?;
+                return Ok(Answer::ManagedReleased);
+            }
             Admission::Retire if frame.request.is_none() => {
                 let writer = runtime.ready_driver(name, incarnation).await?;
                 let event = writer.retire_deployment().await?;
@@ -334,6 +365,45 @@ impl Peer {
                 Ok(Some(basis))
             }
             None => Ok(None),
+            _ => Err(unavailable()),
+        }
+    }
+
+    pub(super) async fn forward_managed_pin(
+        &self, source: &str, destination: &str, target: ManagedCheckpointTarget, pin: Uuid, basis: Basis,
+    ) -> Result<Option<PinnedCheckpointIdentity>> {
+        match self.forward(source.to_owned(), basis.incarnation(), None, Admission::ManagedPin {
+            destination: destination.to_owned(), target, pin, basis,
+        }).await? {
+            Some(Answer::ManagedPinned(identity)) if identity.basis == basis
+                && identity.pin == *pin.as_bytes() && identity.until.is_none() => Ok(Some(identity)),
+            None => Ok(None),
+            _ => Err(unavailable()),
+        }
+    }
+
+    pub(super) async fn forward_managed_install(
+        &self, name: &str, reservation: ManagedCheckpointReservation,
+    ) -> Result<Option<Basis>> {
+        match self.forward(name.to_owned(), reservation.target.incarnation, None,
+            Admission::ManagedInstall { reservation }).await?
+        {
+            Some(Answer::Installed(basis)) if basis == Basis::new(
+                reservation.target.incarnation, reservation.source.basis.position(),
+            ) => Ok(Some(basis)),
+            None => Ok(None),
+            _ => Err(unavailable()),
+        }
+    }
+
+    pub(super) async fn forward_managed_release(
+        &self, source: &str, destination: &str, reservation: ManagedCheckpointReservation,
+    ) -> Result<bool> {
+        match self.forward(source.to_owned(), reservation.source.basis.incarnation(), None,
+            Admission::ManagedRelease { destination: destination.to_owned(), reservation }).await?
+        {
+            Some(Answer::ManagedReleased) => Ok(true),
+            None => Ok(false),
             _ => Err(unavailable()),
         }
     }

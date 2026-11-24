@@ -2,13 +2,15 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use rtdb_columnar::ArrowCell;
 use rtdb_db::PinnedExport;
+use rtdb_directory::DeploymentRecord;
 use rtdb_index::branches::BranchIndex;
 use rtdb_node::{
-    ManagedCheckpointProvider, ManagedCheckpointRead, MultiServing, serving::ServingDriver,
+    ManagedCheckpointProvider, ManagedCheckpointRead, ManagedCheckpointSource, MultiServing, NativeSession,
+    serving::ServingDriver,
 };
 use rtdb_storage::sealing::{PlaintextReleaseCheck, PlaintextView};
 use rtdb_types::{
-    TableRef, Value,
+    PlacedAttemptScope, TableRef, Value,
     rtdb_v1::{Basis, MAIN_BRANCH, ManagedCheckpointReservation},
 };
 
@@ -19,6 +21,52 @@ use super::{transfer::MAX_CONTRIBUTORS, *};
 const ORIGINAL_CARRIER: &[u8] = b"BJWC1";
 const DERIVED_CARRIER: &[u8] = b"BJWP1";
 const WORLD_CODEC: u32 = u32::from_be_bytes(*b"BJWR");
+
+/// Mounts an existing Original reader and its independent family vault in the installed host.
+pub struct ManagedFamilyTransferSource {
+    keys: Arc<dyn KeyService>,
+    region: Arc<IoRegion>,
+    original: OriginalAssertionFamilyReader,
+    deployment: Uuid,
+    custody_incarnation: NonZeroU64,
+}
+
+impl ManagedFamilyTransferSource {
+    pub fn from_placed_original(
+        keys: Arc<dyn KeyService>,
+        region: Arc<IoRegion>,
+        session: &NativeSession,
+        record: &DeploymentRecord,
+    ) -> Result<Self> {
+        let deployment = Uuid::parse_str(&record.id).map_err(|_| unavailable())?;
+        let custody_incarnation = NonZeroU64::new(record.incarnation).ok_or_else(unavailable)?;
+        if deployment.is_nil() || keys.assertion_keys().is_none()
+            || keys.assertion_families(Arc::clone(&region)).is_none()
+            || record.writer_pool().is_none()
+            || session.placed_history()? != Some(PlacedAttemptScope::new(&record.stream("replica"), record.epoch)?)
+        {
+            return Err(unavailable());
+        }
+        let original = session.assertion_family_reader()?;
+        Ok(Self { keys, region, original, deployment, custody_incarnation })
+    }
+}
+
+impl ManagedCheckpointSource for ManagedFamilyTransferSource {
+    fn bind<'a>(
+        &'a self,
+        reservation: ManagedCheckpointReservation,
+        cancellation: &'a CancellationToken,
+    ) -> Result<Box<dyn ManagedCheckpointProvider + 'a>> {
+        if reservation.source.basis.incarnation() != *self.deployment.as_bytes() {
+            return Err(transfer_conflict());
+        }
+        Ok(Box::new(ManagedFamilyTransfer::new(
+            self.keys.as_ref(), Arc::clone(&self.region), &self.original,
+            self.custody_incarnation, reservation, cancellation,
+        )?))
+    }
+}
 
 /// The installed host supplies a private managed catalog reservation and the original reader.
 pub struct ManagedFamilyTransfer<'a> {

@@ -152,6 +152,11 @@ pub enum DeploymentTransfer {
         basis: rtdb_types::rtdb_v1::Basis,
         retain_until: Option<rtdb_types::Timestamp>,
     },
+    /// Private host operation for a source with an installed custody authority.
+    ManagedFork {
+        pin: uuid::Uuid,
+        basis: rtdb_types::rtdb_v1::Basis,
+    },
 }
 
 #[async_trait]
@@ -178,6 +183,14 @@ pub trait ResourceFactory: Send + Sync {
         _cancellation: &CancellationToken,
     ) -> Result<(DatabaseConfig, rtdb_types::rtdb_v1::Basis)> {
         Err(Anomaly::unsupported("rtdb/deployment-restore", "The runtime has no managed checkpoint transfer authority"))
+    }
+
+    #[cfg(feature = "multi")]
+    async fn check_managed_checkpoint_read(
+        &self, _name: &str, _incarnation: [u8; 16], _read: crate::ManagedCheckpointRead<'_>,
+        _cancellation: &CancellationToken,
+    ) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb/managed-checkpoint-read", "The runtime has no managed checkpoint read authority"))
     }
 
     /// Returns the authenticated erasure evidence and the latest time of confirmed unreadability.

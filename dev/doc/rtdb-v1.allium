@@ -6,6 +6,10 @@
 -- Multi deletion first orders a terminal in the settled deployment stream. The catalog retains the incarnation, terminal, key generation and immutable retirement cutoff.
 -- Key destruction and permanent journal deletion complete before the catalog records and authenticates erasure evidence.
 -- A retirement with live dependent pins or unverified independent custody keys cannot close the deployment.
+-- A private Multi custody transfer selects one source pin, source cut, destination incarnation and ordered reservation.
+-- The source pin has no deadline and the destination stays private until its original authority confirms the installed backing and both copy drains.
+-- A retry preserves the exact bound reservation through readiness and can recover the provider terminal after source pin release.
+-- An inherited carrier read requires the mounted original authority and the destination's held generation through delivery.
 
 external entity ConsumerClient {
     -- A caller with credentials for the selected database.

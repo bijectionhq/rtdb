@@ -19,18 +19,22 @@ use rtdb_db::{
 };
 use rtdb_format::database::proto::{DatabaseConfig, LocalStorage, database_config::Storage};
 use rtdb_node::{
-    Clock, DatabaseStorage, DeploymentTransfer, LogAccess, MultiServing, NativeResources, Node,
-    OpenedLogs, ResourceFactory, SystemClock, serving::ServingDriver,
+    Clock, DatabaseStorage, DeploymentTransfer, LogAccess, ManagedCheckpointRead,
+    ManagedCheckpointSource, MultiServing, NativeResources, Node, OpenedLogs, ResourceFactory,
+    SystemClock, serving::ServingDriver,
 };
 use rtdb_storage::{IoRegion, LocalStore, ObjectStore};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp,
+    rtdb_v1::{Basis, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
+};
 use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::config::NodeConfiguration;
 
 mod catalog;
+mod managed_transfer;
 mod peer;
 use catalog::{Status, TransferExport};
 
@@ -49,6 +53,8 @@ pub struct MultiRuntime {
     kms: Arc<dyn Kms>,
     backends: Backends,
     peer: Option<Arc<peer::Peer>>,
+    managed_sources: Arc<BTreeMap<Uuid, Arc<dyn ManagedCheckpointSource>>>,
+    managed_operations: TaskTracker,
 }
 
 impl MultiRuntime {
@@ -256,6 +262,8 @@ impl MultiRuntime {
             kms,
             backends,
             peer,
+            managed_sources: Arc::default(),
+            managed_operations: TaskTracker::new(),
         })
     }
 
@@ -397,6 +405,13 @@ impl MultiRuntime {
                             retain_until,
                         }
                     }
+                    DeploymentTransfer::ManagedFork { pin, basis } => {
+                        if pin.is_nil() || basis.incarnation() != *original.database.as_bytes() {
+                            return Err(managed_transfer::reservation_conflict());
+                        }
+                        self.managed_source(original.database)?;
+                        TransferExport::Managed { pin, basis, manifest: None }
+                    }
                 };
                 self.catalog
                     .reserve_transfer(
@@ -417,6 +432,11 @@ impl MultiRuntime {
                 request: prior,
                 basis,
             } if prior == request => basis,
+            Status::ManagedTransferReady { transfer, basis }
+                if transfer.reservation.target.request == request => basis,
+            Status::TransferPending(pending) if pending.request == request
+                && matches!(pending.export, TransferExport::Managed { .. }) =>
+                self.finish_managed_transfer(destination, selected.database, request, cancellation).await?,
             Status::TransferPending(pending) if pending.request == request => {
                 self.finish_transfer(destination, selected.database, &pending, cancellation)
                     .await?
@@ -477,6 +497,7 @@ impl MultiRuntime {
                 }
             }
             TransferExport::Ticket { .. } => pending,
+            TransferExport::Managed { .. } => return Err(managed_transfer::reservation_conflict()),
         };
         let remote = if let Some(peer) = &self.peer {
             cancellation
@@ -589,7 +610,7 @@ impl MultiRuntime {
                     "The deployment is waiting for provisioning",
                 ));
             }
-            Status::Ready | Status::TransferReady { .. } => {
+            Status::Ready | Status::TransferReady { .. } | Status::ManagedTransferReady { .. } => {
                 let remote = if let Some(peer) = &self.peer {
                     peer.forward_retirement(name, selected.database).await?
                 } else {
@@ -681,13 +702,12 @@ impl MultiRuntime {
     }
 
     pub async fn drive(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
-        if let Some(peer) = &self.peer {
-            return tokio::select! {
-                result = self.drive_databases(node, stop) => result,
-                result = peer.serve(self, node, stop) => result,
-            };
+        tokio::select! {
+            result = self.drive_databases(node, stop) => result,
+            result = self.drive_managed_transfers(stop), if !self.managed_sources.is_empty() => result,
+            result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },
+                if self.peer.is_some() => result,
         }
-        self.drive_databases(node, stop).await
     }
 
     async fn drive_databases(&self, node: &Node, stop: &CancellationToken) -> Result<()> {
@@ -766,6 +786,7 @@ impl MultiRuntime {
     ) -> Result<()> {
         match &entry.status {
             Status::Reserved if !writer => return Ok(()),
+            Status::TransferPending(pending) if matches!(pending.export, TransferExport::Managed { .. }) => return Ok(()),
             Status::TransferPending(pending) => {
                 if writer {
                     let cancellation = CancellationToken::new();
@@ -851,6 +872,8 @@ impl MultiRuntime {
     }
 
     pub async fn close(self) {
+        self.managed_operations.close();
+        self.managed_operations.wait().await;
         drop(self.databases);
         self.backends.io.close_and_wait().await;
     }
@@ -989,6 +1012,11 @@ fn transfer_request_digest(source: &str, transfer: &DeploymentTransfer) -> [u8; 
                 hash.update(deadline.0.to_be_bytes());
             }
         }
+        DeploymentTransfer::ManagedFork { pin, basis } => {
+            hash.update([2]);
+            hash.update(pin.as_bytes());
+            hash.update(basis.to_bytes());
+        }
     }
     hash.finalize().into()
 }
@@ -1053,6 +1081,13 @@ impl ResourceFactory for ServingResources {
         self.runtime
             .transfer(source, destination, transfer, cancellation)
             .await
+    }
+
+    async fn check_managed_checkpoint_read(
+        &self, name: &str, incarnation: [u8; 16], read: ManagedCheckpointRead<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        self.runtime.check_managed_read(name, incarnation, read, cancellation).await
     }
 
     async fn erase_managed_database(&self, name: &str) -> Result<(Vec<u8>, Timestamp)> {
