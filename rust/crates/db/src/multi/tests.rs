@@ -1615,8 +1615,10 @@ async fn checked_workload_custody_retains_its_namespaced_receipt_across_checkpoi
     let ordinary = Authority::Write { fence: fence.clone(), writer: writer.clone() };
     assert_eq!(writes.workload(command([3; 32], submit(3, ordinary, Some(transaction.clone()))))
         .await.err().unwrap().code, "rtdb/managed-workload-authority");
-    let custody = Authority::CustodyWrite { fence, writer, request_digest: [3; 32] };
+    let custody = Authority::CustodyWrite { fence: fence.clone(), writer: writer.clone(), request_digest: [3; 32] };
     let retained = receipt(writes.workload(command([3; 32], submit(3, custody, Some(transaction)))).await.unwrap());
+    let overwrite = submit(4, Authority::Write { fence, writer }, Some(put(4, 1, "unprotected overwrite")));
+    assert_eq!(writes.workload(command([3; 32], overwrite)).await.err().unwrap().code, "rtdb/managed-workload-authority");
 
     database.lock().await.checkpoint(Vec::new()).await.unwrap();
     drop(writes);

@@ -620,6 +620,7 @@ impl Point {
             Authority::Write { .. } | Authority::CustodyWrite { .. } => {
                 let transaction = transaction.filter(|tx| tx.key == key).ok_or_else(denied)?;
                 self.check_write(
+                    state.index(),
                     transaction,
                     matches!(authority, Authority::CustodyWrite { .. }),
                 )?;
@@ -686,10 +687,11 @@ impl Point {
         Ok(control)
     }
 
-    fn check_write(&self, request: &Transact, custody: bool) -> Result<()> {
+    fn check_write(&self, index: &BranchIndex, request: &Transact, custody: bool) -> Result<()> {
         if request.ops.is_empty() && request.otherwise.is_empty()
             || request.uses_custody() != custody
             || request.custody_request_digest.is_some()
+            || index.has_visibility_history()
         {
             return Err(denied());
         }
@@ -698,14 +700,31 @@ impl Point {
             .iter()
             .chain(&request.requires)
             .any(|guard| match guard {
-                Guard::Version { branch, .. } | Guard::CountAtMost { branch, .. } => {
-                    branch != MAIN_BRANCH
+                Guard::Version {
+                    branch, table, id, ..
+                } => branch != MAIN_BRANCH || !custody && index.has_custody_address(table, id),
+                Guard::CountAtMost { branch, range, .. } => {
+                    branch != MAIN_BRANCH || !custody && index.has_custody_relation(&range.table)
                 }
                 Guard::Unchanged(_) => false,
             })
         {
             return Err(denied());
         }
+        let placements: BTreeSet<_> = request
+            .ops
+            .iter()
+            .chain(&request.otherwise)
+            .filter_map(|op| {
+                let Op::PlaceCustodyRow { table, row, .. } = op else {
+                    return None;
+                };
+                Some((table, &row.id))
+            })
+            .collect();
+        let protected = |table: &TableRef, id: &EntityId| {
+            index.has_custody_address(table, id) || placements.contains(&(table, id))
+        };
         for op in request.ops.iter().chain(&request.otherwise) {
             match op {
                 Op::Put {
@@ -719,9 +738,13 @@ impl Point {
                         row.custody_group.is_none()
                             && row.custody_payload.is_none()
                             && row.protected_columns.is_empty()
+                            && !protected(table, &row.id)
                     }) => {}
-                Op::Delete { branch, table, .. }
-                    if branch == MAIN_BRANCH && *table != self.table => {}
+                Op::Delete {
+                    branch, table, ids, ..
+                } if branch == MAIN_BRANCH
+                    && *table != self.table
+                    && ids.iter().all(|id| !protected(table, id)) => {}
                 Op::CreateCustodyGroup { group } if custody && *group != [0; 16] => {}
                 Op::ReserveCustodyPlacement { group, reservation }
                     if custody
@@ -741,7 +764,15 @@ impl Point {
                     && row.custody_payload.is_none()
                     && placement.commitments.is_none() => {}
                 Op::Declare { table, change }
-                    if *table != self.table && !matches!(change, Declaration::Drop) => {}
+                    if *table != self.table
+                        && !matches!(
+                            change,
+                            Declaration::Drop
+                                | Declaration::Visibility(_)
+                                | Declaration::SingleLabelPerTx
+                        )
+                        && (!matches!(change, Declaration::Ttl(_))
+                            || !index.has_custody_relation(table)) => {}
                 _ => return Err(denied()),
             }
         }

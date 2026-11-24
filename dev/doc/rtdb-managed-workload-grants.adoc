@@ -206,7 +206,8 @@ A lost action reply uses the original namespace for recovery or attempt settleme
 
 Write uses the same key in the outer action and embedded `TransactRequest`.
 It admits main-branch puts, deletes and table declarations on data relations.
-Each arm must preserve the configured authority relation.
+Each arm must preserve the configured authority relation and use enrolled custody placement to replace protected addresses.
+Ordinary write guards use clear address and index evidence.
 The exact workload credential uses the named evidence actions for its control reads.
 The separate `read-root` grant admits Capabilities, main merged Query and Changes for the exact applied fence and writer.
 The active writer confirms the capture cut and checks the authorization again before each delivered frame.

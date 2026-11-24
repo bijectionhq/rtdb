@@ -251,6 +251,9 @@ impl Peer {
                 let serving = attached.serving_driver().ok_or_else(unavailable)?;
                 if serving.incarnation() != frame.incarnation { return Err(unavailable()); }
                 let writer = runtime.ready_driver(name, incarnation).await?;
+                if !std::ptr::addr_eq(serving, writer.as_ref() as &dyn ServingDriver) {
+                    return Err(unavailable());
+                }
                 if let workload::Operation::Submit { transaction: Some(transaction), .. } = &mut request.operation {
                     transaction.request_memory = Some(Arc::new(reservation));
                 }
