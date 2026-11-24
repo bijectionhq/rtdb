@@ -107,7 +107,7 @@ pub(crate) fn domain_documents(batch: &RecordBatch, service: &Service) -> Result
     decode_documents(batch, service.memory(), None, rtdb_columnar::read_value_as)
 }
 
-fn operation_dictionary(field: &Field) -> bool {
+pub(crate) fn operation_dictionary(field: &Field) -> bool {
     field.name() == "_op" && field.metadata().is_empty()
         && matches!(field.data_type(), DataType::Dictionary(key, value)
             if key.as_ref() == &DataType::Int8 && value.as_ref() == &DataType::Utf8)
