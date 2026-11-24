@@ -1,4 +1,4 @@
-use crate::production::{admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
+use crate::production::{clock_slot_admits, admits_client_time, admits_historical_time, advances, automatic_time, historical_time};
 use vstd::prelude::*;
 
 verus! {
@@ -83,6 +83,18 @@ pub fn an_admitted_client_time_leaves_a_following_chronon(previous: Option<i64>,
         let next = automatic_time(Some(candidate), next_log);
         assert(next.is_some());
     }
+}
+
+pub fn a_proposal_slot_checks_the_observation_independently_of_append() {
+    let accepted = clock_slot_admits(3, 5, 60, 80, 99, 80);
+    let before_window = clock_slot_admits(3, 5, 60, 80, 99, 79);
+    let at_end = clock_slot_admits(3, 5, 60, 80, 99, 1000080);
+    assert(accepted && !before_window && !at_end);
+}
+
+pub fn an_observation_cannot_authorize_a_history_time_ahead_of_append() {
+    let accepted = clock_slot_admits(3, 5, 60, 80, 79, 80);
+    assert(!accepted);
 }
 
 }
