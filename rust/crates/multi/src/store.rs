@@ -1706,9 +1706,6 @@ pub async fn run_reaper(
                                 Err(error) => eprintln!("The reaper could not open the provider inventory: {}", error.code),
                             }
                         }
-                        if references.is_ok() {
-                            reap_remote_paths(bucket.as_ref(), &deployments, now, grace).await;
-                        }
                     }
                     drop(maintenance);
                     if let Some(keys) = keys.as_deref() {
@@ -1895,8 +1892,9 @@ pub(crate) async fn with_source_lineage<T>(directory: &dyn Directory, lineage: O
     result.and_then(|value| released.map(|_| value))
 }
 
-/// Withdraws released inherited references in hosted storage.
-/// The local eraser requires the local-volume and lineage admission used by the maintenance task.
+/// Exercises logical reference withdrawal for simulation and negative controls.
+/// The hosted maintenance task settles only exact grants. The local eraser
+/// requires the local-volume and lineage admission used by that task.
 ///
 /// ```compile_fail
 /// use rtdb_multi::store::reap_as_of;
@@ -1922,6 +1920,7 @@ pub(crate) async fn with_source_lineage<T>(directory: &dyn Directory, lineage: O
 ///     let _ = simulate_reap_cell(bucket, &[], 0, Duration::ZERO);
 /// }
 /// ```
+#[doc(hidden)]
 pub async fn reaper_pass(bucket: &dyn ObjectStore, deployments: &[DeploymentRecord], now_ms: i64, grace: Duration) -> Result<Vec<Result<Reaped>>> {
     Ok(reap_remote_paths(bucket, deployments, now_ms, grace).await)
 }

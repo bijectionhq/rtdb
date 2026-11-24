@@ -215,3 +215,8 @@ the exact witness inode and acquiring its lock. The catalog update compares
 the ticket and witness identity before removing it. A missing or different
 witness confers no authority. Unsealed providers continue to require normal
 release until they have a shared drain authority.
+
+Hosted maintenance does not use the raw-path grace sweep for inherited
+manifests. A path-only marker leaves the declared source edge in place
+until the held dependency can be withdrawn with exact custody evidence.
+The local-volume maintenance path still has a grace fallback.
