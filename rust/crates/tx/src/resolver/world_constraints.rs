@@ -28,8 +28,15 @@ pub struct AssertionFenceClaim<'a> {
     pub durable_predecessor: Option<rtdb_types::TransactionKey>,
     pub family: [u8; 16],
     pub marker: rtdb_types::AssertionFamilyFenceMarker,
-    pub retirement_world: Option<Iid>,
+    pub winner: Option<AssertionFenceWorldWinner<'a>>,
+    pub root_carrier: Option<&'a [u8]>,
     pub root_erases: &'a BTreeSet<(&'a OwnedRelation, &'a EntityId)>,
+}
+
+pub struct AssertionFenceWorldWinner<'a> {
+    pub world: Iid,
+    pub key: &'a str,
+    pub carrier: &'a [u8],
 }
 
 pub struct ArchivedWorldConstraints<'a> {

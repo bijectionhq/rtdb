@@ -780,7 +780,7 @@ mod tests {
         };
         families.enroll_original(family, crate::keys::EnrolledWorldRow {
             world: Uuid::from_bytes(original.position.line_generation), assertion: original.assertion,
-            capability: original.capability, scope_commitment: [9; 32], codec: 1,
+            capability: original.capability, scope_commitment: [9; 32], slot_commitment: [8; 32], codec: 1,
         }).await?;
         families.register(family, original).await?;
         families.reserve_landing(family, pending).await?;

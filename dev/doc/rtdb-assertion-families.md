@@ -193,9 +193,26 @@ The plan leaves the vault and source unchanged.
 The retiring transaction must take a claim over this inventory before it can order an immutable marker.
 The claim freezes the family record under its vault compare-and-swap and binds the exact placed source attempt.
 The checked insert targets `bj_fact_assertion_family_fences` with the family UUID as 32 lowercase hexadecimal characters and a null expectation.
-Its binary `body` is version 1 (u8), selected `position`, order `uuid` and inventory digest (32).
+Hosted protocol 220 encodes its binary `body` as version 2 (u8), stable member `position`, winning carrier `position`, order `uuid` and inventory digest (32), in 113 bytes.
 Each Root inventory entry requires an erase of its named relation and exact UTF-8 row key in the same transaction.
-The same transaction carries a `fact_unit_fences` row on the selected line with `unit_phase` set to the erasing state and `assertion_vault_inventory` set to the same digest.
+Each erased Root relation requires its `fact_sealed_search_erasures` marker.
+Only selectors authenticated by the family claim can erase a live indexed Root search relation through this route.
+The resulting purge frontier revokes older held ranked reads, while physical search-run withdrawal follows the existing retention path.
+The same transaction carries an all-time `fact_unit_fences` row on the winning carrier's line with `unit_phase` set to the erasing state and `assertion_vault_inventory` set to the same digest.
+For a world retirement, the transaction supplies one present observed point check for the same key in its local `fact_unit_column_payloads` overlay.
+The resolver rereads that exact witnessed valid instant against the current ordered base.
+It rejects ambiguous present witnesses and authenticates the winning carrier's physical world, publication and positive ordinal, the observed point version, and its sealed payload at the enrolled slot.
+The original vault checks that the carrier belongs to the stable bound member from `ResolveFamilyMember.v1`.
+A rewrite can have a different authoring line from its registered member.
+A Root retirement supplies the active Root member in both position fields.
+The ordered resolver reads the current Root carrier at the retiring fence identity and verifies its publication.
+The original vault verifies that carrier's family, stage, destination assertion, target, payload digest and link digest against the exact accepted Root binding before it claims the fence.
+The source refuses world winners that exist only in an inherited layer.
+A nonterminal controlled Proposal retirement with Root erases uses world-batch Root kind 8.
+Its Root publication section has the same hold and independent attempt as kind 2.
+It retains the controlled Proposal receipt and overlay checks and admits the family marker, the exact planned Root erases, and their sealed-search erasure markers.
+A controlled Proposal retirement without Root selectors uses kind 5.
+Clients gate both new wire layouts on Flight advertising `rtdb.owned.DecideHeldWorlds.v3` and `ResolveFamilyMember.v1`. The hosted artifact floor is 220. The prepared landing switch keeps its action and wire.
 At most one family fence can order in a transaction.
 The source resolver validates the installed authority, the marker's absence, the retirement obligation, and the exact Root selectors before claiming the unchanged inventory.
 Original-authority marker reads use a current source barrier for both ordinary and archive release.
@@ -224,7 +241,10 @@ The fixed assertion profile is not installed on hosted cells, so this action is 
 
 A Bijection Root carrier contains the existing unit-sealed payload inside an assertion envelope sealed by the RTDB broker under the reservation's fresh destination stage.
 The Root unit fence and the original family fence both govern release.
-The landing authority verifies equivalent effective disclosure, including access to the Proposal and world, before probing or opening the source.
+The landing authority verifies that Proposal and Root have the same installed payload audience before probing or opening the source.
+This comparison includes the effective world payload-read gate at the reviewed source and the installed payload-read authority at Root.
+Matching label strings alone does not establish equality.
+Proposal authoring, review and approval grants give no payload-read standing.
 The receipt, destination and branch retirement share the prepared-generation switch at the protected publication label.
 The receipt stores the sealed link under the distinct link stage; the Root carrier requires only the destination stage.
 

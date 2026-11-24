@@ -102,7 +102,7 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
         }
         if let Some((relation, rows)) = operation.owned_documents() && rows > 0 {
             selected.entry(relation.world().unwrap_or(ROOT)).or_default().insert(relation.name());
-        } else if let Operation::Public(TxOp::OwnedDelete { relation, .. }) = operation {
+        } else if let Operation::Public(TxOp::OwnedDelete { relation, .. } | TxOp::OwnedErase { relation, .. }) = operation {
             selected.entry(ROOT).or_default().insert(relation.name());
         }
     }
@@ -170,7 +170,7 @@ pub(crate) fn source_inventory(operations: &[Operation]) -> Result<Vec<Value>> {
 
 pub(super) fn verify(
     tables: &BTreeMap<TableRef, TableWrite>, effects: &[Value], key: TransactionKey,
-    memory: &Arc<MemoryBudget>,
+    memory: &Arc<MemoryBudget>, family_fence: bool,
 ) -> Result<HostedEffects> {
     if !(1..=9).contains(&effects.len()) { return Err(mismatch()); }
     let mut worlds = BTreeMap::new();
@@ -195,7 +195,8 @@ pub(super) fn verify(
         if fields.len() != 5 + usize::from(kind == Kind::TimedOverlay) || relations.is_empty() == kind.writes_data()
             || (world == ROOT) != (kind == Kind::Root) || fingerprint.len() != 32
             || attempt.len() != 22 || !attempt.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::ProposalOverlay | Kind::Fork | Kind::RootHeldFork | Kind::ControlsHeldFork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose))
+            || (effects.len() > 1 && kind == Kind::ProposalOverlay && !(family_fence && effects.len() == 2))
+            || (effects.len() > 1 && matches!(kind, Kind::ProposalSettlement | Kind::Fork | Kind::RootHeldFork | Kind::ControlsHeldFork | Kind::RootRetainedFork | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ControlsRetainedFork | Kind::ProposalControlsFork | Kind::ProposalRootFork | Kind::ProposalRootHold | Kind::ProposalRootShorten | Kind::Advance | Kind::ControlsRetainedDrop | Kind::RootRetainedDrop | Kind::ProposalLanding | Kind::ProposalClose))
             || (matches!(kind, Kind::RootRetainedDrop | Kind::ProposalClose | Kind::RootRetainedAdvance | Kind::RootRetainedRenewal | Kind::RootRetainedSibling | Kind::ProposalRootHold | Kind::ProposalRootShorten) && relations.len() != 1)
             || common_fingerprint.is_some_and(|first| first != fingerprint.as_slice())
             || worlds.insert(world, kind).is_some()
@@ -244,7 +245,9 @@ pub(super) fn verify(
         common_fingerprint = Some(fingerprint);
     }
     let separate_root = worlds.contains_key(&ROOT);
-    if separate_root && worlds.len() == 1 || worlds.len() - usize::from(separate_root) > 8 {
+    if separate_root && worlds.len() == 1 || worlds.len() - usize::from(separate_root) > 8
+        || worlds.len() > 1 && matches!(hosted, HostedEffects::ProposalOverlay) && !separate_root
+    {
         return Err(mismatch());
     }
     let delete_root = worlds.values().any(|kind| matches!(kind, Kind::RootRetainedDrop | Kind::ProposalRootShorten | Kind::ProposalClose));
@@ -263,6 +266,11 @@ pub(super) fn verify(
     let mut overlays = BTreeSet::new();
     let mut clocks = BTreeSet::new();
     let mut registrations = BTreeSet::new();
+    let controlled_root = separate_root && matches!(hosted, HostedEffects::ProposalOverlay);
+    let mut root_erases = BTreeSet::new();
+    let mut search_erase_markers = BTreeSet::new();
+    let mut purge_markers = BTreeSet::new();
+    let mut purge_floors = BTreeSet::new();
     for (table, write) in tables {
         let Some(name) = table.owned_storage_name() else { continue; };
         let batch = write.batch().filter(|batch| !batch.is_empty()).ok_or_else(mismatch)?;
@@ -341,13 +349,40 @@ pub(super) fn verify(
                 }
                 Ok(())
             })?;
+        } else if let Some((relation, floor)) = table.owned_purge_relation() {
+            let selected = OwnedRelation::new(relation).map_err(|_| mismatch())?;
+            if !family_fence || !separate_root || !expected_data.contains(relation)
+                || !crate::hosted_control::family_root_erase(&selected)
+            {
+                return Err(mismatch());
+            }
+            if floor {
+                purge_floors.insert(relation);
+                for index in 0..batch.len() {
+                    let header = batch.header(index)?;
+                    if header.op != EventOp::Put || header.system_from != key.system_time
+                        || header.valid_time != Interval::ALL
+                    {
+                        return Err(mismatch());
+                    }
+                }
+            } else {
+                purge_markers.insert(relation);
+                if batch.len() != 1 { return Err(mismatch()); }
+                records(batch, key, memory, |row| {
+                    if row.len() != 1 || row.get("_id") != Some(&Value::I64(key.tx_id.0)) {
+                        return Err(mismatch());
+                    }
+                    Ok(())
+                })?;
+            }
         } else if let Some(relation) = table.owned_root_constraint_relation() {
             if !has_root || !expected_data.contains(relation) || relation == OWNED_ROOT_PUBLICATION_RELATION
                 || OwnedRelation::new(relation).is_err()
             {
                 return Err(mismatch());
             }
-            event_headers(batch, key, true)?;
+            event_headers(batch, key, true, false)?;
         } else {
             let relation = table.owned_effect_relation_name().ok_or_else(mismatch)?;
             let is_data = name == relation;
@@ -387,6 +422,16 @@ pub(super) fn verify(
                         Ok(())
                     })?;
                 }
+                if family_fence && separate_root && relation == "fact_sealed_search_erasures" {
+                    records_with_limit(batch, key, memory, 4096, |row| {
+                        if row.len() != 1 || !matches!(row.get("_id"), Some(Value::Utf8(id))
+                            if search_erase_markers.insert(id.clone()))
+                        {
+                            return Err(mismatch());
+                        }
+                        Ok(())
+                    })?;
+                }
                 data.insert(relation);
             } else if table.is_owned_change_journal() {
                 journals.insert(relation);
@@ -408,10 +453,23 @@ pub(super) fn verify(
                     }
                 }
             }
-            event_headers(batch, key, allows_delete && !root_holder_replace && !landed)?;
+            let allows_erase = family_fence && separate_root && allows_delete && relation.ends_with("_search");
+            if controlled_root && is_data && world.is_none()
+                && !matches!(relation, OWNED_ROOT_PUBLICATION_RELATION | "fact_sealed_search_erasures")
+            {
+                for index in 0..batch.len() {
+                    if !allows_erase || batch.header(index)?.op != EventOp::Erase { return Err(mismatch()); }
+                }
+            }
+            if event_headers(batch, key, allows_delete && !root_holder_replace && !landed, allows_erase)? {
+                root_erases.insert(relation);
+            }
         }
     }
-    if (landed && (landed_rows == 0 || publication_frontiers.len() > landed_rows
+    if root_erases != purge_markers || root_erases != purge_floors
+        || !root_erases.iter().copied().eq(search_erase_markers.iter().map(String::as_str))
+        || (controlled_root && root_erases.is_empty())
+        || (landed && (landed_rows == 0 || publication_frontiers.len() > landed_rows
         || !landed_positions.into_iter().eq(1..=landed_rows as u32)))
         || !attempts.is_empty() || root_head != has_root || data != expected_data
         || !journals.remove(OWNED_ATTEMPT_RELATION) || journals != expected_data
@@ -439,16 +497,19 @@ pub(super) enum HostedEffects {
     ProposalHold,
 }
 
-fn event_headers(batch: &IndexBatch, key: TransactionKey, allows_delete: bool) -> Result<()> {
+fn event_headers(batch: &IndexBatch, key: TransactionKey, allows_delete: bool, allows_erase: bool) -> Result<bool> {
+    let mut erased = false;
     for index in 0..batch.len() {
         let header = batch.header(index)?;
         if header.system_from != key.system_time
-            || !(header.op == EventOp::Put || allows_delete && header.op == EventOp::Delete)
+            || !(header.op == EventOp::Put || allows_delete && header.op == EventOp::Delete
+                || allows_erase && header.op == EventOp::Erase && header.valid_time == Interval::ALL)
         {
             return Err(mismatch());
         }
+        erased |= header.op == EventOp::Erase;
     }
-    Ok(())
+    Ok(erased)
 }
 
 fn records(

@@ -28,7 +28,7 @@ mod unit;
 pub use rtdb_storage::sealing::{UnitOperation, UnitOutput};
 pub use unit::{UnitScope, UnitSlot};
 pub(crate) use unit::UnitLedger;
-pub(crate) use assertion::family::{assertion_root_line, family_vault_address, world_row_scope};
+pub(crate) use assertion::family::{assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment};
 pub use assertion::family::{AssertionFamilies, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation, WorldRowSlot};
 pub use assertion::issuer::{AssertionIngressTicket, AssertionIssuerScope, AssertionIssuers};
 pub use assertion::{AssertionAuthoring, AssertionBackup, AssertionEnvelope, AssertionKeyService, AssertionStage};

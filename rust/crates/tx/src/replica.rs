@@ -166,17 +166,23 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
         match (archive_replay, world_effects) {
             (true, None | Some(Value::Undefined | Value::Null)) => {
                 let proof = proof.ok_or_else(|| invalid("Resolved archive replay has no placed attempt"))?;
-                verify_hosted_controls(proof, &controls, key)?;
+                verify_hosted_controls(proof, &controls, key, memory)?;
                 verify_archive_replay(&tables, key, memory)?;
             }
             (true, Some(_)) => return Err(invalid("Resolved archive replay mixes live and copied world effects")),
             (false, Some(Value::List(effects))) => {
                 let effects = effects.scalar_values().ok_or_else(|| invalid("Resolved world effects have an invalid layout"))?;
-                let hosted = worlds::verify(&tables, effects, key, memory)?;
+                let family_fence = controls.iter().any(|(table, _)| {
+                    table.schema == "public" && table.table == rtdb_types::ASSERTION_FAMILY_FENCES
+                });
+                let hosted = worlds::verify(&tables, effects, key, memory, family_fence)?;
+                let ordinary_control_rows = || controls.iter()
+                    .filter(|(table, _)| table.table != rtdb_types::ASSERTION_FAMILY_FENCES)
+                    .filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>();
                 let has_controls = !controls.is_empty()
                     || proof.is_some_and(|proof| proof.contains_key(crate::hosted_control::CONTROL_TABLES));
                 match hosted {
-                    worlds::HostedEffects::CheckOnly if has_controls =>
+                    worlds::HostedEffects::CheckOnly if has_controls && !(family_fence && controls.len() == 1) =>
                         return Err(invalid("Resolved world effects may only check hosted controls")),
                     worlds::HostedEffects::ProposalClose if !(4..=7).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
@@ -190,9 +196,7 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
                     worlds::HostedEffects::ProposalHold if !(1..=6).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved Proposal hold differs from its bounded control replacements")),
-                    worlds::HostedEffects::ProposalOverlay if !(1..=6).contains(
-                        &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
-                    ) => return Err(invalid("Resolved Proposal settlement differs from its bounded control replacements")),
+                    worlds::HostedEffects::ProposalOverlay if !(1..=6).contains(&ordinary_control_rows()) => return Err(invalid("Resolved Proposal settlement differs from its bounded control replacements")),
                     worlds::HostedEffects::RetainedWrite if !(1..=5).contains(
                         &controls.iter().filter_map(|(_, write)| write.batch()).map(|batch| batch.len()).sum::<usize>()
                     ) => return Err(invalid("Resolved world write differs from its bounded control replacements")),
@@ -200,7 +204,7 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
                 }
                 if has_controls {
                     let proof = proof.ok_or_else(|| invalid("Resolved hosted controls require a placed attempt"))?;
-                    verify_hosted_controls(proof, &controls, key)?;
+                    verify_hosted_controls(proof, &controls, key, memory)?;
                 }
             }
             (false, Some(Value::Undefined | Value::Null) | None) => {
@@ -211,7 +215,7 @@ fn decode(message: &ResolvedTx, predecessor: Option<TransactionKey>, block: Bloc
                     let proof = proof.filter(|_| owned_scopes.contains(&(false, None))).ok_or_else(|| {
                         invalid("Resolved hosted controls require one placed owned root")
                     })?;
-                    verify_hosted_controls(proof, &controls, key)?;
+                    verify_hosted_controls(proof, &controls, key, memory)?;
                 }
             }
             (false, Some(_)) => return Err(invalid("Invalid placed world inventory carrier")),
@@ -389,6 +393,7 @@ fn verify_proposal_landing_controls(
 
 fn verify_hosted_controls(
     proof: &StructFields<Value>, controls: &[(&TableRef, &TableWrite)], key: TransactionKey,
+    memory: &Arc<MemoryBudget>,
 ) -> Result<()> {
     use crate::hosted_control::{CONTROL_TABLES, admits_name};
 
@@ -415,6 +420,22 @@ fn verify_hosted_controls(
             .batch()
             .filter(|batch| !batch.is_empty())
             .ok_or_else(mismatch)?;
+        if table.table == rtdb_types::ASSERTION_FAMILY_FENCES {
+            use rtdb_types::AssertionFamilyFenceMarker;
+
+            if batch.len() != 1 { return Err(mismatch()); }
+            let bound = batch.arrow().get_array_memory_size().saturating_mul(4).saturating_add(8192);
+            let _charge = memory.reserve(bound)?;
+            let StoredOperation::Put(row) = batch.view().read_event(0)?.operation
+            else { return Err(mismatch()); };
+            let (Some(Value::Utf8(family)), Some(Value::Binary(body))) = (row.get("_id"), row.get("body"))
+            else { return Err(mismatch()); };
+            if row.len() != 2 || AssertionFamilyFenceMarker::family_id(family).is_err()
+                || AssertionFamilyFenceMarker::decode(body).is_err()
+            {
+                return Err(mismatch());
+            }
+        }
         for index in 0..batch.len() {
             let row = batch.header(index)?;
             if row.op != EventOp::Put

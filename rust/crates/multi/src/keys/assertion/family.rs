@@ -146,17 +146,25 @@ pub(crate) fn family_vault_address(deployment: Uuid, family: Uuid) -> Uuid {
 }
 
 pub(crate) fn world_row_scope(slot: WorldRowSlot<'_>, disclosure: &[u8; 32]) -> [u8; 32] {
+    let mut scope = world_row_commitment(slot, b"rtdb.owned/world-overlay-row/v1\0");
+    scope.update(disclosure);
+    scope.finish().as_ref().try_into().expect("SHA-256 commitment")
+}
+
+pub(crate) fn world_row_slot_commitment(slot: WorldRowSlot<'_>) -> [u8; 32] {
+    world_row_commitment(slot, b"rtdb.owned/world-overlay-slot/v1\0")
+        .finish().as_ref().try_into().expect("SHA-256 commitment")
+}
+
+fn world_row_commitment(slot: WorldRowSlot<'_>, domain: &[u8]) -> Context {
     let mut scope = Context::new(&SHA256);
-    scope.update(b"rtdb.owned/world-overlay-row/v1\0");
+    scope.update(domain);
     scope.update(slot.world.as_bytes());
     for field in [slot.relation.as_bytes(), slot.key] {
         scope.update(&(field.len() as u16).to_be_bytes());
         scope.update(field);
     }
-    scope.update(disclosure);
-    let mut commitment = [0; 32];
-    commitment.copy_from_slice(scope.finish().as_ref());
-    commitment
+    scope
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -236,6 +244,7 @@ pub struct EnrolledWorldRow {
     pub assertion: AssertionId,
     pub capability: AssertionStage,
     pub scope_commitment: [u8; 32],
+    pub slot_commitment: [u8; 32],
     pub codec: u32,
 }
 
@@ -278,6 +287,18 @@ impl Family {
     fn contains(&self, position: Position) -> bool {
         self.original_at(position)
             || self.landings.iter().any(|landing| landing.accepted.as_ref().is_some_and(|accepted| accepted.position == position))
+    }
+
+    fn admitted_member(&self, assertion: AssertionId) -> Option<FamilyOccurrence> {
+        if self.original.assertion == assertion {
+            return Some(FamilyOccurrence {
+                position: self.original_position?.0, assertion, capability: self.original.capability,
+            });
+        }
+        let landing = self.landings.iter().find(|landing| landing.reservation.destination == assertion)?;
+        Some(FamilyOccurrence {
+            position: landing.accepted.as_ref()?.position, assertion, capability: landing.reservation.capability,
+        })
     }
 
     fn has_member(&self, assertion: AssertionId) -> bool {
@@ -510,15 +531,7 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn resolve_member(&self, family: Uuid, assertion: AssertionId) -> Result<FamilyOccurrence> {
         let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
-        let occurrence = if record.original.assertion == assertion {
-            let position = record.original_position.ok_or_else(conflict)?.0;
-            FamilyOccurrence { position, assertion, capability: record.original.capability }
-        } else {
-            let landing = record.landings.iter().find(|landing| landing.reservation.destination == assertion)
-                .ok_or_else(conflict)?;
-            let position = landing.accepted.as_ref().ok_or_else(conflict)?.position;
-            FamilyOccurrence { position, assertion, capability: landing.reservation.capability }
-        };
+        let occurrence = record.admitted_member(assertion).ok_or_else(conflict)?;
         self.require_position_open(occurrence.position).await?;
         Ok(occurrence)
     }
@@ -621,6 +634,7 @@ impl<'a> AssertionFamilies<'a> {
     pub async fn claim_fence(
         &self, family: Uuid, client_family: Uuid, marker: AssertionFamilyFenceMarker, attempt: PlacedAttempt,
         source_predecessor: Option<rtdb_types::TransactionKey>, root_erases: &BTreeSet<(&OwnedRelation, &EntityId)>,
+        winner: Option<(rtdb_node::AssertionFenceWorldWinner<'_>, &dyn AssertionKeyService)>,
     ) -> Result<()> {
         let pending = PendingFence {
             client_family, attempt: attempt.encode().to_vec(), marker: marker.to_bytes().to_vec(),
@@ -642,6 +656,11 @@ impl<'a> AssertionFamilies<'a> {
             if !record.contains(marker.selected) {
                 return Err(conflict());
             }
+            if let Some((winner, keys)) = &winner {
+                self.authenticate_fence_winner(&record, client_family, marker, winner, *keys).await?;
+            } else if marker.selected != marker.winner {
+                return Err(conflict());
+            }
             let fence = record.fence_inventory(marker.order);
             let roots = fence.derived.iter().filter(|row| row.world.is_none());
             if marker.inventory != fence.vault_inventory() || roots.clone().count() != root_erases.len() {
@@ -660,6 +679,47 @@ impl<'a> AssertionFamilies<'a> {
             }
         }
         Err(contention())
+    }
+
+    async fn authenticate_fence_winner(
+        &self, record: &Family, family: Uuid, marker: AssertionFamilyFenceMarker,
+        winner: &rtdb_node::AssertionFenceWorldWinner<'_>, keys: &dyn AssertionKeyService,
+    ) -> Result<()> {
+        let carrier = winner.carrier.strip_prefix(b"BJWC1").ok_or_else(conflict)?;
+        let (carrier_family, carrier) = carrier.split_first_chunk::<16>().ok_or_else(conflict)?;
+        let (stage, carrier) = carrier.split_first_chunk::<40>().ok_or_else(conflict)?;
+        let (assertion, carrier) = carrier.split_first_chunk::<32>().ok_or_else(conflict)?;
+        let (member, envelope) = carrier.split_first_chunk::<32>().ok_or_else(conflict)?;
+        let assertion = AssertionId::from_bytes(*assertion);
+        let member = AssertionId::from_bytes(*member);
+        let world = Uuid::from_bytes(winner.world.0);
+        let slot = WorldRowSlot { world, relation: "fact_unit_column_payloads", key: winner.key.as_bytes() };
+        if carrier_family != family.as_bytes() || winner.key.len() > usize::from(u16::MAX)
+            || record.admitted_member(member).is_none_or(|occurrence| occurrence.position != marker.selected)
+        {
+            return Err(conflict());
+        }
+
+        let enrolled = if assertion == record.original.assertion {
+            if member != assertion || marker.winner != marker.selected { return Err(conflict()); }
+            &record.original
+        } else {
+            if marker.winner == marker.selected { return Err(conflict()); }
+            &record.rewrites.iter().find(|rewrite| rewrite.member == member && rewrite.row.assertion == assertion)
+                .ok_or_else(conflict)?.row
+        };
+        let capability = enrolled.capability;
+        let stage_matches = &stage[..16] == capability.deployment().as_bytes()
+            && stage[16..24] == capability.incarnation().get().to_be_bytes()
+            && &stage[24..] == capability.identity().as_bytes();
+        if enrolled.world != world || !stage_matches || enrolled.slot_commitment != world_row_slot_commitment(slot)
+            || enrolled.codec != u32::from_be_bytes(*b"BJWR")
+        {
+            return Err(conflict());
+        }
+        let form = AssertionAuthoring { assertion_id: assertion, scope_commitment: enrolled.scope_commitment, codec: enrolled.codec };
+        keys.open_assertion_for_resolution(capability, form, &self.region, Bytes::copy_from_slice(envelope).try_into()?).await?;
+        Ok(())
     }
 
     /// The selected original, or any active landed copy, closes the same
@@ -901,7 +961,7 @@ mod tests {
         EnrolledWorldRow {
             world: Uuid::from_bytes(original.position.line_generation),
             assertion: original.assertion, capability: original.capability,
-            scope_commitment: [9; 32], codec: 1,
+            scope_commitment: [9; 32], slot_commitment: [8; 32], codec: 1,
         }
     }
 
@@ -1069,16 +1129,67 @@ mod tests {
         families.register(family, original).await?;
         let order = Uuid::new_v4();
         let plan = families.plan_fence(family, original.position, order).await?;
-        let marker = AssertionFamilyFenceMarker { selected: original.position, order, inventory: plan.vault_inventory() };
+        let marker = AssertionFamilyFenceMarker { selected: original.position, winner: original.position, order, inventory: plan.vault_inventory() };
         let attempt = PlacedAttemptScope::new("assertion-fence", 1)?.issue().identify(SourcePosition(2), Some("owner"))?;
         let roots = BTreeSet::new();
         let stale = AssertionFamilyFenceMarker { inventory: [0; 32], ..marker };
-        assert!(families.claim_fence(family, family, stale, attempt, None, &roots).await.is_err());
+        assert!(families.claim_fence(family, family, stale, attempt, None, &roots, None).await.is_err());
         families.require_live_occurrence(family, original).await?;
-        families.claim_fence(family, family, marker, attempt, None, &roots).await?;
-        families.claim_fence(family, family, marker, attempt, None, &roots).await?;
+        families.claim_fence(family, family, marker, attempt, None, &roots, None).await?;
+        families.claim_fence(family, family, marker, attempt, None, &roots, None).await?;
         assert!(families.require_live_occurrence(family, original).await.is_err());
         assert!(families.fence(family, original.position, order).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_fence_binds_the_registered_member_and_the_exact_local_slot() -> Result<()> {
+        use rtdb_types::{Iid, PlacedAttemptScope, SourcePosition};
+
+        let directory = tempfile::tempdir().unwrap();
+        let vault = LocalKeyService::with_archive_broker(directory.path())?;
+        let region = IoRegion::new();
+        let families = vault.assertion_families(Arc::clone(&region)).unwrap();
+        let family = Uuid::new_v4();
+        let realm = Uuid::new_v4();
+        let original = FamilyOccurrence {
+            position: position(1), assertion: AssertionId::from_bytes([1; 32]), capability: stage(realm),
+        };
+        families.enroll_original(family, enrolment(original)).await?;
+        families.register(family, original).await?;
+        let world = Uuid::new_v4();
+        let slot = WorldRowSlot { world, relation: "fact_unit_column_payloads", key: b"exact-slot" };
+        let rewrite = EnrolledWorldRow {
+            world, assertion: AssertionId::from_bytes([2; 32]), capability: stage(realm),
+            scope_commitment: world_row_scope(slot, &[3; 32]),
+            slot_commitment: world_row_slot_commitment(slot),
+            codec: u32::from_be_bytes(*b"BJWR"),
+        };
+        families.enroll_rewrite(family, original.assertion, rewrite).await?;
+        let authoring = AssertionAuthoring {
+            assertion_id: rewrite.assertion, scope_commitment: rewrite.scope_commitment, codec: rewrite.codec,
+        };
+        let envelope = Bytes::from(vault.seal_assertion_stage(
+            rewrite.capability, authoring, &region, Bytes::from_static(b"rewritten row"),
+        ).await?);
+        let mut carrier = b"BJWC1".to_vec();
+        carrier.extend_from_slice(family.as_bytes());
+        carrier.extend_from_slice(realm.as_bytes());
+        carrier.extend_from_slice(&rewrite.capability.incarnation().get().to_be_bytes());
+        carrier.extend_from_slice(rewrite.capability.identity().as_bytes());
+        carrier.extend_from_slice(&rewrite.assertion.to_bytes());
+        carrier.extend_from_slice(&original.assertion.to_bytes());
+        carrier.extend_from_slice(&envelope);
+        let plan = families.plan_fence(family, original.position, Uuid::new_v4()).await?;
+        let marker = AssertionFamilyFenceMarker {
+            selected: original.position, winner: Position { line_generation: *world.as_bytes(), ..position(2) },
+            order: plan.order, inventory: plan.vault_inventory(),
+        };
+        let attempt = PlacedAttemptScope::new("assertion-fence", 1)?.issue().identify(SourcePosition(2), Some("owner"))?;
+        let proof = |key| rtdb_node::AssertionFenceWorldWinner { world: Iid(*world.as_bytes()), key, carrier: &carrier };
+        let roots = BTreeSet::new();
+        assert!(families.claim_fence(family, family, marker, attempt, None, &roots, Some((proof("wrong-slot"), &vault))).await.is_err());
+        families.claim_fence(family, family, marker, attempt, None, &roots, Some((proof("exact-slot"), &vault))).await?;
         Ok(())
     }
 

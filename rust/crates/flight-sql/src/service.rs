@@ -586,7 +586,13 @@ impl FlightService for Service {
             && !call.session.fresh_replica && call.session.audience_source().is_none();
         let hosted_upload = self.supports_hosted_upload(&call)
             .then_some(crate::owned_actions::DECIDE_HOSTED_STREAM_V1);
+        let hosted_worlds = self.0.config.owned_world_host.is_some() && self.supports_hosted_upload(&call);
+        let hosted_world_actions = [
+            crate::owned_actions::DECIDE_HELD_WORLDS_V3,
+            crate::owned_family::RESOLVE_FAMILY_MEMBER_V1,
+        ];
         result_stream(call, actions.into_iter().chain(crate::v1::ACTIONS)
+            .chain(hosted_world_actions.into_iter().filter(|_| hosted_worlds))
             .chain(catalog_actions.into_iter().filter(|_| catalog_enabled))
             .chain(hosted_upload)
             .map(|name| Ok(flight::ActionType { r#type: name.into(), description: name.into() })).collect())

@@ -1307,6 +1307,22 @@ mod retained_release_tests {
             relation: facts, id, valid_at: Timestamp(10), expected: None,
         }));
         assert_eq!(hosted_proposal_overlay(&operations), Some(world));
+        let search = OwnedRelation::new("protected_search")?;
+        operations.extend([
+            TxOp::HostedControl(HostedControlWrite::new(
+                OwnedRelation::new(rtdb_types::ASSERTION_FAMILY_FENCES)?, scope, None, control("family"),
+            )?),
+            TxOp::OwnedPublishRoot { attempt: "1".repeat(22), fingerprint: [1; 32] },
+            TxOp::OwnedErase { relation: search.clone(), id: EntityId::String("protected".into()) },
+        ].into_iter().map(Operation::Public));
+        assert_eq!(hosted_proposal_overlay(&operations), None);
+        operations.push(Operation::Public(TxOp::OwnedReplaceDocs {
+            relation: OwnedRelation::new("fact_sealed_search_erasures")?,
+            documents: crate::Documents::new(vec![control(search.name())], &memory)?,
+            valid_from: Some(Timestamp::MIN), valid_to: None,
+        }));
+        assert_eq!(hosted_proposal_overlay(&operations), Some(world));
+        operations.truncate(6);
         operations.remove(4);
         assert_eq!(hosted_proposal_overlay(&operations), None);
         operations.push(Operation::Public(TxOp::OwnedCheckWorldPurge {
@@ -1687,9 +1703,14 @@ pub fn proposal_overlay_controls<'a>(
     let mut existing = 0;
     let mut replacements = 0;
     let mut budget = false;
+    let mut family = false;
     for control in controls {
         if control.is_check() {
             checks += 1;
+            continue;
+        }
+        if control.is_assertion_family_marker() {
+            if !writes || control.expected().is_some() || std::mem::replace(&mut family, true) { return false; }
             continue;
         }
         if let EntityId::String(id) = control.id() {
@@ -1727,6 +1748,9 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
     let mut controls = Vec::new();
     let mut writes = Vec::new();
     let mut terminal = false;
+    let mut root_publication = false;
+    let mut root_erases = BTreeSet::new();
+    let mut search_markers = BTreeSet::new();
     let mut points = BTreeMap::<_, BTreeSet<_>>::new();
     let mut timelines = BTreeSet::new();
     for operation in operations {
@@ -1746,7 +1770,21 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                 world = Some(*next);
                 terminal = settlement_pin.is_some();
             },
+            Operation::Public(TxOp::OwnedPublishRoot { .. }) if !root_publication => {
+                root_publication = true;
+            }
+            Operation::Public(TxOp::OwnedErase { relation, .. }) if family_root_erase(relation) => {
+                root_erases.insert(relation.name());
+            }
             operation => {
+                if let Some(write) = owned_document_write(operation)
+                    && family_search_erase_marker(&write)
+                {
+                    for row in write.documents.rows() {
+                        if !search_markers.insert(row.string_id()?) { return None; }
+                    }
+                    continue;
+                }
                 let write = proposal_overlay_write(operation)?;
                 let start = match (write.from, write.to) {
                     (None, None) => None,
@@ -1762,6 +1800,13 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
         }
     }
     let world = world?;
+    let family = controls.iter().any(|control| control.is_assertion_family_marker());
+    if root_publication && (!family || terminal || root_erases.is_empty())
+        || !root_publication && !root_erases.is_empty()
+        || root_erases != search_markers
+    {
+        return None;
+    }
     let controls_allowed = proposal_overlay_controls(controls, !terminal);
     (terminal == writes.is_empty() && controls_allowed && writes.into_iter().all(|(relation, id, start, create_only)| {
         relation.world() == Some(world)
@@ -1773,6 +1818,31 @@ pub(crate) fn hosted_proposal_overlay(operations: &[crate::source::Operation]) -
                 }
             })
     })).then_some(world)
+}
+
+pub(crate) fn family_root_erase(relation: &OwnedRelation) -> bool {
+    relation.is_root_data() && relation.name().ends_with("_search")
+}
+
+pub(crate) fn family_search_erase_marker(write: &ProposalOverlayWrite<'_>) -> bool {
+    write.relation.name() == "fact_sealed_search_erasures" && !write.create_only
+        && write.from == Some(Timestamp::MIN) && write.to.is_none_or(|to| to == Timestamp::MAX)
+        && write.documents.row_count() > 0 && write.documents.has_exact_presence()
+        && write.documents.rows().all(|row| row.only_id() && row.string_id().is_some())
+}
+
+/// A separate Root publication in controlled Proposal retirement can only carry family erasure effects.
+pub fn proposal_family_root_write(op: &crate::TxOp) -> bool {
+    use crate::TxOp;
+    let (relation, documents, from, to) = match op {
+        TxOp::OwnedErase { relation, .. } => return family_root_erase(relation),
+        TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to } =>
+            (relation, OwnedDocumentPage::Rows(documents), *valid_from, *valid_to),
+        TxOp::OwnedArrowDocs { relation, documents, valid_from, valid_to, create_only: false } =>
+            (relation, OwnedDocumentPage::Arrow(documents), *valid_from, *valid_to),
+        _ => return false,
+    };
+    family_search_erase_marker(&ProposalOverlayWrite { relation, documents, from, to, create_only: false })
 }
 
 pub(crate) struct ProposalOverlayWrite<'a> {
@@ -1816,7 +1886,7 @@ pub(crate) enum OwnedDocumentRow<'a> {
 }
 
 impl<'a> OwnedDocumentRow<'a> {
-    fn id(&self) -> Result<EntityId> {
+    pub(crate) fn id(&self) -> Result<EntityId> {
         match self {
             Self::Values(row) => row.get("_id").ok_or_else(rtdb_types::OwnedWorld::unavailable)?.entity_id(),
             Self::Arrow(page, row) => page.owned_id(*row),
@@ -1828,7 +1898,7 @@ impl<'a> OwnedDocumentRow<'a> {
         page.legacy_owned_cell(name, row)
     }
 
-    fn string_id(&self) -> Option<&'a str> {
+    pub(crate) fn string_id(&self) -> Option<&'a str> {
         match self {
             Self::Values(row) => match row.get("_id") { Some(Value::Utf8(id)) => Some(id), _ => None },
             Self::Arrow(..) => self.cell("_id").ok().flatten()?.utf8(),
@@ -1873,6 +1943,14 @@ impl<'a> OwnedDocumentRow<'a> {
 pub(crate) fn proposal_overlay_write(
     operation: &crate::source::Operation,
 ) -> Option<ProposalOverlayWrite<'_>> {
+    let write = owned_document_write(operation)?;
+    if matches!(write.documents, OwnedDocumentPage::Arrow(page) if page.legacy_owned_presence().is_none()) {
+        return None;
+    }
+    write.relation.world().map(|_| write)
+}
+
+pub(crate) fn owned_document_write(operation: &crate::source::Operation) -> Option<ProposalOverlayWrite<'_>> {
     use crate::{TxOp, source::Operation};
     let (relation, documents, from, to, create_only) = match operation {
         Operation::Public(TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) =>
@@ -1882,14 +1960,11 @@ pub(crate) fn proposal_overlay_write(
         Operation::OwnedWriteIids { relation, documents, valid_from, valid_to, create_only, .. } =>
             (relation, OwnedDocumentPage::Rows(documents), valid_from, valid_to, *create_only),
         Operation::Public(TxOp::OwnedArrowDocs { relation, documents, valid_from, valid_to, create_only })
-        | Operation::OwnedArrowIids { relation, documents, valid_from, valid_to, create_only, .. }
-            if documents.legacy_owned_presence().is_some() =>
+        | Operation::OwnedArrowIids { relation, documents, valid_from, valid_to, create_only, .. } =>
             (relation, OwnedDocumentPage::Arrow(documents), valid_from, valid_to, *create_only),
         _ => return None,
     };
-    relation.world().map(|_| ProposalOverlayWrite {
-        relation, documents, from: *from, to: *to, create_only,
-    })
+    Some(ProposalOverlayWrite { relation, documents, from: *from, to: *to, create_only })
 }
 
 const PRIVATE_LANDING_RECEIPT: &str = "root_proposal_private_landing:";
