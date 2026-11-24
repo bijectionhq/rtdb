@@ -15,6 +15,51 @@ use crate::error::{cancelled, protocol};
 
 mod history_labels;
 
+const COPY_CHUNK_BYTES: usize = 64 * 1024;
+
+struct CopyChunks {
+    chunks: Vec<Vec<u8>>,
+    frame_bytes: usize,
+}
+
+impl CopyChunks {
+    fn new() -> Self {
+        Self { chunks: Vec::new(), frame_bytes: usize::MAX }
+    }
+
+    fn take_header(&mut self) -> Vec<u8> {
+        self.frame_bytes = COPY_CHUNK_BYTES;
+        self.chunks.pop().expect("Arrow IPC writes one schema frame")
+    }
+
+    fn take_batch(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.chunks)
+    }
+}
+
+impl Write for CopyChunks {
+    fn write(&mut self, mut bytes: &[u8]) -> std::io::Result<usize> {
+        let written = bytes.len();
+        while !bytes.is_empty() {
+            if self.chunks.last().is_none_or(|chunk| chunk.len() == self.frame_bytes) {
+                self.chunks.push(Vec::new());
+            }
+            let chunk = self.chunks.last_mut().expect("A COPY chunk is open");
+            let count = bytes.len().min(self.frame_bytes - chunk.len());
+            let (prefix, rest) = bytes.split_at(count);
+            let capacity = (chunk.len() + count).next_power_of_two();
+            if capacity > chunk.capacity() {
+                chunk.reserve_exact(capacity - chunk.len());
+            }
+            chunk.extend_from_slice(prefix);
+            bytes = rest;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
 /// Encodes each batch while its source buffers are in scope and releases
 /// them before waiting on the connection.
 pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
@@ -35,10 +80,10 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
         CopyOutFormat::HistoryLabelDictionaryV1 => history_labels::HistoryLabels::for_schema(&schema),
     };
     let wire_schema = labels.as_ref().map_or(&schema, |labels| labels.schema.as_ref());
-    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), wire_schema)
+    let mut encoder = arrow_ipc::writer::StreamWriter::try_new(CopyChunks::new(), wire_schema)
         .map_err(arrow_output_error)?;
     wire.send(b'H', &[1, 0, 1, 0, 1]).await?;
-    wire.send(b'd', &std::mem::take(encoder.get_mut())).await?;
+    wire.send(b'd', &encoder.get_mut().take_header()).await?;
     wire.flush().await?;
     let mut count = 0u64;
     loop {
@@ -56,24 +101,24 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
             let reservation = memory.reserve(bytes)?;
             let out = if labels.is_some() {
                 // A fresh tracker emits replacement dictionaries without retaining spellings across delivery grants.
-                let mut page = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), wire_schema)
+                let mut page = arrow_ipc::writer::StreamWriter::try_new(CopyChunks::new(), wire_schema)
                     .map_err(arrow_output_error)?;
-                page.get_mut().clear();
+                page.get_mut().take_header();
                 page.write(batch).map_err(arrow_output_error)?;
-                std::mem::take(page.get_mut())
+                page.get_mut().take_batch()
             } else {
                 encoder.write(batch).map_err(arrow_output_error)?;
-                std::mem::take(encoder.get_mut())
+                encoder.get_mut().take_batch()
             };
             Ok((batch.num_rows() as u64, out, reservation))
         }).await?;
         let Some(encoded) = encoded else { break };
-        let (rows, bytes, _reservation) = encoded.inspect_err(|_| cursor.record_consumer_error())?;
+        let (rows, chunks, _reservation) = encoded.inspect_err(|_| cursor.record_consumer_error())?;
         count = count.checked_add(rows).ok_or_else(|| protocol("COPY TO row count overflow"))?;
         let grant = cursor.delivery_grant().await?;
         grant.deliver(async {
-            for chunk in bytes.chunks(64 * 1024) {
-                wire.send(b'd', chunk).await?;
+            for chunk in chunks {
+                wire.send(b'd', &chunk).await?;
             }
             wire.flush().await
         }).await.map_err(crate::wire::delivery_error)?;
@@ -81,7 +126,7 @@ pub(crate) async fn write_arrow<W: tokio::io::AsyncWrite + Unpin>(
     encoder.finish().map_err(arrow_output_error)?;
     let grant = cursor.delivery_grant().await?;
     grant.deliver(async {
-        wire.send(b'd', encoder.get_ref()).await?;
+        wire.send(b'd', &encoder.get_ref().chunks[0]).await?;
         wire.empty(b'c').await?;
         wire.string(b'C', &format!("COPY {count}")).await?;
         if grant.is_bounded() { wire.flush().await?; }
@@ -225,10 +270,15 @@ fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        COPY_CHUNK_BYTES, CopyChunks, CopyFormat, CopyInput, Identifier, MemoryBudget,
+        NamedTempFile, RecordBatch, Seek, SeekFrom, Value, Write, arrow_allocation,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn transit_copy_builds_arrow_documents_in_the_existing_log_layout() {
+        use rtdb_tx::{Documents, TxOp};
         use arrow_array::Array;
         use rtdb_types::ListView;
         use rtdb_format::transit::{self, TransitValue as T};
@@ -304,5 +354,34 @@ mod tests {
                 drop(page); drop(reservation); assert_eq!(memory.used_bytes(), 0);
             }
         }
+    }
+
+    #[test]
+    fn copy_to_chunks_match_contiguous_arrow_ipc_frames() {
+        use arrow_array::BinaryArray;
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let bytes = vec![0xe1; COPY_CHUNK_BYTES * 2 + 13];
+        let schema = Arc::new(Schema::new(vec![Field::new("payload", DataType::Binary, true)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BinaryArray::from(vec![Some(bytes.as_slice()), None]))],
+        ).unwrap();
+        let mut reference = StreamWriter::try_new(Vec::new(), &schema).unwrap();
+        let mut chunked = StreamWriter::try_new(CopyChunks::new(), &schema).unwrap();
+        assert_eq!(std::mem::take(reference.get_mut()), chunked.get_mut().take_header());
+        for _ in 0..2 {
+            reference.write(&batch).unwrap();
+            chunked.write(&batch).unwrap();
+            let expected = std::mem::take(reference.get_mut());
+            let actual = chunked.get_mut().take_batch();
+            assert!(actual.len() > 2);
+            assert!(actual.iter().zip(expected.chunks(COPY_CHUNK_BYTES)).all(|(actual, expected)| actual == expected));
+            assert_eq!(actual.concat(), expected);
+        }
+        reference.finish().unwrap();
+        chunked.finish().unwrap();
+        assert_eq!(chunked.get_ref().chunks.as_slice(), &[reference.into_inner().unwrap()]);
     }
 }
