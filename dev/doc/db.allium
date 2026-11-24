@@ -59,6 +59,7 @@
 -- A pin keeps its first admitted receipt, manifest and expiry across retries and source checkpoint advancement.
 -- A checkpoint pin has its own replica position and does not advance transaction or source progress.
 -- Restore admits the original pin, verifies the independent files and reopens the exact checkpoint from the destination before success.
+-- Restore retries verify and return the same detached backing for the pin in its provisioned destination.
 -- Sealed or custody-held histories require an explicit destination binding for Default export.
 -- Branch Transact submissions with operations append the canonical request and its authenticated admission context to the source log.
 -- The admission context preserves the receipt namespace, label scope, verified claims and any sealed custody request digest.

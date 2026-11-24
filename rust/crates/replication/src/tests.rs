@@ -1376,6 +1376,8 @@ async fn default_orders_an_exact_pin_and_reopens_independent_backing() {
         assert_eq!(serving.pin_checkpoint_export(pin, committed.basis, Some(Timestamp::MAX), &cancellation).await.unwrap(), ticket);
         assert_eq!(serving.pin_checkpoint_export(pin, committed.basis, None, &cancellation).await.unwrap_err().code, "rtdb/checkpoint-pin-conflict");
         let copy = serving.materialize_checkpoint_export(&ticket, target.path(), &cancellation).await.unwrap();
+        let retry = serving.materialize_checkpoint_export(&ticket, target.path(), &cancellation).await.unwrap();
+        assert_eq!(retry.path, copy.path);
         assert!(copy.path.starts_with(target.path()));
         assert_eq!(copy.basis, committed.basis);
         assert_eq!(copy.source, source_position);

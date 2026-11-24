@@ -216,45 +216,83 @@ impl NativeServingHandle {
         if hash(&manifest_bytes) != control.manifest { return Err(invalid("The archived manifest differs from the ordered pin")); }
         let manifest: Manifest = decode(&manifest_bytes)?;
         if &manifest.selection != cut { return Err(invalid("The archive selection differs from the ordered pin")); }
-        let directory = tempfile::Builder::new().prefix("checkpoint-restore-").tempdir_in(&output_parent).map_err(io)?;
-        let staged = directory.path().join(".staging");
-        let destination = Arc::new(LocalStore::open(&staged)?);
-        for file in &manifest.files {
-            let key = ObjectKey::new(file.key.clone())?;
-            let archived = archive_key(&namespace, &key)?;
-            copy_verified(source, &archived, destination.as_ref(), &key, Some(file), memory, cancellation).await?;
+        let ready = output_parent.join(format!("checkpoint-{}-{}", Uuid::from_bytes(cut.basis.incarnation()), cut.pin));
+        if ready.try_exists().map_err(io)? {
+            reopen_detached(&ready, &self.authority, ticket, control, &manifest, memory, cancellation).await?;
+        } else {
+            let directory = tempfile::Builder::new().prefix(".checkpoint-restore-").tempdir_in(&output_parent).map_err(io)?;
+            let staged = directory.path().join("storage");
+            let destination = Arc::new(LocalStore::open(&staged)?);
+            for file in &manifest.files {
+                let key = ObjectKey::new(file.key.clone())?;
+                let archived = archive_key(&namespace, &key)?;
+                copy_verified(source, &archived, destination.as_ref(), &key, Some(file), memory, cancellation).await?;
+            }
+            destination.put(&ObjectKey::new("checkpoint-restore-manifest")?, manifest_bytes.clone()).await?;
+            destination.put(&ObjectKey::new("checkpoint-restore-receipt")?, Bytes::copy_from_slice(ticket)).await?;
+            verify_detached(&destination, &self.authority, ticket, control, &manifest, memory).await?;
+            destination.close_and_wait().await;
+            drop(destination);
+            self.check_restore_delivery(cut, cancellation)?;
+            if let Err(error) = fs::rename(staged, &ready) {
+                if !ready.try_exists().map_err(io)? { return Err(io(error)); }
+                reopen_detached(&ready, &self.authority, ticket, control, &manifest, memory, cancellation).await?;
+            }
+            rtdb_storage::sync_directory(directory.path()).map_err(io)?;
         }
-        let store: Arc<dyn ObjectStore> = destination.clone();
-        let pool = Arc::new(BufferPool::new(Arc::clone(&store), 32 << 20));
-        let blocks = BlockStore::new(store, pool, Arc::clone(memory), rtdb_index::TrieCatalog::default().file_size_target())?;
-        let (root, tables) = blocks.load(cut.block).await?;
-        verify_plain_image(blocks.object_store(), &self.authority, &root, cut).await?;
-        blocks.verify_primary_inventory(&root, &tables).await?;
-        let expected = checkpoint_dependencies(&root, &tables)?;
-        if expected.iter().map(ObjectKey::as_str).ne(manifest.files.iter().map(|file| file.key.as_str())) {
-            return Err(invalid("The archive does not contain the exact checkpoint dependency set"));
-        }
-        let recovered = blocks.recover(Default::default(), cut.source, Timestamp(0), BlockDiscovery::AtPublished(cut.published())).await?;
-        if recovered.progress.source_position != cut.source { return Err(invalid("Restored source progress disagrees with the pin")); }
-        let receipt_key = ObjectKey::new("checkpoint-restore-receipt")?;
-        let manifest_key = ObjectKey::new("checkpoint-restore-manifest")?;
-        destination.put(&manifest_key, manifest_bytes.clone()).await?;
-        destination.put(&receipt_key, Bytes::copy_from_slice(ticket)).await?;
-        if destination.get_fresh_exact(&receipt_key, ticket.len()).await?.as_ref() != ticket
-            || hash(&destination.get_fresh_exact(&manifest_key, manifest_bytes.len()).await?) != control.manifest
-        { return Err(invalid("The detached store did not retain the selected restore evidence")); }
-        drop(recovered);
-        drop(blocks);
-        destination.close_and_wait().await;
-        drop(destination);
+        rtdb_storage::sync_directory(&output_parent).map_err(io)?;
+        self.check_restore_delivery(cut, cancellation)?;
+        Ok(DetachedDefaultCheckpoint { path: ready, basis: cut.basis, checkpoint: cut.published(), source: cut.source })
+    }
+
+    fn check_restore_delivery(&self, cut: &Selection, cancellation: &CancellationToken) -> Result<()> {
         cancelled(cancellation)?;
         if self.replication.status().first_erasure.is_some() { return Err(protected()); }
-        cut.alive(self.replication.serving_clock())?;
-        fs::rename(staged, directory.path().join("storage")).map_err(io)?;
-        rtdb_storage::sync_directory(directory.path()).map_err(io)?;
-        rtdb_storage::sync_directory(&output_parent).map_err(io)?;
-        Ok(DetachedDefaultCheckpoint { path: directory.keep().join("storage"), basis: cut.basis, checkpoint: cut.published(), source: cut.source })
+        cut.alive(self.replication.serving_clock())
     }
+}
+
+async fn reopen_detached(path: &Path, authority: &NativeServingAuthority, ticket: &[u8], control: &PinControl, manifest: &Manifest,
+    memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<()> {
+    if !fs::symlink_metadata(path).map_err(io)?.file_type().is_dir() {
+        return Err(invalid("The detached restore backing must be its own directory"));
+    }
+    let destination = Arc::new(LocalStore::open(path)?);
+    verify_detached(&destination, authority, ticket, control, manifest, memory).await?;
+    for file in &manifest.files {
+        let key = ObjectKey::new(file.key.clone())?;
+        if destination.head_fresh(&key).await?.size != file.length
+            || hash_object(destination.as_ref(), &key, file.length, &mut std::io::sink(), memory, cancellation).await? != file.sha256
+        { return Err(invalid("The detached backing has a different archived object")); }
+    }
+    destination.close_and_wait().await;
+    Ok(())
+}
+
+async fn verify_detached(destination: &Arc<LocalStore>, authority: &NativeServingAuthority, ticket: &[u8], control: &PinControl,
+    manifest: &Manifest, memory: &Arc<MemoryBudget>,
+) -> Result<()> {
+    let receipt_key = ObjectKey::new("checkpoint-restore-receipt")?;
+    let manifest_key = ObjectKey::new("checkpoint-restore-manifest")?;
+    let (backing_manifest, _charge) = read_small(destination.as_ref(), &manifest_key, MAX_MANIFEST, memory).await?;
+    if destination.get_fresh_exact(&receipt_key, ticket.len()).await?.as_ref() != ticket || hash(&backing_manifest) != control.manifest {
+        return Err(invalid("The detached store did not retain the selected restore evidence"));
+    }
+    let cut = &control.selection;
+    let store: Arc<dyn ObjectStore> = destination.clone();
+    let pool = Arc::new(BufferPool::new(Arc::clone(&store), 32 << 20));
+    let blocks = BlockStore::new(store, pool, Arc::clone(memory), rtdb_index::TrieCatalog::default().file_size_target())?;
+    let (root, tables) = blocks.load(cut.block).await?;
+    verify_plain_image(blocks.object_store(), authority, &root, cut).await?;
+    blocks.verify_primary_inventory(&root, &tables).await?;
+    let expected = checkpoint_dependencies(&root, &tables)?;
+    if expected.iter().map(ObjectKey::as_str).ne(manifest.files.iter().map(|file| file.key.as_str())) {
+        return Err(invalid("The archive does not contain the exact checkpoint dependency set"));
+    }
+    let recovered = blocks.recover(Default::default(), cut.source, Timestamp(0), BlockDiscovery::AtPublished(cut.published())).await?;
+    if recovered.progress.source_position != cut.source { return Err(invalid("Restored source progress disagrees with the pin")); }
+    Ok(())
 }
 
 async fn stage_export(blocks: &BlockStore, authority: &NativeServingAuthority, selection: Selection,
