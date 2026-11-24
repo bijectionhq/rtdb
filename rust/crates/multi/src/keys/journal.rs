@@ -1,10 +1,8 @@
 use std::{sync::Arc, time::Instant};
 
 use bytes::Bytes;
-use ordered_logkeeper::ordered::Placement;
 use rtdb_storage::{Error, IoRegion};
 use rtdb_types::{Anomaly, Result};
-use uuid::Uuid;
 
 use crate::cipher::Cipher;
 
@@ -12,23 +10,9 @@ use super::{
     KeyService, LocalKeyService, archive::{self, LocalArchiveKey}, unit::{self, OPERATION_LIMIT},
 };
 
-/// The payload key survives writer replacement and changes only on rotation.
-#[derive(Clone, Copy)]
-pub struct JournalKey {
-    deployment: Uuid,
-    incarnation: Uuid,
-    generation: u64,
-}
+pub use super::journal_identity::JournalKey;
 
 impl JournalKey {
-    pub fn new(placement: Placement, generation: u64) -> Self {
-        Self {
-            deployment: placement.deployment,
-            incarnation: placement.incarnation,
-            generation,
-        }
-    }
-
     pub(crate) fn id(self) -> String {
         format!("journal-{}-{}-{}", self.deployment, self.incarnation, self.generation)
     }
@@ -100,6 +84,8 @@ impl LocalKeyService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ordered_logkeeper::ordered::{Enrollment, Grant, Placement};
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn a_retained_record_uses_its_own_key_until_that_generation_expires() -> Result<()> {
@@ -112,8 +98,13 @@ mod tests {
             group: Uuid::new_v4(),
             generation: 1,
         };
-        let old = JournalKey::new(placement, 1);
-        let new = JournalKey::new(placement, 2);
+        let grant = Grant {
+            enrollment: Enrollment { worker: Uuid::new_v4(), serial: 1 },
+            epoch: 5,
+            key_generation: 1,
+        };
+        let old = JournalKey::for_grant(placement, grant);
+        let new = JournalKey::for_grant(placement, Grant { epoch: 6, key_generation: 2, ..grant });
         let unknown = JournalKey::new(placement, 3);
         let other = JournalKey::new(Placement { incarnation: Uuid::new_v4(), ..placement }, 1);
         for key in [old, new, other] {

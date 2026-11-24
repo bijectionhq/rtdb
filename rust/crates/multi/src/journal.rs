@@ -15,6 +15,7 @@ use ordered_logkeeper::ordered::{
 };
 
 mod adapter_command;
+mod append_selection;
 pub mod custody;
 pub mod hosted;
 mod prefix_retirement;
@@ -404,12 +405,8 @@ impl InstalledJournal {
                 "The peer did not return the ordered append receipt",
             ));
         };
-        if result.position != decision.receipt.position {
-            return Err(mismatch(
-                "The append result names a different command position",
-            ));
-        }
-        Ok(result)
+        append_selection::chosen_result_at(result, result.position, decision.receipt.position)
+            .ok_or_else(|| mismatch("The append result names a different command position"))
     }
 
     pub async fn checkpoint_cut(&self, next: u64) -> Result<Cut> {

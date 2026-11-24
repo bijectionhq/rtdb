@@ -1,7 +1,7 @@
 //! RTDB storage-log projection of the installed journal's ordered grants
 //! and exact replay intervals.
 
-use super::{InstalledJournal, ReadFailure, WriterAdmission, adapter_command, latest, replay_cursor};
+use super::{InstalledJournal, ReadFailure, WriterAdmission, adapter_command, append_selection, latest, replay_cursor};
 use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -290,7 +290,7 @@ impl JournalLog {
         }
         let outcome = crate::residence_trace::AttemptOutcome::from_replica(&payload);
         let (references, checkpoint) = self.references(&writer, &payload).await?;
-        let key = JournalKey::new(current.placement, writer.grant.key_generation);
+        let key = JournalKey::for_grant(current.placement, writer.grant);
         let payload = self.reads.keys.seal_journal_payload(key, &self.reads.io, payload).await?;
         let timestamp = sample()?;
         let command = adapter_command::append_command(
@@ -343,10 +343,9 @@ impl JournalLog {
             }
             Err(error) => return Err(storage(error)),
         };
-        if result.class != *class
-            || result.lsn != *expected_next
-            || result.lsn != writer.head.next_lsn
-        {
+        if !append_selection::matches_pending_append(
+            result.class, *class, result.lsn, *expected_next, writer.head.next_lsn,
+        ) {
             return Err(Error::Task(
                 "The ordered append receipt addresses a different record".into(),
             ));
@@ -722,7 +721,7 @@ impl Cursor {
         if let Some(snapshot) = &self.snapshot {
             snapshot.delivered(head.metadata.offset, first.grant.epoch, first.references.unwrap_or_default())?;
         }
-        let key = JournalKey::new(placement, first.grant.key_generation);
+        let key = JournalKey::for_grant(placement, first.grant);
         let open = IoRegion::retaining(
             Arc::clone(held) as Arc<dyn Send + Sync>,
             key.open(self.reads.keys.as_ref(), &self.reads.io, first.payload),

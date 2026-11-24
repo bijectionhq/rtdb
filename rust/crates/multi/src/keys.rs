@@ -23,6 +23,7 @@ pub mod assertion_deadline;
 mod occurrence;
 pub use occurrence::{AssertionMintKey, AssertionRoute, AssertionRouteKey};
 mod journal;
+mod journal_identity;
 mod unit;
 pub use rtdb_storage::sealing::{UnitOperation, UnitOutput};
 pub use unit::{UnitScope, UnitSlot};

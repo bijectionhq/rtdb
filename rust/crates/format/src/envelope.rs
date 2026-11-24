@@ -7,6 +7,7 @@ use crate::{LEGACY_FLUSH_HEADER, LEGACY_TX_HEADER, PROTOBUF_LOG_HEADER};
 
 mod decoder;
 mod decoder_leaves;
+mod detached;
 mod wire;
 pub use decoder::{ReplicaEnvelope, ReplicaFrame, SourceMessage, decode_replica_outcome_attempt, encode_replica_outcome_attempt};
 use wire::{skip_wire, wire_key};
@@ -203,29 +204,6 @@ impl ReplicaEnvelope {
         });
         message.storage_version = Some(ADMITTED_OFFLOAD_STORAGE);
         self.offload_publication().map(drop)
-    }
-
-    /// Checks the fetched record against the already-admitted envelope without admitting it a second time.
-    pub fn unwrap_payload(&self, bytes: &[u8]) -> Result<Self> {
-        let ReplicaBody::OversizedMessage(reference) = &self.message else {
-            return Err(invalid("Only an oversized envelope has an external payload"));
-        };
-        if let Some(expected) = &reference.payload_sha256
-            && expected.as_slice() != Sha256::digest(bytes).as_slice()
-        {
-            return Err(Anomaly::fault("rtdb.format/oversized-payload-mismatch", "Oversized payload bytes differ from their replica reference"));
-        }
-        let payload = Self::decode(bytes)?.ok_or_else(|| invalid("Oversized payload has no replica message"))?;
-        if payload.term != self.term || payload.term_sequence != self.term_sequence {
-            return Err(Anomaly::fault("rtdb.format/oversized-term-mismatch", "Oversized payload term or sequence differs from its envelope"));
-        }
-        if matches!(payload.message, ReplicaBody::OversizedMessage(_)) {
-            return Err(invalid("Nested oversized replica messages are invalid"));
-        }
-        if matches!(&payload.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
-            return Err(invalid("Strict acceptance requires an inline replica record"));
-        }
-        Ok(payload)
     }
 }
 

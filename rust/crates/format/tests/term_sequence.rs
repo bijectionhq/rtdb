@@ -147,6 +147,10 @@ fn a_collectable_offload_binds_an_exact_provider_version() {
     assert_eq!(decoded.offload_publication().unwrap(), Some((StorageVersion(6), version)));
     assert_eq!(decoded.oversized_payload(StorageVersion(6), StorageEpoch(0)).unwrap().as_deref(), Some("oversized/b01-payload.binpb"));
     assert_eq!(decoded.unwrap_payload(&bytes).unwrap(), body);
+    let mut other_bytes = bytes;
+    other_bytes.extend([0xa0, 0x06, 0x01]);
+    assert_eq!(ReplicaEnvelope::decode(&other_bytes).unwrap().unwrap(), body);
+    assert_eq!(decoded.unwrap_payload(&other_bytes).unwrap_err().code, "rtdb.format/oversized-payload-mismatch");
 }
 
 #[test]
