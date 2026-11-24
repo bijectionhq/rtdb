@@ -404,6 +404,30 @@ These are recorded as open questions in `rtdb-multi.allium`, to be folded into i
 
 ## Migration
 
+### Hosted Classic source seal
+
+The authenticated Classic recovery listener accepts `seal_classic_migration_source` for a directory-backed Classic deployment.
+Close application write and protected delivery admission and settle their outstanding work before selecting the capture.
+`capture_checkpoint` returns the capture operation, source residence and log epoch, exact checkpoint coordinates and manifest digest.
+The operator uses the current Classic holder's directory writer epoch.
+
+Send the ordinary recovery envelope with the exact source `name`, `authority` and `capture`.
+The action carries `destination` (the expected native UUID), `stage_operation` (the stable attempt UUID), `source_manifest_sha256` and `source` with `incarnation`, `log_epoch` and `writer_epoch`.
+Reuse all fields after an interrupted reply.
+The Classic writer closes its submission gate, drains admitted transactions and records its applied source position in the directory fence before the recovery owner seals and verifies the original replica prefix.
+The source terminal includes the drained source frontier, exact source and replica offsets, original transaction key, certified suffix digest where present, lifetime-floor digest and any outstanding placed debt.
+The selected capture and private scratch stage remain available for recovery.
+
+The attempt UUID identifies a private Classic scratch stage independently of the native destination UUID.
+Current Classic staging requires an active source holder and the current captured checkpoint.
+An active retained World or replica suffix pin blocks this source fence.
+`discard_classic_migration_stage` accepts the same selector before fencing and reports the exact scratch disposal receipt once available.
+After fencing, recover the same attempt from its retained state.
+
+The source seal is one input to a future route decision.
+Native import, old-to-native receipt and Basis mapping, protected contributor and key custody, and positive drain of application-owned deliveries and readers require separate evidence.
+Keep the old media and credentials available for retained obligations.
+
 | Phase | Bijection | RTDB plan stages it needs |
 | --- | --- | --- |
 | **A0** (now) | `XtdbWorldStore` over pgwire against stock XTDB; the `WorldStore` conformance suite gates it | none |

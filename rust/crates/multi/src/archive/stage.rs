@@ -66,6 +66,7 @@ pub(crate) async fn discard_checkpoint_stage(
     request: CheckpointStageIntent,
 ) -> Result<Option<DisposalReceipt>> {
     let id = request.destination.to_string();
+    let transfer_only = request.classic_migration.is_some();
     let media = cell_media(storage, keys)?;
     let record = match directory.deployment(&id).await? {
         Some(record) => record,
@@ -85,7 +86,7 @@ pub(crate) async fn discard_checkpoint_stage(
                 source_log_epoch: point.log_epoch,
                 checkpoint: point.checkpoint,
                 media: media.clone(),
-                transfer_only: false,
+                transfer_only,
                 staged_manifest_sha256: None,
             }));
             match directory.create_deployment(tombstone).await {
@@ -94,7 +95,7 @@ pub(crate) async fn discard_checkpoint_stage(
             }
         }
     };
-    staged(&record, &request, &media, false)?;
+    staged(&record, &request, &media, transfer_only)?;
     if record.incarnation != 1
         || record.holder.is_some()
         || record.checkpoint.is_some()
@@ -168,6 +169,12 @@ pub(super) async fn stage_checkpoint_for(
         .deployment(&source_id)
         .await?
         .ok_or_else(|| unavailable("The capture's original directory record is unavailable"))?;
+    if request.classic_migration.is_some_and(|migration| !transfer_only
+        || source.incarnation != migration.source.incarnation || source.log_epoch != migration.source.log_epoch
+        || source.epoch != migration.source.writer_epoch || source.holder.is_none())
+    {
+        return Err(inconsistent("The Classic migration names another writer or residence"));
+    }
     let (point, manifest) = capture_receipt(&source, archive, request.source, request.capture)?
         .filter(|(_, manifest)| manifest == &request.source_manifest_sha256)
         .ok_or_else(|| inconsistent("The source capture has another manifest"))?;

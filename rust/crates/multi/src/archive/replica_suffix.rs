@@ -1321,6 +1321,7 @@ mod custody_tests {
         let stage = Box::pin(stage_checkpoint_transfer(directory.clone(), &archive, &storage, keys.as_ref(), CheckpointStageIntent {
             operation, source: deployment, capture, source_manifest_sha256: manifest,
             destination, name: "target".into(), org: source.org.clone(),
+            classic_migration: None,
         }, None)).await?;
         let selector = StageSelector {
             destination, operation, manifest_sha256: stage.staged_manifest_sha256.clone().unwrap(),

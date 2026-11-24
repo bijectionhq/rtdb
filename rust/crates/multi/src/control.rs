@@ -78,6 +78,7 @@ pub enum Request {
     Snapshot { name: String },
     /// Flush the deployment this node holds and wait for the block's adoption, keeping the holding.
     Flush { name: String },
+    FenceClassicMigration { name: String, stage: Box<rtdb_directory::CheckpointStage> },
     StageSqlErasure { name: String, request: crate::journal::hosted::erasure::SqlErasureRequest },
     EnrollInstalledFork { parent: String, child: String },
     /// Pin the named captured checkpoint through this writer's exact installed basis.

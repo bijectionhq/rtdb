@@ -589,6 +589,14 @@ contract LogService {
         -- Protected delivery checks the selected destination generation together with every contributing original family.
         -- An exact copy terminal can release the export pin and its copy holds while the installed destination remains subject to the original family fence.
 
+    @invariant ClassicMigrationSourceSeal
+        -- The operator selects the original deployment, residence, log epoch, writer epoch, retained capture, attempt and native destination identity.
+        -- The Classic holder closes its submission gate and waits for admitted transactions to apply before the directory orders the fence.
+        -- The directory retains the applied source frontier with the fence and keeps the selected capture and scratch stage pinned.
+        -- The source recovery owner drains admitted storage and catalog readers, seals the original replica journal and verifies the checkpoint and certified suffix through the drained source frontier.
+        -- An identical retry observes the same retained source terminal.
+        -- The migration scratch stage stays private and cannot seed a Classic target writer.
+
     @invariant InstalledJournalErasureCommit
         -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.
         -- Ordinary checkpoint selection preserves replay of that committed marker.

@@ -952,6 +952,49 @@ impl NodeAgent {
         Ok(Response::Flushed { checkpoint })
     }
 
+    async fn fence_classic_migration(&self, name: &str, stage: &rtdb_directory::CheckpointStage) -> Result<Response> {
+        let turn = self.turn(name);
+        let _turn = turn.lock().await;
+        let expected = stage.intent.classic_migration.ok_or_else(|| stale_handoff(name))?.source;
+        let original = self.record(name).await?;
+        if original.id != stage.intent.source.to_string() || original.incarnation != expected.incarnation
+            || original.log_epoch != expected.log_epoch || original.epoch != expected.writer_epoch
+            || original.holder.as_ref() != Some(&self.member())
+            || !self.holdings.lock().get(name).is_some_and(|holding| {
+                holding.id == original.id && holding.epoch == original.epoch
+                    && matches!(&holding.authority, HoldingAuthority::Directory { .. })
+            })
+        {
+            return Err(stale_handoff(name));
+        }
+        let target = self.directory.deployment(&stage.intent.destination.to_string()).await?
+            .ok_or_else(|| stale_handoff(name))?;
+        if target.checkpoint_stage.as_deref() != Some(stage) {
+            return Err(stale_handoff(name));
+        }
+        let database = self.node.catalog().database(name)?;
+        if database.external_source() || !matches!(database.status().role, DriverRole::Leading(_)) {
+            return Err(stale_handoff(name));
+        }
+        let pause = tokio::time::timeout(self.options.activation_timeout, database.pause_transactions()).await
+            .map_err(|_| Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/migration-write-drain",
+                "The Classic writer could not drain its admitted writes"))??;
+        let drained = database.progress().current().source_position.after_offset(StorageEpoch(expected.log_epoch));
+        let current = self.record(name).await?;
+        if current.id != original.id || current.holder != original.holder || current.epoch != original.epoch {
+            return Err(stale_handoff(name));
+        }
+        let fenced = self.directory.fence_checkpoint_transfer(&rtdb_directory::CheckpointTransferSelection {
+            stage: stage.clone(), source_version: current.version, destination_version: target.version,
+            drained_source_through: Some(drained),
+        }).await;
+        if fenced.as_ref().err().is_none_or(|error| error.category != AnomalyCategory::Conflict) {
+            self.stop_serving(name).await;
+        }
+        drop(pause);
+        fenced.map(|_| Response::Done)
+    }
+
     async fn pin_checkpoint_suffix(
         &self, name: &str, deployment: uuid::Uuid, lease: uuid::Uuid,
         capture: uuid::Uuid, basis: TransactionKey, expires_at_ms: i64,
@@ -1997,6 +2040,7 @@ impl Handler for NodeAgent {
                 Ok(()) => self.flush(&name).await,
                 Err(error) => Err(error),
             },
+            Request::FenceClassicMigration { name, stage } => self.fence_classic_migration(&name, &stage).await,
             Request::EnrollInstalledFork { parent, child } => async {
                 let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.multi/installed-fork",
                     "The custody node needs both installed fork routes");

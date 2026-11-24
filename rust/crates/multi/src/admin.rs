@@ -247,6 +247,40 @@ pub(crate) async fn pin_checkpoint_suffix(
     }
 }
 
+pub(crate) async fn fence_classic_migration(
+    directory: &dyn Directory, stage: &rtdb_directory::CheckpointStage, control: &ControlKey,
+) -> Result<rtdb_directory::CheckpointTransferFence> {
+    let id = stage.intent.source.to_string();
+    let conflict = || Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/migration-source",
+        "The Classic writer or migration attempt changed");
+    let selected = |record: &DeploymentRecord| -> Result<Option<rtdb_directory::CheckpointTransferFence>> {
+        record.checkpoint_transfer_fence.as_deref().map(|fence| {
+            if fence.destination == *stage && fence.drained_source_through.is_some() {
+                Ok(fence.clone())
+            } else {
+                Err(conflict())
+            }
+        }).transpose()
+    };
+    let source = directory.deployment(&id).await?.ok_or_else(conflict)?;
+    if let Some(fence) = selected(&source)? { return Ok(fence); }
+    let expected = stage.intent.classic_migration.ok_or_else(conflict)?.source;
+    if source.epoch != expected.writer_epoch || source.incarnation != expected.incarnation
+        || source.log_epoch != expected.log_epoch
+    {
+        return Err(conflict());
+    }
+    let holder = source.holder.as_ref().ok_or_else(conflict)?;
+    let address = control_address(&members(directory).await?, holder)?;
+    let response = expect(&address, Request::FenceClassicMigration {
+        name: source.name, stage: Box::new(stage.clone()),
+    }, control).await;
+    let current = directory.deployment(&id).await?.ok_or_else(conflict)?;
+    if let Some(fence) = selected(&current)? { return Ok(fence); }
+    response?;
+    Err(conflict())
+}
+
 /// Reserves the next claim for `target` during the handoff.
 pub async fn move_deployment(directory: &dyn Directory, name: &str, target: &MemberId, control: &ControlKey) -> Result<()> {
     move_from_holding(directory, name, target, None, control).await

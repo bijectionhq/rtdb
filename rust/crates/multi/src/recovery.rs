@@ -4,8 +4,8 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rtdb_directory::{
-    CheckpointCaptureRetirement, CheckpointStageIntent, CheckpointSuffixCustody, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
-    ServingInventory,
+    CheckpointCaptureRetirement, CheckpointStageIntent, CheckpointSuffixCustody, ClassicMigration, ClassicMigrationSource,
+    DeploymentRecord, Directory, DisposalReceipt, HostedTask, ServingInventory,
 };
 use rtdb_storage::sealing::DeliveryIo;
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
@@ -95,6 +95,18 @@ enum Action {
         destination: Uuid,
         stage_operation: Uuid,
         staged_manifest_sha256: String,
+    },
+    SealClassicMigrationSource {
+        destination: Uuid,
+        stage_operation: Uuid,
+        source_manifest_sha256: String,
+        source: ClassicMigrationSource,
+    },
+    DiscardClassicMigrationStage {
+        destination: Uuid,
+        stage_operation: Uuid,
+        source_manifest_sha256: String,
+        source: ClassicMigrationSource,
     },
     StageCheckpoint {
         source_manifest_sha256: String,
@@ -250,6 +262,13 @@ enum Reply {
     TransferSourceSealed {
         terminal: rtdb_directory::CheckpointTransferTerminal,
     },
+    ClassicMigrationStageDiscarded {
+        authority: Uuid,
+        capture: Uuid,
+        destination: Uuid,
+        stage_operation: Uuid,
+        disposal: DisposalReceipt,
+    },
     TransferTargetSeeded {
         replica: rtdb_directory::CheckpointTransferReplica,
     },
@@ -343,6 +362,7 @@ impl RecoveryService {
         };
         let discard = matches!(request.action, Action::DiscardCheckpointStage { .. });
         let transfer_only = matches!(request.action, Action::StageCheckpointTransfer { .. });
+        let discard_migration = matches!(request.action, Action::DiscardClassicMigrationStage { .. });
         match request.action {
             Action::CaptureCheckpoint => {
                 let retained = archive::capture_receipt(
@@ -516,6 +536,7 @@ impl RecoveryService {
                     destination,
                     name: database.clone(),
                     org: self.org.clone(),
+                    classic_migration: None,
                 };
                 if discard {
                     let disposal = archive::discard_checkpoint_stage(
@@ -584,6 +605,7 @@ impl RecoveryService {
                         destination,
                         name: database.clone(),
                         org: self.org.clone(),
+                        classic_migration: None,
                     },
                     self.hosted_task.clone(),
                 ).await?;
@@ -647,6 +669,38 @@ impl RecoveryService {
                 )).await?;
                 Ok(Reply::TransferSourceSealed { terminal })
             },
+            Action::SealClassicMigrationSource { destination, stage_operation, source_manifest_sha256, source }
+            | Action::DiscardClassicMigrationStage { destination, stage_operation, source_manifest_sha256, source } => {
+                if installation.checkpoint_stage.is_some() || destination.is_nil()
+                    || stage_operation == request.authority || stage_operation.is_nil()
+                    || source.incarnation == 0 || source.log_epoch < 0 || source.writer_epoch == 0
+                    || !valid_manifest(&source_manifest_sha256)
+                {
+                    return Ok(Reply::Refused);
+                }
+                let intent = CheckpointStageIntent {
+                    operation: stage_operation, source: request.authority, capture: request.capture,
+                    source_manifest_sha256, destination: stage_operation,
+                    name: format!("checkpoint-stage-{stage_operation}"), org: self.org.clone(),
+                    classic_migration: Some(ClassicMigration { source, destination }),
+                };
+                if discard_migration {
+                    let disposal = archive::discard_checkpoint_stage(directory.as_ref(), &installation,
+                        &self.archive, &self.storage, self.keys.as_ref(), intent).await?;
+                    return Ok(match disposal {
+                        Some(disposal) => Reply::ClassicMigrationStageDiscarded {
+                            authority: request.authority, capture: request.capture, destination, stage_operation, disposal,
+                        },
+                        None => Reply::Deferred,
+                    });
+                }
+                let stage = Box::pin(archive::stage_checkpoint_transfer(Arc::clone(&directory), &self.archive,
+                    &self.storage, self.keys.as_ref(), intent, self.hosted_task.clone())).await?;
+                let fence = crate::admin::fence_classic_migration(directory.as_ref(), &stage, &self.control).await?;
+                let terminal = Box::pin(archive::seal_checkpoint_transfer(directory.as_ref(), &self.storage,
+                    &self.archive, self.keys.as_ref(), self.broker.as_ref(), self.hosted_task.as_ref(), &fence)).await?;
+                Ok(Reply::TransferSourceSealed { terminal })
+            }
             Action::ActivateCheckpointTransferTarget {
                 destination, stage_operation, staged_manifest_sha256,
             } => {

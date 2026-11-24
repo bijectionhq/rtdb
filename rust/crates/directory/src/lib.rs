@@ -1104,6 +1104,23 @@ pub struct CheckpointStageIntent {
     pub destination: uuid::Uuid,
     pub name: String,
     pub org: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_migration: Option<ClassicMigration>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassicMigration {
+    pub source: ClassicMigrationSource,
+    pub destination: uuid::Uuid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassicMigrationSource {
+    pub incarnation: u64,
+    pub log_epoch: i32,
+    pub writer_epoch: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1127,6 +1144,8 @@ pub struct CheckpointTransferFence {
     pub destination: CheckpointStage,
     pub source_writer_epoch: u64,
     pub fenced_writer_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drained_source_through: Option<i64>,
 }
 
 /// Source owner's terminal receipt. The source log retains the certified interval.
@@ -1177,6 +1196,7 @@ pub struct CheckpointTransferSelection {
     pub stage: CheckpointStage,
     pub source_version: Version,
     pub destination_version: Version,
+    pub drained_source_through: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1645,10 +1665,19 @@ fn prepare_checkpoint_transfer(
     if let Some(fence) = source.checkpoint_transfer_fence.as_deref() {
         if fence.destination == *stage && destination.checkpoint_transfer_fence.as_deref() == Some(fence)
             && source.lifecycle == Lifecycle::Restoring && source.epoch == fence.fenced_writer_epoch
+            && fence.drained_source_through == selection.drained_source_through
         {
             return Ok((source.clone(), destination.clone(), fence.clone()));
         }
         return Err(transfer_changed());
+    }
+    match (intent.classic_migration, selection.drained_source_through) {
+        (Some(migration), Some(drained)) if !migration.destination.is_nil()
+            && migration.source.incarnation == source.incarnation
+            && migration.source.log_epoch == source.log_epoch && migration.source.writer_epoch == source.epoch
+            && source.holder.is_some() && drained >= stage.checkpoint.source => {}
+        (None, None) => {}
+        _ => return Err(transfer_changed()),
     }
     if source.version != selection.source_version || destination.version != selection.destination_version
         || source.writer_pool().is_none() || source.parent.is_some() || source.move_from.is_some()
@@ -1665,6 +1694,7 @@ fn prepare_checkpoint_transfer(
     let fence = CheckpointTransferFence {
         destination: stage.clone(), source_writer_epoch: source.epoch,
         fenced_writer_epoch: source.epoch.checked_add(1).ok_or_else(transfer_changed)?,
+        drained_source_through: selection.drained_source_through,
     };
     source.lifecycle = Lifecycle::Restoring;
     source.epoch = fence.fenced_writer_epoch;
@@ -1693,6 +1723,12 @@ fn prepare_checkpoint_transfer_terminal(
     {
         return Err(transfer_changed());
     }
+    if stage.intent.classic_migration.is_some()
+        && (source.holder.is_some() || !source.catalog_readers.is_empty() || !source.local_publications.is_empty()
+            || terminal.fence.drained_source_through.is_none_or(|drained| terminal.source_through < drained))
+    {
+        return Err(transfer_changed());
+    }
     if let Some(debt) = &terminal.placed_debt {
         let slot = rtdb_types::PlacedReservation::decode(&debt.reservation)?;
         let epoch = rtdb_types::StorageEpoch(stage.source_log_epoch);
@@ -1718,7 +1754,8 @@ fn prepare_checkpoint_transfer_bootstrap(
 ) -> Result<DeploymentRecord> {
     let terminal = &bootstrap.terminal;
     let stage = &terminal.fence.destination;
-    if source.id != stage.intent.source.to_string() || destination.id != stage.intent.destination.to_string()
+    if stage.intent.classic_migration.is_some()
+        || source.id != stage.intent.source.to_string() || destination.id != stage.intent.destination.to_string()
         || source.checkpoint_transfer_terminal.as_deref() != Some(terminal)
         || source.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
         || source.lifecycle != Lifecycle::Restoring || source.epoch != terminal.fence.fenced_writer_epoch
@@ -2224,6 +2261,83 @@ pub mod contract;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classic_migration_seal_requires_the_exact_writer_drain_and_preserves_the_source_pin() {
+        let mut source = DeploymentRecord::new("classic", "acme", vec![], 0);
+        source.epoch = 4;
+        source.log_epoch = 2;
+        source.holder = Some(MemberId::fresh());
+        let checkpoint = Checkpoint { block: 2, boundary: 10, source: 8, system_time: 20, root_sha256: Some([1; 32]) };
+        source.checkpoint = Some(checkpoint);
+        let capture = uuid::Uuid::new_v4();
+        source.checkpoint_captures.insert(capture, CheckpointCapture {
+            archive: "archive".into(), key_namespace: None, incarnation: source.incarnation,
+            log_epoch: source.log_epoch, checkpoint, automatic_fork: false, world_replay: None,
+            media_bound: true, manifest_sha256: Some("capture".into()), remote_disposal: None,
+        });
+        let mut target = DeploymentRecord::new("stage", "acme", vec![], 0);
+        target.lifecycle = Lifecycle::Restoring;
+        let stage = CheckpointStage {
+            intent: CheckpointStageIntent {
+                operation: uuid::Uuid::new_v4(), source: source.id.parse().unwrap(), capture,
+                source_manifest_sha256: "capture".into(), destination: target.id.parse().unwrap(),
+                name: target.name.clone(), org: target.org.clone(),
+                classic_migration: Some(ClassicMigration {
+                    source: ClassicMigrationSource {
+                        incarnation: source.incarnation, log_epoch: source.log_epoch, writer_epoch: source.epoch,
+                    },
+                    destination: source.id.parse().unwrap(),
+                }),
+            },
+            source_incarnation: source.incarnation, source_log_epoch: source.log_epoch, checkpoint,
+            media: CellMedia { objects: [2; 32], keys: "keys".into() }, transfer_only: true,
+            staged_manifest_sha256: Some("stage".into()),
+        };
+        target.checkpoint_stage = Some(Box::new(stage.clone()));
+        let mut selection = CheckpointTransferSelection {
+            stage, source_version: source.version, destination_version: target.version, drained_source_through: None,
+        };
+        assert!(prepare_checkpoint_transfer(&source, &target, &selection).is_err());
+        selection.drained_source_through = Some(7);
+        assert!(prepare_checkpoint_transfer(&source, &target, &selection).is_err());
+        selection.drained_source_through = Some(11);
+        let mut replaced = source.clone();
+        replaced.epoch += 1;
+        assert!(prepare_checkpoint_transfer(&replaced, &target, &selection).is_err());
+        let (mut closed, held, fence) = prepare_checkpoint_transfer(&source, &target, &selection).unwrap();
+        assert_eq!(closed.lifecycle, Lifecycle::Restoring);
+        assert!(closed.holder.is_none() && held.holder.is_none());
+        assert_eq!(prepare_checkpoint_transfer(&closed, &held, &selection).unwrap().2, fence);
+        let mut changed_target = selection.stage.clone();
+        changed_target.intent.classic_migration.as_mut().unwrap().destination = uuid::Uuid::new_v4();
+        let changed = CheckpointTransferSelection { stage: changed_target, ..selection };
+        assert!(prepare_checkpoint_transfer(&closed, &held, &changed).is_err());
+        selection.drained_source_through = Some(12);
+        assert!(prepare_checkpoint_transfer(&closed, &held, &selection).is_err());
+
+        let mut terminal = CheckpointTransferTerminal {
+            fence, replica_through: 14, source_through: 10,
+            basis: rtdb_types::TransactionKey { tx_id: rtdb_types::TxId(11), system_time: rtdb_types::Timestamp(25) },
+            placed_debt: None, replica_sha256: Some([3; 32]), lifetime_floors_sha256: [4; 32],
+        };
+        assert!(prepare_checkpoint_transfer_terminal(&closed, &terminal).is_err());
+        terminal.source_through = 11;
+        let reader = uuid::Uuid::new_v4();
+        closed.catalog_readers.insert(reader, CatalogReader {
+            owner: uuid::Uuid::new_v4(), storage_root: "original".into(), replica_epoch: source.log_epoch,
+            cut: None, catalog_file_paths: None,
+        });
+        assert!(prepare_checkpoint_transfer_terminal(&closed, &terminal).is_err());
+        closed.catalog_readers.remove(&reader);
+        let sealed = prepare_checkpoint_transfer_terminal(&closed, &terminal).unwrap();
+        assert_eq!(prepare_checkpoint_transfer_terminal(&sealed, &terminal).unwrap(), sealed);
+        let mut discarded = sealed.clone();
+        discarded.checkpoint_captures.remove(&capture);
+        assert!(require_transfer_update(&sealed, &discarded).is_err());
+        let classic_bootstrap = CheckpointTransferBootstrap { terminal, ciphertext_sha256: [5; 32] };
+        assert!(prepare_checkpoint_transfer_bootstrap(&sealed, &held, &classic_bootstrap).is_err());
+    }
 
     #[tokio::test]
     async fn memory_directory_meets_the_contract() {

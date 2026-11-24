@@ -2458,6 +2458,7 @@ pub(crate) async fn issue_checkpoint_transfer(
         let stage = &terminal.fence.destination;
         if original.checkpoint_transfer_fence.as_deref() != Some(&terminal.fence)
             || original.lifecycle != Lifecycle::Restoring || original.epoch != terminal.fence.fenced_writer_epoch
+            || stage.intent.classic_migration.is_some()
             || stage.intent.capture != capture || stage.intent.destination != selector.destination
             || stage.intent.operation != selector.operation
             || stage.staged_manifest_sha256.as_deref() != Some(selector.manifest_sha256.as_str())
@@ -2470,6 +2471,9 @@ pub(crate) async fn issue_checkpoint_transfer(
     let stage = reader::admit_transfer_destination(
         Arc::clone(&directory), storage, keys, selector, hosted_task.clone(),
     ).await?;
+    if stage.intent.classic_migration.is_some() {
+        return Err(inconsistent("A native migration must fence the Classic writer through its admission gate"));
+    }
     let point = verify_checkpoint_capture(
         directory.as_ref(), &original, archive, keys, source, capture,
         &stage.intent.source_manifest_sha256, hosted_task.as_ref(),
@@ -2484,7 +2488,7 @@ pub(crate) async fn issue_checkpoint_transfer(
     let destination_version = directory.deployment(&target_id).await?
         .ok_or_else(|| unavailable("The private transfer target is unavailable"))?.version;
     let fence = directory.fence_checkpoint_transfer(&rtdb_directory::CheckpointTransferSelection {
-        stage, source_version, destination_version,
+        stage, source_version, destination_version, drained_source_through: None,
     }).await?;
     seal_checkpoint_transfer(directory.as_ref(), storage, archive, keys, broker, hosted_task.as_ref(), &fence).await
 }

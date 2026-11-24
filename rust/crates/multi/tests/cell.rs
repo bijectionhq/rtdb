@@ -1892,6 +1892,7 @@ async fn a_checkpoint_capture_keeps_its_cut_and_archives_only_sealed_objects() {
         destination: uuid::Uuid::new_v4(),
         name: "restored-shop".into(),
         org: "acme".into(),
+        classic_migration: None,
     };
     let staged = rtdb_multi::archive::stage_checkpoint(
         cell.directory.clone(), &archive, &cell.storage(), &cell.keys(), stage.clone(), None,
