@@ -1,0 +1,73 @@
+= FactStore Binary identity cutover
+
+This is the private RTDB source contract for Bijection's FactStore adapter.
+The Bijection caller inventory was read at main commit `ec376fb543478a96ec8399f6014e9aed3ac0cbc1`.
+
+== Address bytes
+
+Use the complete canonical `AddressRef::encode()` as a non-null Arrow `Binary` `_id`.
+Preserve the custody check in `AddressRef::to_wire()` by requiring current native custody before emitting those bytes.
+The image includes the address kind, table incarnation and escaped complete key.
+Decode a returned fact identity with `AddressRef::decode` and validate the expected table and canonical image at the caller boundary.
+Construct seek boundaries with the same binary order-image writer and original boundary extent, including synthetic prefix successors from `wire_order_boundary`.
+The ordering is unsigned lexicographic, with a shorter prefix before its extensions.
+
+RTDB uses `EntityId::Binary(Vec<u8>)`, `EntityIdRef::Binary(&[u8])` and `Value::Binary` in owned paths.
+In a wire component that explicitly expects a complete typed handle, Binary uses tag byte `04` followed by the unmodified identity bytes.
+The enclosing component supplies its existing length framing.
+The IID is the first 16 bytes of SHA-256 over ASCII `b` followed by the identity bytes.
+The IID routes to a bucket and the full typed key identifies the assertion within it.
+Arrow `_id` cells and compact Binary point/window entries carry the identity bytes directly.
+The typed-handle tag belongs only in handle components, including regional change bounds and expiry candidates.
+In those regional bound components a zero-length handle still denotes an unbounded side.
+
+Provision the Binary fact relations against a clear physical cut.
+An existing Utf8 key and a Binary key occupy separate identities.
+The Binary scan profile requires a Binary identity column at the selected cut.
+Bijection should keep the existing Utf8 path names, control and catalog IDs, publication heads, attempt IDs and protected carrier IDs.
+Public pgwire accepts the existing text, keyword, signed integer and UUID entity identities.
+
+== Request and response mapping
+
+* For `Create.v1`, `Commit.v1`, `Commit.v2`, `CommitOrdered.v1` and hosted/import/restore groups, put Binary in the existing Arrow `_id` field for fact rows.
+  The point condition fields, operation names, schedule, deadlines and row or group order are identical.
+  A batch with a text control row and a Binary fact row can use the corresponding typed legs when its existing operation layout admits a dense union.
+* Scalar Root and world points, positioned points, valid-window and version requests send Binary in the existing Arrow `_id`.
+  Keep the requested valid and system coordinates and the 16-byte original event position independently of the identity.
+  A returned position remains the signed big-endian i64 transaction followed by the unsigned big-endian u64 event ordinal.
+* `ReadPoints.v1` and `ReadRanges.v1` retain their scalar selectors, framing, per-entry results and first scalar refusal.
+  `ReadSelection.v1` selector 9 is the Binary form of selector 0, selector 10 is the Binary form of selector 1, and selector 11 is the Binary form of selector 8.
+  A compact Binary point is the 16-byte held handle, the length-prefixed relation, the signed big-endian i64 valid instant and raw address bytes to the end of the entry.
+  A compact Binary window follows the relation with the signed big-endian i64 system time, valid start and valid end, then raw address bytes.
+  The batch count and each selector and length use the existing framing.
+* `ReadHeldAbsentKeys.v1` accepts one plain Binary column and keeps the common valid instant, original order and leading absence count.
+  The held identity page, all-valid page and world identity page actions select the key type from the Arrow type of the nullable exclusive `after` column.
+  Send a typed Binary null on the first page and the last returned raw Binary `_id` thereafter.
+  The reply remains Binary on empty pages, and the all-valid page collapses repeated validity slices of the same identity.
+* Ordered point and range bounds, continuations and fixed range evidence use Binary for the terminal `_id` of a fact key.
+  Other tuple columns retain their declared types.
+  If a completely empty ordered relation requires a concrete Binary reply layout, supply a typed key bound that establishes the identity type.
+  The held ordered, historical, overlay and replay paths use the same complete-key order.
+* Change touches and ranked or spatial identity unions include a Binary leg after their existing legs.
+  Decode the selected Arrow child by type and retain its full bytes in each touch or hit.
+  Staged search and nearest overlays and spatial gathers accept Binary in their existing `_id` cells.
+  Expiry's nomination remains opaque text and its `identity` column carries the complete typed handle.
+* Source replay stores Arrow Binary facts and typed Binary operation operands, with the existing validity, presence and operation positions.
+  Archive effects and residues keep their original origin and exact event coordinates.
+  Replay validates the Binary put cell against its stored complete typed handle.
+  Replay constraint member receipts keep the Utf8 member key and use holder marker `02` followed by the existing big-endian u64 length and raw bytes for a Binary holder.
+  Where a prepared Sample membership exclusion names a Binary identity, send SHA-256 of byte `ff` followed by the raw identity payload in the existing sorted digest list.
+
+== Bijection source work
+
+* Carry typed keys through `crates/native_store_runtime/src/rtdb/fact_points.rs` and `fact_points/write_runs.rs`, including `FactHeader`, `FactRun`, boxed or packed `Entry` rows, reposting, and the shared point builders.
+* Update `fact_points/history.rs`, `worlds.rs` and `worlds/period_batch.rs`, `store/diff.rs`, `store/expiry.rs`, and `changes.rs` to send and consume Binary on fact routes.
+  Preserve exact cut selection, request-order duplicates, same-identity interval behavior, and failure propagation through `owned_flight` scalar and batch dispatch.
+* Update `fact_points/ordered.rs`, `ordered/checkpoint.rs`, and `ordered/proposal.rs` for typed terminal keys, binary bounds, cursors, posting builders and staged overlays.
+  Update `fact_points/search.rs` and spatial or vector request builders where they carry ordinary fact identities.
+* Update `owned_flight` IPC decoders, archived source capture and restore in `rtdb/recovery/owned_archive`, and typed expiry and Changes decoders.
+  Preserve the origin coordinates, full handle versus raw Arrow identity distinction, and the text formats of unrelated owner records.
+* Keep text serialization for references and controls that use it in their own format.
+  Replace the fact identity's hex read and write paths together in the Bijection caller migration.
+
+The Rust domain, source replay and Flight wire regressions were authored with this change and left unexecuted.

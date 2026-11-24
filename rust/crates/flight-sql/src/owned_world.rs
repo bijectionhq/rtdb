@@ -144,7 +144,7 @@ impl WorldPointRow {
 
 
 pub struct WorldIdentityPage {
-    pub keys: Vec<String>,
+    pub keys: Vec<EntityId>,
     pub more: bool,
     pub reservations: Vec<Arc<MemoryReservation>>,
 }
@@ -213,7 +213,7 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp, root_prefix: &'a str, world_prefix: &'a str,
     ) -> BoxFuture<'a, Result<(WorldIdentityPage, OwnedWorldWitness)>>;
     fn parent_identity_page_at<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize, system: Timestamp,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn parent_schedule_at<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, system: Timestamp,
@@ -252,17 +252,17 @@ pub trait OwnedWorldRead: Send + Sync {
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Interval, system: Timestamp,
     ) -> BoxFuture<'a, Result<Vec<(Interval, Timestamp)>>>;
     fn identity_page<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn identity_page_at<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
         system: Timestamp, parent_only: bool,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn overlay_identities<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn overlay_identities_at<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>,
         limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>>;
     fn parent_touch_images_at<'a>(

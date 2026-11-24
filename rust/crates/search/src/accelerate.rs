@@ -706,7 +706,7 @@ impl OwnedSearchBatch {
         let scores = batch.column(1).as_primitive::<Float64Type>();
         let partitions = batch.column(2).as_primitive::<UInt64Type>();
         let hits = (0..batch.num_rows()).map(|row| {
-            let id = rtdb_columnar::read_entity_id(schema.field(0), ids, row)?.into_owned();
+            let id = rtdb_columnar::read_owned_entity_id(schema.field(0), ids, row)?.into_owned();
             Ok(OwnedSearchHit { partition: partitions.value(row) as usize, id, score: scores.value(row) })
         }).collect::<Result<Vec<_>>>()?;
         Ok(OwnedSearchPage { hits, total: self.total, _reservation: Arc::clone(self.hits.reservation()) })
@@ -861,7 +861,7 @@ async fn rank_owned_artefacts<'a>(
                         context.check_cancelled_at(row)?;
                         let ids = batch.column(id_column).as_ref();
                         let fallback;
-                        let id = match rtdb_columnar::read_entity_id(id_field, ids, row) {
+                        let id = match rtdb_columnar::read_owned_entity_id(id_field, ids, row) {
                             Ok(id) => id,
                             Err(_) => {
                                 fallback = rtdb_columnar::read_value(id_field, ids, row)?.entity_id()?;

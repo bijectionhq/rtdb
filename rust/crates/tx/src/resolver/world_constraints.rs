@@ -132,7 +132,7 @@ impl WindowBudget {
             for row in 0..rows.num_rows() {
                 self.consume(&mut limit)?;
                 let read = |name| occupancy_value_at(&context.memory, rows, row, name, unique_uncovered);
-                let id = read("_id")?.entity_id()?;
+                let id = read("_id")?.owned_entity_id()?;
                 rtdb_query::owned_row_revision(rows, row, &id, &context.memory)?;
                 if unique_key(read(column)?)?.as_slice() != key {
                     return Err(unique_uncovered());
@@ -322,7 +322,7 @@ impl ArchivedWorldConstraints<'_> {
                         for row in 0..rows.num_rows() {
                             context.check_cancelled_at(row)?;
                             let read = |name: &str| occupancy_value_at(&context.memory, rows, row, name, uncovered);
-                            let id = read("_id")?.entity_id()?;
+                            let id = read("_id")?.owned_entity_id()?;
                             if frozen_masks.contains(&id) { continue; }
                             let included = [!self.before.contains(&id), !self.after.contains(&id)];
                             mask_reservations.push(self.memory.reserve(id.as_value().retained_bytes()?.saturating_add(192))?);
@@ -398,7 +398,7 @@ impl ArchivedWorldConstraints<'_> {
                 for row in 0..rows.num_rows() {
                     parent.check_cancelled_at(row)?;
                     let read = |name: &str| occupancy_value_at(&parent.memory, rows, row, name, uncovered);
-                    let id = read("_id")?.entity_id()?;
+                    let id = read("_id")?.owned_entity_id()?;
                     if frozen_masks.contains(&id) { continue; }
                     let inherited = [!self.before.contains(&id), !self.after.contains(&id)];
                     if inherited.iter().any(|included| *included) {
@@ -449,7 +449,7 @@ impl ArchivedWorldConstraints<'_> {
                     Arc::clone(parent), self.owner, self.relation, claim.path, claim.column, key, self.valid,
                 ).await? {
                     let holder = occupancy_value_at(&parent.memory, hit.row.batch(), 0, "_id", unique_uncovered)?
-                        .entity_id()?;
+                        .owned_entity_id()?;
                     if !self.after.contains(&holder) && !frozen_masks.contains(&holder) {
                         return Err(unique_taken());
                     }
@@ -637,7 +637,7 @@ impl OpenTransaction<'_> {
                         for row in 0..rows.num_rows() {
                             local.check_cancelled_at(row)?;
                             let read = |name| occupancy_value_at(&local.memory, rows, row, name, uncovered);
-                            let id = read("_id")?.entity_id()?;
+                            let id = read("_id")?.owned_entity_id()?;
                             reservations.push(local.memory.reserve(id.as_value().retained_bytes()?.saturating_add(192))?);
                             if !after.insert(id) { return Err(uncovered()); }
                             match read(WorldShadow::FIELDS)? {
@@ -731,7 +731,7 @@ impl OpenTransaction<'_> {
                         for row in 0..rows.num_rows() {
                             context.check_cancelled_at(row)?;
                             let read = |name: &str| occupancy_value_at(&context.memory, rows, row, name, uncovered);
-                            let id = read("_id")?.entity_id()?;
+                            let id = read("_id")?.owned_entity_id()?;
                             reservations.push(self.context.memory.reserve(id.as_value().retained_bytes()?.saturating_add(192))?);
                             if !masks[side].insert(id) { return Err(uncovered()); }
                             match read(WorldShadow::FIELDS)? {

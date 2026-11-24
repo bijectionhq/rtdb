@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
-use rtdb_columnar::{ArrowCell, ColumnReader, EntityIdRef, MemoryBudget, read_execution_entity_id_as, read_value};
+use rtdb_columnar::{ArrowCell, ColumnReader, EntityIdRef, MemoryBudget, read_value};
 use rtdb_format::basis::decode_tx_basis;
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{SourceBody, SourceMessage}, log::proto::{AttachDatabase, DetachDatabase, resolved_tx::DbOp}};
 use rtdb_maintenance::CollectionObserver;
@@ -2940,7 +2940,7 @@ impl OwnedReadSession {
             context.check_cancelled()?;
             let size = rtdb_columnar::estimate_read_value_bytes(field, ids, row)?;
             let _identity = context.memory.reserve(size.saturating_add(4096))?;
-            let id = owned_range_id(ColumnReader::new(field)?.read_entity_id(ids, row)?)?;
+            let id = owned_range_id(ColumnReader::new(field)?.read_owned_entity_id(ids, row)?)?;
             let mut point = rtdb_query::open_owned_point(
                 Arc::clone(context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from", "_valid_from", "_valid_to"]),
             ).await?.ok_or_else(lifetime_read_unavailable)?;
@@ -3080,7 +3080,7 @@ impl OwnedReadSession {
             for row in 0..array.len() {
                 let bytes = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
                 let _charge = context.memory.reserve(bytes.saturating_add(4096))?;
-                let id = owned_range_id(read_execution_entity_id_as(None, field, array, row)?)?;
+                let id = owned_range_id(rtdb_columnar::read_execution_owned_entity_id(field, array, row)?)?;
                 self.check_point_purge_floor(relation, &id, system).await?;
             }
         }
@@ -3240,7 +3240,7 @@ impl OwnedWorldAcceptedCut<'_> {
     }
 
     pub async fn overlay_identities(
-        &self, valid: Timestamp, after: Option<&str>, fetch: usize,
+        &self, valid: Timestamp, after: &rtdb_types::OwnedIdentityScan<'_>, fetch: usize,
     ) -> Result<rtdb_query::OwnedIdentityCandidates> {
         self.held.world_identity_candidates_at(self.world, self.relation, self.system, valid, after, fetch).await
     }
@@ -3297,6 +3297,7 @@ impl OwnedWorldWitness {
         let bytes = match point {
             Some(EntityId::String(id)) => id.len(),
             Some(EntityId::Keyword(id)) => id.as_str().len(),
+            Some(EntityId::Binary(id)) => id.len(),
             _ => 0,
         };
         bytes.saturating_add(self.relation.name().len()).saturating_add(1024)

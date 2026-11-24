@@ -2,7 +2,7 @@ use std::{mem::size_of, sync::Arc};
 
 use arrow_array::{
     ArrayRef, UnionArray,
-    builder::{ArrayBuilder, FixedSizeBinaryBuilder, Int64Builder, StringBuilder, UInt64Builder},
+    builder::{ArrayBuilder, BinaryBuilder, FixedSizeBinaryBuilder, Int64Builder, StringBuilder, UInt64Builder},
 };
 use arrow_schema::{DataType, Field, FieldRef, Fields, UnionMode};
 use rtdb_columnar::{
@@ -17,12 +17,12 @@ use tonic::Status;
 
 use crate::{error::status, wire};
 
-// Match the buffer capacity used by StringArray::from_iter for the IPC scratch charge.
-const UTF8_DATA_CAPACITY: usize = 1024;
+// Match the buffer capacity used by Arrow byte arrays for the IPC scratch charge.
+const BYTE_ARRAY_DATA_CAPACITY: usize = 1024;
 
 pub(super) fn touches_type() -> LogicalType {
     let logical_id = LogicalType::from_legs(
-        [ScalarType::I64, ScalarType::Utf8, ScalarType::Keyword, ScalarType::Uuid]
+        [ScalarType::I64, ScalarType::Utf8, ScalarType::Keyword, ScalarType::Uuid, ScalarType::Binary]
             .map(LogicalType::Scalar),
     );
     LogicalType::list(LogicalType::Struct(StructFields::from([
@@ -81,7 +81,7 @@ pub(super) fn merged_column(
     let fields = struct_fields(item)?;
     let groups = commits.iter().flat_map(|commit| &commit.changes).map(|change| change.touches.as_slice());
     let touches = build_touches(&fields[2], groups, counts)?;
-    let mut names = StringBuilder::with_capacity(relations, UTF8_DATA_CAPACITY);
+    let mut names = StringBuilder::with_capacity(relations, BYTE_ARRAY_DATA_CAPACITY);
     let mut sequences = UInt64Builder::with_capacity(relations);
     let mut offsets = vec![0i32];
     for commit in commits {
@@ -105,14 +105,15 @@ fn build_touches<'a>(
     let DataType::Union(id_fields, UnionMode::Dense) = fields[0].data_type() else {
         return Err(layout_error());
     };
-    let len = counts.integer + counts.text + counts.keyword + counts.uuid;
+    let len = counts.integer + counts.text + counts.keyword + counts.uuid + counts.binary;
     let mut integers = Int64Builder::with_capacity(counts.integer);
-    let mut strings = StringBuilder::with_capacity(counts.text, UTF8_DATA_CAPACITY);
-    let mut keywords = StringBuilder::with_capacity(counts.keyword, UTF8_DATA_CAPACITY);
+    let mut strings = StringBuilder::with_capacity(counts.text, BYTE_ARRAY_DATA_CAPACITY);
+    let mut keywords = StringBuilder::with_capacity(counts.keyword, BYTE_ARRAY_DATA_CAPACITY);
     let mut uuids = FixedSizeBinaryBuilder::with_capacity(counts.uuid, 16);
+    let mut binaries = BinaryBuilder::with_capacity(counts.binary, BYTE_ARRAY_DATA_CAPACITY);
     let mut id_tags = Vec::<i8>::with_capacity(len);
     let mut id_offsets = Vec::with_capacity(len);
-    let mut ops = StringBuilder::with_capacity(len, UTF8_DATA_CAPACITY);
+    let mut ops = StringBuilder::with_capacity(len, BYTE_ARRAY_DATA_CAPACITY);
     let mut valid_from = Int64Builder::with_capacity(len);
     let mut valid_to = Int64Builder::with_capacity(len);
     let mut created = Int64Builder::with_capacity(len);
@@ -143,6 +144,11 @@ fn build_touches<'a>(
                     uuids.append_value(value).map_err(arrow_error).map_err(status)?;
                     (3, offset)
                 }
+                EntityIdRef::Binary(value) => {
+                    let offset = binaries.len();
+                    binaries.append_value(value);
+                    (4, offset)
+                }
             };
             id_tags.push(tag);
             id_offsets.push(i32::try_from(offset).map_err(|_| status(Anomaly::incorrect(
@@ -160,7 +166,7 @@ fn build_touches<'a>(
     }
     let id_children: Vec<ArrayRef> = vec![
         Arc::new(integers.finish()), Arc::new(strings.finish()),
-        Arc::new(keywords.finish()), Arc::new(uuids.finish()),
+        Arc::new(keywords.finish()), Arc::new(uuids.finish()), Arc::new(binaries.finish()),
     ];
     let ids = UnionArray::try_new(id_fields.clone(), id_tags.into(), Some(id_offsets.into()), id_children)
         .map_err(arrow_error).map_err(status)?;
@@ -221,6 +227,7 @@ struct TouchCounts {
     text: usize,
     keyword: usize,
     uuid: usize,
+    binary: usize,
 }
 
 impl TouchCounts {
@@ -233,12 +240,13 @@ impl TouchCounts {
                 EntityIdRef::String(_) => &mut self.text,
                 EntityIdRef::Keyword(_) => &mut self.keyword,
                 EntityIdRef::Uuid(_) => &mut self.uuid,
+                EntityIdRef::Binary(_) => &mut self.binary,
             };
             *count = wire::add(*count, 1)?;
             let (op, lifetime) = touch_operation(touch.kind);
             let payload = id.owned_payload_bytes();
             let width = match id {
-                EntityIdRef::String(_) | EntityIdRef::Keyword(_) => payload,
+                EntityIdRef::String(_) | EntityIdRef::Keyword(_) | EntityIdRef::Binary(_) => payload,
                 EntityIdRef::Integer(_) | EntityIdRef::Uuid(_) => 32,
             };
             let mut entry = BuilderSize::cell();
@@ -337,6 +345,7 @@ mod tests {
             (EntityId::Keyword(Keyword::from_name("app/key")), OwnedChangeKind::Redacted, bounded, 0),
             (EntityId::Uuid([0xa3; 16]), OwnedChangeKind::Erase, Interval::ALL, 5),
             (EntityId::Integer(18), OwnedChangeKind::Expired(bounded), Interval::ALL, 0),
+            (EntityId::Binary(vec![0, 255, 0]), OwnedChangeKind::Put, bounded, 6),
         ].into_iter().map(|(id, kind, valid, ordinal)| OwnedChange {
             id, kind, valid, assertion_ordinal: NonZeroU32::new(ordinal),
         }).collect()

@@ -16,7 +16,7 @@ use tonic::{Response, Status, metadata::MetadataValue};
 use crate::{
     config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_REQUEST_BYTES},
     error::{arrow, cancelled, invalid, status},
-    owned_actions::{HELD_OWNED_POINT_V2, HeldRangeFormat, OwnedReplyFormat, PointTime, ValidHistoryMode, WorldOrder},
+    owned_actions::{HELD_OWNED_POINT_V2, CompactIdentity, HeldRangeFormat, OwnedReplyFormat, PointTime, ValidHistoryMode, WorldOrder},
     service::{Call, Output, Service},
     wire,
 };
@@ -78,7 +78,7 @@ impl BatchKind {
         }
         let max_selector = match self {
             Self::Point | Self::Range => 7,
-            Self::Selection => 8,
+            Self::Selection => 11,
             Self::AudiencePoints => 0,
         };
         for _ in 0..u16::from_be_bytes(*count) {
@@ -159,7 +159,7 @@ impl Service {
                         audience_work::decode_bytes(original.encoded_len())
                             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                         self.confirm_audience_observation(call).await?;
-                        self.held_owned_point(call, &original.body, PointTime::Optional, false, OwnedReplyFormat::Selection(selection))
+                        self.held_owned_point(call, &original.body, PointTime::Optional, None, OwnedReplyFormat::Selection(selection))
                             .await.map(OwnedIpcReply::into_unary)
                     };
                     let reply = IoRegion::retaining(owner, audience_work::within_turn(
@@ -186,25 +186,30 @@ impl Service {
     ) -> Result<ActionResult, Status> {
         match kind {
             BatchKind::AudiencePoints => unreachable!("audience points use the reserved action allowance"),
-            BatchKind::Selection if selector == 8 => {
-                self.held_owned_valid_during(call, request, ValidHistoryMode::Timeline, true, false)
+            BatchKind::Selection if matches!(selector, 8 | 11) => {
+                let identity = if selector == 11 { CompactIdentity::Binary } else { CompactIdentity::Text };
+                self.held_owned_valid_during(call, request, ValidHistoryMode::Timeline, Some(identity), false)
                     .await.map(OwnedIpcReply::into_unary)
             },
             BatchKind::Point | BatchKind::Selection => {
-                let compact = matches!(kind, BatchKind::Selection);
+                let compact = matches!(kind, BatchKind::Selection).then_some(if matches!(selector, 9 | 10) {
+                    CompactIdentity::Binary
+                } else {
+                    CompactIdentity::Text
+                });
                 if call.session.fresh_replica && matches!(selector, 4..=6) {
                     return Err(Status::permission_denied("The fresh Flight route only admits Root point reads"));
                 }
-                let format = if compact { OwnedReplyFormat::Selection(selection) } else { OwnedReplyFormat::Unary };
+                let format = if compact.is_some() { OwnedReplyFormat::Selection(selection) } else { OwnedReplyFormat::Unary };
                 match selector {
-                    0 => self.held_owned_point(call, request, PointTime::Optional, compact, format).await,
-                    1 => self.held_owned_point(call, request, PointTime::Required, compact, format).await,
+                    0 | 9 => self.held_owned_point(call, request, PointTime::Optional, compact, format).await,
+                    1 | 10 => self.held_owned_point(call, request, PointTime::Required, compact, format).await,
                     2 => self.held_owned_historical_point(call, request, format).await,
                     3 => self.held_owned_position_point(call, request, format).await,
                     4 => self.held_world_point(call, request, format).await,
                     5 => self.held_world_point_at(call, request, false, format).await,
                     6 => self.held_world_point_at(call, request, true, format).await,
-                    7 if !compact => self.held_root_cut_point_action(call, request, format).await,
+                    7 if compact.is_none() => self.held_root_cut_point_action(call, request, format).await,
                     _ => Err(invalid("Unsupported held selection entry")),
                 }.map(OwnedIpcReply::into_unary)
             }

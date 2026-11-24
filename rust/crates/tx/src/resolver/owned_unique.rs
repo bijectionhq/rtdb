@@ -287,7 +287,7 @@ impl OpenTransaction<'_> {
                 )?;
                 let cursor = rtdb_query::open_owned_unique_timeline(context, owner, relation, &locator, valid).await?;
                 for part in self.read_unique_segments(cursor, &locator, valid, "holder", &mut allocations).await? {
-                    holders.push(Segment { valid: part.valid, value: part.value.entity_id().map_err(|_| unique_uncovered())? });
+                    holders.push(Segment { valid: part.valid, value: part.value.owned_entity_id().map_err(|_| unique_uncovered())? });
                 }
             }
             for Segment { valid, value: holder } in final_holders(change, holders)? {

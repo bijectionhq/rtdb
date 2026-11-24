@@ -60,17 +60,18 @@ impl HeldCheckpointWorld {
                         self.open.record.id, &relation, valid, after, PAGE_ROWS + 1, prefix,
                     ).await?
                 } else {
-                    self.archive_identity_candidates(&relation, valid, after, PAGE_ROWS + 1, None, Some(prefix)).await?
+                    self.archive_identity_candidates(&relation, valid, &OwnedIdentityScan::text(after), PAGE_ROWS + 1, None, Some(prefix)).await?
                 };
                 let page = if overlay {
                     self.merge_overlay_identities(
-                        &relation, valid, after, PAGE_ROWS, candidates, Some(prefix),
+                        &relation, valid, &OwnedIdentityScan::text(after), PAGE_ROWS, candidates, Some(prefix),
                     ).await?
                 } else {
                     self.finish_overlay_identities(&relation, candidates, PAGE_ROWS)?
                 };
                 for key in page.keys {
-                    let suffix = key.strip_prefix(prefix).ok_or_else(unavailable)?;
+                    let EntityId::String(text) = &key else { return Err(unavailable()); };
+                    let suffix = text.strip_prefix(prefix).ok_or_else(unavailable)?;
                     if suffix.len() != width || !lower_hex(suffix.as_bytes())
                         || census.keys.last().is_some_and(|previous| previous >= &key)
                     {
@@ -85,7 +86,7 @@ impl HeldCheckpointWorld {
                     }
                     if !overlay {
                         self.open.snapshot.check_point_purge_floor(
-                            &relation, &EntityId::String(key.clone()), self.parent_basis().system_time,
+                            &relation, &key, self.parent_basis().system_time,
                         ).await?;
                     }
                     census.keys.push(key);
@@ -94,7 +95,8 @@ impl HeldCheckpointWorld {
                 if !page.more {
                     break;
                 }
-                after = Some(census.keys.last().ok_or_else(unavailable)?.as_str());
+                let Some(EntityId::String(key)) = census.keys.last() else { return Err(unavailable()); };
+                after = Some(key.as_str());
             }
         }
         self.check_relation(&relation)?;

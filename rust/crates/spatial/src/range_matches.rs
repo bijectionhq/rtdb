@@ -57,6 +57,7 @@ impl MatchBuilder {
                 (2, &integer)
             }
             EntityIdRef::Uuid(value) => (3, value),
+            EntityIdRef::Binary(value) => (4, value),
         };
         let end = self.keys.len().checked_add(1)
             .and_then(|len| len.checked_add(payload.len()))

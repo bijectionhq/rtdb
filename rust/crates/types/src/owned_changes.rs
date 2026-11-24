@@ -67,7 +67,7 @@ impl OwnedChange {
         let id = fields
             .get("_id")
             .ok_or_else(change_feed_uncovered)?
-            .entity_id()
+            .owned_entity_id()
             .map_err(|_| change_feed_uncovered())?;
         let kind = match fields.get("op") {
             Some(Value::Utf8(op)) if op == "put" => OwnedChangeKind::Put,
@@ -145,11 +145,7 @@ impl OwnedRangeEvidence {
     pub fn retained_bytes(&self) -> usize {
         match self {
             Self::FixedPath(fixed) => fixed.retained_bytes(),
-            Self::Entity { region, .. } => 1024 + match &region.id {
-                EntityId::String(text) => text.capacity(),
-                EntityId::Keyword(keyword) => keyword.retained_bytes(),
-                EntityId::Integer(_) | EntityId::Uuid(_) => 0,
-            },
+            Self::Entity { region, .. } => 1024 + region.id.retained_bytes(),
         }
     }
 }

@@ -250,7 +250,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         })
     }
     fn parent_identity_page_at<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize, system: Timestamp,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
         Box::pin(async move {
             let page = HeldCheckpointWorld::parent_identity_page_at(self, relation, valid, after, limit, system).await?;
@@ -325,7 +325,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn identity_page<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
         Box::pin(async move {
             let page = HeldCheckpointWorld::identity_page(self, relation, valid, after, limit).await?;
@@ -334,7 +334,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn identity_page_at<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
         system: Timestamp, parent_only: bool,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
         Box::pin(async move {
@@ -344,7 +344,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn overlay_identities<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>, limit: usize,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>, limit: usize,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
         Box::pin(async move {
             let page = HeldCheckpointWorld::overlay_identities(self, relation, valid, after, limit).await?;
@@ -353,7 +353,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
     }
 
     fn overlay_identities_at<'a>(
-        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: Option<&'a str>,
+        &'a self, relation: &'a OwnedRelation, valid: Timestamp, after: &'a rtdb_types::OwnedIdentityScan<'a>,
         limit: usize, system: Timestamp,
     ) -> BoxFuture<'a, Result<WorldIdentityPage>> {
         Box::pin(async move {

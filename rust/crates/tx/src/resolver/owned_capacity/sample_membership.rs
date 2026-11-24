@@ -10,6 +10,19 @@ pub(in crate::resolver) const SAMPLE_MEMBERSHIP: &str = "sample_membership";
 const NAME_BYTES: usize = 34;
 const ID_BYTES: usize = 32;
 
+fn sample_identity_digest(id: &EntityId) -> Result<[u8; ID_BYTES]> {
+    let mut digest = Sha256::new();
+    match id {
+        EntityId::String(id) => digest.update(id.as_bytes()),
+        EntityId::Binary(id) => {
+            digest.update([0xff]);
+            digest.update(id);
+        }
+        _ => return Err(uncovered()),
+    }
+    Ok(digest.finalize().into())
+}
+
 pub(in crate::resolver) struct SampleProjection<'a> {
     pub(in crate::resolver) fields: Vec<&'a str>,
     excluded: BTreeSet<[u8; ID_BYTES]>,
@@ -44,8 +57,7 @@ impl<'a> SampleProjection<'a> {
         let mut unmatched = self.excluded.clone();
         for operation in operations {
             let mut admit = |id| {
-                if let EntityId::String(id) = id {
-                    let digest: [u8; ID_BYTES] = Sha256::digest(id.as_bytes()).into();
+                if let Ok(digest) = sample_identity_digest(&id) {
                     unmatched.remove(&digest);
                 }
             };
@@ -61,7 +73,7 @@ impl<'a> SampleProjection<'a> {
                     if target == relation =>
                 {
                     for row in documents.rows() {
-                        admit(row.get("_id").ok_or_else(uncovered)?.entity_id()?);
+                        admit(row.get("_id").ok_or_else(uncovered)?.owned_entity_id()?);
                     }
                 }
                 _ => (),
@@ -126,11 +138,10 @@ impl SamplePopulation {
             for row in 0..rows.num_rows() {
                 context.check_cancelled_at(row)?;
                 let read = |column: &str| occupancy_value_at(&context.memory, rows, row, column, uncovered);
-                let EntityId::String(id) = read("_id")?.entity_id()? else { return Err(uncovered()); };
-                let digest: [u8; ID_BYTES] = Sha256::digest(id.as_bytes()).into();
-                if projection.excluded.contains(&digest) { continue; }
+                let id = read("_id")?.owned_entity_id()?;
+                if projection.excluded.contains(&sample_identity_digest(&id)?) { continue; }
                 if world && !matches!(read(WorldShadow::FIELDS)?, Value::List(_)) { return Err(uncovered()); }
-                let time = rtdb_query::owned_row_revision(rows, row, &EntityId::String(id), &context.memory)?;
+                let time = rtdb_query::owned_row_revision(rows, row, &id, &context.memory)?;
                 let image = |column| match read(column)? {
                     Value::Binary(bytes) => Ok(bytes),
                     _ => Err(uncovered()),

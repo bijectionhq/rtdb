@@ -1036,7 +1036,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
                 },
                 OwnedPeriodEffect::Create(documents) | OwnedPeriodEffect::Replace(documents) => {
                     identities = Cow::Owned(documents.rows().iter().map(|document| {
-                        document_id(document, memory).map(|id| id.iid())
+                        owned_document_id(document, memory).map(|id| id.iid())
                     }).collect::<Result<_>>()?);
                     body.insert("iids".into(), Value::Null);
                     body.insert("field_presence".into(), owned_field_presence(documents));
@@ -1075,7 +1075,7 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         }
         Operation::Public(TxOp::OwnedInsertDocs { relation, documents, valid_from, valid_to } | TxOp::OwnedReplaceDocs { relation, documents, valid_from, valid_to }) => {
             let iids = documents.rows().iter().map(|document| {
-                document_id(document, memory).map(|id| id.iid())
+                owned_document_id(document, memory).map(|id| id.iid())
             }).collect::<Result<_>>()?;
             identities = Cow::Owned(iids);
             body.insert("iids".into(), Value::Null);
@@ -1200,6 +1200,13 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         Operation::Removed(name) => return Err(Anomaly::unsupported("rtdb.tx/removed-operation", format!("Cannot encode removed operation {name}"))),
     };
     Ok((tag.into(), SourceOperation { body: SourceOperationBody::Values { fields: body, arguments }, iids: identities, documents: docs }))
+}
+
+pub(crate) fn owned_document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
+    match document.get("_id") {
+        Some(Value::Binary(bytes)) => Ok(EntityId::Binary(bytes.clone())),
+        _ => document_id(document, memory),
+    }
 }
 
 pub(crate) fn document_id(document: &StructFields<Value>, memory: &Arc<MemoryBudget>) -> Result<EntityId> {
@@ -2708,7 +2715,7 @@ impl SourceOperationReader<'_> {
                             if anchor < 0 || valid.is_empty() {
                                 return Err(invalid("Owned entity range witness needs a covered, nonempty region"));
                             }
-                            let id = value("entity")?.entity_id()?;
+                            let id = value("entity")?.owned_entity_id()?;
                             Some(Arc::new(rtdb_types::OwnedRangeEvidence::Entity {
                                 anchor, region: rtdb_types::OwnedEntityRegion { id, valid },
                             }))
@@ -2800,7 +2807,7 @@ impl SourceOperationReader<'_> {
                     return Err(invalid("Owned expiry sweep has incomplete scope"));
                 };
                 TxOp::OwnedSweepExpired {
-                    relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()?,
+                    relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.owned_entity_id()?,
                     created: Timestamp(created), expiry: Timestamp(expiry),
                     scope: rtdb_types::PlacedAttemptScope::decode(&scope)?,
                 }
@@ -2817,14 +2824,14 @@ impl SourceOperationReader<'_> {
                 }
                 TxOp::OwnedReplayResidue {
                     relation: rtdb_types::OwnedRelation::new(relation)?,
-                    id: value("id")?.entity_id()?,
+                    id: value("id")?.owned_entity_id()?,
                     origin: rtdb_types::EventOrigin(origin.try_into().map_err(|_| invalid("Owned archive residue origin must contain 32 bytes"))?),
                     valid,
                 }
             }
             "rtdb-owned-erase-v2" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned erase has no relation")); };
-                TxOp::OwnedErase { relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.entity_id()? }
+                TxOp::OwnedErase { relation: rtdb_types::OwnedRelation::new(relation)?, id: value("id")?.owned_entity_id()? }
             }
             "rtdb-owned-relative-delete-v2" => {
                 let Value::Utf8(relation) = value("relation")? else {
@@ -2832,14 +2839,14 @@ impl SourceOperationReader<'_> {
                 };
                 TxOp::OwnedRelativePeriod {
                     relation: rtdb_types::OwnedRelation::from_source(relation)?,
-                    effect: OwnedPeriodEffect::Delete(value("id")?.entity_id()?),
+                    effect: OwnedPeriodEffect::Delete(value("id")?.owned_entity_id()?),
                     period: read_relative_period(body, offset)?,
                 }
             }
             "rtdb-owned-check-v2" | "rtdb-owned-delete-v1" => {
                 let Value::Utf8(relation) = value("relation")? else { return Err(invalid("Owned operation has no relation")); };
                 let relation = rtdb_types::OwnedRelation::from_source(relation)?;
-                let id = value("id")?.entity_id()?;
+                let id = value("id")?.owned_entity_id()?;
                 if name == "rtdb-owned-check-v2" {
                     let Value::I64(valid_at) = value("valid_at")? else { return Err(invalid("Owned observation has no valid instant")); };
                     let expected = match (value("expected_history")?, value("expected_position")?) {
@@ -2959,7 +2966,7 @@ impl SourceOperationReader<'_> {
                     if relative {
                         let period = read_relative_period(body, offset)?;
                         for (row, iid) in documents.rows().iter().zip(iids) {
-                            if document_id(row, memory)?.iid() != iid {
+                            if owned_document_id(row, memory)?.iid() != iid {
                                 return Err(invalid("Owned document IID does not match its identity"));
                             }
                         }
@@ -3861,6 +3868,39 @@ mod tests {
         assert_eq!(documents.array().len(), 2);
         assert!(documents.array().column(1).is_null(1));
         assert!(presence[1].contains("payload"));
+    }
+
+    #[test]
+    fn binary_owner_source_replays_arrow_and_typed_effects_in_original_order() {
+        let memory = budget();
+        let relation = rtdb_types::OwnedRelation::new("facts").unwrap();
+        let keys: [&[u8]; 2] = [&[0, 255], &[0, 255, 0]];
+        let batch = RecordBatch::try_from_iter([
+            ("_id", Arc::new(arrow_array::BinaryArray::from_iter_values(keys)) as ArrayRef),
+        ]).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+        let first = EntityId::Binary(keys[0].to_vec());
+        let second = EntityId::Binary(keys[1].to_vec());
+        let position = rtdb_types::OwnedPointVersion {
+            history: Timestamp(8),
+            position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(17), ordinal: 3 },
+        };
+        let source = SourceTransaction::new(vec![
+            TxOp::OwnedCheck { relation: relation.clone(), id: first.clone(), valid_at: Timestamp(2), expected: Some(position) },
+            TxOp::OwnedArrowDocs { relation: relation.clone(), documents, create_only: false, valid_from: None, valid_to: None },
+            TxOp::OwnedDelete { relation, id: second.clone(), valid_from: None, valid_to: None },
+        ], SubmitOptions::default(), &memory).unwrap();
+        let replay = roundtrip(&source);
+        let [
+            Operation::Public(TxOp::OwnedCheck { id, expected, .. }),
+            Operation::OwnedArrowIids { documents, iids, .. },
+            Operation::Public(TxOp::OwnedDelete { id: deleted, .. }),
+        ] = replay.operations.as_slice() else { panic!("expected ordered binary effects"); };
+        assert_eq!((id, *expected, deleted), (&first, Some(position), &second));
+        assert_eq!(documents.owned_id(0).unwrap(), first);
+        assert_eq!(documents.owned_id(1).unwrap(), second);
+        assert_eq!(iids, &[first.iid(), second.iid()]);
     }
 
     #[test]

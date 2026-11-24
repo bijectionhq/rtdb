@@ -1786,6 +1786,7 @@ impl Head {
         let _decode = memory.reserve(key.len().saturating_add(256))?;
         let matches = match (EntityIdRef::from_handle_bytes(key)?, self.tuple().cell(slot)) {
             (EntityIdRef::String(id), AtomRef::Text(value)) => id == value,
+            (EntityIdRef::Binary(id), AtomRef::Binary(value)) => id == value,
             (EntityIdRef::Integer(id), AtomRef::Integer(value)) => i128::from(id) == value,
             (EntityIdRef::Uuid(id), AtomRef::Uuid(value)) => id == value,
             _ => false,

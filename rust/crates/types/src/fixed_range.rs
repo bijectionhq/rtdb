@@ -49,64 +49,62 @@ impl FixedRangeRule {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FixedRangeKey {
     binary: Vec<u8>,
-    id: String,
+    id: EntityId,
 }
 
 impl FixedRangeKey {
     pub fn from_cells(binary: &Value, id: &EntityId) -> Result<Self> {
-        let EntityId::String(id) = id else {
-            return Err(invalid());
-        };
-        Self::new(binary, id)
+        let Value::Binary(binary) = binary else { return Err(invalid()); };
+        Self::new(binary, id.clone())
     }
 
-    fn new(binary: &Value, id: &str) -> Result<Self> {
-        let Value::Binary(binary) = binary else {
-            return Err(invalid());
+    fn new(binary: &[u8], id: EntityId) -> Result<Self> {
+        let id_bytes = match &id {
+            EntityId::String(text) => text.len(),
+            EntityId::Binary(bytes) => bytes.len(),
+            _ => return Err(invalid()),
         };
-        Self::from_parts(binary, id)
+        if binary.len() > FIXED_RANGE_COMPONENT_BYTES || id_bytes > FIXED_RANGE_COMPONENT_BYTES {
+            return Err(invalid());
+        }
+        Ok(Self { binary: binary.to_vec(), id })
     }
 
     pub fn from_parts(binary: &[u8], id: &str) -> Result<Self> {
-        if binary.len() > FIXED_RANGE_COMPONENT_BYTES || id.len() > FIXED_RANGE_COMPONENT_BYTES {
-            return Err(invalid());
-        }
-        Ok(Self {
-            binary: binary.to_vec(),
-            id: id.to_owned(),
-        })
+        Self::new(binary, EntityId::String(id.to_owned()))
+    }
+
+    pub fn from_binary_parts(binary: &[u8], id: &[u8]) -> Result<Self> {
+        Self::new(binary, EntityId::Binary(id.to_vec()))
     }
 
     pub fn from_bound(bound: &StructFields<Value>, column: &str) -> Result<Self> {
         if bound.len() != 2 {
             return Err(invalid());
         }
-        let (Some(binary), Some(Value::Utf8(id))) = (bound.get(column), bound.get("_id")) else {
+        let (Some(Value::Binary(binary)), Some(id)) = (bound.get(column), bound.get("_id")) else {
             return Err(invalid());
         };
-        Self::new(binary, id)
+        Self::new(binary, id.owned_entity_id().map_err(|_| invalid())?)
     }
 
     pub fn to_value(&self) -> Value {
-        Value::list(vec![
-            Value::Binary(self.binary.clone()),
-            Value::Utf8(self.id.clone()),
-        ])
+        Value::list(vec![Value::Binary(self.binary.clone()), self.id.as_value()])
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
-        let Value::List(values) = value else {
-            return Err(invalid());
-        };
+        let Value::List(values) = value else { return Err(invalid()); };
         let values = values.view();
         if values.len() != 2 { return Err(invalid()); }
         let binary = values.binary(0).ok_or_else(invalid)?;
-        let id = values.utf8(1).ok_or_else(invalid)?;
-        Self::from_parts(binary, id)
+        if let Some(id) = values.binary(1) {
+            return Self::from_binary_parts(binary, id);
+        }
+        Self::from_parts(binary, values.utf8(1).ok_or_else(invalid)?)
     }
 
     pub fn belongs_to(&self, id: &EntityId) -> bool {
-        matches!(id, EntityId::String(id) if id == &self.id)
+        &self.id == id
     }
 }
 
@@ -120,7 +118,7 @@ pub struct FixedRangeEvidence {
 
 impl FixedRangeEvidence {
     pub fn retained_bytes(&self) -> usize {
-        let bytes = |key: &FixedRangeKey| key.binary.capacity() + key.id.capacity();
+        let bytes = |key: &FixedRangeKey| key.binary.capacity() + key.id.retained_bytes();
         1024 + self.rule.path.capacity()
             + self.rule.column.capacity()
             + self.lower.as_ref().map_or(0, bytes)
@@ -192,6 +190,21 @@ fn invalid() -> Anomaly {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn binary_fixed_range_tie_break_uses_the_complete_id() {
+        use crate::{EntityId, FixedRangeKey, Value};
+
+        let prefix = EntityId::Binary(vec![0, 255]);
+        let extension = EntityId::Binary(vec![0, 255, 0]);
+        let key = |id| FixedRangeKey::from_cells(&Value::Binary(vec![42]), id).unwrap();
+        let before = key(&prefix);
+        let after = key(&extension);
+        assert!(before < after);
+        assert_eq!(FixedRangeKey::from_value(&before.to_value()).unwrap(), before);
+        assert!(after.belongs_to(&extension));
+        assert!(!after.belongs_to(&prefix));
+    }
+
+    #[test]
     fn fixed_range_key_accepts_packed_binary_and_text_legs() {
         use std::sync::Arc;
         use arrow_array::{Array, BinaryArray, StringArray, UnionArray};
@@ -210,6 +223,6 @@ mod tests {
         let list = crate::ListValue::from_scalar_arrow(field, Arc::new(array)).unwrap();
         let key = super::FixedRangeKey::from_value(&crate::Value::List(list)).unwrap();
         assert_eq!(key.binary, bytes);
-        assert_eq!(key.id, "a");
+        assert_eq!(key.id, crate::EntityId::String("a".into()));
     }
 }

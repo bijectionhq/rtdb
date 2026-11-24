@@ -417,7 +417,7 @@ async fn rank_rows(
             .collect::<Result<Vec<_>>>()?;
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
-            let read_id = || rtdb_columnar::read_entity_id(id_field, batch.column(id_column).as_ref(), row);
+            let read_id = || rtdb_columnar::read_owned_entity_id(id_field, batch.column(id_column).as_ref(), row);
             let is_shadowed = |id| shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id));
             let admitted_id = if let Some((owner, valid)) = sealed {
                 let protected = crate::rank_family::RootProjectionId::parse(read_id()?)?;
@@ -670,7 +670,7 @@ mod tests {
             (text, 0.5, 0, 0), (text, 0.5, 1, 1), (keyword, 0.5, 1, 0),
             (integer, 0.5, 1, 0), (uuid, farther, 1, 0),
         ].into_iter().enumerate() {
-            assert_eq!(rtdb_columnar::read_entity_id(field, ids, row).unwrap(), id);
+            assert_eq!(rtdb_columnar::read_owned_entity_id(field, ids, row).unwrap(), id);
             assert_eq!(ids.value_offset(row), offset);
             assert_eq!(distances.value(row).to_bits(), distance.to_bits());
             assert_eq!(partitions.value(row), partition);

@@ -1,6 +1,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, num::NonZeroU32, sync::Arc};
 
 use rtdb_columnar::EntityIdRef;
+use rtdb_types::OwnedIdentityScan;
 use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, SortExpr, TemporalFilter};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Iid, Interval, OwnedRelation, Result, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 
@@ -171,7 +172,7 @@ pub async fn try_owned_lifetime_range_expiry(
     let mut by_iid = BTreeMap::new();
     for row in 0..page.num_rows() {
         context.check_cancelled()?;
-        let Some(id) = reader.read_entity_id(ids, row)? else { return Ok(None); };
+        let Some(id) = reader.read_owned_entity_id(ids, row)? else { return Ok(None); };
         let iid = id.iid();
         let Entry::Vacant(candidate) = candidates.entry(iid) else { return Ok(None); };
         let bytes = id.owned_payload_bytes().saturating_mul(2).saturating_add(512);
@@ -381,10 +382,10 @@ async fn open_constraint_projection(
     PreparedQuery::new_in(scan, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }
 
-/// Opens a bounded page of visible identities in complete UTF-8 key order.
+/// Opens a bounded page of visible identities in complete key order.
 pub async fn open_owned_identity_page(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: Option<&str>, fetch: i64,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
     if relation.world().is_some() || relation.is_world_catalog() {
         return Err(address_unavailable());
@@ -397,7 +398,7 @@ pub async fn open_owned_identity_page(
 /// caller collapses adjacent repeats.
 pub async fn open_owned_identity_page_all_valid(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    after: Option<&str>, fetch: i64,
+    after: &OwnedIdentityScan<'_>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
     if relation.world().is_some() || relation.is_world_catalog() {
         return Err(address_unavailable());
@@ -414,9 +415,10 @@ pub async fn open_owned_identity_page_all_valid(
         id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false,
         unnamed: false, data_type: table.scan_column_type("_id"),
     };
+    if !after.accepts(&id.data_type) { return Err(address_unavailable()); }
     let order = id.expression();
-    let predicates: Vec<_> = after.map(|after| Expr::binary(
-        BinaryOp::Gt, order.clone(), Expr::Literal(Value::Utf8(after.into())),
+    let predicates: Vec<_> = after.bound().map(|after| Expr::binary(
+        BinaryOp::Gt, order.clone(), Expr::Literal(after),
     )).into_iter().collect();
     let scan = Arc::new(Relation::scan(Scan {
         table,
@@ -444,12 +446,12 @@ pub async fn open_owned_identity_prefix(
     {
         return Err(address_unavailable());
     }
-    open_owned_identity_candidates(context, owner, relation, at, at, after, Some(prefix), fetch).await
+    open_owned_identity_candidates(context, owner, relation, at, at, &OwnedIdentityScan::text(after), Some(prefix), fetch).await
 }
 
 async fn open_owned_identity_candidates(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: Option<&str>, prefix: Option<&str>, fetch: i64,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, prefix: Option<&str>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
     let context = owned_context_at_system(context, system)?;
     if owner.is_empty() { return Err(address_unavailable()); }
@@ -463,9 +465,10 @@ async fn open_owned_identity_candidates(
         id: ColumnId(0), name: "_id".into(), qualifier: None, qualified_only: false,
         unnamed: false, data_type: table.scan_column_type("_id"),
     };
+    if !after.accepts(&id.data_type) { return Err(address_unavailable()); }
     let order = id.expression();
-    let mut predicates: Vec<_> = after.map(|after| Expr::binary(
-        BinaryOp::Gt, order.clone(), Expr::Literal(Value::Utf8(after.into())),
+    let mut predicates: Vec<_> = after.bound().map(|after| Expr::binary(
+        BinaryOp::Gt, order.clone(), Expr::Literal(after),
     )).into_iter().collect();
     if let Some(prefix) = prefix {
         let mut upper = prefix.to_owned();
@@ -493,14 +496,14 @@ async fn open_owned_identity_candidates(
     PreparedQuery::new_in(page, &context.memory)?.execute(context, Vec::new()).await.map(Some)
 }
 
-/// A bounded page of ordered UTF-8 keys with retained memory ownership.
+/// A bounded page of ordered keys with retained memory ownership.
 pub struct OwnedIdentityCandidates {
-    pub keys: Vec<String>,
+    pub keys: Vec<EntityId>,
     _charges: Vec<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
 impl OwnedIdentityCandidates {
-    pub fn into_parts(self) -> (Vec<String>, Vec<Arc<rtdb_columnar::MemoryReservation>>) {
+    pub fn into_parts(self) -> (Vec<EntityId>, Vec<Arc<rtdb_columnar::MemoryReservation>>) {
         (self.keys, self._charges)
     }
 }
@@ -508,7 +511,7 @@ impl OwnedIdentityCandidates {
 /// Reads root identities or local shadow candidates in one exact native cut.
 pub async fn owned_identity_candidates(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: Option<&str>, fetch: usize,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize,
 ) -> Result<OwnedIdentityCandidates> {
     owned_identity_candidates_in_prefix(context, owner, relation, system, valid, after, fetch, None).await
 }
@@ -516,20 +519,24 @@ pub async fn owned_identity_candidates(
 /// Read an exact bounded identity page in a caller-admitted opaque scope.
 pub async fn owned_identity_candidates_in_prefix(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: Option<&str>, fetch: usize, prefix: Option<&str>,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<&str>,
 ) -> Result<OwnedIdentityCandidates> {
     let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/world-identities",
         "The held world identity candidates exceed their exact coverage or byte bound");
     if !(1..=129).contains(&fetch) || relation.is_world_catalog()
         || prefix.is_some_and(|prefix| prefix.is_empty() || !prefix.is_ascii() || prefix.ends_with('\x7f')
-            || after.is_some_and(|after| !after.starts_with(prefix)))
+            || match after {
+                OwnedIdentityScan::Text(after) => after.as_deref().is_some_and(|after| !after.starts_with(prefix)),
+                _ => true,
+            })
     {
         return Err(unavailable());
     }
     let context = owned_context_at_system(context, system)?;
     let mut charges = vec![context.memory.reserve(fetch * 128)?];
-    let mut keys: Vec<String> = Vec::with_capacity(fetch);
+    let mut keys: Vec<EntityId> = Vec::with_capacity(fetch);
     let mut remaining: usize = 8 << 20;
+    let bound = after.bound().map(|key| key.owned_entity_id()).transpose()?;
     if let Some(mut cursor) = open_owned_identity_candidates(
         Arc::clone(&context), owner, relation, system, valid, after, prefix, fetch as i64,
     ).await? {
@@ -541,15 +548,14 @@ pub async fn owned_identity_candidates_in_prefix(
                 let size = rtdb_columnar::estimate_read_value_bytes(field, array, row)?;
                 remaining = remaining.checked_sub(size).ok_or_else(unavailable)?;
                 charges.push(context.memory.reserve(size)?);
-                let Value::Utf8(key) = rtdb_columnar::read_execution_value(field, array, row)? else {
-                    return Err(unavailable());
-                };
-                if keys.len() == fetch || prefix.is_some_and(|prefix| !key.starts_with(prefix))
-                    || keys.last().map(String::as_str).or(after).is_some_and(|prior| prior >= key.as_str())
+                let id = rtdb_columnar::read_owned_entity_id(field, array, row)
+                    .map_err(|_| unavailable())?.into_owned();
+                if keys.len() == fetch
+                    || prefix.is_some_and(|prefix| !matches!(&id, EntityId::String(key) if key.starts_with(prefix)))
+                    || keys.last().or(bound.as_ref()).is_some_and(|prior| prior >= &id)
                 {
                     return Err(unavailable());
                 }
-                let id = EntityId::String(key.clone());
                 let mut point = open_owned_point(
                     Arc::clone(&context), owner, relation, &id,
                     Some(Interval::at(valid)?), Some(&["_id"]),
@@ -562,7 +568,7 @@ pub async fn owned_identity_candidates_in_prefix(
                     found = true;
                 }
                 if !found { return Err(unavailable()); }
-                keys.push(key);
+                keys.push(id);
             }
         }
     }
@@ -1029,10 +1035,10 @@ pub fn owned_row_revision_for(
     let _scratch = memory.reserve(bound.checked_add(4096)
         .ok_or_else(|| Anomaly::fault("rtdb.owned/row-identity", "Owned identity allocation overflow"))?)?;
     let typed = typed_owned_cell(rtdb_columnar::ArrowCell { field: id_field, array: id, row })
-        .and_then(|cell| rtdb_columnar::read_entity_id(cell.field, cell.array, cell.row).ok());
+        .and_then(|cell| rtdb_columnar::read_owned_entity_id(cell.field, cell.array, cell.row).ok());
     let matches = match typed {
         Some(id) => id == expected_id,
-        None => EntityIdRef::from(&rtdb_columnar::read_value(id_field, id, row)?.entity_id()?) == expected_id,
+        None => EntityIdRef::from(&rtdb_columnar::read_value(id_field, id, row)?.owned_entity_id()?) == expected_id,
     };
     if !matches {
         return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "rtdb.owned/iid-collision", "Owned row locator resolves to a different complete identity"));
