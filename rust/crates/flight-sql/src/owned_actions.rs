@@ -3651,8 +3651,27 @@ impl Service {
         Ok(reply)
     }
 
+    async fn begin_held_rank(&self, call: &Call) -> Result<(), Status> {
+        use rtdb_storage::sealing::PlaintextView;
+
+        PlaintextView::begin_rank_inventory().map_err(status)?;
+        if !self.supports_hosted_upload(call) { return Ok(()); }
+        let Some(host) = self.0.config.owned_world_host.as_ref() else { return Ok(()); };
+        let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
+        let Some(attachment) = attachment else { return Ok(()); };
+        let connection = self.connection(call, &call.database).await?;
+        let mut session = connection.borrow().await?;
+        require_idle(&session)?;
+        if let Ok(authority) = host.root_rank_authority(crate::WorldCall {
+            node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation,
+        }) {
+            PlaintextView::bind_root_rank_authority(authority).map_err(status)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3726,6 +3745,7 @@ impl Service {
         for row in 0..input.num_rows() {
             if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
                 || partitions.value(row) >= rank.partitions.len() as u64
+                || (rank.partitions[partitions.value(row) as usize].0.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
             {
                 return Err(invalid("Invalid staged search identity"));
             }
@@ -3739,7 +3759,7 @@ impl Service {
     }
 
     pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held nearest has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3799,7 +3819,7 @@ impl Service {
 
     /// Fuses a held text ranking and a held nearest ranking of the same relations at the held cut by reciprocal rank fusion.
     pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held hybrid search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3857,7 +3877,7 @@ impl Service {
 
     /// The world hybrid family: HybridHeldWorld (with staged overlays), HybridHeldWorldAt and HybridHeldWorldParentAt.
     pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world hybrid handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -3946,6 +3966,7 @@ impl Service {
         for row in 0..input.num_rows() {
             if partitions.is_null(row) || ids.is_null(row) || ids.value(row).is_empty()
                 || partitions.value(row) >= nearest.partitions.len() as u64
+                || (nearest.partitions[partitions.value(row) as usize].relation.name().ends_with("_search") && ids.value(row).starts_with(rtdb_types::RootFamilyDerivativeId::PREFIX))
             {
                 return Err(invalid("Invalid staged nearest identity"));
             }
@@ -3978,7 +3999,7 @@ impl Service {
     /// `NearestHeldWorld.v2`, `NearestHeldWorldAt.v2` and `NearestHeldWorldParentAt.v2`:
     /// the SearchHeldWorld prefixes followed by the NearestHeld.v3 frame.
     pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4056,7 +4077,7 @@ impl Service {
     }
 
     pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
-        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
+        self.begin_held_rank(call).await?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {

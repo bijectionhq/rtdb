@@ -194,8 +194,10 @@ impl HeldTextCorpus {
         if !crate::definitions::has_owned_search_text(snapshot, &table, &column)? {
             return Ok(());
         }
+        let mut columns = vec!["_id", &column];
+        if sealed { columns.push("_system_from"); }
         let Some(mut cursor) = rtdb_query::open_owned_root_projection(
-            Arc::clone(context), owner, relation, valid, &["_id", &column],
+            Arc::clone(context), owner, relation, valid, &columns,
         ).await? else { return Err(corpus_limit()); };
         let shadows = self.shadows.remove(&partition).unwrap_or_default();
         while let Some(batch) = cursor.next_batch().await? {
@@ -210,18 +212,19 @@ impl HeldTextCorpus {
                 context.check_cancelled_at(row)?;
                 let id_bytes = rtdb_columnar::estimate_read_value_bytes(id_field, ids, row)?;
                 let _identity = self.memory.reserve(id_bytes.saturating_mul(2))?;
-                let id = rtdb_columnar::read_entity_id(id_field, ids, row)?.into_owned();
+                let physical = rtdb_columnar::read_entity_id(id_field, ids, row)?;
+                let protected = sealed.then(|| crate::rank_family::RootProjectionId::parse(physical)).transpose()?;
+                let id = protected.as_ref().map_or(physical, |id| id.canonical()).into_owned();
                 if shadows.contains(&id) { continue; }
+                if let Some(protected) = protected {
+                    if self.contains_shadow(partition, &id) { return Err(crate::rank_family::unavailable()); }
+                    protected.require(context, owner, relation, valid, batch, row).await?;
+                }
                 let value = match rtdb_columnar::owned_text_cell(&logical, text_field, text, row)? {
                     rtdb_columnar::TextCell::Utf8(text) => Some(text),
                     rtdb_columnar::TextCell::Missing => None,
                     rtdb_columnar::TextCell::Other => return Err(corpus_limit()),
                 };
-                if sealed && value.is_some() {
-                    crate::rank_family::root_contributor(
-                        context, owner, relation, rtdb_columnar::EntityIdRef::from(&id), valid,
-                    ).await?;
-                }
                 self.shadow(partition, id, value)?;
             }
         }

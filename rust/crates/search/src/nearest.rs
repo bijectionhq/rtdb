@@ -305,6 +305,7 @@ pub async fn owned_nearest_batch(
         let mut columns = vec!["_id", partition.vector.as_str()];
         columns.extend(partition.filters.iter().map(String::as_str));
         let sealed = crate::rank_family::needs_rank_family(&context, owner, &partition.relation).await?;
+        if sealed { columns.push("_system_from"); }
         if query.approximate && !sealed {
             let bounds = TemporalBounds { valid_time: Interval::at(valid)?, system_time: Interval::at(present)? };
             let cut = rtdb_vector::Cut { snapshot, storage: &database.storage, memory: &context.memory, cancellation: &context.cancellation, bounds };
@@ -367,6 +368,8 @@ async fn rank_rows(
     shadows: Option<&BTreeSet<EntityId>>, ordinal: usize, window: &mut NearestWindow,
     sealed: Option<(&str, Timestamp)>,
 ) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut identities = context.memory.reserve(0)?;
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         let schema = batch.schema_ref();
@@ -377,6 +380,18 @@ async fn rank_rows(
             .collect::<Result<Vec<_>>>()?;
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
+            let read_id = || rtdb_columnar::read_entity_id(id_field, batch.column(id_column).as_ref(), row);
+            let is_shadowed = |id| shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id));
+            let admitted_id = if let Some((owner, valid)) = sealed {
+                let protected = crate::rank_family::RootProjectionId::parse(read_id()?)?;
+                let id = protected.canonical();
+                if is_shadowed(id) { continue; }
+                protected.require(context, owner, &partition.relation, valid, batch, row).await?;
+                let charge = Arc::get_mut(&mut identities).expect("exclusive candidate identity reservation");
+                charge.grow_to(charge.bytes().saturating_add(id.owned_payload_bytes()).saturating_add(192))?;
+                if !seen.insert(id.into_owned()) { return Err(crate::rank_family::unavailable()); }
+                Some(id)
+            } else { None };
             let mut cells = [None; MAX_NEAREST_FILTERS];
             for (cell, &(column, field)) in cells.iter_mut().zip(&filters) {
                 *cell = rtdb_columnar::binary_cell(field, batch.column(column).as_ref(), row)?;
@@ -388,12 +403,14 @@ async fn rank_rows(
             let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
             let Some(vector) = read_vector(ArrowCell { field: vector_field, array: vectors, row })? else { continue; };
             let Some(distance) = vector.distance(query)? else { continue; };
-            let ids = batch.column(id_column).as_ref();
-            let id = rtdb_columnar::read_entity_id(id_field, ids, row)?;
-            if shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id)) { continue; }
-            if let Some((owner, valid)) = sealed {
-                crate::rank_family::root_contributor(context, owner, &partition.relation, id, valid).await?;
-            }
+            let id = match admitted_id {
+                Some(id) => id,
+                None => {
+                    let id = read_id()?;
+                    if is_shadowed(id) { continue; }
+                    id
+                }
+            };
             window.admit(ordinal, id, distance)?;
         }
     }

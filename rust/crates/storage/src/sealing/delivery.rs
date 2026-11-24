@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     future::{Future, poll_fn},
     io::{self, IoSlice},
+    num::NonZeroU64,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -99,6 +100,25 @@ pub trait PlaintextReleaseCheck: Send + Sync {
     async fn require_current(&self) -> rtdb_types::Result<()>;
 }
 
+/// A protected Root member selected at the rank's held cut.
+pub struct RootRankSelection<'a> {
+    pub family: uuid::Uuid,
+    pub assertion: rtdb_types::AssertionId,
+    pub stage: [u8; 40],
+    pub target: rtdb_types::RootLandingTarget,
+    pub link_digest: [u8; 32],
+    pub payload_digest: [u8; 32],
+    pub publication: u64,
+    pub ordinal: NonZeroU64,
+    pub relation: &'a str,
+    pub selector: &'a str,
+}
+
+#[async_trait::async_trait]
+pub trait RootRankAuthority: Send + Sync {
+    async fn require_derivative(&self, selected: RootRankSelection<'_>) -> rtdb_types::Result<()>;
+}
+
 /// A conservative inventory of the exact keys and checks for an execution's answer.
 pub struct PlaintextView {
     memory: Arc<MemoryBudget>,
@@ -113,6 +133,7 @@ pub struct PlaintextView {
 struct RankInventory {
     entries: BTreeMap<Vec<u8>, Arc<MemoryReservation>>,
     carrier_reads: usize,
+    root_authority: Option<Arc<dyn RootRankAuthority>>,
 }
 
 struct CheckedRelease {
@@ -166,6 +187,23 @@ impl PlaintextView {
             *owner.rank.lock() = Some(RankInventory::default());
             Ok(())
         }).map_err(|_| rank_unavailable())?
+    }
+
+    pub fn bind_root_rank_authority(authority: Arc<dyn RootRankAuthority>) -> rtdb_types::Result<()> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            let mut rank = views.last().ok_or_else(rank_unavailable)?.rank.lock();
+            rank.as_mut().ok_or_else(rank_unavailable)?.root_authority = Some(authority);
+            Ok(())
+        }).map_err(|_| rank_unavailable())?
+    }
+
+    pub async fn require_root_rank_derivative(selected: RootRankSelection<'_>) -> rtdb_types::Result<()> {
+        let authority = PLAINTEXT_VIEWS.try_with(|views| {
+            views.iter().rev().find_map(|view| {
+                view.rank.lock().as_ref().map(|rank| rank.root_authority.clone())
+            }).flatten()
+        }).ok().flatten().ok_or_else(rank_unavailable)?;
+        authority.require_derivative(selected).await
     }
 
     pub fn tracks_rank_inventory() -> bool {
