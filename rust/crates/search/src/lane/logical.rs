@@ -867,7 +867,7 @@ mod tests {
             tokens: rtdb_text::analyze("body"), position: (Timestamp(1), None, 1) };
         let contents = RunContents { documents: vec![document], erases: Erases::new() };
         builder.store_documents(index, &["body".into()], slug, vec![0], 0, 1, contents,
-            memory.reserve(32 << 20).unwrap(), &CancellationToken::new()).await
+            memory.reserve(32 << 20).unwrap(), None, &CancellationToken::new()).await.map(|prepared| prepared.run)
     }
 
     #[tokio::test]
@@ -931,7 +931,7 @@ mod tests {
             sql_id: Some(1), tokens: rtdb_text::analyze("test"), position: (Timestamp(1), None, 1) };
         let contents = RunContents { documents: vec![document], ..Default::default() };
         builder.store_documents(&index, &["body".into()], slug, vec![0], 0, 1, contents,
-            builder.memory.reserve(indexing_allowance(0))?, &CancellationToken::new()).await
+            builder.memory.reserve(indexing_allowance(0))?, None, &CancellationToken::new()).await.map(|prepared| prepared.run)
     }
 
     #[tokio::test]

@@ -3004,7 +3004,7 @@ mod tests {
         retain_term_directory_pages(store.as_ref(), &table, &slug, &mut closure).await?;
         let expected = written.into_iter().map(|digest| Ok((key(&cow_tree::page_key(&prefix, digest))?, Some(digest.0))))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        assert_eq!(closure, expected);
+        assert_eq!(closure.into_iter().map(|(key, member)| (key, member.digest)).collect::<BTreeMap<_, _>>(), expected);
         Ok(())
     }
 

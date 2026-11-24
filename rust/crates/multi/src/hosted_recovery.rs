@@ -419,6 +419,7 @@ async fn trim_census(record: &DeploymentRecord, stream: &StreamConfig,
 #[cfg(test)]
 mod tests {
     use rtdb_directory::{Checkpoint, CheckpointSuffixPin, ReplayCustody, StorageRegion};
+    use rtdb_storage::ObjectKey;
     use rtdb_types::{Timestamp, TransactionKey, TxId};
 
     use super::*;
