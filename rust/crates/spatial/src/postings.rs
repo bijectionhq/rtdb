@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -478,13 +479,13 @@ struct Page {
     digest: [u8; DIGEST_BYTES],
 }
 
-pub(crate) async fn candidates(
+pub(crate) async fn candidates<F: Future<Output = Result<Bytes>> + Send>(
     root: Root,
     partition: Option<Partition>,
     ranges: &[KeyRange],
     memory: &Arc<MemoryBudget>,
     check: impl Fn() -> Result<()>,
-    mut fetch: impl AsyncFnMut(Range<u64>) -> Result<Bytes>,
+    mut fetch: impl FnMut(Range<u64>) -> F,
     mut insert: impl FnMut(Iid) -> Result<()>,
 ) -> Result<()> {
     check()?;
@@ -639,9 +640,9 @@ mod tests {
         let ranges = [KeyRange { start: SELECTED_CELL, end: SELECTED_CELL }];
         let mut requests = Vec::new();
         let mut found = Vec::new();
-        candidates(root, Some(SELECTED), &ranges, &memory, || Ok(()), async |range| {
+        candidates(root, Some(SELECTED), &ranges, &memory, || Ok(()), |range| {
             requests.push(range.clone());
-            Ok(bytes.slice(range.start as usize..range.end as usize))
+            std::future::ready(Ok(bytes.slice(range.start as usize..range.end as usize)))
         }, |iid| { found.push(iid); Ok(()) }).await.unwrap();
         assert_eq!(requests, [root.range(), pages[1].clone()]);
         assert_eq!(found, [WANTED]);
@@ -656,9 +657,9 @@ mod tests {
         let bytes = Bytes::from(bytes);
         let mut requests = Vec::new();
         let error = candidates(root, Some(SELECTED), &[KeyRange { start: SELECTED_CELL, end: SELECTED_CELL }],
-            &memory, || Ok(()), async |range| {
+            &memory, || Ok(()), |range| {
                 requests.push(range.clone());
-                Ok(bytes.slice(range.start as usize..range.end as usize))
+                std::future::ready(Ok(bytes.slice(range.start as usize..range.end as usize)))
             }, |_| panic!("corrupt directory supplied a candidate")).await.unwrap_err();
         assert_eq!(error.code, CORRUPT);
         assert_eq!(requests, [root.range()]);
@@ -674,12 +675,12 @@ mod tests {
         let error = candidates(root, Some(SELECTED), &[KeyRange { start: 0, end: SELECTED_CELL }],
             &memory, || {
                 if cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
-            }, async |range| {
+            }, |range| {
                 if range == pages[0] {
                     cancellation.cancel();
                 }
                 requests.push(range.clone());
-                Ok(bytes.slice(range.start as usize..range.end as usize))
+                std::future::ready(Ok(bytes.slice(range.start as usize..range.end as usize)))
             }, |_| panic!("cancelled read supplied a candidate")).await.unwrap_err();
         assert_eq!(error.code, cancelled().code);
         assert_eq!(requests, [root.range(), pages[0].clone()]);
@@ -704,9 +705,9 @@ mod tests {
             receipt.digest = sha256(&bytes[directory..], &|| Ok(())).unwrap();
             let bytes = Bytes::from(bytes);
             let mut requests = Vec::new();
-            let error = candidates(receipt, Some(OTHER), &ranges, &memory, || Ok(()), async |range| {
+            let error = candidates(receipt, Some(OTHER), &ranges, &memory, || Ok(()), |range| {
                 requests.push(range.clone());
-                Ok(bytes.slice(range.start as usize..range.end as usize))
+                std::future::ready(Ok(bytes.slice(range.start as usize..range.end as usize)))
             }, |_| panic!("mismatched page supplied a candidate")).await.unwrap_err();
             assert_eq!(error.code, CORRUPT, "{mismatch}");
             assert_eq!(requests, [root.range(), pages[2].clone()], "{mismatch}");
