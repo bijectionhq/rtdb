@@ -30,6 +30,7 @@
 -- Staged Flight shadows borrow text from the admitted Arrow batch through analysis.
 -- A staged null text cell shadows its identity in the selected partition without contributing a document.
 -- Held corpus accounting uses the complete identity's typed payload size and the fixed allowance for its retained entry.
+-- A staged corpus entry owns its partition's shadow identity and any match frequencies for that identity.
 -- An exact Root corpus entry keeps its complete identity with any match frequencies for that identity.
 -- A declared optional text column with only null or absent values contributes an empty corpus.
 -- Owned runs carry their full typed identity.

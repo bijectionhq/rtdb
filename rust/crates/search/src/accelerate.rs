@@ -551,7 +551,7 @@ pub async fn owned_corpus(
     let partition = [(relation.clone(), path.clone())];
     let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, &partition).await?;
     let query = Query::analyzed(analyzer, text);
-    let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, None).await?;
+    let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, |_| false).await?;
     Ok(rtdb_text::Corpus {
         documents: covered.documents, tokens: covered.tokens,
         frequencies: query.terms().iter().cloned().zip(covered.frequencies.values().iter().copied()).collect(),
@@ -571,7 +571,7 @@ struct CoveredCorpus {
 async fn covered_owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query,
     valid_at: Option<Timestamp>, retain_runs: bool,
-    shadowed: Option<&BTreeSet<EntityId>>,
+    is_shadowed: impl Fn(EntityIdRef<'_>) -> bool,
 ) -> Result<CoveredCorpus> {
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
@@ -645,7 +645,7 @@ async fn covered_owned_corpus(
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
-                        if shadowed.is_some_and(|ids| ids.iter().any(|value| EntityIdRef::from(value) == id)) { continue; }
+                        if is_shadowed(id) { continue; }
                         if !seen.insert(key) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         documents += 1;
@@ -796,8 +796,8 @@ async fn prepare_owned_artefacts<'a>(
     let mut frequencies = vec![0; query.terms().len()];
     let mut covered = Vec::with_capacity(partitions.len());
     for (partition, (relation, path)) in partitions.iter().enumerate() {
-        let shadowed = overlay.and_then(|part| part.shadowed(partition));
-        let part = covered_owned_corpus(Arc::clone(context), owner, relation, path, query, valid_at, true, shadowed).await?;
+        let part = covered_owned_corpus(Arc::clone(context), owner, relation, path, query, valid_at, true,
+            |id| overlay.is_some_and(|corpus| corpus.contains_shadow_key(partition, id))).await?;
         documents += part.documents;
         tokens += part.tokens;
         for (total, &frequency) in frequencies.iter_mut().zip(part.frequencies.values()) { *total += frequency; }
