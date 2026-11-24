@@ -54,6 +54,12 @@
 -- The shared projector keeps a protected assertion or revocation in the canonical fold.
 -- A protected assertion withdraws only previously clear ranges for its installed Classic IID.
 -- Default custody admission requires the installed release and delivery fence.
+-- The trusted Default export owner selects one exact published shared Basis with retained files.
+-- It verifies the selected native image and stages the complete dependency manifest in durable source backing before ordering a replica pin.
+-- A pin keeps its first admitted receipt, manifest and expiry across retries and source checkpoint advancement.
+-- A checkpoint pin has its own replica position and does not advance transaction or source progress.
+-- Restore admits the original pin, verifies the independent files and reopens the exact checkpoint from the destination before success.
+-- Sealed or custody-held histories require an explicit destination binding for Default export.
 -- Branch Transact submissions with operations append the canonical request and its authenticated admission context to the source log.
 -- The admission context preserves the receipt namespace, label scope, verified claims and any sealed custody request digest.
 -- Nodes that submit or resolve branch requests share the database's source admission key through its private object store.

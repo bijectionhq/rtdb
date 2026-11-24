@@ -754,6 +754,8 @@ impl NativeServing {
 
     pub(crate) fn shares_main(&self) -> bool { self.shares_main }
 
+    pub(crate) fn incarnation(&self) -> [u8; 16] { self.authority.incarnation }
+
     pub(crate) fn classic_write_authority(&self) -> &BranchIndex { self.durable().index() }
 
     pub(crate) fn require_classic_effects(&self, write: &StagedWrite) -> Result<()> {

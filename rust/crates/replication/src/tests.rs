@@ -1353,6 +1353,43 @@ async fn default_v1_uses_positioned_classic_rows_from_a_preexisting_checkpoint()
 }
 
 #[tokio::test]
+async fn default_orders_an_exact_pin_and_reopens_independent_backing() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let objects: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(source.path()).unwrap());
+    let mut fixture = fixture_over(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 27,
+        None, |replica| replica, Arc::new(MemoryStore::default()), objects).await;
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    let running = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let committed = serving.transact(serving_source_put(1), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        let source_position = fixture.handle.flush().await.unwrap();
+        fixture.handle.await_source(source_position, &cancellation).await.unwrap();
+        let pin = uuid::Uuid::from_bytes([9; 16]);
+        let ticket = serving.pin_checkpoint_export(pin, committed.basis, Some(Timestamp::MAX), &cancellation).await.unwrap();
+        assert_eq!(fixture.handle.progress().current().source_position, source_position);
+        assert_eq!(serving.pin_checkpoint_export(pin, committed.basis, Some(Timestamp::MAX), &cancellation).await.unwrap(), ticket);
+        assert_eq!(serving.pin_checkpoint_export(pin, committed.basis, None, &cancellation).await.unwrap_err().code, "rtdb/checkpoint-pin-conflict");
+        let copy = serving.materialize_checkpoint_export(&ticket, target.path(), &cancellation).await.unwrap();
+        assert!(copy.path.starts_with(target.path()));
+        assert_eq!(copy.basis, committed.basis);
+        assert_eq!(copy.source, source_position);
+        let store: Arc<dyn ObjectStore> = Arc::new(LocalStore::open(&copy.path).unwrap());
+        assert_eq!(store.get_fresh(&ObjectKey::new("checkpoint-restore-receipt").unwrap()).await.unwrap().as_ref(), &ticket[..]);
+        let blocks = BlockStore::new(store.clone(), Arc::new(BufferPool::new(store, 1 << 24)), Arc::clone(&fixture.memory), 100_000_000).unwrap();
+        let recovered = blocks.recover(Default::default(), copy.source, Timestamp(0), crate::BlockDiscovery::AtPublished(copy.checkpoint)).await.unwrap();
+        assert_eq!(recovered.block.unwrap().boundary_replica_position(), Some(copy.checkpoint.boundary));
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn default_recovers_a_shared_checkpoint_and_a_mixed_replica_suffix() {
     use rtdb_crypt::tokens::VerifiedClaims;
     use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};

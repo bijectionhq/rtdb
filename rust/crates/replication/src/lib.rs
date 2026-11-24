@@ -4,6 +4,7 @@ mod admission;
 mod admission_step;
 mod appender;
 mod blocks;
+mod checkpoint_admin;
 mod catalog_cut;
 mod checkpoint_discovery;
 mod replay_floor;
@@ -39,6 +40,7 @@ pub fn verify_archived_transaction(
 }
 pub use admission_step::{Admission, TermFence, TermPosition, Verdict};
 pub use blocks::{BlockDiscovery, BlockStore, NativeErasureCut, ProducedBlock, PublishedCheckpoint, RecoveredPartition, VerifiedNativeErasureCheckpoint};
+pub use checkpoint_admin::DetachedDefaultCheckpoint;
 pub use driver::{CommittedErasure, ExternalReceipt, DatabaseEffects, DriverStatus, InstalledPrefix, RecoverableExternalToken, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, ServingSearchBuilder, TermHandle};
 pub use logs::{PartitionLogs, ReplicaMetadata, ReplicaReceipt, ReplicaRecord};
 pub use snapshot_replay::{ErasureTarget, SnapshotReplay, SqlErasureSource};
