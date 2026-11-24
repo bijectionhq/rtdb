@@ -1,4 +1,5 @@
 use prost::Message;
+use rtdb_tx::transact::REQUIREMENT_FAILED;
 use rtdb_types::{Anomaly, AnomalyCategory as Native};
 use tonic::{Code, Status, metadata::MetadataValue};
 
@@ -109,7 +110,8 @@ pub(super) fn detail(native: Anomaly) -> Error {
         Native::Fault => Category::Fault,
     };
     let stable = match native.code.as_str() {
-        "rtdb/erased-under-view" | "rtdb/cursor-expired" | "rtdb/unknown-branch" => {
+        "rtdb/erased-under-view" | "rtdb/cursor-expired" | "rtdb/unknown-branch"
+        | REQUIREMENT_FAILED => {
             native.code.as_str()
         }
         _ => code(category),

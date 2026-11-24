@@ -82,6 +82,8 @@ message TransactRequest {
   repeated Guard guards = 4;
   repeated Op ops = 5;
   repeated Op otherwise = 6;
+  // Preconditions on the original state. CountAtMost uses WHEN_BEFORE here.
+  repeated Guard requires = 7;
 }
 message TxStatusRequest { bytes key = 1; }
 message Guard {
@@ -233,6 +235,7 @@ enum AnomalyCategory {
 // Serialized in the rtdb-error-bin status metadata.
 message Error {
   AnomalyCategory category = 1;
+  // A failed Transact requirement uses conflict / rtdb/requirement-failed.
   string code = 2;
   string message = 3;
   optional string feature = 4;

@@ -1430,3 +1430,72 @@ async fn rtdb_v1_native_driver_applies_branches_and_keeps_their_receipts_at_the_
     assert!(replay.replayed);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn rtdb_v1_native_driver_requires_fences_both_arms_and_replays() {
+    use rtdb_node::serving::NativeServingAuthority;
+    use rtdb_types::rtdb_v1::ClaimSealer;
+    use v1::{receipt::Outcome, version::Expect};
+
+    let incarnation = [27; 16];
+    let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
+        "xtdb", NativeServingAuthority {
+            incarnation, claims: Arc::new(ClaimSealer::new(incarnation, [8; 32])), checkpoints: None,
+        },
+    );
+    let running = Running::start_with_resources(
+        None, FlightConfig::default(), &[], None, Default::default(), None, Some(Arc::new(resources)),
+    ).await;
+    let database = running.node.catalog().database("xtdb").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let caps = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
+    let caps = v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap();
+    assert!(caps.features.iter().any(|feature| feature == "transact.requires"));
+
+    let put = |id, n| v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+        branch: "main".into(), table: "public.wire_owner".into(), if_absent: false,
+        rows: vec![v1::Row { cells: [("_id".into(), integer_cell(id)), ("n".into(), integer_cell(n))].into_iter().collect() }],
+    })) };
+    let version = |id, expect| v1::Guard { guard: Some(v1::guard::Guard::Version(v1::Version {
+        branch: "main".into(), table: "public.wire_owner".into(), id: Some(integer_cell(id)),
+        valid_at_micros: None, expect: Some(expect),
+    })) };
+    let owner = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![1; 16], ops: vec![put(1, 10)], ..Default::default()
+    }).await.unwrap();
+    let successor = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![2; 16], ops: vec![put(1, 20)], ..Default::default()
+    }).await.unwrap();
+
+    let stale = v1::TransactRequest {
+        key: vec![3; 16], require: vec!["transact.requires".into()],
+        requires: vec![version(1, Expect::Written(owner.basis.unwrap()))],
+        guards: vec![version(2, Expect::Present(()))],
+        ops: vec![put(2, 30)], otherwise: vec![put(3, 40)], ..Default::default()
+    };
+    let refused = transact_wire(&mut client, stale.clone()).await.unwrap();
+    let Some(Outcome::Refused(error)) = &refused.outcome else { panic!("expected refusal"); };
+    assert_eq!(error.category(), v1::AnomalyCategory::Conflict);
+    assert_eq!(error.code, "rtdb/requirement-failed");
+    assert_eq!(error.message, "Requirement 0 failed");
+    assert!(!refused.replayed);
+    let read = input("SELECT n FROM wire_owner ORDER BY n");
+    assert_eq!(ints(&query(&mut client, read.clone()).await.0), [20]);
+    let replayed = v1::Receipt { replayed: true, ..refused };
+    assert_eq!(transact_wire(&mut client, stale.clone()).await.unwrap(), replayed);
+    let status = client.action(
+        "rtdb.v1.TxStatus", v1::TxStatusRequest { key: stale.key.clone() }.encode_to_vec().into(),
+    ).await.unwrap();
+    assert_eq!(v1::Receipt::decode(status[0].body.clone()).unwrap(), replayed);
+
+    let selected = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![4; 16], requires: vec![version(1, Expect::Written(successor.basis.unwrap()))], ..stale
+    }).await.unwrap();
+    assert_eq!(selected.outcome, Some(Outcome::Otherwise(v1::Otherwise { failed: vec![0] })));
+    assert_eq!(ints(&query(&mut client, read).await.0), [20, 40]);
+    running.stop().await;
+}

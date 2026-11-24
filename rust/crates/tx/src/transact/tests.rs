@@ -2,15 +2,15 @@ use super::*;
 use rtdb_types::rtdb_v1::{ClaimEvidence, ClaimFootprint, ClaimRegion, ClaimScope, ClaimSealer};
 
 const INCARNATION: [u8; 16] = [1; 16];
-const DEFAULT: &[&str] = &[LINEARIZABLE];
-const MULTI: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT];
+const DEFAULT: &[&str] = &[LINEARIZABLE, TRANSACT_REQUIRES];
+const MULTI: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES];
 
 fn claims() -> ClaimSealer { ClaimSealer::new(INCARNATION, [2; 32]) }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn basis(position: u64) -> Basis { Basis::new(INCARNATION, position) }
 
 fn request(key: u8, ops: Vec<Op>) -> Transact {
-    Transact { key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), ops, otherwise: Vec::new() }
+    Transact { key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new() }
 }
 
 fn put(branch: &str, id: i64, key: &str) -> Op {
@@ -283,6 +283,25 @@ fn otherwise_discards_the_candidate_and_validation_never_appends() {
     assert!(matches!(result, Resolution::Answer(receipt)
         if receipt.basis == basis(2) && receipt.outcome == (Outcome::Otherwise { failed: vec![0] })));
     assert!(state.tx_status(&validation.key).is_err());
+}
+
+#[test]
+fn requires_count_validates_the_original_state_without_appending() {
+    let mut state = TransactState::new(INCARNATION);
+    commit(&mut state, 1, &request(1, vec![
+        Op::Declare { table: table(), change: Declaration::Index(IndexDefinition { name: "by_key".into(), column: "key".into() }) },
+        put(MAIN_BRANCH, 1, "a"),
+    ]));
+    let range = CountRange { table: table(), index: "by_key".into(), lower: None, upper: None, valid_at: None, n: 0 };
+    let mut validation = request(2, vec![]);
+    for (when, code) in [(When::Before, REQUIREMENT_FAILED), (When::After, "rtdb/invalid-requirement")] {
+        validation.requires = vec![Guard::CountAtMost { branch: MAIN_BRANCH.into(), range: range.clone(), when }];
+        let Resolution::Answer(receipt) = state.resolve(&validation, 2, Timestamp(20), DEFAULT, &claims()).unwrap()
+            else { panic!("expected validation receipt"); };
+        assert_eq!(receipt.basis, basis(1));
+        assert!(matches!(receipt.outcome, Outcome::Refused { error } if error.code == code));
+        assert_eq!(state.tx_status(&validation.key).unwrap_err().code, "rtdb/unknown-transaction");
+    }
 }
 
 #[test]

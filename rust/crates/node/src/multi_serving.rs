@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
-use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT};
+use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
@@ -62,7 +62,7 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT, ROW_VISIBILITY, "query", "query.track", "query.page",
+        &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES, ROW_VISIBILITY, "query", "query.track", "query.page",
           "query.linearizable", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
     }
 
@@ -422,6 +422,7 @@ mod tests {
                 before,
             },
             guards: vec![],
+            requires: vec![],
             ops: vec![Op::Put {
                 branch: MAIN_BRANCH.into(),
                 table: TableRef::new("public", "notes"),
@@ -568,8 +569,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn multi_serving_scoped_query_changes_and_status_share_projected_coordinates() {
-        use rtdb_tx::transact::{Declaration, Visibility};
+    async fn multi_serving_scoped_requires_preserves_projected_coordinates() {
+        use rtdb_tx::transact::{Declaration, Guard, REQUIREMENT_FAILED, Version, Visibility};
         use rtdb_types::rtdb_v1::LabelScope;
 
         let journal = MemoryJournal::default();
@@ -583,6 +584,7 @@ mod tests {
         database.create().await.unwrap();
         let driver = MultiServing::new(database, MemoryBudget::new(64 * 1024 * 1024));
         driver.tick(&BTreeSet::from([node])).await.unwrap();
+        assert!(driver.features().contains(&TRANSACT_REQUIRES));
         let cancel = CancellationToken::new();
         let mut declared = write(1, "declaration", None);
         declared.transaction.ops = vec![Op::Declare {
@@ -609,16 +611,57 @@ mod tests {
         let view = driver.query_scoped(source, true, Timestamp(11), &scope, &cancel).await.unwrap();
         assert_eq!(view.cut.basis, receipt.basis);
         assert_ne!(view.cut.basis.incarnation(), raw.basis.incarnation());
-        assert!(view.claim.is_some());
-        let page = driver.changes_scoped(Changes {
+        let claim = view.claim.unwrap();
+        let changes = || Changes {
             branch: MAIN_BRANCH.into(), tables: BTreeSet::new(), after: Some(receipt.basis), until: None,
             order: ChangeOrder::Ascending, images: ChangeImages::Both, limit: 1, wait: Duration::ZERO,
-        }, &scope, &cancel).await.unwrap();
+        };
+        let page = driver.changes_scoped(changes(), &scope, &cancel).await.unwrap();
         assert_eq!(page.through, receipt.basis);
         assert!(page.groups.is_empty());
         let status = driver.tx_status_scoped(&[2; 16], &scope, &cancel).await.unwrap();
         assert_eq!(status.basis, receipt.basis);
         assert!(status.replayed);
         assert!(driver.tx_status(&[2; 16], &cancel).await.is_err());
+
+        let version = |id, expect| Guard::Version {
+            branch: MAIN_BRANCH.into(), table: TableRef::new("public", "notes"),
+            id: EntityId::Integer(id), valid_at: None, expect,
+        };
+        let TransactSubmission { mut transaction, attempt, submitted_at, source } = labelled(4, 1, 3);
+        transaction.require.push(TRANSACT_REQUIRES.into());
+        transaction.requires = vec![
+            Guard::Unchanged(claim),
+            version(1, Version::Written(receipt.basis)),
+            version(2, Version::Absent),
+        ];
+        transaction.guards = vec![version(3, Version::Present)];
+        transaction.otherwise = labelled(5, 1, 4).transaction.ops;
+        let submission = |transaction| ScopedSubmission {
+            transaction, attempt, submitted_at, source: source.clone(),
+        };
+
+        let refused = driver.transact_scoped(submission(transaction.clone()), scope.clone(), &cancel).await.unwrap();
+        assert_eq!(refused.outcome, Outcome::Refused {
+            error: Anomaly::new(AnomalyCategory::Conflict, REQUIREMENT_FAILED, "Requirement 2 failed"),
+        });
+        assert_eq!(refused.basis, receipt.basis);
+        assert_eq!(refused.system_time, receipt.system_time);
+        assert!(driver.changes_scoped(changes(), &scope, &cancel).await.unwrap().groups.is_empty());
+        let replayed = Receipt { replayed: true, ..refused };
+        let retry = driver.transact_scoped(submission(transaction.clone()), scope.clone(), &cancel).await.unwrap();
+        assert_eq!(retry, replayed);
+        assert_eq!(driver.tx_status_scoped(&transaction.key, &scope, &cancel).await.unwrap(), replayed);
+        assert_eq!(driver.tx_status(&transaction.key, &cancel).await.unwrap_err().code, "rtdb/unknown-transaction");
+
+        transaction.key = vec![5; 16];
+        transaction.requires.truncate(2);
+        let selected = driver.transact_scoped(submission(transaction), scope.clone(), &cancel).await.unwrap();
+        assert_eq!(selected.outcome, Outcome::Otherwise { failed: vec![0] });
+        let page = driver.changes_scoped(changes(), &scope, &cancel).await.unwrap();
+        assert_eq!(page.through, selected.basis);
+        let [group] = page.groups.as_slice() else { panic!("expected one change group"); };
+        let [row] = group.rows.as_slice() else { panic!("expected one changed row"); };
+        assert_eq!(row.id, EntityId::Integer(4));
     }
 }

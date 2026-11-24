@@ -151,7 +151,12 @@ impl TransactPipeline {
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
         if request.ops.is_empty() && request.otherwise.is_empty() {
             // A validation answers at the durable prefix: never reveal an unacknowledged decision.
-            let view = View { index: &self.durable.index, receipts: &self.durable.receipts, pending: false };
+            let view = View {
+                index: &self.durable.index,
+                durable_index: &self.durable.index,
+                receipts: &self.durable.receipts,
+                pending: false,
+            };
             let position = self.durable.index.head().basis.position();
             return match TransactState::resolve_in(view, request, position, now, features, claims, authority)?.0 {
                 Resolution::Answer(receipt) => Ok(Decision::Answer(receipt)),
@@ -163,7 +168,12 @@ impl TransactPipeline {
                 "The writer has the maximum number of unacknowledged transactions"));
         }
         let position = self.next_position;
-        let view = View { index: &self.speculative, receipts: &self.durable.receipts, pending: false };
+        let view = View {
+            index: &self.speculative,
+            durable_index: &self.durable.index,
+            receipts: &self.durable.receipts,
+            pending: false,
+        };
         let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority)?;
         let prepared = match resolution {
             Resolution::Answer(receipt) => return Ok(Decision::Answer(receipt)),
@@ -356,7 +366,7 @@ mod tests {
     use super::*;
 
     const INCARNATION: [u8; 16] = [9; 16];
-    const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT];
+    const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, TRANSACT_REQUIRES];
 
     fn claims() -> ClaimSealer { ClaimSealer::new(INCARNATION, [4; 32]) }
     fn table() -> TableRef { TableRef::new("public", "items") }
@@ -369,6 +379,7 @@ mod tests {
             key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
             ops: vec![Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent }],
             otherwise: Vec::new(),
+            requires: Vec::new(),
         }
     }
 
@@ -424,6 +435,58 @@ mod tests {
         append(&mut pipeline, &put(1, 7, true), 10);
         let (_, record) = append(&mut pipeline, &put(2, 7, true), 11);
         assert!(matches!(outcome(&record), Outcome::Refused { ref error } if error.code == "rtdb/already-present"));
+    }
+
+    #[test]
+    fn requires_refusal_uses_the_speculative_prefix_and_replays() {
+        let mut pipeline = pipeline();
+        let original = append(&mut pipeline, &put(1, 7, false), 10);
+        pipeline.acknowledge(original.0).unwrap();
+        let replacement = append(&mut pipeline, &put(2, 7, false), 11);
+
+        let mut stale = put(3, 8, false);
+        stale.requires.push(Guard::Version {
+            branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Integer(7), valid_at: None,
+            expect: Version::Written(Basis::new(INCARNATION, original.0)),
+        });
+        stale.guards.push(Guard::Unchanged(Claim::from_bytes(vec![0])));
+        stale.otherwise = put(4, 9, false).ops;
+        let refusal = append(&mut pipeline, &stale, 12);
+        assert_eq!(pipeline.tx_status(&stale.key).unwrap_err().code, "rtdb/transaction-pending");
+
+        let receipt = pipeline.acknowledge(refusal.0).unwrap().pop().unwrap();
+        assert_eq!(receipt.outcome, Outcome::Refused {
+            error: Anomaly::new(AnomalyCategory::Conflict, REQUIREMENT_FAILED, "Requirement 0 failed"),
+        });
+        let view = pipeline.durable().index().view(MAIN_BRANCH, At::Latest, Layer::Merged, Timestamp(20)).unwrap();
+        assert_eq!(view.ids(&table()).into_iter().collect::<Vec<_>>(), [&EntityId::Integer(7)]);
+        let replayed = Receipt { replayed: true, ..receipt };
+        assert_eq!(pipeline.tx_status(&stale.key).unwrap(), replayed);
+        let Decision::Answer(retry) = pipeline.decide(&stale, Timestamp(20), FEATURES, &claims()).unwrap()
+            else { panic!("expected replay"); };
+        assert_eq!(retry, replayed);
+        stale.requires.clear();
+        assert_eq!(pipeline.decide(&stale, Timestamp(20), FEATURES, &claims()).err().unwrap().code, "rtdb/idempotency-key");
+        assert_matches_follower(&pipeline, &[original, replacement, refusal]);
+    }
+
+    #[test]
+    fn requires_refusal_survives_a_missed_timed_cutoff() {
+        let mut pipeline = pipeline();
+        let mut request = timed(1, 1, 100);
+        request.requires.push(Guard::Version {
+            branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Integer(2), valid_at: None,
+            expect: Version::Present,
+        });
+        request.otherwise = put(2, 3, false).ops;
+        let original = append(&mut pipeline, &request, 10);
+        assert!(pipeline.acknowledge(original.0).unwrap().is_empty());
+        let terminal = pipeline.terminal(original.0, Timestamp(100)).unwrap();
+        assert!(matches!(TransactionRecord::decode(&terminal.record).unwrap(), TransactionRecord::Refuse { .. }));
+        let receipt = pipeline.acknowledge(terminal.position).unwrap().pop().unwrap();
+        assert!(matches!(&receipt.outcome, Outcome::Refused { error } if error.code == REQUIREMENT_FAILED));
+        assert_eq!(pipeline.tx_status(&request.key).unwrap(), Receipt { replayed: true, ..receipt });
+        assert_matches_follower(&pipeline, &[original, (terminal.position, terminal.record)]);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 use bytes::Bytes;
 use rtdb_index::branches::{
-    BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage,
+    BranchCut, BranchEffect, BranchIndex, BranchTable, BranchView, RowImage, VisibleHistory,
 };
 pub use rtdb_index::branches::{CountRange, IndexDefinition, Visibility};
 use rtdb_types::{
@@ -32,11 +32,13 @@ pub struct Transact {
     pub guards: Vec<Guard>,
     pub ops: Vec<Op>,
     pub otherwise: Vec<Op>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<Guard>,
 }
 
 impl Transact {
     pub fn claims(&self) -> impl Iterator<Item = &Claim> {
-        self.guards.iter().filter_map(|guard| match guard {
+        self.requires.iter().chain(&self.guards).filter_map(|guard| match guard {
             Guard::Unchanged(claim) => Some(claim),
             _ => None,
         })
@@ -125,6 +127,8 @@ pub struct Receipt {
 
 pub const TIMED_TRANSACT: &str = "timed-transact";
 pub const LINEARIZABLE: &str = "linearizable";
+pub const TRANSACT_REQUIRES: &str = "transact.requires";
+pub const REQUIREMENT_FAILED: &str = "rtdb/requirement-failed";
 
 #[derive(Clone, Copy)]
 pub struct ScopedTransact<'a> {
@@ -232,6 +236,7 @@ pub(crate) type Receipts = BTreeMap<Option<[u8; 32]>, BTreeMap<Vec<u8>, StoredRe
 /// What a decision reads: an index, the durable receipts, and whether a timed write is pending.
 pub(crate) struct View<'a> {
     pub(crate) index: &'a BranchIndex,
+    pub(crate) durable_index: &'a BranchIndex,
     pub(crate) receipts: &'a Receipts,
     pub(crate) pending: bool,
 }
@@ -318,19 +323,7 @@ impl TransactState {
         &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: ScopedTransact<'_>,
     ) -> Result<Resolution> {
-        let mut request = request.clone();
-        if request.guards.iter().any(|guard| matches!(guard, Guard::Version { expect: Version::Written(_), .. })) {
-            let history = self.index.project_main_visibility(authority.labels)?;
-            for guard in &mut request.guards {
-                if let Guard::Version { branch, expect: Version::Written(basis), .. } = guard {
-                    if branch != MAIN_BRANCH {
-                        return Err(Anomaly::unsupported("rtdb/scoped-branch", "Scoped written versions require the main branch"));
-                    }
-                    *basis = history.source_basis(*basis)?;
-                }
-            }
-        }
-        self.resolve_with_scope(&request, position, now, features, claims, Some(authority))
+        self.resolve_with_scope(request, position, now, features, claims, Some(authority))
     }
 
     pub fn project_receipt(&self, mut receipt: Receipt, scope: &LabelScope) -> Result<Receipt> {
@@ -344,7 +337,12 @@ impl TransactState {
         &self, request: &Transact, position: u64, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<Resolution> {
-        let view = View { index: &self.index, receipts: &self.receipts, pending: self.pending.is_some() };
+        let view = View {
+            index: &self.index,
+            durable_index: &self.index,
+            receipts: &self.receipts,
+            pending: self.pending.is_some(),
+        };
         Self::resolve_in(view, request, position, now, features, claims, authority).map(|(resolution, _)| resolution)
     }
 
@@ -400,7 +398,8 @@ impl TransactState {
         if !validation { base.advance(cut)?; }
         let decision_time = now.max(cut.system_time);
         let advanced = base.clone();
-        let result = Self::decide(request, base, now, decision_time, features, claims, authority.map(|authority| authority.labels));
+        let scope = authority.map(|authority| authority.labels);
+        let result = Self::decide(request, base, now, decision_time, features, claims, scope, view.durable_index);
         let (outcome, effects, after) = match result {
             Ok(decision) => decision,
             Err(error) if error.is_caller_error() => (Outcome::Refused { error }, Vec::new(), advanced),
@@ -422,10 +421,13 @@ impl TransactState {
 
     fn decide(
         request: &Transact, base: BranchIndex, sample: Timestamp, time: Timestamp,
-        features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>,
+        features: &[&str], claims: &dyn ClaimVerifier, scope: Option<&LabelScope>, durable: &BranchIndex,
     ) -> Result<(Outcome, Vec<BranchEffect>, BranchIndex)> {
         if let Some(feature) = request.require.iter().find(|feature| !features.contains(&feature.as_str())) {
             return Err(feature_required(feature));
+        }
+        if !request.requires.is_empty() && !features.contains(&TRANSACT_REQUIRES) {
+            return Err(feature_required(TRANSACT_REQUIRES));
         }
         let Window { not_before, before } = request.window;
         if not_before.zip(before).is_some_and(|(start, end)| start >= end) {
@@ -439,15 +441,39 @@ impl TransactState {
                 .with_context("retry_after_micros", start.0.saturating_sub(sample.0).into()));
         }
 
+        let visibility = std::cell::OnceCell::new();
+        let evaluate = |guard: &Guard, index: &BranchIndex| {
+            let visible = match (scope, guard) {
+                (Some(scope), Guard::Version { expect: Version::Written(_), .. }) => Some(
+                    visibility.get_or_init(|| durable.project_main_visibility(scope))
+                        .as_ref().map_err(Clone::clone)?,
+                ),
+                _ => None,
+            };
+            guard.evaluate(index, time, claims, visible)
+        };
+        for (i, requirement) in request.requires.iter().enumerate() {
+            if requirement.after() {
+                return Err(Anomaly::incorrect(
+                    "rtdb/invalid-requirement", "A count requirement must use the Before phase",
+                ));
+            }
+            if !evaluate(requirement, &base)? {
+                return Err(Anomaly::new(
+                    AnomalyCategory::Conflict, REQUIREMENT_FAILED, format!("Requirement {i} failed"),
+                ));
+            }
+        }
+
         let mut failed = Vec::new();
         for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| !guard.after()) {
-            if !guard.evaluate(&base, time, claims)? { failed.push(i); }
+            if !evaluate(guard, &base)? { failed.push(i); }
         }
         if failed.is_empty() {
             let mut then = Candidate::new(base.clone(), scope);
             then.execute(&request.ops)?;
             for (i, guard) in request.guards.iter().enumerate().filter(|(_, guard)| guard.after()) {
-                if !guard.evaluate(&then.index, time, claims)? { failed.push(i); }
+                if !evaluate(guard, &then.index)? { failed.push(i); }
             }
             if failed.is_empty() {
                 if !request.ops.is_empty() { then.check_constraints()?; }
@@ -560,18 +586,31 @@ impl Guard {
         matches!(self, Self::CountAtMost { when: When::After, .. })
     }
 
-    fn evaluate(&self, index: &BranchIndex, time: Timestamp, claims: &dyn ClaimVerifier) -> Result<bool> {
+    fn evaluate(
+        &self, index: &BranchIndex, time: Timestamp, claims: &dyn ClaimVerifier, visible: Option<&VisibleHistory>,
+    ) -> Result<bool> {
         let view = |branch| index.view(branch, At::Latest, Layer::Merged, time);
         match self {
             Self::Unchanged(claim) => index.claim_unchanged(&claims.verify(claim)?, time),
             Self::Version { branch, table, id, valid_at, expect } => {
-                if let Version::Written(basis) = expect { index.exact(*basis)?; }
+                let expect = match (*expect, visible) {
+                    (Version::Written(basis), Some(history)) => {
+                        if branch != MAIN_BRANCH {
+                            return Err(Anomaly::unsupported(
+                                "rtdb/scoped-branch", "Scoped written versions require the main branch",
+                            ));
+                        }
+                        Version::Written(history.source_basis(basis)?)
+                    }
+                    (expect, _) => expect,
+                };
+                if let Version::Written(basis) = expect { index.exact(basis)?; }
                 let at = valid_at.unwrap_or(time);
                 let row = view(branch)?.row(table, id, at);
                 Ok(match expect {
                     Version::Absent => row.is_none(),
                     Version::Present => row.is_some(),
-                    Version::Written(basis) => row.is_some_and(|event| event.cut.basis == *basis),
+                    Version::Written(basis) => row.is_some_and(|event| event.cut.basis == basis),
                 })
             }
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),

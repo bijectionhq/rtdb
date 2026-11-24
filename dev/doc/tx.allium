@@ -1739,6 +1739,11 @@ surface ConnectionLifecycle {
 -- The writer samples the transaction time at resolution and keeps it strictly increasing with the preceding settled transaction.
 -- The window includes not_before and excludes before.
 -- A request before not_before can retry with the same key.
+-- The resolver evaluates the ordered requires list against the original state before evaluating any arm guard.
+-- A count requirement uses the Before phase.
+-- The first failed requirement selects a Refused outcome with conflict code rtdb/requirement-failed and no effects.
+-- A request with operations in either arm publishes this refusal under its transaction key.
+-- An empty-armed validation answers at the acquired basis without publishing a record.
 -- Before guards observe the original state.
 -- After guards observe the candidate containing the ordered then operations.
 -- The otherwise operations start from the original state when a guard fails.
@@ -1768,20 +1773,22 @@ surface ConnectionLifecycle {
 -- A labelled table can express expiry in those valid-time bounds.
 -- SingleLabelPerTx checks the distinct labels affected by the selected effects across declared tables whenever those effects address a table with that policy.
 -- The otherwise arm has the same write checks as the then arm and starts from the original state.
--- Before and After guards evaluate the full original state or the full candidate, respectively.
--- A failed guard returns only its position in the request.
+-- Requirements and Before guards evaluate the full original state.
+-- After guards evaluate the full candidate.
+-- A failed requirement or guard reveals only its zero-based position within its respective list.
 -- A tracked read records an authenticated footprint of its visible query dependencies under its admitted read scope.
 -- Unchanged tests every write intersecting that footprint, including writes the credential cannot read.
 -- A conservative footprint can cover an entire branch when dependencies cannot be represented precisely.
 -- A scoped attempt and its status lookup are bound to the authenticated credential identity and scope.
 -- Scoped receipts, version guards and transaction placeholders use the scoped coordinates defined by the serving surface.
+-- A scoped Written selector resolves its basis against the acknowledged projection before comparing the row version.
 -- Erasure removes the authorized historical payloads and follows the storage erasure contract.
 
 rule ValidateRtdbV1 {
     when: TransactValidationRequested(request, reader)
     requires: LinearizablePrefix(reader, basis)
     ensures:
-        ValidationAnswered(request, ResolveGuards(request, basis), basis)
+        ValidationAnswered(request, ResolveRequirementsAndGuards(request, basis), basis)
 }
 
 rule PublishRtdbV1Transaction {
