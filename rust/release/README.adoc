@@ -65,6 +65,12 @@ The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
 `playground --port 5439 --flight-sql-port 3000` selects the original client-suite mode.
 The process receives SIGTERM directly and drains its database and listener owners before returning.
 
+An image built with Multi supports `deploymentAdminPrincipals` in the node's YAML.
+List the exact authenticated principal names that may create, delete, export, restore or fork deployments.
+The default configuration grants no deployment administration access.
+Use the ordinary Flight listener with a verified password or client credential.
+The `rtdb admin` client reads its authorization value from the file supplied through `--authorization-file`.
+
 Use the link:../conformance/README.adoc[packaged client runner] against the produced image and manifest.
 Backend, fault, storage-interoperability, performance and rollback receipts remain separate release requirements in the matrix.
 Use the paired `rtdb-config` artifact for link:../crates/config/README.adoc[offline configuration qualification] before cutover.

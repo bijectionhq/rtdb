@@ -59,3 +59,43 @@ fn rules(values: Option<Vec<Yaml>>, default: Method) -> Result<Vec<MethodRule>> 
         Ok::<_, Anomaly>(rule)
     }).collect()).unwrap_or_else(|| Ok(vec![MethodRule::any(default)]))
 }
+
+#[cfg(feature = "multi")]
+#[derive(Debug)]
+struct DeploymentAdministrators(std::collections::BTreeSet<String>);
+
+#[cfg(feature = "multi")]
+impl rtdb_flight_sql::DeploymentAdminAuthority for DeploymentAdministrators {
+    fn authorize(
+        &self, principal: &rtdb_auth::Principal, _: rtdb_flight_sql::DeploymentAdminAction<'_>,
+    ) -> Result<()> {
+        if principal.user_id().is_some_and(|user| self.0.contains(user)) {
+            return Ok(());
+        }
+        Err(Anomaly::new(
+            rtdb_types::AnomalyCategory::Forbidden,
+            "rtdb/deployment-admin-principal",
+            "The authenticated principal has no deployment administration grant",
+        ))
+    }
+}
+
+/// Parses an explicit host grant. Flight verifies the credential and scope before applying it.
+#[cfg(feature = "multi")]
+pub(super) fn deployment_administrators(
+    values: Option<Vec<Yaml>>,
+) -> Result<Option<std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>>> {
+    let mut principals = std::collections::BTreeSet::new();
+    for value in values.into_iter().flatten() {
+        let Yaml::String(principal) = value else {
+            return Err(invalid("deploymentAdminPrincipals requires a sequence of principal names"));
+        };
+        if principal.is_empty() || principal.trim() != principal || principal.chars().any(char::is_control) {
+            return Err(invalid("An administrator name must be a nonempty authenticated principal name"));
+        }
+        principals.insert(principal);
+    }
+    Ok((!principals.is_empty()).then(|| {
+        std::sync::Arc::new(DeploymentAdministrators(principals)) as std::sync::Arc<dyn rtdb_flight_sql::DeploymentAdminAuthority>
+    }))
+}

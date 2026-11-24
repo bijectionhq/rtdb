@@ -99,6 +99,15 @@ fn a_user_list_grants_databases_per_user() {
     assert!(decode("authn: !UserList\n  users: {}\n  grants:\n    alice:\n      shop: ADMIN").is_err());
 }
 
+#[cfg(feature = "multi")]
+#[test]
+fn deployment_administration_grants_require_explicit_principals_and_flight() {
+    assert!(decode("deploymentAdminPrincipals: [automation]").is_ok());
+    assert!(decode("deploymentAdminPrincipals: [automation]\nflightSql: null").is_err());
+    assert!(decode("deploymentAdminPrincipals: [123]").is_err());
+    assert!(decode("deploymentAdminPrincipals: [' ']").is_err());
+}
+
 #[test]
 fn startup_auth_rules_remain_ordered_and_default_oidc_to_reference_trust() {
     let config = decode("authn: !UserList\n  users:\n    alice: !Argon2id encoded\n  rules:\n    - user: alice\n      method: PASSWORD\n    - remoteAddress: 127.0.0.1\n      method: TRUST").unwrap();

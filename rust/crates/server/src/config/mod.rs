@@ -163,6 +163,12 @@ impl NodeConfiguration {
             let garbage = garbage(fields.take("garbageCollector"))?;
             let search = search(fields.take("search"))?;
             let auth = fields.take("authn").map(|value| authentication::decode(value, environment)).transpose()?.unwrap_or_else(|| authentication::default_auth(environment));
+            #[cfg(feature = "multi")]
+            let deployment_admin = authentication::deployment_administrators(fields.sequence("deploymentAdminPrincipals")?)?;
+            #[cfg(feature = "multi")]
+            if deployment_admin.is_some() && !flight_sql.as_ref().is_some_and(|flight| flight.port >= 0) {
+                return Err(invalid("deploymentAdminPrincipals requires an ordinary Flight SQL listener"));
+            }
             let tracing = tracing(fields.take("tracer"))?;
             let modules = fields.sequence("modules")?.unwrap_or_default().into_iter().map(module).collect::<Result<_>>()?;
             let read_only_databases = fields.boolean("readOnlyDatabases")?.unwrap_or(false);
@@ -173,7 +179,7 @@ impl NodeConfiguration {
             };
             Self { playground: false, server, flight_sql,
                 #[cfg(feature = "multi")]
-                deployment_admin: None,
+                deployment_admin,
                 health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, search, auth, tracing, modules, read_only_databases, default_v1_serving, ordered_index_arrow_references, ordered_index_arrow_references_on_private_storage, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
