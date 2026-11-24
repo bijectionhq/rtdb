@@ -172,6 +172,17 @@ The family must be live and the stage enrolled exactly as for sealing.
 The plaintext is transient resolution input and does not authorize a history read.
 A fenced or settled family, or a retired capability, refuses with `rtdb/erased-under-view`.
 
+### `rtdb.owned.PlanAssertionFamilyFence.v1`
+
+Request: family `uuid`, selected `position`, erasure order `uuid`.
+
+Hosted protocol 217 exposes a read-only plan.
+The selected position must be a bound member.
+The reply has the same order, inventory digest and counted sections as `FenceAssertionFamily.v1`.
+If the vault already fenced the family, the reply preserves its first order.
+The plan leaves the vault and source unchanged.
+The retiring transaction must take a claim over this inventory before it can order an immutable marker.
+
 ### `rtdb.owned.FenceAssertionFamily.v1`
 
 Request: family `uuid`, selected `position`, erasure order `uuid`.

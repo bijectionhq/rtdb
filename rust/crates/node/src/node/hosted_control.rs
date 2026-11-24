@@ -2,9 +2,14 @@ use std::sync::Arc;
 
 use rtdb_query::{HostedControlPoint, QueryCursor};
 use rtdb_tx::HostedControlWrite;
-use rtdb_types::{Anomaly, AnomalyCategory, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, Result};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-use super::{OwnedReadSession, prepare_query};
+use super::{
+    CatalogReadCut, Database, NativeSession, Node, OwnedReadSession, QueryBasis, SessionIdentity, TimeBasis,
+    covers_transaction, hosted_source_unavailable, prepare_query,
+};
 
 #[derive(Clone, Copy)]
 pub enum RootCatalogRead {
@@ -121,5 +126,73 @@ impl OwnedReadSession {
         }
         self.check()?;
         Ok(point)
+    }
+}
+
+pub struct CurrentAssertionFamilyRead {
+    context: Arc<rtdb_query::QueryContext>,
+    owner: String,
+}
+
+impl CurrentAssertionFamilyRead {
+    pub async fn world_registration(&self, world: Iid) -> Result<Option<OwnedWorld>> {
+        let registration = rtdb_query::read_owned_world(Arc::clone(&self.context), &self.owner, world).await?;
+        self.context.check_cancelled()?;
+        Ok(registration.map(|(world, _)| world))
+    }
+}
+
+#[derive(Clone)]
+pub struct OriginalAssertionFamilyReader {
+    node: Node,
+    database: String,
+    owner: String,
+    identity: Arc<dyn SessionIdentity>,
+    attachment: std::sync::Weak<Database>,
+}
+
+impl OriginalAssertionFamilyReader {
+    pub async fn current(&self, deployment: Uuid, cancellation: &CancellationToken) -> Result<CurrentAssertionFamilyRead> {
+        let unavailable = hosted_source_unavailable;
+        let receipt = self.node.await_durable_source(
+            &self.database, self.identity.as_ref(), true, Some(&self.attachment), cancellation,
+        ).await?.ok_or_else(unavailable)?;
+        if Uuid::parse_str(&receipt.history).ok() != Some(deployment) {
+            return Err(unavailable());
+        }
+        let basis = QueryBasis {
+            snapshot: TimeBasis::default(), replica_capture: None, resume_token: None,
+            has_await_floor: false, snapshot_time: None, current_time: self.node.query_instant(),
+            timezone: self.node.factory.options.default_timezone.clone(),
+        };
+        let context = self.node.query_context_in_placement(
+            &self.database, &basis, self.identity.as_ref(), Some(&self.attachment), CatalogReadCut::Current, cancellation,
+        ).await?;
+        let catalog = context.catalog.database(&self.database)?;
+        let [partition] = catalog.partitions.as_slice() else { return Err(unavailable()); };
+        if receipt.applied.is_some_and(|floor| partition.tx_basis().is_none_or(|tip| !covers_transaction(tip, floor))) {
+            return Err(unavailable());
+        }
+        context.check_cancelled()?;
+        Ok(CurrentAssertionFamilyRead { context, owner: self.owner.clone() })
+    }
+}
+
+impl NativeSession {
+    pub fn assertion_family_reader(&self) -> Result<OriginalAssertionFamilyReader> {
+        let unavailable = hosted_source_unavailable;
+        let owner = self.state.user().filter(|owner| !owner.is_empty()).ok_or_else(unavailable)?.to_owned();
+        let database = self.service.database()?;
+        if database.placed_writer_scope().is_none() {
+            return Err(unavailable());
+        }
+        Ok(OriginalAssertionFamilyReader {
+            node: self.service.node.clone(), database: self.state.database().to_owned(), owner,
+            identity: Arc::clone(&self.service.identity), attachment: Arc::downgrade(&database),
+        })
+    }
+
+    pub async fn current_assertion_family_read(&self, deployment: Uuid) -> Result<CurrentAssertionFamilyRead> {
+        self.assertion_family_reader()?.current(deployment, self.state.cancellation()).await
     }
 }

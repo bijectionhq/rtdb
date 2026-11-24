@@ -17,7 +17,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, PlacedAttemptScope, 
 use uuid::Uuid;
 
 use crate::keys::{
-    AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, EnrolledWorldRow, FamilyOccurrence, KeyService, LandingLink,
+    AssertionAuthoring, AssertionEnvelope, AssertionKeyService, AssertionStage, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, KeyService, LandingLink,
     LandingReservation, WorldRowSlot, family_vault_address, world_row_scope,
 };
 
@@ -50,7 +50,8 @@ impl Scope {
                 positions[0] = Some(occurrence.position);
                 None
             }
-            FamilyRequest::RequirePositionOpen(position) | FamilyRequest::Fence { selected: position, .. } => {
+            FamilyRequest::RequirePositionOpen(position) | FamilyRequest::Fence { selected: position, .. }
+            | FamilyRequest::PlanFence { selected: position, .. } => {
                 positions[0] = Some(*position);
                 None
             }
@@ -88,10 +89,10 @@ impl Scope {
             .map(|position| (Uuid::from_bytes(position.line_generation), false))
             .chain(world);
         let Some(first) = worlds.next() else { return Ok(()); };
-        let snapshot = session.open_owned_read().await?;
+        let current = session.current_assertion_family_read(self.deployment).await?;
         for (world, enrolling) in std::iter::once(first).chain(worlds) {
-            if world.is_nil() || snapshot.world_registration(Iid(*world.as_bytes())).await?
-                .is_none_or(|(record, _)| !record.mode.is_writable() || (enrolling && record.dropped))
+            if world.is_nil() || current.world_registration(Iid(*world.as_bytes())).await?
+                .is_none_or(|record| !record.mode.is_writable() || (enrolling && record.dropped))
             {
                 return Err(scope_mismatch("The assertion position or authoring world belongs to another line"));
             }
@@ -252,21 +253,27 @@ pub(super) async fn serve(
             let (stage, authoring) = admit_row(&scope, &families, &row).await?;
             FamilyReply::Opened(vault()?.open_assertion_for_resolution(stage, authoring, &region, envelope).await?)
         }
+        FamilyRequest::PlanFence { family, selected, order } => {
+            fence_reply(families.plan_fence(scope.family(family), selected, order).await?)
+        }
         FamilyRequest::Fence { family, selected, order } => {
-            let fence = families.fence(scope.family(family), selected, order).await?;
-            FamilyReply::Fence(FamilyFenceReply {
-                order: fence.order,
-                inventory: fence.vault_inventory(),
-                positions: fence.positions.into_iter().collect(),
-                assertion_capabilities: fence.assertion_capabilities.into_iter().map(wire_stage).collect(),
-                link_capabilities: fence.link_capabilities.into_iter().map(wire_stage).collect(),
-                derived: fence.derived.into_iter().map(wire_derived).collect(),
-            })
+            fence_reply(families.fence(scope.family(family), selected, order).await?)
         }
         FamilyRequest::Settle { .. } => return Err(Anomaly::unsupported(
             "rtdb.owned/assertion-profile-uninstalled",
             "Family settlement requires the fixed assertion profile, which this cell does not install",
         )),
+    })
+}
+
+fn fence_reply(fence: FamilyFence) -> FamilyReply {
+    FamilyReply::Fence(FamilyFenceReply {
+        order: fence.order,
+        inventory: fence.vault_inventory(),
+        positions: fence.positions.into_iter().collect(),
+        assertion_capabilities: fence.assertion_capabilities.into_iter().map(wire_stage).collect(),
+        link_capabilities: fence.link_capabilities.into_iter().map(wire_stage).collect(),
+        derived: fence.derived.into_iter().map(wire_derived).collect(),
     })
 }
 

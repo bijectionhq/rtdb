@@ -546,6 +546,14 @@ impl<'a> AssertionFamilies<'a> {
         if record.landings.iter().any(|landing| landing.reservation == reservation) { Ok(()) } else { Err(conflict()) }
     }
 
+    pub async fn plan_fence(&self, family: Uuid, selected: Position, order: Uuid) -> Result<FamilyFence> {
+        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        if order.is_nil() || !record.contains(selected) {
+            return Err(conflict());
+        }
+        Ok(record.fence_inventory(record.fenced.unwrap_or(order)))
+    }
+
     /// The selected original, or any active landed copy, closes the same
     /// family. The custody roster includes enrolled stages even before order.
     pub async fn fence(&self, family: Uuid, selected: Position, order: Uuid) -> Result<FamilyFence> {
@@ -819,7 +827,11 @@ mod tests {
             families.reserve_landing(family, pending).await?;
 
             let closed = if close_from_copy { copy.position } else { original.position };
-            let fence = families.fence(family, closed, Uuid::new_v4()).await?;
+            let order = Uuid::new_v4();
+            let plan = families.plan_fence(family, closed, order).await?;
+            families.require_live_occurrence(family, original).await?;
+            let fence = families.fence(family, closed, order).await?;
+            assert_eq!(plan, fence);
             assert_eq!(fence.positions, BTreeSet::from([original.position, copy.position]));
             assert_eq!(fence.assertion_capabilities, BTreeSet::from([
                 original.capability, first.capability, pending.capability,
