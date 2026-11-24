@@ -57,6 +57,7 @@ impl NearestQuery {
 
     pub fn dimensions(&self) -> usize { self.probe.len() }
     pub fn filter_count(&self) -> usize { self.filters.len() }
+    pub fn k(&self) -> usize { self.k }
 
     fn admits<'a>(&self, cells: impl ExactSizeIterator<Item = Option<&'a [u8]>>) -> bool {
         cells.len() == self.filters.len()

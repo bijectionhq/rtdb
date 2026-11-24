@@ -44,6 +44,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | SPATIAL_HELD_OWNED_V3
         | SEARCH_HELD_OWNED_V5
         | NEAREST_HELD_OWNED_V1
+        | HYBRID_HELD_OWNED_V1
         | HELD_OWNED_RANGE_V1
         | HELD_OWNED_RANGE_V2
         | HELD_OWNED_RANGE_V3
@@ -241,6 +242,7 @@ impl Service {
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_OWNED_V5 => Ok(vec![Ok(self.search_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::NEAREST_HELD_OWNED_V1 => Ok(vec![Ok(self.nearest_held_owned_action(&call, &action.body).await?)]),
+                crate::owned_actions::HYBRID_HELD_OWNED_V1 => Ok(vec![Ok(self.hybrid_held_owned_action(&call, &action.body).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
                 crate::owned_actions::SEARCH_HELD_WORLD_V2 => Ok(vec![Ok(self.search_held_world_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),

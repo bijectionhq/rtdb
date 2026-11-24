@@ -6,6 +6,7 @@ pub mod definitions;
 pub mod file;
 pub mod lane;
 mod held_corpus;
+pub mod hybrid;
 pub mod nearest;
 mod member_bounds;
 use rtdb_query::rank_cutoff;

@@ -323,6 +323,9 @@ rule RepairUnreadableSearchFile {
 -- MATCH(column, query[, analyzer]) holds when the column's UTF-8 value holds every term of the query, both tokenised by the named analyzer (`simple` when none is named), and every phrase of it (terms between double quotes) as consecutive tokens.
 -- The analyzer is a string literal, so MATCH and SEARCH_SCORE stay functions of their arguments; every search function takes it as an optional last argument.
 -- RTDB_SEARCH(table, column, query[, analyzer]) ranks with the same analyzer.
+-- RTDB_HYBRID(table, text_column, query, vector_column, vector, window, limit[, analyzer]) fuses, at the query's one snapshot, the first `window` rows of the exact text ranking and of the exact cosine nearest ranking by reciprocal rank fusion.
+-- A row at rank r of a window, counted from 1 with ties ordered by `_iid`, contributes 1 / (60 + r); `_score` adds the text contribution, then the nearest one, and the first `limit` rows by descending `_score`, then `_iid`, are returned.
+-- rtdb.owned.HybridHeld.v1 fuses a held text window and a held nearest window of the same relations at one held cut the same way, ties ordered by typed identity, then partition.
 -- The analyzer splits a word longer than the index's longest token (rtdb_text::MAX_TOKEN_BYTES) into tokens of at most that length, so the index holds every token the analyzer makes.
 -- SEARCH_SCORE(column, query) sums BM25 term-frequency contributions with unit weights and unit length normalization.
 -- The five-argument form computes BM25 from its document count, total stored length and document frequencies.

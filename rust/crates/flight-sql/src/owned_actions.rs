@@ -346,6 +346,7 @@ pub(crate) const SEARCH_HELD_WORLD_AT_V1: &str = "rtdb.owned.SearchHeldWorldAt.v
 pub(crate) const SEARCH_HELD_WORLD_V2: &str = "rtdb.owned.SearchHeldWorld.v2";
 pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
 pub(crate) const NEAREST_HELD_OWNED_V1: &str = "rtdb.owned.NearestHeld.v1";
+pub(crate) const HYBRID_HELD_OWNED_V1: &str = "rtdb.owned.HybridHeld.v1";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -3694,6 +3695,59 @@ impl Service {
         let scope = owned_rank_scope(b"rtdb.owned.nearest.held.v1\0", body, "");
         let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present))?;
         held.snapshot.check_relations(nearest.partitions.iter().map(|partition| &partition.relation)).map_err(status)?;
+        Ok(reply)
+    }
+
+    /// Fuses a held text ranking and a held nearest ranking of the same relations at the held cut by reciprocal rank fusion.
+    pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+        if !self.0.config.owned_native_actions { return Err(unsupported()); }
+        let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held hybrid search has no handle"))?;
+        let handle = Bytes::copy_from_slice(handle);
+        let held = self.owned_read(call, &handle)?;
+        if let Err(error) = held.snapshot.check() {
+            if let Ok(entry) = self.take_owned_read(call, &handle) { entry.close(); }
+            return Err(status(error));
+        }
+        let (valid, request) = request.split_first_chunk::<8>()
+            .ok_or_else(|| invalid("Held hybrid search has no valid instant"))?;
+        let valid = i64::from_be_bytes(*valid);
+        let valid = (valid != i64::MIN).then_some(Timestamp(valid));
+        if let Some(valid) = valid { rtdb_types::Interval::at(valid).map_err(status)?; }
+        let (limit, request) = request.split_first_chunk::<2>()
+            .ok_or_else(|| invalid("Held hybrid search has no limit"))?;
+        let limit = usize::from(u16::from_be_bytes(*limit));
+        let (length, request) = request.split_first_chunk::<4>()
+            .ok_or_else(|| invalid("Held hybrid search has no text request length"))?;
+        let (text, nearest) = request.split_at_checked(u32::from_be_bytes(*length) as usize)
+            .ok_or_else(|| invalid("Held hybrid search has a truncated text request"))?;
+        let rank = owned_rank_request(call, text)?;
+        let nearest = owned_nearest_request(call, nearest)?;
+        let window = rank.limit;
+        if rank.offset != 0 || !(1..=128).contains(&window) || nearest.query.k() != window
+            || !(1..=window).contains(&limit) || nearest.observe != rank.observe
+            || nearest.partitions.len() != rank.partitions.len()
+            || nearest.partitions.iter().zip(&rank.partitions).any(|(vector, (relation, _))| &vector.relation != relation)
+        {
+            return Err(invalid("A held hybrid search ranks one window of the same relations by text and vector, and keeps at most that window"));
+        }
+        let (text_page, witnesses) = held.snapshot.ranked_search_batch(
+            &rank.partitions, rank.query, 0, window, rank.observe, valid, None,
+        ).await.map_err(status)?;
+        let (nearest_page, _) = held.snapshot.nearest_batch(&nearest.partitions, &nearest.query, false, valid, None)
+            .await.map_err(status)?;
+        let page = rtdb_node::hybrid::fuse_ranked(&[&text_page, &nearest_page], limit, self.memory()).map_err(status)?;
+        drop((text_page, nearest_page));
+        let mut nonces = Vec::new();
+        if !witnesses.is_empty() {
+            if witnesses.len() != rank.partitions.len() { return Err(Status::internal("Incomplete owned hybrid evidence")); }
+            for ((relation, _), witness) in rank.partitions.iter().zip(witnesses) {
+                nonces.push(held.remember(call, relation, witness)?);
+            }
+        }
+        let present = held.snapshot.present().system_time;
+        let scope = owned_rank_scope(b"rtdb.owned.hybrid.held.v1\0", body, "");
+        let reply = self.owned_rank_reply(call, page, scope, nonces, present, valid.unwrap_or(present))?;
+        held.snapshot.check_relations(rank.partitions.iter().map(|(relation, _)| relation)).map_err(status)?;
         Ok(reply)
     }
 

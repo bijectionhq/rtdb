@@ -21,7 +21,10 @@ enum TablePurpose { Query, Mutation, Erase }
 enum ListTableKind { Series, Unnest }
 
 #[derive(Clone, Copy)]
-enum RankedTable { Search, Nearest }
+enum RankedTable { Search, Nearest, Hybrid }
+
+/// The reciprocal rank fusion constant of RTDB_HYBRID: a row ranked r in a ranking contributes 1 / (k + r).
+const HYBRID_RANK_CONSTANT: f64 = 60.0;
 
 impl RankedTable {
     fn from_name(name: &ast::ObjectName) -> Option<Self> {
@@ -30,6 +33,7 @@ impl RankedTable {
         match ident.value.to_ascii_lowercase().as_str() {
             "rtdb_search" => Some(Self::Search),
             "rtdb_nearest" => Some(Self::Nearest),
+            "rtdb_hybrid" => Some(Self::Hybrid),
             _ => None,
         }
     }
@@ -1205,6 +1209,7 @@ impl Context<'_> {
             ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(expr),
             _ => Err(grammar_rejected("Ranked table function argument")),
         }).collect::<Result<Vec<_>>>()?;
+        if matches!(ranked, RankedTable::Hybrid) { return self.hybrid_table(&expressions, alias); }
         let (table, column, probe, analyzer, fetch, rank_name, function, descending) = match (ranked, expressions.as_slice()) {
             (RankedTable::Search, [table, column, probe]) => (table, column, probe, None, None, "_score", "search_score", true),
             (RankedTable::Search, [table, column, probe, analyzer]) => (table, column, probe, Some(*analyzer), None, "_score", "search_score", true),
@@ -1247,6 +1252,93 @@ impl Context<'_> {
             SortExpr { expr: tie, descending: false, nulls_first: false },
         ])?);
         let output = if let Some(fetch) = fetch { Arc::new(sorted.limit(None, Some(fetch))?) } else { sorted };
+        alias.map_or(Ok(output.clone()), |alias| self.alias(output, alias))
+    }
+
+    /// RTDB_HYBRID(table, text_column, query, vector_column, vector, window, limit[, analyzer]) fuses, at one snapshot, the first `window`
+    /// rows of the exact text ranking of RTDB_SEARCH and of the exact nearest ranking of RTDB_NEAREST by reciprocal rank fusion.
+    /// Each ranking orders its rows with ties by `_iid` from rank 1; `_score` sums 1 / (k + rank) over the windows that hold the row,
+    /// text first, and the output keeps the first `limit` rows by `_score` descending, then `_iid`.
+    fn hybrid_table(&mut self, expressions: &[&ast::Expr], alias: Option<&ast::TableAlias>) -> Result<Arc<Relation>> {
+        let [table, text, query, vector, probe, window, limit, analyzer @ ..] = expressions else {
+            return Err(error("RTDB_HYBRID requires a table, text column, query, vector column, vector, window, limit and an optional analyzer"));
+        };
+        if analyzer.len() > 1 { return Err(error("RTDB_HYBRID takes at most one analyzer")); }
+        let parts = match table {
+            ast::Expr::Identifier(part) => vec![part.clone()],
+            ast::Expr::CompoundIdentifier(parts) => parts.clone(),
+            _ => return Err(error("A ranked table function requires a source table name")),
+        };
+        let (ast::Expr::Identifier(text), ast::Expr::Identifier(vector)) = (text, vector) else { return Err(error("A ranked table function requires a column name")); };
+        let table = ast::TableFactor::Table {
+            name: ast::ObjectName(parts.into_iter().map(ast::ObjectNamePart::Identifier).collect()),
+            alias: None, args: None, with_hints: vec![], version: None, with_ordinality: false,
+            partitions: vec![], json_path: None, sample: None, index_hints: vec![],
+        };
+        let input = self.table_for(&table, TablePurpose::Query, 0)?;
+        let visible: Vec<Field> = input.schema().fields().to_vec();
+        let field = |name: &str| visible.iter().find(|field| field.name == name);
+        let text = field(&identifier(text).normalized()).ok_or_else(|| error("Ranked column does not exist"))?.clone();
+        let vector = field(&identifier(vector).normalized()).ok_or_else(|| error("Ranked column does not exist"))?.clone();
+        let tie = field("_iid").ok_or_else(|| error("A ranked table function requires a base table"))?.expression();
+        if field("_score").is_some() { return Err(error("Ranked table output already has a column named _score")); }
+        let constant = |context: &mut Self, expression: &ast::Expr| context.expr(expression, &Schema::default(), &BTreeMap::new());
+        let mut text_arguments = vec![text.expression(), constant(self, query)?];
+        if let [analyzer] = analyzer { text_arguments.push(constant(self, analyzer)?); }
+        let probe = constant(self, probe)?;
+        let window = constant(self, window)?;
+        let fetch = constant(self, limit)?;
+
+        let matched = crate::expression::call("match".into(), text_arguments.clone())?;
+        let score = crate::expression::call("search_score".into(), text_arguments)?;
+        let distance = crate::expression::call("cosine_distance".into(), vec![vector.expression(), probe])?;
+        let matched_field = self.binder.field("_hybrid_matched", None, matched.data_type())?;
+        let score_field = self.binder.field("_hybrid_text_score", None, score.data_type())?;
+        let distance_field = self.binder.field("_hybrid_distance", None, distance.data_type())?;
+        let near = Expr::unary(UnaryOp::IsNotNull, distance_field.expression());
+        let near_field = self.binder.field("_hybrid_near", None, LogicalType::Scalar(ScalarType::Bool))?;
+        let input = Arc::new(input.extend(vec![
+            NamedExpr { field: matched_field.clone(), expr: matched },
+            NamedExpr { field: score_field.clone(), expr: score },
+            NamedExpr { field: distance_field.clone(), expr: distance },
+        ])?);
+        let input = Arc::new(input.extend(vec![NamedExpr { field: near_field.clone(), expr: near }])?);
+        let input = Arc::new(input.filter(Expr::binary(BinaryOp::Or, matched_field.expression(), near_field.expression()))?);
+
+        let rank = |context: &mut Self, input: Arc<Relation>, name: &str, partition: &Field, order: Expr, descending: bool| -> Result<(Arc<Relation>, Field)> {
+            let field = context.binder.field(name, None, LogicalType::Scalar(ScalarType::I64))?;
+            let schema = input.schema().concat(&Schema::new(vec![field.clone()])?)?;
+            let window = Relation::new(schema, RelationNode::Window {
+                input, partition_by: vec![partition.id],
+                order_by: vec![
+                    SortExpr { expr: order, descending, nulls_first: false },
+                    SortExpr { expr: tie.clone(), descending: false, nulls_first: false },
+                ],
+                expressions: vec![WindowExpr { field: field.clone(), function: WindowFunction::RowNumber }],
+            })?;
+            Ok((Arc::new(window), field))
+        };
+        let (input, text_rank) = rank(self, input, "_hybrid_text_rank", &matched_field, score_field.expression(), true)?;
+        let (input, near_rank) = rank(self, input, "_hybrid_near_rank", &near_field, distance_field.expression(), false)?;
+        let windowed = |member: &Field, rank: &Field| Expr::binary(BinaryOp::And, member.expression(),
+            Expr::binary(BinaryOp::LtEq, rank.expression(), window.clone()));
+        let reciprocal = |member: &Field, rank: &Field| Expr::Case {
+            branches: vec![(windowed(member, rank), Expr::binary(BinaryOp::Divide, Expr::Literal(Value::F64(1.0)),
+                Expr::binary(BinaryOp::Add, Expr::Literal(Value::F64(HYBRID_RANK_CONSTANT)), rank.expression())))],
+            otherwise: Box::new(Expr::Literal(Value::F64(0.0))),
+        };
+        let input = Arc::new(input.filter(Expr::binary(BinaryOp::Or, windowed(&matched_field, &text_rank), windowed(&near_field, &near_rank)))?);
+        let fused = Expr::binary(BinaryOp::Add, reciprocal(&matched_field, &text_rank), reciprocal(&near_field, &near_rank));
+        let mut score_field = self.binder.field("_score", None, LogicalType::Scalar(ScalarType::F64))?;
+        score_field.qualifier = text.qualifier.clone();
+        let input = Arc::new(input.extend(vec![NamedExpr { field: score_field.clone(), expr: fused }])?);
+        let sorted = Arc::new(input.sort(vec![
+            SortExpr { expr: score_field.expression(), descending: true, nulls_first: false },
+            SortExpr { expr: tie, descending: false, nulls_first: false },
+        ])?);
+        let limited = Arc::new(sorted.limit(None, Some(fetch))?);
+        let output = visible.iter().chain([&score_field]).map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
+        let output = Arc::new(limited.project(output)?);
         alias.map_or(Ok(output.clone()), |alias| self.alias(output, alias))
     }
 

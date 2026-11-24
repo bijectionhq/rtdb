@@ -514,6 +514,14 @@ An overlay has the same admission as SearchHeld.v5.
 One Arrow batch carries `partition: UInt64`, `_id: Utf8`, nullable `vector: List<Float32>` and nullable Binary `filter_0` to `filter_{F-1}` for one to 64 exact staged shadows.
 Each shadow masks the stored row with its identity, and a shadow with a vector is itself a candidate.
 
+`rtdb.owned.HybridHeld.v1` fuses a SearchHeld.v5 text ranking and a NearestHeld.v1 nearest ranking of the same relations at one held cut by reciprocal rank fusion.
+It takes the 16-byte held handle, a signed big-endian i64 valid instant or `i64::MIN` for the held present, a big-endian u16 limit, then a big-endian u32 byte length and the SearchHeld.v5 request that follows its overlay, and last the NearestHeld.v1 request that follows its overlay.
+The text request has offset 0 and its limit is the window W (1 to 128); the nearest request has k = W, the same evidence flag, and the same relations in the same order; the limit is 1 to W.
+Each ranking keeps its first W hits, and a hit at rank r of a window, counted from 1, contributes 1 / (60 + r).
+The reply has `_id` as in SearchHeld.v5, `score: Float64` (the sum of the contributions, text first) and `partition: UInt64`, ordered by descending score, then complete typed identity, then partition ordinal.
+`rtdb.owned.search_total` counts the distinct hits of both windows, `rtdb.owned.search_witnesses` is as in SearchHeld.v5, and `rtdb.owned.search_scope` is the lowercase hex SHA-256 of the domain tag `rtdb.owned.hybrid.held.v1` and a NUL byte followed by the complete request body.
+A hybrid read takes no staged overlay.
+
 === Owned spatial paths
 
 Send `rtdb.owned.DeclareSpatialPath.v1` with the relation prefix and one Arrow row with `_id: Utf8` and `columns: List<Utf8>`.
@@ -1197,10 +1205,15 @@ Query and Changes tokens are scoped to the serving attachment and process.
 The temporal read driver encodes system-time boundaries as positions in the shared basis format.
 Claims use the shared claim format with the process's sealing authority.
 
-`RTDB_SEARCH(table, column, query)` returns matching rows with `_score` in descending score order.
+`RTDB_SEARCH(table, column, query[, analyzer])` returns matching rows with `_score` in descending score order.
 `RTDB_NEAREST(table, column, vector, limit)` returns the nearest vectors with `_distance` in ascending cosine-distance order.
-Both functions break ranking ties by internal row identity.
+`RTDB_HYBRID(table, text_column, query, vector_column, vector, window, limit[, analyzer])` fuses the first `window` rows of the exact RTDB_SEARCH ranking and of the exact RTDB_NEAREST ranking at one snapshot by reciprocal rank fusion with k = 60.
+A row's `_score` is the sum of 1 / (60 + rank) over the windows that hold it, text first, with ranks from 1, and the function returns the first `limit` rows by descending `_score`.
+These functions break ranking ties by internal row identity.
 `MATCH`, `SEARCH_SCORE` and `COSINE_DISTANCE` are also available as SQL expressions.
+`MATCH`, `SEARCH_SCORE`, `SEARCH_TERMS` and `SEARCH_LENGTH` take an optional analyzer name as a string literal after their other arguments, `simple` by default.
+`CREATE SEARCH INDEX name ON table (columns) WITH (analyzer = 'english', history = false)` indexes under that analyzer, and a search index serves only queries that name its analyzer.
+The analyzers are `simple`, `standard`, and `dutch`, `english`, `french`, `german`, `italian`, `portuguese` and `spanish` with their `_stop` forms; dev/doc/fts.allium specifies them.
 `CREATE VECTOR INDEX name ON table (column) PARTITION BY (columns) WITH (dimensions = n, method = 'ivf', recall = r)` declares an approximate index; `DROP VECTOR INDEX name` retires it.
 A query opts into the approximate route by adding `APPROXIMATE_NEAREST(column, vector, limit)` to the predicates of `ORDER BY COSINE_DISTANCE(column, vector), _iid LIMIT limit`.
 The route probes the published generations, ranks the rows above their frontier exactly, and returns exact distances for candidates that may omit true neighbours.

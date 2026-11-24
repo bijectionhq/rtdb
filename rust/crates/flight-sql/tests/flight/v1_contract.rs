@@ -208,6 +208,14 @@ async fn rtdb_v1_sql_parameters_search_nearest_and_history() {
     assert_eq!(ints(&query(&mut client, nearest).await.0), [2]);
     let nearest = input("SELECT _id FROM RTDB_NEAREST(wire_docs, embedding, ARRAY[0.0, 1.0], 1)");
     assert_eq!(ints(&query(&mut client, nearest).await.0), [2]);
+    let stemmed = input("SELECT _id FROM wire_docs WHERE MATCH(body, 'receipt', 'english') ORDER BY _id");
+    assert_eq!(ints(&query(&mut client, stemmed).await.0), [2]);
+    let unstemmed = input("SELECT _id FROM wire_docs WHERE MATCH(body, 'receipt') ORDER BY _id");
+    assert!(ints(&query(&mut client, unstemmed).await.0).is_empty());
+    let stemmed = input("SELECT _id FROM RTDB_SEARCH(wire_docs, body, 'receipt', 'english')");
+    assert_eq!(ints(&query(&mut client, stemmed).await.0), [2]);
+    let hybrid = input("SELECT _id FROM RTDB_HYBRID(wire_docs, body, 'invoice', embedding, ARRAY[0.0, 1.0], 2, 2)");
+    assert_eq!(ints(&query(&mut client, hybrid).await.0), [1, 2]);
     let history =
         input("SELECT _id FROM wire_docs FOR ALL SYSTEM_TIME WHERE _id = 1 ORDER BY _system_from");
     assert_eq!(ints(&query(&mut client, history).await.0), [1, 1]);
