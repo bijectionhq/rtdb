@@ -150,7 +150,18 @@ impl Service {
                 let basis = basis(request.basis)?;
                 let pin = pin(&request.pin)?;
                 let retain_until = request.retain_until_micros.map(Timestamp);
-                let checkpoint = if catalog.is_durable_default() {
+                let checkpoint = if catalog.is_managed() {
+                    self.0
+                        .node
+                        .export_managed_checkpoint(
+                            &request.deployment,
+                            pin,
+                            basis,
+                            retain_until,
+                            &call.cancellation,
+                        )
+                        .await
+                } else if catalog.is_durable_default() {
                     self.0
                         .node
                         .export_default_checkpoint(

@@ -162,6 +162,15 @@ pub trait ResourceFactory: Send + Sync {
         Err(Anomaly::unsupported("rtdb/deployment-catalog", "The runtime has no ordered deployment catalog"))
     }
 
+    /// Routes an exact export to the current deployment writer.
+    #[cfg(feature = "multi")]
+    async fn export_managed_database(
+        &self, _name: &str, _pin: uuid::Uuid, _basis: rtdb_types::rtdb_v1::Basis,
+        _until: Option<rtdb_types::Timestamp>, _cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        Err(Anomaly::unsupported("rtdb/deployment-export", "The runtime has no managed checkpoint export authority"))
+    }
+
     /// Installs an exact checkpoint before making its destination available for attachment.
     #[cfg(feature = "multi")]
     async fn transfer_managed_database(

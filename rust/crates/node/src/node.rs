@@ -1208,6 +1208,16 @@ impl Node {
         self.catalog.with_current_attachment(&database, || Ok(()))
     }
 
+    /// Returns an export ordered by the managed source deployment's writer.
+    #[cfg(feature = "multi")]
+    pub async fn export_managed_checkpoint(
+        &self, source: &str, pin: uuid::Uuid, basis: rtdb_types::rtdb_v1::Basis,
+        until: Option<rtdb_types::Timestamp>, cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        self.ensure_open()?;
+        self.factory.resources.export_managed_database(source, pin, basis, until, cancellation).await
+    }
+
     /// Makes the destination visible after the ordered catalog observes the restored backing.
     #[cfg(feature = "multi")]
     pub async fn transfer_managed_deployment(

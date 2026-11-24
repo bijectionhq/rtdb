@@ -12,7 +12,10 @@ use rtdb_node::{
     serving::{ServingDriver, ServingScope},
 };
 use rtdb_tx::transact::{Receipt, Transact};
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::LabelScope};
+use rtdb_types::{
+    Anomaly, AnomalyCategory, Result, Timestamp,
+    rtdb_v1::{Basis, LabelScope},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::{
@@ -54,13 +57,23 @@ struct Request {
     database: String,
     incarnation: [u8; 16],
     admission: Admission,
-    request: Box<RawValue>,
+    request: Option<Box<RawValue>>,
 }
 
 #[derive(Serialize, Deserialize)]
 enum Admission {
     Ordinary(Option<Scope>),
     CustodyResponse,
+    Catalog,
+    Export {
+        pin: Uuid,
+        basis: Basis,
+        until: Option<Timestamp>,
+    },
+    Restore {
+        request: [u8; 32],
+    },
+    Retire,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,7 +85,19 @@ struct Scope {
 #[derive(Serialize, Deserialize)]
 struct Reply {
     nonce: Uuid,
-    result: Result<Receipt>,
+    result: Result<Answer>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum Answer {
+    Receipt(Receipt),
+    Ticket(Vec<u8>),
+    Installed(Basis),
+    Retired {
+        terminal: u64,
+        generation: u64,
+        lease_until: i64,
+    },
 }
 
 impl Peer {
@@ -171,7 +196,47 @@ impl Peer {
         node: &Node,
         frame: Request,
         reservation: MemoryReservation,
-    ) -> Result<Receipt> {
+    ) -> Result<Answer> {
+        let target = self.selected(Uuid::from_bytes(frame.incarnation));
+        if target != Some(self.address) {
+            return Err(unavailable());
+        }
+        let incarnation = Uuid::from_bytes(frame.incarnation);
+        let name = &frame.database;
+        let admitted = match frame.admission {
+            Admission::Catalog if name.is_empty() => {
+                let request = transaction(frame.request, reservation)?;
+                return Ok(Answer::Receipt(
+                    runtime
+                        .catalog
+                        .apply_peer_write(frame.incarnation, &request)
+                        .await?,
+                ));
+            }
+            Admission::Export { pin, basis, until } if frame.request.is_none() => {
+                let writer = runtime.ready_driver(name, incarnation).await?;
+                let ticket = writer
+                    .export_checkpoint(pin, basis, until, &CancellationToken::new())
+                    .await?;
+                return Ok(Answer::Ticket(ticket));
+            }
+            Admission::Restore { request } if frame.request.is_none() => {
+                let basis = runtime
+                    .install_peer_transfer(name, incarnation, request)
+                    .await?;
+                return Ok(Answer::Installed(basis));
+            }
+            Admission::Retire if frame.request.is_none() => {
+                let writer = runtime.ready_driver(name, incarnation).await?;
+                let event = writer.retire_deployment().await?;
+                return Ok(Answer::Retired {
+                    terminal: event.terminal.0,
+                    generation: event.generation,
+                    lease_until: event.lease_until,
+                });
+            }
+            admitted => admitted,
+        };
         let attached = node.catalog().database(&frame.database)?;
         let serving = attached.serving_driver().ok_or_else(unavailable)?;
         if serving.incarnation() != frame.incarnation {
@@ -187,16 +252,8 @@ impl Peer {
         if writer.incarnation() != frame.incarnation {
             return Err(unavailable());
         }
-        let target = rtdb_db::preferred(
-            Uuid::from_bytes(frame.incarnation),
-            &self.live.read().expect("Multi peer discovery"),
-        );
-        if target != Some(self.address) {
-            return Err(unavailable());
-        }
-        let mut request = Transact::decode_canonical_request(frame.request.get().as_bytes())?;
-        request.request_memory = Some(Arc::new(reservation));
-        match frame.admission {
+        let request = transaction(frame.request, reservation)?;
+        let receipt = match admitted {
             Admission::Ordinary(scope) => {
                 writer
                     .transact_local(
@@ -209,10 +266,163 @@ impl Peer {
                     .await
             }
             Admission::CustodyResponse => writer.submit_response_local(request).await,
+            _ => Err(unavailable()),
+        }?;
+        Ok(Answer::Receipt(receipt))
+    }
+
+    fn selected(&self, incarnation: Uuid) -> Option<IpAddr> {
+        rtdb_db::preferred(
+            incarnation,
+            &self.live.read().expect("Multi peer discovery"),
+        )
+    }
+
+    pub(super) async fn forward_catalog(
+        &self,
+        incarnation: Uuid,
+        request: &Transact,
+    ) -> Result<Option<Receipt>> {
+        self.forward_transaction(
+            String::new(),
+            *incarnation.as_bytes(),
+            request,
+            Admission::Catalog,
+        )
+        .await
+    }
+
+    pub(super) async fn forward_export(
+        &self,
+        name: &str,
+        incarnation: Uuid,
+        pin: Uuid,
+        basis: Basis,
+        until: Option<Timestamp>,
+    ) -> Result<Option<Vec<u8>>> {
+        match self
+            .forward(
+                name.to_owned(),
+                *incarnation.as_bytes(),
+                None,
+                Admission::Export { pin, basis, until },
+            )
+            .await?
+        {
+            Some(Answer::Ticket(ticket)) => Ok(Some(ticket)),
+            None => Ok(None),
+            _ => Err(unavailable()),
         }
     }
 
-    async fn send(&self, request: Request) -> Result<Receipt> {
+    pub(super) async fn forward_restore(
+        &self,
+        name: &str,
+        incarnation: Uuid,
+        request: [u8; 32],
+    ) -> Result<Option<Basis>> {
+        match self
+            .forward(
+                name.to_owned(),
+                *incarnation.as_bytes(),
+                None,
+                Admission::Restore { request },
+            )
+            .await?
+        {
+            Some(Answer::Installed(basis)) if basis.incarnation() == *incarnation.as_bytes() => {
+                Ok(Some(basis))
+            }
+            None => Ok(None),
+            _ => Err(unavailable()),
+        }
+    }
+
+    pub(super) async fn forward_retirement(
+        &self,
+        name: &str,
+        incarnation: Uuid,
+    ) -> Result<Option<rtdb_db::DeploymentRetirement>> {
+        match self
+            .forward(
+                name.to_owned(),
+                *incarnation.as_bytes(),
+                None,
+                Admission::Retire,
+            )
+            .await?
+        {
+            Some(Answer::Retired {
+                terminal,
+                generation,
+                lease_until,
+            }) => Ok(Some(rtdb_db::DeploymentRetirement {
+                incarnation,
+                terminal: journal_contract::Lsn(terminal),
+                generation,
+                lease_until,
+            })),
+            None => Ok(None),
+            _ => Err(unavailable()),
+        }
+    }
+
+    async fn forward_transaction(
+        &self,
+        database: String,
+        incarnation: [u8; 16],
+        request: &Transact,
+        admission: Admission,
+    ) -> Result<Option<Receipt>> {
+        let target = self.selected(Uuid::from_bytes(incarnation));
+        if target.is_none_or(|to| to == self.address) {
+            return Ok(None);
+        }
+        match self
+            .forward(
+                database,
+                incarnation,
+                Some(request.canonical_request()?),
+                admission,
+            )
+            .await?
+        {
+            Some(Answer::Receipt(receipt)) => Ok(Some(receipt)),
+            None => Ok(None),
+            _ => Err(unavailable()),
+        }
+    }
+
+    async fn forward(
+        &self,
+        database: String,
+        incarnation: [u8; 16],
+        request: Option<Box<RawValue>>,
+        admission: Admission,
+    ) -> Result<Option<Answer>> {
+        let Some(to) = self
+            .selected(Uuid::from_bytes(incarnation))
+            .filter(|to| *to != self.address)
+        else {
+            return Ok(None);
+        };
+        let frame = Request {
+            nonce: Uuid::new_v4(),
+            from: self.address,
+            to,
+            expires: Timestamp(SystemClock.now().0.saturating_add(ADMISSION_MICROS)),
+            database,
+            incarnation,
+            admission,
+            request,
+        };
+        tokio::time::timeout(TIMEOUT, self.send(frame))
+            .await
+            .map_err(|_| unavailable())?
+            .map(Some)
+    }
+
+    async fn send(&self, request: Request) -> Result<Answer> {
         let _permit = self.outgoing.try_acquire().map_err(|_| overloaded())?;
         let encoded = serde_json::to_vec(&request).map_err(encoding)?;
         if encoded.len() > MAX_PEER_MESSAGE_BYTES {
@@ -249,36 +459,24 @@ impl MultiWriteRoute for DatabaseRoute {
         request: &Transact,
         admitted: MultiWriteAdmission<'_>,
     ) -> Result<Option<Receipt>> {
-        let target = rtdb_db::preferred(
-            Uuid::from_bytes(incarnation),
-            &self.peer.live.read().expect("Multi peer discovery"),
-        );
-        let Some(to) = target.filter(|to| *to != self.peer.address) else {
-            return Ok(None);
+        let admission = match admitted {
+            MultiWriteAdmission::Ordinary(scope) => Admission::Ordinary(scope.map(|scope| Scope {
+                labels: scope.labels.clone(),
+                namespace: scope.receipt_namespace,
+            })),
+            MultiWriteAdmission::CustodyResponse => Admission::CustodyResponse,
         };
-        let admission = Request {
-            nonce: Uuid::new_v4(),
-            from: self.peer.address,
-            to,
-            expires: Timestamp(SystemClock.now().0.saturating_add(ADMISSION_MICROS)),
-            database: self.database.clone(),
-            incarnation,
-            admission: match admitted {
-                MultiWriteAdmission::Ordinary(scope) => {
-                    Admission::Ordinary(scope.map(|scope| Scope {
-                        labels: scope.labels.clone(),
-                        namespace: scope.receipt_namespace,
-                    }))
-                }
-                MultiWriteAdmission::CustodyResponse => Admission::CustodyResponse,
-            },
-            request: request.canonical_request()?,
-        };
-        tokio::time::timeout(TIMEOUT, self.peer.send(admission))
+        self.peer
+            .forward_transaction(self.database.clone(), incarnation, request, admission)
             .await
-            .map_err(|_| unavailable())?
-            .map(Some)
     }
+}
+
+fn transaction(raw: Option<Box<RawValue>>, reservation: MemoryReservation) -> Result<Transact> {
+    let raw = raw.ok_or_else(unavailable)?;
+    let mut request = Transact::decode_canonical_request(raw.get().as_bytes())?;
+    request.request_memory = Some(Arc::new(reservation));
+    Ok(request)
 }
 
 async fn read_frame(

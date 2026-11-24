@@ -287,6 +287,12 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     assert_eq!(writer.open_export_ticket(&changed).await.err().unwrap().code, "rtdb/invalid-export");
     let export = writer.open_export_ticket(&ticket).await.unwrap();
     let identity = export.checkpoint_identity().unwrap();
+    let mut source_follower = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    assert_eq!(source_follower.role(), Role::Follower);
+    assert_eq!(
+        source_follower.open_export_ticket(&ticket).await.unwrap().checkpoint_identity().unwrap(),
+        identity,
+    );
     assert_eq!(identity.pin, *id.as_bytes());
     assert_eq!(identity.basis, selected.basis);
     assert_eq!(identity.until, None);
@@ -331,6 +337,7 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     writer.release_export_ticket(&ticket).await.unwrap();
     writer.release_export_ticket(&ticket).await.unwrap();
     assert_eq!(writer.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/unknown-pin");
+    assert_eq!(source_follower.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/unknown-pin");
     let replacement = writer.export_ticket(id, selected.basis, None).await.unwrap();
     assert_ne!(replacement, ticket);
     assert_eq!(writer.open_export_ticket(&ticket).await.err().unwrap().code, "rtdb/invalid-export");

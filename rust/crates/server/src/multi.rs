@@ -199,7 +199,7 @@ impl MultiRuntime {
                 Arc::clone(&memory),
             )
         });
-        let catalog = catalog::Catalog::new(control);
+        let catalog = catalog::Catalog::new(control, peer.clone());
         let observed = catalog.read().await?;
         let mut serving = BTreeMap::new();
         for (name, id) in &databases {
@@ -286,6 +286,59 @@ impl MultiRuntime {
             self.catalog.mark_ready(name, id).await?;
         }
         Ok(self.configuration.clone())
+    }
+
+    async fn export(
+        &self,
+        name: &str,
+        pin: Uuid,
+        basis: Basis,
+        until: Option<Timestamp>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        let entry = self
+            .catalog
+            .read()
+            .await?
+            .remove(name)
+            .filter(|entry| entry.status.ready())
+            .ok_or_else(unknown_deployment)?;
+        self.publish_export(name, entry.database, pin, basis, until, cancellation)
+            .await
+    }
+
+    async fn publish_export(
+        &self,
+        name: &str,
+        database: Uuid,
+        pin: Uuid,
+        basis: Basis,
+        until: Option<Timestamp>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        if let Some(peer) = &self.peer
+            && let Some(ticket) = cancellation
+                .run_until_cancelled(peer.forward_export(name, database, pin, basis, until))
+                .await
+                .ok_or_else(transfer_interrupted)??
+        {
+            return Ok(ticket);
+        }
+        self.ready_driver(name, database)
+            .await?
+            .export_checkpoint(pin, basis, until, cancellation)
+            .await
+    }
+
+    async fn ready_driver(&self, name: &str, database: Uuid) -> Result<Arc<MultiServing>> {
+        let entry = self
+            .catalog
+            .read()
+            .await?
+            .remove(name)
+            .filter(|entry| entry.status.ready() && entry.database == database)
+            .ok_or_else(unknown_deployment)?;
+        self.ensure_driver(name, entry.database).await
     }
 
     async fn transfer(
@@ -388,8 +441,15 @@ impl MultiRuntime {
                 retain_until,
             } => {
                 let source = self.transfer_source(pending).await?;
-                let ticket = source
-                    .export_checkpoint(*pin, *basis, *retain_until, cancellation)
+                let ticket = self
+                    .publish_export(
+                        &pending.source,
+                        pending.incarnation,
+                        *pin,
+                        *basis,
+                        *retain_until,
+                        cancellation,
+                    )
                     .await?;
                 let export = source
                     .open_checkpoint_export(ticket.clone(), cancellation)
@@ -412,6 +472,64 @@ impl MultiRuntime {
             }
             TransferExport::Ticket { .. } => pending,
         };
+        let remote = if let Some(peer) = &self.peer {
+            cancellation
+                .run_until_cancelled(peer.forward_restore(name, database, pending.request))
+                .await
+                .ok_or_else(transfer_interrupted)??
+        } else {
+            None
+        };
+        let basis = match remote {
+            Some(basis) => basis,
+            None => {
+                self.install_transfer(name, database, pending, cancellation)
+                    .await?
+            }
+        };
+        self.catalog
+            .mark_transfer_ready(name, database, pending.request, basis)
+            .await?;
+        Ok(basis)
+    }
+
+    async fn install_peer_transfer(
+        &self,
+        name: &str,
+        database: Uuid,
+        request: [u8; 32],
+    ) -> Result<Basis> {
+        let entry = self
+            .catalog
+            .read()
+            .await?
+            .remove(name)
+            .filter(|entry| entry.database == database)
+            .ok_or_else(unknown_deployment)?;
+        match &entry.status {
+            Status::TransferReady {
+                request: prior,
+                basis,
+            } if *prior == request => Ok(*basis),
+            Status::TransferPending(pending) if pending.request == request => {
+                self.install_transfer(name, database, pending, &CancellationToken::new())
+                    .await
+            }
+            _ => Err(Anomaly::new(
+                AnomalyCategory::Conflict,
+                "rtdb/deployment-transfer-conflict",
+                "The destination has no matching ordered checkpoint reservation",
+            )),
+        }
+    }
+
+    async fn install_transfer(
+        &self,
+        name: &str,
+        database: Uuid,
+        pending: &catalog::Transfer,
+        cancellation: &CancellationToken,
+    ) -> Result<Basis> {
         let TransferExport::Ticket { manifest, ticket } = &pending.export else {
             return Err(invalid(
                 "The ordered transfer is missing its bound checkpoint",
@@ -436,9 +554,6 @@ impl MultiRuntime {
                     .basis
             }
         };
-        self.catalog
-            .mark_transfer_ready(name, database, pending.request, basis)
-            .await?;
         Ok(basis)
     }
 
@@ -469,11 +584,20 @@ impl MultiRuntime {
                 ));
             }
             Status::Ready | Status::TransferReady { .. } => {
-                let event = self
-                    .ensure_driver(name, selected.database)
-                    .await?
-                    .retire_deployment()
-                    .await?;
+                let remote = if let Some(peer) = &self.peer {
+                    peer.forward_retirement(name, selected.database).await?
+                } else {
+                    None
+                };
+                let event = match remote {
+                    Some(event) => event,
+                    None => {
+                        self.ensure_driver(name, selected.database)
+                            .await?
+                            .retire_deployment()
+                            .await?
+                    }
+                };
                 self.record_retirement(name, event).await?
             }
             _ => selected,
@@ -829,6 +953,14 @@ fn unknown_deployment() -> Anomaly {
     )
 }
 
+fn transfer_interrupted() -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Interrupted,
+        "rtdb/deployment-transfer",
+        "The deployment transfer was interrupted",
+    )
+}
+
 fn transfer_request_digest(source: &str, transfer: &DeploymentTransfer) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"rtdb/multi/deployment-transfer/v1\0");
@@ -890,6 +1022,19 @@ struct ServingResources {
 impl ResourceFactory for ServingResources {
     async fn provision_managed_database(&self, name: &str) -> Result<DatabaseConfig> {
         self.runtime.provision(name).await
+    }
+
+    async fn export_managed_database(
+        &self,
+        name: &str,
+        pin: Uuid,
+        basis: Basis,
+        until: Option<Timestamp>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>> {
+        self.runtime
+            .export(name, pin, basis, until, cancellation)
+            .await
     }
 
     async fn transfer_managed_database(

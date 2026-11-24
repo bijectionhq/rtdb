@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use rtdb_crypt::tokens::DeploymentErasureEvidence;
 use rtdb_db::{DeploymentRetirement, MultiDatabase};
-use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Row, Transact, Version, Window};
+use rtdb_tx::transact::{Cell, Guard, Op, Outcome, Receipt, Row, Transact, Version, Window};
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Result, StructFields, TableRef, Timestamp, Value,
     rtdb_v1::{At, Basis, Layer, MAIN_BRANCH},
@@ -14,6 +14,7 @@ use uuid::Uuid;
 pub(super) struct Catalog {
     database: Mutex<MultiDatabase>,
     incarnation: Uuid,
+    peer: Option<Arc<super::peer::Peer>>,
 }
 
 #[derive(Clone)]
@@ -83,12 +84,40 @@ pub(super) struct Retirement {
 }
 
 impl Catalog {
-    pub(super) fn new(database: MultiDatabase) -> Self {
+    pub(super) fn new(database: MultiDatabase, peer: Option<Arc<super::peer::Peer>>) -> Self {
         let incarnation = Uuid::from_bytes(database.incarnation());
         Self {
             database: Mutex::new(database),
             incarnation,
+            peer,
         }
+    }
+
+    pub(super) async fn apply_peer_write(
+        &self,
+        incarnation: [u8; 16],
+        request: &Transact,
+    ) -> Result<Receipt> {
+        let [
+            Op::Put {
+                branch,
+                table: relation,
+                rows,
+                ..
+            },
+        ] = request.ops.as_slice()
+        else {
+            return Err(invalid_catalog());
+        };
+        if *self.incarnation.as_bytes() != incarnation
+            || branch.as_str() != MAIN_BRANCH
+            || relation != &table()
+            || rows.len() != 1
+            || !request.otherwise.is_empty()
+        {
+            return Err(invalid_catalog());
+        }
+        self.database.lock().await.transact(request).await
     }
 
     pub(super) fn deployment_id(&self, name: &str) -> Uuid {
@@ -141,7 +170,7 @@ impl Catalog {
         if entries.values().any(|entry| entry.database == database) {
             return Err(conflict());
         }
-        write(&mut control, name, database, status, Version::Absent).await?;
+        write(self, &mut control, name, database, status, Version::Absent).await?;
         let selected = read(&mut control)
             .await?
             .remove(name)
@@ -172,6 +201,7 @@ impl Catalog {
             _ => return Err(conflict()),
         }
         write(
+            self,
             &mut control,
             name,
             database,
@@ -214,6 +244,7 @@ impl Catalog {
         }
         pending.export = TransferExport::Ticket { manifest, ticket };
         write(
+            self,
             &mut control,
             name,
             database,
@@ -251,6 +282,7 @@ impl Catalog {
             _ => return Err(closed()),
         }
         write(
+            self,
             &mut control,
             name,
             database,
@@ -283,6 +315,7 @@ impl Catalog {
         };
         if selected.status.ready() {
             write(
+                self,
                 &mut control,
                 name,
                 selected.database,
@@ -311,6 +344,7 @@ impl Catalog {
         let selected = find(&mut control, name).await?;
         if selected.status == Status::Retiring(retirement) {
             write(
+                self,
                 &mut control,
                 name,
                 selected.database,
@@ -511,6 +545,7 @@ fn decode_transfer_export(cells: &StructFields<Value>) -> Result<TransferExport>
 }
 
 async fn write(
+    catalog: &Catalog,
     control: &mut MultiDatabase,
     name: &str,
     database: Uuid,
@@ -626,7 +661,14 @@ async fn write(
         custody_request_digest: None,
         request_memory: None,
     };
-    match control.transact(&request).await?.outcome {
+    let receipt = if let Some(peer) = &catalog.peer
+        && let Some(receipt) = peer.forward_catalog(catalog.incarnation, &request).await?
+    {
+        receipt
+    } else {
+        control.transact(&request).await?
+    };
+    match receipt.outcome {
         Outcome::Then | Outcome::Otherwise { .. } => Ok(()),
         Outcome::Refused { error } => Err(error),
     }

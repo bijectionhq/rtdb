@@ -537,12 +537,16 @@ impl MultiDatabase {
     }
 
     pub async fn open_pin(&mut self, id: Uuid) -> Result<VerifiedManifest> {
-        self.open_pinned_manifest(id).await.map(|(_, image)| image)
+        self.open_pinned_manifest(id, true).await.map(|(_, image)| image)
     }
 
-    async fn open_pinned_manifest(&mut self, id: Uuid) -> Result<(Pin, VerifiedManifest)> {
+    async fn open_pinned_manifest(&mut self, id: Uuid, require_writer: bool) -> Result<(Pin, VerifiedManifest)> {
         self.refresh().await?;
-        let closure = self.reachability(self.authority()?).await?;
+        self.require_active()?;
+        let state = self.state();
+        let epoch = if require_writer { self.authority()?.epoch } else { state.epoch };
+        let observed = state.head;
+        let closure = state.reachability(&self.stream, self.store.as_ref(), epoch).await?;
         let pin = closure
             .pins()
             .find(|pin| pin.id == id && pin.until.is_none_or(|until| self.before(until)))
@@ -553,8 +557,19 @@ impl MultiDatabase {
                     "The pin is unavailable",
                 )
             })?;
-        let image =
-            read_manifest(self.store.as_ref(), self.stream.kms.as_ref(), pin.manifest).await?;
+        let image = read_manifest(self.store.as_ref(), self.stream.kms.as_ref(), pin.manifest).await?;
+        if !require_writer {
+            self.refresh().await?;
+            self.require_active()?;
+            let state = self.state();
+            if state.head != observed
+                && !state.reachability(&self.stream, self.store.as_ref(), state.epoch)
+                    .await?.pins().any(|current| current == pin)
+            {
+                return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-pin", "The exact export pin was withdrawn"));
+            }
+            self.check_generation(image.generation.number).await?;
+        }
         if pin.until.is_some_and(|until| !self.before(until)) {
             return Err(Anomaly::new(
                 AnomalyCategory::NotFound,

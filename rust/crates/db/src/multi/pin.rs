@@ -113,7 +113,7 @@ impl MultiDatabase {
     }
 
     pub async fn open_export(&mut self, id: Uuid) -> Result<PinnedExport> {
-        let (pin, image) = self.open_pinned_manifest(id).await?;
+        let (pin, image) = self.open_pinned_manifest(id, false).await?;
         Ok(PinnedExport {
             pin,
             image,
