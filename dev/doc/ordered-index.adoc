@@ -49,7 +49,9 @@ It emits both retractions and insertions when a key or interval moves.
 Payload-only changes with the same projected valid-time spans share the previous root.
 The scan captures a single table snapshot, opens the index root for the requested system time, and applies exact edits from uncovered flushed blocks and live segments in that snapshot.
 The point read applies later erasures to the selected root.
-The projector selects plain scalar keys from the source Arrow columns into compact, index-owned batches.
+The projector selects plain scalar keys from source Arrow columns into compact key batches.
+A contiguous, all-valid selection of text, binary, UUID, whole Boolean bytes, or zoned microsecond timestamps can retain source buffers within the projection's memory budget.
+Those buffers keep their source reservations while projected tuples refer to them.
 A governed put compares the document identity with the complete borrowed event identity.
 A world shadow uses the logical null state of its field marker to identify a local tombstone.
 A posting leaf stores an uncompressed Arrow IPC record batch with a compact description of its column types.
