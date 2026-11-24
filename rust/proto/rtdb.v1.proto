@@ -198,6 +198,9 @@ message ChangesRequest {
   // Maximum number of whole system-time groups.
   uint32 limit = 7;
   optional uint64 wait_millis = 8;
+  // Requires the changes.progress-only capability and IMAGES_NONE.
+  // Return the schema and normal coverage trailer with no row batches.
+  bool progress_only = 9;
 }
 message ChangesTrailer {
   // For ascending pages this is the next exclusive lower bound.

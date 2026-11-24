@@ -45,6 +45,12 @@ pub(crate) fn schema_data(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result
     let charge = memory.reserve(schema_bound(schema)?).map_err(status)?;
     Ok(FlightData { data_header: retain(rtdb_format::ipc::write_schema_header_with_options(schema, &IpcWriteOptions::default()).map_err(status)?, charge), ..Default::default() })
 }
+pub(crate) fn reserve_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Arc<MemoryReservation>, Status> {
+    memory.reserve(batch_bound(batch)?).map_err(status)
+}
+fn batch_bound(batch: &RecordBatch) -> Result<usize, Status> {
+    add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)
+}
 pub(crate) struct Encoder { schema: SchemaRef, _reservation: Arc<MemoryReservation>, dictionaries: DictionaryTracker, compression: CompressionContext }
 impl Encoder {
     pub fn new(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
@@ -53,14 +59,18 @@ impl Encoder {
     }
     pub fn batch(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
         if batch.schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
-        self.encode(batch, memory)
+        self.encode_reserved(batch, reserve_batch(batch, memory)?)
     }
     pub fn declared_batch(&mut self, batch: &rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
         if batch.declared_schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
-        self.encode(batch.batch(), memory)
+        self.encode_reserved(batch.batch(), reserve_batch(batch.batch(), memory)?)
     }
-    fn encode(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
-        let charge = memory.reserve(add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)?).map_err(status)?;
+    pub(crate) fn reserved_batch(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
+        if batch.schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
+        if charge.bytes() < batch_bound(batch)? { return Err(invalid("Flight batch exceeds its reservation")); }
+        self.encode_reserved(batch, charge)
+    }
+    fn encode_reserved(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
         let (dictionaries, data) = IpcDataGenerator::default().encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression).map_err(arrow)?;
         Ok(dictionaries.into_iter().chain(std::iter::once(data)).map(|encoded| { let mut data: FlightData = encoded.into(); data.data_header = retain(data.data_header, Arc::clone(&charge)); data.data_body = retain(data.data_body, Arc::clone(&charge)); data }).collect())
     }

@@ -72,6 +72,7 @@ impl Service {
                             "query.track",
                             "query.page",
                             "changes",
+                            changes::PROGRESS_ONLY,
                             "sql.history",
                             "sql.search",
                             "sql.search-table",

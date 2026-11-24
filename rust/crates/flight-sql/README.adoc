@@ -1208,6 +1208,8 @@ Each output row carries a table, a system time, the interval boundary direction,
 The limit counts whole system-time groups.
 Ascending requests advance `after` to `through`, and descending requests move `until` down to `through` while retaining the original `after`.
 A cursor below the retained checkpoint floor returns `rtdb/cursor-expired`.
+With the `changes.progress-only` capability, a request can set `progress_only` with `IMAGES_NONE` to receive only the schema and normal coverage trailer.
+Progress-only requests use the same table readers, group limits, interval bounds, and wait conditions.
 
 Default mode serves the same wire operations on local or shared logs.
 The route advertises `query.linearizable` when it can establish a fresh barrier.

@@ -52,4 +52,8 @@ surface StatelessDatabase {
         -- A returned page carries whole system-time groups.
         -- An expired starting cut returns the cursor-expired code.
         -- A waiting call returns after a relevant change, complete coverage of its requested interval or expiry of its wait.
+
+    @guarantee ChangesProgress
+        -- Where advertised, progress-only Changes returns the schema and coverage trailer for the request.
+        -- The same table admission, group limits, wait and coverage rules apply to a progress-only request.
 }

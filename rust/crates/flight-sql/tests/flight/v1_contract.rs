@@ -36,6 +36,9 @@ async fn get<M: Message + Name, R: Message + Default>(
     let last = frames.pop().expect("typed trailer");
     assert!(last.data_header.is_empty() && last.data_body.is_empty());
     let trailer = R::decode(last.app_metadata).expect("protobuf stream trailer");
+    let schema = arrow_ipc::root_as_message(&frames.first().expect("Arrow schema").data_header)
+        .unwrap();
+    assert!(schema.header_as_schema().is_some());
     let stream = futures::stream::iter(frames.into_iter().map(Ok));
     let batches = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(stream)
         .try_collect()
@@ -80,6 +83,7 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let caps = v1::CapabilitiesResponse::decode(reply[0].body.clone()).unwrap();
     assert_eq!(caps.api, "rtdb.v1");
     assert!(caps.features.iter().any(|feature| feature == "query.track"));
+    assert!(caps.features.iter().any(|feature| feature == "changes.progress-only"));
     assert_eq!(caps.limits.unwrap().min_key_bytes, 16);
     client
         .update(
@@ -290,6 +294,146 @@ async fn rtdb_v1_changes_whole_groups_images_wait_and_expiry() {
         .await
         .unwrap_err();
     error(status, v1::AnomalyCategory::NotFound, "rtdb/cursor-expired");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn rtdb_v1_changes_packs_rows_and_progress_covers_the_same_groups() {
+    use arrow_array::{Array, cast::AsArray, types::TimestampMicrosecondType};
+    use rtdb_types::rtdb_v1::Basis;
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client
+        .update("INSERT INTO wire_a (_id, n) VALUES (0, 0)", None)
+        .await;
+    client
+        .update("INSERT INTO wire_z (_id, n) VALUES (0, 0)", None)
+        .await;
+    let (_, current) = query(&mut client, input("SELECT 1")).await;
+    let (empty, start) = query(&mut client, input("SELECT 1 LIMIT 0")).await;
+    assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert_eq!(current.basis, start.basis);
+
+    let tx = client.begin().await;
+    client
+        .update("INSERT INTO wire_a (_id, n) VALUES (1, 10), (2, 20)", Some(tx.clone()))
+        .await;
+    client
+        .update("INSERT INTO wire_z (_id, n) VALUES (1, 30)", Some(tx.clone()))
+        .await;
+    client.end(tx, true).await.unwrap();
+    let (_, earlier) = query(&mut client, input("SELECT 1 LIMIT 0")).await;
+    client
+        .update("INSERT INTO wire_a (_id, n) VALUES (3, 40), (4, 50)", None)
+        .await;
+    let (_, later) = query(&mut client, input("SELECT 1 LIMIT 0")).await;
+
+    for (order, expected_time, row_counts, table_names) in [
+        (
+            v1::Order::Ascending,
+            earlier.system_time_micros,
+            &[2, 1][..],
+            &["public.wire_a", "public.wire_z"][..],
+        ),
+        (
+            v1::Order::Descending,
+            later.system_time_micros,
+            &[2][..],
+            &["public.wire_a"][..],
+        ),
+    ] {
+        let mut request = v1::ChangesRequest {
+            branch: "main".into(),
+            tables: vec!["wire_z".into(), "wire_a".into()],
+            after: start.basis.clone(),
+            until: later.basis.clone(),
+            order: order as i32,
+            images: v1::Images::Both as i32,
+            limit: 1,
+            ..Default::default()
+        };
+        let (rows, images) = get::<_, v1::ChangesTrailer>(&mut client, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            row_counts,
+        );
+        for (batch, table) in rows.iter().zip(table_names) {
+            let times = batch.column(1).as_primitive::<TimestampMicrosecondType>();
+            let keys = batch.column(3).as_binary::<i32>();
+            let before = batch.column(4).as_binary::<i32>();
+            let after = batch.column(5).as_binary::<i32>();
+            for row in 0..batch.num_rows() {
+                assert_eq!(batch.column(0).as_string::<i32>().value(row), *table);
+                assert_eq!(times.value(row), expected_time);
+                assert!(batch.column(2).as_boolean().value(row));
+                assert!(keys.is_valid(row) && after.is_valid(row) && before.is_null(row));
+                let key = StreamReader::try_new(keys.value(row), None).unwrap().next().unwrap().unwrap();
+                let after = StreamReader::try_new(after.value(row), None).unwrap().next().unwrap().unwrap();
+                assert_eq!(key.num_rows(), 1);
+                assert_eq!(after.num_rows(), 1);
+                assert_eq!(key.column(0).as_ref(), after.column_by_name("_id").unwrap().as_ref());
+            }
+        }
+        assert!(!images.complete);
+        let expected_through = match order {
+            v1::Order::Ascending => earlier.basis.clone().unwrap(),
+            v1::Order::Descending => {
+                let basis = Basis::from_bytes(&later.basis.as_ref().unwrap().value).unwrap();
+                v1::Basis {
+                    value: Basis::new(basis.incarnation(), basis.position() - 1)
+                        .to_bytes()
+                        .to_vec(),
+                }
+            }
+        };
+        assert_eq!(images.through, Some(expected_through));
+
+        request.images = v1::Images::None as i32;
+        let (_, ordinary) = get::<_, v1::ChangesTrailer>(&mut client, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(ordinary, images);
+        request.progress_only = true;
+        let (rows, progress) = get::<_, v1::ChangesTrailer>(&mut client, request.clone())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(progress, ordinary);
+
+        request.images = v1::Images::Keys as i32;
+        let status = get::<_, v1::ChangesTrailer>(&mut client, request).await.unwrap_err();
+        error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+    }
+
+    let mut request = v1::ChangesRequest {
+        branch: "main".into(),
+        tables: vec!["wire_a".into()],
+        after: start.basis,
+        limit: 1,
+        wait_millis: Some(30_000),
+        progress_only: true,
+        ..Default::default()
+    };
+    let (rows, observed) = tokio::time::timeout(
+        Duration::from_secs(10),
+        get::<_, v1::ChangesTrailer>(&mut client, request.clone()),
+    )
+    .await
+    .expect("a matching group completes the wait")
+    .unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(observed.through, earlier.basis);
+    assert!(!observed.complete);
+
+    request.after = later.basis.clone();
+    request.wait_millis = Some(10);
+    let (rows, timeout) = get::<_, v1::ChangesTrailer>(&mut client, request).await.unwrap();
+    assert!(rows.is_empty());
+    assert_eq!(timeout.through, later.basis);
+    assert!(timeout.complete);
     running.stop().await;
 }
 
