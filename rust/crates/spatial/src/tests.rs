@@ -136,7 +136,7 @@ fn canonical_geometry_preserves_work_and_tagged_wkb_results() {
     );
     let exact = Predicate::WithinDistance(0.0);
     assert_eq!(
-        exact.evaluate(&location, &wkb, &mut work).unwrap(),
+        exact.evaluate(&location, &wkb.geometry, None, &mut work).unwrap(),
         Some(None)
     );
 }
