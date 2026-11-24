@@ -24,6 +24,7 @@ Terraform stores these selectors rather than the credential values.
 Set `kafka_bootstrap` to brokers reachable from the private subnets and `kafka_topic` to the primary database's source topic.
 Create the source topic and its `<topic>-replica` topic before startup.
 The native node opens the ordinary Kafka source and replica logs and stores its database files in S3.
+Each task caches remote files in its own ephemeral disk under `/var/lib/rtdb/cache`.
 
 == Multi mode
 
