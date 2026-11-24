@@ -232,7 +232,9 @@ rule SearchJobRuns {
     -- Gap nomination skips the directory when every block in its sealed prefix has posting coverage or a live L0 trie.
     -- An uncovered compacted block in the sealed prefix is nominated through the captured entity directory.
     -- Compacted history beyond the sealed prefix is nominated from live primary tries.
-    -- Primary gap reads count the rows of each decoded page against the inspection budget.
+    -- Primary gap reads count all rows of each candidate page against the inspection budget before decoding the page.
+    -- On a cache miss with ranged storage, a primary gap read checks the page's IPC metadata before reading its body.
+    -- Primary history reads project event headers and recorded keys where the page layout supports projection.
     -- Directory gap reads count only rows from uncovered blocks that lack a live L0 trie against that budget.
     -- The per-trie point path checks recorded entity keys in history files, primary pages, and live segments.
     -- Histories with different entity keys under one IID resolve through the scan.
@@ -246,6 +248,11 @@ rule SearchJobRuns {
     -- A store that requires immutable provider evidence admits a new run only with a physical version or an enrolled terminal publication.
     -- Native local Classic admits runs under the terminal-name contract of its recovery-locked store.
     -- A captured catalog routes each required term using the authenticated locator of each eligible run.
+    -- A logical run open resolves the root locator and checks the decoded tree cache before expanding any inline root.
+    -- A cached tree must match the requested root location and index identity.
+    -- On a cache miss, the reader admits inline expansion before allocating its buffers and authenticates the result before Arrow decode.
+    -- An unusable inline root falls back to the persisted root.
+    -- Fresh verification authenticates the persisted root directly.
     -- A captured catalog can hold one complete term directory for each format 16 definition and analyzer generation.
     -- Each row binds a field, analyzed term and run digest to its document frequency, maximum term frequency, minimum stored length, maximum unit term score and window range.
     -- Its immutable pages authenticate rows and carry the maximum unit term score of each subtree.

@@ -5,13 +5,15 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_flight::FlightData;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
+use rtdb_columnar::{BufferIdentity, MemoryBudget, MemoryReservation, OwnedBatch, RetainedArray, from_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::LogicalType;
 use tonic::Status;
 use crate::error::{arrow, invalid, status};
+
+mod dictionary;
 
 struct RetainedBytes { bytes: Bytes, _reservation: Arc<MemoryReservation> }
 impl AsRef<[u8]> for RetainedBytes { fn as_ref(&self) -> &[u8] { &self.bytes } }
@@ -51,6 +53,16 @@ pub(crate) fn reserve_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> 
 pub(crate) fn batch_bound(batch: &RecordBatch) -> Result<usize, Status> {
     add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)
 }
+
+struct EncodedIpcBytes {
+    bytes: Vec<u8>,
+    _reservation: Arc<std::sync::OnceLock<MemoryReservation>>,
+}
+
+impl AsRef<[u8]> for EncodedIpcBytes {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
+}
+
 pub(crate) struct Encoder { schema: SchemaRef, _reservation: Arc<MemoryReservation>, dictionaries: DictionaryTracker, compression: CompressionContext }
 impl Encoder {
     pub fn new(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
@@ -71,69 +83,294 @@ impl Encoder {
         self.encode_reserved(batch, charge)
     }
     fn encode_reserved(&mut self, batch: &RecordBatch, charge: Arc<MemoryReservation>) -> Result<Vec<FlightData>, Status> {
-        let (dictionaries, data) = IpcDataGenerator::default().encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression).map_err(arrow)?;
-        Ok(dictionaries.into_iter().chain(std::iter::once(data)).map(|encoded| { let mut data: FlightData = encoded.into(); data.data_header = retain(data.data_header, Arc::clone(&charge)); data.data_body = retain(data.data_body, Arc::clone(&charge)); data }).collect())
+        use std::{mem::size_of, sync::OnceLock};
+
+        let mut charge = Arc::try_unwrap(charge)
+            .map_err(|_| Status::internal("Flight batch encoding requires an exclusive reservation"))?;
+        let (dictionaries, data) = IpcDataGenerator::default()
+            .encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression)
+            .map_err(arrow)?;
+
+        let reservation = Arc::new(OnceLock::new());
+        let mut frames = Vec::with_capacity(add(dictionaries.len(), 1)?);
+        let bytes_owner = size_of::<EncodedIpcBytes>() + size_of::<usize>();
+        let reservation_owner = size_of::<OnceLock<MemoryReservation>>() + 2 * size_of::<usize>();
+        let mut retained = add(mul(frames.capacity(), size_of::<FlightData>())?, reservation_owner)?;
+        for encoded in dictionaries.into_iter().chain(std::iter::once(data)) {
+            retained = add(retained, add(encoded.ipc_message.capacity(), encoded.arrow_data.capacity())?)?;
+            retained = add(retained, 2 * bytes_owner)?;
+            frames.push(FlightData {
+                data_header: Bytes::from_owner(EncodedIpcBytes {
+                    bytes: encoded.ipc_message,
+                    _reservation: Arc::clone(&reservation),
+                }),
+                data_body: Bytes::from_owner(EncodedIpcBytes {
+                    bytes: encoded.arrow_data,
+                    _reservation: Arc::clone(&reservation),
+                }),
+                ..Default::default()
+            });
+        }
+        charge.shrink_to(retained)
+            .map_err(|_| Status::internal("Flight IPC output exceeds its encoding reservation"))?;
+        reservation.set(charge).expect("Flight IPC output reservation is installed once");
+        Ok(frames)
     }
 }
-pub(crate) struct Decoder { schema: Option<SchemaRef>, dictionaries: HashMap<i64, ArrayRef>, permanent: Vec<Arc<MemoryReservation>>, memory: Arc<MemoryBudget> }
+struct UploadSchema {
+    schema: SchemaRef,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl UploadSchema {
+    fn decode(header: &[u8], grant: &mut MemoryReservation) -> Result<Self, Status> {
+        let schema = rtdb_format::ipc::read_schema_header(header).map_err(status)?;
+        let bytes = add(128, mul(schema.metadata().capacity(), 64)?)?;
+        let bytes = schema.metadata().iter().try_fold(bytes, |bytes, (key, value)| {
+            add(bytes, add(key.capacity(), value.capacity())?)
+        })?;
+        let bytes = schema.fields().iter().try_fold(bytes, |bytes, field| add(bytes, add(field.size(), 32)?))?;
+        let reservation = grant.split_off(bytes).map_err(status)?;
+        Ok(Self { schema: Arc::new(schema), reservation })
+    }
+}
+
+pub(crate) struct Decoder {
+    schema: Option<UploadSchema>,
+    dictionaries: HashMap<i64, RetainedArray>,
+    memory: Arc<MemoryBudget>,
+}
+
 impl Decoder {
-    pub fn new(memory: Arc<MemoryBudget>) -> Self { Self { schema: None, dictionaries: HashMap::new(), permanent: Vec::new(), memory } }
-    pub fn schema(&self) -> Option<&SchemaRef> { self.schema.as_ref() }
+    pub fn new(memory: Arc<MemoryBudget>) -> Self { Self { schema: None, dictionaries: HashMap::new(), memory } }
+
+    pub fn empty_batch(&self) -> Result<Option<OwnedBatch>, Status> {
+        let Some(schema) = self.schema.as_ref().filter(|schema| !schema.schema.fields().is_empty()) else { return Ok(None); };
+        let mut scratch = self.memory.reserve(mul(schema_bound(&schema.schema)?, 2)?).map_err(status)?;
+        let grant = Arc::get_mut(&mut scratch).expect("empty upload owns its grant");
+        let batch = RecordBatch::new_empty(Arc::clone(&schema.schema));
+        OwnedBatch::with_shared_buffers(batch, grant, Arc::clone(&schema.reservation), |_| false).map(Some).map_err(status)
+    }
+
+    fn funds(&self, buffer: BufferIdentity) -> bool {
+        self.dictionaries.values().any(|dictionary| dictionary.funds(buffer))
+    }
+
+    fn dictionary_refs(&self, grant: &mut MemoryReservation, extra: usize) -> Result<HashMap<i64, ArrayRef>, Status> {
+        let scratch = self.dictionaries.values().try_fold(extra, |bytes, dictionary| {
+            add(bytes, add(128, mul(dictionary.descriptor_bytes(), 4)?)?)
+        })?;
+        grant.grow_to(add(grant.bytes(), scratch)?).map_err(status)?;
+        Ok(self.dictionaries.iter().map(|(&id, dictionary)| (id, Arc::clone(dictionary.array()))).collect())
+    }
+
     pub fn decode(&mut self, data: FlightData) -> Result<Option<OwnedBatch>, Status> {
         if data.data_header.is_empty() { return Ok(None); }
-        let charge = self.memory.reserve(message_bound(&data)?).map_err(status)?;
         let message = arrow_ipc::root_as_message(&data.data_header).map_err(arrow)?;
+        let schema = self.schema.as_ref().map(|schema| schema.schema.as_ref());
+        let (bound, codec) = message_bound(&message, data.data_header.len(), &data.data_body, schema)?;
+        let mut charge = self.memory.reserve(bound).map_err(status)?;
+        let grant = Arc::get_mut(&mut charge).expect("Flight message owns its grant");
+        let codec_workspace = codec.map(|codec| self.memory.reserve(codec_workspace(codec))).transpose().map_err(status)?;
+        if codec == Some(arrow_ipc::CompressionType::LZ4_FRAME) {
+            validate_lz4_lengths(&message, &data.data_body)?;
+        }
         match message.header_type() {
             arrow_ipc::MessageHeader::NONE => Ok(None),
             arrow_ipc::MessageHeader::Schema => {
                 if self.schema.is_some() { return Err(invalid("Flight upload contains more than one schema")); }
-                self.schema = Some(Arc::new(rtdb_format::ipc::read_schema_header(&data.data_header).map_err(status)?)); self.permanent.push(charge); Ok(None)
+                self.schema = Some(UploadSchema::decode(&data.data_header, grant)?);
+                Ok(None)
             }
             arrow_ipc::MessageHeader::DictionaryBatch => {
                 let schema = self.schema.as_ref().ok_or_else(|| invalid("Dictionary arrived before schema"))?;
                 let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Invalid dictionary message"))?;
-                let body = rtdb_format::ipc::align_ipc_body(Buffer::from(data.data_body));
-                arrow_ipc::reader::read_dictionary(&body, dictionary, schema, &mut self.dictionaries, &message.version()).map_err(arrow)?;
-                self.permanent.push(charge); Ok(None)
+                let id = dictionary.id();
+                let is_delta = dictionary.isDelta();
+                let dictionaries = self.dictionary_refs(grant, schema.reservation.bytes())?;
+                let values = dictionary::decode(dictionary, &schema.schema, &dictionaries, data.data_body, &message.version())?;
+                drop(codec_workspace);
+                drop(dictionaries);
+                let incoming = RetainedArray::new(values, grant, |buffer| self.funds(buffer)).map_err(status)?;
+                drop(data.data_header);
+                drop(charge);
+                let owner = if is_delta {
+                    let current = self.dictionaries.get(&id).ok_or_else(|| invalid(format!("No existing dictionary for delta dictionary with id '{id}'")))?;
+                    dictionary::append(current, &incoming, &self.memory, |buffer| self.funds(buffer))?
+                } else {
+                    incoming
+                };
+                self.dictionaries.insert(id, owner);
+                Ok(None)
             }
             arrow_ipc::MessageHeader::RecordBatch => {
-                let schema = self.schema.clone().ok_or_else(|| invalid("Record batch arrived before schema"))?;
+                let schema = self.schema.as_ref().ok_or_else(|| invalid("Record batch arrived before schema"))?;
                 let batch = message.header_as_record_batch().ok_or_else(|| arrow(arrow_schema::ArrowError::ParseError(
                     "Unable to convert flight data header to a record batch".to_owned(),
                 )))?;
+                let dictionaries = self.dictionary_refs(grant, 0)?;
                 let body = rtdb_format::ipc::align_ipc_body(Buffer::from(data.data_body));
                 let batch = arrow_ipc::reader::read_record_batch(
-                    &body, batch, schema, &self.dictionaries, None, &message.version(),
+                    &body, batch, Arc::clone(&schema.schema), &dictionaries, None, &message.version(),
                 ).map_err(arrow)?;
-                let retained = self.memory.reserve(rtdb_columnar::shared_allocation_size(&batch).map_err(status)?).map_err(status)?;
-                let owned = OwnedBatch::with_reservation(batch, retained).map_err(status)?;
-                drop(charge); Ok(Some(owned))
+                OwnedBatch::with_shared_buffers(batch, grant, Arc::clone(&schema.reservation), |buffer| self.funds(buffer))
+                    .map(Some).map_err(status)
             }
             _ => Err(invalid("Unexpected Arrow Flight payload")),
         }
     }
 }
-fn message_bound(data: &FlightData) -> Result<usize, Status> {
-    message_slices_bound(&data.data_header, &data.data_body)
+fn message_batch<'a>(message: &arrow_ipc::Message<'a>) -> Option<arrow_ipc::RecordBatch<'a>> {
+    message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|dictionary| dictionary.data()))
 }
-fn message_slices_bound(header: &[u8], body: &[u8]) -> Result<usize, Status> {
-    let message = arrow_ipc::root_as_message(header).map_err(arrow)?;
+
+fn message_bound(
+    message: &arrow_ipc::Message<'_>, header_len: usize, body: &[u8], schema: Option<&Schema>,
+) -> Result<(usize, Option<arrow_ipc::CompressionType>), Status> {
     if let Some(schema) = message.header_as_schema() { rtdb_format::ipc::validate_decimal_metadata(schema).map_err(status)?; }
-    let mut bound = add(8192, add(mul(header.len(), 64)?, mul(body.len(), 4)?)?)?;
-    if usize::try_from(message.bodyLength()).map_err(arrow)? > body.len() { return Err(invalid("Arrow message body is truncated")); }
-    if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
-        if let Some(nodes) = batch.nodes() { for node in nodes { bound = add(bound, mul(add(usize::try_from(node.length()).map_err(arrow)?, 1)?, 4096)?)?; } }
-        if let Some(buffers) = batch.buffers() { for buffer in buffers {
-            let start = usize::try_from(buffer.offset()).map_err(arrow)?; let len = usize::try_from(buffer.length()).map_err(arrow)?;
-            let bytes = body.get(start..add(start, len)?).ok_or_else(|| invalid("Arrow buffer exceeds message body"))?;
-            let decoded = if batch.compression().is_some() && !bytes.is_empty() {
-                let prefix: [u8; 8] = bytes.get(..8).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(arrow)?;
-                let length = i64::from_le_bytes(prefix); if length == -1 { bytes.len() - 8 } else { usize::try_from(length).map_err(arrow)? }
-            } else { len };
-            bound = add(bound, add(mul(decoded, 4)?, 512)?)?;
-        } }
+    let declared_body = body.get(..usize::try_from(message.bodyLength()).map_err(arrow)?)
+        .ok_or_else(|| invalid("Arrow message body is truncated"))?;
+    let mut bound = add(8192, mul(header_len, 64)?)?;
+    let Some(batch) = message_batch(message) else { return Ok((bound, None)); };
+    // A misaligned body can require a full copy rounded to 64 bytes by Arrow.
+    bound = add(bound, add(body.len(), 63)?)?;
+
+    let compression = batch.compression().map(|compression| {
+        if compression.method() != arrow_ipc::BodyCompressionMethod::BUFFER {
+            return Err(invalid("Unknown Arrow compression method"));
+        }
+        match compression.codec() {
+            codec @ (arrow_ipc::CompressionType::LZ4_FRAME | arrow_ipc::CompressionType::ZSTD) => Ok(codec),
+            _ => Err(invalid("Unknown Arrow compression codec")),
+        }
+    }).transpose()?;
+    let nodes = batch.nodes().ok_or_else(|| invalid("Arrow batch has no field nodes"))?;
+    let buffers = batch.buffers().ok_or_else(|| invalid("Arrow batch has no buffers"))?;
+    let rows = usize::try_from(batch.length()).map_err(arrow)?;
+    let mut codec = None;
+    let mut lengths = buffers.iter().map(|buffer| {
+        let bytes = message_buffer(declared_body, buffer)?;
+        let decoded = if compression.is_some() && !bytes.is_empty() {
+            match compressed_length(bytes)? {
+                -1 => bytes.len() - 8,
+                0 => 0,
+                len => {
+                    codec = compression;
+                    usize::try_from(len).map_err(arrow)?
+                }
+            }
+        } else {
+            bytes.len()
+        };
+        // Decompressed storage, a possible alignment copy, and allocation rounding.
+        bound = add(bound, add(mul(decoded, 4)?, 512)?)?;
+        Ok(decoded)
+    });
+
+    let flat_schema = schema.filter(|schema| {
+        message.header_type() == arrow_ipc::MessageHeader::RecordBatch && !schema.fields().is_empty()
+            && schema.fields().iter().all(|field| flat_layout(field.data_type()).is_some())
+    });
+    let descriptor_bound = if let Some(schema) = flat_schema {
+        if nodes.len() != schema.fields().len() || batch.variadicBufferCounts().is_some_and(|counts| !counts.is_empty()) {
+            return Err(invalid("Arrow flat batch does not match its schema"));
+        }
+        let mut descriptors = 0;
+        for (field, node) in schema.fields().iter().zip(nodes) {
+            let nulls = usize::try_from(node.null_count()).map_err(arrow)?;
+            if usize::try_from(node.length()).map_err(arrow)? != rows || nulls > rows {
+                return Err(invalid("Arrow flat field node does not match its batch length"));
+            }
+            let bitmap = rows.div_ceil(8);
+            require_buffer(&mut lengths, if nulls == 0 { 0 } else { bitmap })?;
+            match flat_layout(field.data_type()).expect("flat schema checked above") {
+                FlatLayout::Bits => { require_buffer(&mut lengths, bitmap)?; }
+                FlatLayout::Fixed(width) => { require_buffer(&mut lengths, mul(rows, width)?)?; }
+                FlatLayout::Offsets(width) => {
+                    let offsets = require_buffer(&mut lengths, if rows == 0 { 0 } else { mul(add(rows, 1)?, width)? })?;
+                    if offsets % width != 0 { return Err(invalid("Arrow flat offsets do not match their width")); }
+                    require_buffer(&mut lengths, 0)?;
+                }
+            }
+            // Flat arrays and their ownership wrappers allocate descriptors per field.
+            descriptors = add(descriptors, add(4096, mul(field.size(), 8)?)?)?;
+        }
+        if lengths.len() != 0 { return Err(invalid("Arrow flat batch has extra buffers")); }
+        descriptors
+    } else {
+        for length in lengths { length?; }
+        let nodes_bound = nodes.iter().try_fold(0, |total, node| {
+            add(total, mul(add(usize::try_from(node.length()).map_err(arrow)?, 1)?, 4096)?)
+        })?;
+        // A batch can declare logical rows without field nodes, as with an empty schema.
+        nodes_bound.max(mul(add(rows, 1)?, 4096)?)
+    };
+    Ok((add(bound, descriptor_bound)?, codec))
+}
+
+enum FlatLayout { Bits, Fixed(usize), Offsets(usize) }
+
+fn flat_layout(data_type: &DataType) -> Option<FlatLayout> {
+    match data_type {
+        DataType::Boolean => Some(FlatLayout::Bits),
+        DataType::Binary | DataType::Utf8 => Some(FlatLayout::Offsets(4)),
+        DataType::LargeBinary | DataType::LargeUtf8 => Some(FlatLayout::Offsets(8)),
+        DataType::FixedSizeBinary(width) if *width > 0 => Some(FlatLayout::Fixed(*width as usize)),
+        data_type => data_type.primitive_width().map(FlatLayout::Fixed),
     }
-    Ok(bound)
+}
+
+fn require_buffer(lengths: &mut impl Iterator<Item = Result<usize, Status>>, minimum: usize) -> Result<usize, Status> {
+    let length = lengths.next().ok_or_else(|| invalid("Arrow flat batch is missing a buffer"))??;
+    if length < minimum { return Err(invalid("Arrow flat buffer is shorter than its layout requires")); }
+    Ok(length)
+}
+
+fn message_buffer<'a>(body: &'a [u8], buffer: &arrow_ipc::Buffer) -> Result<&'a [u8], Status> {
+    let start = usize::try_from(buffer.offset()).map_err(arrow)?;
+    let len = usize::try_from(buffer.length()).map_err(arrow)?;
+    body.get(start..add(start, len)?).ok_or_else(|| invalid("Arrow buffer exceeds message body"))
+}
+
+fn compressed_length(bytes: &[u8]) -> Result<i64, Status> {
+    let prefix = bytes.get(..8).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?;
+    Ok(i64::from_le_bytes(prefix.try_into().map_err(arrow)?))
+}
+
+fn codec_workspace(codec: arrow_ipc::CompressionType) -> usize {
+    match codec {
+        arrow_ipc::CompressionType::LZ4_FRAME => 64 << 20,
+        arrow_ipc::CompressionType::ZSTD => 1 << 20,
+        _ => unreachable!("compression codec checked before reservation"),
+    }
+}
+
+fn validate_lz4_lengths(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result<(), Status> {
+    use std::io::BufRead;
+
+    let buffers = message_batch(message).and_then(|batch| batch.buffers()).expect("LZ4 buffers checked before reservation");
+    for buffer in buffers {
+        let bytes = message_buffer(body, buffer)?;
+        if bytes.is_empty() { continue; }
+        let expected = compressed_length(bytes)?;
+        if expected <= 0 { continue; }
+        let expected = usize::try_from(expected).map_err(arrow)?;
+
+        // Arrow's LZ4 decoder grows its output before it checks the declared length.
+        let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[8..]);
+        let mut decoded = 0;
+        loop {
+            let block = decoder.fill_buf().map_err(arrow)?.len();
+            if block == 0 { break; }
+            decoded = add(decoded, block)?;
+            if decoded > expected { break; }
+            decoder.consume(block);
+        }
+        if decoded != expected {
+            return Err(invalid("LZ4 data differs from its declared Arrow buffer length"));
+        }
+    }
+    Ok(())
 }
 #[cfg(test)]
 fn parameter_ipc(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Bytes>, Status> {
@@ -156,19 +393,21 @@ fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBat
 
 pub(crate) struct BoundParameters {
     batch: OwnedBatch,
-    _schema: Arc<MemoryReservation>,
+    _schema: Option<Arc<MemoryReservation>>,
 }
 
 impl BoundParameters {
     pub fn new(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>, Status> {
         let schema = memory.reserve(schema_bound(batch.batch().schema_ref())?).map_err(status)?;
-        let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch()).map_err(status)? {
-            Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation())).map_err(status)?,
-            None => batch,
+        let (batch, schema) = match rtdb_format::ipc::adapt_stream_batch(batch.batch()).map_err(status)? {
+            Some(adapted) => (batch.with_retained_buffers(adapted), Some(schema)),
+            None if batch.owns_schema() => (batch, None),
+            None => (batch, Some(schema)),
         };
         Ok(Arc::new(Self { batch, _schema: schema }))
     }
 
+    #[cfg(test)]
     pub fn empty(schema: &SchemaRef, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>, Status> {
         let bound = schema_bound(schema)?;
         let scratch = memory.reserve(mul(bound, 2)?).map_err(status)?;
@@ -199,7 +438,8 @@ fn ipc_bound(bytes: &[u8]) -> Result<usize, Status> {
         let message = arrow_ipc::root_as_message(header).map_err(arrow)?;
         let body_end = add(end, usize::try_from(message.bodyLength()).map_err(arrow)?)?;
         let body = bytes.get(end..body_end).ok_or_else(|| invalid("Truncated parameter body"))?;
-        bound = add(bound, message_slices_bound(header, body)?)?;
+        let (decode_bound, codec) = message_bound(&message, header.len(), body, None)?;
+        bound = add(bound, add(decode_bound, codec.map_or(0, codec_workspace))?)?;
         position = body_end;
     }
     Ok(bound)
@@ -240,7 +480,7 @@ mod tests {
     use arrow_array::Int64Array;
     use rtdb_columnar::read_value;
     use rtdb_types::Value;
-    use arrow_schema::{DataType, Field};
+    use arrow_schema::Field;
 
     #[test]
     fn flight_upload_retains_record_and_dictionary_bodies() {
@@ -482,6 +722,89 @@ mod tests {
 
         assert!(decoded.reservation().bytes() < body * 3);
         assert_eq!(decoded.batch(), &batch);
+    }
+
+    #[test]
+    fn flight_upload_admits_flat_int64_columns_under_an_eight_mib_budget() {
+        let batch = RecordBatch::try_from_iter([
+            ("a", Arc::new(Int64Array::from(vec![42; 65_536])) as ArrayRef),
+            ("b", Arc::new(Int64Array::from(vec![43; 65_536])) as ArrayRef),
+        ]).unwrap();
+        let encoding = MemoryBudget::new(16 << 20);
+        let mut encoder = Encoder::new(batch.schema_ref(), &encoding).unwrap();
+        let data = encoder.batch(&batch, &encoding).unwrap().pop().unwrap();
+        let mut decoder = Decoder::new(MemoryBudget::new(8 << 20));
+        decoder.decode(schema_data(batch.schema_ref(), &encoding).unwrap()).unwrap();
+
+        let decoded = decoder.decode(data).unwrap().unwrap();
+
+        assert_eq!(decoded.batch(), &batch);
+    }
+
+    #[test]
+    fn flight_upload_rejects_a_flat_value_buffer_shorter_than_the_declared_width() {
+        let batch = RecordBatch::try_from_iter([
+            ("value", Arc::new(arrow_array::Int8Array::from(vec![42; 64])) as ArrayRef),
+        ]).unwrap();
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        let memory = MemoryBudget::new(1 << 20);
+        let mut encoder = Encoder::new(batch.schema_ref(), &memory).unwrap();
+        let data = encoder.batch(&batch, &memory).unwrap().pop().unwrap();
+        let mut decoder = Decoder::new(Arc::clone(&memory));
+        decoder.decode(schema_data(&schema, &memory).unwrap()).unwrap();
+        let peak = memory.peak_bytes();
+
+        let error = decoder.decode(data).err().unwrap();
+
+        assert_eq!(error.message(), "Arrow flat buffer is shorter than its layout requires");
+        assert_eq!(memory.peak_bytes(), peak);
+    }
+
+    #[test]
+    fn flight_upload_charges_nested_logical_rows_before_decoding() {
+        let items = Arc::new(Int64Array::from(vec![42; 4096])) as ArrayRef;
+        let nested = arrow_array::StructArray::from(vec![(Arc::new(Field::new("item", DataType::Int64, false)), items)]);
+        let batch = RecordBatch::try_from_iter([("value", Arc::new(nested) as ArrayRef)]).unwrap();
+        let encoding = MemoryBudget::new(1 << 20);
+        let mut encoder = Encoder::new(batch.schema_ref(), &encoding).unwrap();
+        let data = encoder.batch(&batch, &encoding).unwrap().pop().unwrap();
+        let mut decoder = Decoder::new(MemoryBudget::new(1 << 20));
+        decoder.decode(schema_data(batch.schema_ref(), &encoding).unwrap()).unwrap();
+
+        let error = decoder.decode(data).err().unwrap();
+
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn flight_upload_accepts_lz4_and_rejects_an_understated_lz4_value_length() {
+        use arrow_ipc::CompressionType::LZ4_FRAME;
+
+        let text = "x".repeat(4096);
+        let batch = RecordBatch::try_from_iter([
+            ("value", Arc::new(arrow_array::StringArray::from(vec![text.as_str()])) as ArrayRef),
+        ]).unwrap();
+        let options = IpcWriteOptions::default().try_with_compression(Some(LZ4_FRAME)).unwrap();
+        let mut tracker = DictionaryTracker::new(false);
+        let (dictionaries, record) = IpcDataGenerator::default().encode(
+            &batch, &mut tracker, &options, &mut CompressionContext::default(),
+        ).unwrap();
+        assert!(dictionaries.is_empty());
+        let data: FlightData = record.into();
+        let memory = MemoryBudget::new(128 << 20);
+        let mut decoder = Decoder::new(Arc::clone(&memory));
+        decoder.decode(schema_data(batch.schema_ref(), &memory).unwrap()).unwrap();
+        assert_eq!(decoder.decode(data.clone()).unwrap().unwrap().batch(), &batch);
+
+        let message = arrow_ipc::root_as_message(&data.data_header).unwrap();
+        let values = message.header_as_record_batch().unwrap().buffers().unwrap().get(2);
+        let offset = values.offset() as usize;
+        let mut body = data.data_body.to_vec();
+        assert_eq!(compressed_length(&body[offset..]).unwrap(), 4096);
+        body[offset..offset + 8].copy_from_slice(&8_i64.to_le_bytes());
+        let error = decoder.decode(FlightData { data_body: body.into(), ..data }).err().unwrap();
+
+        assert_eq!(error.message(), "LZ4 data differs from its declared Arrow buffer length");
     }
 
     #[test]

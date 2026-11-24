@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use arrow_array::Int64Array;
-use bytes::Bytes;
+use arrow_buffer::Buffer;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Iid, Interval, Result, Timestamp};
 
@@ -90,72 +90,71 @@ impl<'a> CorrectionPage<'a> {
 }
 
 pub(super) fn decode(
-    bytes: Bytes,
+    bytes: Buffer,
     max_entries: usize,
-    memory: &Arc<MemoryReservation>,
+    opening: &mut MemoryReservation,
 ) -> Result<Vec<Entry>> {
     let max_rows = bytes.len() / (2 * size_of::<i64>());
     if !bytes.starts_with(&HEADER) {
         return Err(invalid());
     }
     let (batch, mut groups) =
-        KeyBatch::decode(bytes.slice(HEADER.len()..), max_rows, BatchKind::Correction)?;
+        KeyBatch::decode(bytes.slice(HEADER.len()), max_rows, BatchKind::Correction)?;
     if groups.is_empty() {
         return Err(invalid());
     }
-    if batch
-        .retained_bytes()
-        .saturating_add(groups.len())
+    let rows = batch.batch().num_rows();
+    let keys_bytes = batch.bytes_excluding(&bytes)?
+        .saturating_add(ProjectedKeys::allocation_bytes())
+        .saturating_add(rows.saturating_mul(size_of::<Span>()));
+    if keys_bytes
         .saturating_add(max_entries.saturating_mul(size_of::<Entry>()))
-        .saturating_add(batch.batch().num_rows().saturating_mul(size_of::<Span>()))
-        > memory.bytes()
+        > opening.bytes()
     {
         return Err(invalid());
     }
     let from = arrow::<Int64Array>(batch.batch().column(0).as_ref())?.clone();
     let to = arrow::<Int64Array>(batch.batch().column(1).as_ref())?.clone();
-    let keys = ProjectedKeys::new(batch, memory.clone());
-    let mut entries = Vec::with_capacity(max_entries);
+    let mut entries = Vec::new();
     let mut offset = 0usize;
     while !groups.is_empty() {
         if entries.len() == max_entries || groups.len() < GROUP_HEADER_BYTES { return Err(invalid()); }
-        let group = groups.split_to(GROUP_HEADER_BYTES);
+        let group = &groups[..GROUP_HEADER_BYTES];
         let iid = Iid::from_slice(&group[..16])?;
         let length = u32::from_le_bytes(group[16..20].try_into().map_err(format_error)?) as usize;
         let key_len = u32::from_le_bytes(group[20..24].try_into().map_err(format_error)?) as usize;
-        if key_len > groups.len() { return Err(invalid()); }
-        let key = groups.split_to(key_len);
-        if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(&key).map_err(format_error)?; }
+        groups.advance(GROUP_HEADER_BYTES);
+        let key = groups.get(..key_len).ok_or_else(invalid)?;
+        if !key.is_empty() { rtdb_columnar::EntityIdRef::from_handle_bytes(key).map_err(format_error)?; }
         let end = offset
             .checked_add(length)
-            .filter(|&end| end <= from.len())
+            .filter(|&end| end <= rows)
             .ok_or_else(invalid)?;
         if length == 0 {
             return Err(invalid());
         }
-        let mut spans = Vec::with_capacity(length);
+        entries.push((AddressRef { iid, key }.owned(), offset..end));
+        groups.advance(key_len);
+        offset = end;
+    }
+    if offset != rows {
+        return Err(invalid());
+    }
+    let bytes = keys_bytes.saturating_add(entries.len().saturating_mul(2 * size_of::<usize>()));
+    let keys = ProjectedKeys::new(batch, opening.split_off(bytes)?);
+    entries.into_iter().map(|(address, range)| {
+        let mut spans = Vec::with_capacity(range.len());
         let mut prior_end = Timestamp::MIN;
-        for row in offset..end {
+        for row in range {
             let valid = Interval::new(Timestamp(from.value(row)), Timestamp(to.value(row)))?;
             if valid.is_empty() || valid.lower() < prior_end {
                 return Err(invalid());
             }
             prior_end = valid.upper();
-            spans.push(Span {
-                valid,
-                tuple: keys.row(row),
-            });
+            spans.push(Span { valid, tuple: keys.row(row) });
         }
-        entries.push(Entry {
-            key: Key::Row(AddressRef { iid, key: key.as_ref() }.owned()),
-            item: Item::Row(spans.into()),
-        });
-        offset = end;
-    }
-    if offset != from.len() {
-        return Err(invalid());
-    }
-    Ok(entries)
+        Ok(Entry { key: Key::Row(address), item: Item::Row(spans.into()) })
+    }).collect()
 }
 
 fn invalid() -> rtdb_types::Anomaly {
@@ -217,10 +216,14 @@ mod tests {
             address.view(),
         )]).unwrap();
         let leaf = encode_leaf(Some(&postings), &entries).unwrap();
-        let (_, suffix) = Postings::decode(Bytes::from(leaf).slice(16..), 64).unwrap();
+        let (_, suffix) = Postings::decode(Buffer::from_vec(leaf).slice(16), 64).unwrap();
         assert_eq!(suffix.as_ref(), bytes.as_slice());
 
-        let entries = decode(bytes.into(), 64, &reservation).unwrap();
+        let mut opening = budget.reserve(16 << 10).unwrap();
+        let opening = Arc::get_mut(&mut opening).unwrap();
+        let buffer = Buffer::from_vec(bytes);
+        let backing = rtdb_columnar::retain_buffer(&buffer, &opening.split_off(buffer.capacity()).unwrap());
+        let entries = decode(backing, 64, opening).unwrap();
         assert_eq!(entries[0].key, Key::Row(address));
         let Item::Row(decoded) = &entries[0].item else {
             panic!("Expected correction spans");

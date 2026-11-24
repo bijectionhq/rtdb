@@ -5,7 +5,7 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use geometry::{Geometry, GeometryWork, KeyRange, predicates::prepared::PreparedGeometry};
 use rtdb_columnar::{
     BatchBuilder, EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, binary_cell, selected_cell,
-    copy_selected_cells, estimate_copy_cell_bytes, read_entity_id,
+    copy_selected_cells, estimate_copy_cell_bytes, read_entity_id, visible_buffer_bytes,
 };
 use rtdb_format::data::EventBatch;
 use rtdb_plan::Catalog;
@@ -170,25 +170,10 @@ fn slice_selected(
         .map(|&index| source.column(index).slice(first.row, hits.len()))
         .collect::<Vec<_>>();
     let reservation = first.source.reservation();
-    if reservation.bytes() > MAX_UNUSED_SLICE_BYTES {
-        // Arrow's slice size includes unselected children of lists and dense unions.
-        let visible = columns.iter().try_fold(0usize, |bytes, column| {
-            let ty = column.data_type();
-            let flat = ty.primitive_width().is_some() || match ty {
-                DataType::Boolean | DataType::FixedSizeBinary(_) => true,
-                DataType::Binary | DataType::Utf8 => column.null_count() == 0,
-                _ => false,
-            };
-            let size = if flat {
-                column.to_data().get_slice_memory_size().ok()?
-            } else {
-                0
-            };
-            bytes.checked_add(size)
-        })?;
-        if reservation.bytes().saturating_sub(visible) > MAX_UNUSED_SLICE_BYTES {
-            return None;
-        }
+    if reservation.bytes() > MAX_UNUSED_SLICE_BYTES
+        && reservation.bytes().saturating_sub(visible_buffer_bytes(&columns)?) > MAX_UNUSED_SLICE_BYTES
+    {
+        return None;
     }
     let batch = RecordBatch::try_new(Arc::clone(schema), columns).ok()?;
     OwnedBatch::with_reservation(batch, Arc::clone(reservation)).ok()
@@ -920,8 +905,10 @@ fn charge_bytes(spent: &mut u64, size: u64, limit: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{BinaryArray, StringArray};
-    use rtdb_columnar::{entity_id_array, entity_id_type, to_field};
+    use arrow_array::{Array, BinaryArray, ListArray, NullArray, StringArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use rtdb_columnar::{build_struct_array, entity_id_array, entity_id_type, read_value, to_field};
+    use rtdb_types::{LogicalType, Value};
 
     #[test]
     fn spatial_selection_orders_ties_by_the_typed_arrow_identity() -> Result<()> {
@@ -986,11 +973,12 @@ mod tests {
         let revisions = batch.column(3).as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap();
         assert_eq!(revisions.values().as_ref(), &[200, 300]);
 
-        let copied = gather_selected(&[hit(3), hit(1)], &projection, &memory)?.unwrap();
+        let copied = gather_selected(&[hit(3), hit(1), hit(3)], &projection, &memory)?.unwrap();
         assert!(!Arc::ptr_eq(copied.reservation(), source.reservation()));
         let payloads = copied.batch().column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
         assert_eq!(payloads.value(0), b"after");
         assert_eq!(payloads.value(1), winner.as_slice());
+        assert_eq!(payloads.value(2), b"after");
         drop(copied);
 
         let retained = Arc::clone(batch.column(1));
@@ -1000,6 +988,89 @@ mod tests {
         assert_eq!(memory.used_bytes(), charged);
         drop(retained);
         assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_gather_retains_compact_list_and_struct_buffers() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let payload = vec![42; 32 << 10];
+        let values = BinaryArray::from(vec![payload.as_slice()]);
+        let payload_ptr = values.value(0).as_ptr();
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", DataType::Binary, false)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 1, 1])),
+            Arc::new(values),
+            Some(NullBuffer::from(vec![true, false, true])),
+        );
+        let fields = vec![
+            Field::new("list", lists.data_type().clone(), true),
+            to_field("missing", &LogicalType::Nothing)?,
+            to_field("explicit_null", &LogicalType::Null)?,
+        ];
+        let document = build_struct_array(fields.into(), &[
+            Arc::new(lists), Arc::new(NullArray::new(3)), Arc::new(NullArray::new(3)),
+        ], 3, None)?;
+        let schema = Arc::new(Schema::new(vec![Field::new("document", document.data_type().clone(), false)]));
+        let batch = RecordBatch::try_new(schema, vec![document]).unwrap();
+        let source = Arc::new(OwnedBatch::new(batch, &memory)?);
+        let charged = source.reservation().bytes();
+        assert!(charged > MAX_UNUSED_SLICE_BYTES);
+        let hits = [0, 1, 2].map(|row| SelectedHit { source: Arc::clone(&source), row, distance_m: None });
+        let output = gather_selected(&hits, &[0], &memory)?.unwrap();
+        assert!(Arc::ptr_eq(output.reservation(), source.reservation()));
+
+        let document = output.batch().column(0).as_any().downcast_ref::<StructArray>().unwrap();
+        let lists = document.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let retained = lists.value(0);
+        let values = retained.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(values.value(0).as_ptr(), payload_ptr);
+        assert!(lists.is_null(1));
+        assert!(!lists.is_null(2));
+        assert_eq!(lists.value_length(2), 0);
+        let field = output.batch().schema_ref().field(0);
+        let Value::Struct(cells) = read_value(field, document, 1)? else { panic!("Expected a document"); };
+        assert_eq!(cells.get("missing"), Some(&Value::Undefined));
+        assert_eq!(cells.get("explicit_null"), Some(&Value::Null));
+
+        drop(hits);
+        drop(source);
+        drop(output);
+        assert_eq!(memory.used_bytes(), charged);
+        drop(retained);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn spatial_gather_detaches_list_children_outside_the_visible_extent() -> Result<()> {
+        let memory = MemoryBudget::new(1 << 20);
+        let unused = vec![42; 256 << 10];
+        let values = BinaryArray::from(vec![unused.as_slice(), b"a", b"b"]);
+        let lists = ListArray::new(
+            Arc::new(Field::new("item", DataType::Binary, false)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0, 1, 2, 3])),
+            Arc::new(values),
+            Some(NullBuffer::from(vec![false, true, true])),
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("list", lists.data_type().clone(), true)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(lists)]).unwrap();
+        let source = Arc::new(OwnedBatch::new(batch, &memory)?);
+        let hit = |row| SelectedHit { source: Arc::clone(&source), row, distance_m: None };
+        let slice = gather_selected(&[hit(1), hit(2)], &[0], &memory)?.unwrap();
+        let full = gather_selected(&[hit(0), hit(1), hit(2)], &[0], &memory)?.unwrap();
+        assert!(!Arc::ptr_eq(slice.reservation(), source.reservation()));
+        assert!(!Arc::ptr_eq(full.reservation(), source.reservation()));
+        drop(source);
+        assert_eq!(memory.used_bytes(), slice.reservation().bytes() + full.reservation().bytes());
+        assert!(memory.used_bytes() < unused.len());
+
+        let slice_lists = slice.batch().column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let full_lists = full.batch().column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert!(full_lists.is_null(0));
+        assert_eq!(&full_lists.value_offsets()[1..], slice_lists.value_offsets());
+        let values = slice_lists.values().as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(&b"a"[..]), Some(&b"b"[..])]);
         Ok(())
     }
 
