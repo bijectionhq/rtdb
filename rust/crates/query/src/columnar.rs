@@ -9,7 +9,7 @@ use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, PrimitiveArray, StructArray, UnionArray,
-    builder::{Float64Builder, Int64Builder}, types::ArrowPrimitiveType,
+    builder::{Float32Builder, Float64Builder, Int64Builder}, types::ArrowPrimitiveType,
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
@@ -2692,7 +2692,7 @@ mod kernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow_array::{BooleanArray, Float32Array, Float64Array, Int64Array, StringArray};
     use rtdb_plan::{BinaryOp, ColumnId, Expr, Schema, UnaryOp};
     use rtdb_types::ScalarType;
 
@@ -2832,6 +2832,15 @@ mod tests {
             (1, Expr::Literal(Value::F64(nan))),
             (1, cast("unreached double", ScalarType::F64)),
         ], Expr::Literal(Value::Null));
+        let single_nan = f32::from_bits(0x7fc0_0042);
+        let singles = case(vec![
+            (0, cast("-0.0", ScalarType::F32)),
+            (1, Expr::Literal(Value::F32(single_nan))),
+            (1, cast("unreached real", ScalarType::F32)),
+        ], Expr::Literal(Value::Null));
+        let single_nulls = case(vec![(3, cast("unreached real", ScalarType::F32))], Expr::Literal(Value::Null));
+        let single_type = LogicalType::Scalar(ScalarType::F32).maybe();
+        assert!(matches!(ProjectionValues::new(&singles, &single_type, len), ProjectionValues::F32(_)));
         let integers = Expr::Case {
             branches: vec![(
                 Expr::binary(BinaryOp::Eq, selector.clone(), Expr::Literal(Value::I64(0))),
@@ -2842,36 +2851,48 @@ mod tests {
         let nulls = case(vec![(3, cast("unreached integer", ScalarType::I64))], Expr::Literal(Value::Null));
         let mixed = case(vec![(0, Expr::Literal(Value::I64(5)))], Expr::Literal(Value::F64(0.5)));
 
-        let mut cursor = BatchExpressions::new(input(len), schema.clone(), vec![doubles, integers, nulls, mixed], execution.clone());
+        let mut cursor = BatchExpressions::new(input(len), schema.clone(), vec![doubles, singles, single_nulls, integers, nulls, mixed], execution.clone());
         let page = cursor.next_batch().await.unwrap().unwrap();
         let [
             Column::Arrow { array: doubles, field: double_field, logical: Some(double) },
+            Column::Arrow { array: singles, field: single_field, logical: Some(single) },
+            Column::Arrow { array: single_nulls, logical: Some(LogicalType::Null), .. },
             Column::Arrow { array: integers, field: integer_field, logical: Some(integer) },
             Column::Arrow { array: nulls, logical: Some(LogicalType::Null), .. },
             mixed,
         ] = page.columns.as_slice() else { panic!("Expected Arrow columns with observed nullability"); };
         assert_eq!(*double, LogicalType::Scalar(ScalarType::F64).maybe());
         assert!(double_field.is_nullable());
+        assert_eq!(*single, single_type);
+        assert!(single_field.is_nullable());
+        assert_eq!(single_nulls.data_type(), &DataType::Null);
+        assert_eq!(single_nulls.len(), len);
         assert_eq!(*integer, LogicalType::Scalar(ScalarType::I64));
         assert!(!integer_field.is_nullable());
         assert_eq!(nulls.data_type(), &DataType::Null);
         assert_eq!(nulls.len(), len);
         let doubles = doubles.as_any().downcast_ref::<Float64Array>().unwrap();
+        let singles = singles.as_any().downcast_ref::<Float32Array>().unwrap();
         let integers = integers.as_any().downcast_ref::<Int64Array>().unwrap();
         for row in 0..len {
             match row % 3 {
                 0 => {
                     assert!(!doubles.is_null(row));
                     assert_eq!(doubles.value(row).to_bits(), (-0.0f64).to_bits());
+                    assert!(!singles.is_null(row));
+                    assert_eq!(singles.value(row).to_bits(), (-0.0f32).to_bits());
                     assert_eq!(integers.value(row), i64::MIN);
                 }
                 1 => {
                     assert!(!doubles.is_null(row));
                     assert_eq!(doubles.value(row).to_bits(), nan.to_bits());
+                    assert!(!singles.is_null(row));
+                    assert_eq!(singles.value(row).to_bits(), single_nan.to_bits());
                     assert_eq!(integers.value(row), i64::MAX);
                 }
                 _ => {
                     assert!(doubles.is_null(row));
+                    assert!(singles.is_null(row));
                     assert_eq!(integers.value(row), i64::MAX);
                 }
             }
@@ -2882,17 +2903,21 @@ mod tests {
         drop(cursor);
         assert_eq!(memory.used_bytes(), baseline);
 
-        let later_row = case(vec![(1, cast("first projection, second row", ScalarType::I64))], Expr::Literal(Value::I64(0)));
-        let later_column = case(vec![(0, cast("second projection, first row", ScalarType::I64))], Expr::Literal(Value::I64(0)));
-        let projections = vec![later_row, later_column];
-        let mut cursor = BatchExpressions::new(input(0), schema.clone(), projections.clone(), execution.clone());
-        assert_eq!(cursor.next_batch().await.unwrap().unwrap().len, 0);
-        drop(cursor);
+        for (scalar, zero) in [(ScalarType::I64, Value::I64(0)), (ScalarType::F32, Value::F32(0.0))] {
+            let later_row = case(vec![
+                (1, cast("first projection, second row", scalar.clone())),
+                (2, cast("first projection, third row", scalar)),
+            ], Expr::Literal(zero));
+            let later_column = case(vec![(0, cast("second projection, first row", ScalarType::I64))], Expr::Literal(Value::I64(0)));
+            let projections = vec![later_row, later_column];
+            let mut cursor = BatchExpressions::new(input(0), schema.clone(), projections.clone(), execution.clone());
+            assert_eq!(cursor.next_batch().await.unwrap().unwrap().len, 0);
+            drop(cursor);
 
-        let mut cursor = BatchExpressions::new(input(len), schema, projections, execution);
-        let error = cursor.next_batch().await.err().expect("The first projection fails");
-        assert!(error.message.contains("first projection, second row"));
-        drop(cursor);
+            let mut cursor = BatchExpressions::new(input(len), schema.clone(), projections, execution.clone());
+            let error = cursor.next_batch().await.err().expect("The first projection fails");
+            assert!(error.message.contains("first projection, second row"));
+        }
     }
 
     #[tokio::test]
@@ -3644,18 +3669,20 @@ impl BatchCursor for BatchExpressions {
 enum ProjectionValues {
     Dynamic(Vec<Value>),
     I64(Int64Builder),
+    F32(Float32Builder),
     F64(Float64Builder),
 }
 
 impl ProjectionValues {
     fn new(expression: &Expr, output: &LogicalType, len: usize) -> Self {
         let fixed = plain_scalar(output).filter(|scalar| {
-            matches!(scalar, ScalarType::I64 | ScalarType::F64)
+            matches!(scalar, ScalarType::I64 | ScalarType::F32 | ScalarType::F64)
                 && matches!(expression, Expr::Case { .. } | Expr::SimpleCase { .. })
                 && fixed_case_result(expression, scalar)
         });
         match fixed {
             Some(ScalarType::I64) => Self::I64(Int64Builder::with_capacity(len)),
+            Some(ScalarType::F32) => Self::F32(Float32Builder::with_capacity(len)),
             Some(ScalarType::F64) => Self::F64(Float64Builder::with_capacity(len)),
             _ => Self::Dynamic(Vec::with_capacity(len)),
         }
@@ -3666,6 +3693,8 @@ impl ProjectionValues {
             (Self::Dynamic(values), value) => values.push(value),
             (Self::I64(values), Value::I64(value)) => values.append_value(value),
             (Self::I64(values), Value::Null) => values.append_null(),
+            (Self::F32(values), Value::F32(value)) => values.append_value(value),
+            (Self::F32(values), Value::Null) => values.append_null(),
             (Self::F64(values), Value::F64(value)) => values.append_value(value),
             (Self::F64(values), Value::Null) => values.append_null(),
             _ => return Err(rtdb_types::Anomaly::fault("rtdb.query/case-result", "CASE returned a value outside its fixed result type")),
@@ -3677,6 +3706,7 @@ impl ProjectionValues {
         match self {
             Self::Dynamic(values) => Ok(Column::Values(values)),
             Self::I64(mut values) => primitive_column(values.finish()),
+            Self::F32(mut values) => primitive_column(values.finish()),
             Self::F64(mut values) => primitive_column(values.finish()),
         }
     }
@@ -3691,6 +3721,7 @@ fn fixed_case_result(expression: &Expr, scalar: &ScalarType) -> bool {
         }
         Expr::Literal(Value::Null) => true,
         Expr::Literal(Value::I64(_)) => *scalar == ScalarType::I64,
+        Expr::Literal(Value::F32(_)) => *scalar == ScalarType::F32,
         Expr::Literal(Value::F64(_)) => *scalar == ScalarType::F64,
         // A cast of an arbitrary expression can forward an undefined input.
         Expr::Cast { expr, target: CastTarget::Fixed(LogicalType::Scalar(target)) } => {
