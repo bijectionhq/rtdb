@@ -8,33 +8,33 @@ structure NativeRecordIdentity where
   fingerprint : Option (List UInt8)
   deriving DecidableEq
 
-def matchingPresentInteger (observed : Option Int) (expected : Int) : Bool :=
+def matching_present_integer (observed : Option Int) (expected : Int) : Bool :=
   decide (observed = some expected)
 
-def ownReadbackTerm (leader : Option Int) (observed : Int) : Bool :=
-  matchingPresentInteger leader observed
+def own_readback_term (leader : Option Int) (observed : Int) : Bool :=
+  matching_present_integer leader observed
 
-def matchingSequence (appended observed : Option Int) : Bool :=
+def matching_sequence (appended observed : Option Int) : Bool :=
   match appended with
   | none => false
-  | some expected => matchingPresentInteger observed expected
+  | some expected => matching_present_integer observed expected
 
-def readbackMatchesTransaction (resolved : Bool) (appended observed : Option (List UInt8)) : Bool :=
+def readback_matches_transaction (resolved : Bool) (appended observed : Option (List UInt8)) : Bool :=
   resolved && (match appended, observed with
     | some expected, some actual => decide (expected = actual)
     | _, _ => false)
 
 def ExactReadback (appended observed : NativeRecordIdentity) (resolved : Bool) : Bool :=
-  ownReadbackTerm (some appended.term) observed.term &&
-    matchingSequence appended.sequence observed.sequence &&
-    readbackMatchesTransaction resolved appended.fingerprint observed.fingerprint
+  own_readback_term (some appended.term) observed.term &&
+    matching_sequence appended.sequence observed.sequence &&
+    readback_matches_transaction resolved appended.fingerprint observed.fingerprint
 
 inductive TransactionEvent (Result Error : Type) where
   | enqueued (staged : Result)
   | readbackFailed (error : Error)
   | applyFinished (outcome : Except Error Result)
 
-def transactionCompletion : TransactionEvent Result Error → Option (Except Error Result)
+def transaction_completion : TransactionEvent Result Error → Option (Except Error Result)
   | .enqueued _ => none
   | .readbackFailed error => some (.error error)
   | .applyFinished outcome => some outcome
@@ -46,14 +46,14 @@ inductive NativeEvent (Result Error : Type) where
 
 def nativeAcknowledgement (appended : NativeRecordIdentity) :
     NativeEvent Result Error → Option (Except Error Result)
-  | .enqueued staged => transactionCompletion (.enqueued staged)
+  | .enqueued staged => transaction_completion (.enqueued staged)
   | .readBack observed resolved mismatch applied =>
-    if ownReadbackTerm (some appended.term) observed.term &&
-        matchingSequence appended.sequence observed.sequence then
-      if readbackMatchesTransaction resolved appended.fingerprint observed.fingerprint then
-        applied.bind fun outcome => transactionCompletion (.applyFinished outcome)
+    if own_readback_term (some appended.term) observed.term &&
+        matching_sequence appended.sequence observed.sequence then
+      if readback_matches_transaction resolved appended.fingerprint observed.fingerprint then
+        applied.bind fun outcome => transaction_completion (.applyFinished outcome)
       else
-        transactionCompletion (.readbackFailed mismatch)
+        transaction_completion (.readbackFailed mismatch)
     else
       none
 
@@ -61,21 +61,21 @@ theorem enqueued_does_not_acknowledge (appended : NativeRecordIdentity) (staged 
     nativeAcknowledgement (Error := Error) appended (.enqueued staged) = none := rfl
 
 theorem same_key_mismatch_fails_pending_write
-    (sameTerm : ownReadbackTerm (some appended.term) observed.term = true)
-    (sameSequence : matchingSequence appended.sequence observed.sequence = true)
-    (mismatched : readbackMatchesTransaction resolved appended.fingerprint observed.fingerprint = false)
+    (sameTerm : own_readback_term (some appended.term) observed.term = true)
+    (sameSequence : matching_sequence appended.sequence observed.sequence = true)
+    (mismatched : readback_matches_transaction resolved appended.fingerprint observed.fingerprint = false)
     (applied : Option (Except Error Result)) (mismatch : Error) :
     nativeAcknowledgement appended (.readBack observed resolved mismatch applied) = some (.error mismatch) := by
-  simp [nativeAcknowledgement, sameTerm, sameSequence, mismatched, transactionCompletion]
+  simp [nativeAcknowledgement, sameTerm, sameSequence, mismatched, transaction_completion]
 
 theorem native_acknowledgement_refines_applied_record
     (applied : Option (Except Error Result)) (mismatch : Error) (result : Result) :
     nativeAcknowledgement appended (.readBack observed resolved mismatch applied) = some (.ok result) ↔
       ExactReadback appended observed resolved = true ∧ applied = some (.ok result) := by
-  by_cases term : ownReadbackTerm (some appended.term) observed.term = true <;>
-    by_cases seq : matchingSequence appended.sequence observed.sequence = true <;>
-    by_cases payload : readbackMatchesTransaction resolved appended.fingerprint observed.fingerprint = true <;>
-    cases applied <;> simp_all [nativeAcknowledgement, ExactReadback, transactionCompletion]
+  by_cases term : own_readback_term (some appended.term) observed.term = true <;>
+    by_cases seq : matching_sequence appended.sequence observed.sequence = true <;>
+    by_cases payload : readback_matches_transaction resolved appended.fingerprint observed.fingerprint = true <;>
+    cases applied <;> simp_all [nativeAcknowledgement, ExactReadback, transaction_completion]
 
 private def appended : NativeRecordIdentity :=
   ⟨1, some 2, some (List.replicate 32 0)⟩
@@ -89,7 +89,7 @@ theorem exact_readback_and_application_acknowledge_the_applied_result :
 theorem enqueue_only_acknowledgement_is_invalid :
     let staged := 17
     nativeAcknowledgement (Error := Bool) appended (.enqueued staged) ≠ some (.ok staged) := by
-  simp [nativeAcknowledgement, transactionCompletion]
+  simp [nativeAcknowledgement, transaction_completion]
 
 theorem fingerprint_blind_acknowledgement_is_invalid :
     nativeAcknowledgement appended (.readBack otherPayload true false (some (.ok 42))) = some (.error false) ∧

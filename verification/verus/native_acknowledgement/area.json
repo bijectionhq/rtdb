@@ -1,0 +1,91 @@
+{
+  "summary": "A pending native transaction acknowledges only its applied read-back at the exact append identity and returns the applied result.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 13,
+  "controls": {
+    "acknowledge_on_enqueue": {
+      "defect": "Returning from provider enqueue delivers the staged transaction result to its caller.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "TransactionEvent::Enqueued(_) => None,",
+          "replace": "TransactionEvent::Enqueued(staged) => Some(Ok(staged)),"
+        },
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "TransactionEvent::Enqueued(..) => None,",
+          "replace": "TransactionEvent::Enqueued(staged) => Some(Ok(staged)),"
+        }
+      ],
+      "expect": [{
+        "file": "verification/verus/native_acknowledgement/laws.rs",
+        "function": "enqueued_does_not_acknowledge",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
+    },
+    "skip_fingerprint_check": {
+      "defect": "Any present fingerprints are treated as equal.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "(true, Some(appended), Some(observed)) => same_fingerprint(appended, observed),",
+          "replace": "(true, Some(_), Some(_)) => true,"
+        },
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "(true, Some(expected), Some(actual)) => expected@ == actual@,",
+          "replace": "(true, Some(_), Some(_)) => true,"
+        }
+      ],
+      "expect": [{
+        "file": "verification/verus/native_acknowledgement/laws.rs",
+        "function": "acknowledgement_requires_exact_payload",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
+    },
+    "accept_another_term": {
+      "defect": "Any term is considered local while the driver is leading.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "Some(term) => term == observed,",
+          "replace": "Some(_) => true,"
+        },
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "ensures own == (leader == Some(observed)),",
+          "replace": "ensures own == leader.is_some(),"
+        }
+      ],
+      "expect": [{
+        "file": "verification/verus/native_acknowledgement/laws.rs",
+        "function": "acknowledgement_requires_exact_term",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
+    },
+    "accept_another_sequence": {
+      "defect": "Pending lookup and completion accept a later sequence.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "Some(observed) => observed == expected,",
+          "replace": "Some(observed) => observed >= expected,"
+        },
+        {
+          "file": "rust/crates/replication/src/readback_identity.rs",
+          "find": "ensures matched == (observed == Some(expected)),",
+          "replace": "ensures matched == (observed matches Some(sequence) && sequence >= expected),"
+        }
+      ],
+      "expect": [{
+        "file": "verification/verus/native_acknowledgement/laws.rs",
+        "function": "acknowledgement_requires_exact_sequence",
+        "category": "assertion failed"
+      }],
+      "min_verified_functions": 12
+    }
+  }
+}
