@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) mod custody;
 pub mod custody_release;
 pub(crate) mod default;
+pub mod ranked_ivf;
 mod visibility;
 pub use visibility::{ServingScope, ROW_VISIBILITY};
 
@@ -250,6 +251,14 @@ pub trait ServingDriver: Send + Sync {
         &self, _database: &str, source: QuerySource, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
         self.query(source, false, now, cancellation).await
+    }
+
+    fn supports_ranked_ivf(&self) -> bool { false }
+
+    async fn query_ranked_ivf(
+        &self, _source: QuerySource, _target: &ranked_ivf::Target, _now: Timestamp, _cancellation: &CancellationToken,
+    ) -> Result<(QueryView, ranked_ivf::Catalog)> {
+        Err(ranked_ivf::unsupported())
     }
 
     async fn transact(

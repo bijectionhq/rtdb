@@ -53,8 +53,49 @@ FROM totals LEFT JOIN hits ON TRUE
 ORDER BY hits.distance, ENTITY_SORT_KEY(hits._id)
 ```
 
-The exact recipe has `approximate = false`; it never requests an IVF shortlist.
+The exact recipe has `approximate = false`.
 Reject a zero or malformed probe at admission even when the candidate relation is empty.
+
+## Native IVF
+
+Negotiate `query.ranked-ivf` and `query.clear-rank-input` on the same v1 attachment.
+Send `QueryRequest.ranked_ivf` (field 11) with `track = true`, `require_clear_rank_input = true` and `Source` set to `main`, `LAYER_MERGED` and `Exactly(basis)`.
+Leave `sql`, `params_ipc`, `page` and `verify_ranked_artefacts` unset.
+Select one user table and IVF index by schema, table, index name and the original declaration position from `xt.ranked_indexes.version`.
+Supply the held valid instant in signed microseconds, a finite nonzero float32 probe of the declared width (1 to 4096), and `k` from 1 to 256.
+The window starts at zero and has no continuation.
+
+Use up to eight distinct declared partition columns as filters, each with 1 to 64 ordinary Binary values of up to 1024 bytes.
+The server applies AND across columns and OR across a column's values.
+For up to 64 staged mutations, send the complete typed `identity_key` of each masked row (up to 4096 bytes), and include a replacement only when the staged row has an embedding.
+A replacement carries a finite float32 vector of the declared width and one optional Binary filter value per requested column in request order.
+An omitted value represents SQL null, and a present empty byte string matches an empty byte string.
+A mask hides the matching stored identity even when its replacement is absent, fails the filters, or has zero norm.
+
+The mounted Default reader admits the current merged-main publication paired with the selected native basis and clock.
+The request requires a complete clear contributor inventory, a retained current primary catalogue, and verified installed IVF files for the declared generation.
+Missing coverage, a live frontier, relevant historical tries or exhaustion of the 65,536-IID budget can refuse the request.
+Up to 256 MiB of persisted generations are read within the existing storage and query budgets.
+Each round resolves visible stored rows for the shortlisted IIDs and applies masks and filters before ranking the original f32 vectors.
+It adds eligible staged replacements and widens when fewer than `k` rows qualify, stopping at a full window, an exhausted shortlist or refusal.
+Missing and zero-norm vectors contribute no distance.
+
+The Arrow result has non-null `identity_key` (Binary) and `distance` (Float64), ordered by ascending cosine distance and then complete typed identity.
+The handle encodes a string as tag 0 followed by UTF-8, a keyword as tag 1 followed by its UTF-8 name, an integer as tag 2 followed by its sign-biased big-endian 64-bit encoding, and a UUID as tag 3 followed by its 16 bytes.
+`QueryTrailer.ranked_ivf` (field 10) gives the executed declaration generation, `candidate_count` and `approximate`, alongside the basis and branch-wide claim even for an empty window.
+`candidate_count` counts the filtered, scored rows in the settled round, including replacements.
+When `approximate = true`, the candidate count covers the shortlist, and closer eligible rows may exist beyond it.
+When `approximate = false`, the reader exhausted the eligible IVF candidate set for the request.
+Distances use the same component-order binary64 cosine arithmetic as `COSINE_DISTANCE_F32`.
+
+For Bijection's `FactSnapshot::v1_nearest`, retain its path, placement, clear-presence, label, staged-value and posting-marker admission at the held cut.
+Use the admitted relation in `public`, the path's vector column as the index name, the declaration's original version, and the path's `filter_column` names and encoded filter keys.
+Map each staged address to its complete string handle using tag 0 and the UTF-8 `address.to_wire()` bytes.
+Select replacement filter values by the requested ordinals, preserving missing values.
+Decode and re-admit each returned address against the same path, validate the generation, basis, ordering, distinct keys and row count, and retain the trailer claim with the posting-marker claim where applicable.
+Use `candidate_count` as the count for the returned candidate set and carry `approximate` with it.
+A caller that requires index-backed execution should refuse an absent capability or an unavailable IVF request.
+A caller that allows exact fallback can issue the exact SQL recipe at the same held basis after either refusal.
 
 ## Exact spatial predicates and nearest
 
@@ -121,7 +162,8 @@ For spatial and vector, send the value column first and then the ordered equalit
 After an applied receipt, use a separate `Query` at `Exactly(receipt.basis)` to read `xt.ranked_indexes`.
 Compare `_id`, `schema_name`, `table_name`, `kind`, `columns`, and the relevant `analyzer, history`, `geometry_encoding`, or `method, dimensions, recall` fields.
 The `version` names the original declaration position and stays stable on an identical redeclaration.
-The applied v1 snapshot reports `serving_mode = 'exact-sql'` and `approximate = false`.
+The v1 catalog SQL reports `serving_mode = 'exact-sql'` and `approximate = false`.
 Opt in to [physical readiness verification](rtdb-ranked-native-artefacts.md) to obtain `artefacts_ready = true` where the installed exact cut supplies persisted coverage.
 The search accelerator can use the same declaration projected into `xt.search_indexes` for eligible MATCH plans.
-A startup policy that requires a physical spatial or IVF index must gate the route on `artefacts_ready`.
+A startup policy that requires persisted indexes can gate on `artefacts_ready`.
+A native IVF consumer also requires the negotiated execution capability and a successful execution trailer for the requested generation.

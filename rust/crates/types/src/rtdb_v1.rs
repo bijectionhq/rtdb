@@ -16,6 +16,7 @@ pub const SPATIAL_BUILD_CATALOG: &str = "native_spatial_builds";
 pub const VECTOR_BUILD_CATALOG: &str = "native_vector_builds";
 pub const SEARCH_BUILD_CATALOG: &str = "native_search_builds";
 pub const RANKED_ARTEFACT_READINESS: &str = "query.ranked-artefact-readiness";
+pub const RANKED_IVF: &str = "query.ranked-ivf";
 
 pub fn ranked_build_id(table: &TableRef, name: &str) -> String {
     format!("{}:{}{}:{}{name}", table.schema.len(), table.schema, table.table.len(), table.table)

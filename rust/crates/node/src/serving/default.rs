@@ -10,7 +10,7 @@ use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{At, Basi
 use tokio_util::sync::CancellationToken;
 
 use super::{ChangeGroup, ChangeOrder, ChangePage, Changes, QuerySource, QueryView, ServingDriver,
-    ServingScope, append_change_rows};
+    ServingScope, append_change_rows, ranked_ivf};
 use crate::Clock;
 
 pub(crate) struct DefaultServing {
@@ -156,6 +156,37 @@ impl ServingDriver for DefaultServing {
         &self, database: &str, source: QuerySource, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
         self.capture_query(source, false, now, cancellation, Some(database)).await
+    }
+
+    fn supports_ranked_ivf(&self) -> bool {
+        cfg!(feature = "search") && self.handle.supports_ranked_catalog()
+    }
+
+    async fn query_ranked_ivf(
+        &self, source: QuerySource, target: &ranked_ivf::Target, now: Timestamp, cancellation: &CancellationToken,
+    ) -> Result<(QueryView, ranked_ivf::Catalog)> {
+        if !self.supports_ranked_ivf() || source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH
+            || source.layer != Layer::Merged || !matches!(source.at, At::Exactly(_))
+        {
+            return Err(ranked_ivf::unsupported());
+        }
+        let selected = self.handle.view(source.at, cancellation).await?;
+        if selected.index.has_custody_groups() || selected.index.has_visibility_history() {
+            return Err(ranked_ivf::unsupported());
+        }
+        let branch = selected.index.view(&source.branch, source.at, source.layer, now)?;
+        let cut = branch.cut();
+        let declaration = branch.table(&target.table).and_then(|table| table.ranked_indexes.get(&target.index))
+            .filter(|index| index.position == target.generation && matches!(index.definition.kind, RankedIndexKind::Ivf { .. }))
+            .ok_or_else(ranked_ivf::uncovered)?;
+        let physical = self.handle.ranked_catalog(&selected, cut).ok_or_else(ranked_ivf::uncovered)?;
+        let catalog_cut = physical.catalog_cut().ok_or_else(ranked_ivf::uncovered)?;
+        let snapshot = rtdb_query::retain_catalog_snapshot(physical, &self.storage).await?;
+        let view = QueryView { snapshot, cut, claim: None, custody_groups: BTreeSet::new(),
+            custody_contributors: Some(BTreeSet::new()), key_generation: selected.key_generation };
+        let catalog = ranked_ivf::Catalog { target: target.clone(), declaration: declaration.clone(),
+            physical: catalog_cut, storage: Arc::clone(&self.storage) };
+        Ok((view, catalog))
     }
 
     async fn transact(&self, mut request: Transact, cancellation: &CancellationToken) -> Result<Receipt> {

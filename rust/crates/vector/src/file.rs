@@ -83,9 +83,9 @@ impl Locator {
     pub(crate) fn directory_range(&self) -> Range<u64> { self.directory.0..self.directory.0.saturating_add(self.directory.1) }
 }
 
-pub(crate) fn verify_generation(
-    bytes: CacheLease, locator: &Locator, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
-) -> Result<()> {
+pub(crate) fn verified_directory(
+    bytes: &CacheLease, locator: &Locator, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<Directory> {
     let index = |offset| usize::try_from(offset).map_err(|_| corrupt("Vector generation range exceeds addressable memory"));
     let start = index(locator.directory.0)?;
     let length = index(locator.directory.1)?;
@@ -104,7 +104,7 @@ pub(crate) fn verify_generation(
         let to = index(cluster.range.end)?;
         Block::read(bytes.slice(from..to)?, &cluster, directory.dimensions, memory)?;
     }
-    Ok(())
+    Ok(directory)
 }
 
 fn footer(offset: u64, length: u64, dimensions: u32) -> [u8; FOOTER_BYTES] {
@@ -518,7 +518,7 @@ mod tests {
         let key = ObjectKey::new("ready-vector").unwrap();
         store.put(&key, Bytes::from(generation.clone())).await.unwrap();
         let bytes = pool.get_published_exact_or(&key, length, None, &memory).await.unwrap().unwrap();
-        verify_generation(bytes, &written.locator, &memory, &cancellation).unwrap();
+        verified_directory(&bytes, &written.locator, &memory, &cancellation).unwrap();
         let claimed = rtdb_format::log::proto::PublishedObjectVersion { version: Some("another-version".into()), ..Default::default() };
         assert!(pool.get_published_exact_or(&key, length, Some(&claimed), &memory).await.unwrap().is_none());
         for (name, offset) in [("bad-cluster", 0), ("bad-footer", length - 1)] {
@@ -527,7 +527,7 @@ mod tests {
             altered[offset] ^= 1;
             store.put(&key, Bytes::from(altered)).await.unwrap();
             let bytes = pool.get_fresh_exact_or(&key, length, &memory).await.unwrap();
-            assert_eq!(verify_generation(bytes, &written.locator, &memory, &cancellation).unwrap_err().code,
+            assert_eq!(verified_directory(&bytes, &written.locator, &memory, &cancellation).err().unwrap().code,
                 "rtdb.vector/corrupt-generation");
         }
         let bytes = pool.get_exact_cached_or(&key, length, &memory).await.unwrap();

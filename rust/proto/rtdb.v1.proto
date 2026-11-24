@@ -55,7 +55,7 @@ message Page {
 }
 message QueryRequest {
   Source source = 1;
-  // Read-only SQL. Source supplies the statement-wide read settings.
+  // Read-only SQL. Source supplies the statement-wide read settings. Omit for ranked_ivf.
   string sql = 2;
   // An Arrow IPC stream with exactly one batch containing one positional parameter row.
   optional bytes params_ipc = 3;
@@ -72,6 +72,46 @@ message QueryRequest {
   bool observe_applied_position = 9;
   // Inspect persisted ranked artefacts for a tracked, clear exact-cut catalog read.
   bool verify_ranked_artefacts = 10;
+  // Execute a bounded rank on a proved native IVF generation. Requires tracked,
+  // clear, exact merged main; SQL, params_ipc, Page and field 10 are absent.
+  RankedIvf ranked_ivf = 11;
+}
+message RankedIvf {
+  string schema = 1;
+  string table = 2;
+  string index = 3;
+  // The original declaration position selected at Source.At.Exactly.
+  uint64 generation = 4;
+  optional sint64 valid_at_micros = 5;
+  uint32 k = 6;
+  repeated float probe = 7;
+  // AND across distinct declared partition columns, OR across a column's Binary values.
+  repeated RankedIvfFilter filters = 8;
+  repeated RankedIvfStaged staged = 9;
+}
+message RankedIvfFilter {
+  string column = 1;
+  repeated bytes values = 2;
+}
+message RankedIvfStaged {
+  // Complete typed handle, as returned in identity_key. Always masks the stored row.
+  bytes identity_key = 1;
+  RankedIvfReplacement replacement = 2;
+}
+message RankedIvfReplacement {
+  repeated float embedding = 1;
+  // One cell per request filter in request order.
+  repeated RankedIvfFilterCell filter_values = 2;
+}
+message RankedIvfFilterCell {
+  optional bytes value = 1;
+}
+message RankedIvfResult {
+  uint64 generation = 1;
+  // True if the shortlist did not exhaust eligible IVF candidates.
+  bool approximate = 2;
+  // Filtered, visible non-null scores in the settled candidate set, including replacements.
+  uint32 candidate_count = 3;
 }
 message QueryTrailer {
   Basis basis = 1;
@@ -87,6 +127,7 @@ message QueryTrailer {
   optional uint64 applied_position = 8;
   // Present for observe_applied_position on an assigned Multi follower.
   FollowerProgress follower_progress = 9;
+  RankedIvfResult ranked_ivf = 10;
 }
 message FollowerProgress {
   string database = 1;

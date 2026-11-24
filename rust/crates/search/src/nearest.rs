@@ -17,6 +17,9 @@ use rtdb_types::{
 
 use crate::OwnedSearchBatch;
 
+mod native;
+pub use native::NativeNearest;
+
 pub const MAX_NEAREST_K: usize = 256;
 pub const MAX_NEAREST_DIMENSIONS: usize = 4096;
 pub const MAX_NEAREST_FILTERS: usize = 8;

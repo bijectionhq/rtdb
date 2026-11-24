@@ -8,10 +8,10 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EncodedEvent, EventBatch}, ipc::{ArrowFile, inspect_file_reserved}};
-use rtdb_index::{CatalogTrie, Snapshot, TrieState};
-use rtdb_query::{IidScope, visit_projected_data_events};
-use rtdb_storage::{ObjectKey, cache::BufferPool};
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TemporalBounds};
+use rtdb_index::{CatalogTrie, Snapshot, TrieState, branches::RankedIndexDeclaration};
+use rtdb_query::{IidScope, QueryContext, visit_projected_data_events};
+use rtdb_storage::{ObjectKey, cache::{BufferPool, CacheLease}};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Result, TableRef, TemporalBounds};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -45,18 +45,21 @@ pub struct Round { pub candidates: Vec<Iid>, pub complete: bool }
 
 /// An opened generation and its clusters eligible under the partition filter, nearest centroid first.
 struct Opened {
-    key: ObjectKey,
+    read: GenerationRead,
     clusters: Vec<Cluster>,
     probed: usize,
     _allocation: Arc<MemoryReservation>,
 }
 
+enum GenerationRead { Ranges(ObjectKey), Verified(CacheLease) }
+
 impl Opened {
-    fn rank(key: &ObjectKey, directory: &Directory, probe: &[f32], partition: Option<Partition>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
+    fn rank(read: GenerationRead, directory: &Directory, probe: &[f32], partition: Option<Partition>, memory: &Arc<MemoryBudget>) -> Result<Option<Self>> {
         let eligible = || (0..directory.len()).filter(|&row| partition.is_none_or(|partition| directory.partition(row) == partition));
         let count = eligible().count();
         if count == 0 { return Ok(None); }
-        let held = (2 * size_of::<Self>()).saturating_add(key.as_str().len()).saturating_add(count.saturating_mul(size_of::<Cluster>()));
+        let key_bytes = match &read { GenerationRead::Ranges(key) => key.as_str().len(), GenerationRead::Verified(_) => 0 };
+        let held = (2 * size_of::<Self>()).saturating_add(key_bytes).saturating_add(count.saturating_mul(size_of::<Cluster>()));
         let bytes = held.saturating_add(count.saturating_mul(size_of::<(f64, usize)>()));
         let mut allocation = memory.reserve(bytes)?;
         let mut order = Vec::with_capacity(count);
@@ -66,7 +69,7 @@ impl Opened {
         clusters.extend(order.iter().map(|&(_, row)| directory.cluster(row)));
         drop(order);
         Arc::get_mut(&mut allocation).expect("directory ranking owns its reservation").shrink_to(held)?;
-        Ok(Some(Self { key: key.clone(), clusters, probed: 0, _allocation: allocation }))
+        Ok(Some(Self { read, clusters, probed: 0, _allocation: allocation }))
     }
 }
 
@@ -102,10 +105,33 @@ impl Shortlist {
             let lease = cut.storage.get_range_or(key, locator.directory_range(), cut.memory).await?;
             let directory = Directory::read(lease, locator, cut.memory)?;
             if directory.dimensions != definition.dimensions { return Ok(None); }
-            if let Some(generation) = Opened::rank(key, &directory, &probe, partition, cut.memory)? {
+            if let Some(generation) = Opened::rank(GenerationRead::Ranges(key.clone()), &directory, &probe, partition, cut.memory)? {
                 opened.push(generation);
             }
         }
+        Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, scores, opened }))
+    }
+
+    /// Opens only fully proved native generations. The caller holds the catalog's read region.
+    pub async fn open_native(
+        context: &Arc<QueryContext>, bounds: TemporalBounds, table: &TableRef, name: &str,
+        declaration: &RankedIndexDeclaration, probe: Vec<f32>, limit: usize, partition: Option<Partition>,
+    ) -> Result<Option<Self>> {
+        if !(bounds.valid_time.is_point() && bounds.system_time.is_point()) { return Ok(None); }
+        let Some(definition) = crate::readiness::native_definition(context, table, name, declaration).await? else {
+            return Ok(None);
+        };
+        if probe.len() != definition.dimensions { return Ok(None); }
+        let budget = Budget { max_uncovered_bytes: 0, ..Budget::default() };
+        let mut opened = Vec::new();
+        let covered = crate::readiness::visit_native_generations(context, &definition, Some(bounds), |bytes, directory| {
+            if let Some(generation) = Opened::rank(GenerationRead::Verified(bytes), &directory, &probe, partition, &context.memory)? {
+                opened.push(generation);
+            }
+            Ok(())
+        }).await?;
+        if !covered { return Ok(None); }
+        let scores = Scores::new(&context.memory, budget.max_candidates)?;
         Ok(Some(Self { plan: probe::Plan::new(definition.approximate.recall, limit), probe, budget, partition, scores, opened }))
     }
 
@@ -117,12 +143,15 @@ impl Shortlist {
             let probes = self.plan.probes(generation.clusters.len());
             let start = generation.probed.min(probes);
             generation.probed = generation.probed.max(probes);
-            let key = &generation.key;
+            let read = &generation.read;
             let clusters = &generation.clusters;
             let blocks = futures::stream::iter((start..probes).map(|index| {
                 let cluster = &clusters[index];
                 async move {
-                    let lease = cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?;
+                    let lease = match read {
+                        GenerationRead::Ranges(key) => cut.storage.get_range_or(key, cluster.range.clone(), cut.memory).await?,
+                        GenerationRead::Verified(bytes) => bytes.slice(cluster.range.start as usize..cluster.range.end as usize)?,
+                    };
                     Block::read(lease, cluster, dimensions, cut.memory)
                 }
             })).buffer_unordered(8);
@@ -155,11 +184,11 @@ enum Source { Generation { key: ObjectKey, locator: Locator }, Frontier { data: 
 fn sources(cut: Cut<'_>, definition: &VectorDefinition, budget: Budget) -> Option<Vec<Source>> {
     let table = &definition.table;
     let entry = cut.snapshot.table_entry(table)?;
-    let earliest = cut.bounds.valid_time.lower().0.min(cut.bounds.system_time.lower().0);
-    let visible = |trie: &&CatalogTrie| trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest);
     let mut uncovered = 0i64;
     let mut sources = Vec::new();
-    for trie in cut.snapshot.trie_catalog().current_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).filter(visible) {
+    for trie in cut.snapshot.trie_catalog().current_tries(table).into_iter()
+        .filter(|trie| trie.state == TrieState::Live && visible(trie, cut.bounds))
+    {
         let recorded = trie.artefact(definition::KIND, &definition.artefact_id(), definition.generation)
             .and_then(|record| Some((record, Locator::decode(record.stats.as_deref()?)?)))
             .filter(|(_, locator)| locator.dimensions as usize == definition.dimensions)
@@ -173,6 +202,11 @@ fn sources(cut: Cut<'_>, definition: &VectorDefinition, budget: Budget) -> Optio
         }
     }
     (uncovered <= budget.max_uncovered_bytes).then_some(sources)
+}
+
+pub(crate) fn visible(trie: &CatalogTrie, bounds: TemporalBounds) -> bool {
+    let earliest = bounds.valid_time.lower().0.min(bounds.system_time.lower().0);
+    trie.key.recency().is_none_or(|date| date.epoch_day().saturating_mul(86_400_000_000) > earliest)
 }
 
 struct FrontierRanker<'a> {
@@ -367,8 +401,8 @@ mod tests {
         let first = ObjectKey::new("ivf/generation-1").unwrap();
         let second = ObjectKey::new("ivf/generation-2").unwrap();
         let budget = MemoryBudget::new(1 << 20);
-        let a = Opened::rank(&first, &directory, &[1.0, 0.0], Some(selected), &budget).unwrap().unwrap();
-        let b = Opened::rank(&second, &directory, &[1.0, 0.0], Some(selected), &budget).unwrap().unwrap();
+        let a = Opened::rank(GenerationRead::Ranges(first), &directory, &[1.0, 0.0], Some(selected), &budget).unwrap().unwrap();
+        let b = Opened::rank(GenerationRead::Ranges(second), &directory, &[1.0, 0.0], Some(selected), &budget).unwrap().unwrap();
         assert_eq!(a.clusters.iter().map(|cluster| cluster.range.clone()).collect::<Vec<_>>(), expected);
         assert_eq!(budget.used_bytes(), a._allocation.bytes() + b._allocation.bytes());
         drop(a);

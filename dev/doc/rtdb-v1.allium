@@ -75,6 +75,13 @@ surface StatelessDatabase {
         -- A tracked exact-cut rank with an empty window still returns its claim.
         -- RequireClearRankInput admits an unscoped tracked exact cut whose complete branch-view contributor inventory is proved empty.
 
+    @guarantee RankedIvfQuery
+        -- The negotiated ranked IVF query names one table, index and declaration generation at the tracked clear exact merged-main cut.
+        -- A serving reader proves the generation against its retained primary catalogue and resolves the selected candidates at that same cut.
+        -- Staged masks compare complete typed identities and filters constrain the effective candidate set before the zero-offset window.
+        -- The trailer carries the executed generation, scored candidate count and approximation status with the basis and claim.
+        -- A route advertises ranked IVF execution when its owner can capture and retain the paired physical catalogue.
+
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
         -- The same authority seals the claim and authenticates it when the writer evaluates Unchanged.

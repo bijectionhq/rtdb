@@ -18,10 +18,10 @@ use arrow_schema::{DataType, Field, Schema};
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_crypt::tokens::{PageToken, ReceiverClockObservation, TokenIssuer};
-use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::{QuerySource, QueryView, ServingDriver, ServingScope}};
+use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::{QuerySource, QueryView, ServingDriver, ServingScope, ranked_ivf}};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::transact::CustodyGroupId;
-use rtdb_types::{LogicalType, Timestamp, Value, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
+use rtdb_types::{LogicalType, TableRef, Timestamp, Value, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -94,6 +94,10 @@ fn fingerprint(query: &proto::QueryRequest) -> [u8; 32] {
     if query.require_clear_rank_input { hash.update(b"clear-rank-input"); }
     if query.observe_applied_position { hash.update(b"observe-applied-position"); }
     if query.verify_ranked_artefacts { hash.update(b"ranked-artefact-readiness"); }
+    if let Some(ranked) = &query.ranked_ivf {
+        hash.update(b"ranked-ivf");
+        hash.update(Sha256::digest(ranked.encode_to_vec()));
+    }
     hash.finalize().into()
 }
 
@@ -221,7 +225,7 @@ impl Service {
     async fn open_v1_query(
         &self,
         call: &Call,
-        request: proto::QueryRequest,
+        mut request: proto::QueryRequest,
     ) -> Result<OpenedQuery, Status> {
         let source = request
             .source
@@ -262,6 +266,17 @@ impl Service {
         ) {
             return Err(error::unsupported(super::RANKED_ARTEFACT_READINESS));
         }
+        if request.ranked_ivf.is_some() {
+            if self.follower_only() || !request.require_clear_rank_input
+                || source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || claim_layer != Layer::Merged
+                || driver.is_none_or(|driver| !driver.supports_ranked_ivf())
+            {
+                return Err(error::unsupported(super::RANKED_IVF));
+            }
+            if !request.sql.is_empty() || request.params_ipc.is_some() || request.page.is_some() || request.verify_ranked_artefacts {
+                return Err(error::incorrect("Ranked IVF supplies its own query body and returns a single bounded window"));
+            }
+        }
         if request.observe_receiver_clock && (
             driver.is_none_or(|driver| !driver.supports_query_tokens())
                 || visibility.is_some()
@@ -295,7 +310,11 @@ impl Service {
         let scope = visibility.as_ref().map_or(raw_scope, |scope| {
             uuid::Uuid::from_bytes(scope.labels.main_read_incarnation(*raw_scope.as_bytes()))
         });
-        let request_hash = fingerprint(&request);
+        let request_hash = {
+            let _encoding = request.ranked_ivf.as_ref().map(|ranked| call.reserve(ranked.encoded_len())).transpose()?;
+            fingerprint(&request)
+        };
+        let ranked_ivf = request.ranked_ivf.take().map(read_ranked_ivf).transpose()?;
         let (limit, after) = match &request.page {
             Some(page) if (1..=MAX_PAGE_ROWS).contains(&page.limit) => {
                 (u64::from(page.limit), page.after.as_slice())
@@ -318,11 +337,19 @@ impl Service {
             Some(authority) => (None, Some(authority.issuer().await.map_err(error::anomaly)?)),
             None => (None, None),
         };
+        let mut ranked_catalog = None;
         let (context, page, cut, scoped_claim, custody_groups, key_generation, custody_contributors, follower_evidence) = if let Some(driver) = driver {
             let now = self.0.node.now();
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (query_source, clock, offset) = applied_source(source, claim_layer, selection, continuation, now)?;
-            let (view, follower_evidence) = self.query_view(call, driver, query_source, visibility.as_ref(), &request, now).await?;
+            let (view, follower_evidence) = if let Some(ranked) = &ranked_ivf {
+                let (view, catalog) = driver.query_ranked_ivf(query_source, &ranked.target, now, &call.cancellation)
+                    .await.map_err(error::anomaly)?;
+                ranked_catalog = Some(catalog);
+                (view, None)
+            } else {
+                self.query_view(call, driver, query_source, visibility.as_ref(), &request, now).await?
+            };
             let cut = view.cut.system_time;
             let (context, clock) = if visibility.is_some() {
                 let clock = continuation.map_or(now, |page| page.clock);
@@ -399,21 +426,21 @@ impl Service {
         ) {
             return Err(error::unsupported(super::CLEAR_RANK_INPUT));
         }
-        let parameters = request
-            .params_ipc
-            .map(|bytes| {
+        let (cursor, footprint, ranked_result) = if let Some(ranked) = ranked_ivf {
+            let generation = ranked.target.generation;
+            let (cursor, count, approximate) = ranked_catalog.ok_or_else(|| error::unsupported(super::RANKED_IVF))?
+                .execute(context, ranked).await.map_err(error::anomaly)?;
+            let result = proto::RankedIvfResult { generation, approximate, candidate_count: count as u32 };
+            (cursor, ClaimFootprint::default(), Some(result))
+        } else {
+            let parameters = request.params_ipc.map(|bytes| {
                 Parameters::read(Buffer::from(call.retain_request_bytes(bytes)), &context.memory)
-            })
-            .transpose()?;
-        let types = parameters
-            .as_ref()
-            .map_or(&[][..], |params| params.types.as_slice());
-        let prepared = self
-            .0
-            .v1
-            .plans
-            .prepare(scope, &request.sql, &context, types)?;
-        let (cursor, footprint) = open_query(prepared, context, parameters.as_ref(), request.track).await?;
+            }).transpose()?;
+            let types = parameters.as_ref().map_or(&[][..], |params| params.types.as_slice());
+            let prepared = self.0.v1.plans.prepare(scope, &request.sql, &context, types)?;
+            let (cursor, footprint) = open_query(prepared, context, parameters.as_ref(), request.track).await?;
+            (cursor, footprint, None)
+        };
         let claim = if visibility.is_some() && request.track {
             let claim = scoped_claim.ok_or_else(|| error::unsupported("query.track"))?;
             Some(proto::Claim { value: claim.into_bytes() })
@@ -458,9 +485,29 @@ impl Service {
             custody_release_inventory,
             applied_position,
             follower_progress,
+            ranked_ivf: ranked_result,
         };
         Ok(OpenedQuery { cursor, database, issuer, labels: visibility.map(|scope| scope.labels), page, limit, trailer, custody_groups, key_generation })
     }
+}
+
+fn read_ranked_ivf(ranked: proto::RankedIvf) -> Result<ranked_ivf::Request, Status> {
+    let request = ranked_ivf::Request {
+        target: ranked_ivf::Target { table: TableRef::new(ranked.schema, ranked.table), index: ranked.index, generation: ranked.generation },
+        valid: Timestamp(ranked.valid_at_micros.ok_or_else(|| error::incorrect("Ranked IVF requires a valid instant"))?),
+        k: ranked.k as usize,
+        probe: ranked.probe,
+        filters: ranked.filters.into_iter().map(|filter| (filter.column, filter.values)).collect(),
+        staged: ranked.staged.into_iter().map(|staged| ranked_ivf::Staged {
+            identity_key: staged.identity_key,
+            replacement: staged.replacement.map(|replacement| ranked_ivf::Replacement {
+                embedding: replacement.embedding,
+                filter_values: replacement.filter_values.into_iter().map(|cell| cell.value).collect(),
+            }),
+        }).collect(),
+    };
+    request.validate().map_err(error::anomaly)?;
+    Ok(request)
 }
 
 pub(super) async fn check_read_delivery(call: &Call, database: &Database, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {

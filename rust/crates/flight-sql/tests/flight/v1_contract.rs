@@ -1683,6 +1683,133 @@ async fn transact_wire(
 }
 
 #[tokio::test]
+async fn native_ivf_proves_the_generation_and_ranks_the_resolved_filtered_overlay() {
+    use arrow_array::{BinaryArray, Float64Array, ListArray, types::Float32Type};
+    use rtdb_types::rtdb_v1::{Basis, RANKED_IVF};
+    use tokio_util::sync::CancellationToken;
+
+    let resources = rtdb_node::NativeResources::default().with_native_serving_authority(
+        "xtdb", rtdb_node::serving::NativeServingAuthority { incarnation: [33; 16], checkpoints: None },
+    );
+    let options = NodeOptions { file_size_target: 1, automatic_artefacts: false, ..Default::default() };
+    let running = Running::start_with_resources(
+        None, FlightConfig::default(), &[], None, options, None, Some(Arc::new(resources)),
+    ).await;
+    let database = running.node.catalog().database("xtdb").unwrap();
+    let mut status = database.watch_status();
+    tokio::time::timeout(Duration::from_secs(5), status.wait_for(|status| {
+        matches!(status.role, rtdb_replication::Role::Leading(_))
+    })).await.unwrap().unwrap();
+    let mut client = Client::connect(&running.server, None).await;
+    let declaration = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![1; 16],
+        ops: vec![v1::Op { op: Some(v1::op::Op::Declare(v1::Declare {
+            table: "public.vectors".into(),
+            change: Some(v1::declare::Change::Index(v1::Index {
+                name: "vectors_ivf".into(), kind: v1::IndexKind::Vector as i32,
+                columns: vec!["embedding".into(), "category".into()],
+                options: Some(v1::index::Options::Vector(v1::VectorIndexOptions {
+                    method: "ivf".into(), dimensions: 2, recall: 0.9,
+                })),
+            })),
+        })) }],
+        ..Default::default()
+    }).await.unwrap();
+    let generation = Basis::from_bytes(&declaration.basis.unwrap().value).unwrap().position();
+
+    let row = |id, vector: [f32; 2], category: &[u8]| v1::Row {
+        cells: [
+            ("_id".into(), id),
+            ("embedding".into(), scalar_cell(Arc::new(ListArray::from_iter_primitive::<Float32Type, _, _>([Some(vector.map(Some))])))),
+            ("category".into(), scalar_cell(Arc::new(BinaryArray::from_vec(vec![category])))),
+        ].into_iter().collect(),
+        ..Default::default()
+    };
+    let mut rows = vec![
+        row(integer_cell(2), [1.0, 0.0], b"allow"),
+        row(integer_cell(3), [3.0, 4.0], b"allow"),
+        row(scalar_cell(Arc::new(StringArray::from(vec!["3"]))), [3.0, 4.0], b"allow"),
+        row(integer_cell(5), [1.0, 0.0], b"allow"),
+        row(integer_cell(6), [0.0, 0.0], b"allow"),
+    ];
+    rows.extend((100..170).map(|id| row(integer_cell(id), [1.0, 0.0], b"deny")));
+    let written = transact_wire(&mut client, v1::TransactRequest {
+        key: vec![2; 16],
+        ops: vec![v1::Op { op: Some(v1::op::Op::Put(v1::Put {
+            table: "public.vectors".into(), branch: "main".into(), rows, if_absent: false,
+        })) }],
+        ..Default::default()
+    }).await.unwrap();
+
+    let mut request = input("");
+    request.source.as_mut().unwrap().at = Some(v1::At { selection: written.basis.clone().map(Selection::Exactly) });
+    request.track = true;
+    request.require_clear_rank_input = true;
+    request.ranked_ivf = Some(v1::RankedIvf {
+        schema: "public".into(), table: "vectors".into(), index: "vectors_ivf".into(), generation,
+        valid_at_micros: Some(written.system_time_micros), k: 8, probe: vec![1.0, 0.0],
+        filters: vec![v1::RankedIvfFilter { column: "category".into(), values: vec![b"allow".to_vec(), b"other".to_vec()] }],
+        staged: [(2, [0.0, 0.0], Some(b"allow".to_vec())), (4, [1.0, 1.0], Some(b"allow".to_vec())), (5, [1.0, 0.0], None)]
+            .into_iter().map(|(id, embedding, value)| v1::RankedIvfStaged {
+                identity_key: EntityId::Integer(id).handle_bytes(),
+                replacement: Some(v1::RankedIvfReplacement { embedding: embedding.to_vec(), filter_values: vec![v1::RankedIvfFilterCell { value }] }),
+            }).collect(),
+    });
+    assert!(get::<_, v1::QueryTrailer>(&mut client, request.clone()).await.is_err());
+
+    database.flush().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    database.compaction().unwrap().compact_all().await.unwrap();
+    database.build_artefacts().await.unwrap();
+    running.node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+    let caps = client.action("rtdb.v1.Capabilities", Bytes::new()).await.unwrap();
+    assert!(v1::CapabilitiesResponse::decode(caps[0].body.clone()).unwrap().features.iter().any(|feature| feature == RANKED_IVF));
+
+    let mut readiness = input("SELECT COUNT(*) FROM xt.ranked_indexes WHERE _id = 'vectors_ivf' AND artefacts_ready AND serving_mode = 'exact-sql' AND NOT approximate");
+    readiness.source = request.source.clone();
+    readiness.track = true;
+    readiness.require_clear_rank_input = true;
+    readiness.verify_ranked_artefacts = true;
+    let (rows, trailer) = query(&mut client, readiness).await;
+    assert_eq!(ints(&rows), [1]);
+    assert!(trailer.ranked_ivf.is_none());
+
+    let mut wrong_generation = request.clone();
+    wrong_generation.ranked_ivf.as_mut().unwrap().generation += 1;
+    assert!(get::<_, v1::QueryTrailer>(&mut client, wrong_generation).await.is_err());
+    let (batches, trailer) = query(&mut client, request.clone()).await;
+    assert_eq!(trailer.basis, written.basis);
+    assert!(trailer.claim.is_some());
+    assert_eq!(trailer.ranked_ivf, Some(v1::RankedIvfResult { generation, approximate: false, candidate_count: 3 }));
+    let hits: Vec<_> = batches.iter().flat_map(|batch| {
+        let keys = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        let scores = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        (0..batch.num_rows()).map(move |row| (EntityId::from_handle_bytes(keys.value(row)).unwrap(), scores.value(row)))
+    }).collect();
+    assert_eq!(hits, [
+        (EntityId::Integer(4), 1.0 - 1.0 / 2.0_f64.sqrt()),
+        (EntityId::String("3".into()), 1.0 - 3.0 / 5.0),
+        (EntityId::Integer(3), 1.0 - 3.0 / 5.0),
+    ]);
+
+    let mut empty = request.clone();
+    empty.ranked_ivf.as_mut().unwrap().filters[0].values = vec![b"absent".to_vec()];
+    let (batches, trailer) = query(&mut client, empty).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    assert!(trailer.claim.is_some());
+    assert_eq!(trailer.ranked_ivf, Some(v1::RankedIvfResult { generation, approximate: false, candidate_count: 0 }));
+
+    let ranked = request.ranked_ivf.as_mut().unwrap();
+    ranked.k = 1;
+    ranked.filters.clear();
+    ranked.staged.clear();
+    let (batches, trailer) = query(&mut client, request).await;
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    assert_eq!(trailer.ranked_ivf, Some(v1::RankedIvfResult { generation, approximate: true, candidate_count: 64 }));
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_reads_compound_index_catalog_at_the_declaration_receipt() {
     use rtdb_node::serving::NativeServingAuthority;
 

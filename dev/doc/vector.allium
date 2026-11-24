@@ -84,6 +84,18 @@ entity ProbePlan {
 -- A missing or corrupt generation leaves the scan exact.
 -- Results of the approximate route may omit true neighbours; their distances and order are exact.
 --
+-- The native v1 route
+--
+-- An explicit ranked IVF Query selects one declared generation at a tracked clear exact cut.
+-- The reader retains the current primary catalogue paired with the native cut and opens every current-trie generation with the recorded provider identity.
+-- The shortlist probes slices of the verified bytes held by that reader.
+-- The reader requires complete persisted inventory and a covered temporal point.
+-- Each round resolves the candidate IIDs at that cut, masks stored rows by complete typed identity, and filters the surviving rows and staged replacements before applying k.
+-- The final order uses cosine distance on the original float32 components and the complete typed identity.
+-- A replacement with absent or zero-norm embedding still masks its stored row.
+-- The reply counts scored candidates and reports approximation when the settled shortlist leaves candidates unconsidered.
+-- An unavailable generation proof or exhausted budget refuses ranked IVF execution.
+--
 -- The held route
 --
 -- `rtdb.owned.NearestHeld.v4` with the approximate route ranks, for each partition with an approximate vector path, the rows of its shortlist resolved at the held cut.

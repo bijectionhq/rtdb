@@ -172,6 +172,11 @@ impl NativeServingHandle {
         self.authority.checkpoints.is_some() && !self.has_local_erasure_fence()
     }
 
+    pub fn supports_ranked_catalog(&self) -> bool {
+        let view = self.view.borrow();
+        view.compatible && view.ranked_catalog.is_some() && !self.has_local_erasure_fence()
+    }
+
     pub fn ranked_catalog(&self, selected: &NativeServingView, cut: BranchCut) -> Option<Snapshot> {
         if self.has_local_erasure_fence() { return None; }
         let (native, physical) = selected.ranked_catalog?;

@@ -7,7 +7,7 @@ use rtdb_node::serving::{ROW_VISIBILITY, ServingDriver, ServingScope};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_tx::transact::{PHYSICAL_ERASURE, TIMED_TRANSACT, TRANSACT_REQUIRES};
-use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS}};
+use rtdb_types::{Timestamp, rtdb_v1::{CLEAR_RANK_INPUT, RANKED_ARTEFACT_READINESS, RANKED_IVF}};
 use tonic::{Response, Status, metadata::MetadataMap};
 
 use crate::{
@@ -117,6 +117,9 @@ impl Service {
                             }
                             if database.serving_driver().is_some() {
                                 features.push(RECEIVER_CLOCK.into());
+                                if database.serving_driver().is_some_and(|driver| driver.supports_ranked_ivf()) {
+                                    features.push(RANKED_IVF.into());
+                                }
                                 if call.session.caller.verified_credential {
                                     features.push(APPLIED_POSITION.into());
                                     if features.iter().any(|feature| feature == "changes") {

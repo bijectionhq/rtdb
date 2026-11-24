@@ -21,7 +21,8 @@ Native generations keep a distinct artefact identity under each current trie and
 For physical readiness the checker requires each selected current trie's persisted generation.
 It reopens the immutable object, checks the footer and directory against the recorded locator, and uses the funded decoder to verify every indexed cluster.
 The check reports current-trie generation coverage.
-The native v1 query still uses the exact SQL route until a mounted shortlist reader can report the realized method for that query.
+The tag 10 catalog query reports the exact SQL method independently of this result.
+An explicit [native IVF Query](rtdb-ranked-query.md#native-ivf) rechecks the requested generation at its own held cut and probes the verified bytes from that read.
 
 ## Full-text build and readback
 
@@ -42,13 +43,20 @@ An unversioned record can match an unversioned read under its captured owner and
 Terminal publications need a same-read terminal observation before they can pass this check.
 An empty persisted inventory, a live tail, missing or invalid objects, unmatched cuts, and routes without this association report false.
 
-Multi's committed view returns the native fold and key generation, and the native query snapshot constructs its own live rows.
-Multi needs a committed primary catalogue and an artefact publication under its existing writer and storage authority before the same proof can be made.
-The reader needs the associated storage generation and a retained read on the selected catalogue.
+## Multi prerequisites
+
+`MultiDatabase::fresh_view` supplies a committed `BranchIndex` and key generation, from which `MultiServing::query` constructs a live branch snapshot.
+The native Multi checkpoint manifest doesn't supply the selected primary trie catalogue and its artefact inventory to that Query path.
+The Multi writer needs to project the ordered native IVF declaration into its own persisted build catalogue and publish the primary tries and their funded IVF generations under the deployment's fenced writer and storage generation.
+The committed publication must bind the deployment incarnation, branch cut and clock, exact primary ownership, and per-trie generation addresses, lengths, locators and provider versions.
+The Multi reader needs an exact-cut capture of that publication, the matching storage-generation grant, and a retained catalogue read that covers primary resolution, artefact probing and delivery under Multi's retention and key authority.
+Until those dependencies are installed, Multi serves the exact branch-fold query and omits `query.ranked-ivf`.
+
+## Reading the catalogue
 
 Negotiate `query.ranked-artefact-readiness` and set `verify_ranked_artefacts = true` (QueryRequest field 10) along with the clear exact-cut guard and tracking.
 Read `xt.ranked_indexes` without a Flight continuation.
 The row reports the declared options and original generation, the result of the physical proof in `artefacts_ready`, and the permitted method in `serving_mode`.
 Check the declaration at its original receipt; check physical readiness at a current exact basis once the writer has published the postings.
-The current native method remains `exact-sql` and reports `approximate = false`.
+This catalog query reports `serving_mode = 'exact-sql'` and `approximate = false`.
 Persisted postings require a mounted exact-cut spatial selector before the query can use them for narrowing.
