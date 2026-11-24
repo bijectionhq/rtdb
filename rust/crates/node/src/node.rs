@@ -1881,12 +1881,19 @@ impl OwnedReadSession {
         &self, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation, id: &rtdb_types::EntityId,
         valid_at: Timestamp, system: Timestamp, observed: bool,
     ) -> Result<OwnedWorldShadowRead> {
-        let valid = rtdb_types::Interval::at(valid_at)?;
         self.require_unscoped_root()?;
         self.admit_read().await?;
         let context = self.relation_context(relation)?;
         let context = if system == self.present.system_time { context }
             else { context.with_owned_system_cut(system, &context.cancellation)? };
+        self.read_world_shadow_in_context(context, world, relation, id, valid_at, system, observed).await
+    }
+
+    async fn read_world_shadow_in_context(
+        &self, context: Arc<QueryContext>, world: rtdb_types::Iid, relation: &rtdb_types::OwnedRelation,
+        id: &rtdb_types::EntityId, valid_at: Timestamp, system: Timestamp, observed: bool,
+    ) -> Result<OwnedWorldShadowRead> {
+        let valid = rtdb_types::Interval::at(valid_at)?;
         let root = relation;
         let relation = root.in_world(world)?;
         let mut row = None;

@@ -1256,7 +1256,7 @@ pub async fn read_owned_schema_catalog(
 }
 
 pub struct OwnedChangeEntry {
-    pub system_time: Timestamp,
+    pub publication: TransactionKey,
     pub through_events: i64,
     pub value: Value,
     pub retained: Arc<rtdb_columnar::MemoryReservation>,
@@ -1307,7 +1307,7 @@ async fn read_owned_journal_cell(
     let id = EntityId::Integer(revision);
     let memory = Arc::clone(&context.memory);
     let journal = relation.change_journal(owner)?;
-    let Some(mut cursor) = open_owned_table_point(context, journal, id.iid(), Some(&id), None, Some(&[cell, "through_events"]), false).await? else {
+    let Some(mut cursor) = open_owned_table_point(context, journal, id.iid(), Some(&id), None, Some(&[cell, "through_events", rtdb_types::OWNED_EVENT_POSITION_COLUMN]), false).await? else {
         return Err(change_feed_uncovered());
     };
     let mut entry = None;
@@ -1316,6 +1316,7 @@ async fn read_owned_journal_cell(
         for row in 0..batch.num_rows() {
             if entry.is_some() { return Err(change_feed_uncovered()); }
             let system_time = owned_row_revision(batch, row, &id, &memory)?;
+            let position = owned_row_event_position(batch, row)?;
             let (frontier_column, frontier_field) = batch.schema_ref().column_with_name("through_events")
                 .ok_or_else(change_feed_uncovered)?;
             let Value::I64(through) = rtdb_columnar::read_value(frontier_field, batch.column(frontier_column).as_ref(), row)?
@@ -1327,7 +1328,8 @@ async fn read_owned_journal_cell(
             let retained = memory.reserve(size.checked_mul(2).and_then(|bytes| bytes.checked_add(4096))
                 .ok_or_else(change_feed_uncovered)?)?;
             entry = Some(OwnedChangeEntry {
-                system_time, through_events: through, value: rtdb_columnar::read_value(field, values, row)?, retained,
+                publication: TransactionKey { tx_id: position.transaction, system_time },
+                through_events: through, value: rtdb_columnar::read_value(field, values, row)?, retained,
             });
         }
     }

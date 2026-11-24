@@ -5821,16 +5821,16 @@ async fn merged_held_changes_resume_only_after_whole_visible_commits() {
     assert_eq!(page.commits[0].changes[1].relation, second);
     assert_eq!(page.commits[0].changes[1].touches[0].id, EntityId::Integer(2));
 
-    let next = held.merged_changes(&selected, page.commits[0].revision, 1).await.unwrap();
+    let next = held.merged_changes(&selected, page.commits[0].publication.system_time, 1).await.unwrap();
     assert_eq!(next.commits.len(), 1);
     assert_eq!(next.covered_through().unwrap(), present);
     assert_eq!(next.commits[0].changes.len(), 1);
     assert_eq!(next.commits[0].changes[0].touches[0].id, EntityId::Integer(3));
-    assert!(held.merged_changes(&selected, next.commits[0].revision, 1).await.unwrap().commits.is_empty());
+    assert!(held.merged_changes(&selected, next.commits[0].publication.system_time, 1).await.unwrap().commits.is_empty());
     assert!(held.merged_changes(&[first.clone(), first.clone()], Timestamp::MIN, 1).await.is_err());
 
     assert!(session.state_mut().execute_tx(vec![insert(&second, 4)], AutonomousTxOptions::default()).await.unwrap().committed());
-    assert!(held.merged_changes(&selected, next.commits[0].revision, 1).await.unwrap().commits.is_empty());
+    assert!(held.merged_changes(&selected, next.commits[0].publication.system_time, 1).await.unwrap().commits.is_empty());
 
     drop(held);
     drop(session);

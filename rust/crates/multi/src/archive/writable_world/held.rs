@@ -1915,7 +1915,7 @@ impl<'a> InheritedRelation<'a> {
         let page = self.changes(before, group, 1, false).await?;
         let [commit] = page.commits.as_slice() else { return Err(unavailable()); };
         let [changes] = commit.changes.as_slice() else { return Err(unavailable()); };
-        if commit.revision != group || changes.relation != *self.relation
+        if commit.publication.system_time != group || changes.relation != *self.relation
             || !changes.touches.iter().any(|touch| &touch.id == id)
         {
             return Err(unavailable());
@@ -2260,11 +2260,11 @@ async fn require_parent_journal(
     let floor = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, 0).await?;
     let first = rtdb_query::read_owned_journal_header(Arc::clone(context), owner, relation, 1).await?;
     let head = rtdb_query::read_owned_change_entry(Arc::clone(context), owner, relation, entries - 1).await?;
-    if floor.value != Value::Null || floor.system_time != first.committed_at
-        || floor.through_events >= first.through_events || (floor.through_events != 0 && selected < floor.system_time)
-        || head.through_events != data_events || head.system_time > context.current_time.as_micros()?
-        || (entries > 2 && (head.system_time <= first.committed_at || head.through_events <= first.through_events))
-        || (entries == 2 && (head.system_time != first.committed_at || head.through_events != first.through_events))
+    if floor.value != Value::Null || floor.publication.system_time != first.committed_at
+        || floor.through_events >= first.through_events || (floor.through_events != 0 && selected < floor.publication.system_time)
+        || head.through_events != data_events || head.publication.system_time > context.current_time.as_micros()?
+        || (entries > 2 && (head.publication.system_time <= first.committed_at || head.through_events <= first.through_events))
+        || (entries == 2 && (head.publication.system_time != first.committed_at || head.through_events != first.through_events))
         || !matches!(head.value, Value::List(touches) if !touches.is_empty())
     {
         return Err(unavailable());

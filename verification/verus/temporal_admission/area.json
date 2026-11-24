@@ -5,10 +5,29 @@
     "--verify-module",
     "production",
     "--verify-module",
+    "owned_range_order",
+    "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 9,
+  "min_verified_functions": 11,
   "controls": {
+    "replay_the_range_anchor_as_a_change": {
+    "defect": "Treat an earlier or repeated publication as a new intervening change when SQL history times tie.",
+    "mutate": [
+      {
+        "file": "rust/crates/query/src/owned_range_order.rs",
+        "find": "    previous.0 < group.0 && group.0 <= head.0 && previous.1",
+        "replace": "    previous.0 <= group.0 && group.0 <= head.0 && previous.1"
+      }
+    ],
+    "expect": [
+      {
+        "file": "rust/crates/query/src/owned_range_order.rs",
+        "function": "ordered_range_group",
+        "category": "postcondition not satisfied"
+      }
+    ]
+  },
     "admit_upper_endpoint": {
       "defect": "An ordinary event recorded at the system interval's exclusive upper edge is admitted.",
       "mutate": [

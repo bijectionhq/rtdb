@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use rtdb_types::{EntityId, OwnedRelation, Result, Timestamp, Value, change_feed_uncovered};
+use rtdb_types::{EntityId, OwnedRelation, Result, TransactionKey, Value, change_feed_uncovered};
 
-use crate::{QueryContext, owned_relation::open_owned_table_point, owned_row_revision};
+use crate::{QueryContext, owned_relation::open_owned_table_point, owned_row_event_position, owned_row_revision};
 
 /// The durable order and coverage fields on one owner-scoped journal row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedJournalHeader {
-    pub committed_at: Timestamp,
+    pub publication: TransactionKey,
     pub through_events: i64,
 }
 
@@ -27,7 +27,7 @@ pub async fn read_owned_journal_header(
         id.iid(),
         Some(&id),
         None,
-        Some(&["through_events"]),
+        Some(&["through_events", rtdb_types::OWNED_EVENT_POSITION_COLUMN]),
         false,
     )
     .await?
@@ -41,7 +41,8 @@ pub async fn read_owned_journal_header(
             if header.is_some() {
                 return Err(change_feed_uncovered());
             }
-            let committed_at = owned_row_revision(batch, row, &id, &memory)?;
+            let system_time = owned_row_revision(batch, row, &id, &memory)?;
+            let position = owned_row_event_position(batch, row)?;
             let (column, field) = batch
                 .schema_ref()
                 .column_with_name("through_events")
@@ -55,7 +56,7 @@ pub async fn read_owned_journal_header(
                 return Err(change_feed_uncovered());
             }
             header = Some(OwnedJournalHeader {
-                committed_at,
+                publication: TransactionKey { tx_id: position.transaction, system_time },
                 through_events,
             });
         }

@@ -2244,9 +2244,9 @@ impl<'a> OpenTransaction<'a> {
                         )?;
                         match region {
                             rtdb_types::OwnedRangeEvidence::FixedPath(evidence) =>
-                                rtdb_query::verify_owned_fixed_range(&context, &base, owner, relation, basis.system_time, *frontier, head, evidence).await,
+                                rtdb_query::verify_owned_fixed_range(&context, &base, owner, relation, *basis, *frontier, head, evidence).await,
                             rtdb_types::OwnedRangeEvidence::Entity { anchor, region } =>
-                                rtdb_query::verify_owned_entity_region(&context, &base, owner, relation, basis.system_time, *frontier, head, *anchor, region).await,
+                                rtdb_query::verify_owned_entity_region(&context, &base, owner, relation, *basis, *frontier, head, *anchor, region).await,
                         }
                     }.await.unwrap_or(false);
                     if !exact {

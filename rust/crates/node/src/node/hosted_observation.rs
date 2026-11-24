@@ -289,12 +289,12 @@ impl NativeSession {
                 Some(rtdb_types::OwnedRangeEvidence::FixedPath(evidence)) =>
                     rtdb_query::verify_owned_fixed_range(
                         &read.context, captured, &read.owner, &range.relation,
-                        range.basis.system_time, range.frontier, frontier, evidence,
+                        range.basis, range.frontier, frontier, evidence,
                     ).await?,
                 Some(rtdb_types::OwnedRangeEvidence::Entity { anchor, region }) =>
                     rtdb_query::verify_owned_entity_region(
                         &read.context, captured, &read.owner, &range.relation,
-                        range.basis.system_time, range.frontier, frontier, *anchor, region,
+                        range.basis, range.frontier, frontier, *anchor, region,
                     ).await?,
                 None => false,
             };

@@ -5,17 +5,22 @@ use std::sync::Arc;
 use rtdb_index::Snapshot;
 use rtdb_types::{
     FixedRangeEvidence, FixedRangeKey, OwnedChange, OwnedEntityRegion, OwnedRelation, Result,
-    Timestamp, Value, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS, OWNED_CHANGE_PAGE_GROUPS,
+    TransactionKey, Value, FIXED_RANGE_MAX_GROUPS, FIXED_RANGE_MAX_IDS, OWNED_CHANGE_PAGE_GROUPS,
 };
 
-use crate::QueryContext;
+use crate::{QueryContext, owned_range_order::ordered_range_group};
+
+fn ordered_group(previous: TransactionKey, group: TransactionKey, head: TransactionKey) -> bool {
+    let coordinates = |key: TransactionKey| (key.tx_id.0, key.system_time.0);
+    ordered_range_group(coordinates(previous), coordinates(group), coordinates(head))
+}
 
 pub async fn verify_owned_fixed_range(
     context: &Arc<QueryContext>,
     base: &Snapshot,
     owner: &str,
     relation: &OwnedRelation,
-    basis: Timestamp,
+    basis: TransactionKey,
     frontier: i64,
     head_frontier: i64,
     evidence: &FixedRangeEvidence,
@@ -45,14 +50,14 @@ pub async fn verify_owned_fixed_range(
     if anchor.through_events != frontier
         || (evidence.revision == 0 && (frontier != 0 || anchor.value != Value::Null))
         || (evidence.revision != 0
-            && (anchor.system_time > basis
+            && (!anchor.publication.at_or_before(basis)
                 || !matches!(anchor.value, Value::List(touches) if !touches.is_empty())))
     {
         return Ok(false);
     }
     let mut through = frontier;
-    let mut previous_time = basis;
-    let Some(head_time) = base.tx_basis().map(|key| key.system_time) else {
+    let mut previous = basis;
+    let Some(head_publication) = base.tx_basis() else {
         return Ok(false);
     };
     for revision in evidence.revision + 1..=head {
@@ -73,8 +78,7 @@ pub async fn verify_owned_fixed_range(
             return Ok(false);
         };
         if *events <= 0
-            || entry.system_time <= previous_time
-            || entry.system_time > head_time
+            || !ordered_group(previous, entry.publication, head_publication)
             || through.checked_add(*events) != Some(entry.through_events)
             || sides.len() > FIXED_RANGE_MAX_IDS
         {
@@ -94,7 +98,7 @@ pub async fn verify_owned_fixed_range(
             }
         }
         through = entry.through_events;
-        previous_time = entry.system_time;
+        previous = entry.publication;
     }
     Ok(through == head_frontier)
 }
@@ -104,7 +108,7 @@ pub async fn verify_owned_entity_region(
     base: &Snapshot,
     owner: &str,
     relation: &OwnedRelation,
-    basis: Timestamp,
+    basis: TransactionKey,
     frontier: i64,
     head_frontier: i64,
     anchor: i64,
@@ -119,27 +123,27 @@ pub async fn verify_owned_entity_region(
     {
         return Ok(false);
     }
-    let Some(head_time) = base.tx_basis().map(|key| key.system_time) else {
+    let Some(head_publication) = base.tx_basis() else {
         return Ok(false);
     };
     let entry = crate::read_owned_change_entry(Arc::clone(context), owner, relation, anchor).await?;
     let anchored = if anchor == 0 {
         frontier == 0 && entry.value == Value::Null
     } else {
-        entry.system_time <= basis && matches!(entry.value, Value::List(touches) if !touches.is_empty())
+        entry.publication.at_or_before(basis) && matches!(entry.value, Value::List(touches) if !touches.is_empty())
     };
     if !anchored || entry.through_events != frontier {
         return Ok(false);
     }
 
-    let mut previous_time = basis;
+    let mut previous = basis;
     let mut through = frontier;
     for revision in anchor + 1..=head {
         context.check_cancelled()?;
         let entry = crate::read_owned_change_entry(Arc::clone(context), owner, relation, revision).await?;
         let Value::List(touches) = entry.value else { return Ok(false); };
         let count = i64::try_from(touches.len()).map_err(|_| rtdb_types::change_feed_uncovered())?;
-        if count == 0 || entry.system_time <= previous_time || entry.system_time > head_time
+        if count == 0 || !ordered_group(previous, entry.publication, head_publication)
             || through.checked_add(count) != Some(entry.through_events)
         {
             return Ok(false);
@@ -149,7 +153,7 @@ pub async fn verify_owned_entity_region(
                 return Ok(false);
             }
         }
-        previous_time = entry.system_time;
+        previous = entry.publication;
         through = entry.through_events;
     }
     Ok(through == head_frontier)

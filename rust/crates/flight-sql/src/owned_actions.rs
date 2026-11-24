@@ -3396,7 +3396,7 @@ impl Service {
         }
         let schema = Arc::new(schema);
         let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
-        let revisions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.revision.0));
+        let revisions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.system_time.0));
         let changes: Vec<_> = page.commits.iter().map(|commit| Value::list(commit.changes.iter().map(|change| {
             Value::Struct(StructFields::from([
                 ("relation".into(), Value::Utf8(change.relation.name().into())),
