@@ -103,6 +103,7 @@ The ordered publication builds its Arrow declaration batch from the prepared dur
 | Preparation and hook opening fetched a key list through PostgreSQL, then fetched each declaration as a row on the same transaction.
 | Flight returns the bounded declaration inventory as Arrow batches on the same hold as the installation, owner, application admission, and program observations.
 Bijection checks the original allowance, declaration identities and stamps before using the installed layout.
+The scoped fresh Flight route admits the same bounded catalog selectors under a reader-owned hold.
 
 | Hosted Root catalog replacement
 | The Flight decoder materialized the hosted catalog payload as generic document fields before source encoding and resolution.

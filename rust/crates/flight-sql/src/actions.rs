@@ -15,6 +15,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | OBSERVE_HELD_HOSTED_V1
         | CONFIRM_APPLIED_HOSTED_V6
         | READ_HELD_HOSTED_CONTROL_V2
+        | READ_HELD_ROOT_CATALOG_V1
         | OPEN_OWNED_SCOPED_READ_V2
         | OPEN_OWNED_READ_AS_OF_V1
         | OPEN_FRESH_OWNED_READ_V2
@@ -379,6 +380,7 @@ fn fresh_flight_sessions_admit_only_read_actions() {
     use crate::owned_actions::*;
     assert!(fresh_replica_action(OPEN_FRESH_OWNED_READ_V2));
     assert!(fresh_replica_action(HELD_OWNED_POINT_V2));
+    assert!(fresh_replica_action(READ_HELD_ROOT_CATALOG_V1));
     assert!(fresh_replica_action(CLOSE_OWNED_READ_V1));
     assert!(!fresh_replica_action(OPEN_OWNED_READ_V3));
     assert!(!fresh_replica_action(OFFER_CLOCK_SLOT_V1));
