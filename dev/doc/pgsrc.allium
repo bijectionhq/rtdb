@@ -353,6 +353,7 @@ surface TargetIngestion {
         -- Domains over float arrays or pgvector use the Arrow layout of their PostgreSQL base type.
         -- The upstream type catalog supplies the effective dimension for pgvector domains in logical replication.
         -- Ordinary homogeneous floating-point arrays in JSON and JSONB build packed Float64 children.
+        -- The JSON decoder borrows scalar tokens during nested document traversal and preserves their spelling for native type inference.
         -- It stages Arrow document vectors with separately resolved event headers.
         -- A complete WAL transaction carries Arrow batches grouped by relation, operation kind and compatible field layout.
         -- The mirror stages rows in upstream event order using Arrow document vectors and typed ID and valid-time columns.

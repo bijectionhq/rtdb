@@ -7,6 +7,8 @@ mod column;
 pub use column::{read_source_text_column, read_text_column, read_vector_column};
 mod transit_input;
 pub use transit_input::{decode_transit_msgpack, decode_transit_sequence, decode_transit_transaction};
+mod json_input;
+use json_input::read_json;
 
 /// The caller covers decoding allocations and the returned value with its own reservation.
 /// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
@@ -190,7 +192,7 @@ fn range(text: &str) -> Result<Option<(i64, i64)>> {
 }
 
 
-fn read_json(text: &str) -> Result<Value> {
+fn read_json_legacy(text: &str) -> Result<Value> {
     use serde_json::value::RawValue;
     let text = text.trim();
     Ok(match text.as_bytes().first() {
@@ -201,34 +203,19 @@ fn read_json(text: &str) -> Result<Value> {
         Some(b'[') => {
             let values: Vec<&RawValue> = serde_json::from_str(text).map_err(invalid)?;
             if let Some(list) = json_float_list(&values)? { Value::List(list) }
-            else { Value::list(values.into_iter().map(|value| read_json(value.get())).collect::<Result<_>>()?) }
+            else { Value::list(values.into_iter().map(|value| read_json_legacy(value.get())).collect::<Result<_>>()?) }
         },
         Some(b'{') => {
-            let mut fields: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).map_err(invalid)?;
+            let mut fields: BTreeMap<String, &RawValue> = serde_json::from_str(text).map_err(invalid)?;
             let kind = fields.get("@type").and_then(|kind| serde_json::from_str::<String>(kind.get()).ok());
             if let Some(kind) = kind {
                 let value = fields.remove("@value").ok_or_else(|| invalid("JSON-LD value requires @value"))?;
-                let string = || serde_json::from_str::<String>(value.get()).map_err(invalid);
-                match kind.as_str() {
-                    "xt:long" => Value::I64(if let Ok(integer) = value.get().parse::<i64>() { integer } else { string()?.parse().map_err(invalid)? }),
-                    "xt:double" => Value::F64(if let Ok(text) = string() { float(&text)? } else { float(value.get())? }),
-                    "xt:decimal" => decimal(&string()?)?,
-                    "xt:instant" => { let mut timestamp = timestamp(&string()?)?; if let Value::Timestamp { timezone, .. } = &mut timestamp { *timezone = Some("UTC".into()); } timestamp },
-                    "xt:timestamptz" => zoned_timestamp(&string()?)?,
-                    "xt:timestamp" => read_text(1114, &string()?)?, "xt:date" => read_text(1082, &string()?)?, "xt:time" => read_text(1083, &string()?)?,
-                    "xt:duration" => read_text(11112, &string()?)?, "xt:interval" => read_text(1186, &string()?)?,
-                    "xt:keyword" => Value::Keyword(rtdb_types::Keyword::from_name(string()?)), "xt:uuid" => read_text(2950, &string()?)?,
-                    "xt:set" => { let Value::List(values) = read_json(value.get())? else { return Err(invalid("JSON-LD set requires an array")); }; Value::Set(unique(values.into_values())) },
-                    "xt:incorrect" | "xt:unsupported" | "xt:conflict" | "xt:fault" | "xt:interrupted" | "xt:not-found" | "xt:forbidden" | "xt:busy" | "xt:unavailable" | "xt:error" => json_error(&kind, value.get())?,
-                    _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-json-ld-value", format!("JSON-LD {kind} cannot be imported as a native document value"))),
-                }
-            } else { Value::Struct(fields.into_iter().map(|(key, value)| Ok((key, read_json(value.get())?))).collect::<Result<_>>()?) }
+                json_tag(&kind, value.get(), || read_json_legacy(value.get()))?
+            } else { Value::Struct(fields.into_iter().map(|(key, value)| Ok((key, read_json_legacy(value.get())?))).collect::<Result<_>>()?) }
         }
         _ => {
-            let _: Box<RawValue> = serde_json::from_str(text).map_err(invalid)?;
-            if let Ok(integer) = text.parse::<i64>() { Value::I64(integer) }
-            else if !text.contains(['.', 'e', 'E']) && text.trim_start_matches('-').len() <= 64 { decimal(text)? }
-            else { Value::F64(float(text)?) }
+            let _: &RawValue = serde_json::from_str(text).map_err(invalid)?;
+            json_number(text)?
         }
     })
 }
@@ -250,6 +237,31 @@ fn json_float_list(values: &[&serde_json::value::RawValue]) -> Result<Option<rtd
     Ok(Some(rtdb_types::ListValue::from_f64(builder.finish())))
 }
 
+fn json_tag(kind: &str, raw: &str, read_set: impl FnOnce() -> Result<Value>) -> Result<Value> {
+    let string = || serde_json::from_str::<String>(raw).map_err(invalid);
+    Ok(match kind {
+        "xt:long" => Value::I64(if let Ok(integer) = raw.parse::<i64>() { integer } else { string()?.parse().map_err(invalid)? }),
+        "xt:double" => Value::F64(if let Ok(text) = string() { float(&text)? } else { float(raw)? }),
+        "xt:decimal" => decimal(&string()?)?,
+        "xt:instant" => { let mut timestamp = timestamp(&string()?)?; if let Value::Timestamp { timezone, .. } = &mut timestamp { *timezone = Some("UTC".into()); } timestamp },
+        "xt:timestamptz" => zoned_timestamp(&string()?)?,
+        "xt:timestamp" => read_text(1114, &string()?)?, "xt:date" => read_text(1082, &string()?)?, "xt:time" => read_text(1083, &string()?)?,
+        "xt:duration" => read_text(11112, &string()?)?, "xt:interval" => read_text(1186, &string()?)?,
+        "xt:keyword" => Value::Keyword(rtdb_types::Keyword::from_name(string()?)), "xt:uuid" => read_text(2950, &string()?)?,
+        "xt:set" => { let Value::List(values) = read_set()? else { return Err(invalid("JSON-LD set requires an array")); }; Value::Set(unique(values.into_values())) },
+        "xt:incorrect" | "xt:unsupported" | "xt:conflict" | "xt:fault" | "xt:interrupted" | "xt:not-found" | "xt:forbidden" | "xt:busy" | "xt:unavailable" | "xt:error" => json_error(kind, raw)?,
+        _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-json-ld-value", format!("JSON-LD {kind} cannot be imported as a native document value"))),
+    })
+}
+fn json_number(text: &str) -> Result<Value> {
+    if let Ok(integer) = text.parse::<i64>() {
+        Ok(Value::I64(integer))
+    } else if !text.contains(['.', 'e', 'E']) && text.trim_start_matches('-').len() <= 64 {
+        decimal(text)
+    } else {
+        Ok(Value::F64(float(text)?))
+    }
+}
 fn zoned_timestamp(text: &str) -> Result<Value> {
     timestamp(text)
 }

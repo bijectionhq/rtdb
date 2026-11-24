@@ -56,6 +56,8 @@
 -- An embedded Clojure cursor writes Transit leaves from Arrow cell positions and lends the encoded batch to the row reader for the duration of decoding.
 -- Clojure callers can set the connection await token and the read-only transaction settings through typed session calls.
 -- Embedded ADBC metadata builds its catalog, schema, table, and column arrays with the declared ADBC field order and list validity.
+-- JSON Bind preserves the spelling of numeric tokens through native type inference.
+-- The decoder borrows tokens while visiting nested input.
 -- A prepared Flight SQL query that only projects compatible bindings selects the first row from their Arrow columns.
 -- A Flight SQL statement ticket retains its plan, Arrow parameters, catalog and clock behind a bounded opaque handle.
 -- The authenticated session and original attachment authorize redemption of its ticket.

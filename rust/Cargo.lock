@@ -5023,6 +5023,7 @@ dependencies = [
  "rtdb-expr",
  "rtdb-format",
  "rtdb-types",
+ "serde",
  "serde_json",
  "uuid",
 ]

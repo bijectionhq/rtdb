@@ -18,6 +18,7 @@ num-bigint.workspace = true
 num-traits.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 uuid.workspace = true
 
