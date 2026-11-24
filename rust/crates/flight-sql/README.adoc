@@ -377,6 +377,9 @@ The point response has the same coordinates as the unmasked historical point.
 
 The ordinary owned endpoint accepts `x-rtdb-owned-ipc: stream-v1` for actions returning a single raw Arrow IPC stream.
 If the owner echoes the header, each Flight result contains one complete Arrow IPC message from the original response, followed by a separate eight-byte IPC end marker.
+Held change feeds, held identity pages and held storage usage can encode these messages directly.
+The contiguous writer and message slicing remain available for negotiated replies that use the original writer.
+Without negotiation the reply remains one contiguous IPC stream.
 The audience endpoint and actions with control envelopes use their existing framing.
 
 `rtdb.owned.ReadPoints.v1` accepts two to 256 held point entries.
@@ -709,8 +712,9 @@ A relation with zero events is covered through the held present.
 A request that crosses untracked relation events or encounters a missing journal group is refused.
 
 The reply is a terminated Arrow stream with `revision: UInt64`, `system_time_micros: Int64` and `touches: List<Struct>`.
-Each touch contains the full native `_id`, `op: Utf8` (`put` or `delete`), `valid_from_micros: Int64`, and `valid_to_micros: Int64?`.
+Each touch contains the full native `_id` as a dense union, `op: Utf8`, `valid_from_micros: Int64`, and nullable Int64 fields `valid_to_micros`, `created_micros`, `expiry_micros` and `assertion_ordinal`.
 The exclusive upper endpoint is null for an unbounded interval.
+Expiry touches carry their creation and expiry endpoints.
 A group records the relation's committed mutations in their original order.
 Writes exceeding the 1 MiB retained-value budget for a relation's group abort.
 A page stops before its next whole group if that group would exceed the 8 MiB retained-value budget.
@@ -957,13 +961,13 @@ An incomplete descending page returns an edge immediately before its oldest emit
 The archived and live world routes use the same position-bearing reply.
 A point-in-time projection flag identifies when a time-only consumer can represent the page without skipping a tied publication.
 
-The reply is a terminated Arrow stream with `revision: Int64` ordered system microseconds and `changes: List<Struct<relation: Utf8, touches: List<Struct>>>`.
-The touch fields match ReadHeldChanges.v2.
+The reply is a terminated Arrow stream with `system_time_micros: Int64`, `transaction_position: Int64` and `changes: List<Struct<relation: Utf8, relation_sequence: UInt64, touches: List<Struct>>>`.
+The touch fields match `ReadHeldChanges.v3`.
 All selected relations touched by the same commit share a row, with relations in name order and touches in the relation's original write order.
 A capped page stops before a whole commit if it would exceed the 8 MiB retained-value budget.
 A commit that cannot fit in an otherwise empty page is rejected.
-`rtdb.owned.change_coverage_micros` identifies the last returned revision of a partial page and the held present of an exhausted page.
-Resume from that coverage time.
+`rtdb.owned.change_coverage_micros`, `rtdb.owned.change_position` and `rtdb.owned.change_edge_kind` together encode the continuation edge.
+Resume from the complete edge to preserve publications that share a system time.
 An empty covered page has no rows and carries the already-known held present in `rtdb.owned.present_micros`.
 
 === Retiring an owned relation

@@ -1,3 +1,4 @@
+mod changes;
 mod hosted_control;
 mod hosted_upload;
 mod prepared_landing;
@@ -2670,7 +2671,9 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_owned_identities_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_identities_action(
+        &self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned identity page has no held read handle"))?;
@@ -2699,14 +2702,16 @@ impl Service {
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
-        let reply = self.owned_point_reply(&schema, Some(&rows), system, valid, None)?;
+        let reply = self.owned_point_reply_in(self.memory(), &schema, Some(&rows), system, valid, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
 
     /// Identities current at the held system cut across all valid time,
     /// for a period table's bounded index build turns.
-    pub(crate) async fn held_owned_identities_all_valid_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_identities_all_valid_action(
+        &self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("Owned identity page has no held read handle"))?;
@@ -2735,7 +2740,7 @@ impl Service {
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
         // The reply's valid coordinate is the system cut it enumerated.
-        let reply = self.owned_point_reply(&schema, Some(&rows), system, system, None)?;
+        let reply = self.owned_point_reply_in(self.memory(), &schema, Some(&rows), system, system, None, None, reply_format)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -2877,8 +2882,8 @@ impl Service {
     }
 
     pub(crate) async fn archived_world_changes_action(
-        &self, call: &Call, body: &[u8], ancestor: bool,
-    ) -> Result<ActionResult, Status> {
+        &self, call: &Call, body: &[u8], ancestor: bool, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Earlier parent changes require a held world"))?;
         let (selected, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Earlier parent changes require a selected publication"))?;
@@ -2902,7 +2907,7 @@ impl Service {
             held.snapshot.parent_changes_at(&relation, selected, after, through, limit, reverse).await
         }.map_err(status)?;
         let nonce = held.remember(call, witness, false)?;
-        let reply = self.owned_merged_changes_reply(&page, selected, reverse, Some(nonce))?;
+        let reply = self.owned_merged_changes_reply(&page, selected, reverse, Some(nonce), ipc_stream)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -4224,7 +4229,9 @@ impl Service {
         self.owned_tx_reply(&session, committed.tx_key()).await
     }
 
-    pub(crate) async fn held_owned_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_changes_action(
+        &self, call: &Call, body: &[u8], ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned change read has no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -4244,14 +4251,14 @@ impl Service {
             let (lower, upper, valid, _bounds) = change_region_request(call, tail)?;
             held.snapshot.changes_in_region(&relation, after, limit, lower.as_ref(), upper.as_ref(), valid).await
         }.map_err(status)?;
-        let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time)?;
+        let reply = self.owned_changes_reply(&page, held.snapshot.present().system_time, ipc_stream)?;
         held.snapshot.check_live_change_relations(std::slice::from_ref(&relation)).map_err(status)?;
         Ok(reply)
     }
 
     pub(crate) async fn held_owned_storage_usage_action(
-        &self, call: &Call, body: &[u8],
-    ) -> Result<ActionResult, Status> {
+        &self, call: &Call, body: &[u8], ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned storage usage requires a held handle"))?;
         let held = self.owned_read(call, &Bytes::copy_from_slice(handle))?;
@@ -4285,7 +4292,7 @@ impl Service {
             Arc::new(Int64Array::from_iter(usage.iter().map(|row| row.history_search_bytes))),
             Arc::new(Int64Array::from_iter(usage.iter().map(|row| row.ordered_index_bytes))),
         ]).map_err(arrow)?;
-        let reply = self.owned_action_reply(&schema, Some(&batch))?;
+        let reply = self.encode_owned_stream_reply(self.memory(), &schema, &[batch], ipc_stream)?;
         held.snapshot.check().map_err(status)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
@@ -4344,7 +4351,9 @@ impl Service {
         Ok(ActionResult { body: wire::retain(reply, call.reserve(24)?) })
     }
 
-    pub(crate) async fn held_owned_merged_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_owned_merged_changes_action(
+        &self, call: &Call, body: &[u8], descending: bool, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Merged changes require a held read handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -4355,23 +4364,27 @@ impl Service {
         }
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
         let page = held.snapshot.merged_changes_window(&relations, after, through, limit, descending).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending, None)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present().system_time, descending, None, ipc_stream)?;
         held.snapshot.check_live_change_relations(&relations).map_err(status)?;
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_changes_action(&self, call: &Call, body: &[u8], descending: bool) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_changes_action(
+        &self, call: &Call, body: &[u8], descending: bool, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("World changes require a held world handle"))?;
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (after, through, limit, relations, _charge) = self.merged_changes_request(call, request)?;
         let page = held.snapshot.changes(&relations, after, through, limit, descending).await.map_err(status)?;
-        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending, None)?;
+        let reply = self.owned_merged_changes_reply(&page, held.snapshot.present(), descending, None, ipc_stream)?;
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_region_changes_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_region_changes_action(
+        &self, call: &Call, body: &[u8], ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("World region changes require a held world handle"))?;
@@ -4389,7 +4402,7 @@ impl Service {
             Timestamp(i64::from_be_bytes(*through)).into(), usize::from(u16::from_be_bytes(*limit)), false,
         ).await.map_err(status)?.into_relation_page().map_err(status)?;
         page.retain_identity_region(lower.as_ref(), upper.as_ref(), valid).map_err(status)?;
-        let reply = self.owned_changes_reply(&page, held.snapshot.present())?;
+        let reply = self.owned_changes_reply(&page, held.snapshot.present(), ipc_stream)?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -4419,14 +4432,9 @@ impl Service {
 
     fn owned_merged_changes_reply(
         &self, page: &rtdb_node::OwnedMergedChanges, present: Timestamp, descending: bool, witness: Option<Uuid>,
-    ) -> Result<ActionResult, Status> {
-        use rtdb_types::{LogicalType, ScalarType};
-
-        let changes_type = LogicalType::list(LogicalType::Struct(StructFields::from([
-            ("relation".into(), LogicalType::Scalar(ScalarType::Utf8)),
-            ("relation_sequence".into(), LogicalType::Scalar(ScalarType::U64)),
-            ("touches".into(), owned_touches_type()),
-        ])));
+        ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
+        let changes_type = changes::merged_type();
         let edge = page.covered_edge(descending).map_err(status)?;
         let (kind, position) = match edge.order {
             ChangeEdgeOrder::AsOf => (0, -1),
@@ -4449,28 +4457,21 @@ impl Service {
             rtdb_columnar::to_field("changes", &changes_type).map_err(status)?,
         ]).with_metadata(metadata);
         if page.commits.is_empty() {
-            return self.owned_action_reply(&schema, None);
+            return self.encode_owned_stream_reply(self.memory(), &schema, &[], ipc_stream);
         }
         let schema = Arc::new(schema);
         let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
         let history = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.system_time.0));
         let positions = Int64Array::from_iter_values(page.commits.iter().map(|commit| commit.publication.tx_id.0));
-        let changes: Vec<_> = page.commits.iter().map(|commit| Value::list(commit.changes.iter().map(|change| {
-            Value::Struct(StructFields::from([
-                ("relation".into(), Value::Utf8(change.relation.name().into())),
-                ("relation_sequence".into(), Value::U64(change.sequence)),
-                ("touches".into(), Value::list(change.touches.iter().map(rtdb_types::OwnedChange::to_value).collect())),
-            ]))
-        }).collect())).collect();
-        let _arrow = self.memory().reserve(rtdb_columnar::estimate_builder_bytes(&changes_type, &changes).map_err(status)?)
-            .map_err(status)?;
-        let changes = rtdb_columnar::build_array(&changes_type, &changes).map_err(status)?;
+        let (changes, _arrow) = changes::merged_column(self.memory(), &changes_type, schema.field(2), &page.commits)?;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(history), Arc::new(positions), changes]).map_err(arrow)?;
-        self.owned_action_reply(&schema, Some(&batch))
+        self.encode_owned_stream_reply(self.memory(), &schema, &[batch], ipc_stream)
     }
 
-    fn owned_changes_reply(&self, page: &rtdb_node::OwnedChangePage, present: Timestamp) -> Result<ActionResult, Status> {
-        let touches_type = owned_touches_type();
+    fn owned_changes_reply(
+        &self, page: &rtdb_node::OwnedChangePage, present: Timestamp, ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
+        let touches_type = changes::touches_type();
         let schema = Arc::new(Schema::new(vec![
             Field::new("revision", DataType::UInt64, false),
             Field::new("system_time_micros", DataType::Int64, false),
@@ -4479,18 +4480,15 @@ impl Service {
             (OWNED_PRESENT.into(), present.0.to_string()),
             (OWNED_CHANGE_COVERAGE.into(), page.covered_through.0.to_string()),
         ])));
-        if page.groups.is_empty() { return self.owned_action_reply(&schema, None); }
+        if page.groups.is_empty() {
+            return self.encode_owned_stream_reply(self.memory(), &schema, &[], ipc_stream);
+        }
         let _rows = self.memory().reserve(wire::add(wire::mul(page.retained_bytes, 2)?, 8192)?).map_err(status)?;
         let revisions = UInt64Array::from(page.groups.iter().map(|group| group.revision).collect::<Vec<_>>());
         let times = Int64Array::from(page.groups.iter().map(|group| group.system_time.0).collect::<Vec<_>>());
-        let touches: Vec<_> = page.groups.iter().map(|group| Value::list(
-            group.touches.iter().map(rtdb_types::OwnedChange::to_value).collect(),
-        )).collect();
-        let _arrow = self.memory().reserve(rtdb_columnar::estimate_builder_bytes(&touches_type, &touches).map_err(status)?)
-            .map_err(status)?;
-        let touches = rtdb_columnar::build_array(&touches_type, &touches).map_err(status)?;
+        let (touches, _arrow) = changes::touches_column(self.memory(), &touches_type, schema.field(2), &page.groups)?;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(revisions), Arc::new(times), touches]).map_err(arrow)?;
-        self.owned_action_reply(&schema, Some(&batch))
+        self.encode_owned_stream_reply(self.memory(), &schema, &[batch], ipc_stream)
     }
 
     fn take_owned_read(&self, call: &Call, handle: &Bytes) -> Result<Arc<OwnedReadResource>, Status> {
@@ -4858,7 +4856,9 @@ impl Service {
         Ok(reply)
     }
 
-    pub(crate) async fn held_world_identities_action(&self, call: &Call, body: &[u8], mode: WorldIdentityRead) -> Result<ActionResult, Status> {
+    pub(crate) async fn held_world_identities_action(
+        &self, call: &Call, body: &[u8], mode: WorldIdentityRead, reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned world identities have no held handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -4911,7 +4911,10 @@ impl Service {
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string())].into()
         );
-        let reply = self.owned_point_reply(&schema, Some(&rows), system.unwrap_or_else(|| held.snapshot.present()), valid, None)?;
+        let reply = self.owned_point_reply_in(
+            self.memory(), &schema, Some(&rows), system.unwrap_or_else(|| held.snapshot.present()), valid,
+            None, None, reply_format,
+        )?;
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)
     }
@@ -6253,22 +6256,6 @@ mod audience_projection_tests {
         assert!(!audience_point_admitted(&visible, &readiness, &id("layout"), false));
         assert!(audience_point_admitted(&visible, &readiness, &id("layout"), true));
     }
-}
-
-fn owned_touches_type() -> rtdb_types::LogicalType {
-    use rtdb_types::{LogicalType, ScalarType};
-
-    let logical_id = LogicalType::from_legs([ScalarType::I64, ScalarType::Utf8, ScalarType::Keyword, ScalarType::Uuid]
-        .into_iter().map(LogicalType::Scalar));
-    LogicalType::list(LogicalType::Struct(StructFields::from([
-        ("_id".into(), logical_id),
-        ("op".into(), LogicalType::Scalar(ScalarType::Utf8)),
-        ("valid_from_micros".into(), LogicalType::Scalar(ScalarType::I64)),
-        ("valid_to_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
-        ("created_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
-        ("expiry_micros".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
-        ("assertion_ordinal".into(), LogicalType::Scalar(ScalarType::I64).maybe()),
-    ])))
 }
 
 #[cfg(test)]

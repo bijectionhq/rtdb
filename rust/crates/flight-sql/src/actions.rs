@@ -292,18 +292,25 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_COUNT_V2 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, false).await?)]),
                 crate::owned_actions::HELD_OWNED_MEASURE_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, false, true).await?)]),
                 crate::owned_actions::HELD_OWNED_MEASURE_AT_V1 => Ok(vec![Ok(self.held_owned_count_action(&call, &action.body, true, true).await?)]),
-                crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::READ_HELD_WORLD_CHANGES_V4 => Ok(vec![Ok(self.held_world_changes_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 => Ok(vec![Ok(self.held_world_region_changes_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 => Ok(vec![Ok(self.held_owned_storage_usage_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2 | crate::owned_actions::READ_HELD_WORLD_CHANGES_V4 => {
+                    let descending = action_type == crate::owned_actions::READ_HELD_WORLD_CHANGES_DESCENDING_V2;
+                    return self.held_world_changes_action(&call, &action.body, descending, ipc_stream).await.map(ActionReplies::Owned);
+                }
+                crate::owned_actions::READ_HELD_WORLD_REGION_CHANGES_V1 =>
+                    return self.held_world_region_changes_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_STORAGE_USAGE_V1 =>
+                    return self.held_owned_storage_usage_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2 | crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V4 => {
+                    let descending = action_type == crate::owned_actions::HELD_OWNED_MERGED_CHANGES_DESCENDING_V2;
+                    return self.held_owned_merged_changes_action(&call, &action.body, descending, ipc_stream).await.map(ActionReplies::Owned);
+                }
                 crate::owned_actions::HELD_LOOKUP_PUBLICATION_V1 => Ok(vec![Ok(self.held_lookup_publication_action(&call, &action.body).await?)]),
                 HELD_TABLE_PUBLICATION_SEQUENCE_V1 => Ok(vec![Ok(self.held_table_publication_sequence_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_MERGED_CHANGES_V4 => Ok(vec![Ok(self.held_owned_merged_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::READ_HELD_EXPIRY_CANDIDATES_V1 => Ok(vec![Ok(self.held_expiry_candidates_action(&call, &action.body).await?)]),
                 crate::owned_actions::APPLY_HELD_EXPIRY_V1 => Ok(vec![Ok(self.apply_held_expiry_action(&call, &action.body).await?)]),
                 crate::owned_actions::NOMINATE_HELD_EXPIRY_V1 => Ok(vec![Ok(self.nominate_held_expiry_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_CHANGES_V3 => Ok(vec![Ok(self.held_owned_changes_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_CHANGES_V3 =>
+                    return self.held_owned_changes_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(self.held_owned_unique_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_UNIQUE_WINDOW_V1 => Ok(vec![Ok(self.held_owned_unique_window_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_OWNED_POINT_V1 =>
@@ -314,23 +321,38 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_FIXED_POINT_V1 =>
                     return self.held_owned_point(&call, &action.body, PointTime::Required, false, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierParent).await?)]),
-                crate::owned_actions::HELD_WORLD_PARENT_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::ParentAt).await?)]),
                 crate::owned_actions::HELD_WORLD_VALID_AT_V1 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::EarlierEffective).await?)]),
                 crate::owned_actions::HELD_WORLD_VALID_V2 => Ok(vec![Ok(self.held_world_valid_during_action(&call, &action.body, crate::owned_actions::WorldHistoricalRead::Current).await?)]),
-                crate::owned_actions::HELD_WORLD_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::EffectiveAt).await?)]),
-                crate::owned_actions::HELD_WORLD_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::Effective).await?)]),
-                crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_AT_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::OverlayAt).await?)]),
-                crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => Ok(vec![Ok(self.held_world_identities_action(&call, &action.body, crate::owned_actions::WorldIdentityRead::Overlay).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_IDENTITIES_AT_V1 | crate::owned_actions::HELD_WORLD_IDENTITIES_AT_V1
+                | crate::owned_actions::HELD_WORLD_IDENTITIES_V1 | crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_AT_V1
+                | crate::owned_actions::HELD_WORLD_OVERLAY_IDENTITIES_V1 => {
+                    use crate::owned_actions::{
+                        HELD_WORLD_IDENTITIES_AT_V1, HELD_WORLD_IDENTITIES_V1, HELD_WORLD_OVERLAY_IDENTITIES_AT_V1,
+                        HELD_WORLD_PARENT_IDENTITIES_AT_V1, WorldIdentityRead,
+                    };
+                    let mode = match action_type {
+                        HELD_WORLD_PARENT_IDENTITIES_AT_V1 => WorldIdentityRead::ParentAt,
+                        HELD_WORLD_IDENTITIES_AT_V1 => WorldIdentityRead::EffectiveAt,
+                        HELD_WORLD_IDENTITIES_V1 => WorldIdentityRead::Effective,
+                        HELD_WORLD_OVERLAY_IDENTITIES_AT_V1 => WorldIdentityRead::OverlayAt,
+                        _ => WorldIdentityRead::Overlay,
+                    };
+                    return self.held_world_identities_action(&call, &action.body, mode, reply_format).await.map(ActionReplies::Owned);
+                }
                 crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 => Ok(vec![Ok(self.held_protected_coverage_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V1 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 => Ok(vec![Ok(self.held_protected_carriers_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_IDENTITIES_V1 => Ok(vec![Ok(self.held_owned_identities_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_OWNED_IDENTITIES_ALL_VALID_V1 => Ok(vec![Ok(self.held_owned_identities_all_valid_action(&call, &action.body).await?)]),
+                crate::owned_actions::HELD_OWNED_IDENTITIES_V1 =>
+                    return self.held_owned_identities_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
+                crate::owned_actions::HELD_OWNED_IDENTITIES_ALL_VALID_V1 =>
+                    return self.held_owned_identities_all_valid_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
                 crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V5 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V2 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V2 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
+                crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V2 | crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V2 => {
+                    let ancestor = action_type == crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V2;
+                    return self.archived_world_changes_action(&call, &action.body, ancestor, ipc_stream).await.map(ActionReplies::Owned);
+                }
                 crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_OWNED_VERSIONS_V2 => Ok(self.held_owned_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
                 crate::owned_actions::HELD_WORLD_VERSION_V2 => self.held_world_version_action(&call, &action.body).await,
