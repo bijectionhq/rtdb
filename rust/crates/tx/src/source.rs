@@ -5,10 +5,10 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
+use prost::{Message, encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len}};
 use rtdb_columnar::{ArrowCell, BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, estimate_builder_bytes_refs, estimate_read_value_bytes, from_field, read_value, struct_field_cell, to_field};
-use rtdb_format::envelope::{SourceBody, SourceMessage};
-use prost::Message;
+use rtdb_format::{PROTOBUF_LOG_HEADER, envelope::{SourceBody, SourceMessage}};
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, OrderedSet, PlacedAttempt, PlacedAttemptSeed, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, Value};
 
 use crate::{ArrowDocumentWrite, ArrowDocuments, Documents, EntityIds, OwnedPeriodEffect, OwnedRelativePeriod, ReplaySubmission, RetainedBytes, SqlArguments, SubmitOptions, TxOp, UserMetadata};
@@ -19,6 +19,11 @@ use crate::values::arguments::{canonical_float_field, compatible_float_cell, flo
 pub(crate) mod canonical;
 
 const LEGACY_REPLAY_ABORT: &str = "ASSERT FALSE";
+const SOURCE_TX_TAG: u32 = 6;
+const TX_OPS_TAG: u32 = 1;
+// Keep the IPC start on an eight-byte boundary within the allocation for retained replay.
+const SOURCE_PREFIX_SPACE: usize = (1 + key_len(SOURCE_TX_TAG) + key_len(TX_OPS_TAG)
+    + 2 * encoded_len_varint(u64::MAX)).next_multiple_of(8);
 // The hosted value model admits UTC years 0001 through 9999.
 const HOSTED_INSTANT_MICROS: std::ops::Range<i64> = -62_135_596_800_000_000..253_402_300_800_000_000;
 
@@ -383,7 +388,9 @@ impl SourceTransaction {
             Operation::Public(TxOp::Sql { sql: LEGACY_REPLAY_ABORT.into(), args: None })
         });
         let batch = self.operation_batch(prefix.as_ref(), SourcePurpose::Log)?;
-        let bytes = crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?;
+        let mut output = crate::ipc::Output::new(&self.memory, SOURCE_PREFIX_SPACE)?;
+        output.write_stream(batch.batch().schema_ref(), [batch.batch()])?;
+        let ops_len = output.len() - SOURCE_PREFIX_SPACE;
         let metadata = self.options.user_metadata.as_ref().map(|metadata| encode_metadata(metadata, &self.memory)).transpose()?;
         let body_size = self.options.default_tz.capacity().checked_add(self.options.user.as_ref().map_or(0, String::capacity)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let _body_reservation = self.memory.reserve(body_size)?;
@@ -405,21 +412,35 @@ impl SourceTransaction {
             })),
             None => (None, None, None),
         };
-        let (tx_ops, _tx_ops_reservation) = bytes.into_parts();
         let (user_metadata, _user_metadata_reservation) = metadata.map(RetainedBytes::into_parts).unzip();
-        let tx = rtdb_format::generated::xtdb::log::proto::Tx {
-            tx_ops: Some(tx_ops.into()),
+        let tx = proto::Tx {
+            tx_ops: None,
             default_tz: Some(self.options.default_tz.clone()), user: self.options.user.clone(),
-            user_metadata: user_metadata.map(Into::into), external_source_token: None,
+            user_metadata, external_source_token: None,
             idempotency_guard,
             replay_submission,
             bounded_retry,
             placed_attempt_seed: self.placed_seed.map(|seed| seed.encode().to_vec().into()),
         };
-        let wire = rtdb_format::generated::xtdb::log::proto::SourceLogMessage { message: Some(SourceBody::Tx(tx)) };
-        let reservation = self.memory.reserve(wire.encoded_len().checked_add(128).ok_or_else(overflow)?)?;
-        let encoded = SourceMessage::Protobuf(wire.message.ok_or_else(|| invalid("Source envelope has no transaction"))?).encode()?;
-        RetainedBytes::with_reservation(encoded, reservation)
+        let tail_len = tx.encoded_len();
+        let ops_prefix_len = key_len(TX_OPS_TAG) + encoded_len_varint(ops_len as u64);
+        let tx_len = ops_len.checked_add(ops_prefix_len)
+            .and_then(|len| len.checked_add(tail_len)).ok_or_else(overflow)?;
+        let prefix_len = 1 + key_len(SOURCE_TX_TAG) + encoded_len_varint(tx_len as u64) + ops_prefix_len;
+        let start = SOURCE_PREFIX_SPACE - prefix_len;
+
+        output.reserve(tail_len)?;
+        let (mut encoded, reservation) = output.into_parts();
+        tx.encode(&mut encoded).expect("the source buffer has room for the protobuf tail");
+
+        // Prost writes tx_ops first. Right-align the actual prefix so the IPC stays in place.
+        let mut header = &mut encoded[start..SOURCE_PREFIX_SPACE];
+        header.put_u8(PROTOBUF_LOG_HEADER);
+        encode_key(SOURCE_TX_TAG, WireType::LengthDelimited, &mut header);
+        encode_varint(tx_len as u64, &mut header);
+        encode_key(TX_OPS_TAG, WireType::LengthDelimited, &mut header);
+        encode_varint(ops_len as u64, &mut header);
+        RetainedBytes::with_reserved_suffix(encoded, start, reservation)
     }
 
     fn operation_batch(&self, prefix: Option<&Operation>, purpose: SourcePurpose) -> Result<OwnedBatch> {
@@ -3053,6 +3074,111 @@ mod tests {
         let encoded = source.encode().unwrap();
         let message = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
         SourceTransaction::decode(&message, &source.memory).unwrap()
+    }
+
+    #[test]
+    fn journal_source_bytes_match_generated_protobuf_for_ordinary_and_hosted_guards() {
+        use rtdb_format::generated::xtdb::log::proto;
+        use rtdb_types::PlacedAttemptScope;
+
+        let memory = budget();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let seed = PlacedAttemptScope::new("history", 7).unwrap().issue();
+        let ordinary = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &memory).unwrap();
+        let application = SourceTransaction::new(vec![TxOp::Sql {
+            sql: format!("ASSERT TRUE /*{}*/", "x".repeat(16_384)), args: None,
+        }], SubmitOptions { user: Some("writer".into()), ..Default::default() }, &memory).unwrap()
+            .with_idempotency_guard(Timestamp(-1), false);
+        let relation = rtdb_types::OwnedRelation::new("facts").unwrap();
+        let batch = RecordBatch::try_from_iter([
+            ("_id", Arc::new(arrow_array::StringArray::from(vec!["a", "b"])) as ArrayRef),
+            ("payload", Arc::new(arrow_array::BinaryArray::from(vec![Some(b"data".as_slice()), None]))),
+        ]).unwrap();
+        let batch = OwnedBatch::new(batch, &memory).unwrap();
+        let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+        let hosted_ops = || vec![
+            TxOp::OwnedDelete {
+                relation: relation.clone(), id: EntityId::String("first".into()), valid_from: None, valid_to: None,
+            },
+            TxOp::OwnedArrowDocs {
+                relation: relation.clone(), documents: documents.clone(), create_only: true, valid_from: None, valid_to: None,
+            },
+            TxOp::OwnedDelete {
+                relation: relation.clone(), id: EntityId::String("last".into()), valid_from: None, valid_to: None,
+            },
+        ];
+        let replay = ReplaySubmission::admit(&format!("{nonce}/0"), Timestamp(1), Timestamp(2)).unwrap();
+        let hosted = SourceTransaction::new(hosted_ops(), SubmitOptions::default(), &memory).unwrap()
+            .with_replay_submission(replay).with_placed_seed(Some(seed));
+        let bounded_metadata = UserMetadata::new(Value::Struct(StructFields::from([
+            (BOUNDED_RETRY_METADATA_KEY.into(), Value::Struct(StructFields::from([
+                ("nonce".into(), Value::Utf8(nonce.into())), ("not_after_micros".into(), Value::I64(2)),
+            ]))),
+        ])), &memory).unwrap();
+        let bounded = SourceTransaction::new(hosted_ops(), SubmitOptions {
+            user: Some("owner".into()), user_metadata: Some(bounded_metadata), ..Default::default()
+        }, &memory).unwrap().with_placed_seed(Some(seed));
+
+        for (source, mut tx, legacy_abort) in [
+            (ordinary, proto::Tx::default(), false),
+            (application, proto::Tx {
+                user: Some("writer".into()), idempotency_guard: Some(proto::IdempotencyGuard {
+                    submitted_at_micros: Some(-1), after_bootstrap: Some(false),
+                }), ..Default::default()
+            }, false),
+            (hosted, proto::Tx {
+                replay_submission: Some(proto::ReplaySubmission {
+                    key: Some(format!("{nonce}/0")), submitted_at_micros: Some(1),
+                    not_after_micros: Some(2), abort_on_legacy_resolver: Some(true),
+                }), placed_attempt_seed: Some(seed.encode().to_vec().into()), ..Default::default()
+            }, true),
+            (bounded, proto::Tx {
+                user: Some("owner".into()), bounded_retry: Some(proto::BoundedRetry {
+                    nonce: Some(nonce.as_bytes().to_vec()), not_after_micros: Some(2),
+                }), placed_attempt_seed: Some(seed.encode().to_vec().into()), ..Default::default()
+            }, true),
+        ] {
+            let legacy_assertion = legacy_abort.then(|| Operation::Public(TxOp::Sql {
+                sql: "ASSERT FALSE".into(), args: None,
+            }));
+            let batch = source.operation_batch(legacy_assertion.as_ref(), SourcePurpose::Log).unwrap();
+            let ipc = rtdb_format::ipc::write_stream_to(batch.batch().schema_ref(), [batch.batch()], Vec::new()).unwrap();
+            tx.tx_ops = Some(ipc.into());
+            tx.default_tz = Some("UTC".into());
+            tx.user_metadata = source.options.user_metadata.as_ref().map(|metadata| {
+                Bytes::copy_from_slice(encode_metadata(metadata, &memory).unwrap().as_slice())
+            });
+            let expected = SourceMessage::Protobuf(SourceBody::Tx(tx)).encode().unwrap();
+
+            let base_charge = memory.used_bytes();
+            let actual = source.encode().unwrap();
+            assert_eq!(actual.as_slice(), expected.as_slice());
+            let address = actual.as_slice().as_ptr();
+            let bytes = actual.into_bytes();
+            assert_eq!(bytes.as_ptr(), address);
+            let retained_charge = memory.used_bytes();
+            assert!(retained_charge >= base_charge + bytes.len());
+            let message = SourceMessage::decode_bytes(bytes.clone()).unwrap().unwrap();
+            drop(bytes);
+            assert_eq!(memory.used_bytes(), retained_charge);
+
+            let replay = SourceTransaction::decode(&message, &memory).unwrap();
+            assert_eq!(replay.operations.len(), source.operations.len());
+            if legacy_abort {
+                let [Operation::Public(TxOp::OwnedDelete { id: first, .. }),
+                    Operation::OwnedArrowIids { documents, iids, create_only: true, .. },
+                    Operation::Public(TxOp::OwnedDelete { id: last, .. })] = replay.operations.as_slice() else {
+                    panic!("expected hosted operations in their submitted order");
+                };
+                assert_eq!(first, &EntityId::String("first".into()));
+                assert_eq!(last, &EntityId::String("last".into()));
+                assert_eq!(iids, &[EntityId::String("a".into()).iid(), EntityId::String("b".into()).iid()]);
+                assert!(documents.array().column(1).is_null(1));
+            }
+            assert_eq!(replay.placed_seed, source.placed_seed);
+            drop((replay, message));
+            assert_eq!(memory.used_bytes(), base_charge);
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, ListArray, PrimitiveArray, RecordBatch, StructArray, cast::AsArray, types::{Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type}};
 use arrow_schema::{DataType, Fields, Schema};
+use bytes::Bytes;
 use rtdb_columnar::{ArrowCell, ColumnReader, MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_types::{Anomaly, EntityId, ListKind, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
@@ -13,21 +14,24 @@ mod union;
 pub(crate) use arguments::valid_argument_union_cell;
 
 #[derive(Clone, Debug)]
-pub struct RetainedBytes { data: Arc<Vec<u8>>, _reservation: Arc<MemoryReservation> }
+pub struct RetainedBytes { data: Bytes, _reservation: Arc<MemoryReservation> }
 impl RetainedBytes {
     /// Adopts an existing allocation; producers of large payloads must reserve before allocating.
     pub fn new(data: Vec<u8>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = memory.reserve(data.capacity().checked_add(128).ok_or_else(overflow)?)?;
-        Ok(Self { data: Arc::new(data), _reservation: reservation })
+        Self::with_reservation(data, reservation)
     }
     pub fn as_slice(&self) -> &[u8] { &self.data }
-    pub(crate) fn into_parts(self) -> (Vec<u8>, Arc<MemoryReservation>) {
-        (Arc::unwrap_or_clone(self.data), self._reservation)
+    pub(crate) fn into_parts(self) -> (Bytes, Arc<MemoryReservation>) {
+        (self.data, self._reservation)
     }
-    pub fn into_bytes(self) -> bytes::Bytes { bytes::Bytes::from_owner(self) }
+    pub fn into_bytes(self) -> Bytes { Bytes::from_owner(self) }
     pub fn with_reservation(data: Vec<u8>, reservation: Arc<MemoryReservation>) -> Result<Self> {
+        Self::with_reserved_suffix(data, 0, reservation)
+    }
+    pub(crate) fn with_reserved_suffix(data: Vec<u8>, start: usize, reservation: Arc<MemoryReservation>) -> Result<Self> {
         if data.capacity() > reservation.bytes() { return Err(Anomaly::fault("rtdb.tx/byte-reservation", "Encoded payload exceeds its reservation")); }
-        Ok(Self { data: Arc::new(data), _reservation: reservation })
+        Ok(Self { data: Bytes::from(data).slice(start..), _reservation: reservation })
     }
 }
 impl AsRef<[u8]> for RetainedBytes { fn as_ref(&self) -> &[u8] { self.as_slice() } }
@@ -1724,7 +1728,7 @@ pub struct SubmittedTx {
 }
 
 #[derive(Debug)]
-struct AnomalyAllocation { error: Anomaly, wire: Option<Arc<Vec<u8>>>, reservation: Arc<MemoryReservation> }
+struct AnomalyAllocation { error: Anomaly, wire: Option<Bytes>, reservation: Arc<MemoryReservation> }
 
 #[derive(Clone, Debug)]
 pub struct RetainedAnomaly(Arc<AnomalyAllocation>);
@@ -1738,10 +1742,10 @@ impl RetainedAnomaly {
         let _transient = memory.reserve(bytes.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let error = rtdb_format::transit::decode_anomaly(bytes)?;
         let reservation = memory.reserve(anomaly_bytes(&error)?.checked_add(bytes.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
-        Ok(Self(Arc::new(AnomalyAllocation { error, wire: Some(Arc::new(bytes.to_vec())), reservation })))
+        Ok(Self(Arc::new(AnomalyAllocation { error, wire: Some(Bytes::copy_from_slice(bytes)), reservation })))
     }
     pub fn encode(&self) -> Result<RetainedBytes> {
-        if let Some(wire) = &self.0.wire { return Ok(RetainedBytes { data: Arc::clone(wire), _reservation: Arc::clone(&self.0.reservation) }); }
+        if let Some(wire) = &self.0.wire { return Ok(RetainedBytes { data: wire.clone(), _reservation: Arc::clone(&self.0.reservation) }); }
         let bound = anomaly_bytes(&self.0.error)?.checked_mul(8).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?;
         let reservation = self.0.reservation.budget().reserve(bound)?;
         RetainedBytes::with_reservation(rtdb_format::transit::encode_anomaly(&self.0.error)?, reservation)

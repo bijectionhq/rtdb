@@ -11,25 +11,64 @@ use rtdb_types::{Anomaly, Result};
 
 use crate::RetainedBytes;
 
-struct Sink { chunks: Vec<(Vec<u8>, Arc<MemoryReservation>)>, memory: Arc<MemoryBudget>, length: usize }
-impl Write for Sink {
+pub(crate) struct Output {
+    data: Vec<u8>,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl Output {
+    pub(crate) fn new(memory: &Arc<MemoryBudget>, prefix_len: usize) -> Result<Self> {
+        let reservation = memory.reserve(prefix_len.checked_add(128).ok_or_else(overflow)?)?;
+        Ok(Self { data: vec![0; prefix_len], reservation })
+    }
+
+    pub(crate) fn len(&self) -> usize { self.data.len() }
+
+    pub(crate) fn reserve(&mut self, additional: usize) -> Result<()> {
+        let required = self.len().checked_add(additional).ok_or_else(overflow)?;
+        let capacity = self.data.capacity();
+        if required <= capacity { return Ok(()); }
+
+        let preferred = required.saturating_add((capacity / 2).max(256));
+        let reserve = |capacity: usize| {
+            self.reservation.budget().reserve(capacity.checked_add(128).ok_or_else(overflow)?)
+        };
+        // A reallocating growth can briefly keep the old allocation live.
+        let (capacity, reservation) = match reserve(preferred) {
+            Err(_) if preferred > required => (required, reserve(required)?),
+            result => (preferred, result?),
+        };
+        let additional = capacity - self.len();
+        self.data.try_reserve_exact(additional)
+            .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+        self.reservation = reservation;
+        Ok(())
+    }
+
+    pub(crate) fn write_stream<'a>(&mut self, schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>) -> Result<()> {
+        let _schema = self.reservation.budget().reserve(rtdb_format::ipc::schema_translation_bound(schema)?)?;
+        rtdb_format::ipc::write_stream_to(schema, pages, self)?;
+        Ok(())
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Arc<MemoryReservation>) {
+        (self.data, self.reservation)
+    }
+}
+
+impl Write for Output {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let length = self.length.checked_add(bytes.len()).ok_or_else(|| io::Error::other("IPC length overflow"))?;
-        let reservation = self.memory.reserve(bytes.len().checked_add(256).ok_or_else(|| io::Error::other("IPC reservation overflow"))?).map_err(io::Error::other)?;
-        self.chunks.push((bytes.to_vec(), reservation));
-        self.length = length;
+        self.reserve(bytes.len()).map_err(io::Error::other)?;
+        self.data.extend_from_slice(bytes);
         Ok(bytes.len())
     }
     fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 pub(crate) fn encode<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
-    let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(schema)?)?;
-    let sink = Sink { chunks: Vec::new(), memory: Arc::clone(memory), length: 0 };
-    let sink = rtdb_format::ipc::write_stream_to(schema, pages, sink)?;
-    let reservation = memory.reserve(sink.length.checked_add(128).ok_or_else(overflow)?)?;
-    let mut data = Vec::with_capacity(sink.length);
-    for (chunk, _reservation) in sink.chunks { data.extend_from_slice(&chunk); }
+    let mut output = Output::new(memory, 0)?;
+    output.write_stream(schema, pages)?;
+    let (data, reservation) = output.into_parts();
     RetainedBytes::with_reservation(data, reservation)
 }
 
@@ -88,6 +127,22 @@ pub(crate) fn allocation_bound(bytes: &[u8]) -> Result<usize> {
 
 fn overflow() -> Anomaly { invalid("IPC allocation bound exceeds address space") }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.tx/invalid-ipc", message) }
+
+#[test]
+fn ipc_output_falls_back_to_exact_growth_and_releases_failed_growth() {
+    let memory = MemoryBudget::new((64 + 128) + (65 + 128));
+    let mut output = Output::new(&memory, 64).unwrap();
+    output.write_all(&[7]).unwrap();
+    assert_eq!(memory.used_bytes(), 65 + 128);
+
+    assert!(output.write_all(&[8]).is_err());
+    assert_eq!(output.len(), 65);
+    assert_eq!(output.data[64], 7);
+    assert_eq!(memory.used_bytes(), 65 + 128);
+
+    drop(output);
+    assert_eq!(memory.used_bytes(), 0);
+}
 
 #[test]
 fn replay_ipc_buffers_keep_the_source_allocation_and_its_charge() {

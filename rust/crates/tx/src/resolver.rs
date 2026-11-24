@@ -202,7 +202,7 @@ impl ResolvedTx {
             let name = format!("{}/{}", table.schema, table.table);
             bound = bound.checked_add(name.capacity()).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
             let (bytes, reservation) = bytes.into_parts();
-            tables.push((name, bytes.into()));
+            tables.push((name, bytes));
             table_reservations.push(reservation);
         }
         let error = self.result.encoded_error()?;
