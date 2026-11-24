@@ -1096,9 +1096,15 @@ async fn owned_v2_layout_reads_both_legs_after_redeclaration() {
     assert_eq!(selected[0].body.as_ref(), &[0]);
     client.action("rtdb.owned.DeclareRelation.v2", declaration("i64")).await.unwrap();
     let selected = client.action(layout, Bytes::from_static(relation)).await.unwrap();
-    assert_eq!(selected[0].body.as_ref(), &[2]);
+    assert_eq!(selected[0].body[0], 2);
+    assert_eq!(&selected[0].body[1..], &declaration("i64")[relation.len()..]);
     client.action("rtdb.owned.Create.v1", request(1, Some(Arc::new(Int64Array::from(vec![7]))))).await.unwrap();
     client.action("rtdb.owned.DeclareRelation.v2", declaration("utf8")).await.unwrap();
+    let selected = client.action(layout, Bytes::from_static(relation)).await.unwrap();
+    assert_eq!(selected[0].body[0], 2);
+    let installed = rtdb_types::OwnedSchema::from_json(&selected[0].body[1..]).unwrap();
+    assert!(installed.validate_row(&rtdb_types::StructFields::from([("value".into(), Value::I64(7))])).is_ok());
+    assert!(installed.validate_row(&rtdb_types::StructFields::from([("value".into(), Value::Utf8("seven".into()))])).is_ok());
     let text = Arc::new(StringArray::from(vec!["seven"]));
     client.action("rtdb.owned.Create.v1", request(2, Some(text))).await.unwrap();
 

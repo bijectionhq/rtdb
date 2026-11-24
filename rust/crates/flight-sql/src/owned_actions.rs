@@ -825,8 +825,20 @@ impl Service {
         let connection = self.connection(call, &call.database).await?;
         let mut native = connection.borrow().await?;
         require_idle(&native)?;
-        let version = native.owned_relation_layout_version(&relation).await.map_err(status)?.unwrap_or(0);
-        Ok(ActionResult { body: Bytes::copy_from_slice(&[version]) })
+        let layout = native.owned_relation_layout(&relation).await.map_err(status)?;
+        let body = match layout {
+            None => Bytes::from_static(b"\x00"),
+            Some((schema, _held)) if schema.is_v2() => {
+                let reservation = call.reserve(rtdb_types::OwnedSchema::MAX_JSON_BYTES * 3 + 1)?;
+                let encoded = schema.to_json().map_err(status)?;
+                let mut body = Vec::with_capacity(encoded.len() + 1);
+                body.push(2);
+                body.extend_from_slice(&encoded);
+                wire::retain(Bytes::from(body), reservation)
+            }
+            Some(_) => Bytes::from_static(b"\x01"),
+        };
+        Ok(ActionResult { body })
     }
 
     pub(crate) async fn declare_owned_relation_action(&self, call: &Call, body: &[u8], v2: bool) -> Result<ActionResult, Status> {

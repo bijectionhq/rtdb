@@ -3903,13 +3903,12 @@ impl NativeSession {
         Ok(self.instrument_query_context(self.service.query_context(self.state.database(), &basis, self.state.cancellation()).await?))
     }
 
-    pub async fn owned_relation_layout_version(&mut self, relation: &rtdb_types::OwnedRelation) -> Result<Option<u8>> {
+    pub async fn owned_relation_layout(&mut self, relation: &rtdb_types::OwnedRelation) -> Result<Option<(rtdb_types::OwnedSchema, Arc<rtdb_columnar::MemoryReservation>)>> {
         if !self.service.node.factory.options.owned_relations { return Err(owned_relations_disabled()); }
         let owner = self.state.user().filter(|owner| !owner.is_empty()).map(str::to_owned)
             .ok_or_else(|| Anomaly::new(AnomalyCategory::Forbidden, "rtdb.owned/no-owner", "Owned relations require an authenticated principal"))?;
         let context = self.query_context().await?;
-        Ok(rtdb_query::read_owned_relation_schema(context, &owner, relation).await?
-            .map(|(schema, _)| if schema.is_v2() { 2 } else { 1 }))
+        rtdb_query::read_owned_relation_schema(context, &owner, relation).await
     }
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;

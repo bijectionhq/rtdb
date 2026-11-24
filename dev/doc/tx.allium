@@ -93,7 +93,7 @@
 -- The owner declares the first layout before an owned relation has stored data.
 -- A version 1 declaration is immutable and specifies one scalar type per field.
 -- The owned Flight capability action advertises version 2 and a separate declaration action admits that version.
--- The layout lookup returns the selected Root relation's declaration version at an authenticated live cut.
+-- The layout lookup returns the selected Root relation's declaration version at an authenticated live cut and includes the effective declaration for version 2.
 -- Version 2 admits bounded clear scalar, dense-union, list and struct shapes.
 -- Each admitted Decimal128 coefficient fits the precision of its selected leaf, including inside lists and structs.
 -- An ordered version 2 redeclaration joins the new clear shapes with the stored declaration and preserves earlier admissions.
