@@ -431,7 +431,7 @@ fn interrupted() -> Anomaly {
 
 #[cfg(test)]
 mod tests {
-    use journal_contract::{Identity, MemoryJournal};
+    use journal_contract::{Identity, reference::MemoryJournal};
     use rtdb_crypt::LocalKms;
     use rtdb_db::MultiOptions;
     use rtdb_query::{
@@ -493,7 +493,7 @@ mod tests {
                 lease_micros: 100,
                 drift_micros: 1,
             },
-            Arc::new(journal.handle(Identity(1))),
+            Arc::new(journal.handle(Identity::from_static("urn:rtdb:test:1"))),
             Arc::new(MemoryStore::default()),
             Arc::new(LocalKms::new(|| 10)),
             Arc::new(|| Timestamp(10)),
@@ -623,7 +623,8 @@ mod tests {
         let node = IpAddr::from([127, 0, 0, 1]);
         let database = MultiDatabase::new(
             MultiOptions { database: id, node, lease_micros: 100, drift_micros: 1 },
-            Arc::new(journal.handle(Identity(1))), Arc::new(MemoryStore::default()),
+            Arc::new(journal.handle(Identity::from_static("urn:rtdb:test:1"))),
+            Arc::new(MemoryStore::default()),
             Arc::new(LocalKms::new(|| 10)), Arc::new(|| Timestamp(10)),
         ).unwrap();
         database.create().await.unwrap();

@@ -9,10 +9,10 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 journal-contract.workspace = true
-stream-contract = { package = "journal-contract", git = "https://github.com/bijectionhq/logkeeper.git", rev = "6e1e1d772bc7e2a2902d7b58f19b08e68d807db2" }
-stream-logkeeper = { package = "logkeeper", git = "https://github.com/bijectionhq/logkeeper.git", rev = "6e1e1d772bc7e2a2902d7b58f19b08e68d807db2", features = ["stream"] }
+stream-logkeeper.workspace = true
 
 [dev-dependencies]
+journal-contract = { workspace = true, features = ["conformance"] }
 tempfile.workspace = true
 tokio.workspace = true
 

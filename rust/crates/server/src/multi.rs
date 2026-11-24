@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use journal_contract::{FileJournal, Identity, Journal, JournalError, Limits, StreamId};
+use journal_contract::{
+    Identity, Journal, JournalError, StreamId,
+    reference::{FileJournal, Limits},
+};
 use rtdb_columnar::MemoryBudget;
 use rtdb_crypt::{FileKms, Kms};
 use rtdb_db::{JournalBatchAppender, MultiDatabase, MultiOptions, discover_nodes};
@@ -47,7 +50,8 @@ impl MultiRuntime {
         })?);
         let journal =
             FileJournal::open(path.join("journal"), Limits::default()).map_err(io_error)?;
-        let journal = Arc::new(journal.handle(Identity(Uuid::new_v4().as_u128())));
+        let identity = Identity::from(format!("urn:rtdb:dev:{}", Uuid::new_v4()));
+        let journal = Arc::new(journal.handle(identity));
         let io = IoRegion::new();
         let store = Arc::new(LocalStore::open_in(path.join("objects"), Arc::clone(&io))?);
         let path = path
@@ -84,7 +88,7 @@ impl MultiRuntime {
         config: &mut NodeConfiguration,
         memory: Arc<MemoryBudget>,
     ) -> Result<Self> {
-        use rtdb_journal_logkeeper::{Credentials, LogkeeperJournal};
+        use rtdb_stream_journal::{Credentials, StreamJournal};
 
         let node = installed_node_ip().await?;
         let peers = Some(required("RTDB_PEERS")?);
@@ -119,12 +123,12 @@ impl MultiRuntime {
                 &format!("RTDB_JOURNAL_{slot}_CA_CERTIFICATE"),
             )?,
         };
-        let journal = LogkeeperJournal::connect(&journal_url, &credentials, Duration::from_secs(5))
+        let journal = StreamJournal::connect(&journal_url, &credentials, Duration::from_secs(5))
             .await
             .map_err(|error| {
                 Anomaly::new(
                     AnomalyCategory::Unavailable,
-                    "rtdb/logkeeper-connect",
+                    "rtdb/journal-connect",
                     error.to_string(),
                 )
             })?;
@@ -288,7 +292,7 @@ struct Backends {
 }
 
 #[cfg(feature = "s3")]
-struct StreamJournalBatch(Arc<rtdb_journal_logkeeper::LogkeeperJournal>);
+struct StreamJournalBatch(Arc<rtdb_stream_journal::StreamJournal>);
 
 #[cfg(feature = "s3")]
 impl JournalBatchAppender for StreamJournalBatch {
