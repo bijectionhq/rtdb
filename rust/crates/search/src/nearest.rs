@@ -304,7 +304,8 @@ pub async fn owned_nearest_batch(
         let shadows = overlay.as_ref().and_then(|overlay| overlay.shadowed(ordinal));
         let mut columns = vec!["_id", partition.vector.as_str()];
         columns.extend(partition.filters.iter().map(String::as_str));
-        if query.approximate {
+        let sealed = crate::rank_family::needs_rank_family(&context, owner, &partition.relation).await?;
+        if query.approximate && !sealed {
             let bounds = TemporalBounds { valid_time: Interval::at(valid)?, system_time: Interval::at(present)? };
             let cut = rtdb_vector::Cut { snapshot, storage: &database.storage, memory: &context.memory, cancellation: &context.cancellation, bounds };
             match approximate_partition(&context, owner, partition, query, cut, valid, &columns, shadows, ordinal, &mut window).await {
@@ -317,7 +318,7 @@ pub async fn owned_nearest_batch(
         let Some(cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(&context), owner, &partition.relation, valid, &columns,
         ).await? else { continue; };
-        rank_rows(&context, cursor, partition, query, shadows, ordinal, &mut window).await?;
+        rank_rows(&context, cursor, partition, query, shadows, ordinal, &mut window, sealed.then_some((owner, valid))).await?;
     }
     if let Some(overlay) = overlay {
         for (ordinal, id, vector) in &overlay.rows {
@@ -350,7 +351,7 @@ async fn approximate_partition(
         if !candidates.is_empty() && let Some(cursor) = rtdb_query::open_owned_root_projection_of(
             Arc::clone(context), owner, &partition.relation, valid, columns, candidates,
         ).await? {
-            rank_rows(context, cursor, partition, query, shadows, ordinal, &mut settled).await?;
+            rank_rows(context, cursor, partition, query, shadows, ordinal, &mut settled, None).await?;
         }
         if settled.total >= query.k || complete {
             window.absorb(settled)?;
@@ -364,6 +365,7 @@ async fn approximate_partition(
 async fn rank_rows(
     context: &Arc<QueryContext>, mut cursor: rtdb_query::QueryCursor, partition: &NearestPartition, query: &NearestQuery,
     shadows: Option<&BTreeSet<EntityId>>, ordinal: usize, window: &mut NearestWindow,
+    sealed: Option<(&str, Timestamp)>,
 ) -> Result<()> {
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
@@ -389,6 +391,9 @@ async fn rank_rows(
             let ids = batch.column(id_column).as_ref();
             let id = rtdb_columnar::read_entity_id(id_field, ids, row)?;
             if shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id)) { continue; }
+            if let Some((owner, valid)) = sealed {
+                crate::rank_family::root_contributor(context, owner, &partition.relation, id, valid).await?;
+            }
             window.admit(ordinal, id, distance)?;
         }
     }

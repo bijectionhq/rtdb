@@ -56,12 +56,13 @@ pub enum FamilyReleaseInput<'a> {
     Member(FamilyOccurrence),
     WorldRow { member: FamilyOccurrence, winner: Position, row: EnrolledWorldRow },
     WorldDerived { member: FamilyOccurrence, stage: AssertionStage, slot: WorldRowSlot<'a> },
+    RootDerived { member: FamilyOccurrence, relation: &'a str, key: &'a [u8] },
 }
 
 impl FamilyReleaseInput<'_> {
     fn member(self) -> FamilyOccurrence {
         match self {
-            Self::Member(member) | Self::WorldRow { member, .. } | Self::WorldDerived { member, .. } => member,
+            Self::Member(member) | Self::WorldRow { member, .. } | Self::WorldDerived { member, .. } | Self::RootDerived { member, .. } => member,
         }
     }
 
@@ -83,6 +84,10 @@ impl FamilyReleaseInput<'_> {
                     }
             }
             Self::WorldDerived { stage, slot, .. } => family.derived_capability(stage, member.assertion, slot),
+            Self::RootDerived { relation, key, .. } => family.derived.iter().any(|row| {
+                row.world.is_none() && row.capability.is_none() && row.member == member.assertion
+                    && row.relation == relation && row.key == key
+            }),
         };
         if !enrolled { return Err(conflict()); }
         Ok(())
@@ -114,6 +119,15 @@ impl FamilyReleaseInput<'_> {
                 bytes.update(&[2]);
                 update_stage(&mut bytes, stage);
                 bytes.update(&world_row_slot_commitment(slot));
+            }
+            Self::RootDerived { relation, key, .. } => {
+                bytes.update(&[3]);
+                for field in [relation.as_bytes(), key] {
+                    let length = u16::try_from(field.len()).map_err(|_| conflict())?;
+                    if length == 0 { return Err(conflict()); }
+                    bytes.update(&length.to_be_bytes());
+                    bytes.update(field);
+                }
             }
         }
         Ok(finish(bytes))

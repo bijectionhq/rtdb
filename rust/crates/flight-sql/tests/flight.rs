@@ -2056,7 +2056,7 @@ async fn check_held_root_rank_flight() {
     digest.update(&frame_bytes);
     digest.update(b"invoice");
     let scope = format!("{:x}", digest.finalize());
-    let search = "rtdb.owned.SearchHeld.v5";
+    let search = "rtdb.owned.SearchHeld.v6";
     let request = |offset: u32, limit: u16| {
         let mut body = frame_bytes.clone();
         body.extend(offset.to_be_bytes());
@@ -2746,8 +2746,8 @@ async fn world_flight_actions_require_a_placed_world_host() {
     for action in [
         "rtdb.owned.PublishWorldCut.v1", "rtdb.owned.DecideWorldCut.v1",
         "rtdb.owned.DecideHeldWorlds.v3",
-        "rtdb.owned.OpenWorldRead.v5", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v2",
-        "rtdb.owned.NearestHeldWorld.v1", "rtdb.owned.NearestHeldWorldAt.v1", "rtdb.owned.NearestHeldWorldParentAt.v1",
+        "rtdb.owned.OpenWorldRead.v5", "rtdb.owned.ReadHeldWorldPoint.v2", "rtdb.owned.SearchHeldWorld.v3",
+        "rtdb.owned.NearestHeldWorld.v2", "rtdb.owned.NearestHeldWorldAt.v2", "rtdb.owned.NearestHeldWorldParentAt.v2",
         "rtdb.owned.ReadHeldWorldValidDuring.v2",
         "rtdb.owned.ReadHeldWorldHead.v1",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",
@@ -2769,7 +2769,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unimplemented, "{action}");
     }
-    let refused = client.action("rtdb.owned.SearchHeldWorld.v2", Bytes::new()).await.unwrap_err();
+    let refused = client.action("rtdb.owned.SearchHeldWorld.v3", Bytes::new()).await.unwrap_err();
     assert_eq!(refused.code(), tonic::Code::Unimplemented);
     running.stop().await;
 }

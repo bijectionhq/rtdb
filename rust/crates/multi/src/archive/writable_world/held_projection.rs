@@ -207,6 +207,21 @@ impl WorldProjectionCustody {
         match opened.await {
             Ok(body) => {
                 families.track_family_delivery(carrier.family)?;
+                if rtdb_storage::sealing::PlaintextView::tracks_rank_inventory() {
+                    let mut input = Vec::with_capacity(109 + relation.name().len() + key.len());
+                    input.push(1);
+                    input.extend_from_slice(carrier.family.as_bytes());
+                    input.extend_from_slice(&carrier.member.to_bytes());
+                    input.extend_from_slice(carrier.deployment.as_bytes());
+                    input.extend_from_slice(&carrier.incarnation.to_be_bytes());
+                    input.extend_from_slice(carrier.stage.as_bytes());
+                    input.extend_from_slice(&world.0);
+                    for field in [relation.name().as_bytes(), key.as_bytes()] {
+                        input.extend_from_slice(&(field.len() as u16).to_be_bytes());
+                        input.extend_from_slice(field);
+                    }
+                    rtdb_storage::sealing::PlaintextView::track_rank_contributor(&input)?;
+                }
                 Ok(SearchRow::Sealed(body, charge))
             }
             Err(error) if !historical && error.code == "rtdb/erased-under-view" => Ok(SearchRow::Erased),

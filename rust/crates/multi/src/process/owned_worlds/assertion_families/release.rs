@@ -111,12 +111,24 @@ fn part(bytes: [u8; 72]) -> Result<FamilyResponsePart> {
     })
 }
 
-fn input(scope: &Scope, family: Uuid, wire: FamilyReleaseInputWire) -> Result<FamilyReleaseInput<'static>> {
+fn input<'a>(scope: &Scope, family: Uuid, wire: &'a FamilyReleaseInputWire) -> Result<FamilyReleaseInput<'a>> {
     Ok(match wire {
-        FamilyReleaseInputWire::Member(member) => FamilyReleaseInput::Member(scope.occurrence(member)?),
+        FamilyReleaseInputWire::Member(member) => FamilyReleaseInput::Member(scope.occurrence(*member)?),
         FamilyReleaseInputWire::World { member, winner, row } if row.family == family =>
-            FamilyReleaseInput::WorldRow { member: scope.occurrence(member)?, winner, row: scope.enrolled_row(&row)? },
-        FamilyReleaseInputWire::World { .. } => return Err(OwnedWorld::unavailable()),
+            FamilyReleaseInput::WorldRow { member: scope.occurrence(*member)?, winner: *winner, row: scope.enrolled_row(row)? },
+        FamilyReleaseInputWire::WorldDerived { member, stage, world, relation, key } => {
+            rtdb_types::OwnedRelation::new(relation.as_str())?;
+            FamilyReleaseInput::WorldDerived {
+                member: scope.occurrence(*member)?, stage: scope.stage(*stage)?,
+                slot: WorldRowSlot { world: *world, relation, key },
+            }
+        }
+        FamilyReleaseInputWire::RootDerived { member, relation, key } if member.position.line_generation == scope.root_line => {
+            rtdb_types::OwnedRelation::new(relation.as_str())?;
+            FamilyReleaseInput::RootDerived { member: scope.occurrence(*member)?, relation, key }
+        }
+        FamilyReleaseInputWire::World { .. } | FamilyReleaseInputWire::RootDerived { .. } =>
+            return Err(OwnedWorld::unavailable()),
     })
 }
 
@@ -132,7 +144,7 @@ pub(super) async fn serve(
     let families = families.with_release_authority(&authority);
     match request {
         FamilyReleaseRequest::Prepare { family, part: coordinates, cutoff, input: selected } => {
-            let registration = families.prepare_family_release(family, input(scope, family, selected)?, part(coordinates)?, cutoff).await?;
+            let registration = families.prepare_family_release(family, input(scope, family, &selected)?, part(coordinates)?, cutoff).await?;
             let mut body = Vec::with_capacity(252);
             body.extend_from_slice(&registration.origin());
             body.extend_from_slice(&registration.attempt());
@@ -141,7 +153,7 @@ pub(super) async fn serve(
         }
         FamilyReleaseRequest::Stage { registration: wire, input: selected } => {
             let registration = registration(wire)?;
-            families.stage_family_release(registration, input(scope, registration.client_family(), selected)?).await?;
+            families.stage_family_release(registration, input(scope, registration.client_family(), &selected)?).await?;
         }
         FamilyReleaseRequest::Promote(wire) => families.promote_family_release(registration(wire)?).await?,
         FamilyReleaseRequest::Check(wire) => families.require_family_release(registration(wire)?).await?,

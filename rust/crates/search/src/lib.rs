@@ -6,6 +6,7 @@ pub mod definitions;
 pub mod file;
 pub mod lane;
 mod held_corpus;
+mod rank_family;
 pub mod hybrid;
 pub mod nearest;
 mod member_bounds;

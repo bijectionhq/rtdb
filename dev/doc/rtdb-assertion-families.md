@@ -250,6 +250,18 @@ The RTDB adapter derives the registry commitment from the original placed histor
 It authenticates the exact row creator against the current original `bj_installation` writer and checks the original registry address at the same barrier.
 Flight and archive rank outputs also carry a bounded current marker check through the plaintext handoff.
 
+### Ranked response contributor inventory
+
+Protocol 222 includes a complete bounded family inventory in each held text and nearest reply, including replies with no hits.
+The inventory comes from the admitted corpus before result slicing. It covers non-hit text statistics and vector candidates, and includes protected world shadows that affect the inherited corpus.
+The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field. Root contributors resolve their exact carrier on the same held cut.
+The inventory is `rtdb.owned.rank_families` in the authenticated Arrow schema, as lowercase hex of a big-endian u16 entry count and canonical sorted entries.
+An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root carrier publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
+The bounds are 512 entries of at most 1024 bytes and at most 512 Root carrier probes per rank. Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
+`FamilyResponseRelease.v2` adds exact world-derived input kind 2 and exact Root-derived input kind 3 to the existing response-part hold.
+The consumer retains the inventory in the invocation's original output custody even when it returns only counts, cursors or derived scores.
+Hybrid reads retain the combined text and vector dependencies under that same bound.
+
 ### Fence plan reply
 
 Protocol 217 retires the former immediate fence action.
