@@ -538,7 +538,7 @@ impl World {
         deployment.holder = None;
         deployment.pending.clear();
         let prefix = deployment.record.storage_prefix();
-        reference::materialize(self.cells[source].as_ref(), &prefix, self.cells[target].as_ref(), &prefix).await.map_err(|error| format!("moving d{index}: {error}"))?;
+        reference::simulate_materialize(self.cells[source].as_ref(), &prefix, self.cells[target].as_ref(), &prefix).await.map_err(|error| format!("moving d{index}: {error}"))?;
         let deployment = &mut self.deployments[index];
         deployment.cell = target;
         deployment.cells.insert(source, Some(moved_at));

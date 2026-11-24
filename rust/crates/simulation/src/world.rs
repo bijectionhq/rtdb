@@ -536,5 +536,8 @@ fn describe_reply(body: &ResponseBody) -> String {
         ResponseBody::PageDigest(page) => format!("digest through {}", page.through_lsn),
         ResponseBody::JournalIdentity(identity) => format!("journal {}", identity.journal),
         ResponseBody::AuthorityConfirmed(_) => "authority confirmed".into(),
+        ResponseBody::ReadIndex(_) => "read index".into(),
+        ResponseBody::DecisionVote(_) => "decision vote".into(),
+        ResponseBody::DecisionInstallation(_) => "decision installation".into(),
     }
 }

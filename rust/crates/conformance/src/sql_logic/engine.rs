@@ -219,7 +219,7 @@ impl Engine {
         let row_count = rows.len();
         let result = format::finish(rows, record.sort.as_deref().unwrap_or("nosort"))?;
         Ok((json!({"text":result,"rows":row_count,"values":actual_values,"schema":schema,
-                  "basis":{"current_time_micros":basis.current_time.as_micros()?.0,"timezone":"UTC","snapshot_token":basis.snapshot_token()}}), charges))
+                  "basis":{"current_time_micros":basis.current_time.as_micros()?.0,"timezone":"UTC","snapshot_token":basis.resume_token.as_deref()}}), charges))
     }
 }
 

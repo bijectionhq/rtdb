@@ -706,6 +706,14 @@ pub(crate) async fn materialize(
     Ok(())
 }
 
+/// The storage simulator uses unsealed in-memory objects.
+pub async fn simulate_materialize(
+    from_bucket: &rtdb_storage::MemoryStore, from: &str,
+    to_bucket: &rtdb_storage::MemoryStore, to: &str,
+) -> Result<()> {
+    materialize(from_bucket, from, to_bucket, to, async |_, bytes| Ok(bytes)).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
