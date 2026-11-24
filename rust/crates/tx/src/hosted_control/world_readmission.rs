@@ -104,27 +104,25 @@ impl WorldReadmission {
         if self.ancestors.len() != world.ancestors.len() {
             return Err(replay_invalid());
         }
-        let mut previous = self.basis.system_time;
+        let mut previous = self.basis;
         for (old, RelocatedAncestor { original, selected, retained }) in world.ancestors.iter().zip(&self.ancestors) {
             if *original != old.basis
-                || selected.system_time != old.system
-                || selected.tx_id.0 < 0
-                || (*selected != old.basis
-                    && (selected.tx_id >= old.basis.tx_id || old.system >= old.basis.system_time))
+                || *selected != old.publication
+                || !selected.at_or_before(*original)
                 || old.basis.system_time > self.source_cut
-                || (old.system == old.basis.system_time) != (retained.system == retained.basis.system_time)
-                || retained.system <= previous
-                || retained.system > retained.basis.system_time
+                || (old.publication == old.basis) != (retained.publication == retained.basis)
+                || previous.tx_id >= retained.publication.tx_id
+                || !previous.at_or_before(retained.publication)
+                || !retained.publication.at_or_before(retained.basis)
                 || retained.world != old.world
                 || retained.pin != old.pin
                 || retained.logical != old.logical
                 || retained.source_root != old.source_root
-                || retained.basis.tx_id <= self.basis.tx_id
                 || retained.basis.system_time >= self.until
             {
                 return Err(replay_invalid());
             }
-            previous = retained.system;
+            previous = retained.publication;
         }
         Ok(())
     }
@@ -260,7 +258,7 @@ mod tests {
             suffix: [5; 16],
             manifest: "a".repeat(43),
             basis: position(2, 20),
-            system: Timestamp(20),
+            publication: position(2, 20),
             source_root: position(1, 10),
             logical: Timestamp(17),
         };
@@ -278,13 +276,13 @@ mod tests {
             ancestors: vec![original.clone()],
             fork_lineage: vec![rtdb_types::OwnedWorldForkLink {
                 world: original.world, pin: original.pin, registered: Timestamp(16),
-                system: original.system, logical: original.logical,
+                system: original.publication.system_time, logical: original.logical,
             }],
             dropped: false,
         };
         let mut retained = original.clone();
         retained.basis = position(102, 120);
-        retained.system = Timestamp(120);
+        retained.publication = position(102, 120);
         let mut admission = WorldReadmission {
             binding: [9; 32],
             world: world.id.0,
@@ -301,7 +299,7 @@ mod tests {
         };
         admission.require_retained_ancestors(&world)?;
         let moved = admission.ancestors.first_mut().expect("fixture has a relocated ancestor");
-        moved.selected = position(1, original.system.0);
+        moved.selected = position(1, original.publication.system_time.0);
         assert!(admission.require_retained_ancestors(&world).is_err());
         let moved = admission.ancestors.first_mut().expect("fixture has a relocated ancestor");
         moved.selected = original.basis;

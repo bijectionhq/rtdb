@@ -663,7 +663,10 @@ The indexed branch limits the overlay to 4,096 shadow keys and 8 MiB of text, an
 The ranked reply carries the world present, requested valid instant, exact total and one held condition per partition, including for an empty result.
 Conditions validate the original archive pin and whole-corpus purge frontiers, plus the local relation touch frontier for writable worlds.
 
-`rtdb.owned.RetainReplayedWorld.v3` retains a provisional world on the held restore writer.
+`rtdb.owned.RetainReplayedWorld.v5` retains a provisional world on the held restore writer.
+Each Held ancestor carries the original selected publication transaction and the separately protected archive end transaction.
+`rtdb.owned.PreflightHeldWorldAt.v2` and `rtdb.owned.SelectHeldWorldAsOf.v2` return the selected transaction ID, its SQL history time, the logical clock reading, and the world mode.
+`rtdb.owned.PrepareHeldWorldOverlay.v5` and `rtdb.owned.PublishHeldWorldRetention.v4` take that exact publication key on the original hold.
 A retained Held fork has two independently certified destination positions, an inherited Root cut and the exact replay of its source Held overlay.
 The reply carries the destination parent media and the optional Held ancestor media with its unchanged source world, pin and logical publication.
 World readmission binds both positions to the same Original replay before the restored world opens.

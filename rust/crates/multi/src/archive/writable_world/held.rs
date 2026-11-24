@@ -87,7 +87,7 @@ fn frozen_prefix(
     layers: &[rtdb_directory::CheckpointWorldAncestor], selected: Option<Timestamp>,
 ) -> &[rtdb_directory::CheckpointWorldAncestor] {
     match selected {
-        Some(at) => &layers[..(layers.partition_point(|layer| layer.system < at) + 1).min(layers.len())],
+        Some(at) => &layers[..(layers.partition_point(|layer| layer.publication.system_time < at) + 1).min(layers.len())],
         None => layers,
     }
 }
@@ -271,10 +271,25 @@ enum ArchiveRead {
     },
 }
 
+#[derive(Clone, Copy)]
+enum ClockCut {
+    System(Timestamp),
+    Publication(TransactionKey),
+}
+
+impl ClockCut {
+    fn system(self) -> Timestamp {
+        match self {
+            Self::System(system) => system,
+            Self::Publication(publication) => publication.system_time,
+        }
+    }
+}
+
 enum AncestorRead {
     Point { id: EntityId, valid: Interval },
     Changes { after: Timestamp, through: Timestamp, limit: usize, reverse: bool },
-    Clock(Timestamp),
+    Clock(ClockCut),
     SelectClock(Timestamp),
     PathTouch { id: EntityId, path: OwnedRelation, group: Timestamp, valid: Timestamp, images: bool },
     Version { id: EntityId, from: Timestamp, through: Timestamp, group: Timestamp },
@@ -296,7 +311,7 @@ enum AncestorResult {
     Point(Option<WorldFact>, bool),
     Changes(rtdb_node::OwnedMergedChanges),
     Clock(rtdb_query::ArchivedHeldClock),
-    SelectedClock(Option<(Timestamp, Timestamp)>),
+    SelectedClock(Option<(TransactionKey, Timestamp)>),
     PathTouch([(Option<WorldFact>, bool); 2]),
     Version(Timestamp, Vec<(Interval, WorldFact, bool)>),
     Schedule(Vec<(Interval, Timestamp)>),
@@ -337,23 +352,23 @@ impl HeldCheckpointWorld {
     pub fn clock_mode(&self) -> WorldClockMode { self.open.record.mode }
 
     pub async fn retained_child_cut(
-        &self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
+        &self, scope: rtdb_types::PlacedAttemptScope, publication: TransactionKey,
     ) -> Result<rtdb_node::OwnedForkCut> {
         self.check()?;
-        if self.open.record.ancestors.is_empty() && system == self.open.record.basis.system_time {
+        if self.open.record.ancestors.is_empty() && publication == self.open.record.basis {
             let cut = self.open.snapshot.fork_inherited_root_cut(scope, &self.open.record).await?;
             self.check()?;
             return Ok(cut);
         }
-        let archived = if self.open.record.ancestor_at(system).is_some() {
+        let archived = if self.open.record.ancestor_covering(publication).is_some() {
             let relations = self.open.record.schemas.relations().map(|(name, _)| OwnedRelation::new(name))
                 .collect::<Result<Vec<_>>>()?;
-            Some(self.archived_accepted_clock(&relations, system).await?)
+            Some(self.archived_accepted_clock(&relations, ClockCut::Publication(publication)).await?)
         } else {
             None
         };
         let cut = self.open.snapshot.fork_overlay_cut(
-            scope, &self.open.record, system, archived.as_ref(),
+            scope, &self.open.record, publication, archived.as_ref(),
         ).await?;
         self.check()?;
         Ok(cut)
@@ -361,10 +376,10 @@ impl HeldCheckpointWorld {
 
     pub fn parent_basis(&self) -> TransactionKey { self.open.retained.basis }
     pub fn ancestor(&self) -> Option<(Iid, Timestamp)> {
-        self.open.record.ancestor().map(|ancestor| (Iid(ancestor.world), ancestor.system))
+        self.open.record.ancestor().map(|ancestor| (Iid(ancestor.world), ancestor.publication.system_time))
     }
     pub fn ancestors(&self) -> Vec<(Iid, Timestamp)> {
-        self.open.record.ancestors.iter().map(|layer| (Iid(layer.world), layer.system)).collect()
+        self.open.record.ancestors.iter().map(|layer| (Iid(layer.world), layer.publication.system_time)).collect()
     }
 
     fn uses_frozen_overlay(&self, system: Option<Timestamp>) -> bool {
@@ -522,30 +537,37 @@ impl HeldCheckpointWorld {
         Ok(())
     }
 
-    pub async fn preflight_accepted_scope(&self, relations: &[OwnedRelation], system: Timestamp) -> Result<Timestamp> {
+    pub async fn preflight_accepted_scope(
+        &self, relations: &[OwnedRelation], system: Timestamp,
+    ) -> Result<(TransactionKey, Timestamp)> {
         self.check()?;
-        if let Some(ancestor) = self.open.record.ancestor() {
-            if let Some(layer) = self.open.record.ancestor_at(system) {
-                return self.archived_accepted_clock(relations, system).await?.reading(layer, system);
-            }
-            self.archived_accepted_clock(relations, ancestor.system).await?;
+        if let Some(layer) = self.open.record.ancestor_at_system(system) {
+            let archived = self.archived_accepted_clock(relations, ClockCut::System(system)).await?;
+            return Ok((archived.publication(), archived.reading(layer, system)?));
         }
-        let clock = self.open.snapshot.certify_world_accepted_scope(&self.open.record, relations, system).await?;
+        if let Some(ancestor) = self.open.record.ancestor() {
+            self.archived_accepted_clock(relations, ClockCut::Publication(ancestor.publication)).await?;
+        }
+        let publication = self.open.snapshot.certify_world_clock_publication(&self.open.record, relations, system).await?;
         self.require_accepted_archive_scope(relations).await?;
-        Ok(clock)
+        Ok(publication)
     }
 
     async fn archived_accepted_clock(
-        &self, relations: &[OwnedRelation], system: Timestamp,
+        &self, relations: &[OwnedRelation], cut: ClockCut,
     ) -> Result<rtdb_query::ArchivedHeldClock> {
         let unavailable = OwnedWorld::unavailable;
-        let ancestor = self.open.record.ancestor_at(system).ok_or_else(unavailable)?;
+        let ancestor = match cut {
+            ClockCut::System(system) => self.open.record.ancestor_at_system(system),
+            ClockCut::Publication(publication) => self.open.record.ancestor_covering(publication),
+        }.ok_or_else(unavailable)?;
         let mut certified = None;
         for relation in relations {
-            let (result, _) = self.read_ancestor(relation, AncestorRead::Clock(system)).await?;
+            let (result, _) = self.read_ancestor(relation, AncestorRead::Clock(cut)).await?;
             let AncestorResult::Clock(clock) = result else { return Err(unavailable()); };
-            let reading = clock.reading(ancestor, system)?;
-            if certified.replace((clock, reading)).is_some_and(|(_, previous)| previous != reading) {
+            let reading = clock.reading(ancestor, cut.system())?;
+            let winner = (clock.publication(), reading);
+            if certified.replace((clock, winner)).is_some_and(|(_, previous)| previous != winner) {
                 return Err(unavailable());
             }
         }
@@ -553,25 +575,25 @@ impl HeldCheckpointWorld {
     }
 
     pub async fn select_accepted_scope(&self, relations: &[OwnedRelation], requested: Timestamp)
-        -> Result<Option<(Timestamp, Timestamp)>> {
+        -> Result<Option<(TransactionKey, Timestamp)>> {
         self.check()?;
         if self.ancestor().is_some() {
             if self.clock_mode().is_writable() && requested > self.initial_clock()
-                && let Some((system, reading)) = self.open.snapshot.select_world_accepted_scope(
+                && let Some(selected) = self.open.snapshot.select_world_accepted_scope(
                     &self.open.record, relations, requested,
                 ).await?
             {
-                if self.preflight_accepted_scope(relations, system).await? != reading {
-                    return Err(OwnedWorld::unavailable());
-                }
-                return Ok(Some((system, reading)));
+                self.require_accepted_archive_scope(relations).await?;
+                return Ok(Some(selected));
             }
             let first = relations.first().ok_or_else(OwnedWorld::unavailable)?;
             let (result, _) = self.read_ancestor(first, AncestorRead::SelectClock(requested)).await?;
             let AncestorResult::SelectedClock(selected) = result else { return Err(OwnedWorld::unavailable()); };
             self.require_accepted_archive_scope(relations).await?;
-            if let Some((system, reading)) = selected {
-                if self.preflight_accepted_scope(relations, system).await? != reading {
+            if let Some((publication, reading)) = selected {
+                let layer = self.open.record.ancestor_covering(publication).ok_or_else(OwnedWorld::unavailable)?;
+                let archived = self.archived_accepted_clock(relations, ClockCut::Publication(publication)).await?;
+                if archived.reading(layer, publication.system_time)? != reading {
                     return Err(OwnedWorld::unavailable());
                 }
             }
@@ -1682,6 +1704,7 @@ struct InheritedRelation<'a> {
     initial_clock: Timestamp,
     floor: Timestamp,
     overlay_basis: Timestamp,
+    publication: TransactionKey,
     root_basis: TransactionKey,
     earlier: Vec<Self>,
     schema: &'a rtdb_types::OwnedSchema,
@@ -1696,12 +1719,14 @@ impl<'a> InheritedRelation<'a> {
     ) -> Result<Self> {
         if overlays.len() != ancestors.len() { return Err(OwnedWorld::unavailable()); }
         let mut writers = Vec::with_capacity(ancestors.len());
-        let mut floor = root.current_time.as_micros()?;
+        let database = root.catalog.database(root.catalog.default_database())?;
+        let [partition] = database.partitions.as_slice() else { return Err(OwnedWorld::unavailable()); };
+        let mut floor = partition.tx_basis().ok_or_else(OwnedWorld::unavailable)?;
         for (index, (overlay, ancestor)) in overlays.into_iter().zip(ancestors).enumerate() {
             writers.push(Self::open_writer(
                 Arc::clone(&root), overlay, owner, relation, ancestor, &ancestors[..index], floor, schema, memory,
             ).await?);
-            floor = ancestor.system;
+            floor = ancestor.publication;
         }
         let mut latest = writers.pop().ok_or_else(OwnedWorld::unavailable)?;
         latest.earlier = writers;
@@ -1716,7 +1741,7 @@ impl<'a> InheritedRelation<'a> {
     async fn open_writer(
         root: Arc<rtdb_query::QueryContext>, overlay: Arc<rtdb_query::QueryContext>, owner: &'a str,
         relation: &'a OwnedRelation, ancestor: &rtdb_directory::CheckpointWorldAncestor,
-        earlier: &[rtdb_directory::CheckpointWorldAncestor], floor: Timestamp,
+        earlier: &[rtdb_directory::CheckpointWorldAncestor], floor: TransactionKey,
         schema: &'a rtdb_types::OwnedSchema, memory: &'a Arc<MemoryBudget>,
     ) -> Result<Self> {
         let unavailable = OwnedWorld::unavailable;
@@ -1724,26 +1749,22 @@ impl<'a> InheritedRelation<'a> {
         let shadow = relation.in_world(world)?;
         let root_cut = root.current_time.as_micros()?;
         let media_cut = overlay.current_time.as_micros()?;
-        if media_cut != ancestor.basis.system_time || ancestor.system <= floor {
+        if media_cut != ancestor.basis.system_time || floor.tx_id >= ancestor.publication.tx_id
+            || !floor.at_or_before(ancestor.publication) {
             return Err(unavailable());
         }
         check_archive_coverage(&root, owner, [(relation, 0)])?;
         check_archive_coverage(&overlay, owner, [(relation, 0), (&shadow, 0)])?;
         require_parent_journal(&root, owner, relation, root_cut).await?;
-        require_parent_journal(&overlay, owner, &shadow, floor).await?;
+        require_parent_journal(&overlay, owner, &shadow, floor.system_time).await?;
         let overlay_media = overlay;
-        let at_time = overlay_media.with_owned_system_cut(ancestor.system, &overlay_media.cancellation)?;
-        let (reading, publication) = rtdb_query::read_owned_world_clock_publication(at_time, owner, world)
-            .await?.ok_or_else(unavailable)?;
-        if reading != ancestor.logical || publication.system_time != ancestor.system
-            || publication.tx_id > ancestor.basis.tx_id
-            || (publication.tx_id == ancestor.basis.tx_id && publication != ancestor.basis)
-        {
+        let overlay = overlay_media.with_owned_transaction_cut(ancestor.publication, &overlay_media.cancellation)?;
+        let (record, reading, _charge) = rtdb_query::read_held_world_publication(
+            &overlay, owner, world, ancestor.publication,
+        ).await?;
+        if reading != ancestor.logical || !ancestor.publication.at_or_before(ancestor.basis) {
             return Err(unavailable());
         }
-        let overlay = overlay_media.with_owned_transaction_cut(publication, &overlay_media.cancellation)?;
-        let (record, _charge) = rtdb_query::read_owned_world(Arc::clone(&overlay), owner, world)
-            .await?.ok_or_else(unavailable)?;
         let root_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&root), owner, relation).await?;
         let overlay_schema = rtdb_query::read_owned_relation_schema(Arc::clone(&overlay), owner, relation).await?;
         if record.dropped || record.pin.0 != *ancestor.pin.as_bytes()
@@ -1751,7 +1772,8 @@ impl<'a> InheritedRelation<'a> {
             || record.ancestors.iter().zip(earlier).any(|(registered, retained)| {
                 registered.world != *retained.world.as_bytes() || registered.pin != *retained.pin.as_bytes()
                     || registered.logical != retained.logical || registered.source_root != retained.source_root
-                    || registered.system > retained.system
+                    || registered.publication.system_time > retained.publication.system_time
+                    || (registered.basis == retained.basis && registered.publication != retained.publication)
             })
             || !matches!(record.mode, WorldClockMode::Held { .. }) || record.schemas.relation(relation) != Some(schema)
             || record.basis != ancestor.source_root || ancestor.source_root.system_time > root_cut
@@ -1762,7 +1784,8 @@ impl<'a> InheritedRelation<'a> {
         }
         Ok(Self {
             root, overlay_media, overlay, owner, relation, shadow, world, initial_clock: record.initial_clock(),
-            floor, overlay_basis: ancestor.system, root_basis: record.basis, earlier: Vec::new(), schema, memory,
+            floor: floor.system_time, overlay_basis: ancestor.publication.system_time,
+            publication: ancestor.publication, root_basis: floor, earlier: Vec::new(), schema, memory,
         })
     }
 
@@ -1915,12 +1938,12 @@ impl<'a> InheritedRelation<'a> {
         Ok((clock, timeline))
     }
 
-    async fn select_clock(&self, requested: Timestamp) -> Result<Option<(Timestamp, Timestamp)>> {
+    async fn select_clock(&self, requested: Timestamp) -> Result<Option<(TransactionKey, Timestamp)>> {
         for writer in self.writers().filter(|writer| writer.initial_clock < requested) {
             if let Some((publication, reading)) = rtdb_query::select_owned_world_clock(
                 &writer.overlay, self.owner, writer.world, writer.root_basis, writer.initial_clock, requested,
             ).await? {
-                return Ok(Some((publication.system_time, reading)));
+                return Ok(Some((publication, reading)));
             }
         }
         Ok(None)
@@ -2379,13 +2402,19 @@ pub(crate) async fn open_held_checkpoint_world(
                                     let read = async {
                                         guard()?;
                                         let needed = selected.or(match &read {
-                                            AncestorRead::Clock(group)
-                                                | AncestorRead::Version { group, .. }
+                                            AncestorRead::Clock(cut) => Some(cut.system()),
+                                            AncestorRead::Version { group, .. }
                                                 | AncestorRead::PathTouch { group, .. } => Some(*group),
                                             AncestorRead::Changes { through, .. } => Some(*through),
                                             _ => None,
                                         });
-                                        let ancestors = frozen_prefix(&ancestors, needed);
+                                        let ancestors = if let AncestorRead::Clock(ClockCut::Publication(publication)) = &read {
+                                            let through = ancestors.iter().position(|layer| publication.at_or_before(layer.publication))
+                                                .ok_or_else(OwnedWorld::unavailable)?;
+                                            &ancestors[..=through]
+                                        } else {
+                                            frozen_prefix(&ancestors, needed)
+                                        };
                                         with_frozen_writers(
                                             archive, deployment, ancestors,
                                             CheckpointReadResources {
@@ -2414,11 +2443,24 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             };
                                                             Ok(AncestorResult::Version(clock, spans))
                                                         },
-                                                        AncestorRead::Clock(group) => {
-                                                            let writer = inherited.writer_at(group)?;
-                                                            writer.changes(group, group, 1, false).await?;
+                                                        AncestorRead::Clock(cut) => {
+                                                            let group = cut.system();
+                                                            let (writer, exact) = match cut {
+                                                                ClockCut::System(_) => (inherited.writer_at(group)?, None),
+                                                                ClockCut::Publication(publication) => {
+                                                                    let writer = inherited.writers().find(|writer|
+                                                                        writer.root_basis.tx_id < publication.tx_id
+                                                                            && publication.at_or_before(writer.publication))
+                                                                        .ok_or_else(OwnedWorld::unavailable)?;
+                                                                    (writer, Some(publication))
+                                                                }
+                                                            };
+                                                            rtdb_node::archived_changes_at_cut(
+                                                                Arc::clone(&writer.overlay_media), owner, &writer.shadow,
+                                                                group, group, 1, false,
+                                                            ).await?;
                                                             let clock = rtdb_query::read_archived_held_clock(
-                                                                &writer.overlay_media, owner, writer.world, group,
+                                                                &writer.overlay_media, owner, writer.world, writer.publication, group, exact,
                                                             ).await?;
                                                             Ok(AncestorResult::Clock(clock))
                                                         },

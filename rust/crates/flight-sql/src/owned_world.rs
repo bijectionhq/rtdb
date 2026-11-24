@@ -45,7 +45,7 @@ pub struct PreparedWorldOverlay {
     pub suffix: [u8; 16],
     pub manifest: String,
     pub basis: TransactionKey,
-    pub system: Timestamp,
+    pub publication: TransactionKey,
     pub logical: Timestamp,
     pub until: Timestamp,
 }
@@ -118,7 +118,7 @@ pub struct WorldParentVersions {
 /// A verified live cut and its already admitted archived parent.
 pub trait OwnedWorldRead: Send + Sync {
     fn retained_child_cut<'a>(
-        &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
+        &'a self, scope: rtdb_types::PlacedAttemptScope, publication: TransactionKey,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>>;
     fn present(&self) -> Timestamp;
     fn ancestors(&self) -> Vec<(rtdb_types::Iid, Timestamp)>;
@@ -227,7 +227,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<[WorldPointResult; 2]>>;
     fn select_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
-    ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>>;
+    ) -> BoxFuture<'a, Result<Option<(TransactionKey, Timestamp)>>>;
     fn select_parent_as_of<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
     ) -> BoxFuture<'a, Result<Option<Timestamp>>>;
@@ -236,7 +236,7 @@ pub trait OwnedWorldRead: Send + Sync {
     ) -> BoxFuture<'a, Result<WorldPointResult>>;
     fn preflight_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], system: Timestamp,
-    ) -> BoxFuture<'a, Result<Timestamp>>;
+    ) -> BoxFuture<'a, Result<(TransactionKey, Timestamp)>>;
     fn accepted_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
         system: Timestamp,

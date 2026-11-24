@@ -158,6 +158,13 @@ impl TermSequence {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransactionKey { pub tx_id: TxId, pub system_time: Timestamp }
 
+impl TransactionKey {
+    /// Compare keys already authenticated in the same history and partition.
+    pub fn at_or_before(self, through: Self) -> bool {
+        self == through || (self.tx_id < through.tx_id && self.system_time <= through.system_time)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TxBasis { pub databases: BTreeMap<String, Vec<TxId>> }
 

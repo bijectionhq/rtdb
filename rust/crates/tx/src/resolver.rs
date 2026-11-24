@@ -1887,10 +1887,10 @@ impl<'a> OpenTransaction<'a> {
                             if let Some(ancestor) = world.ancestor()
                                 && ancestor.world == source.id.0
                             {
-                                let (original, reading, publication, _charge) = rtdb_query::read_held_world_publication(
-                                    &context, owner, source.id, ancestor.system,
+                                let (original, reading, _charge) = rtdb_query::read_held_world_publication(
+                                    &context, owner, source.id, ancestor.publication,
                                 ).await?;
-                                if original != source || reading != ancestor.logical || publication != ancestor.basis {
+                                if original != source || reading != ancestor.logical || ancestor.publication != ancestor.basis {
                                     return Err(unavailable());
                                 }
                             }

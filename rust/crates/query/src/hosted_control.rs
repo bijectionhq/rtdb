@@ -40,7 +40,8 @@ pub async fn read_hosted_control_point(
     };
     let table_binding = context.catalog.table(&catalog)?.ok_or_else(unavailable)?;
     let mut columns = vec!["_valid_from", "_valid_to"];
-    let stamped_receipt = include_payload && table.table == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE;
+    let stamped_receipt = include_payload && (table.table == rtdb_types::HOSTED_ROOT_RECEIPTS_TABLE
+        || table.table == "bj_rtdb_restore_hold" || table.table == "bj_rtdb_restore_transactions");
     if stamped_receipt {
         columns.push(rtdb_types::HOSTED_RECEIPT_TX_ID);
     }

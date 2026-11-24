@@ -235,17 +235,20 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     let (original, _charge) = live.world_registration(world).await?.filter(|(original, _)| {
         original.pin == pin && !original.dropped && matches_retention(original, retained)
     }).ok_or_else(unavailable)?;
-    if cut.basis() <= original.basis.system_time || cut.until() <= now() { return Err(unavailable()); }
+    let publication = cut.positioned_basis()
+        .filter(|publication| publication.tx_id > original.basis.tx_id && original.basis.at_or_before(*publication))
+        .ok_or_else(unavailable)?;
+    if cut.until() <= now() { return Err(unavailable()); }
     if live.world_registration(Iid(*child.as_bytes())).await?.is_some() { return Err(unavailable()); }
-    let inherited_at = original.ancestor_at(cut.basis());
+    let inherited_at = original.ancestor_covering(publication);
     let (mut ancestors, ancestor, until) = if let Some(inherited_at) = inherited_at {
         let index = original.ancestors.iter().position(|layer| layer == inherited_at).ok_or_else(unavailable)?;
         let inherited = retained.ancestors.get(index).ok_or_else(unavailable)?;
-        if !cut.admits_overlay(inherited.basis, cut.basis()) || !inherited_at.covers(cut.basis(), logical) {
+        if !cut.admits_overlay(inherited.basis, publication) || !inherited_at.covers(publication, logical) {
             return Err(unavailable());
         }
         let mut selected = inherited.clone();
-        selected.system = cut.basis();
+        selected.publication = publication;
         selected.logical = logical;
         (retained.ancestors[..index].to_vec(), selected, cut.until())
     } else {
@@ -292,7 +295,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
         ).await?;
         let ancestor = rtdb_directory::CheckpointWorldAncestor {
             world: Uuid::from_bytes(world.0), pin: Uuid::from_bytes(pin.0), capture, suffix,
-            manifest_sha256: manifest, basis, system: basis.system_time, source_root: original.basis, logical,
+            manifest_sha256: manifest, basis, publication: basis, source_root: original.basis, logical,
         };
         (retained.ancestors.clone(), ancestor, until)
     };
@@ -302,7 +305,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     if inherited_at.is_some() {
         reopened.snapshot.check_overlay_standing(&original).await?;
     } else {
-        let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), &original, ancestor.system, None).await?;
+        let refreshed = reopened.snapshot.fork_overlay_cut(cut.scope(), &original, ancestor.publication, None).await?;
         if refreshed.overlay() != cut.overlay() || !refreshed.matches_basis(ancestor.basis) {
             return Err(unavailable());
         }
@@ -336,7 +339,7 @@ pub(crate) async fn prepare_checkpoint_world_overlay(
     }).await?;
     Ok(rtdb_flight_sql::PreparedWorldOverlay {
         world: world.0, parent_pin: pin.0, capture: *ancestor.capture.as_bytes(), suffix: *ancestor.suffix.as_bytes(),
-        manifest: ancestor.manifest_sha256, basis: ancestor.basis, system: ancestor.system,
+        manifest: ancestor.manifest_sha256, basis: ancestor.basis, publication: ancestor.publication,
         logical, until: retain_until, child: *child.as_bytes(),
     })
 }
@@ -467,55 +470,59 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     let owner = session.state().user().filter(|owner| !owner.is_empty())
         .ok_or_else(unavailable)?.to_owned();
     let iid = Iid(*id.as_bytes());
-    let staged = session.open_owned_read().await?.replayed_world(binding, iid).await?;
+    let held = session.open_owned_read().await?;
+    let staged = held.replayed_world(binding, iid).await?;
+    let scope = session.placed_history()?.ok_or_else(unavailable)?;
     let parent = prepare_checkpoint_replay_parent(
         Arc::clone(&directory), archive, storage, agent, keys, hosted_task, session,
         deployment, binding, Some(staged.world.basis), Some(&staged.world.schemas), resources.clone(),
     ).await?.ok_or_else(unavailable)?;
     let mut ancestors = Vec::with_capacity(staged.world.ancestors.len());
+    let mut floor = parent.basis;
     for original in &staged.world.ancestors {
         let archived = prepare_checkpoint_replay_parent(
             Arc::clone(&directory), archive, storage, agent, keys, hosted_task, session,
             deployment, binding, Some(original.basis), None, resources.clone(),
         ).await?.ok_or_else(unavailable)?;
-        if archived.basis.tx_id <= parent.basis.tx_id || archived.basis.system_time <= parent.basis.system_time {
+        if archived.basis.tx_id <= parent.basis.tx_id || !parent.basis.at_or_before(archived.basis) {
             return Err(unavailable());
         }
         let suffix = archived.suffix.map(Uuid::from_bytes).ok_or_else(unavailable)?;
         let capture = Uuid::from_bytes(archived.capture);
+        let (selected, _) = held.replayed_parent_cut(binding, original.publication, scope).await?;
+        let publication = selected.positioned_basis().ok_or_else(unavailable)?;
+        if floor.tx_id >= publication.tx_id || !floor.at_or_before(publication)
+            || !publication.at_or_before(archived.basis)
+            || (publication == archived.basis) != (original.publication == original.basis)
+        {
+            return Err(unavailable());
+        }
         let source_world = Iid(original.world);
         let owner = &owner;
         let schemas = &staged.world.schemas;
-        let system = with_registered_capture_context(
+        with_registered_capture_context(
             directory.as_ref(), archive, keys, hosted_task,
             CaptureSelection {
                 deployment, capture, manifest: &archived.manifest, suffix: Some(suffix),
                 expected_basis: Some(archived.basis), require_replay: false,
             },
             resources.clone(),
-            |context, basis| async move {
-                let (record, _) = rtdb_query::read_owned_world(Arc::clone(&context), owner, source_world)
-                    .await?.ok_or_else(unavailable)?;
-                if record.dropped || record.pin.0 != original.pin
-                    || record.basis != original.source_root
-                    || !matches!(record.mode, WorldClockMode::Held { .. }) || &record.schemas != schemas
+            |context, _| async move {
+                let (record, logical, _charge) = rtdb_query::read_held_world_publication(
+                    &context, owner, source_world, publication,
+                ).await?;
+                if record.pin.0 != original.pin || record.basis != original.source_root
+                    || &record.schemas != schemas || logical != original.logical
                 {
                     return Err(unavailable());
                 }
-                let (publication, logical) = rtdb_query::select_owned_world_clock(
-                    &context, owner, source_world, record.basis, record.initial_clock(), original.logical,
-                ).await?.ok_or_else(unavailable)?;
-                if logical != original.logical
-                    || (publication == basis) != (original.system == original.basis.system_time)
-                {
-                    return Err(unavailable());
-                }
-                Ok(publication.system_time)
+                Ok(())
             },
         ).await?;
+        floor = publication;
         ancestors.push(rtdb_directory::CheckpointWorldAncestor {
             world: Uuid::from_bytes(original.world), pin: Uuid::from_bytes(original.pin),
-            capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis, system,
+            capture, suffix, manifest_sha256: archived.manifest, basis: archived.basis, publication,
             source_root: original.source_root, logical: original.logical,
         });
     }
@@ -524,7 +531,7 @@ pub(crate) async fn retain_replayed_checkpoint_world(
     let world = current.world;
     if world != staged.world || current.source_cut != staged.source_cut
         || current.destination_parent != staged.destination_parent
-        || parent.basis.system_time != current.destination_parent
+        || parent.basis != current.destination_parent
     {
         return Err(unavailable());
     }
@@ -627,7 +634,7 @@ fn world_ancestors(retained: &CheckpointWorldRetention) -> Vec<rtdb_types::Owned
         suffix: *ancestor.suffix.as_bytes(),
         manifest: ancestor.manifest_sha256.clone(),
         basis: ancestor.basis,
-        system: ancestor.system,
+        publication: ancestor.publication,
         source_root: ancestor.source_root,
         logical: ancestor.logical,
     }).collect()
@@ -741,7 +748,7 @@ pub(crate) async fn fork_checkpoint_world_selected(
         if !capture.is_nil() || suffix.is_some() || child.is_nil() || retained.world != child
             || fork.world != fork.pin || retained.owner != owner || retained.until != until
             || retained.mode != mode || fork.cut.until() <= now() || until <= now()
-            || ancestor.logical != logical || !fork.cut.admits_overlay(ancestor.basis, ancestor.system)
+            || ancestor.logical != logical || !fork.cut.admits_overlay(ancestor.basis, ancestor.publication)
             || session.placed_history()? != Some(fork.cut.scope())
         {
             return Err(unavailable());

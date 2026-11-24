@@ -222,7 +222,7 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_IDENTITIES_ALL_VALID_V1 => Ok(vec![Ok(self.held_owned_identities_all_valid_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, true).await,
                 crate::owned_actions::HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1 => self.held_world_parent_touch_images_action(&call, &action.body, false).await,
-                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V4 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
+                crate::owned_actions::PREPARE_HELD_WORLD_OVERLAY_V5 => Ok(vec![Ok(self.prepare_held_world_overlay_action(&call, &action.body).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_CHANGES_AT_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_WORLD_ANCESTOR_CHANGES_V1 => Ok(vec![Ok(self.archived_world_changes_action(&call, &action.body, true).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_VERSIONS_AT_V1 => Ok(self.held_world_parent_versions_action(&call, &action.body).await?.into_iter().map(Ok).collect()),
@@ -242,20 +242,20 @@ impl Service {
                 }
                 crate::owned_actions::PREPARE_REPLAY_PARENT_V1 => Ok(vec![Ok(self.prepare_replay_parent_action(&call, &action.body).await?)]),
                 crate::owned_actions::FINISH_REPLAY_PARENTS_V1 => Ok(vec![Ok(self.finish_replay_parents_action(&call, &action.body).await?)]),
-                crate::owned_actions::RETAIN_REPLAYED_WORLD_V4 => Ok(vec![Ok(self.retain_replayed_world_action(&call, &action.body).await?)]),
+                crate::owned_actions::RETAIN_REPLAYED_WORLD_V5 => Ok(vec![Ok(self.retain_replayed_world_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_WORLD_READ_V6 => Ok(vec![Ok(self.open_world_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::READ_HELD_WORLD_HEAD_V1 => Ok(vec![Ok(self.read_held_world_head_action(&call, &action.body)?)]),
                 crate::owned_actions::SELECT_HELD_WORLD_PARENT_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfParent).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_POINT_AT_V1 => Ok(vec![Ok(self.held_world_point_at_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal).await?)]),
-                crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V1 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal).await?)]),
+                crate::owned_actions::SELECT_HELD_WORLD_AS_OF_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::AsOfLocal).await?)]),
+                crate::owned_actions::HELD_WORLD_AT_PREFLIGHT_V2 => Ok(vec![Ok(self.held_world_at_preflight_action(&call, &action.body, crate::owned_actions::WorldCutSelection::ExactLocal).await?)]),
                 crate::owned_actions::HELD_WORLD_POINT_AT_V1 => Ok(vec![Ok(self.held_world_point_at_action(&call, &action.body, false).await?)]),
                 crate::owned_actions::HELD_WORLD_POINT_V2 => Ok(vec![Ok(self.held_world_point_action(&call, &action.body).await?)]),
                 crate::owned_actions::CLOSE_WORLD_READ_V1 => {
                     self.close_world_read_action(&call, &action.body)?;
                     Ok(Vec::new())
                 }
-                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V3 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
+                crate::owned_actions::PUBLISH_HELD_WORLD_RETENTION_V4 => Ok(vec![Ok(self.publish_held_world_retention_action(&call, &action.body).await?)]),
                 crate::owned_actions::PUBLISH_WORLD_CUT_V1 | crate::owned_actions::DECIDE_WORLD_CUT_V1 => {
                     Ok(vec![Ok(self.publish_world_cut_action(&call, &action.body,
                         action.r#type == crate::owned_actions::DECIDE_WORLD_CUT_V1).await?)])

@@ -310,7 +310,7 @@ pub(crate) struct ReplayedWorldParent {
     pub(crate) world: [u8; 16],
     pub(crate) pin: [u8; 16],
     pub(crate) original: rtdb_types::TransactionKey,
-    pub(crate) destination: Timestamp,
+    pub(crate) destination: rtdb_types::TransactionKey,
 }
 
 impl ReplayedWorldParent {
@@ -325,11 +325,11 @@ pub fn replayed_world_parent_locator(world: &rtdb_types::OwnedWorld) -> String {
 
 pub fn replayed_world_parent(
     body: &[u8], binding: [u8; 32], world: &rtdb_types::OwnedWorld,
-) -> Result<Timestamp> {
+) -> Result<rtdb_types::TransactionKey> {
     if body.len() > 4096 { return Err(replay_invalid()); }
     let parent: ReplayedWorldParent = serde_json::from_slice(body).map_err(|_| replay_invalid())?;
     if parent.binding != binding || parent.world != world.id.0 || parent.pin != world.pin.0
-        || parent.original != world.basis || parent.destination <= world.basis.system_time
+        || parent.original != world.basis || parent.destination.tx_id.0 < 0 || parent.destination.system_time <= world.basis.system_time
     {
         return Err(replay_invalid());
     }

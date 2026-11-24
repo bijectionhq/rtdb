@@ -160,9 +160,9 @@ impl OwnedWorldHost for PlacedWorldHost {
 
 impl OwnedWorldRead for HeldCheckpointWorld {
     fn retained_child_cut<'a>(
-        &'a self, scope: rtdb_types::PlacedAttemptScope, system: Timestamp,
+        &'a self, scope: rtdb_types::PlacedAttemptScope, publication: TransactionKey,
     ) -> BoxFuture<'a, Result<rtdb_node::OwnedForkCut>> {
-        Box::pin(HeldCheckpointWorld::retained_child_cut(self, scope, system))
+        Box::pin(HeldCheckpointWorld::retained_child_cut(self, scope, publication))
     }
 
     fn present(&self) -> Timestamp { HeldCheckpointWorld::present(self).system_time }
@@ -375,7 +375,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn select_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], requested: Timestamp,
-    ) -> BoxFuture<'a, Result<Option<(Timestamp, Timestamp)>>> {
+    ) -> BoxFuture<'a, Result<Option<(TransactionKey, Timestamp)>>> {
         Box::pin(HeldCheckpointWorld::select_accepted_scope(self, relations, requested))
     }
 
@@ -396,7 +396,7 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn preflight_accepted_scope<'a>(
         &'a self, relations: &'a [OwnedRelation], system: Timestamp,
-    ) -> BoxFuture<'a, Result<Timestamp>> {
+    ) -> BoxFuture<'a, Result<(TransactionKey, Timestamp)>> {
         Box::pin(HeldCheckpointWorld::preflight_accepted_scope(self, relations, system))
     }
 

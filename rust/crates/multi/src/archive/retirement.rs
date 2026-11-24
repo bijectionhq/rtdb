@@ -546,7 +546,7 @@ mod tests {
                     suffix: Uuid::new_v4(),
                     manifest_sha256: "ancestor".into(),
                     basis,
-                    system: basis.system_time,
+                    publication: basis,
                     source_root: basis,
                     logical: basis.system_time,
                 }],

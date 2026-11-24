@@ -261,7 +261,7 @@ pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPa
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_IMAGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchImagesAt.v1";
-pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V4: &str = "rtdb.owned.PrepareHeldWorldOverlay.v4";
+pub(crate) const PREPARE_HELD_WORLD_OVERLAY_V5: &str = "rtdb.owned.PrepareHeldWorldOverlay.v5";
 pub(crate) const HELD_WORLD_ANCESTOR_CHANGES_V1: &str = "rtdb.owned.ReadHeldWorldAncestorChanges.v1";
 pub(crate) const HELD_WORLD_PARENT_CHANGES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentChangesAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VERSIONS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentVersionsAt.v1";
@@ -269,7 +269,7 @@ pub(crate) const HELD_OWNED_VERSIONS_V2: &str = "rtdb.owned.ReadHeldVersions.v2"
 pub(crate) const CLOSE_OWNED_READ_V1: &str = "rtdb.owned.CloseRead.v1";
 pub(crate) const PREPARE_REPLAY_PARENT_V1: &str = "rtdb.owned.PrepareReplayParent.v1";
 pub(crate) const FINISH_REPLAY_PARENTS_V1: &str = "rtdb.owned.FinishReplayParents.v1";
-pub(crate) const RETAIN_REPLAYED_WORLD_V4: &str = "rtdb.owned.RetainReplayedWorld.v4";
+pub(crate) const RETAIN_REPLAYED_WORLD_V5: &str = "rtdb.owned.RetainReplayedWorld.v5";
 pub(crate) const OPEN_WORLD_READ_V6: &str = "rtdb.owned.OpenWorldRead.v6";
 pub(crate) const READ_HELD_WORLD_HEAD_V1: &str = "rtdb.owned.ReadHeldWorldHead.v1";
 pub(crate) const SELECT_HELD_WORLD_PARENT_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldParentAsOf.v1";
@@ -277,12 +277,12 @@ pub(crate) const HELD_WORLD_PARENT_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorld
 
 pub(crate) enum WorldCutSelection { ExactLocal, AsOfLocal, AsOfParent }
 
-pub(crate) const SELECT_HELD_WORLD_AS_OF_V1: &str = "rtdb.owned.SelectHeldWorldAsOf.v1";
-pub(crate) const HELD_WORLD_AT_PREFLIGHT_V1: &str = "rtdb.owned.PreflightHeldWorldAt.v1";
+pub(crate) const SELECT_HELD_WORLD_AS_OF_V2: &str = "rtdb.owned.SelectHeldWorldAsOf.v2";
+pub(crate) const HELD_WORLD_AT_PREFLIGHT_V2: &str = "rtdb.owned.PreflightHeldWorldAt.v2";
 pub(crate) const HELD_WORLD_POINT_AT_V1: &str = "rtdb.owned.ReadHeldWorldPointAt.v1";
 pub(crate) const HELD_WORLD_POINT_V2: &str = "rtdb.owned.ReadHeldWorldPoint.v2";
 pub(crate) const CLOSE_WORLD_READ_V1: &str = "rtdb.owned.CloseWorldRead.v1";
-pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V3: &str = "rtdb.owned.PublishHeldWorldRetention.v3";
+pub(crate) const PUBLISH_HELD_WORLD_RETENTION_V4: &str = "rtdb.owned.PublishHeldWorldRetention.v4";
 pub(crate) const PUBLISH_WORLD_CUT_V1: &str = "rtdb.owned.PublishWorldCut.v1";
 pub(crate) const DECIDE_WORLD_CUT_V1: &str = "rtdb.owned.DecideWorldCut.v1";
 pub(crate) const DECIDE_HELD_WORLDS_V1: &str = "rtdb.owned.DecideHeldWorlds.v1";
@@ -622,6 +622,17 @@ fn count_component(body: &[u8], maximum: usize) -> Result<(&[u8], &[u8]), Status
         return Err(invalid("Owned count component exceeds its bound"));
     }
     body.split_at_checked(length).ok_or_else(|| invalid("Incomplete owned count component"))
+}
+
+fn split_world_publication(body: &[u8]) -> Result<(TransactionKey, &[u8]), Status> {
+    let (position, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world publication position"))?;
+    let (history, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Missing world publication history"))?;
+    let tx_id = rtdb_types::TxId(i64::from_be_bytes(*position));
+    let system_time = Timestamp(i64::from_be_bytes(*history));
+    if tx_id.0 < 0 || system_time <= Timestamp::MIN || system_time >= Timestamp::MAX {
+        return Err(invalid("Invalid world publication key"));
+    }
+    Ok((TransactionKey { tx_id, system_time }, body))
 }
 
 fn split_relation(body: &[u8]) -> Result<(OwnedRelation, &[u8]), Status> {
@@ -3442,7 +3453,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, rest) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a held world"))?;
-        let (system, rest) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Overlay preparation requires an exact system publication"))?;
+        let (publication, rest) = split_world_publication(rest)?;
         let (child, rest) = rest.split_first_chunk::<16>().ok_or_else(|| invalid("Overlay preparation requires a child identity"))?;
         let (until, mode) = rest.split_first_chunk::<8>().ok_or_else(|| invalid("Overlay preparation requires a retention deadline"))?;
         let retain_until = Timestamp(i64::from_be_bytes(*until));
@@ -3451,7 +3462,6 @@ impl Service {
             [1] => true,
             _ => return Err(invalid("Overlay preparation requires its exact clock mode")),
         };
-        let system = Timestamp(i64::from_be_bytes(*system));
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
@@ -3459,7 +3469,7 @@ impl Service {
         let mut session = connection.borrow().await?;
         require_idle(&session)?;
         let scope = session.placed_history().map_err(status)?.ok_or_else(unsupported)?;
-        let cut = held.snapshot.retained_child_cut(scope, system).await.map_err(status)?;
+        let cut = held.snapshot.retained_child_cut(scope, publication).await.map_err(status)?;
         let charge = call.reserve(4096)?;
         let prepared = host.prepare_world_overlay(
             crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
@@ -3654,18 +3664,18 @@ impl Service {
         let selected = if matches!(selection, WorldCutSelection::AsOfLocal) {
             held.snapshot.select_accepted_scope(&relations, system).await.map_err(status)?
         } else {
-            let clock = held.snapshot.preflight_accepted_scope(&relations, system).await.map_err(status)?;
-            Some((system, clock))
+            Some(held.snapshot.preflight_accepted_scope(&relations, system).await.map_err(status)?)
         };
         for relation in &relations { held.snapshot.check_relation(relation).map_err(status)?; }
-        let Some((system, clock)) = selected else {
+        let Some((publication, clock)) = selected else {
             return Ok(ActionResult { body: Bytes::from_static(&[0]) });
         };
-        let mut reply = Vec::with_capacity(17);
-        reply.extend_from_slice(&system.0.to_be_bytes());
+        let mut reply = Vec::with_capacity(25);
+        reply.extend_from_slice(&publication.tx_id.0.to_be_bytes());
+        reply.extend_from_slice(&publication.system_time.0.to_be_bytes());
         reply.extend_from_slice(&clock.0.to_be_bytes());
         reply.push(mode);
-        Ok(ActionResult { body: wire::retain(reply, call.reserve(17)?) })
+        Ok(ActionResult { body: wire::retain(reply, call.reserve(25)?) })
     }
 
     pub(crate) async fn held_world_point_at_action(&self, call: &Call, body: &[u8], parent: bool) -> Result<ActionResult, Status> {
@@ -3897,7 +3907,7 @@ impl Service {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
         let (handle, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires its original hold"))?;
-        let (system, body) = body.split_first_chunk::<8>().ok_or_else(|| invalid("Retaining a Held publication requires its physical revision"))?;
+        let (publication, body) = split_world_publication(body)?;
         let (child, body) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Retaining a Held publication requires a minted child"))?;
         let (mode, body) = body.split_first().ok_or_else(|| invalid("The child has no clock mode"))?;
         let requested = match mode {
@@ -3915,7 +3925,7 @@ impl Service {
         }
         let held = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
         let scope = self.hosted_control_scope(call).await?;
-        let cut = held.snapshot.retained_child_cut(scope, Timestamp(i64::from_be_bytes(*system))).await.map_err(status)?;
+        let cut = held.snapshot.retained_child_cut(scope, publication).await.map_err(status)?;
         let policy = self.hosted_control_policy(call)?;
         let groups = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, groups.iter().map(|(relation, _)| relation))?;

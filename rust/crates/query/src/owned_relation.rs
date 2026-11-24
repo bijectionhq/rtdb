@@ -1056,7 +1056,7 @@ impl ArchivedHeldClock {
             || self.publication.tx_id > self.media_end.tx_id
             || self.media_end != ancestor.basis || self.source_root != ancestor.source_root
             || self.publication.system_time != system
-            || !ancestor.covers(system, self.reading)
+            || !ancestor.covers(self.publication, self.reading)
         {
             return Err(rtdb_types::OwnedWorld::unavailable());
         }
@@ -1065,7 +1065,8 @@ impl ArchivedHeldClock {
 }
 
 pub async fn read_archived_held_clock(
-    context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
+    context: &Arc<QueryContext>, owner: &str, world: Iid, through: TransactionKey,
+    system: Timestamp, exact: Option<TransactionKey>,
 ) -> Result<ArchivedHeldClock> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
     let database = context.catalog.database(context.catalog.default_database())?;
@@ -1075,7 +1076,20 @@ pub async fn read_archived_held_clock(
     if media_end.system_time != context.current_time.as_micros()? {
         return Err(unavailable());
     }
-    let (source, reading, publication, _charge) = read_held_world_publication(context, owner, world, system).await?;
+    let selected = context.with_owned_transaction_cut(through, &context.cancellation)?;
+    let publication = if let Some(publication) = exact {
+        if publication.system_time != system || !publication.at_or_before(through) {
+            return Err(unavailable());
+        }
+        publication
+    } else {
+        let at = selected.with_owned_system_cut(system, &selected.cancellation)?;
+        read_owned_world_clock_publication(at, owner, world).await?
+            .map(|(_, publication)| publication)
+            .filter(|publication| publication.system_time == system)
+            .ok_or_else(unavailable)?
+    };
+    let (source, reading, _charge) = read_held_world_publication(&selected, owner, world, publication).await?;
     Ok(ArchivedHeldClock {
         world, pin: source.pin, media_end, source_root: source.basis, publication, reading,
     })
@@ -1083,21 +1097,18 @@ pub async fn read_archived_held_clock(
 
 /// Open the source registration and the actual clock event at the selected publication.
 pub async fn read_held_world_publication(
-    context: &Arc<QueryContext>, owner: &str, world: Iid, system: Timestamp,
-) -> Result<(rtdb_types::OwnedWorld, Timestamp, TransactionKey, Arc<rtdb_columnar::MemoryReservation>)> {
+    context: &Arc<QueryContext>, owner: &str, world: Iid, publication: TransactionKey,
+) -> Result<(rtdb_types::OwnedWorld, Timestamp, Arc<rtdb_columnar::MemoryReservation>)> {
     let unavailable = rtdb_types::OwnedWorld::unavailable;
-    let at = context.with_owned_system_cut(system, &context.cancellation)?;
-    let (reading, publication) = read_owned_world_clock_publication(at, owner, world).await?
-        .filter(|(_, publication)| publication.system_time == system)
-        .ok_or_else(unavailable)?;
     let at = context.with_owned_transaction_cut(publication, &context.cancellation)?;
     let (source, charge) = read_owned_world(Arc::clone(&at), owner, world).await?
         .filter(|(source, _)| !source.dropped
-            && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. })
-            && source.inherited_system() < system)
+            && matches!(source.mode, rtdb_types::WorldClockMode::Held { .. }))
         .ok_or_else(unavailable)?;
-    if !source.admits_clock_publication(reading, system) { return Err(unavailable()); }
-    Ok((source, reading, publication, charge))
+    let (reading, _) = read_owned_world_clock_publication(at, owner, world).await?
+        .filter(|(reading, event)| *event == publication && source.admits_clock_publication(*reading, publication.system_time))
+        .ok_or_else(unavailable)?;
+    Ok((source, reading, charge))
 }
 
 /// Select an accepted Held or Proposal reading within a certified physical prefix.

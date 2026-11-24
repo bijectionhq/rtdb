@@ -103,13 +103,13 @@ pub struct OwnedWorldAncestor {
     /// The exact end of the archived replica suffix.
     pub basis: TransactionKey,
     /// The selected application publication, which can precede the media end.
-    pub system: Timestamp,
+    pub publication: TransactionKey,
     pub source_root: TransactionKey,
     pub logical: Timestamp,
 }
 
 impl OwnedWorldAncestor {
-    const WIDTH: usize = 155;
+    const WIDTH: usize = 163;
 
     fn encode(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.world);
@@ -117,7 +117,7 @@ impl OwnedWorldAncestor {
         bytes.extend_from_slice(&self.capture);
         bytes.extend_from_slice(&self.suffix);
         bytes.extend_from_slice(self.manifest.as_bytes());
-        for value in [self.basis.tx_id.0, self.basis.system_time.0, self.system.0,
+        for value in [self.basis.tx_id.0, self.basis.system_time.0, self.publication.tx_id.0, self.publication.system_time.0,
             self.source_root.tx_id.0, self.source_root.system_time.0, self.logical.0]
         {
             bytes.extend_from_slice(&value.to_be_bytes());
@@ -140,9 +140,9 @@ impl OwnedWorldAncestor {
             world: uuid(0)?, pin: uuid(16)?, capture: uuid(32)?, suffix: uuid(48)?,
             manifest: manifest.to_owned(),
             basis: TransactionKey { tx_id: TxId(number(0)), system_time: Timestamp(number(1)) },
-            system: Timestamp(number(2)),
-            source_root: TransactionKey { tx_id: TxId(number(3)), system_time: Timestamp(number(4)) },
-            logical: Timestamp(number(5)),
+            publication: TransactionKey { tx_id: TxId(number(2)), system_time: Timestamp(number(3)) },
+            source_root: TransactionKey { tx_id: TxId(number(4)), system_time: Timestamp(number(5)) },
+            logical: Timestamp(number(6)),
         })
     }
 
@@ -153,9 +153,9 @@ impl OwnedWorldAncestor {
             && self.source_root == other.source_root
     }
 
-    pub fn covers(&self, system: Timestamp, logical: Timestamp) -> bool {
-        (system == self.system && logical == self.logical)
-            || (system < self.system && logical < self.logical)
+    pub fn covers(&self, publication: TransactionKey, logical: Timestamp) -> bool {
+        (publication == self.publication && logical == self.logical)
+            || (publication.tx_id < self.publication.tx_id && publication.at_or_before(self.publication) && logical < self.logical)
     }
 }
 
@@ -235,10 +235,15 @@ impl OwnedWorld {
         self.ancestors.last()
     }
 
-    /// Oldest to newest, selecting the writer responsible for this physical cut.
-    pub fn ancestor_at(&self, system: Timestamp) -> Option<&OwnedWorldAncestor> {
+    /// Select the first frozen writer containing a fresh SQL as-of selector.
+    pub fn ancestor_at_system(&self, system: Timestamp) -> Option<&OwnedWorldAncestor> {
         if system <= self.basis.system_time { return None; }
-        self.ancestors.iter().find(|layer| system <= layer.system)
+        self.ancestors.iter().find(|layer| system <= layer.publication.system_time)
+    }
+
+    pub fn ancestor_covering(&self, publication: TransactionKey) -> Option<&OwnedWorldAncestor> {
+        if publication.tx_id <= self.basis.tx_id { return None; }
+        self.ancestors.iter().find(|layer| publication.at_or_before(layer.publication))
     }
 
     /// Extend the independently retained certificate before publishing a child.
@@ -291,7 +296,11 @@ impl OwnedWorld {
 
     /// The publication inherited when this world began its own journal.
     pub fn inherited_system(&self) -> Timestamp {
-        self.ancestor().map_or(self.basis.system_time, |ancestor| ancestor.system)
+        self.inherited_position().system_time
+    }
+
+    pub fn inherited_position(&self) -> TransactionKey {
+        self.ancestor().map_or(self.basis, |ancestor| ancestor.publication)
     }
 
     pub fn root_clock(&self) -> Timestamp {
@@ -418,20 +427,21 @@ impl OwnedWorld {
             _ => return Err(Self::unavailable()),
         };
         let mut writers = BTreeSet::from([*id]);
-        let mut previous_system = Timestamp(*time);
+        let mut previous = TransactionKey { tx_id: TxId(*tx_id), system_time: Timestamp(*time) };
         let mut previous_logical = inherited;
         for layer in &ancestors {
             if !writers.insert(layer.world)
                 || *pin != *id || layer.basis.tx_id.0 <= *tx_id
                 || layer.basis.system_time.0 >= *until
-                || layer.system <= previous_system || layer.system > layer.basis.system_time
+                || layer.publication.tx_id <= previous.tx_id || !previous.at_or_before(layer.publication)
+                || !layer.publication.at_or_before(layer.basis)
                 || layer.logical <= previous_logical || layer.logical == Timestamp::MAX
                 || layer.source_root.tx_id.0 < 0 || layer.source_root.system_time.0 <= 0
                 || layer.source_root.system_time.0 > *time
             {
                 return Err(Self::unavailable());
             }
-            previous_system = layer.system;
+            previous = layer.publication;
             previous_logical = layer.logical;
         }
         let fork_lineage = match row.get("fork_lineage") {
@@ -516,13 +526,14 @@ impl OwnedWorld {
         let source = if prefix == self.ancestors.as_slice() {
             matches!(self.mode, WorldClockMode::Held { .. })
                 && self.id.0 == overlay.world && self.pin.0 == overlay.pin && self.basis == overlay.source_root
-                && overlay.system == overlay.basis.system_time
-                && overlay.system > self.inherited_system() && overlay.logical > self.initial_clock()
+                && overlay.publication == overlay.basis
+                && self.inherited_position().tx_id < overlay.publication.tx_id
+                && self.inherited_position().at_or_before(overlay.publication) && overlay.logical > self.initial_clock()
         } else {
             self.mode != WorldClockMode::Proposal
                 && self.ancestors.get(..prefix.len()) == Some(prefix)
                 && self.ancestors.get(prefix.len()).is_some_and(|inherited|
-                    inherited.holds_same_media(overlay) && inherited.covers(overlay.system, overlay.logical))
+                    inherited.holds_same_media(overlay) && inherited.covers(overlay.publication, overlay.logical))
         };
         source && self.id != next.id && next.id == next.pin && !self.dropped && !next.dropped
             && (next.mode == WorldClockMode::Retained
@@ -713,21 +724,28 @@ mod tests {
             next.mode = WorldClockMode::Held { start: system };
             next.ancestors.push(OwnedWorldAncestor {
                 world: source.id.0, pin: source.pin.0, capture: [31; 16], suffix: [32 + writer; 16],
-                manifest: "b".repeat(43), basis: TransactionKey { tx_id: TxId(i64::from(writer) + 1), system_time: system },
-                system, source_root: source.basis, logical: system,
+                manifest: "b".repeat(43), basis: TransactionKey { tx_id: TxId(i64::from(writer) * 10 + 1), system_time: system },
+                publication: TransactionKey { tx_id: TxId(i64::from(writer) * 10 + 1), system_time: system },
+                source_root: source.basis, logical: system,
             });
             assert!(source.can_retain_overlay(&next));
             next.fork_lineage = source.retained_child_lineage(&next, Timestamp(system.0 - 1))?;
             assert_eq!(OwnedWorld::from_record(&next.record())?, next);
             source = next;
         }
-        assert_eq!(source.ancestor_at(Timestamp(55)).unwrap().world, [3; 16]);
+        assert_eq!(source.ancestor_at_system(Timestamp(55)).unwrap().world, [3; 16]);
+        let earlier = TransactionKey { tx_id: TxId(30), system_time: Timestamp(70) };
+        let next = TransactionKey { tx_id: TxId(32), system_time: Timestamp(70) };
+        let layer = source.ancestor_covering(earlier).unwrap();
+        assert_eq!(layer.world, [3; 16]);
+        assert!(layer.covers(earlier, Timestamp(65)));
+        assert!(!layer.covers(next, Timestamp(65)));
         let mut child = source.clone();
         child.id = Iid([14; 16]);
         child.pin = child.id;
         child.ancestors.truncate(3);
         let selected = child.ancestors.last_mut().unwrap();
-        selected.system = Timestamp(55);
+        selected.publication = TransactionKey { tx_id: TxId(25), system_time: Timestamp(55) };
         selected.logical = Timestamp(54);
         child.mode = WorldClockMode::Held { start: Timestamp(54) };
         assert!(source.can_retain_overlay(&child));
@@ -746,7 +764,7 @@ mod tests {
                 world: [3; 16], pin: [3; 16], capture: [4; 16], suffix: [5; 16],
                 manifest: "b".repeat(43),
                 basis: TransactionKey { tx_id: TxId(20), system_time: Timestamp(200) },
-                system: Timestamp(200),
+                publication: TransactionKey { tx_id: TxId(20), system_time: Timestamp(200) },
                 source_root: TransactionKey { tx_id: TxId(10), system_time: Timestamp(100) },
                 logical: Timestamp(150),
             }],

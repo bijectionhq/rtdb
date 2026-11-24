@@ -52,13 +52,11 @@ impl ReplayedHeldPublication {
     fn binds(&self, binding: [u8; 32], ancestor: &rtdb_types::OwnedWorldAncestor) -> bool {
         self.binding == binding && self.pin == ancestor.pin
             && self.root == ancestor.source_root && self.reading == ancestor.logical
-            && self.source.system_time == ancestor.system
-            && (self.source == ancestor.basis
-                || (self.source.tx_id < ancestor.basis.tx_id && self.source.system_time < ancestor.basis.system_time))
+            && self.source == ancestor.publication && self.source.at_or_before(ancestor.basis)
     }
 }
 
-fn held_publication_locator(world: Iid, source: Timestamp) -> String {
+fn held_publication_locator(world: Iid, source: rtdb_types::TxId) -> String {
     format!("native-world-publication/{world}/{}", source.0)
 }
 
@@ -121,12 +119,12 @@ impl OpenTransaction<'_> {
                 .ok_or_else(unavailable)?,
         );
         let root_clock = world.root_clock();
-        if admission.basis.system_time != proven
-            || restored != proven
+        if admission.basis != proven
+            || restored != admission.basis
             || admission.basis.tx_id >= ordered.tx_id
             || root_clock > world.basis.system_time
             || (world.mode == WorldClockMode::Proposal && root_clock != logical)
-            || lease_start < proven
+            || lease_start < proven.system_time
             || lease_start > ordered.system_time
             || admission.until <= ordered.system_time
         {
@@ -139,11 +137,11 @@ impl OpenTransaction<'_> {
             let locator = format!("native-transaction/{}", original.tx_id.0);
             let (receipt, destination) = replay_control(context, &locator).await?;
             replayed_parent_logical_time(&receipt, admission.binding, &archive, original)?;
-            if ancestor.basis.system_time != destination
+            if ancestor.basis != destination
                 || ancestor.basis.tx_id >= ordered.tx_id
-                || destination > lease_start
-                || ancestor.system <= admission.basis.system_time
-                || ancestor.system > destination
+                || destination.system_time > lease_start
+                || ancestor.publication.tx_id <= admission.basis.tx_id
+                || !ancestor.publication.at_or_before(destination)
             {
                 return Err(unavailable());
             }
@@ -151,11 +149,10 @@ impl OpenTransaction<'_> {
             let locator = format!("native-transaction/{}", selected.tx_id.0);
             let (receipt, selected_destination) = replay_control(context, &locator).await?;
             replayed_parent_logical_time(&receipt, admission.binding, &archive, selected)?;
-            let (source, clock, publication, _charge) = rtdb_query::read_held_world_publication(
-                context, owner, Iid(ancestor.world), ancestor.system,
+            let (source, clock, _charge) = rtdb_query::read_held_world_publication(
+                context, owner, Iid(ancestor.world), ancestor.publication,
             ).await?;
-            if selected_destination != ancestor.system || clock != ancestor.logical
-                || (selected == original && publication != ancestor.basis)
+            if selected_destination != ancestor.publication || clock != ancestor.logical
                 || source.pin.0 != ancestor.pin || source.basis != ancestor.source_root
             {
                 return Err(unavailable());
@@ -402,7 +399,7 @@ impl OpenTransaction<'_> {
         self.buffer.put(
             TableRef::new("public", crate::hosted_control::RESTORE),
             StructFields::from([
-                ("_id".into(), Value::Utf8(held_publication_locator(world.id, source.system_time))),
+                ("_id".into(), Value::Utf8(held_publication_locator(world.id, source.tx_id))),
                 ("binding".into(), Value::Binary(body)),
             ]),
             Interval::new(Timestamp(0), Timestamp::MAX)?,
@@ -450,15 +447,17 @@ impl OpenTransaction<'_> {
             true,
         )
         .await?;
-        let (row, destination) = point.row.ok_or_else(OwnedWorld::unavailable)?;
+        let (row, system_time) = point.row.ok_or_else(OwnedWorld::unavailable)?;
+        let tx_id = rtdb_types::TxId(point.receipt_tx_id.ok_or_else(OwnedWorld::unavailable)?);
+        let destination = TransactionKey { tx_id, system_time };
         let bytes = row
             .batch()
             .column_by_name("binding")
             .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
             .filter(|column| column.is_valid(0))
             .ok_or_else(OwnedWorld::unavailable)?;
-        if destination <= replay.source_time()
-            || destination >= self.tx_key().system_time
+        if destination.system_time <= replay.source_time()
+            || destination.tx_id >= self.tx_key().tx_id || !destination.at_or_before(self.tx_key())
             || !replay.matches_parent_receipt(bytes.value(0), world.basis)
         {
             return Err(OwnedWorld::unavailable());
@@ -511,7 +510,7 @@ async fn require_replayed_fork_parent(
     if !admits_child
         || source.pin.0 != link.pin
         || !registration.precedes(replay.holds_binding(), replay.source_position(), link)
-        || destination != registered_at || destination != accepted_at
+        || destination != registered_at.system_time || registered_at != accepted_at
         || !replay.matches_parent_receipt(&accepted, registration.source)
         || link.registered >= logical
         || logical >= source.until
@@ -534,7 +533,7 @@ async fn require_replayed_held_publication(
     let unavailable = OwnedWorld::unavailable;
     let id = Iid(ancestor.world);
     let (body, selected_destination) =
-        replay_control(context, &held_publication_locator(id, ancestor.system)).await?;
+        replay_control(context, &held_publication_locator(id, ancestor.publication.tx_id)).await?;
     let proof: ReplayedHeldPublication = serde_json::from_slice(&body).map_err(|_| unavailable())?;
     let selected = proof.source;
     if !proof.binds(replay.holds_binding(), ancestor) {
@@ -543,13 +542,14 @@ async fn require_replayed_held_publication(
     if selected != ancestor.basis {
         let locator = format!("native-transaction/{}", ancestor.basis.tx_id.0);
         let (media_receipt, media_destination) = replay_control(context, &locator).await?;
-        if media_destination <= selected_destination || !replay.matches_parent_receipt(&media_receipt, ancestor.basis) {
+        if media_destination.tx_id <= selected_destination.tx_id || !selected_destination.at_or_before(media_destination)
+            || !replay.matches_parent_receipt(&media_receipt, ancestor.basis) {
             return Err(unavailable());
         }
     }
     let locator = format!("native-transaction/{}", selected.tx_id.0);
     let (receipt, destination) = replay_control(context, &locator).await?;
-    let (record, reading, _publication, _charge) =
+    let (record, reading, _charge) =
         rtdb_query::read_held_world_publication(context, owner, id, destination).await?;
     if destination != selected_destination
         || !replay.matches_parent_receipt(&receipt, selected)
@@ -563,23 +563,23 @@ async fn require_replayed_held_publication(
 async fn replay_control(
     context: &Arc<rtdb_query::QueryContext>,
     locator: &str,
-) -> Result<(Vec<u8>, Timestamp)> {
-    let (row, revision) = rtdb_query::read_hosted_control_point(
+) -> Result<(Vec<u8>, TransactionKey)> {
+    let point = rtdb_query::read_hosted_control_point(
         Arc::clone(context),
         TableRef::new("public", "bj_rtdb_restore_hold"),
         &EntityId::String(locator.to_owned()),
         true,
     )
-    .await?
-    .row
-    .ok_or_else(OwnedWorld::unavailable)?;
+    .await?;
+    let (row, system_time) = point.row.ok_or_else(OwnedWorld::unavailable)?;
+    let tx_id = rtdb_types::TxId(point.receipt_tx_id.ok_or_else(OwnedWorld::unavailable)?);
     let body = row
         .batch()
         .column_by_name("binding")
         .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
         .filter(|column| column.is_valid(0) && column.value(0).len() <= 4096)
         .ok_or_else(OwnedWorld::unavailable)?;
-    Ok((body.value(0).to_vec(), revision))
+    Ok((body.value(0).to_vec(), TransactionKey { tx_id, system_time }))
 }
 
 #[cfg(test)]
@@ -596,11 +596,14 @@ mod tests {
         };
         let mut ancestor = OwnedWorldAncestor {
             world: [3; 16], pin: proof.pin, capture: [4; 16], suffix: [5; 16], manifest: String::new(),
-            basis: source, system: source.system_time, source_root: root, logical: proof.reading,
+            basis: source, publication: source, source_root: root, logical: proof.reading,
         };
         assert!(proof.binds([1; 32], &ancestor));
         ancestor.basis.tx_id = TxId(9);
+        assert!(proof.binds([1; 32], &ancestor));
+        ancestor.publication.tx_id = TxId(7);
         assert!(!proof.binds([1; 32], &ancestor));
+        ancestor.publication = source;
         ancestor.basis.system_time = Timestamp(100);
         assert!(proof.binds([1; 32], &ancestor));
         ancestor.logical = Timestamp(62);
