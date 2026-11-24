@@ -1423,6 +1423,7 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
         matches!(status.role, rtdb_replication::Role::Leading(_))
     })).await.unwrap().unwrap();
     let mut client = Client::connect(&running.server, None).await;
+    let geometry = [0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let row = |id, text, vector: [f32; 2]| {
         let embedding = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Float32Type, _, _>([
             Some(vector.map(Some)),
@@ -1430,6 +1431,7 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
         v1::Row {
             cells: [("_id".into(), integer_cell(id)),
                 ("body".into(), scalar_cell(Arc::new(StringArray::from(vec![text])))),
+                ("geometry".into(), scalar_cell(Arc::new(arrow_array::BinaryArray::from_vec(vec![geometry.as_slice()])))),
                 ("embedding".into(), scalar_cell(Arc::new(embedding)))].into_iter().collect(),
             ..Default::default()
         }
@@ -1504,6 +1506,34 @@ async fn rtdb_v1_ranks_rows_at_the_native_receipt_basis() {
     request.require_clear_rank_input = true;
     let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
     error(status, v1::AnomalyCategory::Unsupported, "rtdb/unsupported");
+
+    for (anchor, expected) in [(0, vec![1, 2]), (1, vec![2]), (2, vec![])] {
+        let point = "X'00010100000000000000000000000000000000000000'";
+        let mut request = input(&format!(
+            "WITH MATERIALIZED distances AS (
+                 SELECT _id, _rtdb_written_basis, body,
+                        SPATIAL_DISTANCE(geometry, {point}, 'tagged-wkb-v1', 'wgs84_geometry_m', 0) AS distance
+                 FROM ranked_rows
+                 WHERE SPATIAL_MATCH(geometry, {point}, 'tagged-wkb-v1', 'equals')
+             )
+             SELECT _id, _rtdb_written_basis, body, distance FROM distances
+             WHERE distance IS NOT NULL AND (distance > 0 OR ENTITY_SORT_KEY(_id) > ENTITY_SORT_KEY({anchor}))
+             ORDER BY distance, ENTITY_SORT_KEY(_id) LIMIT 2"
+        ));
+        request.source.as_mut().unwrap().at = Some(v1::At { selection: original.basis.clone().map(Selection::Exactly) });
+        request.track = true;
+        request.require_clear_rank_input = true;
+        let (rows, trailer) = query(&mut client, request).await;
+        assert_eq!(ints(&rows), expected);
+        for batch in &rows {
+            for row in 0..batch.num_rows() {
+                assert!(!batch.column(1).is_null(row));
+                assert!(!batch.column(2).is_null(row));
+            }
+        }
+        assert_eq!(trailer.basis, original.basis);
+        assert!(!trailer.claim.unwrap().value.is_empty());
+    }
     running.stop().await;
 }
 

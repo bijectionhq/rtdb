@@ -76,6 +76,36 @@ For a nearest page of size `k`, use `WHERE distance IS NOT NULL` and order by `d
 The extra row's distance is the next-distance bound.
 Keep the anchor from the last delivered row and use `distance > $after_distance OR (distance = $after_distance AND ENTITY_SORT_KEY(_id) > $after_key)` on the next exact-cut Query.
 Keep the original radius and exclusive lower bound independent of that anchor.
+To return the bound without returning the extra document, materialize the ordered prefix and split it into the hit projection and a scalar bound as below.
+
+```sql
+WITH MATERIALIZED candidates AS (
+    SELECT _id, _rtdb_written_basis, document, geometry
+    FROM places FOR VALID_TIME AS OF $1 WHERE partition_key = $2
+    LIMIT 100001
+), admission AS (
+    SELECT RANK_ADMITTED_COUNT(COUNT(*), 100000) AS admitted FROM candidates
+), MATERIALIZED distances AS (
+    SELECT _id, _rtdb_written_basis, document,
+           SPATIAL_DISTANCE(geometry, $3, 'tagged-wkb-v1', 'wgs84_geometry_m', $4, $5) AS distance
+    FROM candidates
+), MATERIALIZED prefix AS (
+    SELECT _id, _rtdb_written_basis, document, distance, ENTITY_SORT_KEY(_id) AS identity_key
+    FROM distances WHERE distance IS NOT NULL
+    ORDER BY distance, identity_key LIMIT 21
+), hits AS (
+    SELECT * FROM prefix ORDER BY distance, identity_key LIMIT 20
+), omitted AS (
+    SELECT distance FROM prefix ORDER BY distance, identity_key LIMIT 1 OFFSET 20
+)
+SELECT hits._id, hits._rtdb_written_basis, hits.document, hits.distance, hits.identity_key,
+       omitted.distance AS next_distance_m, admission.admitted
+FROM admission LEFT JOIN hits ON TRUE LEFT JOIN omitted ON TRUE
+ORDER BY hits.distance, hits.identity_key
+```
+
+The first page omits the keyset predicate, and following pages add it to the prefix's filter.
+The single null-identity result on an empty page carries the admitted count along with the Query trailer's claim.
 For an unranked range order and seek by the complete identity key alone.
 Bind any application continuation to the original basis, branch, layer, valid instant, projection, predicate, probe and exact partition values.
 These SQL expressions perform bounded exact refinement over the resolved source.
