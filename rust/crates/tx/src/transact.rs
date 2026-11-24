@@ -558,6 +558,29 @@ impl TransactState {
 
     pub fn has_receipts(&self) -> bool { !self.receipts.is_empty() }
 
+    /// Copies authenticated shared-checkpoint receipts onto their exact native transaction cuts.
+    /// Original physical coordinates remain evidence on the source installation and are cleared in the copy.
+    pub fn import_classic_receipts(
+        &mut self, original: &Self, map: impl Fn(InstalledReceipt) -> Option<Basis>,
+    ) -> Result<usize> {
+        if self.pending.is_some() || !self.receipts.is_empty() || original.pending.is_some() || original.pending_erasure.is_some() {
+            return Err(invalid_record());
+        }
+        let mut receipts = original.receipts.clone();
+        let mut count = 0;
+        for stored in receipts.values_mut().flat_map(|namespace| namespace.values_mut()) {
+            let basis = stored.installed.and_then(&map).ok_or_else(invalid_record)?;
+            if stored.workload.is_some() || self.index.exact(basis)?.system_time != stored.receipt.system_time {
+                return Err(invalid_record());
+            }
+            stored.receipt.basis = basis;
+            stored.installed = None;
+            count += 1;
+        }
+        self.receipts = receipts;
+        Ok(count)
+    }
+
     pub fn install_receipt_position(&mut self, namespace: Option<[u8; 32]>, receipt: &Receipt, position: InstalledReceipt) -> Result<()> {
         let stored = self.receipts.get_mut(&namespace).and_then(|receipts| receipts.get_mut(&receipt.key)).ok_or_else(invalid_record)?;
         if stored.receipt != *receipt || stored.installed.is_some() { return Err(invalid_record()); }

@@ -46,6 +46,8 @@
 -- The checkpoint's retained event positions identify earlier written versions.
 -- Historical events without original transaction provenance carry no written-basis value.
 -- A shared checkpoint records that its physical partition and branch fold cover the same prefix.
+-- An authenticated Classic migration preserves retained literal event clocks, bounds and their known written identity in the private native fold.
+-- Native candidate recovery reads the imported byte commitment from a committed restore checkpoint before reporting its mapped cut.
 -- An attachment without a shared write projection can serve an empty branch fold from the exact published Classic catalog.
 -- A valid standalone v1 checkpoint retains its canonical receipts and native rows through the legacy fold.
 -- A terminal shared decision records its original source position and term-admitted replica position as evidence on the canonical receipt.

@@ -94,11 +94,12 @@ impl BranchIndex {
     }
 
     pub fn unowned_checkpoint_image(table: &TableRef, image: &RowImage) -> bool {
-        TableRef::owned_schema(&table.schema)
-            || image
-                .cells
-                .iter()
-                .any(|(column, value)| unowned_carrier(column, value))
+        Self::has_unowned_checkpoint_carrier(table, &image.cells)
+    }
+
+    /// Identifies owned relations and carrier encodings that need their Original custody authority.
+    pub fn has_unowned_checkpoint_carrier(table: &TableRef, cells: &rtdb_types::StructFields<Value>) -> bool {
+        TableRef::owned_schema(&table.schema) || cells.iter().any(|(column, value)| unowned_carrier(column, value))
     }
 
     fn native_group_commitment(&self, group: CustodyGroupId) -> Result<[u8; 32]> {

@@ -614,6 +614,17 @@ contract LogService {
         -- The reader holds scratch storage while examining the replay and observes the original fence and retained obligations without acquiring original journal or object write authority.
         -- The migration scratch stage stays private and cannot seed a Classic target writer.
 
+    @invariant ClassicMigrationNativeCandidate
+        -- The authenticated recovery operator selects the exact fenced source name and authority, capture, scratch artifact and migration request.
+        -- Native catalog reservation compares both name and physical stream identity and retains the exact projection commitment.
+        -- Candidate admission stays closed while a private writer appends the restored checkpoint to the native stream.
+        -- The import preserves admitted literal event times and retains their exact transaction cuts under the candidate's native coordinates.
+        -- Canonical receipt imports preserve their original namespace, key, fingerprint and outcome under the mapped cut.
+        -- Authenticated Original receipt read-through selects the exact control row at the certified scratch replay and returns its retained event coordinates.
+        -- The retained replay, its covered relations and remaining Original custody remain distinguishable in the private proof.
+        -- Status reopens the same native manifest through the ordered restore terminal after an interrupted append or reply.
+        -- Route readiness and authority publication require the caller's separate guarded decision.
+
     @invariant InstalledJournalErasureCommit
         -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.
         -- Ordinary checkpoint selection preserves replay of that committed marker.

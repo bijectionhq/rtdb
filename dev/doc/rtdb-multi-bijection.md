@@ -444,9 +444,51 @@ An active retained World or replica suffix pin blocks this source fence.
 `discard_classic_migration_stage` accepts the same selector before fencing and reports the exact scratch disposal receipt once available.
 After fencing, recover the same attempt from its retained state.
 
-The source seal is one input to a future route decision.
-Native import, old-to-native receipt and Basis mapping, protected contributor and key custody, and positive drain of application-owned deliveries and readers require separate evidence.
-Keep the old media and credentials available for retained obligations.
+### Private native candidate
+
+Start the recovery listener with `--recovery-native-destination` and the installed native Multi journal, catalog and storage configuration.
+The recovery task uses an enrolled native peer's network identity and its own journal credential slot.
+Send install to the peer selected for the destination stream and use any admitted recovery owner for status.
+The listener authenticates the ordinary recovery envelope against the exact fenced Classic `name`, `authority` and `capture`.
+The destination keeps that name and authority UUID and uses a separately reserved native catalog row, native stream and encrypted manifest.
+
+The four actions take a `selection` with `destination`, `stage_operation`, `staged_manifest_sha256`, `ciphertext_sha256`, `command_id`, `command_digest` and optional `original_receipt_table`.
+`destination` equals the original authority UUID, while `stage_operation` names the independent Classic scratch installation.
+The command ID and digest identify Bijection's retained migration request.
+Choose the exact public receipt-control table with `{schema, table}` when the migration needs Classic receipt read-through.
+Every reply uses `classic_migration_destination` and returns the exact `selection`, old terminal transaction and frontiers, `terminal_sha256` and `request_sha256` in `evidence`.
+
+- `stage_classic_migration_destination` verifies the scratch replay and returns `projection` and the closed native `candidate` when the projection is installable.
+- `install_classic_migration_destination` takes the exact staged `projection_sha256` and commits the native restore checkpoint under the private stream lease.
+- `classic_migration_destination_status` reports the same catalog reservation and, once present, reopens the committed native checkpoint without acquiring a writer lease.
+  Supply optional `classic_cut` with the old `tx_id` and `system_time` to verify an exact retained cut against the reopened native checkpoint and return `mapped_cut`.
+- `read_classic_migration_original_receipt` takes a typed `id`, such as `{"String":"<original receipt row ID>"}`, and returns the selected Original control row history from the exact scratch replay.
+  Each retained event includes its original valid-time extent, system time, position, digest and literal document where present.
+  The control row is evidence for Bijection's original request and disclosure interpretation.
+
+Keep the same selection and staged projection digest after any indeterminate response.
+The native proof reports the candidate's catalog reservation basis and the restore record's LSN, writer epoch, key generation, manifest address, ciphertext digest, and checkpoint state digest.
+The source and destination terminal times must agree.
+A native terminal establishes private installation only.
+The ordered catalog leaves the candidate closed to serving, workload claim and automatic attachment while Bijection establishes readiness and independently guards the route decision.
+
+The literal projection covers positioned clear puts and deletes with unambiguous physical addresses.
+It preserves valid intervals, system times and original written transaction identity.
+It also covers uniquely anchored unpositioned events with disjoint same-transaction intervals and keeps their written basis absent.
+Retained source transaction `n` maps to native position `n + 1`, provided the exact source clock and transaction are present in the imported prefix.
+The proof commits to the complete mapping of admitted cuts and the literal source inventory.
+An authenticated inline shared checkpoint can contribute canonical v1 receipts whose installed source coordinates map exactly to those cuts.
+The copy preserves each canonical namespace, key, fingerprint and outcome, and its Original source coordinates remain in the retained evidence.
+The Classic business receipt path uses the original control row key and its retained outcome history.
+It assigns no canonical v1 request identity to a Classic retry token.
+
+Projection coverage identifies retained Classic bookkeeping, withheld protected carriers, owned relations, system relations and literal relations that need further event translation.
+A sealed canonical checkpoint object needs its original generation and key evidence.
+Canonical suffix decisions need authenticated shared-fold replay, and canonical branch, visibility, workload, erasure and custody controls need a compatible native representation.
+The candidate also needs proof for any Classic outstanding placed reservation, source erasure or redaction, unresolved retained World, suffix pin, capture and pending release.
+Reciprocal custody for protected history requires the Original contributor census, exact forward and reverse binding and positive holder, reader and release disposition.
+The existing native checkpoint protocol requires distinct native source and target incarnations and an active Original ordering owner for that binding.
+Keep the Classic media and credentials for retained obligations while the closed candidate awaits the missing proofs.
 
 | Phase | Bijection | RTDB plan stages it needs |
 | --- | --- | --- |

@@ -44,7 +44,7 @@ use crate::{
 mod owned_inventory;
 pub(crate) use owned_inventory::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, inspect_staged_owned_relations, stream_staged_owned_event_files};
 mod classic_migration;
-pub(crate) use classic_migration::{ClassicMigrationInventory, inspect_classic_migration_inventory};
+pub(crate) use classic_migration::{ClassicMigrationInventory, ClassicProjection, ClassicRead, ReceiptHistory, ReceiptLookup, inspect_classic_migration_inventory, read_classic_migration};
 
 pub struct StagedReaderSettings {
     pub destination: Uuid,

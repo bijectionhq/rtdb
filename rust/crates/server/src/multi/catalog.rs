@@ -29,6 +29,7 @@ pub(super) struct Deployment {
 pub(super) enum Status {
     Reserved,
     Ready,
+    ClassicCandidate { request: [u8; 32], projection: [u8; 32] },
     TransferPending(Transfer),
     TransferReady {
         request: [u8; 32],
@@ -194,6 +195,15 @@ impl Catalog {
     /// Selects a stable incarnation before any provisioner opens its data stream.
     pub(super) async fn reserve(&self, name: &str, database: Uuid) -> Result<Deployment> {
         self.reserve_status(name, database, Status::Reserved).await
+    }
+
+    pub(super) async fn reserve_classic_candidate(
+        &self, name: &str, database: Uuid, request: [u8; 32], projection: [u8; 32],
+    ) -> Result<Deployment> {
+        let status = Status::ClassicCandidate { request, projection };
+        let selected = self.reserve_status(name, database, status.clone()).await?;
+        if selected.status != status { return Err(conflict()); }
+        Ok(selected)
     }
 
     pub(super) async fn reserve_transfer(
@@ -565,6 +575,14 @@ async fn find(control: &mut MultiDatabase, name: &str) -> Result<Deployment> {
 }
 
 fn decode_status(ready: bool, database: [u8; 16], cells: &StructFields<Value>) -> Result<Status> {
+    if let Some(request) = cells.get("classic_request") {
+        let (false, Value::Binary(request), Some(Value::Binary(projection))) =
+            (ready, request, cells.get("classic_projection")) else { return Err(invalid_catalog()); };
+        let request = request.as_slice().try_into().map_err(|_| invalid_catalog())?;
+        let projection = projection.as_slice().try_into().map_err(|_| invalid_catalog())?;
+        if request == [0; 32] || projection == [0; 32] { return Err(invalid_catalog()); }
+        return Ok(Status::ClassicCandidate { request, projection });
+    }
     if let Some(request) = cells.get("transfer_request") {
         let Value::Binary(request) = request else {
             return Err(invalid_catalog());
@@ -739,9 +757,15 @@ async fn write(
         ),
         ("ready".into(), Cell::Value(Value::Bool(status.ready()))),
     ]);
+    let private_classic = matches!(status, Status::ClassicCandidate { .. });
     let phase = match status {
         Status::Reserved => b"reserve".to_vec(),
         Status::Ready => b"ready".to_vec(),
+        Status::ClassicCandidate { request, projection } => {
+            cells.insert("classic_request".into(), Cell::Value(Value::Binary(request.to_vec())));
+            cells.insert("classic_projection".into(), Cell::Value(Value::Binary(projection.to_vec())));
+            b"classic-candidate".to_vec()
+        }
         Status::TransferPending(transfer) => {
             cells.insert(
                 "transfer_request".into(),
@@ -889,12 +913,13 @@ async fn write(
             if_absent: true,
         });
     }
-    let receipt = if let Some(peer) = &catalog.peer
-        && let Some(receipt) = peer.forward_catalog(catalog.incarnation, &request).await?
-    {
-        receipt
-    } else {
-        control.transact(&request).await?
+    let receipt = match &catalog.peer {
+        Some(peer) if private_classic => peer.forward_classic_catalog(catalog.incarnation, &request).await?,
+        Some(peer) => match peer.forward_catalog(catalog.incarnation, &request).await? {
+            Some(receipt) => receipt,
+            None => control.transact(&request).await?,
+        },
+        None => control.transact(&request).await?,
     };
     match receipt.outcome {
         Outcome::Then | Outcome::Otherwise { .. } => Ok(()),

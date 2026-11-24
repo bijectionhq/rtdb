@@ -106,7 +106,7 @@ pub use read_world::{CheckpointPoint, CheckpointReadResources, CheckpointReadWor
 pub(crate) use retirement::{capture_retirement_receipt, commit_capture_revocation, prepare_capture_retirement, finish_capture_retirement, obsolete_fork_input, obsolete_world_suffix, require_capture_open, retire_capture, retire_obsolete_fork_input, schedule_capture_revocation, retire_world_suffix};
 pub use reader::{StagedReaderSettings, serve_staged_checkpoint};
 pub(crate) use reader::{activate_checkpoint_transfer_target, seed_checkpoint_transfer_target, verify_checkpoint_transfer_target, StageOwnedRelations, StageSelector, inspect_staged_owned_relations, stream_staged_owned_event_files, tunnel_staged_checkpoint};
-pub(crate) use reader::{ClassicMigrationInventory, inspect_classic_migration_inventory};
+pub(crate) use reader::{ClassicMigrationInventory, ClassicProjection, ClassicRead, ReceiptHistory, ReceiptLookup, inspect_classic_migration_inventory, read_classic_migration};
 
 const MAXIMUM_BYTES: u64 = 1 << 30;
 const MAXIMUM_MANIFEST_BYTES: u64 = 16 << 20;
@@ -924,7 +924,7 @@ fn inconsistent(message: &'static str) -> Anomaly {
     Anomaly::new(AnomalyCategory::Conflict, "rtdb.multi/capture", message)
 }
 
-fn encode(value: &impl Serialize) -> Result<Bytes> {
+pub(crate) fn encode(value: &impl Serialize) -> Result<Bytes> {
     serde_json::to_vec(value).map(Bytes::from).map_err(|_| {
         Anomaly::fault(
             "rtdb.multi/capture",
@@ -2777,7 +2777,7 @@ pub(crate) struct RemoteArchive {
     pub inventory: [u8; 32],
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     ring::digest::digest(&ring::digest::SHA256, bytes)
         .as_ref()
         .try_into()

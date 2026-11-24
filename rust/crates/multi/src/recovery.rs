@@ -29,6 +29,8 @@ use crate::{
     keys::KeyService,
 };
 
+mod classic_destination;
+
 const FRAME_BYTES: u64 = 2048;
 const MAX_REPLY_BYTES: usize = 4 << 20;
 const SOCKET_DEADLINE: Duration = Duration::from_secs(15);
@@ -160,6 +162,10 @@ enum Action {
         staged_manifest_sha256: String,
         ciphertext_sha256: [u8; 32],
     },
+    StageClassicMigrationDestination { selection: classic_destination::Selection },
+    InstallClassicMigrationDestination { selection: classic_destination::Selection, projection_sha256: [u8; 32] },
+    ClassicMigrationDestinationStatus { selection: classic_destination::Selection, classic_cut: Option<rtdb_types::TransactionKey> },
+    ReadClassicMigrationOriginalReceipt { selection: classic_destination::Selection, id: rtdb_types::EntityId },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
         stage_operation: Uuid,
@@ -316,6 +322,7 @@ enum Reply {
     TransferTargetVerified {
         bootstrap: rtdb_directory::CheckpointTransferBootstrap,
     },
+    ClassicMigrationDestination { evidence: classic_destination::Evidence },
     ClassicMigrationInventoryInspected {
         inventory: archive::ClassicMigrationInventory,
     },
@@ -348,6 +355,7 @@ pub struct RecoveryService {
     hosted_task: Option<HostedTask>,
     control: ControlKey,
     memory: Arc<MemoryBudget>,
+    classic_destination: Option<rtdb_server::multi::MultiRuntime>,
 }
 
 impl RecoveryService {
@@ -371,7 +379,13 @@ impl RecoveryService {
             hosted_task,
             control,
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
+            classic_destination: None,
         })
+    }
+
+    pub fn with_classic_destination(mut self, runtime: rtdb_server::multi::MultiRuntime) -> Self {
+        self.classic_destination = Some(runtime);
+        self
     }
 
     async fn authorize(
@@ -863,6 +877,18 @@ impl RecoveryService {
                 )).await?;
                 Ok(Reply::TransferTargetVerified { bootstrap })
             },
+            Action::StageClassicMigrationDestination { selection } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Stage,
+            )).await,
+            Action::InstallClassicMigrationDestination { selection, projection_sha256 } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Install { projection_sha256 },
+            )).await,
+            Action::ClassicMigrationDestinationStatus { selection, classic_cut } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Status { classic_cut },
+            )).await,
+            Action::ReadClassicMigrationOriginalReceipt { selection, id } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::OriginalReceipt { id },
+            )).await,
             Action::InspectClassicMigrationInventory { destination, stage_operation, staged_manifest_sha256, ciphertext_sha256 } => {
                 if installation.checkpoint_stage.is_some() || destination.is_nil() || stage_operation.is_nil()
                     || !valid_manifest(&staged_manifest_sha256)
@@ -1278,6 +1304,7 @@ mod tests {
         let service = RecoveryService {
             token: Token::new(&token)?, org: "cell".into(), broker: None, hosted_task: None,
             control: ControlKey::default(), memory: MemoryBudget::new(1 << 20),
+            classic_destination: None,
             storage: CellStorage::Local { root: temporary.path().join("serving") },
             archive: CellStorage::Local { root: temporary.path().join("archive") },
             keys: Arc::new(crate::keys::LocalKeyService::new(&temporary.path().join("keys"))?),
@@ -1430,6 +1457,7 @@ mod tests {
             hosted_task: None,
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
+            classic_destination: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local { root: temporary.path().join("serving") },
@@ -1520,6 +1548,7 @@ mod tests {
             hosted_task: None,
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
+            classic_destination: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local { root: temporary.path().join("serving") },
@@ -1632,6 +1661,7 @@ mod tests {
             hosted_task: None,
             control: ControlKey::default(),
             memory: MemoryBudget::new(rtdb_node::NodeOptions::default().execution_memory_bytes),
+            classic_destination: None,
             token: Token::new(&token).unwrap(),
             org: "cell".into(),
             storage: CellStorage::Local {

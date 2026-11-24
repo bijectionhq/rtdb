@@ -1642,3 +1642,54 @@ async fn checked_workload_custody_retains_its_namespaced_receipt_across_checkpoi
         else { panic!("expected recovered custody receipt") };
     assert_eq!(scoped, recovered);
 }
+
+#[tokio::test]
+async fn classic_candidate_status_recovers_a_lost_checkpoint_append_after_reopen() {
+    use rtdb_format::data::{StoredEvent, StoredOperation};
+    use rtdb_index::branches::BranchCut;
+    use rtdb_types::{EventPosition, Interval, TransactionKey, TxId};
+
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, faults.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let first = TransactionKey { tx_id: TxId(123), system_time: Timestamp(5) };
+    let terminal = TransactionKey { tx_id: TxId(124), system_time: Timestamp(7) };
+    let cut = |tx: TransactionKey| BranchCut {
+        basis: classic_import_basis(writer.incarnation(), tx.tx_id).unwrap(), system_time: tx.system_time,
+    };
+    let (first_cut, terminal_cut) = (cut(first), cut(terminal));
+    let mut index = BranchIndex::new(writer.incarnation());
+    let id = EntityId::Integer(1);
+    let valid = Interval::new(Timestamp(40), Timestamp(48)).unwrap();
+    index.advance_classic(first_cut).unwrap();
+    index.apply_classic_event(&table(), StoredEvent {
+        position: Some(EventPosition { transaction: first.tx_id, ordinal: 0 }),
+        origin: None, entity_key: None, iid: id.iid(), system_from: first.system_time,
+        commit_position: 0, valid_time: valid,
+        operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])), recency: None,
+    }, Some(first.tx_id)).unwrap();
+    index.advance_classic(terminal_cut).unwrap();
+    let mut folded = TransactState::new(writer.incarnation());
+    folded.replace_applied_index(index).unwrap();
+
+    let projection = [83; 32];
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(writer.install_classic_checkpoint(projection, &folded).await.unwrap_err().category, AnomalyCategory::Interrupted);
+    drop(writer);
+
+    let mut reopened = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    let proof = reopened.classic_checkpoint_status(projection).await.unwrap().unwrap();
+    assert_eq!(proof.basis, terminal_cut.basis);
+    assert_eq!(proof.system_time, terminal_cut.system_time);
+    assert_eq!(reopened.install_classic_checkpoint(projection, &folded).await.unwrap(), proof);
+    assert!(reopened.classic_checkpoint_status([84; 32]).await.is_err());
+    assert_eq!(reopened.classic_checkpoint_cut(projection, first).await.unwrap(), first_cut);
+    assert!(reopened.classic_checkpoint_cut(projection, TransactionKey { system_time: Timestamp(6), ..first }).await.is_err());
+    let (index, _) = reopened.fresh_view().await.unwrap();
+    let view = index.view(MAIN_BRANCH, At::Exactly(first_cut.basis), Layer::Merged, first_cut.system_time).unwrap();
+    assert_eq!(view.row(&table(), &id, Timestamp(44)).unwrap().valid, valid);
+    assert!(view.row(&table(), &id, Timestamp(48)).is_none());
+}

@@ -191,6 +191,9 @@ surface StatelessDatabase {
         -- The idempotency key within its receipt namespace identifies the request.
         -- The writer records its admission time, the complete canonical request and the selected outcome with resolved effects.
         -- Followers apply the recorded effects. Checkpoints preserve the namespaced key, request digest and outcome for retries.
+        -- A Classic migration can import authenticated canonical receipts whose original installed coordinates map to retained native cuts.
+        -- The imported canonical receipt keeps its namespace, key, request digest and outcome.
+        -- Classic-only receipt controls preserve the original lookup identity through authenticated read-through.
         -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
 
     @guarantee TransactionRequirements

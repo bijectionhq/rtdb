@@ -955,6 +955,17 @@ fn replica_basis_position(replica: ReplicaPosition) -> Result<u64> {
     u64::try_from(position).map_err(|_| invalid())
 }
 
+/// Reads the canonical fold from the inline bytes of an authenticated Classic replay block.
+pub fn classic_inline_receipts(block: &rtdb_format::catalog::BlockCatalog, incarnation: [u8; 16]) -> Result<Option<TransactState>> {
+    let wire = block.as_proto();
+    let Some(inline) = wire.serving_checkpoint.as_deref() else { return Ok(None); };
+    if wire.serving_checkpoint_object.is_some() { return Err(invalid()); }
+    let (fold, _, shared) = decode_checkpoint_image(inline, incarnation)?;
+    if !shared { return Err(invalid()); }
+    fold.validate_installed_receipts(block.latest_source_position(), block.boundary_replica_position(), block.boundary_term())?;
+    Ok(Some(fold))
+}
+
 pub(crate) fn decode_checkpoint_image(image: &[u8], incarnation: [u8; 16]) -> Result<(TransactState, u64, bool)> {
     let (mut header, state) = image.split_at_checked(CHECKPOINT_HEADER_BYTES).ok_or_else(invalid)?;
     let position = header.get_u64();

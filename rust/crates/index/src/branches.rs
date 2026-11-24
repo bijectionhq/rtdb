@@ -320,6 +320,24 @@ impl BranchIndex {
         self.catalog.values().any(|history| history.iter().any(|(_, definition)| definition.visibility.is_some()))
     }
 
+    /// Reports canonical state that requires translation beyond the retained Classic rows.
+    pub fn has_classic_migration_controls(&self) -> bool {
+        self.branches.len() != 1 || self.erased.is_some() || !self.custody.is_empty()
+            || !self.custody_transfers.is_empty() || self.inherited_custody.is_some()
+            || self.latest_custody_revocation.is_some() || !self.used_custody_placements.is_empty()
+            || !self.scoped_holds.is_empty()
+            || self.catalog.values().any(|history| history.iter().any(|(_, definition)| {
+                !definition.indexes.is_empty() || !definition.ranked_indexes.is_empty() || definition.ttl_micros.is_some()
+                    || !definition.constraints.is_empty() || !definition.grouped_constraints.is_empty()
+                    || definition.generation != 0 || definition.dropped || definition.visibility.is_some()
+                    || definition.single_label_per_tx
+            }))
+            || self.retained_images().any(|(_, table, _, image)| {
+                image.expires_at.is_some() || image.custody_group.is_some() || image.custody_payload.is_some()
+                    || Self::unowned_checkpoint_image(table, image)
+            })
+    }
+
     /// Select an exact settled prefix for checkpoint export. Erasure fences
     /// constrain export even when a historical cut is still queryable.
     pub fn checkpoint_at(&self, at: Basis) -> Result<Self> {

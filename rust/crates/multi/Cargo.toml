@@ -36,7 +36,7 @@ rtdb-query.workspace = true
 rtdb-pgwire.workspace = true
 rtdb-replication.workspace = true
 rtdb-s3 = { workspace = true, features = ["versioning"] }
-rtdb-server.workspace = true
+rtdb-server = { workspace = true, features = ["multi", "s3"] }
 rtdb-storage.workspace = true
 rtdb-trie.workspace = true
 rtdb-tx.workspace = true

@@ -1302,3 +1302,43 @@ fn custody_admission_orders_the_whole_part_and_preserves_its_drain_after_restart
         assert!(state.index().custody_releases_drained(registration.group));
     }
 }
+
+#[test]
+fn classic_receipt_import_preserves_fingerprints_and_separates_equal_keys_by_namespace() {
+    let mut original = TransactState::new(INCARNATION);
+    let shared_key = request(1, vec![declare_visibility(), labelled_put(MAIN_BRANCH, 1, 1, Interval::ALL)]);
+    let plain = commit(&mut original, 1, &shared_key);
+    let other = commit(&mut original, 2, &request(2, vec![labelled_put(MAIN_BRANCH, 3, 1, Interval::ALL)]));
+    let labels = LabelScope { read: BTreeSet::from([vec![1]]), write: BTreeSet::from([vec![1]]) };
+    let scoped = ScopedTransact { labels: &labels, receipt_namespace: [8; 32] };
+    let scoped_request = request(1, vec![labelled_put(MAIN_BRANCH, 2, 1, Interval::ALL)]);
+    let Resolution::Append(append) = original.resolve_scoped(&scoped_request, 3, Timestamp(30), MULTI, &claims(), scoped).unwrap() else {
+        panic!("expected a scoped receipt");
+    };
+    let scoped_receipt = apply(&mut original, 3, append.record()).unwrap();
+    for (namespace, receipt) in [(None, &plain), (None, &other), (Some(scoped.receipt_namespace), &scoped_receipt)] {
+        let position = receipt.basis.position() as i64;
+        original.install_receipt_position(namespace, receipt, InstalledReceipt {
+            source: SourcePosition(position), replica: ReplicaPosition(position * 2), term: Term(1),
+        }).unwrap();
+    }
+
+    let mut candidate = TransactState::new(INCARNATION);
+    let mut index = candidate.index().clone();
+    for position in 1..=3 {
+        index.advance_classic(BranchCut { basis: basis(position + 100), system_time: Timestamp(position as i64 * 10) }).unwrap();
+    }
+    candidate.replace_applied_index(index).unwrap();
+    assert!(candidate.import_classic_receipts(&original, |_| Some(basis(101))).is_err());
+    assert!(!candidate.has_receipts());
+    assert_eq!(candidate.import_classic_receipts(&original, |position| Some(basis(position.source.0 as u64 + 100))).unwrap(), 3);
+    for namespace in [None, Some(scoped.receipt_namespace)] {
+        let from = &original.receipts[&namespace][&shared_key.key];
+        let installed = &candidate.receipts[&namespace][&shared_key.key];
+        assert_eq!(installed.fingerprint, from.fingerprint);
+        assert_eq!(installed.receipt.outcome, from.receipt.outcome);
+        assert_eq!(installed.receipt.basis, basis(from.receipt.basis.position() + 100));
+        assert!(installed.installed.is_none());
+        assert!(from.installed.is_some());
+    }
+}

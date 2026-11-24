@@ -19,11 +19,13 @@ use crate::{
     replay::{ChangeHistory, Committed, JournalCoordinates},
 };
 
+mod classic_migration;
 mod pin;
 mod pipeline;
 mod ranked;
 mod rotation;
 mod retirement;
+pub use classic_migration::{ClassicInstallation, classic_import_basis};
 pub use pin::{NativeCheckpointInstallation, PinnedExport};
 pub use pipeline::WritePipeline;
 pub use ranked::{RankedBuild, RankedFiles, RankedPublication};

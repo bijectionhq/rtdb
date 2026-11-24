@@ -1,4 +1,9 @@
 use std::sync::Arc;
+
+mod outcomes;
+mod projection;
+pub(crate) use outcomes::{ReceiptHistory, ReceiptLookup};
+pub(crate) use projection::{ClassicPrepared, ClassicProjection};
 use std::time::Duration;
 
 use ring::digest::{Context, SHA256};
@@ -29,12 +34,12 @@ use crate::{
 
 #[derive(Serialize)]
 pub(crate) struct ClassicMigrationInventory {
-    bootstrap: CheckpointTransferBootstrap,
+    pub(crate) bootstrap: CheckpointTransferBootstrap,
     relations: Vec<RelationInventory>,
     retained: RetainedInventory,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct RelationInventory {
     table: TableRef,
     kind: RelationKind,
@@ -73,7 +78,7 @@ impl RelationKind {
     }
 }
 
-#[derive(PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct RetainedInventory {
     worlds: usize,
     suffix_pins: usize,
@@ -117,6 +122,27 @@ pub(crate) async fn inspect_classic_migration_inventory(
     ciphertext_sha256: [u8; 32],
     hosted_task: Option<HostedTask>,
 ) -> Result<ClassicMigrationInventory> {
+    Ok(Box::pin(read_classic_migration(
+        directory, storage, keys, selector, destination, ciphertext_sha256, hosted_task, ClassicRead::Inventory,
+    )).await?.0)
+}
+
+pub(crate) enum ClassicRead {
+    Inventory,
+    Projection([u8; 32]),
+    Receipt(ReceiptLookup),
+}
+
+pub(crate) async fn read_classic_migration(
+    directory: Arc<dyn Directory>,
+    storage: &CellStorage,
+    keys: &dyn KeyService,
+    selector: StageSelector,
+    destination: Uuid,
+    ciphertext_sha256: [u8; 32],
+    hosted_task: Option<HostedTask>,
+    read: ClassicRead,
+) -> Result<(ClassicMigrationInventory, Option<ClassicPrepared>, Option<ReceiptHistory>)> {
     if selector.source.is_none() || !selector.transfer_only {
         return Err(inconsistent(
             "Classic migration replay requires an authenticated transfer stage",
@@ -177,6 +203,7 @@ pub(crate) async fn inspect_classic_migration_inventory(
                 let mut chain = artifact.chain();
                 let mut replay =
                     replica_suffix::TerminalReplayProgress::new(&terminal.fence, &recovered)?;
+                let mut serving_suffix = false;
                 let mut next = transfer_first(&authority.stage)?;
                 while next <= terminal.replica_through {
                     let _segment = memory.reserve(replica_suffix::MAX_SEGMENT_BYTES * 4)?;
@@ -189,11 +216,15 @@ pub(crate) async fn inspect_classic_migration_inventory(
                         else {
                             continue;
                         };
+                        serving_suffix |= matches!(&envelope.message,
+                            rtdb_format::envelope::ReplicaBody::NoOp(row) if row.serving_record.is_some());
                         if let Some(payload) = observe_transfer_payload(
                             &artifact, entry.lsn, &envelope, &mut chain, &memory,
                         )
                         .await?
                         {
+                            serving_suffix |= matches!(&payload.resolved.message,
+                                rtdb_format::envelope::ReplicaBody::NoOp(row) if row.serving_record.is_some());
                             let _body = payload.body;
                             replay.apply(payload.resolved, &mut recovered, &memory)?;
                         } else {
@@ -263,9 +294,23 @@ pub(crate) async fn inspect_classic_migration_inventory(
                     ));
                 }
                 let mut relations = Vec::with_capacity(tables.len());
+                let (mut projection, mut receipt) = match read {
+                    ClassicRead::Inventory => (None, None),
+                    ClassicRead::Projection(request) => (Some(projection::Projection::new(destination, request, terminal.basis, Arc::clone(&memory))), None),
+                    ClassicRead::Receipt(lookup) if !serving_suffix => (None, Some(lookup)),
+                    ClassicRead::Receipt(_) => return Err(unavailable("Original receipt lookup requires the complete canonical suffix replay")),
+                };
                 for table in tables {
-                    relations.push(inspect_relation(&snapshot, table, &pool, &memory, stop).await?);
+                    let kind = RelationKind::of(&table);
+                    let rows = projection.as_mut().filter(|_| kind == RelationKind::Literal || is_transactions(&table));
+                    let outcome = receipt.as_mut().filter(|lookup| lookup.table == table);
+                    let relation = inspect_relation(&snapshot, table, &pool, &memory, stop, rows, outcome).await?;
+                    if let Some(lookup) = &mut receipt { lookup.observe_relation(&relation); }
+                    relations.push(relation);
                 }
+                let prepared = projection.map(|projection| projection.finish(
+                    &snapshot, &relations, &retained, &recovered, bootstrap, serving_suffix,
+                )).transpose()?;
                 authority.confirm(name).await?;
                 if RetainedInventory::of(
                     &read_source(source_directory.as_ref(), bootstrap).await?,
@@ -276,11 +321,11 @@ pub(crate) async fn inspect_classic_migration_inventory(
                         "Classic migration retention changed during inspection",
                     ));
                 }
-                Ok(ClassicMigrationInventory {
+                Ok((ClassicMigrationInventory {
                     bootstrap: bootstrap.clone(),
                     relations,
                     retained,
-                })
+                }, prepared, receipt.map(ReceiptLookup::finish)))
             })
             .await;
             cancellation.cancel();
@@ -312,12 +357,18 @@ async fn read_source(
         .ok_or_else(|| inconsistent("The exact Classic migration source terminal is unavailable"))
 }
 
+fn is_transactions(table: &TableRef) -> bool {
+    table.schema == "xt" && table.table == "txs"
+}
+
 async fn inspect_relation(
     snapshot: &rtdb_index::Snapshot,
     table: TableRef,
     pool: &Arc<BufferPool>,
     memory: &Arc<MemoryBudget>,
     stop: &CancellationToken,
+    mut projection: Option<&mut projection::Projection>,
+    mut receipt: Option<&mut ReceiptLookup>,
 ) -> Result<RelationInventory> {
     let mut relation = RelationInventory {
         kind: RelationKind::of(&table),
@@ -346,14 +397,27 @@ async fn inspect_relation(
                 .document_allocation_bound()?
                 .checked_add(512)
                 .ok_or_else(|| inconsistent("A Classic migration row exceeds the memory bound"))?;
-            let _charge = memory.reserve(bound)?;
+            let copies = if projection.is_some() || receipt.is_some() { 2 } else { 1 };
+            let charge = memory.reserve(bound.checked_mul(copies)
+                .ok_or_else(|| inconsistent("A Classic migration row exceeds the memory bound"))?)?;
             let event = batch.read_event(row)?;
             let header = event.header();
             relation.events += 1;
             relation.unpositioned += header.position.is_none() as u64;
             relation.erasures += (header.op == EventOp::Erase) as u64;
             relation.redacted += (header.op == EventOp::Redacted) as u64;
-            digest.update(&event.history_fingerprint()?);
+            let fingerprint = if projection.is_some() || receipt.is_some() {
+                let fingerprint = event.clone().history_fingerprint()?;
+                if let Some(projection) = projection.as_deref_mut() {
+                    projection.observe(&relation.table, event, fingerprint, charge)?;
+                } else if let Some(receipt) = receipt.as_deref_mut() {
+                    receipt.observe(event, fingerprint, charge)?;
+                }
+                fingerprint
+            } else {
+                event.history_fingerprint()?
+            };
+            digest.update(&fingerprint);
         }
         Ok(())
     };

@@ -38,6 +38,8 @@ use crate::config::NodeConfiguration;
 pub use rtdb_flight_sql::NativeFollowerAssignment;
 
 mod catalog;
+mod classic_migration;
+pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
 mod native_checkpoint;
 mod peer;
@@ -776,7 +778,7 @@ impl MultiRuntime {
             .remove(name)
             .ok_or_else(unknown_deployment)?;
         let selected = match &selected.status {
-            Status::Reserved | Status::TransferPending(_) => {
+            Status::Reserved | Status::TransferPending(_) | Status::ClassicCandidate { .. } => {
                 return Err(Anomaly::new(
                     AnomalyCategory::Busy,
                     "rtdb/deployment-provisioning",
@@ -989,6 +991,7 @@ impl MultiRuntime {
     ) -> Result<()> {
         match &entry.status {
             Status::Reserved if !writer => return Ok(()),
+            Status::ClassicCandidate { .. } => return Ok(()),
             Status::TransferPending(pending) if matches!(pending.export, TransferExport::Managed { .. }) => return Ok(()),
             Status::TransferPending(pending) => {
                 if writer {

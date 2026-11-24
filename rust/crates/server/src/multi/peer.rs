@@ -386,6 +386,24 @@ impl Peer {
         .await
     }
 
+    pub(super) async fn forward_classic_catalog(&self, incarnation: Uuid, request: &Transact) -> Result<Receipt> {
+        let to = self.selected(incarnation).ok_or_else(unavailable)?;
+        let frame = Request {
+            nonce: Uuid::new_v4(),
+            from: self.address,
+            to,
+            expires: Timestamp(SystemClock.now().0.saturating_add(ADMISSION_MICROS)),
+            database: String::new(),
+            incarnation: *incarnation.as_bytes(),
+            admission: Admission::Catalog,
+            request: Some(request.canonical_request()?),
+        };
+        match tokio::time::timeout(TIMEOUT, self.send(frame)).await.map_err(|_| unavailable())?? {
+            Answer::Receipt(receipt) => Ok(receipt),
+            _ => Err(unavailable()),
+        }
+    }
+
     pub(super) async fn forward_export(
         &self,
         name: &str,
