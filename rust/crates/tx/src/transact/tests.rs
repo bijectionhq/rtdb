@@ -10,7 +10,7 @@ fn table() -> TableRef { TableRef::new("public", "docs") }
 fn basis(position: u64) -> Basis { Basis::new(INCARNATION, position) }
 
 fn request(key: u8, ops: Vec<Op>) -> Transact {
-    Transact { key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new(), admission: None }
+    Transact { key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new(), custody_request_digest: None }
 }
 
 fn put(branch: &str, id: i64, key: &str) -> Op {

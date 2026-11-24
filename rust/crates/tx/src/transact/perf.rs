@@ -29,7 +29,7 @@ fn put(n: u64) -> Transact {
         cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("row-{n}"))))]),
     };
     Transact {
-        admission: None,
+        custody_request_digest: None,
         key: key(n),
         require: Vec::new(),
         window: Window::default(),

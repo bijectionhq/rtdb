@@ -22,7 +22,7 @@ pub(super) fn request(
     require.sort_unstable();
     require.dedup();
     Ok(Transact {
-        admission: None,
+        custody_request_digest: None,
         key: request.key,
         require,
         window: request

@@ -11,6 +11,7 @@ use rtdb_types::{
     rtdb_v1::{At, Basis, Branch, Claim, ClaimVerifier, LabelScope, Layer, MAIN_BRANCH, valid_branch_name},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::value::{RawValue, to_raw_value};
 use sha2::{Digest, Sha256};
 
 mod operations;
@@ -24,15 +25,6 @@ pub struct Window {
     pub before: Option<Timestamp>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Admission {
-    pub attempt: [u8; 16],
-    pub submitted_at: Timestamp,
-    pub source_sha256: [u8; 32],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logical_sha256: Option<[u8; 32]>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct Transact {
     pub key: Vec<u8>,
@@ -44,7 +36,7 @@ pub struct Transact {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Guard>,
     #[serde(skip)]
-    pub admission: Option<Admission>,
+    pub custody_request_digest: Option<[u8; 32]>,
 }
 
 impl Transact {
@@ -55,9 +47,25 @@ impl Transact {
         })
     }
 
-    pub fn logical_sha256(&self) -> Result<[u8; 32]> { fingerprint(self) }
+    pub fn logical_sha256(&self) -> Result<[u8; 32]> {
+        Ok(Sha256::digest(self.canonical_request()?.get().as_bytes()).into())
+    }
+
+    fn canonical_request(&self) -> Result<Box<RawValue>> {
+        to_raw_value(self).map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
+    }
 
     pub fn uses_custody(&self) -> bool { self.ops.iter().chain(&self.otherwise).any(Op::uses_custody) }
+
+    fn has_unsealed_custody(&self) -> bool {
+        self.ops.iter().chain(&self.otherwise).any(|op| {
+            let Op::Put { rows, .. } = op else { return false; };
+            rows.iter().any(|row| {
+                !row.protected_columns.is_empty() && (row.custody_payload.is_none()
+                    || row.protected_columns.iter().any(|column| row.cells.get(column).is_some()))
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,7 +111,7 @@ pub struct Row {
     pub custody_group: Option<CustodyGroupId>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub protected_columns: Vec<String>,
-    #[serde(skip)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_payload: Option<CustodyPayload>,
 }
 
@@ -277,25 +285,20 @@ pub struct ResolvedTransact {
     before: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receipt_namespace: Option<[u8; 32]>,
-    /// The writer's clock sample when it admitted the request.
-    submitted_at: Timestamp,
+    #[serde(alias = "submitted_at")]
+    admitted_at: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    wire_admission: Option<Admission>,
+    request: Option<Box<RawValue>>,
 }
 
 impl ResolvedTransact {
-    /// The admission witness carried in the one durable record of an ordinary transaction:
-    /// the attempt identity (the idempotency key), when the writer admitted it, and the
-    /// SHA-256 commitment to the exact submitted request.
+    /// The ordered admission uses the request key, writer clock and canonical fingerprint.
     pub fn admission(&self) -> (&[u8], Timestamp, [u8; 32]) {
-        match &self.wire_admission {
-            Some(admission) => (&admission.attempt, admission.submitted_at, admission.source_sha256),
-            None => (&self.receipt.key, self.submitted_at, self.fingerprint),
-        }
+        (&self.receipt.key, self.admitted_at, self.fingerprint)
     }
-}
 
-impl ResolvedTransact {
+    pub fn canonical_request(&self) -> Option<&RawValue> { self.request.as_deref() }
+
     pub fn effects(&self) -> &[BranchEffect] { &self.effects }
 }
 
@@ -322,13 +325,6 @@ pub(crate) struct View<'a> {
     pub(crate) durable_index: &'a BranchIndex,
     pub(crate) receipts: &'a Receipts,
     pub(crate) pending: bool,
-}
-
-/// The commitment to the exact submitted request: the admission witness's source-bytes digest.
-fn fingerprint(request: &Transact) -> Result<[u8; 32]> {
-    serde_json::to_vec(request)
-        .map(|bytes| Sha256::digest(bytes).into())
-        .map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
 }
 
 /// State folded from a single stream. A caller resolves at its fresh committed prefix.
@@ -438,9 +434,18 @@ impl TransactState {
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         validate_key(&request.key)?;
+        if request.has_unsealed_custody() {
+            return Err(if features.contains(&ROW_CUSTODY) {
+                Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed before admission")
+            } else {
+                feature_required(ROW_CUSTODY)
+            });
+        }
         let receipt_namespace = authority.map(|authority| authority.receipt_namespace);
-        let fingerprint = request.admission.and_then(|admission| admission.logical_sha256)
-            .map_or_else(|| fingerprint(request), Ok)?;
+        let canonical_request = request.canonical_request()?;
+        let fingerprint = request.custody_request_digest.unwrap_or_else(|| {
+            Sha256::digest(canonical_request.get().as_bytes()).into()
+        });
         if let Some(stored) = view.receipts.get(&receipt_namespace).and_then(|namespace| namespace.get(&request.key)) {
             if stored.fingerprint != fingerprint {
                 return Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb/idempotency-key", "The key belongs to a different transaction"));
@@ -497,8 +502,8 @@ impl TransactState {
         } else {
             // For a timed write, `after` is the index once it settles at `position + 1`.
             let record = TransactionRecord::Tx(ResolvedTransact {
-                fingerprint, receipt, effects, before, receipt_namespace, submitted_at: now,
-                wire_admission: request.admission,
+                fingerprint, receipt, effects, before, receipt_namespace, admitted_at: now,
+                request: Some(canonical_request),
             });
             Ok((Resolution::Append(PreparedAppend { position, record }), Some(after)))
         }

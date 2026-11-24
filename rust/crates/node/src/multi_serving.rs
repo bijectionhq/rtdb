@@ -94,7 +94,7 @@ impl ServingDriver for MultiServing {
     async fn transact_scoped(&self, request: ScopedSubmission, scope: ServingScope,
                              cancellation: &CancellationToken) -> Result<Receipt> {
         cancellation.run_until_cancelled(self.writes.transact_scoped(
-            request.into_admitted_transaction(), scope.labels, scope.receipt_namespace,
+            request.transaction, scope.labels, scope.receipt_namespace,
         )).await.ok_or_else(interrupted)?
     }
 
@@ -176,7 +176,7 @@ impl ServingDriver for MultiServing {
                 if request.transaction.uses_custody() && self.features().contains(&ROW_CUSTODY) {
                     crate::serving::custody::prepare(&mut request, &self.tokens.custody_vault()).await?;
                 }
-                self.writes.transact(request.into_admitted_transaction()).await
+                self.writes.transact(request.transaction).await
             })
             .await
             .ok_or_else(interrupted)?
@@ -441,7 +441,7 @@ mod tests {
 
     fn write(key: u8, title: &str, before: Option<Timestamp>) -> TransactSubmission {
         let transaction = Transact {
-            admission: None,
+            custody_request_digest: None,
             key: vec![key; 16],
             require: vec![],
             window: Window {

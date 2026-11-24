@@ -376,7 +376,7 @@ mod tests {
     fn put(n: u8, id: i64, if_absent: bool) -> Transact {
         let row = Row { id: EntityId::Integer(id), valid: None, cells: StructFields::from([("v".into(), Cell::Value(Value::Utf8(format!("{n}"))))]), custody_group: None, protected_columns: Vec::new(), custody_payload: None };
         Transact {
-            admission: None,
+            custody_request_digest: None,
             key: key(n), require: Vec::new(), window: Window::default(), guards: Vec::new(),
             ops: vec![Op::Put { branch: MAIN_BRANCH.into(), table: table(), rows: vec![row], if_absent }],
             otherwise: Vec::new(),
@@ -626,24 +626,20 @@ mod tests {
         let (identity, submitted_at, commitment) = tx.admission();
         assert_eq!(identity, request.key.as_slice());
         assert_eq!(submitted_at, Timestamp(42));
-        assert_eq!(commitment, fingerprint(&request).unwrap());
+        assert_eq!(commitment, request.logical_sha256().unwrap());
+        assert_eq!(tx.canonical_request().unwrap().get(), request.canonical_request().unwrap().get());
     }
 
     #[test]
-    fn wire_admission_survives_recovery_without_changing_retry_identity() {
+    fn canonical_admission_survives_recovery_without_changing_retry_identity() {
         let mut pipeline = pipeline();
-        let mut request = put(1, 1, false);
-        let first = super::super::Admission {
-            attempt: [21; 16], submitted_at: Timestamp(37), source_sha256: [42; 32], logical_sha256: None,
-        };
-        request.admission = Some(first);
+        let request = put(1, 1, false);
         let (position, record) = append(&mut pipeline, &request, 42);
         let TransactionRecord::Tx(tx) = TransactionRecord::decode(&record).unwrap() else { panic!() };
-        assert_eq!(tx.admission(), (first.attempt.as_slice(), first.submitted_at, first.source_sha256));
+        assert_eq!(tx.admission(), (request.key.as_slice(), Timestamp(42), request.logical_sha256().unwrap()));
         pipeline.withdraw();
         pipeline.recover(position, &record).unwrap();
         pipeline.resume(position + 1).unwrap();
-        request.admission = Some(super::super::Admission { attempt: [22; 16], ..first });
         let Decision::Answer(receipt) = pipeline.decide(&request, Timestamp(43), FEATURES, &claims()).unwrap() else {
             panic!("a retry should recover the admitted decision");
         };

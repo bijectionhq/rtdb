@@ -11,7 +11,7 @@ use super::{ChangePage, TransactSubmission};
 
 pub(crate) async fn prepare(submission: &mut TransactSubmission, vault: &CustodyVault) -> Result<()> {
     let fingerprint = submission.transaction.logical_sha256()?;
-    submission.record_logical_admission(fingerprint);
+    submission.transaction.custody_request_digest = Some(fingerprint);
     for action in submission.transaction.ops.iter().chain(&submission.transaction.otherwise) {
         if let Op::CreateCustodyGroup { group } = action {
             vault.create(*group).await?;
@@ -154,7 +154,7 @@ mod tests {
         let request = |key, ops| TransactSubmission {
             transaction: Transact {
                 key: vec![key; 16], require: Vec::new(), window: Window::default(),
-                guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new(), admission: None,
+                guards: Vec::new(), ops, otherwise: Vec::new(), requires: Vec::new(), custody_request_digest: None,
             },
             attempt: Uuid::from_u128(key.into()), submitted_at: Timestamp(10), source: Default::default(),
         };
@@ -170,6 +170,8 @@ mod tests {
             },
         ]);
         let mut state = TransactState::new(incarnation);
+        let unsealed = state.resolve(&first.transaction, 1, Timestamp(10), &[ROW_CUSTODY], &claims);
+        assert!(matches!(unsealed, Err(error) if error.code == "rtdb/custody-payload"));
         let mut retry = request(1, first.transaction.ops.clone());
         prepare(&mut first, &vault).await.unwrap();
         let Resolution::Append(append) = state.resolve(&first.transaction, 1, Timestamp(10), &[ROW_CUSTODY], &claims).unwrap()

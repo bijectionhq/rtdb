@@ -5,11 +5,10 @@ use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Admission, Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, ScopedTransact, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
-use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -18,8 +17,9 @@ use crate::ReplicationHandle;
 
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_CHANGE_GROUPS: usize = 4096;
-const FRAME_VERSION: u8 = 1;
-const FRAME_HEADER_BYTES: usize = 65;
+const FRAME_VERSION: u8 = 2;
+const FRAME_HEADER_BYTES: usize = 9;
+const LEGACY_FRAME_HEADER_BYTES: usize = 65;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", QUERY_WRITTEN_BASIS, LINEARIZABLE, "branches",
@@ -53,28 +53,6 @@ pub struct TransactSubmission {
     pub attempt: Uuid,
     pub submitted_at: Timestamp,
     pub source: Bytes,
-}
-
-impl TransactSubmission {
-    fn admission(&self) -> Admission {
-        Admission {
-            attempt: *self.attempt.as_bytes(),
-            submitted_at: self.submitted_at,
-            source_sha256: Sha256::digest(&self.source).into(),
-            logical_sha256: self.transaction.admission.and_then(|admission| admission.logical_sha256),
-        }
-    }
-
-    pub fn into_admitted_transaction(mut self) -> Transact {
-        self.transaction.admission = Some(self.admission());
-        self.transaction
-    }
-
-    pub fn record_logical_admission(&mut self, logical_sha256: [u8; 32]) {
-        let mut admission = self.admission();
-        admission.logical_sha256 = Some(logical_sha256);
-        self.transaction.admission = Some(admission);
-    }
 }
 
 #[derive(Clone)]
@@ -272,7 +250,7 @@ impl NativeServing {
     }
 
     pub(crate) fn decide_batch(
-        &mut self, now: Timestamp, mut requests: Vec<(NativeRequest, Completion)>,
+        &mut self, now: Timestamp, requests: Vec<(NativeRequest, Completion)>,
     ) -> Result<Vec<proto::NoOp>> {
         if !self.view.borrow().compatible {
             for (_, completion) in requests { let _ = completion.send(Err(incompatible())); }
@@ -289,10 +267,8 @@ impl NativeServing {
             self.deciding = true;
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
-        let decisions = requests.iter_mut().map(|(request, _)| {
-            let submission = &mut request.submission;
-            submission.transaction.admission = Some(submission.admission());
-            let transaction = &submission.transaction;
+        let decisions = requests.iter().map(|(request, _)| {
+            let transaction = &request.submission.transaction;
             match &request.scope {
                 Some(scope) => pipeline.decide_scoped(transaction, now, SCOPED_FEATURES, &request.claims, scope.authority()),
                 None => pipeline.decide(transaction, now, NATIVE_WRITE_FEATURES, &request.claims),
@@ -306,7 +282,7 @@ impl NativeServing {
                 }
                 Err(error) => { let _ = completion.send(Err(error)); }
                 Ok(Decision::Append { position, record }) => {
-                    let frame = frame(position, &request.submission, &record);
+                    let frame = frame(position, &record);
                     self.pending.insert(position, Pending { frame: frame.clone(), completion, scope: request.scope });
                     messages.push(proto::NoOp { serving_record: Some(frame), ..Default::default() });
                 }
@@ -394,22 +370,25 @@ impl Drop for NativeServing {
     fn drop(&mut self) { self.withdraw(); }
 }
 
-fn frame(position: u64, request: &TransactSubmission, record: &[u8]) -> Bytes {
+fn frame(position: u64, record: &[u8]) -> Bytes {
     let mut frame = BytesMut::with_capacity(FRAME_HEADER_BYTES + record.len());
     frame.put_u8(FRAME_VERSION);
     frame.put_u64(position);
-    frame.extend_from_slice(request.attempt.as_bytes());
-    frame.put_i64(request.submitted_at.0);
-    frame.extend_from_slice(&request.transaction.admission.expect("framed transaction was admitted").source_sha256);
     frame.extend_from_slice(record);
     frame.freeze()
 }
 
 fn decode(frame: &[u8]) -> Result<(u64, &[u8])> {
-    let Some((mut header, record)) = frame.split_at_checked(FRAME_HEADER_BYTES) else { return Err(invalid()); };
-    if header.get_u8() != FRAME_VERSION { return Err(invalid()); }
-    let position = header.get_u64();
-    if position == 0 || record.is_empty() || header[..16] == [0; 16] { return Err(invalid()); }
+    let header_len = match frame.first().copied() {
+        Some(FRAME_VERSION) => FRAME_HEADER_BYTES,
+        Some(1) => LEGACY_FRAME_HEADER_BYTES,
+        _ => return Err(invalid()),
+    };
+    let (header, record) = frame.split_at_checked(header_len).ok_or_else(invalid)?;
+    let position = u64::from_be_bytes(header[1..FRAME_HEADER_BYTES].try_into().expect("serving position has fixed width"));
+    if position == 0 || record.is_empty() || header_len == LEGACY_FRAME_HEADER_BYTES && header[9..25] == [0; 16] {
+        return Err(invalid());
+    }
     Ok((position, record))
 }
 
@@ -452,7 +431,7 @@ mod tests {
             attempt: Uuid::from_u128(key.into()), submitted_at: Timestamp(31),
             source: Bytes::from_static(b"\x0a\x02\x03\x04\xf8\x07\x01"),
             transaction: Transact {
-                admission: None,
+                custody_request_digest: None,
                 key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
                 requires: Vec::new(),
                 ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
@@ -478,10 +457,12 @@ mod tests {
         assert_eq!(messages.len(), 2);
         let excluded = messages.pop().unwrap().serving_record.unwrap();
         let committed = messages.pop().unwrap().serving_record.unwrap();
-        assert_eq!(&committed[9..25], put(1).attempt.as_bytes());
-        assert_eq!(&committed[25..33], &Timestamp(31).0.to_be_bytes());
-        let digest: [u8; 32] = Sha256::digest(&put(1).source).into();
-        assert_eq!(&committed[33..65], &digest);
+        let (position, bytes) = decode(&committed).unwrap();
+        let TransactionRecord::Tx(record) = TransactionRecord::decode(bytes).unwrap() else { panic!() };
+        assert_eq!(position, 1);
+        assert_eq!(record.admission().0, &[1; 16]);
+        assert_eq!(record.admission().1, Timestamp(41));
+        assert!(record.canonical_request().is_some());
         assert!(first_result.try_recv().is_err());
         assert!(second_result.try_recv().is_err());
         assert_eq!(serving.status(&[1; 16], None).unwrap_err().code, "rtdb/transaction-pending");

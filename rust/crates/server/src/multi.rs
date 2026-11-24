@@ -588,7 +588,7 @@ mod tests {
                     .transact(
                         TransactSubmission {
                             transaction: Transact {
-                                admission: None,
+                                custody_request_digest: None,
                                 key: key.clone(),
                                 require: vec![],
                                 window: Default::default(),
