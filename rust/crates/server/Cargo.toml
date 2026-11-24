@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:tempfile", "dep:sha2"]
+multi = ["rtdb-node/multi", "rtdb-flight-sql/multi", "dep:journal-contract", "dep:rtdb-db", "dep:rtdb-stream-journal", "dep:sha2"]
 kafka = ["rtdb-node/kafka", "dep:rtdb-kafka", "rtdb-metrics/kafka"]
 kafka-connect = ["kafka", "rtdb-node/kafka-connect"]
 s3 = ["rtdb-node/s3", "dep:rtdb-s3"]
@@ -35,12 +35,13 @@ rtdb-crypt.workspace = true
 journal-contract = { workspace = true, optional = true }
 rtdb-db = { path = "../db", optional = true }
 rtdb-stream-journal = { package = "rtdb-journal-logkeeper", path = "../journal-logkeeper", optional = true }
-tempfile = { workspace = true, optional = true }
+tempfile.workspace = true
 sha2 = { workspace = true, optional = true }
 rtdb-tx.workspace = true
 rtdb-query.workspace = true
 rtdb-auth.workspace = true
 rtdb-pgwire.workspace = true
+rtdb-replication.workspace = true
 rtdb-types.workspace = true
 rtdb-tls.workspace = true
 rtdb-columnar.workspace = true
@@ -74,9 +75,6 @@ zeroize = "1.8"
 futures.workspace = true
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls"] }
 fs2.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [lints]
 workspace = true

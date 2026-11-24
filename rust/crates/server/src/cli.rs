@@ -14,7 +14,7 @@ pub use admin::AdminOptions;
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE [--parent-stdin] [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -32,6 +32,8 @@ pub struct DevOptions {
 
 #[derive(Clone, Debug)]
 pub enum Command { Help, Version, BuildInfo, Start(StartOptions), StartMulti { options: StartOptions, config_env: Option<String> }, Dev(DevOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool, retained_base: Option<PathBuf> }, RepairCheckpoint { request: rtdb_node::LocalRepair, memory_bytes: usize, checkpoint_key_vault: Option<PathBuf> },
+    InitializeStandalone(crate::standalone::Target),
+    Standalone(crate::standalone::Launch),
     AdminHelp,
     #[cfg(feature = "multi")]
     Admin(AdminOptions),
@@ -58,6 +60,11 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         arguments.next();
         if arguments.next().is_some() { return Err(invalid("--build-info accepts no arguments")); }
         return Ok(Command::BuildInfo);
+    }
+    if matches!(arguments.peek().map(String::as_str), Some("initialize-standalone" | "standalone")) {
+        let initialize = arguments.next().expect("peeked standalone command") == "initialize-standalone";
+        if matches!(arguments.peek().map(String::as_str), Some("-h" | "--help")) { return Ok(Command::Help); }
+        return standalone(initialize, arguments);
     }
     if matches!(arguments.peek().map(String::as_str), Some("repair-checkpoint" | "retain-repair-base")) {
         let command = arguments.next().expect("peeked repair command");
@@ -258,6 +265,45 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
     } else {
         Command::Start(options)
     })
+}
+
+fn standalone(initialize: bool, mut arguments: impl Iterator<Item = String>) -> Result<Command> {
+    use crate::standalone::{Launch, Target};
+
+    let mut values = std::collections::BTreeMap::new();
+    let mut parent_stdin = false;
+    while let Some(option) = arguments.next() {
+        match option.as_str() {
+            "--parent-stdin" if !initialize && !parent_stdin => { parent_stdin = true; continue; }
+            "--state" | "--name" | "--id" => (),
+            "--certificate" | "--private-key" | "--password-file" | "--ready-file" | "--custody-provider-config"
+                if !initialize => (),
+            _ => return Err(invalid(format!("Unknown or repeated standalone option '{option}'"))),
+        }
+        let value = arguments.next().filter(|value| !value.is_empty() && !value.starts_with("--"))
+            .ok_or_else(|| invalid(format!("{option} requires a value")))?;
+        if values.insert(option.clone(), value).is_some() {
+            return Err(invalid(format!("Repeated standalone option '{option}'")));
+        }
+    }
+    let mut required = |key| values.remove(key).ok_or_else(|| invalid(format!("Standalone requires {key}")));
+    let raw_id = required("--id")?;
+    let id = uuid::Uuid::parse_str(&raw_id).ok().filter(|id| !id.is_nil() && id.to_string() == raw_id)
+        .ok_or_else(|| invalid("--id must be a canonical, nonzero UUID"))?;
+    let target = Target { state: required("--state")?.into(), name: required("--name")?, id };
+    target.validate().map_err(|error| invalid(error.message.unwrap_or_default()))?;
+    if initialize {
+        return Ok(Command::InitializeStandalone(target));
+    }
+    Ok(Command::Standalone(Launch {
+        target,
+        certificate: required("--certificate")?.into(),
+        private_key: required("--private-key")?.into(),
+        password_file: required("--password-file")?.into(),
+        ready_file: required("--ready-file")?.into(),
+        parent_stdin,
+        custody_provider_config: values.remove("--custody-provider-config").map(PathBuf::from),
+    }))
 }
 
 impl DevOptions {

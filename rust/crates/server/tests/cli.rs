@@ -146,9 +146,35 @@ fn compiled_build_info_ignores_runtime_version_overrides() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtdb")).arg("--build-info").env("XTDB_VERSION", "runtime-only-version").env("GIT_SHA", "runtime-only-revision").output().unwrap();
     assert!(output.status.success());
     let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(actual, serde_json::to_value(rtdb_types::compiled_build_info()).unwrap());
+    let mut expected = serde_json::to_value(rtdb_types::compiled_build_info()).unwrap();
+    expected["standalone_protocol"] = 3.into();
+    assert_eq!(actual, expected);
     assert_eq!(actual["tzdb_sha256"].as_str().unwrap().len(), 64);
     assert_ne!(actual["version"], "runtime-only-version");
+}
+
+#[test]
+fn installed_standalone_requires_the_canonical_uuid_and_rejects_legacy_action_flags() {
+    let id = "01234567-89ab-4def-8000-000000000001";
+    let init = ["initialize-standalone", "--state", "stage", "--name", "team.dev", "--id", id];
+    let Command::InitializeStandalone(target) = parse(&init) else { panic!("expected standalone initialization") };
+    assert_eq!(target.name, "team.dev");
+    assert_eq!(target.id.to_string(), id);
+    for invalid_id in ["00000000-0000-0000-0000-000000000000", "01234567-89AB-4DEF-8000-000000000001"] {
+        let mut arguments = init;
+        arguments[6] = invalid_id;
+        assert!(cli::parse(arguments.map(str::to_owned), &|_| None).is_err());
+    }
+    let launch = [
+        "standalone", "--state", "installed", "--name", "team.dev", "--id", id,
+        "--certificate", "certificate.pem", "--private-key", "key.pem",
+        "--password-file", "password", "--ready-file", "ready.json", "--parent-stdin",
+        "--custody-provider-config", "provider.yaml",
+    ];
+    let Command::Standalone(options) = parse(&launch) else { panic!("expected standalone launch") };
+    assert!(options.parent_stdin);
+    assert_eq!(options.custody_provider_config.as_deref(), Some(std::path::Path::new("provider.yaml")));
+    assert!(cli::parse(launch.into_iter().chain(["--owned-flight"]).map(str::to_owned), &|_| None).is_err());
 }
 
 #[test]

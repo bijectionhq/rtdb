@@ -30,9 +30,18 @@ async fn run() -> Result<()> {
         }
         Command::Version => { println!("rtdb {}", rtdb_types::runtime_version()); Ok(()) }
         Command::BuildInfo => write_report(std::io::stdout().lock(), |output| {
-            serde_json::to_writer(&mut *output, &rtdb_types::compiled_build_info()).map_err(std::io::Error::other)?;
+            #[derive(serde::Serialize)]
+            struct BuildInfo {
+                #[serde(flatten)]
+                provenance: rtdb_types::BuildInfo,
+                standalone_protocol: u32,
+            }
+            let report = BuildInfo { provenance: rtdb_types::compiled_build_info(), standalone_protocol: rtdb_server::standalone::PROTOCOL };
+            serde_json::to_writer(&mut *output, &report).map_err(std::io::Error::other)?;
             writeln!(output)
         }),
+        Command::InitializeStandalone(target) => rtdb_server::standalone::initialize(target).await,
+        Command::Standalone(launch) => run_standalone(launch).await,
         Command::HashPassword { bcrypt, password } => { println!("{}", cli::hash_password(bcrypt, password, &mut std::io::stdin().lock())?); Ok(()) }
         Command::Inspect { kind, path, allocation_limit_bytes } => rtdb_server::inspect::file(kind, &path, &rtdb_columnar::MemoryBudget::new(allocation_limit_bytes), &mut std::io::stdout().lock()),
         Command::SnapshotExport { options, database, dry_run } => export_snapshot(options, database, dry_run).await,
@@ -104,6 +113,24 @@ async fn run() -> Result<()> {
             let (handle, driver) = ServerDriver::open_with_memory(config, limit, memory).await?;
             run_started(&handle, driver).await
         }
+    }
+}
+
+async fn run_standalone(launch: rtdb_server::standalone::Launch) -> Result<()> {
+    let stop = tokio_util::sync::CancellationToken::new();
+    if launch.parent_stdin {
+        let parent = stop.clone();
+        std::thread::Builder::new().name("rtdb-parent-stdin".into()).spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            parent.cancel();
+        }).map_err(signal_error)?;
+    }
+    let serving = rtdb_server::standalone::serve(launch, stop.clone());
+    tokio::pin!(serving);
+    tokio::select! {
+        biased;
+        signal = shutdown_signal() => { stop.cancel(); after_close(signal, serving.await) }
+        result = &mut serving => result,
     }
 }
 

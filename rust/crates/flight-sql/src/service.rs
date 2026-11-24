@@ -28,6 +28,7 @@ pub(crate) struct Inner {
     pub node: Node,
     pub(crate) v1: crate::v1::State,
     pub config: FlightConfig,
+    pub(crate) standalone_custody_owner: Option<&'static str>,
     pub cancellation: CancellationToken,
     pub sessions: Registry<String, Session>,
     pub transactions: Registry<Bytes, Transaction>,
@@ -167,7 +168,7 @@ impl Call {
     }
 }
 impl Service {
-    pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>) -> rtdb_types::Result<Self> {
+    pub fn new(node: Node, auth: Arc<Authenticator>, config: FlightConfig, clock: Arc<dyn Clock>, cancellation: CancellationToken, status: watch::Sender<ServerStatus>, standalone_custody_owner: Option<&'static str>) -> rtdb_types::Result<Self> {
         let memory = Arc::clone(node.memory());
         let audience = if let Some(profile) = config.audience {
             let cache = CacheBudget::with_memory(memory.prepay(profile.cache_bytes())?);
@@ -184,7 +185,7 @@ impl Service {
                 transport,
             })
         } else { None };
-        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, cancellation, status })))
+        Ok(Self(Arc::new(Inner { sessions: Registry::new(clock.clone(), memory.clone()), transactions: Registry::new(clock.clone(), memory.clone()), prepared: Registry::new(clock.clone(), memory.clone()), query_tickets: Registry::new(clock.clone(), memory.clone()), query_ticket_slots: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), owned_reads: Registry::new(clock.clone(), memory.clone()), owned_world_reads: Registry::new(clock, memory), owned_read_slots: Arc::new(Semaphore::new(64)), audience, v1: Default::default(), auth: Authentication::new(auth), permits: Arc::new(Semaphore::new(config.maximum_concurrent_calls)), node, config, standalone_custody_owner, cancellation, status })))
     }
     pub fn memory(&self) -> &Arc<MemoryBudget> { self.0.node.memory() }
     fn sessions(&self, reserved: bool) -> &Registry<String, Session> {

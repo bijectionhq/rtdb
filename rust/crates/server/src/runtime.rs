@@ -77,6 +77,12 @@ impl ServerHandle {
 }
 
 type ResourceOverride = Box<dyn FnOnce(NativeResources) -> Arc<dyn ResourceFactory> + Send>;
+type Tls = Arc<tokio_rustls::rustls::ServerConfig>;
+
+enum Backend {
+    Configured(Option<ResourceOverride>),
+    Installed { resources: Box<NativeResources>, tls: Option<Tls> },
+}
 
 pub struct ServerDriver {
     handle: ServerHandle,
@@ -93,24 +99,24 @@ impl ServerDriver {
     /// Run exactly once; request shutdown through the handle and join this run before releasing dependencies.
     pub async fn open(config: NodeConfiguration, allocation_limit_bytes: usize) -> Result<(ServerHandle, Self)> {
         let memory = MemoryBudget::new(config.node_options(allocation_limit_bytes)?.execution_memory_bytes);
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, None).await
+        Self::open_with_memory(config, allocation_limit_bytes, memory).await
     }
 
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, Backend::Configured(None)).await
     }
 
     /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
     /// Its holders claim as soon as they reach the tip and append nothing while idle.
     pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), Backend::Configured(None)).await
     }
 
     /// Uses a host clock for transactions appended to in-memory and local source logs.
     pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, Backend::Configured(None)).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -126,15 +132,23 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, None).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, Backend::Configured(None)).await
     }
 
     #[cfg(feature = "multi")]
     pub async fn open_with_multi(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, limit, memory, false, None, None, Some(multi.resource_override())).await
+        Self::open_mode(config, limit, memory, false, None, None, Backend::Configured(Some(multi.resource_override()))).await
     }
 
-    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, override_resources: Option<ResourceOverride>) -> Result<(ServerHandle, Self)> {
+    pub(crate) async fn open_installed(config: NodeConfiguration, limit: usize, resources: NativeResources, tls: Option<Tls>) -> Result<(ServerHandle, Self)> {
+        if tls.is_none() && (config.server.is_some() || config.flight_sql.is_some()) {
+            return Err(Anomaly::incorrect("rtdb.server/standalone", "Installed listeners require TLS"));
+        }
+        let memory = MemoryBudget::new(config.node_options(limit)?.execution_memory_bytes);
+        Self::open_mode(config, limit, memory, false, None, None, Backend::Installed { resources: Box::new(resources), tls }).await
+    }
+
+    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, backend: Backend) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
         options.owned_relations = config.flight_sql.as_ref().is_some_and(|flight| flight.port >= 0 && flight.owned_native_actions);
         if let Some(placed) = &placed {
@@ -162,7 +176,17 @@ impl ServerDriver {
             Some(policy) => Arc::new(HostedTransactionAuthority { auth: auth.clone(), owner: policy.owner.clone() }),
             None => auth.clone(),
         };
-        let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
+        let (resources, external_sources, mut registrations, override_resources, installed_tls) = match backend {
+            Backend::Configured(install) => {
+                let (resources, sources, registrations) = crate::resources::open(&config, &memory, &metrics)?;
+                (resources, sources, registrations, install, None)
+            }
+            Backend::Installed { resources, tls } => {
+                options.compaction_threads = config.compactor.threads;
+                options.artefact_threads = if config.search.enabled { config.search.threads } else { 0 };
+                (*resources, rtdb_node::ExternalSources::new(), Vec::new(), None, tls)
+            }
+        };
         let mut resources = match transaction_clock {
             Some(clock) => resources.with_log_clock(clock),
             None => resources,
@@ -197,11 +221,15 @@ impl ServerDriver {
         let mut addresses = ListenerAddresses::default();
         let mut pgwire = Vec::new();
         if let Some(settings) = &config.server {
-            let tls = settings.ssl.as_ref().map(|settings| crate::tls::load(settings, node.memory())).transpose()?;
+            let tls = match &installed_tls {
+                Some(tls) => Some(Arc::clone(tls)),
+                None => settings.ssl.as_ref().map(|settings| crate::tls::load(settings, node.memory())).transpose()?,
+            };
             for (port, read_only) in [(settings.port, false), (settings.read_only_port, true)] {
                 if port < 0 { continue; }
                 let mut configuration = rtdb_pgwire::ServerConfig { address: address(&settings.host, port).await?, maximum_connections: settings.connections,
-                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), capabilities: capabilities.clone(), gateway_session_state, ..Default::default() };
+                    pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), require_tls: installed_tls.is_some(),
+                    capabilities: capabilities.clone(), gateway_session_state, ..Default::default() };
                 if let Some(zone) = &config.default_timezone {
                     configuration.parameters.insert("timezone".into(), zone.clone());
                 }
@@ -246,7 +274,10 @@ impl ServerDriver {
                 addresses.audience_flight = Some(handle.address());
                 flight.push((handle, driver));
             }
-            let (handle, driver) = rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?;
+            let (handle, driver) = match &installed_tls {
+                Some(tls) => rtdb_flight_sql::ServerDriver::bind_standalone(ordinary, node.clone(), auth.clone(), tls.as_ref().clone()).await?,
+                None => rtdb_flight_sql::ServerDriver::bind(ordinary, node.clone(), auth.clone()).await?,
+            };
             addresses.flight_sql = Some(handle.address());
             flight.push((handle, driver));
         }

@@ -41,6 +41,7 @@ uuid.workspace = true
 chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-rustls = "=0.26.6"
 arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }
 tonic = "=0.14.5"
 tokio-stream = { version = "=0.1.19", features = ["net"] }

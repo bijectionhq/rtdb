@@ -186,10 +186,8 @@ fn read_proofs_commitment(proofs: &[Vec<u8>]) -> [u8; 32] {
 impl Service {
     pub(super) fn custody_route(&self, call: &Call) -> Result<&CustodyProviderRoute, Status> {
         let config = &self.0.config;
-        let owner = config
-            .hosted_controls
-            .as_ref()
-            .map(|policy| policy.owner.as_str());
+        let owner = config.hosted_controls.as_ref().map(|policy| policy.owner.as_str())
+            .or(self.0.standalone_custody_owner);
         let caller = &call.session.caller;
         if owner.is_none()
             || caller.principal.user_id() != owner

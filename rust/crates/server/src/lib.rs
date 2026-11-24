@@ -3,6 +3,7 @@ pub mod prometheus;
 pub mod config;
 pub mod tls;
 pub mod cli;
+pub mod standalone;
 pub mod inspect;
 pub mod tracing;
 pub mod metric_export;

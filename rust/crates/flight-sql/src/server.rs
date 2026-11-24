@@ -7,6 +7,7 @@ use rtdb_node::{Clock, Node, SystemClock};
 use rtdb_storage::sealing::{DeliveryDeadline, PlaintextDelivery};
 use rtdb_types::{Anomaly, Result};
 use tokio::{io::{AsyncRead, AsyncWrite, ReadBuf}, net::{TcpListener, TcpStream}, sync::{OwnedSemaphorePermit, Semaphore, watch}};
+use tokio_rustls::{TlsAcceptor, rustls, server::TlsStream};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::server::{Connected, TcpConnectInfo};
@@ -23,21 +24,35 @@ impl ServerHandle {
     pub fn status(&self) -> ServerStatus { self.status.borrow().clone() }
     pub fn watch_status(&self) -> watch::Receiver<ServerStatus> { self.status.clone() }
 }
-pub struct ServerDriver { listener: Option<TcpListener>, service: Service }
+pub struct ServerDriver { listener: Option<TcpListener>, service: Service, tls: Option<TlsAcceptor> }
 impl ServerDriver {
     /// Binds the insecure Flight endpoint without spawning a task.
     /// The owner runs this driver and cancels its handle, then joins `run`, before closing the node.
     pub async fn bind(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>) -> Result<(ServerHandle, Self)> {
         Self::bind_with_clock(config, node, authenticator, Arc::new(SystemClock)).await
     }
+    /// Binds the private TLS listener for the installed native database.
+    pub async fn bind_standalone(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, mut tls: rustls::ServerConfig) -> Result<(ServerHandle, Self)> {
+        if !config.address.ip().is_loopback() || config.owned_native_actions || config.hosted_controls.is_some()
+            || config.audience.is_some() || config.forwarded_peer.is_some() || config.playground
+        {
+            return Err(Anomaly::incorrect("rtdb.flight-sql/standalone", "Installed Flight requires a private native listener"));
+        }
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        Self::bind_listener(config, node, authenticator, Arc::new(SystemClock), Some(TlsAcceptor::from(Arc::new(tls)))).await
+    }
     pub async fn bind_with_clock(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>) -> Result<(ServerHandle, Self)> {
-        config.validate()?;
+        Self::bind_listener(config, node, authenticator, clock, None).await
+    }
+    async fn bind_listener(config: FlightConfig, node: Node, authenticator: Arc<Authenticator>, clock: Arc<dyn Clock>, tls: Option<TlsAcceptor>) -> Result<(ServerHandle, Self)> {
+        let standalone_custody_owner = tls.as_ref().map(|_| "xtdb");
+        config.validate(standalone_custody_owner)?;
         let listener = TcpListener::bind(config.address).await.map_err(network)?;
         let address = listener.local_addr().map_err(network)?;
         let cancellation = node.cancellation().child_token();
         let (sender, receiver) = watch::channel(ServerStatus::default());
-        let service = Service::new(node, authenticator, config, clock, cancellation.clone(), sender)?;
-        Ok((ServerHandle { address, cancellation, status: receiver }, Self { listener: Some(listener), service }))
+        let service = Service::new(node, authenticator, config, clock, cancellation.clone(), sender, standalone_custody_owner)?;
+        Ok((ServerHandle { address, cancellation, status: receiver }, Self { listener: Some(listener), service, tls }))
     }
     pub async fn run(mut self) -> Result<()> {
         let listener = self.listener.take().expect("unstarted Flight driver");
@@ -72,7 +87,26 @@ impl ServerDriver {
                 .initial_connection_window_size(AUDIENCE_H2_CONNECTION_WINDOW)
                 .http2_adaptive_window(Some(false));
         }
-        let serving = http.add_service(server).serve_with_incoming_shutdown(incoming, cancellation.clone().cancelled_owned());
+        let server = http.add_service(server);
+        let stop = cancellation.clone().cancelled_owned();
+        let tls = self.tls.take();
+        let serving = async {
+            match tls {
+                Some(tls) => {
+                    let incoming = incoming.map(|connection| {
+                        let tls = tls.clone();
+                        async move {
+                            match connection {
+                                Ok(connection) => TlsConnection::accept(tls, connection).await.map(Ok),
+                                Err(error) => Some(Err(error)),
+                            }
+                        }
+                    }).buffer_unordered(32).filter_map(std::future::ready);
+                    server.serve_with_incoming_shutdown(incoming, stop).await
+                }
+                None => server.serve_with_incoming_shutdown(incoming, stop).await,
+            }
+        };
         tokio::pin!(serving);
         let mut sweep = tokio::time::interval(self.service.0.config.sweep_interval);
         let result = loop { tokio::select! { result = &mut serving => break result.map_err(network), _ = sweep.tick() => self.service.sweep() } };
@@ -215,6 +249,43 @@ struct ConnectionIo {
     _admission: Option<OwnedSemaphorePermit>,
     _transport: Option<Arc<MemoryReservation>>,
     cancellation: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+struct TlsConnection {
+    stream: TlsStream<ConnectionIo>,
+    info: FlightConnectInfo,
+}
+
+impl TlsConnection {
+    async fn accept(tls: TlsAcceptor, connection: ConnectionIo) -> Option<Self> {
+        let info = connection.connect_info();
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(5), tls.accept(connection))
+            .await.ok()?.ok()?;
+        (stream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice())).then_some(Self { stream, info })
+    }
+}
+
+impl Connected for TlsConnection {
+    type ConnectInfo = FlightConnectInfo;
+    fn connect_info(&self) -> Self::ConnectInfo { self.info.clone() }
+}
+
+impl AsyncRead for TlsConnection {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for TlsConnection {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 impl Connected for ConnectionIo {

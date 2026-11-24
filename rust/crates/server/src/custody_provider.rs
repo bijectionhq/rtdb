@@ -218,6 +218,10 @@ struct Provider {
 }
 
 impl Settings {
+    pub(crate) fn matches_installation(&self, name: &str, id: Uuid) -> bool {
+        self.database == name && self.authority.incarnation == *id.as_bytes()
+    }
+
     pub(crate) fn installation(
         &self,
         memory: Arc<MemoryBudget>,

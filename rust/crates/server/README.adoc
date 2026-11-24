@@ -46,6 +46,27 @@ JKS and PKCS#12 loading uses the configured store password for private keys and 
 JKS password encoding uses UTF-16 code units, including supplementary characters.
 The loader selects a usable signing algorithm from the available identities; certificate-alias selection and multiple PKCS#12 private identities still need compatibility work.
 
+== Installed local startup
+
+`rtdb initialize-standalone --state STAGE --name NAME --id UUID` installs one Default Local database in an empty private staging directory.
+Supply the original database name and a canonical nonzero UUID chosen by the caller.
+Publish the staging directory as the installation authority only after the command succeeds.
+Keep the whole authority together, including `native-authority.json`, `journal/LOG`, `journal/REPLICA_LOG`, `objects/`, `token-keys/` and `checkpoint-keys/`.
+
+`rtdb standalone --state AUTHORITY --name NAME --id UUID --certificate PEM --private-key PEM --password-file FILE --ready-file FILE --parent-stdin` reopens that authority and serves PostgreSQL and native Flight on distinct ephemeral IPv4 loopback ports.
+Supply a certificate valid for `127.0.0.1`, its matching PEM key, and a private file containing a 64-digit hexadecimal password for `xtdb`.
+Select the installed name in the PostgreSQL startup packet and the Flight database header.
+The launcher atomically publishes a private protocol 3 receipt containing `database`, `installation`, `host`, `port` and `native_flight_port` after the exact writer has applied the retained startup positions.
+`rtdb --build-info` advertises the same version as `standalone_protocol`.
+With `--parent-stdin`, EOF initiates the same shutdown and resource drain as a termination signal.
+
+Use `--custody-provider-config FILE` to supply the existing Original provider projection for this name and incarnation.
+The native listener authenticates the configured Original's caller and resolves release authority through the applied writer and provider evidence.
+The native launcher requires its own installed authority format.
+Classic installations require a separate migration that preserves their data and custody.
+
+== Node configuration
+
 The node applies indexing enablement, skipped transaction IDs, trie limits, flush policy, compactor options, GC options and database membership from its startup settings.
 `--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` controls the allocation ceiling shared by the cache and execution regions; the default is one GiB.
 `ParsedConfiguration` owns startup settings and their allocation reservations until they transfer into the execution region.
