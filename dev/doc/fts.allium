@@ -483,6 +483,7 @@ contract SearchFileLayout {
     @invariant OneDocPerRun
         -- A search file has one document per text run of each column in each member's data file, so a version changing one column adds no posting to another.
         -- It records each row's run in each column, or that the row is visible with the column null or absent, or that it is visible nowhere within the file.
+        -- Each event page in formats 14 and later records these entries in the file's column order, with each column's entries aligned to the page's events.
         -- A document's rectangles may merge when they have the same system-time interval and adjacent valid-time intervals.
         -- Each rectangle retains the originating event's system-from for cuts by events outside its file.
 

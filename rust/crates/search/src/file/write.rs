@@ -333,7 +333,11 @@ impl Builder {
         let pages = Table::Pages.array(vec![Arc::new(UInt32Array::from(self.pages))])?;
         let (row_runs, postings): (Vec<_>, Vec<_>) = self.columns.into_iter().map(|column| (column.row_runs, column.postings)).unzip();
         let counts: Vec<_> = row_runs.iter().map(Vec::len).collect();
-        let row_runs = Table::RowRuns.array(vec![list(Arc::new(UInt32Array::from_iter_values(row_runs.into_iter().flatten())),
+        let runs_by_row = match <[_; 1]>::try_from(row_runs) {
+            Ok([rows]) => UInt32Array::from(rows),
+            Err(fields) => UInt32Array::from_iter_values(fields.into_iter().flatten()),
+        };
+        let row_runs = Table::RowRuns.array(vec![list(Arc::new(runs_by_row),
             counts, item_of(&Table::RowRuns.fields()[0]))?])?;
         let term_count = postings.iter().map(BTreeMap::len).sum::<usize>();
         if term_count > u32::MAX as usize { return Err(fault("A search file has too many terms")); }
