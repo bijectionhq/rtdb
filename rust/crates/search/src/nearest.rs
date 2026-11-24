@@ -176,12 +176,13 @@ impl HeldVectorOverlay {
     }
 
     pub fn shadow_opened_projection(
-        &mut self, partition: usize, id: EntityId, vector: &[f32], filters: &[Option<Vec<u8>>], query: &NearestQuery,
+        &mut self, partition: usize, id: EntityId, vector: impl ExactSizeIterator<Item = f32>,
+        filters: &[Option<&[u8]>], query: &NearestQuery,
     ) -> Result<()> {
-        self.reserve_shadow(&id, vector.len(), filters.iter().flatten().map(Vec::len).sum())?;
+        self.reserve_shadow(&id, vector.len(), filters.iter().flatten().map(|key| key.len()).sum())?;
         self.register_shadow(partition, &id)?;
-        let distance = if query.admits(filters.iter().map(Option::as_deref)) {
-            query.distance(vector.iter().copied().map(f64::from))
+        let distance = if query.admits(filters.iter().copied()) {
+            query.distance(vector.map(f64::from))
         } else {
             Ok(None)
         };

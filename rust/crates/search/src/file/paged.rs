@@ -21,55 +21,69 @@ pub(super) struct Block {
 }
 
 pub(super) struct PostingPlan {
-    terms: Vec<Vec<Block>>,
-    groups: Vec<Vec<PostingBuilder>>,
+    terms: Vec<PlannedTerm>,
+}
+
+struct PlannedTerm {
+    postings: PostingBuilder,
+    blocks: Vec<PlannedBlock>,
+}
+
+struct PlannedBlock {
+    page: usize,
+    slot: usize,
+    documents: Range<usize>,
+    positions: Range<usize>,
+    impacts: Range<usize>,
 }
 
 impl PostingPlan {
     pub fn new(terms: impl IntoIterator<Item = PostingBuilder>) -> Self {
-        let mut plan = Self { terms: Vec::new(), groups: Vec::new() };
-        let mut small = Vec::new();
-        for term in terms {
-            let mut blocks = Vec::new();
-            if term.len() <= TARGET_POSTINGS {
-                if small.len() == POSTING_TERMS {
-                    plan.groups.push(std::mem::take(&mut small));
+        let mut page = FIRST_POSTING_PAGE;
+        let mut slot = 0;
+        let terms = terms.into_iter().map(|postings| {
+            let blocks = if postings.len() <= TARGET_POSTINGS {
+                let block = PlannedBlock {
+                    page, slot, documents: 0..postings.len(),
+                    positions: 0..postings.positions.len(), impacts: 0..postings.windows.len(),
+                };
+                slot += 1;
+                if slot == POSTING_TERMS {
+                    page += 2;
+                    slot = 0;
                 }
-                blocks.push(plan.block(small.len(), &term));
-                small.push(term);
+                vec![block]
             } else {
-                if !small.is_empty() { plan.groups.push(std::mem::take(&mut small)); }
+                if slot != 0 {
+                    page += 2;
+                    slot = 0;
+                }
+                let mut blocks = Vec::new();
                 let mut first = 0;
                 let mut first_position = 0;
                 let mut first_impact = 0;
-                while first < term.len() {
-                    let candidate = (first + TARGET_POSTINGS).min(term.len()) - 1;
-                    let last_window = window_of(term.documents[candidate]);
-                    let end = candidate + 1 + term.documents[candidate + 1..]
+                while first < postings.len() {
+                    let candidate = (first + TARGET_POSTINGS).min(postings.len()) - 1;
+                    let last_window = window_of(postings.documents[candidate]);
+                    let end = candidate + 1 + postings.documents[candidate + 1..]
                         .partition_point(|&doc| window_of(doc) == last_window);
-                    let end_position = first_position + term.position_counts[first..end].iter().sum::<usize>();
-                    let end_impact = first_impact + term.windows[first_impact..].partition_point(|impact| impact.window <= last_window);
-                    let chunk = PostingBuilder {
-                        documents: term.documents[first..end].to_vec(),
-                        position_counts: term.position_counts[first..end].to_vec(),
-                        positions: term.positions[first_position..end_position].to_vec(),
-                        windows: term.windows[first_impact..end_impact].to_vec(),
-                    };
-                    blocks.push(plan.block(0, &chunk));
-                    plan.groups.push(vec![chunk]);
+                    let end_position = first_position + postings.position_counts[first..end].iter().sum::<usize>();
+                    let end_impact = first_impact + postings.windows[first_impact..]
+                        .partition_point(|impact| impact.window <= last_window);
+                    blocks.push(PlannedBlock {
+                        page, slot: 0, documents: first..end, positions: first_position..end_position,
+                        impacts: first_impact..end_impact,
+                    });
+                    page += 2;
                     first = end;
                     first_position = end_position;
                     first_impact = end_impact;
                 }
-            }
-            plan.terms.push(blocks);
-        }
-        if !small.is_empty() { plan.groups.push(small); }
-        plan
-    }
-
-    fn block(&self, slot: usize, term: &PostingBuilder) -> Block {
-        Block { page: FIRST_POSTING_PAGE + self.groups.len() * 2, slot, count: term.len(), impacts: term.windows.clone() }
+                blocks
+            };
+            PlannedTerm { postings, blocks }
+        }).collect();
+        Self { terms }
     }
 
     pub fn directory(&self) -> Result<StructArray> {
@@ -77,8 +91,10 @@ impl PostingPlan {
         let arrow_schema::DataType::Struct(block_fields) = block_item.data_type() else { unreachable!() };
         let impact_item = item_of(&block_fields[3]);
         let arrow_schema::DataType::Struct(impact_fields) = impact_item.data_type() else { unreachable!() };
-        let blocks: Vec<_> = self.terms.iter().flatten().collect();
-        let impact_values = || blocks.iter().flat_map(|block| &block.impacts);
+        let blocks: Vec<_> = self.terms.iter().flat_map(|term| term.blocks.iter().map(move |block| {
+            (block, &term.postings.windows[block.impacts.clone()])
+        })).collect();
+        let impact_values = || blocks.iter().flat_map(|&(_, impacts)| impacts);
         let impacts = StructArray::try_new(impact_fields.clone(), vec![
             Arc::new(UInt32Array::from_iter_values(impact_values().map(|impact| impact.window))),
             Arc::new(UInt32Array::from_iter_values(impact_values().map(|impact| impact.frequency))),
@@ -87,59 +103,156 @@ impl PostingPlan {
             Arc::new(BooleanArray::from_iter(impact_values().map(|impact| Some(impact.same_length)))),
             Arc::new(Float64Array::from_iter_values(impact_values().map(|impact| impact.max_unit_score))),
         ], None).map_err(fault)?;
-        let column = |value: fn(&Block) -> usize| {
-            blocks.iter().map(|block| u32::try_from(value(block)).map_err(fault)).collect::<Result<Vec<_>>>()
+        let column = |value: fn(&PlannedBlock) -> usize| {
+            blocks.iter().map(|(block, _)| u32::try_from(value(block)).map_err(fault)).collect::<Result<Vec<_>>>()
                 .map(|values| Arc::new(UInt32Array::from(values)) as arrow_array::ArrayRef)
         };
         let blocks_table = StructArray::try_new(block_fields.clone(), vec![
-            column(|block| block.page)?, column(|block| block.slot)?, column(|block| block.count)?,
-            list(Arc::new(impacts), blocks.iter().map(|block| block.impacts.len()), impact_item)?,
+            column(|block| block.page)?, column(|block| block.slot)?, column(|block| block.documents.len())?,
+            list(Arc::new(impacts), blocks.iter().map(|(_, impacts)| impacts.len()), impact_item)?,
         ], None).map_err(fault)?;
-        Table::Blocks.array(vec![list(Arc::new(blocks_table), self.terms.iter().map(Vec::len), block_item)?])
+        Table::Blocks.array(vec![list(Arc::new(blocks_table), self.terms.iter().map(|term| term.blocks.len()), block_item)?])
     }
 
     pub fn ids(&self, minima: &[Option<i64>]) -> Result<StructArray> {
         let item = item_of(&Table::ImpactIds.fields()[0]);
         let arrow_schema::DataType::Struct(fields) = item.data_type() else { unreachable!() };
-        let impacts = || self.terms.iter().flatten().flat_map(|block| block.impacts.iter());
+        let impacts = || self.terms.iter().flat_map(|term| &term.postings.windows);
         let array = StructArray::try_new(fields.clone(), vec![
             Arc::new(UInt32Array::from_iter_values(impacts().map(|impact| impact.window))),
             Arc::new(Int64Array::from_iter(impacts().map(|impact| minima[impact.window as usize]))),
             Arc::new(Int64Array::from_iter(impacts().map(|impact| impact.max_unit_id))),
         ], None).map_err(fault)?;
-        Table::ImpactIds.array(vec![list(Arc::new(array), self.terms.iter()
-            .map(|blocks| blocks.iter().map(|block| block.impacts.len()).sum()), item)?])
+        Table::ImpactIds.array(vec![list(Arc::new(array), self.terms.iter().map(|term| term.postings.windows.len()), item)?])
     }
 
     pub fn write(self, writer: &mut layout::Writer<impl std::io::Write>) -> Result<Vec<layout::PageRef>> {
-        self.emit(|table, data| writer.page([(table, data)]))
+        self.emit(false, |table, data| writer.page([(table, data)]))
     }
 
-    pub fn emit<T>(self, mut page: impl FnMut(Table, StructArray) -> Result<T>) -> Result<Vec<T>> {
+    pub fn emit<T>(self, retain_pages: bool, mut page: impl FnMut(Table, StructArray) -> Result<T>) -> Result<Vec<T>> {
         let mut pages = Vec::new();
-        for group in self.groups {
-            let counts: Vec<_> = group.iter().map(PostingBuilder::len).collect();
-            let mut documents = Vec::new();
-            let mut position_counts = Vec::new();
-            let mut positions = Vec::new();
-            for term in group {
-                documents.extend(term.documents);
-                position_counts.extend(term.position_counts);
-                positions.extend(term.positions);
+        let mut emit = |tables: [(Table, StructArray); 2]| -> Result<()> {
+            for (table, data) in tables {
+                pages.push(page(table, data)?);
             }
-            let columns = Table::Frequencies.fields();
-            let frequencies = Table::Frequencies.array(vec![
-                list(Arc::new(UInt32Array::from(documents)), counts.iter().copied(), item_of(&columns[0]))?,
-                list(Arc::new(UInt32Array::from_iter_values(position_counts.iter().map(|&count| count as u32))),
-                    counts.iter().copied(), item_of(&columns[1]))?,
-            ])?;
-            let outer = item_of(&Table::Positions.fields()[0]);
-            let positions = list(Arc::new(UInt32Array::from(positions)), position_counts, item_of(&outer))?;
-            let positions = Table::Positions.array(vec![list(positions, counts, outer)?])?;
-            pages.push(page(Table::Frequencies, frequencies)?);
-            pages.push(page(Table::Positions, positions)?);
+            Ok(())
+        };
+        let mut terms = self.terms.into_iter().peekable();
+        while let Some(term) = terms.next() {
+            if term.postings.len() <= TARGET_POSTINGS {
+                let first_page = term.blocks[0].page;
+                let group = std::iter::once(term).chain(std::iter::from_fn(|| {
+                    terms.next_if(|term| term.blocks[0].page == first_page)
+                }));
+                let mut counts = Vec::new();
+                let mut documents = Vec::new();
+                let mut position_counts = Vec::new();
+                let mut positions = Vec::new();
+                for term in group {
+                    counts.push(term.postings.len());
+                    documents.extend(term.postings.documents);
+                    position_counts.extend(term.postings.position_counts);
+                    positions.extend(term.postings.positions);
+                }
+                emit(posting_pages(UInt32Array::from(documents), &position_counts, UInt32Array::from(positions), &counts)?)?;
+            } else {
+                let documents = UInt32Array::from(term.postings.documents);
+                let positions = UInt32Array::from(term.postings.positions);
+                let values = |array: &UInt32Array, range: Range<usize>| {
+                    if retain_pages {
+                        // Query builds charge each page for the full capacity of its backing buffers.
+                        let mut values = Vec::new();
+                        values.extend_from_slice(&array.values()[range]);
+                        UInt32Array::from(values)
+                    } else {
+                        array.slice(range.start, range.len())
+                    }
+                };
+                for block in term.blocks {
+                    let count = block.documents.len();
+                    let position_counts = &term.postings.position_counts[block.documents.clone()];
+                    emit(posting_pages(values(&documents, block.documents), position_counts,
+                        values(&positions, block.positions), &[count])?)?;
+                }
+            }
         }
         Ok(pages)
+    }
+}
+
+fn posting_pages(documents: UInt32Array, position_counts: &[usize], positions: UInt32Array, counts: &[usize])
+    -> Result<[(Table, StructArray); 2]> {
+    let columns = Table::Frequencies.fields();
+    let frequencies = Table::Frequencies.array(vec![
+        list(Arc::new(documents), counts.iter().copied(), item_of(&columns[0]))?,
+        list(Arc::new(UInt32Array::from_iter_values(position_counts.iter().map(|&count| count as u32))),
+            counts.iter().copied(), item_of(&columns[1]))?,
+    ])?;
+    let outer = item_of(&Table::Positions.fields()[0]);
+    let positions = list(Arc::new(positions), position_counts.iter().copied(), item_of(&outer))?;
+    let positions = Table::Positions.array(vec![list(positions, counts.iter().copied(), outer)?])?;
+    Ok([(Table::Frequencies, frequencies), (Table::Positions, positions)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::FORMAT_VERSION;
+
+    #[test]
+    fn split_posting_pages_keep_windows_positions_and_ipc_bytes() -> Result<()> {
+        let positions = |doc| (0..doc % 3 + 1).map(|index| index * 3 + doc % 5).collect::<Vec<u32>>();
+        let doc_start = 127u32;
+        let doc_end = doc_start + 2 * TARGET_POSTINGS as u32 + 2;
+        let plan = || {
+            let small = || {
+                let mut term = PostingBuilder::default();
+                term.push(1, 2, vec![0], Some(50));
+                term
+            };
+            let mut large = PostingBuilder::default();
+            for doc in doc_start..doc_end {
+                large.push(doc, 10, positions(doc), Some(i64::from(doc)));
+            }
+            PostingPlan::new((0..=POSTING_TERMS).map(|_| small()).chain([large, small(), small()]))
+        };
+        let durable = plan();
+        let directory = durable.directory()?;
+        let directory = directory.column(0).as_list::<i64>();
+        let large = POSTING_TERMS + 1;
+        let coordinates = |term| blocks(directory, term).iter().map(|block| (block.page, block.slot, block.count))
+            .collect::<Vec<_>>();
+        assert_eq!(coordinates(POSTING_TERMS - 1), [(2, POSTING_TERMS - 1, 1)]);
+        assert_eq!(coordinates(POSTING_TERMS), [(4, 0, 1)]);
+        assert_eq!(coordinates(large), [(6, 0, TARGET_POSTINGS + 1), (8, 0, TARGET_POSTINGS), (10, 0, 1)]);
+        assert_eq!(coordinates(large + 2), [(12, 1, 1)]);
+
+        let retained = plan().emit(true, |table, data| layout::record(FORMAT_VERSION, [(table, data)]))?;
+        let mut next_doc = doc_start;
+        for block in blocks(directory, large) {
+            let page = block.page - FIRST_POSTING_PAGE;
+            let frequencies = Frequencies::from_batch(&retained[page], &block, doc_end)?;
+            let stored = frequencies.positions_from_batch(&retained[page + 1], &block)?;
+            for row in 0..block.count {
+                assert_eq!(frequencies.document(row), next_doc);
+                assert_eq!(position_values(&stored, row), positions(next_doc).as_slice());
+                next_doc += 1;
+            }
+        }
+        assert_eq!(next_doc, doc_end);
+
+        let mut actual = Vec::new();
+        let mut writer = layout::Writer::new(&mut actual, FORMAT_VERSION)?;
+        durable.write(&mut writer)?;
+        writer.finish()?;
+
+        let mut expected = Vec::new();
+        let mut writer = layout::Writer::new(&mut expected, FORMAT_VERSION)?;
+        for batch in retained { writer.write_batch(&batch)?; }
+        writer.finish()?;
+        assert_eq!(actual, expected);
+        Ok(())
     }
 }
 

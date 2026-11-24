@@ -64,6 +64,7 @@ tokio.workspace = true
 tokio-rustls = "=0.26.6"
 tokio-util.workspace = true
 tracing = "=0.1.44"
+zeroize = "=1.9.1"
 
 [dev-dependencies]
 arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }

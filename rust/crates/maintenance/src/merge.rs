@@ -102,13 +102,25 @@ struct MergeOutput {
 }
 
 enum MergePages {
-    Pending,
-    Retained(OwnedBatch),
+    Retained(RetainedPages),
     Writing(ArrowFileWriter),
     Spilled,
 }
 
+#[derive(Default)]
+struct RetainedPages {
+    batches: Vec<OwnedBatch>,
+    bytes: usize,
+}
+
+struct MergePlan {
+    tasks: Vec<planner::Task>,
+    tie_order: planner::TieOrder,
+    source_precedence: Vec<usize>,
+}
+
 const RETAINED_MERGE_BYTES: usize = 2 * 1024 * 1024;
+const RETAINED_MERGE_TASKS: usize = 4;
 
 #[derive(Clone)]
 struct OutputSchema { put: Option<Arc<StructFields<LogicalType>>>, iid_encoding: Option<RunEndWidth>, recency: bool, keyed: bool, topology: bool, include_origins: bool, include_positions: bool, redacted_leg: bool }
@@ -156,6 +168,14 @@ impl OutputSchema {
 
 fn create_file(path: &Path) -> Result<File> {
     OpenOptions::new().create_new(true).write(true).read(true).open(path).map_err(crate::invalid)
+}
+
+fn remove_temporary_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(crate::invalid(error)),
+    }
 }
 
 /// What encoding an event may hold at once: its document's decoded cells, and the event itself.
@@ -372,7 +392,6 @@ impl CompactionExecutor for SegmentCompactor {
 
 impl SegmentCompactor {
     async fn execute_job(&self, job: &CompactionJob, snapshot: Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<TriesAdded> {
-        let positioned_history = TableRef::owned_schema(&job.table.schema);
         let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
         let entry = snapshot.table_catalog().entry(&job.table).cloned().ok_or_else(|| crate::invalid("Compaction table has no recorded slug"))?;
         let mut inputs = Vec::new();
@@ -418,13 +437,62 @@ impl SegmentCompactor {
             put, iid_encoding: (self.config.run_end_encoded_iids && initial_recency.is_some()).then_some(RunEndWidth::I32),
             recency: job.recency_mode == RecencyMode::Preserve && carry, keyed, topology, include_origins, include_positions, redacted_leg,
         };
-        let retain = tasks.len() == 1 && initial_schema.supports_retention();
-        let initial = MergeOutput::pending(directory.path().join("merged-0.arrow"), initial_recency, &job.part, initial_schema);
-        let mut outputs = vec![initial];
-        if !retain {
-            outputs[0].start_spill(&self.config, &self.memory)?;
+        let retain_multiple = job.recency_mode == RecencyMode::Preserve && initial_recency.is_none()
+            && (2..=RETAINED_MERGE_TASKS).contains(&tasks.len());
+        let mut retain = initial_schema.supports_retention() && (tasks.len() == 1 || retain_multiple);
+        let plan = MergePlan { tasks, tie_order, source_precedence };
+        let initial_path = directory.path().join("merged-0.arrow");
+        let mut outputs = loop {
+            let mut initial = MergeOutput::pending(initial_path.clone(), initial_recency, &job.part, initial_schema.clone());
+            if !retain {
+                initial.start_spill(&self.config, &self.memory, cancellation)?;
+            }
+            match self.merge_tasks(job, &mut inputs, &plan, initial, cancellation).await {
+                // The next task can run out of scratch before it can spill the retained pages.
+                Err(error) if retain && retain_multiple && error.code == "rtdb/memory-budget-exceeded" => {
+                    if cancellation.is_cancelled() { return Err(crate::closed()); }
+                    remove_temporary_file(&initial_path)?;
+                    retain = false;
+                }
+                result => break result?,
+            }
+        };
+        drop(plan);
+        drop(inputs);
+        for output in &mut outputs { output.finish(&self.config, &self.memory, cancellation)?; }
+        let mut outputs = outputs.into_iter().enumerate();
+        let initial = outputs.next();
+        let mut tries = Vec::new();
+        for (index, mut output) in outputs.chain(initial) {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let key = TrieKey::new(job.output.level(), output.recency, job.output.part().to_vec(), job.output.block_index())?.with_epoch(job.output.epoch());
+            let data_path = directory.path().join(format!("output-{index}.arrow"));
+            let meta_path = directory.path().join(format!("output-{index}.meta.arrow"));
+            let (size, metadata) = output.normalize(&self.config, &self.memory, &data_path, &meta_path, cancellation)?;
+            drop(output);
+            check_disk(directory.path(), self.config.temporary_byte_limit, 0)?;
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let data_key = ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?;
+            let data = self.store.put_file_with_publication(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+                .with_context("key", data_key.to_string().into()).with_context("operation", "put_file".into()))?;
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
+            let meta = self.store.put_file_with_publication(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+                .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
+            let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
+            let published_files = if data.is_some() || meta.is_some() {
+                Some(TrieFileVersions { data: data.map(Into::into), metadata: meta.map(Into::into) })
+            } else { None };
+            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, published_files, ..Default::default() });
         }
-        for task in tasks {
+        Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
+    }
+
+    async fn merge_tasks(&self, job: &CompactionJob, inputs: &mut [InputSegment], plan: &MergePlan, initial: MergeOutput,
+        cancellation: &CancellationToken) -> Result<Vec<MergeOutput>> {
+        let positioned_history = TableRef::owned_schema(&job.table.schema);
+        let mut outputs = vec![initial];
+        for task in &plan.tasks {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let mut rows = Vec::new();
             let mut charges = Vec::new();
@@ -449,13 +517,13 @@ impl SegmentCompactor {
                     }
                 }
                 charges.push(event_reservation(&self.memory, &events, 2)?);
-                rows.push(planner::PageRows { source_precedence: source_precedence[page.segment], events });
+                rows.push(planner::PageRows { source_precedence: plan.source_precedence[page.segment], events });
             }
             for event in rows.iter().flat_map(|page| &page.events) {
                 if let Some((_, events)) = erase_times.get_mut(&same_time_key(event)) { *events += 1; }
             }
             erase_times.retain(|_, (_, events)| *events > 1);
-            let mut heap = planner::RowHeap::new(&rows, tie_order)?;
+            let mut heap = planner::RowHeap::new(&rows, plan.tie_order)?;
             let mut states = EntityStates::new();
             let mut buckets: BTreeMap<usize, Vec<PageEvent>> = BTreeMap::new();
             let mut bucket_charges = Vec::new();
@@ -491,8 +559,8 @@ impl SegmentCompactor {
                     let date = recency_partition(recency, self.config.recency_partition)?;
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
                     else {
-                        if matches!(outputs[0].pages, MergePages::Pending) {
-                            outputs[0].start_spill(&self.config, &self.memory)?;
+                        if matches!(outputs[0].pages, MergePages::Retained(_)) {
+                            outputs[0].start_spill(&self.config, &self.memory, cancellation)?;
                         }
                         let index = outputs.len();
                         let schema = OutputSchema {
@@ -500,8 +568,9 @@ impl SegmentCompactor {
                             recency: self.config.within_file_recency_branching,
                             ..outputs[0].schema.clone()
                         };
-                        let mut output = MergeOutput::pending(directory.path().join(format!("merged-{index}.arrow")), Some(date), &job.part, schema);
-                        output.start_spill(&self.config, &self.memory)?;
+                        let directory = outputs[0].path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
+                        let mut output = MergeOutput::pending(directory.join(format!("merged-{index}.arrow")), Some(date), &job.part, schema);
+                        output.start_spill(&self.config, &self.memory, cancellation)?;
                         outputs.push(output);
                         index
                     }
@@ -513,81 +582,76 @@ impl SegmentCompactor {
             }
             drop(states);
             for (index, events) in buckets {
-                outputs[index].write(&events, task.path.clone(), &self.config, &self.memory)?;
+                outputs[index].write(&events, task.path.clone(), &self.config, &self.memory, cancellation)?;
             }
             tokio::task::yield_now().await;
         }
-        drop(inputs);
-        for output in &mut outputs { output.finish(&self.config, &self.memory)?; }
-        let mut outputs = outputs.into_iter().enumerate();
-        let initial = outputs.next();
-        let mut tries = Vec::new();
-        for (index, mut output) in outputs.chain(initial) {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let key = TrieKey::new(job.output.level(), output.recency, job.output.part().to_vec(), job.output.block_index())?.with_epoch(job.output.epoch());
-            let data_path = directory.path().join(format!("output-{index}.arrow"));
-            let meta_path = directory.path().join(format!("output-{index}.meta.arrow"));
-            let (size, metadata) = output.normalize(&self.config, &self.memory, &data_path, &meta_path, cancellation)?;
-            drop(output);
-            check_disk(directory.path(), self.config.temporary_byte_limit, 0)?;
-            let data_key = ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?;
-            let data = self.store.put_file_with_publication(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
-                .with_context("key", data_key.to_string().into()).with_context("operation", "put_file".into()))?;
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
-            let meta = self.store.put_file_with_publication(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
-                .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
-            let artefacts = self.artefacts_of(&snapshot, &job.table, &key, &data_path, size, cancellation).await;
-            let published_files = if data.is_some() || meta.is_some() {
-                Some(TrieFileVersions { data: data.map(Into::into), metadata: meta.map(Into::into) })
-            } else { None };
-            tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), artefacts, published_files, ..Default::default() });
-        }
-        Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
+        Ok(outputs)
     }
 }
 
 impl MergeOutput {
     fn pending(path: PathBuf, recency: Option<CivilDate>, part: &[u8], schema: OutputSchema) -> Self {
-        Self { path, part: part.to_vec(), recency, schema, pages: MergePages::Pending, leaves: Vec::new() }
+        Self { path, part: part.to_vec(), recency, schema, pages: MergePages::Retained(RetainedPages::default()), leaves: Vec::new() }
     }
 
-    fn start_spill(&mut self, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn start_spill(&mut self, config: &MergeConfig, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<()> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let MergePages::Retained(retained) = &mut self.pages else { return Err(crate::invalid("Merge spill already started")); };
         let directory = self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&self.path)?, self.schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
+        let batches = std::mem::take(&mut retained.batches);
         self.pages = MergePages::Writing(writer);
+        for batch in batches {
+            self.spill_page(&batch, config, memory, cancellation)?;
+        }
         Ok(())
     }
 
-    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<()> {
+    fn write(&mut self, events: &[PageEvent], path: Vec<u8>, config: &MergeConfig, memory: &Arc<MemoryBudget>,
+        cancellation: &CancellationToken) -> Result<()> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
         if events.is_empty() { return Ok(()); }
-        let candidate = if matches!(self.pages, MergePages::Pending) && events.len() <= config.page_size {
+        let candidate = if let MergePages::Retained(retained) = &mut self.pages && events.len() <= config.page_size {
             // Appended origin and topology columns can hold separate buffer reservations.
             let page_memory = memory.scope();
             let batch = self.schema.batch(events, &page_memory)?;
-            if page_memory.used_bytes() <= RETAINED_MERGE_BYTES {
-                self.pages = MergePages::Retained(batch);
+            let bytes = page_memory.used_bytes();
+            if bytes <= RETAINED_MERGE_BYTES - retained.bytes
+                && batch.batch().schema() == self.schema.schema()?
+            {
+                retained.bytes += bytes;
+                retained.batches.push(batch);
                 self.record_leaf(path, events);
                 return Ok(());
             }
-            Some(batch)
+            retained.batches.is_empty().then_some(batch)
         } else { None };
-        if matches!(self.pages, MergePages::Pending) { self.start_spill(config, memory)?; }
-        let MergePages::Writing(writer) = &mut self.pages else { return Err(crate::invalid("Merge file already ended")); };
-        limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
+        if matches!(self.pages, MergePages::Retained(_)) { self.start_spill(config, memory, cancellation)?; }
         let batch = match candidate { Some(batch) => batch, None => self.schema.batch(events, memory)? };
-        writer.write_event_page(batch.batch(), memory)?;
+        self.spill_page(&batch, config, memory, cancellation)?;
         self.record_leaf(path, events);
         Ok(())
+    }
+
+    fn spill_page(&mut self, batch: &OwnedBatch, config: &MergeConfig, memory: &Arc<MemoryBudget>,
+        cancellation: &CancellationToken) -> Result<()> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let MergePages::Writing(writer) = &mut self.pages else { return Err(crate::invalid("Merge file already ended")); };
+        limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
+        writer.write_event_page(batch.batch(), memory)
     }
 
     fn record_leaf(&mut self, path: Vec<u8>, events: &[PageEvent]) {
         self.leaves.push(layout::Leaf { page: self.leaves.len(), path, rows: events.len(), min_recency: events.iter().filter_map(|event| event.recency).min(), max_recency: events.iter().filter_map(|event| event.recency).max() });
     }
 
-    fn finish(&mut self, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<()> {
-        if matches!(self.pages, MergePages::Retained(_)) { return Ok(()); }
-        if matches!(self.pages, MergePages::Pending) { self.start_spill(config, memory)?; }
+    fn finish(&mut self, config: &MergeConfig, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<()> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        if let MergePages::Retained(retained) = &self.pages {
+            if !retained.batches.is_empty() { return Ok(()); }
+            self.start_spill(config, memory, cancellation)?;
+        }
         let MergePages::Writing(mut writer) = std::mem::replace(&mut self.pages, MergePages::Spilled) else {
             return Err(crate::invalid("Merge file already ended"));
         };
@@ -604,23 +668,10 @@ impl MergeOutput {
         }
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         for path in [data, meta] {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(crate::invalid(error)),
-            }
+            remove_temporary_file(path)?;
         }
-        let MergePages::Retained(batch) = std::mem::replace(&mut self.pages, MergePages::Pending) else {
-            return Err(crate::invalid("Retained merge page is missing"));
-        };
-        self.start_spill(config, memory)?;
-        let MergePages::Writing(writer) = &mut self.pages else {
-            return Err(crate::invalid("Merge spill writer is missing"));
-        };
-        limit_writer(writer, self.path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?, config.temporary_byte_limit)?;
-        writer.write_event_page(batch.batch(), memory)?;
-        drop(batch);
-        self.finish(config, memory)?;
+        self.start_spill(config, memory, cancellation)?;
+        self.finish(config, memory, cancellation)?;
         layout::normalize(self, config, memory, data, meta, cancellation)
     }
 }
@@ -677,7 +728,7 @@ mod tests {
 
     fn spill(path: PathBuf, schema: OutputSchema, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> MergeOutput {
         let mut spill = MergeOutput::pending(path, None, &[], schema);
-        spill.start_spill(config, memory).unwrap();
+        spill.start_spill(config, memory, &CancellationToken::new()).unwrap();
         spill
     }
 
@@ -706,12 +757,13 @@ mod tests {
     }
 
     #[test]
-    fn retained_compaction_page_matches_spill_bytes_and_preserves_event_witnesses() {
+    fn retained_compaction_pages_match_spill_geometry_bytes_and_event_witnesses() {
         use rtdb_types::{BlockIndex, EventOrigin, EventPosition, TxId};
 
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryBudget::new(32 << 20);
         let config = MergeConfig { page_size: 3, ..Default::default() };
+        let cancellation = CancellationToken::new();
         let schema = OutputSchema {
             put: Some(Arc::new(StructFields::from([
                 ("text".into(), LogicalType::Scalar(ScalarType::Utf8).maybe()),
@@ -724,91 +776,125 @@ mod tests {
             StoredOperation::Put(StructFields::from([("text".into(), Value::Utf8("a".into())), ("number".into(), Value::F64(-0.0))])),
             StoredOperation::Put(StructFields::from([("text".into(), Value::Null), ("number".into(), Value::F64(1.0))])),
             StoredOperation::Redacted,
+            StoredOperation::Delete,
+            StoredOperation::Put(StructFields::from([("text".into(), Value::Utf8("b".into())), ("number".into(), Value::F64(2.0))])),
         ].into_iter().enumerate().map(|(row, operation)| StoredEvent {
-            iid: Iid([row as u8; 16]), system_from: Timestamp(10 + row as i64), valid_time: Interval::ALL,
+            iid: Iid([[0, 1, 16, 64, 65][row]; 16]), system_from: Timestamp(10 + row as i64),
+            valid_time: Interval::from_micros(row as i64, 100).unwrap(),
             entity_key: Some(Arc::from([row as u8].as_slice())), commit_position: row as u32 + 1,
-            origin: (row != 0).then(|| EventOrigin::at([1; 16], row as u64, BlockIndex(1))),
+            origin: (row >= 2).then(|| EventOrigin::at([1; 16], row as u64, BlockIndex(1))),
             position: Some(EventPosition { transaction: TxId(1), ordinal: row as u64 }), recency: None, operation,
         }).collect::<Vec<_>>();
         let input = EventBatch::new(build_event_batch(&rows, schema.put.as_deref().cloned(), None).unwrap()).unwrap();
         let events = input.page_events().unwrap();
-        let mut retained = MergeOutput::pending(directory.path().join("retained-spill.arrow"), None, &[0], schema.clone());
         assert!(schema.supports_retention());
-        let mut spilled = spill(directory.path().join("spill.arrow"), schema, &config, &memory);
-        for output in [&mut retained, &mut spilled] {
-            output.write(&events, vec![0], &config, &memory).unwrap();
-            output.finish(&config, &memory).unwrap();
-        }
-        assert!(matches!(retained.pages, MergePages::Retained(_)));
-        assert!(!retained.path.exists());
-        assert!(matches!(spilled.pages, MergePages::Spilled));
+        for (name, tasks, lengths) in [
+            ("single", vec![(0..3, vec![0])], vec![3]),
+            ("multiple", vec![(0..2, vec![0, 0]), (2..3, vec![0, 1]), (3..5, vec![1])], vec![3, 2]),
+        ] {
+            let directory = directory.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let mut retained = MergeOutput::pending(directory.join("retained-spill.arrow"), None, &[], schema.clone());
+            let mut spilled = spill(directory.join("spill.arrow"), schema.clone(), &config, &memory);
+            for output in [&mut retained, &mut spilled] {
+                for (rows, path) in &tasks {
+                    output.write(&events[rows.clone()], path.clone(), &config, &memory, &cancellation).unwrap();
+                }
+                output.finish(&config, &memory, &cancellation).unwrap();
+            }
+            assert!(matches!(&retained.pages, MergePages::Retained(pages) if pages.batches.len() == tasks.len()));
+            assert!(!retained.path.exists());
+            assert!(matches!(spilled.pages, MergePages::Spilled));
 
-        let normalize = |output: &mut MergeOutput, name| {
-            let data = directory.path().join(format!("{name}.arrow"));
-            let meta = directory.path().join(format!("{name}.meta.arrow"));
-            let (size, details) = output.normalize(&config, &memory, &data, &meta, &CancellationToken::new()).unwrap();
-            (std::fs::read(data).unwrap(), std::fs::read(meta).unwrap(), size, details)
-        };
-        let result = normalize(&mut retained, "retained");
-        assert_eq!(result, normalize(&mut spilled, "spilled"));
-        assert!(!retained.path.exists());
-        let mut reader = ArrowFile::open(result.0.into(), None).unwrap();
-        assert_eq!(reader.page_count(), 1);
-        let page = EventBatch::new(reader.read_page(0).unwrap()).unwrap();
-        assert_eq!((0..page.len()).map(|row| page.read_event(row).unwrap()).collect::<Vec<_>>(), rows);
-        drop(retained);
-        assert_eq!(memory.used_bytes(), 0);
+            let normalize = |output: &mut MergeOutput, name| {
+                let data = directory.join(format!("{name}.arrow"));
+                let meta = directory.join(format!("{name}.meta.arrow"));
+                let (size, details) = output.normalize(&config, &memory, &data, &meta, &cancellation).unwrap();
+                (std::fs::read(data).unwrap(), std::fs::read(meta).unwrap(), size, details)
+            };
+            let result = normalize(&mut retained, "retained");
+            assert_eq!(result, normalize(&mut spilled, "spilled"));
+            assert!(!retained.path.exists());
+            let mut reader = ArrowFile::open(result.0.into(), None).unwrap();
+            assert_eq!(reader.page_count(), lengths.len());
+            let mut offset = 0;
+            for (index, length) in lengths.into_iter().enumerate() {
+                let page = EventBatch::new(reader.read_page(index).unwrap()).unwrap();
+                assert_eq!(page.len(), length);
+                let observed = (0..length).map(|row| page.read_event(row).unwrap()).collect::<Vec<_>>();
+                assert_eq!(observed.as_slice(), &rows[offset..offset + length]);
+                offset += length;
+            }
+            drop(retained);
+            assert_eq!(memory.used_bytes(), 0);
+        }
     }
 
     #[test]
-    fn flat_compaction_page_over_the_retention_cap_uses_ipc_spill() {
+    fn flat_compaction_pages_over_the_aggregate_retention_cap_spill_in_task_order() {
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryBudget::new(64 << 20);
         let config = MergeConfig::default();
+        let cancellation = CancellationToken::new();
         let schema = OutputSchema {
             put: Some(Arc::new(StructFields::from([("blob".into(), LogicalType::Scalar(ScalarType::Binary))]))),
             iid_encoding: None, recency: false, keyed: false, topology: false,
             include_origins: false, include_positions: false, redacted_leg: false,
         };
-        let events = [StoredEvent {
-            iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
-            entity_key: None, commit_position: 0, origin: None, position: None, recency: None,
-            operation: StoredOperation::Put(StructFields::from([("blob".into(), Value::Binary(vec![7; RETAINED_MERGE_BYTES + 1]))])),
-        }];
-        let input = EventBatch::new(build_event_batch(&events, schema.put.as_deref().cloned(), None).unwrap()).unwrap();
         assert!(schema.supports_retention());
-        let mut output = MergeOutput::pending(directory.path().join("spill.arrow"), None, &[], schema);
-        output.write(&input.page_events().unwrap(), vec![], &config, &memory).unwrap();
-        output.finish(&config, &memory).unwrap();
-        assert!(matches!(output.pages, MergePages::Spilled));
-        assert!(output.path.exists());
-        assert_eq!(memory.used_bytes(), 0);
+        for (name, count, bytes) in [("single", 1, RETAINED_MERGE_BYTES + 1), ("multiple", 2, RETAINED_MERGE_BYTES / 2 + 1)] {
+            let mut output = MergeOutput::pending(directory.path().join(format!("{name}.arrow")), None, &[], schema.clone());
+            let events = (0..count).map(|index| StoredEvent {
+                iid: Iid([64 * index as u8; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
+                entity_key: None, commit_position: 0, origin: None, position: None, recency: None,
+                operation: StoredOperation::Put(StructFields::from([("blob".into(), Value::Binary(vec![index as u8; bytes]))])),
+            }).collect::<Vec<_>>();
+            for (index, event) in events.iter().enumerate() {
+                let input = EventBatch::new(build_event_batch(std::slice::from_ref(event), schema.put.as_deref().cloned(), None).unwrap()).unwrap();
+                output.write(&input.page_events().unwrap(), vec![index as u8], &config, &memory, &cancellation).unwrap();
+                assert_eq!(output.path.exists(), index + 1 == count);
+            }
+            output.finish(&config, &memory, &cancellation).unwrap();
+            assert!(matches!(output.pages, MergePages::Spilled));
+            assert_eq!(memory.used_bytes(), 0);
+            let (mut reader, _reservation) = open_input(File::open(&output.path).unwrap(), &memory).unwrap();
+            assert_eq!(reader.page_count(), count);
+            for (index, expected) in events.iter().enumerate() {
+                let page = EventBatch::new(reader.read_page(index).unwrap()).unwrap();
+                assert_eq!(page.len(), 1);
+                assert_eq!(&page.read_event(0).unwrap(), expected);
+            }
+        }
     }
 
     #[test]
-    fn retained_compaction_page_obeys_cancellation_and_temporary_byte_limit() {
+    fn retained_compaction_pages_obey_cancellation_and_temporary_byte_limit() {
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryBudget::new(8 << 20);
-        let config = MergeConfig::default();
+        let config = MergeConfig { page_size: 1, ..Default::default() };
+        let cancellation = CancellationToken::new();
         let schema = OutputSchema {
             put: None, iid_encoding: None, recency: false, keyed: false, topology: false,
             include_origins: false, include_positions: false, redacted_leg: false,
         };
-        let events = page(&[StoredEvent {
-            iid: Iid([1; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
+        let events = [0, 64].map(|bucket| StoredEvent {
+            iid: Iid([bucket; 16]), system_from: Timestamp(1), valid_time: Interval::ALL,
             entity_key: None, commit_position: 0, origin: None, position: None, recency: None,
             operation: StoredOperation::Delete,
-        }]);
+        });
         let mut output = MergeOutput::pending(directory.path().join("spill.arrow"), None, &[], schema);
-        output.write(&events, vec![], &config, &memory).unwrap();
-        output.finish(&config, &memory).unwrap();
-        assert!(matches!(output.pages, MergePages::Retained(_)));
+        for (index, event) in events.iter().enumerate() {
+            output.write(&page(std::slice::from_ref(event)), vec![index as u8], &config, &memory, &cancellation).unwrap();
+        }
+        output.finish(&config, &memory, &cancellation).unwrap();
+        assert!(matches!(&output.pages, MergePages::Retained(pages) if pages.batches.len() == 2));
 
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let meta = directory.path().join("meta.arrow");
         let data = directory.path().join("cancelled.arrow");
         assert_eq!(output.normalize(&config, &memory, &data, &meta, &cancelled).unwrap_err().code, crate::closed().code);
+        assert!(!data.exists());
         assert!(!meta.exists());
 
         let limited = MergeConfig { temporary_byte_limit: disk_usage(directory.path()).unwrap() + 1, ..config };
@@ -831,6 +917,7 @@ mod tests {
         let meta = directory.path().join("meta.arrow");
         let memory = MemoryBudget::new(32 << 20);
         let config = MergeConfig::default();
+        let cancellation = CancellationToken::new();
         let values = [Value::FixedSizeList(vec![Value::F32(-0.0), Value::F64(f64::from_bits(0x7ff8_0000_0000_0042)), Value::Null].into()), Value::Null];
         let item = LogicalType::from_legs([LogicalType::Scalar(ScalarType::F32), LogicalType::Scalar(ScalarType::F64), LogicalType::Null]);
         let fields = Some(StructFields::from([("v".into(), LogicalType::List {
@@ -845,8 +932,8 @@ mod tests {
         let schema = OutputSchema { put: fields.clone().map(Arc::new), iid_encoding: None, recency: false, keyed: false, topology: false, include_origins: false, include_positions: false, redacted_leg: false };
         assert!(!schema.supports_retention());
         let mut spill = spill(directory.path().join("spill.arrow"), schema, &config, &memory);
-        spill.write(&input.page_events().unwrap(), vec![], &config, &memory).unwrap();
-        spill.finish(&config, &memory).unwrap();
+        spill.write(&input.page_events().unwrap(), vec![], &config, &memory, &cancellation).unwrap();
+        spill.finish(&config, &memory, &cancellation).unwrap();
 
         let expected = rtdb_format::data::copy_event_batch_with_recency(&events, fields.clone(), None, false).unwrap();
         let (mut reader, _reservation) = open_input(File::open(&spill.path).unwrap(), &memory).unwrap();
@@ -880,6 +967,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryBudget::new(32 << 20);
+        let cancellation = CancellationToken::new();
         let fields = Some(StructFields::from([("v".into(), LogicalType::list(LogicalType::Scalar(ScalarType::F64).maybe()).maybe())]));
         let events = [0, 1, 128, 129].into_iter().map(|first| {
             let mut iid = [0; 16];
@@ -908,12 +996,12 @@ mod tests {
                 EventBatch::new(build_event_batch(events, fields.clone(), None).unwrap()).unwrap().page_events().unwrap()
             };
             if name == "split" {
-                spill.write(&events_in(&events), vec![], &config, &memory).unwrap();
+                spill.write(&events_in(&events), vec![], &config, &memory, &cancellation).unwrap();
             } else {
-                spill.write(&events_in(&events[..2]), vec![0], &config, &memory).unwrap();
-                spill.write(&events_in(&events[2..]), vec![2], &config, &memory).unwrap();
+                spill.write(&events_in(&events[..2]), vec![0], &config, &memory, &cancellation).unwrap();
+                spill.write(&events_in(&events[2..]), vec![2], &config, &memory, &cancellation).unwrap();
             }
-            spill.finish(&config, &memory).unwrap();
+            spill.finish(&config, &memory, &cancellation).unwrap();
 
             let (mut reader, _reservation) = open_input(File::open(&spill.path).unwrap(), &memory).unwrap();
             let pages = (0..spill.leaves.len()).map(|page| {
@@ -951,6 +1039,7 @@ mod tests {
         let metadata = directory.path().join("meta.arrow");
         let memory = MemoryBudget::new(1 << 22);
         let config = MergeConfig::default();
+        let cancellation = CancellationToken::new();
         let events = [(b"world-a".as_slice(), 2), (b"world-b".as_slice(), 1)].map(|(key, commit_position)| StoredEvent { position: None,
             origin: None,
             commit_position,
@@ -959,8 +1048,8 @@ mod tests {
         });
         let schema = OutputSchema { put: None, iid_encoding: None, recency: false, keyed: true, topology: false, include_origins: false, include_positions: false, redacted_leg: false };
         let mut spill = spill(spill_path, schema, &config, &memory);
-        spill.write(&page(&events), vec![], &config, &memory).unwrap();
-        spill.finish(&config, &memory).unwrap();
+        spill.write(&page(&events), vec![], &config, &memory, &cancellation).unwrap();
+        spill.finish(&config, &memory, &cancellation).unwrap();
         layout::normalize(&spill, &config, &memory, &data, &metadata, &CancellationToken::new()).unwrap();
         let (mut reader, _reservation) = open_input(File::open(data).unwrap(), &memory).unwrap();
         let batch = EventBatch::new(read_page(&mut reader, 0, &memory).unwrap().batch().clone()).unwrap();
@@ -1024,6 +1113,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let memory = MemoryBudget::new(1 << 22);
         let config = MergeConfig::default();
+        let cancellation = CancellationToken::new();
         let id = rtdb_types::EntityId::Integer(1);
         let redacted = StoredEvent { position: None,
             origin: Some(EventOrigin::at([1; 16], 2, BlockIndex(1))),
@@ -1046,9 +1136,9 @@ mod tests {
         assert_eq!(normalized.iter().map(EncodedEvent::header).collect::<Vec<_>>(), [redacted.header(), earlier.header()]);
         let schema = OutputSchema { put: None, iid_encoding: None, recency: false, keyed: true, topology: false, include_origins: true, include_positions: false, redacted_leg: true };
         let mut spill = spill(directory.path().join("merge.arrow"), schema, &config, &memory);
-        spill.write(&normalized[..1], vec![], &config, &memory).unwrap();
-        spill.write(&normalized[1..], vec![], &config, &memory).unwrap();
-        spill.finish(&config, &memory).unwrap();
+        spill.write(&normalized[..1], vec![], &config, &memory, &cancellation).unwrap();
+        spill.write(&normalized[1..], vec![], &config, &memory, &cancellation).unwrap();
+        spill.finish(&config, &memory, &cancellation).unwrap();
         let (mut reader, _reservation) = open_input(File::open(spill.path).unwrap(), &memory).unwrap();
         for (index, expected) in [redacted, earlier].into_iter().enumerate() {
             let batch = read_page(&mut reader, index, &memory).unwrap();

@@ -4,7 +4,7 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::{data::{EventBatch, PageEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
 use rtdb_types::{Iid, Result, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -62,7 +62,7 @@ impl FinalWriter<'_> {
         Ok(leaf)
     }
 
-    fn spill_ranges(&mut self, sources: &[(&EventBatch, Range<usize>)]) -> Result<usize> {
+    fn write_ranges(&mut self, sources: &[(&EventBatch, Range<usize>)]) -> Result<usize> {
         if sources.iter().all(|(page, _)| page.arrow().schema_ref() == &self.arrow_schema) {
             match rtdb_format::data::copy_spill_event_ranges(sources, self.memory) {
                 Ok(Some(batch)) => return self.page(batch.batch()),
@@ -76,10 +76,10 @@ impl FinalWriter<'_> {
         self.leaf(&events)
     }
 
-    fn split_spill(&mut self, page: &EventBatch, rows: Range<usize>, depth: usize, page_size: usize) -> Result<usize> {
+    fn split_page(&mut self, page: &EventBatch, rows: Range<usize>, depth: usize, page_size: usize) -> Result<usize> {
         if rows.is_empty() { return self.metadata.write_nil(); }
         if rows.len() <= page_size || depth == 64 || page.iid(rows.start)? == page.iid(rows.end - 1)? {
-            return self.spill_ranges(&[(page, rows)]);
+            return self.write_ranges(&[(page, rows)]);
         }
         let mut children = [None; 4];
         let mut start = rows.start;
@@ -89,18 +89,19 @@ impl FinalWriter<'_> {
                 let middle = end + (hi - end) / 2;
                 if usize::from(bucket(page.iid(middle)?, depth)) <= part { end = middle + 1; } else { hi = middle; }
             }
-            if start < end { *child = Some(self.split_spill(page, start..end, depth + 1, page_size)?); }
+            if start < end { *child = Some(self.split_page(page, start..end, depth + 1, page_size)?); }
             start = end;
         }
         self.metadata.write_iid_branch(children)
     }
 
-    fn tree(&mut self, reader: &mut ArrowFile, leaves: &[Leaf], depth: usize, page_size: usize) -> Result<usize> {
+    fn tree(&mut self, read: &mut impl FnMut(usize) -> Result<OwnedBatch>, leaves: &[Leaf], depth: usize, page_size: usize) -> Result<usize> {
+        if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         if leaves.is_empty() { return self.metadata.write_nil(); }
         let total = leaves.iter().try_fold(0usize, |total, leaf| total.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Page tree row count overflow")))?;
         if let [leaf] = leaves && leaf.rows > 0 && leaf.rows <= page_size {
-            let page = read_page(reader, leaf.page, self.memory)?;
-            if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
+            let page = read(leaf.page)?;
+            if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Merge page row count differs from its page tree")); }
             if page.batch().schema() == self.arrow_schema { return self.page(page.batch()); }
             let _descriptors = self.memory.reserve(rtdb_format::ipc::schema_translation_bound(&self.arrow_schema)?)?;
             if let Some(restored) = rtdb_format::ipc::restore_spill_page_schema(page.batch(), &self.arrow_schema)? {
@@ -109,30 +110,30 @@ impl FinalWriter<'_> {
             drop(_descriptors);
             let _charge = self.memory.reserve(super::decoded_bound(page.batch())?)?;
             let page = EventBatch::new(page.batch().clone())?;
-            return self.spill_ranges(&[(&page, 0..leaf.rows)]);
+            return self.write_ranges(&[(&page, 0..leaf.rows)]);
         }
         if (leaves.len() == 1 && leaves[0].path.len() == depth) || total <= page_size {
             let mut pages = Vec::with_capacity(leaves.len());
             let mut charges = Vec::with_capacity(leaves.len());
             for leaf in leaves {
-                let page = read_page(reader, leaf.page, self.memory)?;
-                if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Spill page row count differs from its page tree")); }
+                let page = read(leaf.page)?;
+                if page.batch().num_rows() != leaf.rows { return Err(crate::invalid("Merge page row count differs from its page tree")); }
                 charges.push(self.memory.reserve(super::decoded_bound(page.batch())?)?);
                 let restored = rtdb_format::ipc::restore_spill_page_schema(page.batch(), &self.arrow_schema)?;
                 pages.push(EventBatch::new(restored.unwrap_or_else(|| page.batch().clone()))?);
             }
             if total == 0 { return self.metadata.write_nil(); }
             if let [page] = pages.as_slice() {
-                return self.split_spill(page, 0..total, depth, page_size);
+                return self.split_page(page, 0..total, depth, page_size);
             }
             let sources = pages.iter().map(|page| (page, 0..page.len())).collect::<Vec<_>>();
-            return self.spill_ranges(&sources);
+            return self.write_ranges(&sources);
         }
         if depth >= 64 { return Err(crate::invalid("Page tree exceeds IID width")); }
         let mut children = [None; 4];
         for (part, child) in children.iter_mut().enumerate() {
             let matching: Vec<_> = leaves.iter().filter(|leaf| leaf.path.get(depth) == Some(&(part as u8))).cloned().collect();
-            if !matching.is_empty() { *child = Some(self.tree(reader, &matching, depth + 1, page_size)?); }
+            if !matching.is_empty() { *child = Some(self.tree(read, &matching, depth + 1, page_size)?); }
         }
         self.metadata.write_iid_branch(children)
     }
@@ -264,9 +265,11 @@ impl StreamingTrie {
 
 pub(super) fn normalize(input: &MergeOutput, config: &MergeConfig, memory: &Arc<MemoryBudget>,
     data_path: &Path, meta_path: &Path, cancellation: &CancellationToken) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
     match &input.pages {
-        MergePages::Retained(batch) => normalize_to_files(&input.schema, config, memory, data_path, meta_path, cancellation, |output| {
-            output.page(batch.batch())?;
+        MergePages::Retained(retained) => normalize_to_files(&input.schema, config, memory, data_path, meta_path, cancellation, |output| {
+            let mut read = |page: usize| retained.batches.get(page).cloned().ok_or_else(|| crate::invalid("Retained merge page is missing"));
+            output.tree(&mut read, &input.leaves, 0, config.page_size)?;
             Ok(())
         }),
         MergePages::Spilled => {
@@ -299,7 +302,9 @@ fn normalize_to_files(schema: &OutputSchema, config: &MergeConfig, memory: &Arc<
 
 fn normalize_spill(output: &mut FinalWriter<'_>, reader: &mut ArrowFile, input: &MergeOutput, page_size: usize) -> Result<()> {
     if !input.schema.recency {
-        output.tree(reader, &input.leaves, 0, page_size)?;
+        let memory = output.memory;
+        let mut read = |page| read_page(reader, page, memory);
+        output.tree(&mut read, &input.leaves, 0, page_size)?;
     } else if input.leaves.is_empty() { output.metadata.write_nil()?; }
     else {
         let minimum = input.leaves.iter().filter_map(|leaf| leaf.min_recency).min().ok_or_else(|| crate::invalid("Historical spill has no recency range"))?;

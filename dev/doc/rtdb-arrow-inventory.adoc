@@ -17,6 +17,10 @@ ADBC can combine bound pages in input order.
 The uploader aligns physical layouts for source encoding and preserves empty upload operations.
 |Arrow C Data import copies foreign buffers into native allocations.
 Arrow file and stream imports open IPC buffers and validate document fields before submission.
+Pgwire can retain up to 256 KiB of an autocommit Arrow stream under the shared memory budget and decode compatible buffers from those bytes after `CopyDone` and full framing and allocation preflight.
+Larger streams and streams that exceed the optional retention budget use the temporary spool.
+Arrow files use the spool for footer access, and explicit transactions spool streams above 8 KiB and own their decoded buffers independently of COPY input.
+Retained streams still use the IPC decoder's alignment and decompression fallbacks.
 See link:../../rust/crates/tx/src/values.rs[document admission].
 
 |PostgreSQL CDC and non-Arrow ingress

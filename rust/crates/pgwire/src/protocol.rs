@@ -614,7 +614,10 @@ impl ProtocolSession {
                     }
                     ControlResult::CopyIn { table, format, allocation: _allocation } => {
                         if self.config.read_only { return Err(Anomaly::incorrect("xtdb/dml-in-read-only-server", "COPY is not allowed on the READ ONLY server")); }
-                        let copy = crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?;
+                        let autocommit = self.session.state().status() == TransactionStatus::Idle;
+                        let copy = crate::copy::CopyInput::new(
+                            table, format, self.node.memory(), self.config.maximum_copy_bytes, autocommit,
+                        )?;
                         let format = copy.wire_format().code() as u8;
                         self.copy = Some(copy);
                         writer.send(b'G', &[format, 0, 1, 0, format]).await?;

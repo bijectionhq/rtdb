@@ -63,6 +63,10 @@ Trie GC deletes artefacts whatever the setting, so turning search off leaves not
 * *One analyzer feeds every format.*
   `rtdb-text` produces pre-tokenized text for Tantivy format 11 and Arrow formats 12 through 14.
   The residual predicate uses the same analyzer.
+* *Paged posting blocks keep scoring windows whole.*
+  The durable Arrow writer uses bounded slices of a long term's document and position buffers to write each block.
+  On-demand builds materialize page-sized buffers so their individual retained memory charges cover only the allocations they hold.
+  The format 11 reader retains converted Arrow batches when admitted and otherwise serves them from a temporary mapped Arrow file.
 * *The artefact record locates the Arrow root.*
   Format 14 puts paths to term, posting, document and IID visibility pages in that root.
   Format 15 can inline the authenticated root in the catalog, groups compatible primaries into packs and maps logical versions to primary Arrow rows.
