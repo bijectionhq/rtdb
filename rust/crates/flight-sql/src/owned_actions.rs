@@ -1103,7 +1103,7 @@ impl Service {
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
-        refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<rtdb_types::TransactionKey>,
+        refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
     ) -> Result<ActionResult, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
