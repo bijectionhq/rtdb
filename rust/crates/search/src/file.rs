@@ -50,7 +50,7 @@ pub(crate) fn term_stats(nodes: &StructArray, row: usize, doc_freq: u32) -> Resu
         unit_bound: node.unit_score, first_window: node.first, last_window: node.last })
 }
 pub(crate) use page_tree::PageCache;
-pub(crate) use tree_file::{MAX_ROOT_BYTES, TreeFile, TreeLocator};
+pub(crate) use tree_file::{EncodedTreeLocator, MAX_ROOT_BYTES, TreeFile, TreeLocator};
 pub(crate) use tree_file::LogicalDocument;
 pub(crate) use tree_rank::{TreeRankOrder, TreeRanked};
 pub(crate) use write::{BuildMode, write_group_as};
@@ -235,8 +235,8 @@ pub(crate) fn encode_catalog_stats(sections: &[Section], footer: Option<&FooterL
     encode_sections_with(sections, metadata)
 }
 
-pub(crate) fn encode_tree_stats(sections: &[Section], locator: &TreeLocator) -> Result<Vec<u8>> {
-    encode_sections_with(sections, [(ROOT_LOCATOR.to_owned(), locator.encode())].into_iter().collect())
+pub(crate) fn encode_tree_stats(sections: &[Section], locator: String) -> Result<Vec<u8>> {
+    encode_sections_with(sections, [(ROOT_LOCATOR.to_owned(), locator)].into_iter().collect())
 }
 
 fn encode_sections_with(sections: &[Section], metadata: std::collections::HashMap<String, String>) -> Result<Vec<u8>> {
@@ -1567,7 +1567,8 @@ mod tests {
         rows.sort_unstable_by_key(|row| row.iid);
         let mut on_disk = tempfile::tempfile().unwrap();
         write_versioned_group(&columns, [[Ok(rows.clone())]], "remote-v14", 42, None, &mut on_disk, None, TREE_FORMAT_VERSION).unwrap();
-        let locator = TreeLocator::read(&mut on_disk, TREE_FORMAT_VERSION).unwrap();
+        let encoded = EncodedTreeLocator::read(&mut on_disk, TREE_FORMAT_VERSION, false).unwrap();
+        let locator = TreeLocator::decode(&encoded.text).unwrap();
         use std::io::{Read, Seek};
         on_disk.rewind().unwrap();
         let mut bytes = Vec::new();

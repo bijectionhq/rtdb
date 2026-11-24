@@ -263,8 +263,13 @@ pub(crate) struct TreeLocator {
     inline_root: Option<Bytes>,
 }
 
-impl TreeLocator {
-    pub fn read(input: &mut File, format: i32) -> Result<Self> {
+pub(crate) struct EncodedTreeLocator {
+    pub length: u64,
+    pub text: String,
+}
+
+impl EncodedTreeLocator {
+    pub fn read(input: &mut File, format: i32, canonical_uuid_iids: bool) -> Result<Self> {
         let locator = FooterLocator::read(input)?;
         let footer_len = locator.length - locator.start - 10;
         input.seek(SeekFrom::Start(locator.start as u64)).map_err(fault)?;
@@ -286,26 +291,34 @@ impl TreeLocator {
         page.digest = Sha256::digest(&bytes).into();
         let decoder = arrow_ipc::reader::FileDecoder::new(Arc::clone(super::layout::schema(format)), arrow_ipc::MetadataVersion::V5);
         let bytes = Bytes::from(bytes);
-        let inline_root = (format >= PACKED_FORMAT_VERSION && lz4_flex::block::compress(&bytes).len() <= INLINE_ROOT_BYTES)
-            .then(|| bytes.clone());
+        let inline_root = (format >= PACKED_FORMAT_VERSION).then(|| lz4_flex::block::compress(&bytes))
+            .filter(|root| root.len() <= INLINE_ROOT_BYTES);
         let root = page.decode(Buffer::from(bytes), &decoder)?;
         let synopsis = table(&root, Table::Synopsis);
         let bits = synopsis.column(0).as_any().downcast_ref::<arrow_array::FixedSizeBinaryArray>().expect("search synopsis layout");
         if bits.len() != 1 || bits.is_null(0) { return Err(corrupt("Search root has no complete term synopsis")); }
         let synopsis = Arc::new(bits.value(0).try_into().map_err(fault)?);
-        Ok(Self { length: locator.length as u64, page, synopsis: Some(synopsis), format, inline_root, canonical_uuid_iids: false })
+        let length = locator.length as u64;
+        let locator = TreeLocator { length, page, synopsis: Some(synopsis), format, inline_root: None, canonical_uuid_iids };
+        Ok(Self { length, text: locator.encode_with_inline_root(|| inline_root) })
+    }
+}
+
+impl TreeLocator {
+    pub fn encode(&self) -> String {
+        self.encode_with_inline_root(|| self.inline_root.as_ref().map(|root| lz4_flex::block::compress(root)))
     }
 
-    pub fn encode(&self) -> String {
+    fn encode_with_inline_root(&self, compressed_root: impl FnOnce() -> Option<Vec<u8>>) -> String {
         let digest = encode_hex(&self.page.digest);
         let prefix = match self.format { LOGICAL_FORMAT_VERSION => "v16:", PACKED_FORMAT_VERSION => "v15:", _ => "" };
         let header = format!("{prefix}{}:{}:{}:{}:{digest}", self.length, self.page.offset, self.page.metadata, self.page.body);
         let Some(bits) = self.synopsis.as_deref() else { return header; };
         let check = synopsis_digest(&self.page.digest, bits);
         let mut encoded = format!("{header}:{}:{}", encode_hex(bits), encode_hex(&check));
-        if let Some(root) = &self.inline_root {
+        if let Some(root) = compressed_root() {
             encoded.push(':');
-            encoded.push_str(&encode_hex(&lz4_flex::block::compress(root)));
+            encoded.push_str(&encode_hex(&root));
         } else if self.format >= PACKED_FORMAT_VERSION && self.canonical_uuid_iids {
             encoded.push(':');
         }
@@ -348,10 +361,6 @@ impl TreeLocator {
         let canonical_uuid_iids = synopsis.is_some() && fields.next().and_then(decode_hex::<32>)
             .is_some_and(|check| check == uuid_evidence_digest(&digest));
         Some(Self { length, page, synopsis, format, inline_root, canonical_uuid_iids })
-    }
-
-    pub fn with_uuid_iid_evidence(self, canonical_uuid_iids: bool) -> Self {
-        Self { canonical_uuid_iids, ..self }
     }
 
     pub fn has_canonical_uuid_iids(&self) -> bool { self.canonical_uuid_iids }
@@ -814,11 +823,13 @@ mod tests {
         rows.sort_unstable_by_key(|row| row.iid);
         let mut file = tempfile::tempfile().unwrap();
         super::super::write_versioned_group(&columns, [[Ok(rows.clone())]], "tree", 42, None, &mut file, None, TREE_FORMAT_VERSION).unwrap();
-        let locator = TreeLocator::read(&mut file, TREE_FORMAT_VERSION).unwrap();
-        assert_eq!(TreeLocator::decode(&locator.encode()), Some(locator.clone()));
+        let encoded = EncodedTreeLocator::read(&mut file, TREE_FORMAT_VERSION, false).unwrap();
+        let locator = TreeLocator::decode(&encoded.text).unwrap();
+        assert_eq!(locator.encode(), encoded.text);
         assert!(!locator.has_canonical_uuid_iids());
-        let certified = locator.clone().with_uuid_iid_evidence(true);
-        assert_eq!(TreeLocator::decode(&certified.encode()), Some(certified.clone()));
+        let certified = EncodedTreeLocator::read(&mut file, TREE_FORMAT_VERSION, true).unwrap();
+        let certified = TreeLocator::decode(&certified.text).unwrap();
+        assert_eq!(certified, TreeLocator { canonical_uuid_iids: true, ..locator.clone() });
         let wrong_proof = format!("{}:{}", locator.encode(), encode_hex(&uuid_evidence_digest(&[0; 32])));
         assert_eq!(TreeLocator::decode(&wrong_proof), Some(locator.clone()));
         assert!(locator.might_contain(0, "report"));
@@ -873,7 +884,8 @@ mod tests {
         }).collect::<Vec<_>>();
         let mut file = tempfile::tempfile().unwrap();
         super::super::write_versioned_group(&columns, [[Ok(rows)]], "sparse", 1, None, &mut file, None, PACKED_FORMAT_VERSION)?;
-        let locator = TreeLocator::read(&mut file, PACKED_FORMAT_VERSION)?;
+        let encoded = EncodedTreeLocator::read(&mut file, PACKED_FORMAT_VERSION, false)?;
+        let locator = TreeLocator::decode(&encoded.text).unwrap();
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
@@ -922,20 +934,28 @@ mod tests {
             vec![Ok(vec![row(9, 2, EventOp::Put, Some("separate report"))])],
         ];
         super::super::write_versioned_group(&columns, members, "pack", 1, None, &mut file, None, PACKED_FORMAT_VERSION).unwrap();
-        let locator = TreeLocator::read(&mut file, PACKED_FORMAT_VERSION).unwrap();
-        assert!(locator.inline_root.is_some());
-        let encoded = locator.encode();
-        assert_eq!(TreeLocator::decode(&encoded), Some(locator.clone()));
-        let (prefix, bytes) = encoded.rsplit_once(':').unwrap();
-        let byte = if bytes.ends_with('0') { '1' } else { '0' };
-        let corrupted = format!("{prefix}:{}{byte}", &bytes[..bytes.len() - 1]);
-        assert_eq!(TreeLocator::decode(&corrupted), Some(locator.without_inline_root()));
+        let encoded = EncodedTreeLocator::read(&mut file, PACKED_FORMAT_VERSION, true).unwrap();
+        let locator = TreeLocator::decode(&encoded.text).unwrap();
+        assert!(locator.has_canonical_uuid_iids());
+        assert_eq!(locator.encode(), encoded.text);
+        assert_eq!(TreeLocator::decode_route(&encoded.text), Some(locator.without_inline_root()));
+
+        let mut corrupt_root = locator.inline_root.as_ref().unwrap().to_vec();
+        assert_eq!(locator.inline_root_bytes() as u64, locator.page.metadata as u64 + locator.page.body);
+        corrupt_root[0] ^= 1;
+        let (prefix, proof) = encoded.text.rsplit_once(':').unwrap();
+        let (prefix, _) = prefix.rsplit_once(':').unwrap();
+        let corrupted = format!("{prefix}:{}:{proof}", encode_hex(&lz4_flex::block::compress(&corrupt_root)));
+        let fallback = TreeLocator::decode(&corrupted).unwrap();
+        assert_eq!(fallback, locator.without_inline_root());
 
         file.rewind().unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
-        let tree = TreeFile::local(Buffer::from_vec(bytes), None, &locator, &columns, "pack", 1).await.unwrap();
+        let bytes = Buffer::from_vec(bytes);
+        let tree = TreeFile::local(bytes.clone(), None, &locator, &columns, "pack", 1).await.unwrap();
         tree.verify().await.unwrap();
+        TreeFile::local(bytes, None, &fallback, &columns, "pack", 1).await.unwrap().verify().await.unwrap();
         let first = Iid([1; 16]);
         let second = Iid([9; 16]);
         let queried = BTreeSet::from([first, second, Iid([5; 16])]);
@@ -993,7 +1013,8 @@ mod tests {
             let mut file = tempfile::tempfile().map_err(fault)?;
             let members = [[Ok(HistoryRows(0..before)), Ok(HistoryRows(before..after + 2))]];
             write_group_as(columns, members, "history", Some(1), None, &mut file, None, LOGICAL_FORMAT_VERSION, BuildMode::History)?;
-            let locator = TreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION)?;
+            let encoded = EncodedTreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION, false)?;
+            let locator = TreeLocator::decode(&encoded.text).unwrap();
             file.rewind().map_err(fault)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(fault)?;

@@ -12,7 +12,7 @@ use rtdb_types::{AnomalyCategory, BlockIndex, EventHeader, EventOp, Iid, Interva
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SearchDefinition, file::{BuildMode, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, SearchPosition, search_position, TextRevision, TreeLocator, write_group_as}};
+use crate::{SearchDefinition, file::{BuildMode, EncodedTreeLocator, IndexedRow, LOGICAL_FORMAT_VERSION, LogicalDocument, SearchPage, SearchPosition, search_position, TextRevision, write_group_as}};
 use super::{ArrowSearchPage, PageRows, SearchBuilder, fault, indexing_allowance, open_search_input};
 use super::forward::{ForwardFile, ForwardOutput};
 use crate::term_directory::{TermEdits, TermSummaries};
@@ -422,11 +422,11 @@ impl SearchBuilder {
     }
 
     async fn publish_run(&self, index: &LogicalIndex, slug: &TableSlug, output: &Path, blocks: Vec<i64>, rebuild: i64, source_rows: i64,
-        has_erases: bool, locator: TreeLocator,
+        has_erases: bool, locator: EncodedTreeLocator,
         digest: [u8; 32], allocation: [u8; 16], source_receipt: Option<SourceReceipt>, cancellation: &CancellationToken) -> Result<SearchRun> {
         if cancellation.is_cancelled() { return Err(crate::accelerate::search_cancelled()); }
         let mut run = SearchRun { definition_id: Some(index.id.clone()), definition_version: Some(index.version), blocks,
-            digest: Some(digest.to_vec()), locator: Some(locator.encode().into_bytes()), file_size: Some(locator.length as i64),
+            digest: Some(digest.to_vec()), locator: Some(locator.text.into_bytes()), file_size: Some(locator.length as i64),
             publication: None, rebuild: (rebuild > 0).then_some(rebuild), source_rows: Some(source_rows),
             has_erases: has_erases.then_some(true), allocation: Some(allocation.to_vec()), source_receipt };
         let intent = ObjectKey::new(run.pending_key(slug)?)?;
@@ -928,7 +928,7 @@ impl SearchPage for MergedRows {
     }
 }
 
-fn read_locator(path: &Path) -> Result<(TreeLocator, [u8; 32])> {
+fn read_locator(path: &Path) -> Result<(EncodedTreeLocator, [u8; 32])> {
     let mut file = File::open(path).map_err(fault)?;
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -937,7 +937,7 @@ fn read_locator(path: &Path) -> Result<(TreeLocator, [u8; 32])> {
         if size == 0 { break; }
         digest.update(&buffer[..size]);
     }
-    Ok((TreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION)?, digest.finalize().into()))
+    Ok((EncodedTreeLocator::read(&mut file, LOGICAL_FORMAT_VERSION, false)?, digest.finalize().into()))
 }
 
 async fn publish_change(publisher: &dyn ArtefactPublisher, storage: (StorageVersion, StorageEpoch), index: &LogicalIndex,
