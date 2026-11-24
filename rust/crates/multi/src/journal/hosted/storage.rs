@@ -623,7 +623,7 @@ impl ObjectStore for ServingStore {
         files.sort_by_key(|file| file.release_order());
         for file in files {
             let key = ObjectKey::new(&file.key)?;
-            if rtdb_format::keys::is_receipt_trie_file(key.as_str()) {
+            if super::reclamation::can_fence_trie_file(key.as_str()) {
                 writer.reclamation.enqueue_receipt(
                     self.upper.as_ref(), self.lower.as_deref(), &key, receipt, installed.cut(), file,
                 ).await?;

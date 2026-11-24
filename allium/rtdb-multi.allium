@@ -709,7 +709,7 @@ contract LogService {
         -- A physical segment is reclaimed once every deployment's records in it are trimmed.
         -- A deployment whose tail pins a segment past log_max_retention is force-flushed (FlushOnRetention).
     -- The hosted directory path stores receipt L0 data and metadata as separate publications.
-    -- An exact retirement of a covered receipt L0 requires a certified recovery exclusion through its removal and an independent published recovery root.
+    -- Exact retirement of covered receipt tries and compacted primaries requires a certified recovery exclusion through the installed removal and an independent published recovery root.
 
     @invariant DroppedStreamsAreTerminal
         -- A drop at the deletion epoch durably removes the stream from the server's readable and writable state.

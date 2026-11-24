@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rtdb_format::{keys::is_receipt_trie_file, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES, RetirementFile}};
+use rtdb_format::{keys::{is_compacted_primary_file, is_receipt_trie_file}, trie_retirement::{InstalledRetirement, MAXIMUM_RECEIPT_BYTES, RetirementFile}};
 use rtdb_storage::{Error, IoRegion, ObjectKey, ObjectStore, Result};
 use rtdb_types::{CatalogCut, PhysicalObjectVersion};
 use std::sync::Arc;
@@ -26,6 +26,10 @@ struct Candidate {
 
 const RECEIPTS: &str = "receipts";
 const MAXIMUM_CANDIDATE_BYTES: u64 = 16 << 10;
+
+pub(super) fn can_fence_trie_file(key: &str) -> bool {
+    is_receipt_trie_file(key) || is_compacted_primary_file(key)
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -77,6 +81,9 @@ impl ReclamationQueue {
         &self, upper: &dyn ObjectStore, lower: Option<&dyn ObjectStore>,
         key: &ObjectKey, receipt: &ObjectKey, cut: CatalogCut, file: &RetirementFile,
     ) -> Result<()> {
+        if key.as_str() != file.key || !can_fence_trie_file(key.as_str()) {
+            return Err(Error::InvalidKey(key.to_string()));
+        }
         let Some(publication) = ReceiptCandidate::publication(file) else { return Ok(()); };
         if let Some(lower) = lower {
             match lower.head_fresh(key).await {
@@ -199,7 +206,7 @@ pub(super) async fn settle_receipts(
             || rtdb_format::keys::StorageRoot::new(candidate.cut.storage_version, candidate.cut.storage_epoch)?.key() != root.as_str()
             || u64::try_from(through).ok().is_none_or(|through| through >= route.floor.next_lsn)
             || route.floor.next_lsn > route.checkpoint.cut.next_lsn
-            || !is_receipt_trie_file(&candidate.key)
+            || !can_fence_trie_file(&candidate.key)
         {
             continue;
         }
@@ -299,6 +306,15 @@ mod tests {
             candidates.push(serde_json::from_slice(&bytes).unwrap());
         }
         candidates
+    }
+
+    #[test]
+    fn installed_trie_grants_cover_primary_versions_and_leave_other_files_with_their_owners() {
+        assert!(can_fence_trie_file("tables/public$orders/data/l01-rc-b00.arrow"));
+        assert!(can_fence_trie_file("tables/public$orders/meta/l01-rc-b00.arrow"));
+        assert!(!can_fence_trie_file("tables/public$orders/data/l00-rc-b00.arrow"));
+        assert!(!can_fence_trie_file("~packs/b00.pack"));
+        assert!(!can_fence_trie_file("blocks/b00.binpb"));
     }
 
     #[tokio::test]
