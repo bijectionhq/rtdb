@@ -277,6 +277,8 @@ The retirement owner fences that exact upload and settles the members together.
 Local serving attempts remain in Directory while the volume owner drains the writer's I/O region.
 The maintenance owner checks every loose and packed alias before withdrawing an unselected local slot.
 A hosted upload with an ambiguous outcome retains its slot until definitive provider evidence.
+Directory serving slots remain under the lineage retirement owner across loose, packed, and versioned publications.
+Provider qualification remains outside this increment's implementation work.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

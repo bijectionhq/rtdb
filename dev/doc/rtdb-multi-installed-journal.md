@@ -149,8 +149,14 @@ For an installed fork, run `custody-enroll-installed-fork` against a custody nod
 The custodian opens both selected provider checkpoints and authenticates every inherited origin in the child's first allocation against the parent checkpoint.
 Both enrolled evidence keys sign the exact placement cuts and the same event inventory digest.
 Enroll the edge while both original fork checkpoints are selected and the domain is open.
-Dependent staging opens its own ordered head and removes the event origins projected by the broker.
-Every enrolled installed root must report its sealed successor before any root requests rotation.
+After admission closes, every enrolled installed writer signs all local erase selectors at its certified head.
+The broker waits for every signed cut, including roots with an empty local selection.
+It projects the union of the other roots' selectors through authenticated fork maps.
+Staging checks the local selectors against the exact head being rewritten and removes the projected inherited origins.
+Every enrolled installed root must report a sealed successor bound to the same selection before any root requests rotation.
+A directory-only root needs an authenticated ordered handoff before it can participate.
+The handoff must fence the Directory writer and certify its exact recovery closure before selecting an installed route.
+Its original key inventories and admitted custody stay in the broker's domain until their original authorities confirm disposition.
 The installed custodian's erasure coordinator accepts an operation identity, custody domain and exact incumbent grant.
 Its custody adapter quiesces the incumbent writer, including unfinished appends and offloaded writes, and reconciles outstanding copy admissions.
 The adapter retains that fence through restart until the attempt has a durable resolution.
