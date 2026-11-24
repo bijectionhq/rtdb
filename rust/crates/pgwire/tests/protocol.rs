@@ -797,6 +797,47 @@ async fn arrow_copy_batches_autocommit_separately_and_share_an_explicit_transact
     drop(client); running.stop().await;
 }
 
+#[tokio::test]
+async fn arrow_stream_copy_preflights_the_tail_before_any_commit_and_keeps_decode_errors_in_batch_order() {
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id) VALUES (0)").await), b"CZ");
+
+    let batch = |id| RecordBatch::try_from_iter([("_id", Arc::new(Int64Array::from(vec![id])) as ArrayRef)]).unwrap();
+    let first = batch(1i64);
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), first.schema_ref()).unwrap();
+    writer.write(&first).unwrap();
+    let mut bytes = std::mem::take(writer.get_mut());
+    writer.write(&batch(2)).unwrap();
+    let mut last = writer.into_inner().unwrap();
+    let length = i32::from_le_bytes(last[4..8].try_into().unwrap()) as usize;
+    let message = arrow_ipc::root_as_message(&last[8..8 + length]).unwrap();
+    let node = message.header_as_record_batch().unwrap().nodes().unwrap().get(0);
+    let null_count = node.0.as_ptr() as usize - last.as_ptr() as usize + 8;
+    last[null_count..null_count + 8].copy_from_slice(&(-2i64).to_le_bytes());
+    assert_eq!(last[last.len() - 8..], [255, 255, 255, 255, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&last);
+
+    for (input, message, count) in [
+        (&bytes[..bytes.len() - 9], "IPC body exceeds file", 1),
+        (bytes.as_slice(), "Arrow null count is below the unknown-count sentinel", 2),
+    ] {
+        client.send(b'Q', &cstring("COPY docs FROM STDIN WITH (FORMAT 'arrow-stream')")).await;
+        assert_eq!(client.receive().await.0, b'G');
+        for chunk in input.chunks(11) { client.send(b'd', chunk).await; }
+        client.send(b'c', &[]).await;
+        let result = client.through(b'Z').await;
+        assert_eq!(tags(&result), b"EZ");
+        assert!(String::from_utf8_lossy(&result[0].1).contains(message));
+        assert_eq!(rows(&client.query("SELECT _id FROM docs ORDER BY _id").await),
+            (0..count).map(|id| vec![Some(id.to_string().into_bytes())]).collect::<Vec<_>>());
+    }
+    drop(client);
+    running.stop().await;
+}
+
 #[derive(Debug)]
 struct PinnedCertificate(tokio_rustls::rustls::pki_types::CertificateDer<'static>);
 impl tokio_rustls::rustls::client::danger::ServerCertVerifier for PinnedCertificate {

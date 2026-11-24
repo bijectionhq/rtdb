@@ -377,6 +377,7 @@
 --      The ordinary Utf8 projection remains valid when the owner ignores the offer.
 --      Dictionary frames and their rows share each batch's original delivery grant.
 --      COPY FROM STDIN with an Arrow format submits Arrow document batches.
+--      The connection completes Arrow framing and allocation preflight before submitting the first batch.
 --      Without an explicit transaction, each input batch commits separately.
 --      COPY FROM STDIN with a Transit format decodes consecutive values from the input file and submits the documents in one operation.
 --      Transit wire failures take precedence over document conversion failures.

@@ -13,9 +13,13 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{cancelled, protocol};
 
 mod history_labels;
+mod stream_headers;
 mod transit;
 
+use stream_headers::StreamHeaders;
+
 const COPY_CHUNK_BYTES: usize = 64 * 1024;
+const COPY_INPUT_SCRATCH_BYTES: usize = 8192;
 
 struct CopyChunks {
     chunks: Vec<Vec<u8>>,
@@ -145,7 +149,7 @@ impl CopyInput {
     pub fn new(table: Vec<Identifier>, format: Option<CopyFormat>, memory: &Arc<MemoryBudget>, limit: u64) -> Result<Self> {
         let format = format.ok_or_else(|| Anomaly::incorrect("xtdb.pgwire/invalid-copy-format", "COPY IN requires a valid format: 'arrow-file', 'arrow-stream', 'transit-json', 'transit-msgpack'").with_context("format", serde_json::Value::Null))?;
         let table = match table.as_slice() { [table] => TableRef::new("public", table.normalized()), [schema, table] => TableRef::new(schema.normalized(), table.normalized()), _ => return Err(protocol("COPY table requires a table or schema.table")) };
-        let reservation = memory.reserve(table.schema.len() + table.table.len() + 8192)?;
+        let reservation = memory.reserve(table.schema.len() + table.table.len() + COPY_INPUT_SCRATCH_BYTES)?;
         Ok(Self { file: NamedTempFile::new().map_err(io_error)?, format, table, length: 0, limit, _reservation: reservation })
     }
     pub fn wire_format(&self) -> Format { if self.format == CopyFormat::TransitJson { Format::Text } else { Format::Binary } }
@@ -168,12 +172,20 @@ impl CopyInput {
             }
             CopyFormat::ArrowFile | CopyFormat::ArrowStream => {
                 let mut file = self.file.reopen().map_err(io_error)?;
-                let bound = arrow_allocation(&mut file, self.format == CopyFormat::ArrowFile, node.memory())?;
+                let mut headers = StreamHeaders::default();
+                let is_file = self.format == CopyFormat::ArrowFile;
+                let bound = if is_file {
+                    arrow_file_allocation(&mut file, node.memory())?
+                } else {
+                    arrow_stream_allocation(&mut file, node.memory(), &mut headers)?
+                };
                 let _arrow = node.memory().reserve(bound)?;
                 file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-                let reader: Box<dyn Iterator<Item = Result<RecordBatch>> + Send> = if self.format == CopyFormat::ArrowFile {
+                let reader: Box<dyn Iterator<Item = Result<RecordBatch>> + Send> = if is_file {
                     Box::new(rtdb_format::ipc::ArrowFile::from_reader(file, None)?)
-                } else { Box::new(rtdb_format::ipc::ArrowStream::from_reader(file, None)?) };
+                } else {
+                    Box::new(rtdb_format::ipc::ArrowStream::from_reader(headers.replay(file), None)?)
+                };
                 let mut count = 0u64;
                 for batch in reader {
                     if cancellation.is_cancelled() { return Err(cancelled()); }
@@ -204,33 +216,60 @@ impl CopyInput {
     }
 }
 
-fn arrow_allocation(file: &mut File, is_file: bool, memory: &Arc<MemoryBudget>) -> Result<usize> {
+fn arrow_file_allocation(file: &mut File, memory: &Arc<MemoryBudget>) -> Result<usize> {
     let length = file.metadata().map_err(io_error)?.len();
     let mut permanent = 65_536usize; let mut record = 0usize;
-    if is_file {
-        if length < 10 { return Err(protocol("Arrow file has no footer")); }
-        file.seek(SeekFrom::End(-10)).map_err(io_error)?; let mut tail = [0; 10]; file.read_exact(&mut tail).map_err(io_error)?;
-        let size = arrow_ipc::reader::read_footer_length(tail).map_err(io_error)?;
-        let start = length.checked_sub(size as u64 + 10).ok_or_else(|| protocol("Arrow footer exceeds file"))?;
-        let _footer = memory.reserve(size.checked_mul(64).and_then(|n| n.checked_add(65_536)).ok_or_else(|| protocol("Arrow footer allocation overflow"))?)?;
-        let mut bytes = vec![0; size]; file.seek(SeekFrom::Start(start)).map_err(io_error)?; file.read_exact(&mut bytes).map_err(io_error)?;
-        let footer = arrow_ipc::root_as_footer(&bytes).map_err(io_error)?; permanent = add(permanent, size.checked_mul(64).ok_or_else(|| protocol("Arrow footer overflow"))?)?;
-        rtdb_format::ipc::validate_decimal_metadata(footer.schema().ok_or_else(|| protocol("Arrow footer has no schema"))?)?;
-        for (dictionary, blocks) in [(true, footer.dictionaries()), (false, footer.recordBatches())] {
-            if let Some(blocks) = blocks { for block in blocks { let offset = u64::try_from(block.offset()).map_err(io_error)?; file.seek(SeekFrom::Start(offset)).map_err(io_error)?; let (bound, end, _) = message_allocation(file, start, memory)?.ok_or_else(|| protocol("Missing Arrow file message"))?; if end > start { return Err(protocol("Arrow block exceeds footer")); } if dictionary { permanent = add(permanent, bound)?; } else { record = record.max(bound); } } }
+    if length < 10 { return Err(protocol("Arrow file has no footer")); }
+    file.seek(SeekFrom::End(-10)).map_err(io_error)?; let mut tail = [0; 10]; file.read_exact(&mut tail).map_err(io_error)?;
+    let size = arrow_ipc::reader::read_footer_length(tail).map_err(io_error)?;
+    let start = length.checked_sub(size as u64 + 10).ok_or_else(|| protocol("Arrow footer exceeds file"))?;
+    let _footer = memory.reserve(size.checked_mul(64).and_then(|n| n.checked_add(65_536)).ok_or_else(|| protocol("Arrow footer allocation overflow"))?)?;
+    let mut bytes = vec![0; size]; file.seek(SeekFrom::Start(start)).map_err(io_error)?; file.read_exact(&mut bytes).map_err(io_error)?;
+    let footer = arrow_ipc::root_as_footer(&bytes).map_err(io_error)?; permanent = add(permanent, size.checked_mul(64).ok_or_else(|| protocol("Arrow footer overflow"))?)?;
+    rtdb_format::ipc::validate_decimal_metadata(footer.schema().ok_or_else(|| protocol("Arrow footer has no schema"))?)?;
+    for (dictionary, blocks) in [(true, footer.dictionaries()), (false, footer.recordBatches())] {
+        if let Some(blocks) = blocks {
+            for block in blocks {
+                let offset = u64::try_from(block.offset()).map_err(io_error)?;
+                file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+                let (bound, end, _) = message_allocation(file, start, memory, None)?
+                    .ok_or_else(|| protocol("Missing Arrow file message"))?;
+                if end > start { return Err(protocol("Arrow block exceeds footer")); }
+                if dictionary { permanent = add(permanent, bound)?; } else { record = record.max(bound); }
+            }
         }
-    } else {
-        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        loop { match message_allocation(file, length, memory)? { None => break, Some((bound, _, dictionary)) => { if dictionary { permanent = add(permanent, bound)?; } else { record = record.max(bound); } } } }
     }
     add(permanent, record)
 }
 
-fn message_allocation(file: &mut File, end: u64, memory: &Arc<MemoryBudget>) -> Result<Option<(usize, u64, bool)>> {
-    if file.stream_position().map_err(io_error)? == end { return Ok(None); }
-    let mut prefix = [0; 4]; file.read_exact(&mut prefix).map_err(io_error)?; let mut length = i32::from_le_bytes(prefix);
-    if length == -1 { file.read_exact(&mut prefix).map_err(io_error)?; length = i32::from_le_bytes(prefix); }
-    if length == 0 { return Ok(None); }
+fn arrow_stream_allocation(file: &mut File, memory: &Arc<MemoryBudget>, headers: &mut StreamHeaders) -> Result<usize> {
+    let length = file.metadata().map_err(io_error)?.len();
+    let mut permanent = 65_536usize;
+    let mut record = 0usize;
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    while let Some((bound, _, dictionary)) = message_allocation(file, length, memory, Some(&mut *headers))? {
+        if dictionary { permanent = add(permanent, bound)?; } else { record = record.max(bound); }
+    }
+    add(permanent, record)
+}
+
+fn message_allocation(file: &mut File, end: u64, memory: &Arc<MemoryBudget>, headers: Option<&mut StreamHeaders>) -> Result<Option<(usize, u64, bool)>> {
+    let offset = file.stream_position().map_err(io_error)?;
+    if offset == end { return Ok(None); }
+    let mut prefix = [0; 8];
+    file.read_exact(&mut prefix[..4]).map_err(io_error)?;
+    let mut length = i32::from_le_bytes(prefix[..4].try_into().unwrap());
+    let prefix = if length == -1 {
+        file.read_exact(&mut prefix[4..]).map_err(io_error)?;
+        length = i32::from_le_bytes(prefix[4..].try_into().unwrap());
+        &prefix[..]
+    } else {
+        &prefix[..4]
+    };
+    if length == 0 {
+        if let Some(headers) = headers { headers.retain(offset, prefix, &[]); }
+        return Ok(None);
+    }
     let length = usize::try_from(length).map_err(io_error)?;
     let _metadata = memory.reserve(length.checked_mul(64).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("IPC metadata allocation overflow"))?)?;
     let mut metadata = vec![0; length]; file.read_exact(&mut metadata).map_err(io_error)?;
@@ -250,6 +289,7 @@ fn message_allocation(file: &mut File, end: u64, memory: &Arc<MemoryBudget>) -> 
         } }
     }
     file.seek(SeekFrom::Start(next)).map_err(io_error)?;
+    if let Some(headers) = headers { headers.retain(offset, prefix, &metadata); }
     Ok(Some((bound, next, dictionary)))
 }
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(|| protocol("COPY allocation overflow")) }
@@ -259,7 +299,8 @@ fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb
 mod tests {
     use super::{
         COPY_CHUNK_BYTES, CopyChunks, CopyFormat, CopyInput, Identifier, MemoryBudget,
-        NamedTempFile, RecordBatch, Seek, SeekFrom, Write, arrow_allocation,
+        NamedTempFile, RecordBatch, Seek, SeekFrom, StreamHeaders, Write, arrow_file_allocation,
+        arrow_stream_allocation,
     };
     use rtdb_types::Value;
     use std::sync::Arc;
@@ -281,18 +322,23 @@ mod tests {
 
     #[tokio::test]
     async fn copy_disk_limit_and_drop_release_temp_file_and_memory() {
-        let memory = MemoryBudget::new(1 << 20);
-        let mut copy = CopyInput::new(vec![Identifier { text: "docs".into(), quoted: false }], Some(CopyFormat::TransitJson), &memory, 3).unwrap();
-        let path = copy.file.path().to_owned(); assert!(path.exists());
-        copy.append(b"abc").await.unwrap(); assert!(copy.append(b"d").await.is_err());
-        assert_eq!(copy.length, 3); drop(copy); assert!(!path.exists()); assert_eq!(memory.used_bytes(), 0);
+        for format in [CopyFormat::TransitJson, CopyFormat::ArrowStream] {
+            let memory = MemoryBudget::new(1 << 20);
+            let mut copy = CopyInput::new(vec![Identifier { text: "docs".into(), quoted: false }], Some(format), &memory, 3).unwrap();
+            let path = copy.file.path().to_owned(); assert!(path.exists());
+            copy.append(b"abc").await.unwrap();
+            assert_eq!(copy.append(b"d").await.unwrap_err().code, "xtdb.pgwire/copy-limit");
+            assert_eq!(copy.length, 3); drop(copy); assert!(!path.exists()); assert_eq!(memory.used_bytes(), 0);
+        }
     }
 
     #[test]
     fn malformed_arrow_lengths_are_rejected_before_large_allocation() {
         let memory = MemoryBudget::new(1 << 20); let mut file = NamedTempFile::new().unwrap();
         file.write_all(&(-1i32).to_le_bytes()).unwrap(); file.write_all(&i32::MAX.to_le_bytes()).unwrap();
-        let mut input = file.reopen().unwrap(); assert!(arrow_allocation(&mut input, false, &memory).is_err()); assert_eq!(memory.used_bytes(), 0);
+        let mut input = file.reopen().unwrap();
+        assert!(arrow_stream_allocation(&mut input, &memory, &mut StreamHeaders::default()).is_err());
+        assert_eq!(memory.used_bytes(), 0);
     }
     #[test]
     fn copy_arrow_inspection_and_readers_preserve_signed_decimal_parameters() {
@@ -305,13 +351,44 @@ mod tests {
             for is_file in [false, true] {
                 let bytes = if is_file { rtdb_format::ipc::write_file(&schema, std::slice::from_ref(&page)).unwrap() } else { rtdb_format::ipc::write_stream(&schema, std::slice::from_ref(&page)).unwrap() };
                 let mut file = NamedTempFile::new().unwrap(); file.write_all(&bytes).unwrap();
-                let mut input = file.reopen().unwrap(); let bound = arrow_allocation(&mut input, is_file, &memory).unwrap();
+                let mut input = file.reopen().unwrap();
+                let mut headers = StreamHeaders::default();
+                let bound = if is_file { arrow_file_allocation(&mut input, &memory) }
+                    else { arrow_stream_allocation(&mut input, &memory, &mut headers) }.unwrap();
                 let reservation = memory.reserve(bound).unwrap(); input.seek(SeekFrom::Start(0)).unwrap();
                 let page = if is_file { rtdb_format::ipc::ArrowFile::from_reader(input, None).unwrap().next().unwrap().unwrap() }
-                    else { rtdb_format::ipc::ArrowStream::from_reader(input, None).unwrap().next().unwrap().unwrap() };
+                    else { rtdb_format::ipc::ArrowStream::from_reader(headers.replay(input), None).unwrap().next().unwrap().unwrap() };
                 assert_eq!(rtdb_columnar::read_value(page.schema().field(0), page.column(0).as_ref(), 0).unwrap(), value);
                 drop(page); drop(reservation); assert_eq!(memory.used_bytes(), 0);
             }
+        }
+    }
+
+    #[test]
+    fn stream_preflight_replays_compressed_dictionaries_through_the_original_end_boundary() {
+        use arrow_array::{ArrayRef, builder::StringDictionaryBuilder, types::Int8Type};
+        use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
+
+        let memory = MemoryBudget::new(1 << 24);
+        let mut values = StringDictionaryBuilder::<Int8Type>::new();
+        for value in ["first", "second", "first"] { values.append(value).unwrap(); }
+        let batch = RecordBatch::try_from_iter([("value", Arc::new(values.finish()) as ArrayRef)]).unwrap();
+        let options = IpcWriteOptions::default().try_with_compression(Some(CompressionType::ZSTD)).unwrap();
+        let stream = rtdb_format::ipc::write_arrow_stream(batch.schema_ref(), &[batch.clone(), batch.clone()], options).unwrap();
+        let end = stream.len() - 8;
+        assert_eq!(stream[end..], [255, 255, 255, 255, 0, 0, 0, 0]);
+        for terminator in [stream[end..].to_vec(), vec![0; 4], Vec::new()] {
+            let mut file = NamedTempFile::new().unwrap();
+            file.write_all(&stream[..end]).unwrap();
+            file.write_all(&terminator).unwrap();
+            if !terminator.is_empty() { file.write_all(&[255]).unwrap(); }
+            let mut input = file.reopen().unwrap();
+            let mut headers = StreamHeaders::default();
+            let bound = arrow_stream_allocation(&mut input, &memory, &mut headers).unwrap();
+            let _reservation = memory.reserve(bound).unwrap();
+            input.seek(SeekFrom::Start(0)).unwrap();
+            let reader = rtdb_format::ipc::ArrowStream::from_reader(headers.replay(input), None).unwrap();
+            assert_eq!(reader.collect::<rtdb_types::Result<Vec<_>>>().unwrap(), [batch.clone(), batch.clone()]);
         }
     }
 
