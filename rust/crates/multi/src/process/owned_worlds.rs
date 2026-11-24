@@ -450,7 +450,10 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid: Timestamp,
         system: Timestamp, original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
-        Box::pin(async move { HeldCheckpointWorld::accepted_point(self, relation, id, valid, system, original_scope).await.map(|image| path_touch_result(system, image)) })
+        Box::pin(async move {
+            let (fact, shadowed, frozen_winner) = HeldCheckpointWorld::accepted_point(self, relation, id, valid, system, original_scope).await?;
+            Ok(WorldPointResult { frozen_winner, ..path_touch_result(system, (fact, shadowed)) })
+        })
     }
 
     fn read_point<'a>(
@@ -474,10 +477,10 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
 fn path_touch_result(present: Timestamp, (fact, shadowed): (Option<crate::archive::WorldFact>, bool)) -> WorldPointResult {
     let row = fact.map(crate::archive::WorldFact::into_point_row);
-    WorldPointResult { present, row, until: None, shadowed, witness: None }
+    WorldPointResult { present, row, until: None, shadowed, witness: None, frozen_winner: None }
 }
 
 fn point_result(read: crate::archive::WorldPoint) -> WorldPointResult {
     let row = read.fact.map(crate::archive::WorldFact::into_point_row);
-    WorldPointResult { present: read.present.system_time, row, until: read.until, shadowed: read.shadowed, witness: read.witness }
+    WorldPointResult { present: read.present.system_time, row, until: read.until, shadowed: read.shadowed, witness: read.witness, frozen_winner: None }
 }

@@ -46,6 +46,25 @@ pub(super) struct StreamReplay<R> {
     file_position: u64,
 }
 
+impl<R: Seek> Seek for StreamReplay<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        if matches!(position, SeekFrom::Current(0)) { return Ok(self.position); }
+        self.position = match position {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(offset) => self.position.checked_add_signed(offset)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid COPY spool offset"))?,
+            SeekFrom::End(offset) => {
+                self.file_position = self.file.seek(SeekFrom::End(offset))?;
+                self.file_position
+            }
+        };
+        self.next = self.headers.spans.partition_point(|span| {
+            span.file_offset + span.bytes.len() as u64 <= self.position
+        });
+        Ok(self.position)
+    }
+}
+
 impl<R: Read + Seek> Read for StreamReplay<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() { return Ok(0); }

@@ -5,18 +5,19 @@ mod row_heap;
 use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
+use bytes::Bytes;
 use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EncodedEvent, EventBatch, PageEvent, compacted_event_schema, copy_compaction_batch}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails, TrieFileVersions}, metadata::MetadataFile};
 use rtdb_index::{PartitionValue, TrieState};
-use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation};
+use rtdb_storage::{HeldView, IoRegion, ObjectKey, ObjectStore, ReadReservation, RetainedBytes};
 use rtdb_temporal::AdmittedPolygonCalculator;
 use rtdb_types::{EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, ScalarType, StorageEpoch, StorageVersion, TableRef, Timestamp};
 use tokio_util::sync::CancellationToken;
@@ -90,7 +91,20 @@ impl SegmentCompactor {
     }
 }
 
-struct InputSegment { key: TrieKey, metadata: MetadataFile, reader: ArrowFile, _reservations: Vec<Arc<MemoryReservation>> }
+struct InputSegment { key: TrieKey, data: PrimaryReader }
+
+struct InputMetadata {
+    file: MetadataFile,
+    _reservation: Arc<MemoryReservation>,
+}
+
+struct InputBytes(RetainedBytes);
+
+impl AsRef<[u8]> for InputBytes {
+    fn as_ref(&self) -> &[u8] { self.0.as_slice() }
+}
+
+const RETAINED_INPUT_METADATA_BYTES: usize = 1024 * 1024;
 
 struct MergeOutput {
     path: PathBuf,
@@ -213,28 +227,101 @@ fn limit_writer(writer: &mut ArrowFileWriter, directory: &Path, limit: u64) -> R
 }
 
 pub async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path, cancellation: &CancellationToken) -> Result<File> {
-    let object = store.head(key).await?;
+    download_sized(store, memory, key, path, store.head(key).await?.size, cancellation).await
+}
+
+fn reserve_input_read(
+    store: &dyn ObjectStore, key: &ObjectKey, count: usize, ranges: bool,
+    retained_memory: &Arc<MemoryBudget>, memory: &Arc<MemoryBudget>,
+) -> Result<ReadReservation> {
+    let allocation = if ranges { store.scan_range_allocation(key, count)? } else { store.whole_object_allocation(key, count)? };
+    let retained = retained_memory.reserve(allocation.retained_bytes.max(count))?;
+    let scratch = (allocation.scratch_bytes > 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
+    Ok(ReadReservation::funded(count, retained, scratch))
+}
+
+async fn read_input_bytes(
+    store: &dyn ObjectStore, key: &ObjectKey, position: u64, ranges: bool,
+    reservation: ReadReservation, cancellation: &CancellationToken,
+) -> Result<RetainedBytes> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    let bytes = if ranges {
+        store.get_reserved_scan_range(key, position..position + reservation.length() as u64, reservation).await?
+    } else {
+        store.get_reserved_object(key, reservation).await?
+    };
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    Ok(bytes)
+}
+
+async fn download_sized(
+    store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &ObjectKey, path: &Path,
+    size: u64, cancellation: &CancellationToken,
+) -> Result<File> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
     let mut file = create_file(path)?;
     let ranges = store.supports_scan_ranges(key);
     let mut position = 0;
-    while position < object.size {
+    while position < size {
         if cancellation.is_cancelled() { return Err(crate::closed()); }
-        let remaining = object.size - position;
+        let remaining = size - position;
         let count = usize::try_from(if ranges { remaining.min(1024 * 1024) } else { remaining }).map_err(crate::invalid)?;
-        let allocation = if ranges { store.scan_range_allocation(key, count)? } else { store.whole_object_allocation(key, count)? };
-        let retained = memory.reserve(allocation.retained_bytes)?;
-        let scratch = (allocation.scratch_bytes > 0).then(|| memory.reserve(allocation.scratch_bytes)).transpose()?;
-        let reservation = ReadReservation::funded(count, retained, scratch);
-        let bytes = if ranges {
-            store.get_reserved_scan_range(key, position..position + count as u64, reservation).await?
-        } else {
-            store.get_reserved_object(key, reservation).await?
-        };
+        let reservation = reserve_input_read(store, key, count, ranges, memory, memory)?;
+        let bytes = read_input_bytes(store, key, position, ranges, reservation, cancellation).await?;
         file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
         position += count as u64;
     }
     file.seek(SeekFrom::Start(0)).map_err(crate::invalid)?;
     Ok(file)
+}
+
+fn if_memory_available<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.code == "rtdb/memory-budget-exceeded" => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn open_metadata(
+    store: &dyn ObjectStore, key: &ObjectKey, path: &Path, size: u64,
+    memory: &Arc<MemoryBudget>, retained_memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+) -> Result<InputMetadata> {
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    let ranges = store.supports_scan_ranges(key);
+    let (mut file, inspected) = if let Ok(count) = usize::try_from(size)
+        && count > 0 && count <= retained_memory.limit_bytes()
+        && let Some(reservation) = if_memory_available(reserve_input_read(store, key, count, ranges, retained_memory, memory))?
+    {
+        let bytes = read_input_bytes(store, key, 0, ranges, reservation, cancellation).await?;
+        let mut cursor = Cursor::new(bytes.as_slice());
+        let inspected = match if_memory_available(inspect_file_reserved(&mut cursor, |bytes| memory.reserve(bytes)))? {
+            Some(layout) if layout.uncompressed => {
+                if let Some(reservation) = if_memory_available(memory.reserve(layout.full_allocation_bound()?))? {
+                    if cancellation.is_cancelled() { return Err(crate::closed()); }
+                    let buffer = Bytes::from_owner(InputBytes(bytes)).into();
+                    let file = ArrowFile::from_inspected_buffer(buffer, None, layout)?;
+                    return Ok(InputMetadata { file: MetadataFile::read_file(file)?, _reservation: reservation });
+                }
+                Some(layout)
+            }
+            layout => layout,
+        };
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let mut file = create_file(path)?;
+        file.write_all(bytes.as_slice()).map_err(crate::invalid)?;
+        (file, inspected)
+    } else {
+        (download_sized(store, memory, key, path, size, cancellation).await?, None)
+    };
+    if cancellation.is_cancelled() { return Err(crate::closed()); }
+    let layout = match inspected {
+        Some(layout) => layout,
+        None => inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?,
+    };
+    let reservation = memory.reserve(layout.full_allocation_bound()?)?;
+    let file = ArrowFile::from_inspected_reader(file, None, layout)?;
+    Ok(InputMetadata { file: MetadataFile::read_file(file)?, _reservation: reservation })
 }
 
 pub fn open_input(
@@ -245,6 +332,71 @@ pub fn open_input(
     let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
     Ok((reader, reservation))
+}
+
+pub(crate) struct PrimaryReader {
+    pub(crate) reader: ArrowFile,
+    _opening: Arc<MemoryReservation>,
+}
+
+pub(crate) enum PrimaryData {
+    File(File),
+    Retained { bytes: Bytes, spill: PathBuf },
+}
+
+pub(crate) fn primary_data_budget(memory: &Arc<MemoryBudget>) -> Arc<MemoryBudget> {
+    const RETAINED_PRIMARY_BYTES: usize = 1024 * 1024;
+    memory.scope_with_limit(RETAINED_PRIMARY_BYTES.min(memory.limit_bytes() / 8))
+}
+
+impl PrimaryData {
+    pub(crate) async fn stored(
+        store: &dyn ObjectStore, key: &ObjectKey, spill: PathBuf, size: u64,
+        memory: &Arc<MemoryBudget>, retained: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        if let Ok(count) = usize::try_from(size)
+            && count > 0 && count <= retained.limit_bytes()
+        {
+            let ranges = store.supports_scan_ranges(key);
+            if let Some(reservation) = if_memory_available(reserve_input_read(store, key, count, ranges, retained, memory))? {
+                let bytes = read_input_bytes(store, key, 0, ranges, reservation, cancellation).await?;
+                return Ok(Self::Retained { bytes: Bytes::from_owner(InputBytes(bytes)), spill });
+            }
+        }
+        Ok(Self::File(download_sized(store, memory, key, &spill, size, cancellation).await?))
+    }
+
+    /// A retained read may replay its consumer, so that consumer owns all partial work.
+    pub(crate) fn read<T>(
+        self, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+        mut consume: impl FnMut(PrimaryReader) -> Result<T>,
+    ) -> Result<T> {
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let file = match self {
+            Self::File(file) => file,
+            Self::Retained { bytes, spill } => {
+                let inspected = inspect_file_reserved(&mut Cursor::new(bytes.as_ref()), |bytes| memory.reserve(bytes));
+                if let Some(layout) = if_memory_available(inspected)?
+                    && layout.uncompressed && layout.dictionary_encoded_bytes == 0
+                {
+                    let result = (|| {
+                        let opening = memory.reserve(layout.opening_allocation_bound()?)?;
+                        let reader = ArrowFile::from_inspected_buffer(bytes.clone().into(), None, layout)?;
+                        consume(PrimaryReader { reader, _opening: opening })
+                    })();
+                    if let Some(value) = if_memory_available(result)? { return Ok(value); }
+                }
+                if cancellation.is_cancelled() { return Err(crate::closed()); }
+                let mut file = create_file(&spill)?;
+                file.write_all(&bytes).map_err(crate::invalid)?;
+                file
+            }
+        };
+        if cancellation.is_cancelled() { return Err(crate::closed()); }
+        let (reader, opening) = open_input(file, memory)?;
+        consume(PrimaryReader { reader, _opening: opening })
+    }
 }
 
 pub fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
@@ -266,7 +418,7 @@ fn decoded_bound(batch: &arrow_array::RecordBatch) -> Result<usize> {
 fn merged_put_schema(inputs: &[InputSegment]) -> Result<Option<StructFields<LogicalType>>> {
     let mut puts = Vec::new();
     for input in inputs {
-        let schema = input.reader.schema();
+        let schema = input.data.reader.schema();
         let op = schema.field_with_name("op").map_err(crate::invalid)?;
         let DataType::Union(fields, _) = op.data_type() else { return Err(crate::invalid("Input event schema lacks operation union")); };
         if let Some((_, field)) = fields.iter().find(|(_, field)| field.name() == "put" && !matches!(field.data_type(), DataType::Struct(fields) if fields.is_empty())) {
@@ -394,73 +546,22 @@ impl CompactionExecutor for SegmentCompactor {
 
 impl SegmentCompactor {
     async fn execute_job(&self, job: &CompactionJob, snapshot: Arc<PartitionValue>, cancellation: &CancellationToken) -> Result<TriesAdded> {
-        let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
         let entry = snapshot.table_catalog().entry(&job.table).cloned().ok_or_else(|| crate::invalid("Compaction table has no recorded slug"))?;
-        let mut inputs = Vec::new();
-        for (index, key) in job.inputs.iter().enumerate() {
-            if cancellation.is_cancelled() { return Err(crate::closed()); }
-            let data_key = ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?;
-            let meta_key = ObjectKey::new(entry.slug.metadata_key(key)).map_err(crate::invalid)?;
-            let size = self.store.head(&data_key).await.map_err(crate::invalid)?.size.checked_add(self.store.head(&meta_key).await.map_err(crate::invalid)?.size).ok_or_else(|| crate::invalid("Input file size overflow"))?;
-            check_disk(directory.path(), self.config.temporary_byte_limit, size)?;
-            let data = download(self.store.as_ref(), &self.memory, &data_key, &directory.path().join(format!("input-{index}.arrow")), cancellation).await?;
-            let mut metadata = download(self.store.as_ref(), &self.memory, &meta_key, &directory.path().join(format!("meta-{index}.arrow")), cancellation).await?;
-            let metadata_layout = inspect_file_reserved(&mut metadata, |bytes| self.memory.reserve(bytes))?;
-            let metadata_charge = self.memory.reserve(metadata_layout.full_allocation_bound()?)?;
-            let metadata = MetadataFile::read_reader(metadata)?;
-            let (reader, reservation) = open_input(data, &self.memory)?;
-            inputs.push(InputSegment { key: key.clone(), metadata, reader, _reservations: vec![reservation, metadata_charge] });
-        }
-        let keyed = job.table.is_owned_event_data();
-        let topology = job.table.is_owned_world_topology();
-        let include_origins = inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::EVENT_ORIGIN_FIELD).is_ok());
-        if inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::ENTITY_KEY_FIELD).is_ok() != keyed) {
-            return Err(crate::invalid("Compaction input does not have the required entity-key layout"));
-        }
-        let include_positions = inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_ok());
-        if include_positions && inputs.iter().any(|input| input.reader.schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_err()) {
-            return Err(crate::invalid("Positioned history cannot mix with unpositioned primary pages"));
-        }
-        let redacted_leg = inputs.iter().any(|input| input.reader.schema().field_with_name("op").is_ok_and(|op| {
-            matches!(op.data_type(), DataType::Union(fields, _) if fields.iter().any(|(_, field)| field.name() == "redacted"))
-        }));
-        let put = merged_put_schema(&inputs)?.map(Arc::new);
-        let carry = self.config.within_file_recency_branching && job.output.recency().is_some() && inputs.iter().all(|input| input.reader.schema().index_of("_recency").is_ok());
-        let tasks = planner::plan(&inputs, &job.part)?;
-        let tie_order = self.config.tie_order(job.output.epoch());
-        let mut sources: Vec<_> = (0..inputs.len()).collect();
-        sources.sort_by(|&left, &right| inputs[left].key.scan_precedence().cmp(&inputs[right].key.scan_precedence()));
-        let mut source_precedence = vec![0; inputs.len()];
-        for (priority, source) in sources.into_iter().enumerate() {
-            source_precedence[source] = priority;
-        }
-        let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
-        let initial_schema = OutputSchema {
-            put, iid_encoding: (self.config.run_end_encoded_iids && initial_recency.is_some()).then_some(RunEndWidth::I32),
-            recency: job.recency_mode == RecencyMode::Preserve && carry, keyed, topology, include_origins, include_positions, redacted_leg,
-        };
-        let retain_multiple = job.recency_mode == RecencyMode::Preserve
-            && (2..=RETAINED_MERGE_TASKS).contains(&tasks.len());
-        let mut retain = initial_schema.supports_retention() && (tasks.len() == 1 || retain_multiple);
-        let plan = MergePlan { tasks, tie_order, source_precedence };
-        let initial_path = directory.path().join("merged-0.arrow");
-        let mut outputs = loop {
-            let mut initial = MergeOutput::pending(initial_path.clone(), initial_recency, &job.part, initial_schema.clone());
-            if !retain {
-                initial.start_spill(&self.config, &self.memory, cancellation)?;
-            }
-            match self.merge_tasks(job, &mut inputs, &plan, initial, cancellation).await {
-                // The next task can run out of scratch before it can spill the retained pages.
-                Err(error) if retain && retain_multiple && error.code == "rtdb/memory-budget-exceeded" => {
+        let mut retained_data = primary_data_budget(&self.memory);
+        let mut retained_metadata = self.memory.scope_with_limit(RETAINED_INPUT_METADATA_BYTES.min(self.memory.limit_bytes() / 8));
+        let (directory, mut outputs) = loop {
+            let directory = tempfile::Builder::new().prefix("rtdb-compaction-").tempdir_in(&self.config.temporary_directory).map_err(crate::invalid)?;
+            match self.merge_inputs(job, &entry.slug, directory.path(), &retained_data, &retained_metadata, cancellation).await {
+                Err(error) if error.code == "rtdb/memory-budget-exceeded"
+                    && (retained_data.peak_bytes() > 0 || retained_metadata.peak_bytes() > 0) => {
                     if cancellation.is_cancelled() { return Err(crate::closed()); }
-                    remove_temporary_file(&initial_path)?;
-                    retain = false;
+                    directory.close().map_err(crate::invalid)?;
+                    retained_data = self.memory.scope_with_limit(0);
+                    retained_metadata = self.memory.scope_with_limit(0);
                 }
-                result => break result?,
+                result => break (directory, result?),
             }
         };
-        drop(plan);
-        drop(inputs);
         for output in &mut outputs { output.finish(&self.config, &self.memory, cancellation)?; }
         let mut outputs = outputs.into_iter().enumerate();
         let initial = outputs.next();
@@ -490,6 +591,80 @@ impl SegmentCompactor {
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })
     }
 
+    async fn merge_inputs(&self, job: &CompactionJob, slug: &rtdb_format::keys::TableSlug, directory: &Path,
+        retained_data: &Arc<MemoryBudget>, retained_metadata: &Arc<MemoryBudget>, cancellation: &CancellationToken) -> Result<Vec<MergeOutput>> {
+        let mut inputs = Vec::new();
+        let mut metadata = Vec::new();
+        let mut input_bytes = 0u64;
+        for (index, key) in job.inputs.iter().enumerate() {
+            if cancellation.is_cancelled() { return Err(crate::closed()); }
+            let data_key = ObjectKey::new(slug.data_key(key)).map_err(crate::invalid)?;
+            let meta_key = ObjectKey::new(slug.metadata_key(key)).map_err(crate::invalid)?;
+            let data_size = self.store.head(&data_key).await.map_err(crate::invalid)?.size;
+            let metadata_size = self.store.head(&meta_key).await.map_err(crate::invalid)?.size;
+            input_bytes = input_bytes.checked_add(data_size).and_then(|bytes| bytes.checked_add(metadata_size))
+                .ok_or_else(|| crate::invalid("Input file size overflow"))?;
+            if input_bytes > self.config.temporary_byte_limit {
+                return Err(crate::invalid("Compaction temporary disk budget exceeded"));
+            }
+            let data = PrimaryData::stored(self.store.as_ref(), &data_key, directory.join(format!("input-{index}.arrow")),
+                data_size, &self.memory, retained_data, cancellation).await?;
+            metadata.push(open_metadata(self.store.as_ref(), &meta_key, &directory.join(format!("meta-{index}.arrow")),
+                metadata_size, &self.memory, retained_metadata, cancellation).await?);
+            let data = data.read(&self.memory, cancellation, Ok)?;
+            inputs.push(InputSegment { key: key.clone(), data });
+        }
+        let keyed = job.table.is_owned_event_data();
+        let topology = job.table.is_owned_world_topology();
+        let include_origins = inputs.iter().any(|input| input.data.reader.schema().index_of(rtdb_format::data::EVENT_ORIGIN_FIELD).is_ok());
+        if inputs.iter().any(|input| input.data.reader.schema().index_of(rtdb_format::data::ENTITY_KEY_FIELD).is_ok() != keyed) {
+            return Err(crate::invalid("Compaction input does not have the required entity-key layout"));
+        }
+        let include_positions = inputs.iter().any(|input| input.data.reader.schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_ok());
+        if include_positions && inputs.iter().any(|input| input.data.reader.schema().index_of(rtdb_format::data::EVENT_POSITION_FIELD).is_err()) {
+            return Err(crate::invalid("Positioned history cannot mix with unpositioned primary pages"));
+        }
+        let redacted_leg = inputs.iter().any(|input| input.data.reader.schema().field_with_name("op").is_ok_and(|op| {
+            matches!(op.data_type(), DataType::Union(fields, _) if fields.iter().any(|(_, field)| field.name() == "redacted"))
+        }));
+        let put = merged_put_schema(&inputs)?.map(Arc::new);
+        let carry = self.config.within_file_recency_branching && job.output.recency().is_some() && inputs.iter().all(|input| input.data.reader.schema().index_of("_recency").is_ok());
+        let tasks = planner::plan(&metadata, &job.part)?;
+        drop(metadata);
+        let tie_order = self.config.tie_order(job.output.epoch());
+        let mut sources: Vec<_> = (0..inputs.len()).collect();
+        sources.sort_by(|&left, &right| inputs[left].key.scan_precedence().cmp(&inputs[right].key.scan_precedence()));
+        let mut source_precedence = vec![0; inputs.len()];
+        for (priority, source) in sources.into_iter().enumerate() {
+            source_precedence[source] = priority;
+        }
+        let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
+        let initial_schema = OutputSchema {
+            put, iid_encoding: (self.config.run_end_encoded_iids && initial_recency.is_some()).then_some(RunEndWidth::I32),
+            recency: job.recency_mode == RecencyMode::Preserve && carry, keyed, topology, include_origins, include_positions, redacted_leg,
+        };
+        let retain_multiple = job.recency_mode == RecencyMode::Preserve
+            && (2..=RETAINED_MERGE_TASKS).contains(&tasks.len());
+        let mut retain = initial_schema.supports_retention() && (tasks.len() == 1 || retain_multiple);
+        let plan = MergePlan { tasks, tie_order, source_precedence };
+        let initial_path = directory.join("merged-0.arrow");
+        loop {
+            let mut initial = MergeOutput::pending(initial_path.clone(), initial_recency, &job.part, initial_schema.clone());
+            if !retain {
+                initial.start_spill(&self.config, &self.memory, cancellation)?;
+            }
+            match self.merge_tasks(job, &mut inputs, &plan, initial, cancellation).await {
+                // The next task can run out of scratch before it can spill the retained pages.
+                Err(error) if retain && retain_multiple && error.code == "rtdb/memory-budget-exceeded" => {
+                    if cancellation.is_cancelled() { return Err(crate::closed()); }
+                    remove_temporary_file(&initial_path)?;
+                    retain = false;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn merge_tasks(&self, job: &CompactionJob, inputs: &mut [InputSegment], plan: &MergePlan, initial: MergeOutput,
         cancellation: &CancellationToken) -> Result<Vec<MergeOutput>> {
         let positioned_history = TableRef::owned_schema(&job.table.schema);
@@ -501,7 +676,7 @@ impl SegmentCompactor {
             let mut erase_times = BTreeMap::new();
             for page in &task.pages {
                 let input = &mut inputs[page.segment];
-                let batch = read_page(&mut input.reader, page.page, &self.memory)?;
+                let batch = read_page(&mut input.data.reader, page.page, &self.memory)?;
                 let _decoded = self.memory.reserve(decoded_bound(batch.batch())?)?;
                 let mut events = EventBatch::new(batch.batch().clone())?.page_events()?;
                 if input.key.level() == 0 && !positioned_history {
@@ -722,6 +897,117 @@ mod tests {
         let mut body = Vec::new();
         file.read_to_end(&mut body).map_err(crate::invalid)?;
         assert_eq!(body.as_slice(), input.0.as_ref());
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_primary_inputs_spill_at_the_shared_cap_and_release_bytes_before_output() -> Result<()> {
+        let fields = StructFields::from([("value".into(), LogicalType::Scalar(ScalarType::I64))]);
+        let event = StoredEvent {
+            position: None, origin: None, commit_position: 0, iid: Iid([1; 16]), entity_key: None,
+            system_from: Timestamp(10), valid_time: Interval::ALL, recency: None,
+            operation: StoredOperation::Put(StructFields::from([("value".into(), Value::I64(17))])),
+        };
+        let page = build_event_batch(&[event], Some(fields.clone()), None)?;
+        let store = WholeInput(rtdb_format::ipc::write_file(page.schema_ref(), std::slice::from_ref(&page))?.into());
+        let size = store.0.len();
+        let key = ObjectKey::new("data.arrow")?;
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryBudget::new(8 << 20);
+        let retained = memory.scope_with_limit(size);
+        let cancellation = CancellationToken::new();
+        let first_path = directory.path().join("first.arrow");
+        let second_path = directory.path().join("second.arrow");
+        let first = PrimaryData::stored(&store, &key, first_path.clone(), size as u64, &memory, &retained, &cancellation).await?;
+        let second = PrimaryData::stored(&store, &key, second_path.clone(), size as u64, &memory, &retained, &cancellation).await?;
+        let mut first = first.read(&memory, &cancellation, Ok)?;
+        let mut second = second.read(&memory, &cancellation, Ok)?;
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        assert_eq!(retained.used_bytes(), size);
+
+        let batch = read_page(&mut first.reader, 0, &memory)?;
+        let spilled = read_page(&mut second.reader, 0, &memory)?;
+        assert_eq!(batch.batch(), spilled.batch());
+        let events = EventBatch::new(batch.batch().clone())?.page_events()?;
+        let output = copy_compaction_batch(&events, Some(fields), None, false, false, &memory)?;
+        drop((first, second, batch, spilled));
+        assert_eq!(retained.used_bytes(), size);
+        drop(events);
+        assert_eq!(retained.used_bytes(), 0);
+        assert_eq!(EventBatch::new(output.batch().clone())?.header(0)?.system_from, Timestamp(10));
+        drop(output);
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn primary_input_replays_its_consumer_from_spill_after_memory_pressure() -> Result<()> {
+        let page = build_event_batch(&[StoredEvent {
+            position: None, origin: None, commit_position: 0, iid: Iid([1; 16]), entity_key: None,
+            system_from: Timestamp(10), valid_time: Interval::ALL, recency: None, operation: StoredOperation::Delete,
+        }], None, None)?;
+        let store = WholeInput(rtdb_format::ipc::write_file(page.schema_ref(), std::slice::from_ref(&page))?.into());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("spill.arrow");
+        let memory = MemoryBudget::new(8 << 20);
+        let retained = primary_data_budget(&memory);
+        let cancellation = CancellationToken::new();
+        let data = PrimaryData::stored(&store, &ObjectKey::new("data.arrow")?, path.clone(), store.0.len() as u64,
+            &memory, &retained, &cancellation).await?;
+        let mut attempts = 0;
+        data.read(&memory, &cancellation, |mut input| {
+            attempts += 1;
+            let batch = read_page(&mut input.reader, 0, &memory)?;
+            if attempts == 1 {
+                assert!(!path.exists());
+                assert_eq!(retained.used_bytes(), store.0.len());
+                memory.reserve(memory.limit_bytes() - memory.used_bytes() + 1)?;
+            }
+            assert_eq!(retained.used_bytes(), 0);
+            let header = EventBatch::new(batch.batch().clone())?.header(0)?;
+            assert_eq!(header.op, EventOp::Delete);
+            assert_eq!(header.system_from, Timestamp(10));
+            Ok(())
+        })?;
+        assert_eq!(attempts, 2);
+        assert_eq!(std::fs::read(path).map_err(crate::invalid)?.as_slice(), store.0.as_ref());
+        assert_eq!(memory.used_bytes(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compaction_metadata_retains_original_bytes_up_to_the_job_limit() -> Result<()> {
+        use rtdb_format::metadata::{LeafColumns, MetadataNode};
+
+        let metadata = MetadataFile::from_nodes(vec![MetadataNode::Leaf {
+            data_page_index: 3,
+            columns: LeafColumns::new(Vec::new()),
+        }], false)?;
+        let store = WholeInput(Bytes::from(metadata.write()?));
+        let size = store.0.len();
+        let key = ObjectKey::new("metadata.arrow")?;
+        let directory = tempfile::tempdir().unwrap();
+        let memory = MemoryBudget::new(8 << 20);
+        let retained = memory.scope_with_limit(size);
+        let cancellation = CancellationToken::new();
+        let first_path = directory.path().join("first.arrow");
+        let second_path = directory.path().join("second.arrow");
+        let first = open_metadata(&store, &key, &first_path, size as u64, &memory, &retained, &cancellation).await?;
+        assert!(!first_path.exists());
+        assert_eq!(retained.used_bytes(), size);
+
+        let second = open_metadata(&store, &key, &second_path, size as u64, &memory, &retained, &cancellation).await?;
+        assert_eq!(std::fs::read(second_path).map_err(crate::invalid)?.as_slice(), store.0.as_ref());
+        assert_eq!(retained.used_bytes(), size);
+
+        let inputs = [first, second];
+        let tasks = planner::plan(&inputs, &[])?;
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].pages.iter().map(|page| (page.segment, page.page)).collect::<Vec<_>>(), [(0, 3), (1, 3)]);
+        drop(inputs);
+        assert_eq!(retained.used_bytes(), 0);
         assert_eq!(memory.used_bytes(), 0);
         Ok(())
     }

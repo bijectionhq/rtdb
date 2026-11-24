@@ -159,71 +159,151 @@ fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironme
     let values = match value { Value::List(_) | Value::FixedSizeList(_) => value.list_view().unwrap(), _ => return Err(incompatible(ty, value)) };
     array_payload(ty, format, values.iter(), |element, value| {
         match value.as_ref() {
-            Value::Null | Value::Undefined => Ok(None),
-            Value::F32(value) if element == PgType::Float4 => Ok(Some(float4_bytes(format, *value))),
-            Value::F64(value) if element == PgType::Float8 => Ok(Some(float8_bytes(format, *value))),
-            value => encode_value(element, format, value, env).map(Some),
+            Value::Null | Value::Undefined => Ok(ArrayElement::Null),
+            Value::F32(value) if element == PgType::Float4 => Ok(ArrayElement::Float4(*value)),
+            Value::F64(value) if element == PgType::Float8 => Ok(ArrayElement::Float8(*value)),
+            value => encode_value(element, format, value, env).map(ArrayElement::Encoded),
         }
     })
 }
 
-fn array_payload<T>(
-    ty: PgType, format: Format, cells: impl ExactSizeIterator<Item = T>,
-    mut encode: impl FnMut(PgType, T) -> Result<Option<Vec<u8>>>,
+enum ArrayElement<'a> {
+    Null,
+    Integer(i128),
+    Float4(f32),
+    Float8(f64),
+    Text(&'a str),
+    Encoded(Vec<u8>),
+}
+
+fn array_element_type(ty: PgType) -> PgType {
+    PgType::from_oid(ty.descriptor().element_oid.expect("array type has an element OID"))
+        .expect("known element type")
+}
+
+fn array_payload<'a, T>(
+    ty: PgType,
+    format: Format,
+    cells: impl ExactSizeIterator<Item = T>,
+    encode: impl FnMut(PgType, T) -> Result<ArrayElement<'a>>,
 ) -> Result<Vec<u8>> {
-    let element = PgType::from_oid(ty.descriptor().element_oid.expect("array type has an element OID")).expect("known element type");
+    let mut output = Vec::new();
+    let has_nulls = write_array_payload(ty, format, cells, false, encode, &mut output)?;
+    if format == Format::Binary && has_nulls && matches!(ty, PgType::Float4s | PgType::Float8s) {
+        output[4..8].copy_from_slice(&1i32.to_be_bytes());
+    }
+    Ok(output)
+}
+
+fn write_array_payload<'a, T>(
+    ty: PgType,
+    format: Format,
+    cells: impl ExactSizeIterator<Item = T>,
+    has_nulls: bool,
+    mut encode: impl FnMut(PgType, T) -> Result<ArrayElement<'a>>,
+    output: &mut impl Write,
+) -> Result<bool> {
+    let element = array_element_type(ty);
     let floats = matches!(ty, PgType::Float4s | PgType::Float8s);
-    if format == Format::Binary {
-        let mut output = Vec::new();
+    let binary = format == Format::Binary;
+    if binary {
         if floats && cells.len() == 0 {
-            for field in [0, 0, element.descriptor().oid] { output.extend_from_slice(&field.to_be_bytes()); }
-            return Ok(output);
-        }
-        for field in [1, 0, element.descriptor().oid, i32::try_from(cells.len()).map_err(invalid)?, 1] {
-            output.extend_from_slice(&field.to_be_bytes());
-        }
-        for cell in cells {
-            if let Some(bytes) = encode(element, cell)? {
-                output.extend_from_slice(&i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes());
-                output.extend_from_slice(&bytes);
-            } else {
-                if floats { output[4..8].copy_from_slice(&1i32.to_be_bytes()); }
-                else if ty != PgType::Texts { return Err(invalid("Integer binary arrays do not support null elements")); }
-                output.extend_from_slice(&(-1i32).to_be_bytes());
+            for field in [0, 0, element.descriptor().oid] {
+                write_bytes(output, &field.to_be_bytes())?;
             }
+            return Ok(false);
         }
-        return Ok(output);
+        let len = i32::try_from(cells.len()).map_err(invalid)?;
+        for field in [1, i32::from(floats && has_nulls), element.descriptor().oid, len, 1] {
+            write_bytes(output, &field.to_be_bytes())?;
+        }
+    } else {
+        write_bytes(output, b"{")?;
     }
-    let mut output = String::from("{");
+
+    let mut saw_null = false;
+    let mut float_scratch = String::new();
     for (index, cell) in cells.enumerate() {
-        if index != 0 { output.push(','); }
-        let Some(bytes) = encode(element, cell)? else { output.push_str("NULL"); continue; };
-        let text = std::str::from_utf8(&bytes).map_err(invalid)?;
-        if ty == PgType::Texts {
-            output.push('"');
-            for ch in text.chars() {
-                if matches!(ch, '\\' | '"') { output.push('\\'); }
-                output.push(ch);
+        if !binary && index != 0 {
+            write_bytes(output, b",")?;
+        }
+        match (format, encode(element, cell)?) {
+            (Format::Binary, ArrayElement::Null) => {
+                if !floats && ty != PgType::Texts {
+                    return Err(invalid("Integer binary arrays do not support null elements"));
+                }
+                saw_null = true;
+                write_bytes(output, &(-1i32).to_be_bytes())?;
             }
-            output.push('"');
-        } else {
-            output.push_str(text);
+            (Format::Text, ArrayElement::Null) => write_bytes(output, b"NULL")?,
+            (Format::Binary, ArrayElement::Integer(value)) if element == PgType::Int4 => {
+                write_binary_array_element(output, &(value as i32).to_be_bytes())?;
+            }
+            (Format::Binary, ArrayElement::Integer(value)) => {
+                write_binary_array_element(output, &(value as i64).to_be_bytes())?;
+            }
+            (Format::Text, ArrayElement::Integer(value)) => write!(output, "{value}").map_err(write_error)?,
+            (Format::Binary, ArrayElement::Float4(value)) => {
+                write_binary_array_element(output, &value.to_be_bytes())?;
+            }
+            (Format::Binary, ArrayElement::Float8(value)) => {
+                write_binary_array_element(output, &value.to_be_bytes())?;
+            }
+            (Format::Text, ArrayElement::Float4(value)) => {
+                float_scratch.clear();
+                rtdb_types::write_java_float(&mut float_scratch, f64::from(value), Some(value));
+                write_bytes(output, float_scratch.as_bytes())?;
+            }
+            (Format::Text, ArrayElement::Float8(value)) => {
+                float_scratch.clear();
+                rtdb_types::write_java_float(&mut float_scratch, value, None);
+                write_bytes(output, float_scratch.as_bytes())?;
+            }
+            (Format::Binary, ArrayElement::Text(text)) => {
+                write_binary_array_element(output, text.as_bytes())?;
+            }
+            (Format::Text, ArrayElement::Text(text)) => write_quoted_array_text(output, text)?,
+            (Format::Binary, ArrayElement::Encoded(bytes)) => write_binary_array_element(output, &bytes)?,
+            (Format::Text, ArrayElement::Encoded(bytes)) => {
+                let text = std::str::from_utf8(&bytes).map_err(invalid)?;
+                if ty == PgType::Texts {
+                    write_quoted_array_text(output, text)?;
+                } else {
+                    write_bytes(output, text.as_bytes())?;
+                }
+            }
         }
     }
-    output.push('}');
-    Ok(output.into_bytes())
+    if !binary {
+        write_bytes(output, b"}")?;
+    }
+    Ok(saw_null)
+}
+
+fn write_binary_array_element(output: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    write_bytes(output, &i32::try_from(bytes.len()).map_err(invalid)?.to_be_bytes())?;
+    write_bytes(output, bytes)
+}
+
+fn write_quoted_array_text(output: &mut impl Write, text: &str) -> Result<()> {
+    write_bytes(output, b"\"")?;
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(*byte, b'\\' | b'"') {
+            write_bytes(output, &bytes[start..index])?;
+            write_bytes(output, b"\\")?;
+            start = index;
+        }
+    }
+    write_bytes(output, &bytes[start..])?;
+    write_bytes(output, b"\"")
 }
 
 fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> {
     rtdb_format::temporal_text::interval_parts(value).ok_or_else(|| incompatible(PgType::Interval, value))
 }
 fn decimal_text(value: &rtdb_types::DecimalValue) -> String { rtdb_expr::decimal_text(value) }
-fn float4_bytes(format: Format, value: f32) -> Vec<u8> {
-    match format { Format::Binary => value.to_be_bytes().to_vec(), Format::Text => rtdb_types::java_f32_text(value).into_bytes() }
-}
-fn float8_bytes(format: Format, value: f64) -> Vec<u8> {
-    match format { Format::Binary => value.to_be_bytes().to_vec(), Format::Text => rtdb_types::java_f64_text(value).into_bytes() }
-}
 fn float_text(value: f64, single: Option<f32>) -> String {
     single.map_or_else(|| rtdb_types::java_f64_text(value), rtdb_types::java_f32_text)
 }

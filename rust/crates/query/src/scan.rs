@@ -727,7 +727,7 @@ impl Fragment {
         if let FragmentState::Dispatched(dispatch) = &mut self.state {
             let answer = (&mut dispatch.0).await;
             self.state = match answer {
-                Ok(Ok(Some(reply))) => match reply.await.and_then(|bytes| crate::fragment::decode_batches(bytes.as_slice(), memory)) {
+                Ok(Ok(Some(reply))) => match reply.await.and_then(|bytes| crate::fragment::decode_batches(bytes.into_ipc_buffer(), memory)) {
                     Ok(batches) => FragmentState::Remote(batches.into()),
                     Err(_) => FragmentState::Local,
                 },

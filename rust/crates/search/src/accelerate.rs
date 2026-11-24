@@ -525,12 +525,12 @@ impl LoadSearch {
 }
 
 /// A shared file's selected members and their positions in the scan's trie list.
-struct FileMembers { file: Arc<SearchFile>, members: BTreeMap<u32, usize> }
+struct FileMembers<'a> { file: &'a Arc<SearchFile>, members: BTreeMap<u32, usize> }
 
-fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers> {
+fn by_file(files: &[TrieFile]) -> impl Iterator<Item = FileMembers<'_>> {
     let mut grouped = BTreeMap::new();
     for (index, trie) in files.iter().enumerate() {
-        let selected = grouped.entry(trie.identity.as_str()).or_insert_with(|| FileMembers { file: Arc::clone(&trie.file), members: BTreeMap::new() });
+        let selected = grouped.entry(trie.identity.as_str()).or_insert_with(|| FileMembers { file: &trie.file, members: BTreeMap::new() });
         selected.members.insert(trie.member, index);
     }
     grouped.into_values()
@@ -551,7 +551,7 @@ pub async fn owned_corpus(
     let partition = [(relation.clone(), path.clone())];
     let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, &partition).await?;
     let query = Query::analyzed(analyzer, text);
-    let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, None).await?;
+    let covered = covered_owned_corpus(context, owner, relation, path, &query, None, false, |_| false).await?;
     Ok(rtdb_text::Corpus {
         documents: covered.documents, tokens: covered.tokens,
         frequencies: query.terms().iter().cloned().zip(covered.frequencies.values().iter().copied()).collect(),
@@ -571,7 +571,7 @@ struct CoveredCorpus {
 async fn covered_owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, query: &Query,
     valid_at: Option<Timestamp>, retain_runs: bool,
-    shadowed: Option<&BTreeSet<EntityId>>,
+    is_shadowed: impl Fn(EntityIdRef<'_>) -> bool,
 ) -> Result<CoveredCorpus> {
     let definition = crate::definitions::owned_definition(Arc::clone(&context), owner, relation, path).await?
         .ok_or_else(|| Anomaly::incorrect("rtdb.owned/search-path", "Owned relation has no declared clear-text search path with this name"))?;
@@ -629,9 +629,9 @@ async fn covered_owned_corpus(
     let mut documents = 0;
     let mut tokens = 0;
     let mut frequencies = vec![0; query.terms().len()];
+    let mut scratch = context.memory.reserve(4096)?;
     let mut seen = BTreeSet::new();
     let mut visible_runs = Vec::new();
-    let mut scratch = context.memory.reserve(4096)?;
     for selected in by_file(&files) {
         let mut visible = BTreeSet::new();
         for (&member, &own) in &selected.members {
@@ -640,14 +640,13 @@ async fn covered_owned_corpus(
                 if !selected.file.visible(doc.doc, bounds) { continue; }
                 Arc::get_mut(&mut scratch).expect("corpus owns its reservation").grow_to(4096usize.saturating_add(seen.len().saturating_add(1).saturating_mul(256)))?;
                 let key = selected.file.run_identity_bytes(doc)?;
-                let _key = context.memory.reserve(key.len())?;
                 let id = selected.file.run_identity_key(doc)?;
                 match cutter.judge_key(own, doc, Some(key))? {
                     Judged::Hidden => (),
                     Judged::Visible { exact: false } => return Err(uncovered_owned_search()),
                     Judged::Visible { exact: true } => {
-                        if shadowed.is_some_and(|ids| ids.iter().any(|value| EntityIdRef::from(value) == id)) { continue; }
-                        if !seen.insert(key.to_vec()) { return Err(uncovered_owned_search()); }
+                        if is_shadowed(id) { continue; }
+                        if !seen.insert(key) { return Err(uncovered_owned_search()); }
                         visible.insert(doc.doc);
                         documents += 1;
                         tokens += u64::from(selected.file.token_length(doc.doc)?);
@@ -660,7 +659,7 @@ async fn covered_owned_corpus(
             *frequency += postings.documents().iter().filter(|doc| visible.contains(doc)).count() as u64;
         }
         if retain_runs && !visible.is_empty() {
-            visible_runs.push((Arc::clone(&selected.file), UInt32Array::from_iter_values(visible)));
+            visible_runs.push((Arc::clone(selected.file), UInt32Array::from_iter_values(visible)));
         }
     }
     context.check_cancelled()?;
@@ -749,16 +748,21 @@ pub async fn owned_ranked_overlay_batch(
             return rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await;
         }
     }
-    match rank_owned_artefacts(&context, owner, partitions, &query, offset, limit, valid_at, overlay.as_ref()).await {
-        Ok((scorer, mut rank)) => {
-            if let Some(overlay) = overlay { overlay.rank(&scorer, &mut rank)?; }
-            context.check_cancelled()?;
-            rank.finish_batch()
-        }
-        Err(error) if error.code == "rtdb.owned/search-uncovered" =>
-            rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await,
-        Err(error) => Err(error),
+    let uncovered = match prepare_owned_artefacts(&context, owner, partitions, &query, valid_at, overlay.as_ref()).await {
+        Ok(corpus) => match rank_owned_artefacts(&context, owner, &corpus, offset, limit).await {
+            Ok(mut rank) => {
+                if let Some(overlay) = overlay { overlay.rank(&corpus.scorer, &mut rank)?; }
+                context.check_cancelled()?;
+                return rank.finish_batch();
+            }
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    if uncovered.code != "rtdb.owned/search-uncovered" {
+        return Err(uncovered);
     }
+    rank_owned_exact(&context, owner, partitions, analyzer, text, offset, limit, valid_at, overlay).await
 }
 
 async fn rank_owned_exact(
@@ -778,17 +782,22 @@ async fn rank_owned_exact(
     corpus.finish_batch(offset, limit)
 }
 
-async fn rank_owned_artefacts(
-    context: &Arc<QueryContext>, owner: &str, partitions: &[(OwnedRelation, OwnedRelation)], query: &Query,
-    offset: usize, limit: usize, valid_at: Option<Timestamp>, overlay: Option<&crate::HeldTextCorpus>,
-) -> Result<(rtdb_text::Scorer, OwnedRankWindow)> {
+struct OwnedArtefactCorpus<'a> {
+    scorer: rtdb_text::Scorer,
+    partitions: Vec<(&'a OwnedRelation, CoveredCorpus)>,
+}
+
+async fn prepare_owned_artefacts<'a>(
+    context: &Arc<QueryContext>, owner: &str, partitions: &'a [(OwnedRelation, OwnedRelation)], query: &Query,
+    valid_at: Option<Timestamp>, overlay: Option<&crate::HeldTextCorpus>,
+) -> Result<OwnedArtefactCorpus<'a>> {
     let mut documents = 0;
     let mut tokens = 0;
     let mut frequencies = vec![0; query.terms().len()];
     let mut covered = Vec::with_capacity(partitions.len());
     for (partition, (relation, path)) in partitions.iter().enumerate() {
-        let shadowed = overlay.and_then(|part| part.shadowed(partition));
-        let part = covered_owned_corpus(Arc::clone(context), owner, relation, path, query, valid_at, true, shadowed).await?;
+        let part = covered_owned_corpus(Arc::clone(context), owner, relation, path, query, valid_at, true,
+            |id| overlay.is_some_and(|corpus| corpus.contains_shadow_key(partition, id))).await?;
         documents += part.documents;
         tokens += part.tokens;
         for (total, &frequency) in frequencies.iter_mut().zip(part.frequencies.values()) { *total += frequency; }
@@ -803,11 +812,19 @@ async fn rank_owned_artefacts(
         }
     }
     let scorer = rtdb_text::Scorer::from_frequencies(query.clone(), documents, tokens, &frequencies);
+    Ok(OwnedArtefactCorpus { scorer, partitions: covered })
+}
+
+async fn rank_owned_artefacts<'a>(
+    context: &Arc<QueryContext>, owner: &str, corpus: &'a OwnedArtefactCorpus<'_>, offset: usize, limit: usize,
+) -> Result<OwnedRankWindow<'a>> {
+    let scorer = &corpus.scorer;
+    let query = scorer.query();
     let mut rank = OwnedRankWindow::new(&context.memory, offset, limit)?;
-    for (partition, (relation, covered)) in covered.iter().enumerate() {
+    for (partition, (relation, covered)) in corpus.partitions.iter().enumerate() {
         for (file, visible) in &covered.visible_runs {
             context.check_cancelled()?;
-            let mut matches = file.matched_scores(&covered.column, &scorer, covered.bounds, Some(visible.values()))
+            let mut matches = file.matched_scores(&covered.column, scorer, covered.bounds, Some(visible.values()))
                 .map_err(|_| uncovered_owned_search())?;
             loop {
                 let available = OWNED_RANK_CANDIDATES - rank.total;
@@ -889,13 +906,13 @@ async fn rank_owned_artefacts(
                 for candidate in pending {
                     let score = candidate.verified.ok_or_else(uncovered_owned_search)?;
                     if let Some(at) = rank.position(partition, candidate.id, score) {
-                        rank.insert_at(at, OwnedSearchHit { partition, id: candidate.id.into_owned(), score })?;
+                        rank.insert_at(at, partition, RankedIdentity::Covered(candidate.id), score)?;
                     }
                 }
             }
         }
     }
-    Ok((scorer, rank))
+    Ok(rank)
 }
 
 struct OwnedCandidate<'a> {
@@ -908,8 +925,35 @@ struct OwnedCandidate<'a> {
 
 const OWNED_RANK_CANDIDATES: usize = 100_000;
 
-pub(crate) struct OwnedRankWindow {
-    hits: Vec<OwnedSearchHit>,
+pub(crate) enum RankedIdentity<'a> {
+    Covered(EntityIdRef<'a>),
+    Held(EntityId),
+}
+
+impl RankedIdentity<'_> {
+    fn key(&self) -> EntityIdRef<'_> {
+        match self {
+            Self::Covered(id) => *id,
+            Self::Held(id) => EntityIdRef::from(id),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Covered(_) => 128,
+            Self::Held(id) => owned_id_bytes(EntityIdRef::from(id)).saturating_add(128),
+        }
+    }
+}
+
+struct RankedHit<'a> {
+    partition: usize,
+    id: RankedIdentity<'a>,
+    score: f64,
+}
+
+pub(crate) struct OwnedRankWindow<'a> {
+    hits: Vec<RankedHit<'a>>,
     memory: Arc<rtdb_columnar::MemoryReservation>,
     offset: usize,
     window: usize,
@@ -917,10 +961,10 @@ pub(crate) struct OwnedRankWindow {
     bytes: usize,
 }
 
-impl OwnedRankWindow {
+impl<'a> OwnedRankWindow<'a> {
     pub(crate) fn new(memory: &Arc<rtdb_columnar::MemoryBudget>, offset: usize, limit: usize) -> Result<Self> {
         let window = offset + limit;
-        let memory = memory.reserve(4096 + (window + 1) * size_of::<OwnedSearchHit>())?;
+        let memory = memory.reserve(4096 + (window + 1) * size_of::<RankedHit<'_>>())?;
         Ok(Self { hits: Vec::with_capacity(window + 1), memory, offset, window, total: 0, bytes: 4096 })
     }
 
@@ -934,18 +978,18 @@ impl OwnedRankWindow {
 
     pub(crate) fn position(&self, partition: usize, id: EntityIdRef<'_>, score: f64) -> Option<usize> {
         let at = self.hits.partition_point(|previous| {
-            owned_rank_key(previous.partition, EntityIdRef::from(&previous.id), previous.score, partition, id, score).is_lt()
+            owned_rank_key(previous.partition, previous.id.key(), previous.score, partition, id, score).is_lt()
         });
         (at < self.window).then_some(at)
     }
 
-    pub(crate) fn insert_at(&mut self, at: usize, hit: OwnedSearchHit) -> Result<()> {
-        let added = owned_id_bytes(EntityIdRef::from(&hit.id)).saturating_add(128);
+    pub(crate) fn insert_at(&mut self, at: usize, partition: usize, id: RankedIdentity<'a>, score: f64) -> Result<()> {
+        let added = id.retained_bytes();
         if self.hits.len() == self.window {
             let evicted = self.hits.pop().expect("A full rank window has a last hit");
-            self.bytes -= owned_id_bytes(EntityIdRef::from(&evicted.id)).saturating_add(128);
+            self.bytes -= evicted.id.retained_bytes();
         }
-        self.hits.insert(at, hit);
+        self.hits.insert(at, RankedHit { partition, id, score });
         self.bytes = self.bytes.saturating_add(added);
         let reservation = Arc::get_mut(&mut self.memory).expect("ranking owns its reservation");
         reservation.grow_to(self.bytes.max(reservation.bytes()))
@@ -954,7 +998,7 @@ impl OwnedRankWindow {
     pub(crate) fn finish_batch(self) -> Result<OwnedSearchBatch> {
         let hits = &self.hits[self.offset.min(self.hits.len())..];
         let bound = hits.iter().try_fold(4096usize, |size, hit| {
-            size.checked_add(owned_id_bytes(EntityIdRef::from(&hit.id)).saturating_mul(4).saturating_add(128))
+            size.checked_add(owned_id_bytes(hit.id.key()).saturating_mul(4).saturating_add(128))
                 .ok_or_else(uncovered_owned_search)
         })?;
         let reservation = self.memory.budget().reserve(bound)?;
@@ -963,7 +1007,7 @@ impl OwnedRankWindow {
             Field::new("score", DataType::Float64, false),
             Field::new("partition", DataType::UInt64, false),
         ]));
-        let ids = rtdb_columnar::entity_id_array(hits.iter().map(|hit| EntityIdRef::from(&hit.id)))?;
+        let ids = rtdb_columnar::entity_id_array(hits.iter().map(|hit| hit.id.key()))?;
         let score = Arc::new(Float64Array::from_iter_values(hits.iter().map(|hit| hit.score)));
         let partition = Arc::new(UInt64Array::from_iter_values(hits.iter().map(|hit| hit.partition as u64)));
         let output = RecordBatch::try_new(schema, vec![ids, score, partition])
@@ -1317,6 +1361,42 @@ mod tests {
         };
         assert_eq!(candidates.next(None, false, &mut NarrowingWork::default()).await.unwrap().map(|row| row.iid), Some(Iid([64; 16])));
         assert!(candidates.next(None, false, &mut NarrowingWork::default()).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn covered_rank_window_borrows_run_identity_through_arrow_output() {
+        let columns = ["body".to_owned()];
+        let id = EntityId::String("places/東京".repeat(32));
+        let row = crate::SearchRow {
+            position: None,
+            identity: Some(id.clone()),
+            iid: id.iid().0,
+            system_from: 1,
+            valid_from: 1,
+            valid_to: 10,
+            op: EventOp::Put,
+            values: vec![Some(rtdb_text::Analyzer::Simple.tokens("invoice"))],
+        };
+        let bytes = crate::build_search_file(&columns, &[row], "owned-run").unwrap();
+        let other_file = SearchFile::open(bytes.clone(), &columns).unwrap();
+        let file = SearchFile::open(bytes, &columns).unwrap();
+        let run = file.single_column_member_runs(0).unwrap().next().unwrap();
+        let other_run = other_file.single_column_member_runs(0).unwrap().next().unwrap();
+        let mut seen = BTreeSet::new();
+        assert!(seen.insert(file.run_identity_bytes(run).unwrap()));
+        assert!(!seen.insert(other_file.run_identity_bytes(other_run).unwrap()));
+
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let mut rank = OwnedRankWindow::new(&memory, 0, 1).unwrap();
+        rank.admit_candidate().unwrap();
+        let key = file.run_identity_key(run).unwrap();
+        rank.insert_at(0, 0, RankedIdentity::Covered(key), 1.0).unwrap();
+        let EntityIdRef::String(held) = rank.hits[0].id.key() else { panic!("expected string identity") };
+        assert_eq!(held.as_ptr(), file.run_identity_bytes(run).unwrap()[1..].as_ptr());
+        assert_eq!(rank.bytes, 4096 + 128);
+        let page = rank.finish_batch().unwrap().into_page().unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].id, id);
     }
 
     #[test]

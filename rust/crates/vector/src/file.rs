@@ -12,10 +12,9 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, UInt32Array, UInt64Array,
-    builder::FixedSizeBinaryBuilder,
 };
 use arrow_buffer::{Buffer, ToByteSlice};
-use arrow_ipc::{Message, convert::fb_to_schema, reader::read_record_batch, root_as_message, writer::StreamWriter};
+use arrow_ipc::{Message, convert::fb_to_schema, reader::read_record_batch, root_as_message};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use rtdb_format::ipc::write_uncompressed_stream_from_buffers;
 use rtdb_types::{Anomaly, Iid, Result};
@@ -125,35 +124,33 @@ pub(crate) fn write_generation(mut rows: IndexedRows, output: &mut impl Write, c
             output.write_all(&[0u8; ALIGNMENT as usize][..padding]).map_err(io)?;
             written += padding as u64;
             let (length, digest) = write_block(output, &block, &rows, &selected)?;
-            partitions.push(partition);
+            partitions.extend_from_slice(&partition.0);
             centroids.extend_from_slice(centroid);
             offsets.push(written);
             lengths.push(length);
             counts.push(count);
-            digests.push(digest);
+            digests.extend_from_slice(&digest);
             written += length;
         }
         start = end;
     }
     let directory = directory_schema(dimensions)?;
-    let mut partition_column = FixedSizeBinaryBuilder::with_capacity(partitions.len(), 32);
-    for partition in &partitions { partition_column.append_value(partition.0).map_err(arrow)?; }
-    let mut digest_column = FixedSizeBinaryBuilder::with_capacity(digests.len(), 32);
-    for digest in &digests { digest_column.append_value(digest).map_err(arrow)?; }
-    let batch = RecordBatch::try_new(Arc::clone(&directory), vec![
-        Arc::new(partition_column.finish()),
-        Arc::new(unit_list(centroids, dimensions)?),
-        Arc::new(UInt64Array::from(offsets)),
-        Arc::new(UInt64Array::from(lengths)),
-        Arc::new(UInt32Array::from(counts)),
-        Arc::new(digest_column.finish()),
-    ]).map_err(arrow)?;
-    let bytes = encode(&directory, batch)?;
+    let count = counts.len();
+    let buffers: [&[u8]; 13] = [
+        &[], &partitions,
+        &[], &[], centroids.to_byte_slice(),
+        &[], offsets.to_byte_slice(),
+        &[], lengths.to_byte_slice(),
+        &[], counts.to_byte_slice(),
+        &[], &digests,
+    ];
     let directory_offset = written;
-    output.write_all(&bytes).map_err(io)?;
-    written += bytes.len() as u64;
-    let locator = Locator { directory: (directory_offset, bytes.len() as u64), dimensions: dimensions_u32, digest: Sha256::digest(&bytes).into() };
-    output.write_all(&footer(directory_offset, bytes.len() as u64, dimensions_u32)).map_err(io)?;
+    let (directory_len, digest) = write_counted_stream(
+        output, &directory, count, &[count, count, centroids.len(), count, count, count, count], &buffers,
+    )?;
+    written += directory_len;
+    let locator = Locator { directory: (directory_offset, directory_len), dimensions: dimensions_u32, digest };
+    output.write_all(&footer(directory_offset, directory_len, dimensions_u32)).map_err(io)?;
     written += FOOTER_BYTES as u64;
     Ok(Written { size: written, locator })
 }
@@ -180,7 +177,6 @@ fn write_block(
             Cow::Owned(units)
         }
     };
-    let mut output = HashingWriter { output, length: 0, digest: Sha256::new() };
     let buffers: [&[u8]; 11] = [
         &[], &iids,
         &[], valid_from.to_byte_slice(),
@@ -188,9 +184,14 @@ fn write_block(
         &[], system_from.to_byte_slice(),
         &[], &[], units.as_ref().to_byte_slice(),
     ];
-    write_uncompressed_stream_from_buffers(
-        &mut output, schema, count, &[count, count, count, count, count, units.len()], &buffers,
-    ).map_err(|error| match error {
+    write_counted_stream(output, schema, count, &[count, count, count, count, count, units.len()], &buffers)
+}
+
+fn write_counted_stream(
+    output: &mut impl Write, schema: &Schema, rows: usize, node_lengths: &[usize], buffers: &[&[u8]],
+) -> Result<(u64, [u8; 32])> {
+    let mut output = HashingWriter { output, length: 0, digest: Sha256::new() };
+    write_uncompressed_stream_from_buffers(&mut output, schema, rows, node_lengths, buffers).map_err(|error| match error {
         ArrowError::IoError(_, error) => io(error),
         error => arrow(error),
     })?;
@@ -212,21 +213,6 @@ impl<W: Write> Write for HashingWriter<'_, W> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> { self.output.flush() }
-}
-
-fn unit_list(values: Vec<f32>, dimensions: usize) -> Result<FixedSizeListArray> {
-    let width = i32::try_from(dimensions).map_err(|_| corrupt("Vector dimensions exceed the Arrow list width"))?;
-    FixedSizeListArray::try_new(Arc::new(Field::new("item", DataType::Float32, false)), width, Arc::new(Float32Array::from(values)), None)
-        .map_err(arrow)
-}
-
-fn encode(schema: &SchemaRef, batch: RecordBatch) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, schema).map_err(arrow)?;
-    writer.write(&batch).map_err(arrow)?;
-    writer.finish().map_err(arrow)?;
-    drop(writer);
-    Ok(bytes)
 }
 
 fn message(bytes: &[u8]) -> Result<(Message<'_>, Range<usize>)> {
@@ -364,6 +350,15 @@ mod tests {
     use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, cache::BufferPool};
     use rtdb_types::{EventHeader, EventOp, Interval, Timestamp};
 
+    fn encode(schema: &SchemaRef, batch: RecordBatch) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut bytes, schema).map_err(arrow)?;
+        writer.write(&batch).map_err(arrow)?;
+        writer.finish().map_err(arrow)?;
+        drop(writer);
+        Ok(bytes)
+    }
+
     fn rows(seeds: impl IntoIterator<Item = u64>) -> IndexedRows {
         let mut rows = IndexedRows::new(2);
         for seed in seeds {
@@ -388,7 +383,11 @@ mod tests {
         assert_eq!(written.size, first.len() as u64);
         let locator = Locator::decode(&written.locator.encode()).unwrap();
         let bytes = Buffer::from_slice_ref(&first);
-        let directory = Directory::read(bytes.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize), &locator).unwrap();
+        let directory_bytes = bytes.slice_with_length(locator.directory.0 as usize, locator.directory.1 as usize);
+        let directory_layout = directory_schema(2).unwrap();
+        let directory_batch = decode(directory_bytes.clone(), &directory_layout, None).unwrap();
+        assert_eq!(directory_bytes.as_slice(), encode(&directory_layout, directory_batch).unwrap().as_slice());
+        let directory = Directory::read(directory_bytes, &locator).unwrap();
         let total: u32 = directory.clusters.iter().map(|cluster| cluster.rows).sum();
         assert_eq!(total, 1_000);
         let schema = block_schema(2).unwrap();

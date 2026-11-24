@@ -26,6 +26,7 @@ entity Checkpoint {
 -- A revision edits both sides of a changed projection. Unchanged spans retain their postings.
 -- Plain scalar keys project from selected positions in the source Arrow columns.
 -- Retained projected tuples own compact key batches and their memory reservations.
+-- A contiguous, all-valid selection may share compact, layout-compatible Arrow buffers whose backing capacity is known.
 -- A governed put binds its typed Arrow identity to the borrowed identity in its event header.
 -- A world shadow's logical null field marker identifies a local tombstone.
 -- Leaf edits and correction writes select key slots from their Arrow columns across plain and dense-union layouts.

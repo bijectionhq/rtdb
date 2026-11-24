@@ -2798,7 +2798,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.ReadHeldWorldHead.v1",
         "rtdb.owned.SelectHeldWorldParentAsOf.v1",
         "rtdb.owned.SelectHeldWorldAsOf.v1",
-        "rtdb.owned.ReadHeldWorldPointAt.v1",
+        "rtdb.owned.ReadHeldWorldPointAt.v2",
         "rtdb.owned.ReadHeldWorldParentVersionsAt.v1",
         "rtdb.owned.ReadHeldWorldParentChangesAt.v2",
         "rtdb.owned.ReadHeldWorldAncestorChanges.v2",
@@ -2976,7 +2976,7 @@ async fn catalog_actions_publish_exact_position_and_wake_a_separate_session() {
 
     let publication = CatalogPublication {
         before: vec![CatalogStatement {
-            sql: "ASSERT $1 = 'guard' AND SUBSTRING(CAST($2 AS TEXT) FROM 3) = '00ff'".into(),
+            sql: "ASSERT $1 = 'guard' AND $2 = X'00ff'".into(),
             args: catalog_ipc(
                 &["_0", "_1"],
                 vec![Arc::new(StringArray::from(vec!["guard"])),
@@ -2996,7 +2996,7 @@ async fn catalog_actions_publish_exact_position_and_wake_a_separate_session() {
     assert_eq!(resumed[0].body.as_ref(), 1i64.to_be_bytes());
 
     let check = format!(
-        "SELECT _id FROM bj_kernel_writes WHERE key = '00ff' AND idx = 0 AND op = 'put'
+        "SELECT _id FROM bj_kernel_writes WHERE key = X'00ff' AND idx = 0 AND op = 'put'
          AND label = 'catalog' AND 'unit' = ANY(units) AND number IS NULL
          AND value = OVERLAY(OVERLAY(X'7f0000000000000000aa000000000000000080'
                        PLACING EPOCH_NANOS_BE(_system_from) FROM 11 FOR 8)
@@ -3018,12 +3018,12 @@ async fn catalog_scan_returns_bound_binary_at_the_original_snapshot() {
     }).await;
     let mut writer = Client::connect(&running.server, Some("xtdb:secret")).await;
     let mut reader = Client::connect(&running.server, Some("xtdb:secret")).await;
-    writer.update("INSERT INTO bj_kernel_writes RECORDS {_id: 'one', key: '00ff'}", None).await;
+    writer.update("INSERT INTO bj_kernel_writes (_id, key) VALUES ('one', X'00ff')", None).await;
     let original = writer.query("SELECT SNAPSHOT_TOKEN AS token").await;
     let token = original[0].column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0);
-    writer.update("INSERT INTO bj_kernel_writes RECORDS {_id: 'two', key: '01ff'}", None).await;
+    writer.update("INSERT INTO bj_kernel_writes (_id, key) VALUES ('two', X'01ff')", None).await;
     let scan = CatalogStatement {
-        sql: "SELECT CAST(key AS BYTEA) AS key FROM bj_kernel_writes WHERE key >= SUBSTRING(CAST($2 AS TEXT) FROM 3) ORDER BY key".into(),
+        sql: "SELECT key FROM bj_kernel_writes WHERE key >= $2 ORDER BY key".into(),
         args: catalog_ipc(&["_0", "_1"], vec![
             Arc::new(StringArray::from(vec![token])),
             Arc::new(BinaryArray::from_vec(vec![&[0, 0xff]])),

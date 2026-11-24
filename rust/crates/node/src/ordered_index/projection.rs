@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use bytes::Bytes;
 use rtdb_columnar::{ArrowCell, MemoryBudget, MemoryReservation};
 use rtdb_format::data::{EncodedEvent, EventBatch, PageEvent};
 use rtdb_temporal::HistoryResolver;
@@ -322,12 +323,17 @@ impl Changes {
         let identity = keyed.then(|| column("_id")).flatten();
         let marker = matches!(layout, KeyLayout::World).then(|| column(WorldShadow::FIELDS)).flatten();
         for events in events[skip.min(events.len())..].chunks(128) {
-            let _cells = memory.reserve(
+            let _scratch = memory.reserve(
                 events
                     .len()
                     .saturating_mul(columns.len())
                     .saturating_mul(size_of::<AtomRef<'_>>())
-                    .saturating_add(8192),
+                    .saturating_add(8192)
+                    .saturating_add(if keyed {
+                        events.len().saturating_mul(128)
+                    } else {
+                        0
+                    }),
             )?;
             let mut retained = Vec::new();
             let mut rows = Vec::new();
@@ -393,12 +399,21 @@ impl Changes {
                     .shrink_to(keys.retained_bytes())?;
                 Some(ProjectedKeys::new(keys, allocation))
             };
+            let mut address_keys = BTreeMap::new();
             for (header, address, row) in retained {
                 let allocation = memory.reserve(address.key.len().saturating_add(256))?;
+                let key = if address.key.is_empty() {
+                    Bytes::new()
+                } else {
+                    address_keys
+                        .entry(address.key)
+                        .or_insert_with(|| Bytes::copy_from_slice(address.key))
+                        .clone()
+                };
                 self.revisions
                     .entry(IndexRevision::of_event(header))
                     .or_default()
-                    .entry(address.owned())
+                    .entry(Address::new(address.iid, key))
                     .or_default()
                     .push(Event {
                         header,
@@ -510,6 +525,66 @@ mod tests {
         }
         keys.sort_unstable();
         keys
+    }
+
+    #[test]
+    fn projection_releases_unknown_source_owners_and_reuses_complete_address_bytes() -> Result<()>
+    {
+        use arrow_array::StringArray;
+        use rtdb_types::EntityId;
+
+        let events = [(0, "one"), (1, "two")].map(|(system, key)| {
+            let mut event = put(1, system, Interval::ALL, 0);
+            event.entity_key = Some(EntityId::Integer(1).handle_bytes().into());
+            let StoredOperation::Put(row) = &mut event.operation else {
+                unreachable!()
+            };
+            row.insert("key".into(), Value::Utf8(key.into()));
+            event
+        });
+        let source_memory = MemoryBudget::new(32 << 20);
+        let projection_memory = MemoryBudget::new(32 << 20);
+        let batch = IndexBatch::from_events(&events, &StructFields::new(), &source_memory)?;
+        let source = batch
+            .view()
+            .put_document()?
+            .unwrap()
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0)
+            .as_ptr();
+        let mut changes = Changes::default();
+        changes.add_batch(
+            batch.view(),
+            0,
+            &["key".into()],
+            &projection_memory,
+            &CancellationToken::new(),
+            KeyLayout::Governed,
+            |_, _| true,
+        )?;
+        drop(batch);
+
+        let mut rows = changes
+            .revisions
+            .values()
+            .map(|revision| revision.first_key_value().unwrap());
+        let (first, events) = rows.next().unwrap();
+        let (second, _) = rows.next().unwrap();
+        let AtomRef::Text(value) = events[0].tuple.as_ref().unwrap().view().cell(0) else {
+            unreachable!()
+        };
+        assert_eq!(value, "one");
+        assert_ne!(value.as_ptr(), source);
+        assert_eq!(first.view().key.as_ptr(), second.view().key.as_ptr());
+        assert_eq!(source_memory.used_bytes(), 0);
+        assert!(projection_memory.used_bytes() > 0);
+        drop(changes);
+        assert_eq!(projection_memory.used_bytes(), 0);
+        Ok(())
     }
 
     #[tokio::test]

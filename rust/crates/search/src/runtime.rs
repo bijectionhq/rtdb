@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, LargeListArray, StringArray, UInt32Array,
-    builder::{LargeListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::UInt32Type};
+    builder::{Float64Builder, Int64Builder, LargeListBuilder, StringBuilder, UInt32Builder}, cast::AsArray, types::UInt32Type};
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field};
 use parking_lot::Mutex;
@@ -111,6 +111,13 @@ pub(crate) struct LivePostingPage {
     _reservation: Option<Arc<rtdb_columnar::MemoryReservation>>,
 }
 
+#[derive(Default)]
+struct LiveTermPostings {
+    count: usize,
+    last_row: Option<usize>,
+    next: usize,
+}
+
 impl LivePostingPage {
     fn bytes(&self) -> usize {
         self.terms.get_array_memory_size() + self.rows.get_array_memory_size()
@@ -175,40 +182,81 @@ impl LivePostingPage {
             builder.expect("unprepared page has a token builder").finish()
         };
         let values = tokens.values().as_string::<i32>();
-        let offsets = tokens.value_offsets();
+        let token_offsets = tokens.value_offsets();
         let integer_ids = Int64Array::from_iter(ids.iter().map(|id| id.flatten()));
-        let mut postings = BTreeMap::<&str, (Vec<(u32, u32)>, crate::rank_cutoff::RankKey)>::new();
-        for (row, id) in ids.into_iter().enumerate() {
+        let mut postings = BTreeMap::<&str, LiveTermPostings>::new();
+        for row in 0..tokens.len() {
             if cancellation.is_cancelled() { return Ok(None); }
-            let Some(id) = id else { continue; };
-            let mut frequencies = BTreeMap::<&str, u32>::new();
-            for token in offsets[row] as usize..offsets[row + 1] as usize {
-                *frequencies.entry(values.value(token)).or_default() += 1;
-            }
-            for (term, frequency) in frequencies {
-                let score = rtdb_text::unit_term_score(frequency);
-                let (rows, peak) = postings.entry(term).or_insert_with(|| {
-                    (Vec::new(), crate::rank_cutoff::RankKey::integer(score, id))
-                });
-                rows.push((from + row as u32, frequency));
-                if score > peak.score {
-                    *peak = crate::rank_cutoff::RankKey::integer(score, id);
-                } else if score == peak.score {
-                    let minimum = peak.integer_id().zip(id).map(|(left, right)| left.min(right));
-                    *peak = crate::rank_cutoff::RankKey::integer(peak.score, minimum);
+            if tokens.is_null(row) { continue; }
+            for token in token_offsets[row] as usize..token_offsets[row + 1] as usize {
+                let term = postings.entry(values.value(token)).or_default();
+                if term.last_row != Some(row) {
+                    term.count += 1;
+                    term.last_row = Some(row);
                 }
             }
         }
+        if cancellation.is_cancelled() { return Ok(None); }
+        let offsets = OffsetBuffer::<i64>::from_lengths(postings.values().map(|term| term.count));
+        let len = offsets[postings.len()] as usize;
+        if len > available / (2 * size_of::<u32>()) { return Ok(None); }
         let terms = StringArray::from_iter_values(postings.keys().copied());
-        let (postings, peaks): (Vec<_>, Vec<_>) = postings.into_values().unzip();
-        let offsets = OffsetBuffer::from_lengths(postings.iter().map(Vec::len));
-        let rows = UInt32Array::from_iter_values(postings.iter().flatten().map(|&(row, _)| row));
-        let frequencies = UInt32Array::from_iter_values(postings.into_iter().flatten().map(|(_, frequency)| frequency));
+        let mut rows = vec![0u32; len];
+        let mut frequencies = vec![0u32; len];
+        for (term, &start) in postings.values_mut().zip(offsets.iter()) {
+            term.next = start as usize;
+            term.last_row = None;
+        }
+        for row in 0..tokens.len() {
+            if cancellation.is_cancelled() { return Ok(None); }
+            if tokens.is_null(row) { continue; }
+            for token in token_offsets[row] as usize..token_offsets[row + 1] as usize {
+                let term = postings.get_mut(values.value(token)).expect("counted live term");
+                if term.last_row != Some(row) {
+                    rows[term.next] = from + row as u32;
+                    term.next += 1;
+                    term.last_row = Some(row);
+                }
+                frequencies[term.next - 1] += 1;
+            }
+        }
+        drop(postings);
+
+        let mut peak_scores = Float64Builder::with_capacity(terms.len());
+        let mut peak_ids = Int64Builder::with_capacity(terms.len());
+        for span in offsets.windows(2) {
+            if cancellation.is_cancelled() { return Ok(None); }
+            let range = span[0] as usize..span[1] as usize;
+            let mut peak_score = 0.0;
+            let mut peak_id = None;
+            for (&row, &frequency) in rows[range.clone()].iter().zip(&frequencies[range]) {
+                let score = rtdb_text::unit_term_score(frequency);
+                let row = (row - from) as usize;
+                let id = integer_ids.is_valid(row).then(|| integer_ids.value(row));
+                if score > peak_score {
+                    peak_score = score;
+                    peak_id = id;
+                } else if score == peak_score {
+                    peak_id = peak_id.zip(id).map(|(left, right)| left.min(right));
+                }
+            }
+            peak_scores.append_value(peak_score);
+            peak_ids.append_option(peak_id);
+        }
         let field = Arc::new(Field::new("item", DataType::UInt32, false));
-        Ok(Some(Self { first_row: from, terms,
-            rows: LargeListArray::new(field, offsets, Arc::new(rows), None), tokens, shared_tokens, frequencies, ids: integer_ids,
-            peak_scores: Float64Array::from_iter_values(peaks.iter().map(|peak| peak.score)),
-            peak_ids: Int64Array::from_iter(peaks.into_iter().map(crate::rank_cutoff::RankKey::integer_id)), minimum_id, _reservation: None }))
+        Ok(Some(Self {
+            first_row: from,
+            terms,
+            rows: LargeListArray::new(field, offsets, Arc::new(UInt32Array::from(rows)), None),
+            frequencies: UInt32Array::from(frequencies),
+            tokens,
+            shared_tokens,
+            ids: integer_ids,
+            peak_scores: peak_scores.finish(),
+            peak_ids: peak_ids.finish(),
+            minimum_id,
+            _reservation: None,
+        }))
     }
 
     fn term_index(&self, term: &str) -> Option<usize> {
@@ -1045,10 +1093,38 @@ mod tests {
         assert!(page.tokens.is_null(0));
         assert!(page.tokens.value_offsets()[0] > 0);
         assert_eq!(page.postings("audit"), Some(&[2][..]));
+        assert_eq!(page.frequencies.values(), &[2, 1]);
         assert!(rtdb_text::Query::parse(r#""report audit""#).matches_arrow(&page.tokens(2)));
         assert!(delta_memory.used_bytes() > 0);
         drop(page);
         assert_eq!(delta_memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn live_posting_columns_align_frequencies_and_peak_ties() {
+        let row = |text, integer_id| Some(LiveText { text, integer_id });
+        let page = LivePostingPage::from_text(
+            40,
+            &[
+                row("pear apple pear", Some(9)),
+                None,
+                row("apple pear pear", Some(3)),
+                row("apple", None),
+                row("", Some(1)),
+            ],
+            rtdb_text::Analyzer::Simple,
+            1 << 20,
+            &CancellationToken::new(),
+            None,
+        ).unwrap().unwrap();
+        assert_eq!(page.terms.iter().collect::<Vec<_>>(), [Some("apple"), Some("pear")]);
+        assert_eq!(page.rows.value_offsets(), &[0, 3, 5]);
+        assert_eq!(page.postings("apple"), Some(&[40, 42, 43][..]));
+        assert_eq!(page.postings("pear"), Some(&[40, 42][..]));
+        assert_eq!(page.frequencies.values(), &[1, 1, 1, 2, 2]);
+        assert_eq!(page.peak_scores.values(), &[rtdb_text::unit_term_score(1), rtdb_text::unit_term_score(2)]);
+        assert_eq!(page.peak_ids.iter().collect::<Vec<_>>(), [None, Some(3)]);
+        assert_eq!(page.minimum_id, None);
     }
 
     #[test]

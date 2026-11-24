@@ -9,7 +9,8 @@ impl Service {
         &self,
         call: &Call,
         body: &Bytes,
-    ) -> Result<ActionResult, Status> {
+        stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         use arrow_array::builder::{BinaryBuilder, Int64Builder, StringBuilder};
         use rtdb_types::Interval;
 
@@ -94,10 +95,10 @@ impl Service {
         }
         let schema = Arc::new(rows.schema_ref().as_ref().clone().with_metadata(metadata));
         let reply = if rows.num_rows() == 0 {
-            self.owned_stream_reply(&schema, &[])?
+            self.encode_owned_stream_reply(self.memory(), &schema, &[], stream)?
         } else {
             let rows = RecordBatch::try_new(Arc::clone(&schema), rows.columns().to_vec()).map_err(arrow)?;
-            self.owned_stream_reply(&schema, &[rows])?
+            self.encode_owned_stream_reply(self.memory(), &schema, &[rows], stream)?
         };
         held.snapshot.check_relation(&relation).map_err(status)?;
         Ok(reply)

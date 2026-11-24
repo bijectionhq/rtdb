@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{Array, StringArray, UInt64Array};
 use rtdb_columnar::{EntityIdRef, MemoryBudget, MemoryReservation};
@@ -10,7 +7,7 @@ use rtdb_query::QueryContext;
 use rtdb_text::{Corpus, Query, Scorer};
 use rtdb_types::{Anomaly, AnomalyCategory, EntityId, OwnedRelation, Result, Timestamp, Value};
 
-use crate::{OwnedSearchBatch, OwnedSearchHit, OwnedSearchPage, accelerate::OwnedRankWindow};
+use crate::{OwnedSearchBatch, OwnedSearchPage, accelerate::{OwnedRankWindow, RankedIdentity}};
 
 /// Resolve a declared single-column search path on its admitted archive cut.
 pub async fn owned_text_column(
@@ -59,8 +56,6 @@ const MAX_IDENTITIES: usize = 4096;
 const MAX_TEXT_BYTES: usize = 8 << 20;
 
 struct Match {
-    id: EntityId,
-    partition: usize,
     length: u32,
     frequencies: Vec<u32>,
 }
@@ -114,8 +109,10 @@ impl<'a> TextShadows<'a> {
         check()?;
         let mut corpus = HeldTextCorpus::new(memory, analyzer, text)?;
         for (partition, id, text) in self.rows() {
-            corpus.admit_shadow(partition, id, text)?;
-            corpus.insert_shadow(partition, id.into_owned())?;
+            let matched = corpus.observe(id, text)?;
+            if corpus.shadows.entry(partition).or_default().insert(id.into_owned(), matched).is_some() {
+                return Err(corpus_limit());
+            }
             check()?;
         }
         Ok(corpus)
@@ -126,13 +123,13 @@ impl<'a> TextShadows<'a> {
 /// Only match frequencies are retained. Scoring waits for the complete corpus.
 pub struct HeldTextCorpus {
     memory: Arc<MemoryBudget>,
-    retained: Arc<MemoryReservation>,
     query: Query,
     corpus: Corpus,
-    matches: Vec<Match>,
-    shadows: BTreeMap<usize, BTreeSet<EntityId>>,
+    shadows: BTreeMap<usize, BTreeMap<EntityId, Option<Match>>>,
+    roots: BTreeMap<usize, BTreeMap<EntityId, Option<Match>>>,
     identities: usize,
     text_bytes: usize,
+    retained: Arc<MemoryReservation>,
 }
 
 impl HeldTextCorpus {
@@ -145,31 +142,42 @@ impl HeldTextCorpus {
         let query = Query::analyzed(analyzer, text);
         Ok(Self {
             memory,
-            retained,
             query,
             corpus: Corpus::default(),
-            matches: Vec::new(),
             shadows: BTreeMap::new(),
+            roots: BTreeMap::new(),
             identities: 0,
             text_bytes: 0,
+            retained,
         })
     }
 
-    fn observe(&mut self, partition: usize, id: EntityIdRef<'_>, text: Option<&str>) -> Result<()> {
-        self.identities += 1;
-        if self.identities > MAX_IDENTITIES {
+    fn observe(&mut self, id: EntityIdRef<'_>, text: Option<&str>) -> Result<Option<Match>> {
+        if self.identities >= MAX_IDENTITIES {
             return Err(corpus_limit());
         }
+        let entry_charge = identity_charge(id) + 192;
+        let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
         let Some(text) = text else {
-            return Ok(());
+            retained.grow_to(retained.bytes().saturating_add(entry_charge))?;
+            self.identities += 1;
+            return Ok(None);
         };
-        self.text_bytes = self
+        let text_bytes = self
             .text_bytes
             .checked_add(text.len())
             .filter(|total| *total <= MAX_TEXT_BYTES)
             .ok_or_else(corpus_limit)?;
         let _tokens = self.memory.reserve(4096 + 64 * text.len())?;
         let (tokens, frequencies, matched) = self.query.text_terms(text, true);
+        let match_charge = if matched {
+            256 + 4 * frequencies.capacity()
+        } else {
+            0
+        };
+        retained.grow_to(retained.bytes().saturating_add(entry_charge + match_charge))?;
+        self.identities += 1;
+        self.text_bytes = text_bytes;
         self.corpus.documents += 1;
         self.corpus.tokens += tokens.len() as u64;
         for (term, &count) in self.query.terms().iter().zip(&frequencies) {
@@ -177,42 +185,26 @@ impl HeldTextCorpus {
                 *self.corpus.frequencies.entry(term.clone()).or_default() += 1;
             }
         }
-        if matched {
-            let charge = identity_charge(id) + 256 + 4 * frequencies.capacity();
-            let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
-            retained.grow_to(retained.bytes().saturating_add(charge))?;
-            self.matches.push(Match {
-                id: id.into_owned(),
-                partition,
-                length: rtdb_text::stored_length(tokens.len()),
-                frequencies,
-            });
-        }
-        Ok(())
+        Ok(matched.then(|| Match { length: rtdb_text::stored_length(tokens.len()), frequencies }))
     }
 
     /// Register an exact typed overlay shadow, even if it contributes no text.
     pub fn shadow(&mut self, partition: usize, id: EntityId, text: Option<&str>) -> Result<()> {
-        self.admit_shadow(partition, EntityIdRef::from(&id), text)?;
-        self.insert_shadow(partition, id)
-    }
-
-    fn admit_shadow(&mut self, partition: usize, id: EntityIdRef<'_>, text: Option<&str>) -> Result<()> {
-        self.observe(partition, id, text)?;
-        let charge = identity_charge(id) + 192;
-        let retained = Arc::get_mut(&mut self.retained).expect("exclusive corpus reservation");
-        retained.grow_to(retained.bytes().saturating_add(charge))
-    }
-
-    fn insert_shadow(&mut self, partition: usize, id: EntityId) -> Result<()> {
-        if !self.shadows.entry(partition).or_default().insert(id) {
+        if self.contains_shadow(partition, &id) {
             return Err(corpus_limit());
         }
+        let matched = self.observe(EntityIdRef::from(&id), text)?;
+        self.shadows.entry(partition).or_default().insert(id, matched);
         Ok(())
     }
 
     pub fn contains_shadow(&self, partition: usize, id: &EntityId) -> bool {
-        self.shadows.get(&partition).is_some_and(|ids| ids.contains(id))
+        self.shadows.get(&partition).is_some_and(|rows| rows.contains_key(id))
+    }
+
+    pub(crate) fn contains_shadow_key(&self, partition: usize, id: EntityIdRef<'_>) -> bool {
+        self.shadows.get(&partition)
+            .is_some_and(|rows| rows.keys().any(|key| EntityIdRef::from(key) == id))
     }
 
     pub(crate) async fn read_root_partition(
@@ -240,7 +232,6 @@ impl HeldTextCorpus {
         let Some(mut cursor) = rtdb_query::open_owned_root_projection(
             Arc::clone(context), owner, relation, valid, &columns,
         ).await? else { return Err(corpus_limit()); };
-        let shadows = self.shadows.remove(&partition).unwrap_or_default();
         while let Some(batch) = cursor.next_batch().await? {
             let batch = batch.batch();
             let schema = batch.schema_ref();
@@ -256,9 +247,11 @@ impl HeldTextCorpus {
                 let physical = rtdb_columnar::read_entity_id(id_field, ids, row)?;
                 let protected = sealed.then(|| crate::rank_family::RootProjectionId::parse(physical)).transpose()?;
                 let id = protected.as_ref().map_or(physical, |id| id.canonical()).into_owned();
-                if shadows.contains(&id) { continue; }
+                if self.contains_shadow(partition, &id) { continue; }
+                if self.roots.get(&partition).is_some_and(|rows| rows.contains_key(&id)) {
+                    return Err(if sealed { crate::rank_family::unavailable() } else { corpus_limit() });
+                }
                 if let Some(protected) = protected {
-                    if self.contains_shadow(partition, &id) { return Err(crate::rank_family::unavailable()); }
                     protected.require(context, owner, relation, valid, batch, row).await?;
                 }
                 let value = match rtdb_columnar::owned_text_cell(&logical, text_field, text, row)? {
@@ -266,14 +259,11 @@ impl HeldTextCorpus {
                     rtdb_columnar::TextCell::Missing => None,
                     rtdb_columnar::TextCell::Other => return Err(corpus_limit()),
                 };
-                self.shadow(partition, id, value)?;
+                let matched = self.observe(EntityIdRef::from(&id), value)?;
+                self.roots.entry(partition).or_default().insert(id, matched);
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn shadowed(&self, partition: usize) -> Option<&BTreeSet<EntityId>> {
-        self.shadows.get(&partition)
     }
 
     pub(crate) fn statistics(&self) -> &Corpus {
@@ -287,15 +277,18 @@ impl HeldTextCorpus {
         Ok(())
     }
 
-    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow) -> Result<()> {
-        for matched in self.matches {
+    pub(crate) fn rank(self, scorer: &Scorer, window: &mut OwnedRankWindow<'_>) -> Result<()> {
+        let matches = self.shadows.into_iter().chain(self.roots).flat_map(|(partition, rows)| {
+            rows.into_iter().filter_map(move |(id, matched)| matched.map(|matched| (partition, id, matched)))
+        });
+        for (partition, id, matched) in matches {
             window.admit_candidate()?;
             let score = scorer.score(&matched.frequencies, matched.length);
             if !score.is_finite() {
                 return Err(corpus_limit());
             }
-            if let Some(at) = window.position(matched.partition, rtdb_columnar::EntityIdRef::from(&matched.id), score) {
-                window.insert_at(at, OwnedSearchHit { partition: matched.partition, id: matched.id, score })?;
+            if let Some(at) = window.position(partition, EntityIdRef::from(&id), score) {
+                window.insert_at(at, partition, RankedIdentity::Held(id), score)?;
             }
         }
         Ok(())
@@ -352,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn held_corpus_charges_compact_ids_for_shadows_and_matches() {
+    fn held_corpus_charges_each_typed_identity_once() {
         let mut text = String::with_capacity(1024);
         text.push_str("places/東京");
         let ids = [
@@ -365,23 +358,65 @@ mod tests {
         for (partition, id) in ids.into_iter().enumerate() {
             let expected = id.as_value().retained_bytes().unwrap();
             let before = corpus.retained.bytes();
+            let key = id.clone();
             corpus.shadow(partition, id, Some("apples")).unwrap();
-            let matched = corpus.matches.last().unwrap();
-            assert_eq!(corpus.retained.bytes() - before, 2 * expected + 192 + 256 + 4 * matched.frequencies.capacity());
+            let matched = corpus.shadows[&partition][&key].as_ref().unwrap();
+            assert_eq!(corpus.retained.bytes() - before, expected + 192 + 256 + 4 * matched.frequencies.capacity());
         }
         let before = corpus.retained.bytes();
         let id = EntityId::String("deleted".into());
         let expected = id.as_value().retained_bytes().unwrap();
         corpus.shadow(0, id, None).unwrap();
         assert_eq!(corpus.retained.bytes() - before, expected + 192);
-        assert_eq!(corpus.matches.len(), 4);
+    }
+
+    #[test]
+    fn held_shadows_reject_duplicate_typed_keys_and_rank_ties_by_key_then_partition() {
+        let mut corpus = HeldTextCorpus::new(MemoryBudget::new(1 << 20), rtdb_text::Analyzer::Simple, "apples").unwrap();
+        let string = EntityId::String("fruit/東京".into());
+        let keyword = EntityId::Keyword(rtdb_types::Keyword::from_name("fruit/東京"));
+        corpus.shadow(1, string.clone(), Some("apples")).unwrap();
+        corpus.shadow(0, keyword.clone(), Some("apples")).unwrap();
+        assert!(!corpus.contains_shadow_key(0, EntityIdRef::from(&string)));
+        corpus.shadow(0, string.clone(), Some("apples")).unwrap();
+        let before = corpus.retained.bytes();
+        let error = corpus.shadow(0, string.clone(), Some("apples apples")).unwrap_err();
+        assert_eq!(error.code, "rtdb.owned/search-held-corpus-limit");
+        assert_eq!(corpus.retained.bytes(), before);
+        assert_eq!(corpus.statistics().documents, 3);
+        assert_eq!(corpus.statistics().tokens, 3);
+        let page = corpus.finish(0, 3).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.hits.into_iter().map(|hit| (hit.id, hit.partition)).collect::<Vec<_>>(),
+            [(string.clone(), 0), (string, 1), (keyword, 0)]);
+    }
+
+    #[test]
+    fn held_root_match_charges_one_typed_identity_and_ranks_it() {
+        let mut corpus = HeldTextCorpus::new(
+            MemoryBudget::new(1 << 20),
+            rtdb_text::Analyzer::Simple,
+            "apples",
+        ).unwrap();
+        let id = EntityId::String("places/東京".repeat(32));
+        let key = EntityIdRef::from(&id);
+        let before = corpus.retained.bytes();
+        let matched = corpus.observe(key, Some("apples")).unwrap().unwrap();
+        assert_eq!(
+            corpus.retained.bytes() - before,
+            identity_charge(key) + 192 + 256 + 4 * matched.frequencies.capacity(),
+        );
+        corpus.roots.entry(0).or_default().insert(id.clone(), Some(matched));
+        let page = corpus.finish(0, 1).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.hits[0].id, id);
     }
 
     #[test]
     fn staged_arrow_shadows_borrow_text_and_replace_committed_documents() {
-        let partitions = UInt64Array::from(vec![0, 0, 1]);
-        let ids = StringArray::from(vec!["replaced", "deleted", "empty"]);
-        let text = StringArray::from(vec![Some("pears"), None, Some("")]);
+        let partitions = UInt64Array::from(vec![0, 0, 1, 1]);
+        let ids = StringArray::from(vec!["replaced", "deleted", "empty", "staged"]);
+        let text = StringArray::from(vec![Some("pears"), None, Some(""), Some("apples")]);
         let shadows = TextShadows::try_new(&partitions, &ids, &text, |_, _| true).unwrap();
         {
             let mut rows = shadows.rows();
@@ -398,15 +433,18 @@ mod tests {
         assert!(corpus.contains_shadow(0, &replaced));
         assert!(corpus.contains_shadow(0, &deleted));
         assert!(corpus.contains_shadow(1, &EntityId::String("empty".into())));
+        assert!(corpus.contains_shadow_key(1, EntityIdRef::String("staged")));
         assert!(!corpus.contains_shadow(1, &replaced));
         for id in [replaced, deleted, unchanged.clone()] {
             if !corpus.contains_shadow(0, &id) {
                 corpus.shadow(0, id, Some("apples")).unwrap();
             }
         }
-        assert_eq!(corpus.statistics().documents, 3);
+        assert_eq!(corpus.statistics().documents, 4);
         let page = corpus.finish(0, 10).unwrap();
-        assert_eq!(page.total, 1);
-        assert_eq!(page.hits[0].id, unchanged);
+        assert_eq!(page.total, 2);
+        assert_eq!(page.hits[0].id, EntityId::String("staged".into()));
+        assert_eq!(page.hits[0].partition, 1);
+        assert_eq!(page.hits[1].id, unchanged);
     }
 }

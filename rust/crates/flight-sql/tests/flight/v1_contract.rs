@@ -122,11 +122,18 @@ async fn query_parameters_require_one_row_and_continuations_bind_the_exact_ipc()
 
 #[tokio::test]
 async fn query_parameter_binding_preserves_result_types_and_errors() {
-    use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, UInt64Array};
+    use arrow_array::{
+        Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int32Array, ListArray, NullArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array, cast::AsArray, types::Float32Type,
+    };
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
     use rtdb_types::Value;
 
     fn parameter(values: ArrayRef) -> Vec<u8> {
-        let batch = RecordBatch::try_from_iter([("argument", values)]).unwrap();
+        let nullable = values.is_nullable();
+        let batch =
+            RecordBatch::try_from_iter_with_nullable([("argument", values, nullable)]).unwrap();
         rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
     }
 
@@ -135,15 +142,103 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
     let single_nan = f32::from_bits(0x7fc0_0042);
     let double_nan = f64::from_bits(0x7ff8_0000_0000_0042);
     for (values, data_type, expected) in [
-        (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, DataType::Boolean, Value::Bool(true)),
-        (Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef, DataType::Int32, Value::I32(i32::MIN)),
-        (Arc::new(Float32Array::from(vec![single_nan])) as ArrayRef, DataType::Float32, Value::F32(single_nan)),
-        (Arc::new(Float32Array::from(vec![-0.0])) as ArrayRef, DataType::Float32, Value::F32(-0.0)),
-        (Arc::new(Float64Array::from(vec![double_nan])) as ArrayRef, DataType::Float64, Value::F64(double_nan)),
-        (Arc::new(Float64Array::from(vec![-0.0])) as ArrayRef, DataType::Float64, Value::F64(-0.0)),
-        (Arc::new(Float32Array::from(vec![None])) as ArrayRef, DataType::Float32, Value::Null),
-        (Arc::new(Int64Array::from(vec![None])) as ArrayRef, DataType::Int64, Value::Null),
-        (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, DataType::Int64, Value::I64(-1)),
+        (
+            Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+            DataType::Boolean,
+            Value::Bool(true),
+        ),
+        (
+            Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef,
+            DataType::Int32,
+            Value::I32(i32::MIN),
+        ),
+        (
+            Arc::new(Float32Array::from(vec![single_nan])) as ArrayRef,
+            DataType::Float32,
+            Value::F32(single_nan),
+        ),
+        (
+            Arc::new(Float32Array::from(vec![-0.0])) as ArrayRef,
+            DataType::Float32,
+            Value::F32(-0.0),
+        ),
+        (
+            Arc::new(Float64Array::from(vec![double_nan])) as ArrayRef,
+            DataType::Float64,
+            Value::F64(double_nan),
+        ),
+        (
+            Arc::new(Float64Array::from(vec![-0.0])) as ArrayRef,
+            DataType::Float64,
+            Value::F64(-0.0),
+        ),
+        (
+            Arc::new(Float32Array::from(vec![None])) as ArrayRef,
+            DataType::Float32,
+            Value::Null,
+        ),
+        (
+            Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+            DataType::Int64,
+            Value::Null,
+        ),
+        (
+            Arc::new(NullArray::new(1)) as ArrayRef,
+            DataType::Null,
+            Value::Null,
+        ),
+        (
+            Arc::new(StringArray::from(vec!["café"])) as ArrayRef,
+            DataType::Utf8,
+            Value::Utf8("café".into()),
+        ),
+        (
+            Arc::new(BinaryArray::from(vec![&b"\x00\xff"[..]])) as ArrayRef,
+            DataType::Binary,
+            Value::Binary(vec![0, 255]),
+        ),
+        (
+            Arc::new(Date32Array::from(vec![-42])) as ArrayRef,
+            DataType::Date32,
+            Value::DateDay(-42),
+        ),
+        (
+            Arc::new(
+                Decimal128Array::from(vec![-123])
+                    .with_precision_and_scale(8, 2)
+                    .unwrap(),
+            ) as ArrayRef,
+            DataType::Decimal128(8, 2),
+            Value::Decimal(
+                rtdb_types::DecimalValue::new((-123_i128).to_be_bytes().to_vec(), 8, 2, 128)
+                    .unwrap(),
+            ),
+        ),
+        (
+            Arc::new(UInt8Array::from(vec![u8::MAX])) as ArrayRef,
+            DataType::Int8,
+            Value::I8(-1),
+        ),
+        (
+            Arc::new(UInt16Array::from(vec![u16::MAX])) as ArrayRef,
+            DataType::Int16,
+            Value::I16(-1),
+        ),
+        (
+            Arc::new(UInt32Array::from(vec![u32::MAX])) as ArrayRef,
+            DataType::Int32,
+            Value::I32(-1),
+        ),
+        (
+            Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef,
+            DataType::Int64,
+            Value::I64(-1),
+        ),
+        (
+            Arc::new(UInt64Array::from(vec![None])) as ArrayRef,
+            DataType::Int64,
+            Value::Null,
+        ),
     ] {
         let mut request = input("SELECT $1 AS n");
         request.params_ipc = Some(parameter(values));
@@ -153,11 +248,39 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
         assert_eq!(field.data_type(), &data_type);
         let actual = rtdb_columnar::read_value(field, batch.column(0).as_ref(), 0).unwrap();
         match (actual, expected) {
-            (Value::F32(actual), Value::F32(expected)) => assert_eq!(actual.to_bits(), expected.to_bits()),
-            (Value::F64(actual), Value::F64(expected)) => assert_eq!(actual.to_bits(), expected.to_bits()),
+            (Value::F32(actual), Value::F32(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits())
+            }
+            (Value::F64(actual), Value::F64(expected)) => {
+                assert_eq!(actual.to_bits(), expected.to_bits())
+            }
             (actual, expected) => assert_eq!(actual, expected),
         }
     }
+
+    let item = Arc::new(Field::new("$data$", DataType::Float32, false));
+    let list = ListArray::new(
+        Arc::clone(&item),
+        OffsetBuffer::new(ScalarBuffer::from(vec![0, 2])),
+        Arc::new(Float32Array::from(vec![-0.0, single_nan])),
+        None,
+    );
+    let mut request = input("SELECT $1 AS n");
+    request.params_ipc = Some(parameter(Arc::new(list)));
+    let (batches, _) = query(&mut client, request).await;
+    let batch = &batches[0];
+    assert_eq!(
+        batch.schema_ref().field(0).data_type(),
+        &DataType::List(item)
+    );
+    let values = batch.column(0).as_list::<i32>().value(0);
+    let values = values.as_primitive::<Float32Type>();
+    assert_eq!(values.value(0).to_bits(), (-0.0_f32).to_bits());
+    assert_eq!(values.value(1).to_bits(), single_nan.to_bits());
+
+    let mut request = input("SELECT 10::BIGINT / $1 AS n");
+    request.params_ipc = Some(parameter(Arc::new(UInt64Array::from(vec![u64::MAX]))));
+    assert_eq!(ints(&query(&mut client, request).await.0), [-10]);
 
     for values in [
         Arc::new(Int64Array::from(vec![0])) as ArrayRef,
@@ -165,10 +288,48 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
     ] {
         let mut request = input("SELECT 10::BIGINT / $1 AS n");
         request.params_ipc = Some(parameter(values));
-        let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
-        let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        let status = get::<_, v1::QueryTrailer>(&mut client, request)
+            .await
+            .unwrap_err();
+        let detail = error(
+            status,
+            v1::AnomalyCategory::Incorrect,
+            "rtdb/invalid-request",
+        );
         assert_eq!(detail.message, "data exception - division by zero");
     }
+
+    let uri = rtdb_columnar::to_field(
+        "address",
+        &rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Uri),
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("divisor", DataType::Int64, false),
+        uri,
+    ]));
+    let invalid_uri = "1:bad-scheme";
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![0])),
+            Arc::new(StringArray::from(vec![invalid_uri])),
+        ],
+    )
+    .unwrap();
+    let mut request = input("SELECT 10::BIGINT / $1 AS n, $2 AS address");
+    request.params_ipc = Some(
+        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap(),
+    );
+    let status = get::<_, v1::QueryTrailer>(&mut client, request)
+        .await
+        .unwrap_err();
+    let detail = error(
+        status,
+        v1::AnomalyCategory::Incorrect,
+        "rtdb/invalid-request",
+    );
+    assert_eq!(detail.message, "Illegal scheme name");
     running.stop().await;
 }
 

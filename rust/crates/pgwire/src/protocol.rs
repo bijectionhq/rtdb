@@ -196,7 +196,12 @@ impl ProtocolSession {
         }
         if self.skip_until_sync && frame.tag != b'S' { return Ok(()); }
         if self.copy.is_some() && matches!(frame.tag, b'S' | b'H') { return Ok(()); }
-        let result = self.message(&frame, writer).await;
+        let result = if frame.tag == b'd' {
+            self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))
+                .and_then(|copy| copy.append(frame))
+        } else {
+            self.message(&frame, writer).await
+        };
         if let Err(error) = result {
             if error.code == "xtdb.pgwire/connection-error" { return Err(error); }
             if self.extended { self.skip_until_sync = true; }
@@ -300,7 +305,6 @@ impl ProtocolSession {
             b'C' => { let kind = input.byte()?; let name = input.string()?; input.end()?; match kind { b'P' => { self.portals.remove(name); }, b'S' => { if let Some(statement) = self.statements.remove(name) { self.portals.retain(|_, portal| !Arc::ptr_eq(&portal.prepared, &statement.prepared)); } }, _ => return Err(protocol("Invalid close target")) } writer.empty(b'3').await?; }
             b'S' => { input.end()?; if self.implicit { let result = if self.session.state().status() == TransactionStatus::Failed { self.rollback() } else { self.commit(None).await }; if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; } } self.skip_until_sync = false; self.extended = false; self.report_ready(writer).await?; }
             b'H' => { input.end()?; writer.flush().await?; }
-            b'd' => { self.copy.as_mut().ok_or_else(|| protocol("COPY IN not in progress, cannot write data"))?.append(input.remaining()).await?; }
             b'c' => {
                 input.end()?;
                 let copy = self.copy.take().ok_or_else(|| protocol("COPY IN not in progress"))?;

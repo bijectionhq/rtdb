@@ -238,12 +238,40 @@ pub(super) fn record(format: i32, populated: impl IntoIterator<Item = (Table, St
     RecordBatch::try_new(Arc::clone(schema), columns).map_err(fault)
 }
 
+pub(crate) struct FileDigestWriter<W> {
+    output: W,
+    digest: Sha256,
+}
+
+impl<W> FileDigestWriter<W> {
+    pub(crate) fn new(output: W) -> Self {
+        Self { output, digest: Sha256::new() }
+    }
+
+    pub(crate) fn into_digest(self) -> [u8; 32] {
+        self.digest.finalize().into()
+    }
+}
+
+impl<W: Write> Write for FileDigestWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.output.write(buf)?;
+        self.digest.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.output.flush()
+    }
+}
+
 struct DigestWriter<W> {
     writer: W,
     digest: Sha256,
     position: usize,
     prefix: [u8; 8],
     captured: usize,
+    root: Option<Vec<u8>>,
 }
 
 impl<W: Write> Write for DigestWriter<W> {
@@ -253,6 +281,13 @@ impl<W: Write> Write for DigestWriter<W> {
         let copied = written.min(self.prefix.len() - self.captured);
         self.prefix[self.captured..self.captured + copied].copy_from_slice(&buf[..copied]);
         self.captured += copied;
+        if let Some(root) = &mut self.root {
+            if written <= super::MAX_ROOT_BYTES as usize - root.len() {
+                root.extend_from_slice(&buf[..written]);
+            } else {
+                self.root = None;
+            }
+        }
         self.position += written;
         Ok(written)
     }
@@ -304,7 +339,7 @@ impl PageRef {
 impl<W: Write> Writer<W> {
     pub(super) fn new(output: W, format: i32) -> Result<Self> {
         let mut writer = FileWriter::try_new(DigestWriter {
-            writer: output, digest: Sha256::new(), position: 0, prefix: [0; 8], captured: 0,
+            writer: output, digest: Sha256::new(), position: 0, prefix: [0; 8], captured: 0, root: None,
         }, schema(format)).map_err(fault)?;
         writer.get_mut().digest.reset();
         Ok(Self { writer, checksums: String::new(), format })
@@ -313,6 +348,15 @@ impl<W: Write> Writer<W> {
     pub(super) fn page(&mut self, populated: impl IntoIterator<Item = (Table, StructArray)>) -> Result<PageRef> {
         let batch = record(self.format, populated)?;
         self.write_batch(&batch)
+    }
+
+    pub(super) fn root_page(&mut self, populated: impl IntoIterator<Item = (Table, StructArray)>)
+        -> Result<(PageRef, Option<Vec<u8>>)> {
+        // Packed locators may inline the exact bytes of the written root page.
+        self.writer.get_mut().root = (self.format >= super::PACKED_FORMAT_VERSION).then(Vec::new);
+        let page = self.page(populated);
+        let root = self.writer.get_mut().root.take();
+        Ok((page?, root))
     }
 
     pub(super) fn write_batch(&mut self, batch: &RecordBatch) -> Result<PageRef> {
@@ -333,10 +377,12 @@ impl<W: Write> Writer<W> {
         Ok(PageRef { offset: start as u64, metadata, body: body as u64, digest: digest.into() })
     }
 
-    pub(super) fn finish(mut self) -> Result<()> {
+    pub(super) fn finish(mut self) -> Result<u64> {
         self.writer.write_metadata(CHECKSUMS, self.checksums);
         self.writer.finish().map_err(fault)?;
-        self.writer.get_mut().flush().map_err(fault)
+        let output = self.writer.get_mut();
+        output.flush().map_err(fault)?;
+        Ok(output.position as u64)
     }
 }
 

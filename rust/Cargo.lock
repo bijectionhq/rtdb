@@ -3173,7 +3173,7 @@ dependencies = [
 [[package]]
 name = "journal-contract"
 version = "0.1.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb#9c6ece1237441c9775923180ace158398812dfbb"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8#c6531760536758526f7a5b77daaffc6bba51fcb8"
 dependencies = [
  "bytes",
 ]
@@ -3371,13 +3371,13 @@ dependencies = [
 [[package]]
 name = "logkeeper"
 version = "0.2.0"
-source = "git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb#9c6ece1237441c9775923180ace158398812dfbb"
+source = "git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8#c6531760536758526f7a5b77daaffc6bba51fcb8"
 dependencies = [
  "bytes",
  "crc32fast",
  "fs2",
  "futures",
- "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb)",
+ "journal-contract 0.1.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8)",
  "libc",
  "parking_lot",
  "prost",
@@ -5176,7 +5176,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
- "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=9c6ece1237441c9775923180ace158398812dfbb)",
+ "logkeeper 0.2.0 (git+https://github.com/bijectionhq/logkeeper.git?rev=c6531760536758526f7a5b77daaffc6bba51fcb8)",
  "openssl",
  "parking_lot",
  "prost",
@@ -5336,6 +5336,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures",
+ "memmap2",
  "rtdb-auth",
  "rtdb-columnar",
  "rtdb-expr",

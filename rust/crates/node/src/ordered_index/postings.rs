@@ -2,7 +2,8 @@ use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Decimal128Array, FixedSizeBinaryArray, Int64Array,
-    NullArray, RecordBatch, StringArray, UInt8Array, UInt64Array, UnionArray,
+    NullArray, RecordBatch, StringArray, TimestampMicrosecondArray, UInt8Array, UInt64Array,
+    UnionArray,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder, StringBuilder},
 };
 use arrow_buffer::Buffer;
@@ -10,7 +11,7 @@ use arrow_ipc::{
     MetadataVersion,
     reader::read_record_batch,
     root_as_message,
-    writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
+    writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions},
 };
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::Bytes;
@@ -456,38 +457,48 @@ fn select_array(
             .iter()
             .enumerate()
             .all(|(offset, &index)| index == (source, start + offset))
+        && let Some(slice) = compact_slice(arrays[source], start, indices.len())?
     {
-        let slice = arrays[source].slice(start, indices.len());
-        // IPC can carry the rest of a byte through a byte-aligned bitmap slice.
-        let compact_bytes = match slice.data_type() {
-            DataType::Boolean => {
-                let values = arrow::<BooleanArray>(slice.as_ref())?.values();
-                (values.offset().is_multiple_of(8) && values.len().is_multiple_of(8))
-                    .then_some(values.len() / 8)
-            }
-            DataType::Utf8 => {
-                let offsets = arrow::<StringArray>(slice.as_ref())?.value_offsets();
-                Some(size_of_val(offsets).saturating_add(byte_span(offsets)))
-            }
-            DataType::Binary => {
-                let offsets = arrow::<BinaryArray>(slice.as_ref())?.value_offsets();
-                Some(size_of_val(offsets).saturating_add(byte_span(offsets)))
-            }
-            DataType::FixedSizeBinary(width) => Some(slice.len().saturating_mul(*width as usize)),
-            data_type => data_type
-                .primitive_width()
-                .map(|width| slice.len().saturating_mul(width)),
-        };
-        // Bound retained capacity by the selected bytes and Arrow buffer rounding.
-        if slice.null_count() == 0
-            && compact_bytes.is_some_and(|bytes| {
-                slice.get_buffer_memory_size() <= bytes.saturating_mul(2).saturating_add(64)
-            })
-        {
-            return Ok(slice);
-        }
+        return Ok(slice);
     }
     interleave_array(arrays, indices)
+}
+
+fn compact_slice(array: &dyn Array, start: usize, len: usize) -> Result<Option<ArrayRef>> {
+    let data = array.to_data();
+    // Arrow reports zero capacity for external owners, including a view into an entire source file.
+    if data.buffers().iter().any(|buffer| buffer.capacity() == 0)
+        || data.nulls().is_some_and(|nulls| nulls.buffer().capacity() == 0)
+    {
+        return Ok(None);
+    }
+    let slice = array.slice(start, len);
+    // IPC can carry the rest of a byte through a byte-aligned bitmap slice.
+    let compact_bytes = match slice.data_type() {
+        DataType::Boolean => {
+            let values = arrow::<BooleanArray>(slice.as_ref())?.values();
+            (values.offset().is_multiple_of(8) && values.len().is_multiple_of(8))
+                .then_some(values.len() / 8)
+        }
+        DataType::Utf8 => {
+            let offsets = arrow::<StringArray>(slice.as_ref())?.value_offsets();
+            Some(size_of_val(offsets).saturating_add(byte_span(offsets)))
+        }
+        DataType::Binary => {
+            let offsets = arrow::<BinaryArray>(slice.as_ref())?.value_offsets();
+            Some(size_of_val(offsets).saturating_add(byte_span(offsets)))
+        }
+        DataType::FixedSizeBinary(width) => Some(len.saturating_mul(*width as usize)),
+        data_type => data_type
+            .primitive_width()
+            .map(|width| len.saturating_mul(width)),
+    };
+    // Allow for Arrow buffer rounding when comparing reported capacity with selected bytes.
+    Ok((slice.null_count() == 0
+        && compact_bytes.is_some_and(|bytes| {
+            slice.get_buffer_memory_size() <= bytes.saturating_mul(2).saturating_add(64)
+        }))
+    .then_some(slice))
 }
 
 #[derive(Debug)]
@@ -579,8 +590,17 @@ impl Postings {
         self.0.batch.columns().get(self.0.prefix + slot)
     }
 
-    pub fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
-        self.0.encode(header, suffix)
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
+        self.0.stage(header, suffix_len)
+    }
+
+    #[cfg(test)]
+    fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
+        let encoding = self.stage(header, suffix.len())?;
+        let mut bytes = Vec::with_capacity(encoding.encoded_len());
+        encoding.append_batch(&mut bytes);
+        bytes.extend_from_slice(suffix);
+        Ok(bytes)
     }
 
     pub fn decode(bytes: Bytes, max_rows: usize) -> Result<(Self, Bytes)> {
@@ -703,6 +723,28 @@ impl SelectedColumn<'_> {
         }
     }
 
+    fn retain(&self, start: usize, len: usize) -> Result<Option<(Layout, ArrayRef)>> {
+        let Self::Typed(kind, Some(array), _) = *self else {
+            return Ok(None);
+        };
+        if !matches!(
+            kind,
+            Kind::Bool | Kind::Text | Kind::Binary | Kind::Uuid | Kind::InstantMicros
+        ) {
+            return Ok(None);
+        }
+        let Some(slice) = compact_slice(array, start, len)? else {
+            return Ok(None);
+        };
+        let values: ArrayRef = if kind == Kind::InstantMicros {
+            let times = arrow::<TimestampMicrosecondArray>(slice.as_ref())?;
+            Arc::new(Int64Array::new(times.values().clone(), None))
+        } else {
+            slice
+        };
+        Ok(Some((Layout(kind.bit()), values)))
+    }
+
     fn build(self, slot: usize, rows: &arrow_array::UInt32Array) -> Result<(Layout, ArrayRef)> {
         let bytes = self.payload();
         if bytes > i32::MAX as usize { return Err(invalid()); }
@@ -733,8 +775,16 @@ impl SelectedColumn<'_> {
                     };
                     return Ok((layout, values));
                 }
-                let start = rows.value(0) as usize;
-                let selected = if nulls != 0 {
+                let selected = if matches!(
+                    kind,
+                    Kind::Integer
+                        | Kind::Decimal128
+                        | Kind::Day
+                        | Kind::FloatOrder
+                        | Kind::InstantMicros
+                ) {
+                    kind.gather_execution(array, rows.values())?
+                } else if nulls != 0 {
                     // A source null can hide arbitrary bytes in its physical value buffer.
                     let null = arrow_array::new_null_array(array.data_type(), 1);
                     let indices = rows
@@ -746,22 +796,10 @@ impl SelectedColumn<'_> {
                         })
                         .collect::<Vec<_>>();
                     interleave_array(&[array, null.as_ref()], &indices)?
-                } else if matches!(
-                    kind,
-                    Kind::Integer | Kind::Decimal128 | Kind::Day | Kind::FloatOrder
-                ) && array.nulls().is_none()
-                    && rows
-                        .values()
-                        .iter()
-                        .enumerate()
-                        .all(|(offset, &row)| row as usize == start + offset)
-                {
-                    // The conversion allocates the execution values, so the source slice is temporary.
-                    array.slice(start, rows.len())
                 } else {
                     arrow_select::take::take(array, rows, None).map_err(format_error)?
                 };
-                Ok((layout, kind.execution_array(selected)?))
+                Ok((layout, selected))
             }
             Self::Typed(_, None, _) => unreachable!("a missing column has null type"),
             Self::Cells(cells) => {
@@ -774,41 +812,51 @@ impl SelectedColumn<'_> {
 }
 
 impl Kind {
-    fn execution_array(self, array: ArrayRef) -> Result<ArrayRef> {
-        use arrow_array::{types::*, Date32Array, Date64Array, Float32Array, Float64Array,
-            Int8Array, Int16Array, Int32Array, TimestampMicrosecondArray, UInt16Array, UInt32Array};
-        macro_rules! unary {
-            ($array:ty, $output:ty, $convert:expr) => {{
-                let values = arrow::<$array>(array.as_ref())?;
+    fn gather_execution(self, array: &dyn Array, rows: &[u32]) -> Result<ArrayRef> {
+        use arrow_array::{
+            Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
+            Int32Array, UInt16Array, UInt32Array,
+        };
+        macro_rules! gather {
+            ($array:ty, $variant:ident, $convert:expr) => {{
+                let values = arrow::<$array>(array)?;
                 let convert = $convert;
-                Arc::new(if values.null_count() == 0 {
-                    values.unary::<_, $output>(convert)
-                } else {
-                    values.unary_opt::<_, $output>(|value| Some(convert(value)))
-                })
+                self.build(
+                    rows.iter().map(|&row| {
+                        let row = row as usize;
+                        if values.is_null(row) {
+                            AtomRef::Null
+                        } else {
+                            AtomRef::$variant(convert(values.value(row)))
+                        }
+                    }),
+                    0,
+                )
             }};
         }
-        Ok(match self {
-            Self::Integer => {
-                let values = match array.data_type() {
-                    DataType::Int8 => arrow::<Int8Array>(array.as_ref())?.unary(i128::from),
-                    DataType::Int16 => arrow::<Int16Array>(array.as_ref())?.unary(i128::from),
-                    DataType::Int32 => arrow::<Int32Array>(array.as_ref())?.unary(i128::from),
-                    DataType::Int64 => arrow::<Int64Array>(array.as_ref())?.unary(i128::from),
-                    DataType::UInt8 => arrow::<UInt8Array>(array.as_ref())?.unary(|value| i128::from(value as i8)),
-                    DataType::UInt16 => arrow::<UInt16Array>(array.as_ref())?.unary(|value| i128::from(value as i16)),
-                    DataType::UInt32 => arrow::<UInt32Array>(array.as_ref())?.unary(|value| i128::from(value as i32)),
-                    DataType::UInt64 => arrow::<UInt64Array>(array.as_ref())?.unary(|value| i128::from(value as i64)),
-                    _ => return Err(invalid()),
-                };
-                Arc::new(Decimal128Array::with_precision_and_scale(values, INTEGER_PRECISION, 0).map_err(format_error)?)
-            }
+        match self {
+            Self::Integer => match array.data_type() {
+                DataType::Int8 => gather!(Int8Array, Integer, i128::from),
+                DataType::Int16 => gather!(Int16Array, Integer, i128::from),
+                DataType::Int32 => gather!(Int32Array, Integer, i128::from),
+                DataType::Int64 => gather!(Int64Array, Integer, i128::from),
+                DataType::UInt8 => gather!(UInt8Array, Integer, |value| i128::from(value as i8)),
+                DataType::UInt16 => gather!(UInt16Array, Integer, |value| i128::from(value as i16)),
+                DataType::UInt32 => gather!(UInt32Array, Integer, |value| i128::from(value as i32)),
+                DataType::UInt64 => gather!(UInt64Array, Integer, |value| i128::from(value as i64)),
+                _ => Err(invalid()),
+            },
             Self::Decimal128 => {
-                let values = arrow::<Decimal128Array>(array.as_ref())?;
+                let values = arrow::<Decimal128Array>(array)?;
                 let (precision, scale) = (values.precision(), values.scale());
-                let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), 18);
-                for coefficient in values {
-                    let Some(coefficient) = coefficient else { builder.append_null(); continue; };
+                let mut builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 18);
+                for &row in rows {
+                    let row = row as usize;
+                    if values.is_null(row) {
+                        builder.append_null();
+                        continue;
+                    }
+                    let coefficient = values.value(row);
                     if !super::key::decimal_coefficient_fits(precision, coefficient) {
                         return Err(format_error("Decimal128 coefficient exceeds its path declaration"));
                     }
@@ -817,15 +865,26 @@ impl Kind {
                     bytes[2..].copy_from_slice(&coefficient.to_be_bytes());
                     builder.append_value(bytes).map_err(format_error)?;
                 }
-                Arc::new(builder.finish())
+                Ok(Arc::new(builder.finish()))
             }
-            Self::Day if array.data_type() == &DataType::Date32 => unary!(Date32Array, Int64Type, i64::from),
-            Self::Day => unary!(Date64Array, Int64Type, |millis: i64| millis.div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
-            Self::InstantMicros => Arc::new(arrow::<TimestampMicrosecondArray>(array.as_ref())?.reinterpret_cast::<Int64Type>()),
-            Self::FloatOrder if array.data_type() == &DataType::Float32 => unary!(Float32Array, UInt64Type, |value| super::key::float_order(f64::from(value))),
-            Self::FloatOrder => unary!(Float64Array, UInt64Type, super::key::float_order),
-            _ => array,
-        })
+            Self::Day if array.data_type() == &DataType::Date32 => {
+                gather!(Date32Array, Day, i64::from)
+            }
+            Self::Day => gather!(Date64Array, Day, |millis: i64| millis
+                .div_euclid(rtdb_types::java_date::MILLIS_PER_DAY)),
+            Self::InstantMicros => gather!(
+                TimestampMicrosecondArray,
+                InstantMicros,
+                std::convert::identity
+            ),
+            Self::FloatOrder if array.data_type() == &DataType::Float32 => {
+                gather!(Float32Array, FloatOrder, |value| super::key::float_order(
+                    f64::from(value)
+                ))
+            }
+            Self::FloatOrder => gather!(Float64Array, FloatOrder, super::key::float_order),
+            _ => Err(invalid()),
+        }
     }
 }
 
@@ -836,6 +895,35 @@ pub(super) struct KeyBatch {
     prefix: usize,
     bytes: usize,
     share_slices: bool,
+}
+
+pub(super) struct KeyBatchEncoding<'a> {
+    header: &'a [u8],
+    lengths: [u32; 3],
+    layouts: &'a [Layout],
+    data: EncodedData,
+    body_start: usize,
+    len: usize,
+}
+
+impl KeyBatchEncoding<'_> {
+    pub fn encoded_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn append_batch(self, bytes: &mut Vec<u8>) {
+        let start = bytes.len();
+        bytes.extend_from_slice(self.header);
+        for length in self.lengths {
+            bytes.extend_from_slice(&length.to_le_bytes());
+        }
+        for layout in self.layouts {
+            bytes.extend_from_slice(&layout.0.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.data.ipc_message);
+        bytes.resize(start + self.body_start, 0);
+        bytes.extend_from_slice(&self.data.arrow_data);
+    }
 }
 
 impl KeyBatch {
@@ -901,12 +989,32 @@ impl KeyBatch {
     }
 
     pub fn project(columns: Vec<SelectedColumn<'_>>, rows: Vec<u32>) -> Result<Self> {
-        if columns.is_empty() { return Err(invalid()); }
+        if columns.is_empty() || rows.is_empty() {
+            return Err(invalid());
+        }
+        let start = rows[0] as usize;
+        let contiguous = rows
+            .iter()
+            .enumerate()
+            .all(|(offset, &row)| (row as usize).checked_sub(start) == Some(offset));
         let rows = arrow_array::UInt32Array::from(rows);
-        let (layouts, arrays) = columns.into_iter().enumerate().map(|(slot, column)| column.build(slot, &rows))
-            .collect::<Result<Vec<_>>>()?.into_iter().unzip::<_, _, Vec<_>, Vec<_>>();
+        let mut layouts = Vec::with_capacity(columns.len());
+        let mut arrays = Vec::with_capacity(columns.len());
+        let mut retained_source = false;
+        for (slot, column) in columns.into_iter().enumerate() {
+            let (layout, array) =
+                if contiguous && let Some(slice) = column.retain(start, rows.len())? {
+                    retained_source = true;
+                    slice
+                } else {
+                    column.build(slot, &rows)?
+                };
+            layouts.push(layout);
+            arrays.push(array);
+        }
         let batch = RecordBatch::try_new(schema(BatchKind::Keys, &layouts)?, arrays).map_err(format_error)?;
-        Self::new(layouts, batch, 0, true)
+        // Page gathers copy keys that still borrow source buffers.
+        Self::new(layouts, batch, 0, !retained_source)
     }
 
     pub fn build(tuples: &[Tuple<'_>], kind: BatchKind, mut arrays: Vec<ArrayRef>) -> Result<Self> {
@@ -1035,7 +1143,7 @@ impl KeyBatch {
     }
 
     // One schema-bound IPC record batch. The short layout prefix identifies its typed columns.
-    pub fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
         let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)
             .map_err(format_error)?;
         let (dictionaries, data) = IpcDataGenerator::default()
@@ -1049,18 +1157,33 @@ impl KeyBatch {
         if !dictionaries.is_empty() {
             return Err(invalid());
         }
-        let mut bytes = header.to_vec();
-        for length in [self.layouts.len(), data.ipc_message.len(), suffix.len()] {
-            bytes.extend_from_slice(&u32::try_from(length).map_err(format_error)?.to_le_bytes());
-        }
-        for layout in &self.layouts {
-            bytes.extend_from_slice(&layout.0.to_le_bytes());
-        }
-        bytes.extend_from_slice(&data.ipc_message);
-        bytes.resize(bytes.len().next_multiple_of(ALIGNMENT), 0);
-        bytes.extend_from_slice(&data.arrow_data);
-        bytes.extend_from_slice(suffix);
-        Ok(bytes)
+        let lengths = [
+            u32::try_from(self.layouts.len()).map_err(format_error)?,
+            u32::try_from(data.ipc_message.len()).map_err(format_error)?,
+            u32::try_from(suffix_len).map_err(format_error)?,
+        ];
+        let layouts_bytes = self.layouts.len()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(invalid)?;
+        let body_start = header.len()
+            .checked_add(size_of_val(&lengths))
+            .and_then(|len| len.checked_add(layouts_bytes))
+            .and_then(|len| len.checked_add(data.ipc_message.len()))
+            .and_then(|len| len.checked_next_multiple_of(ALIGNMENT))
+            .ok_or_else(invalid)?;
+        let len = body_start
+            .checked_add(data.arrow_data.len())
+            .and_then(|len| len.checked_add(suffix_len))
+            .filter(|&len| len <= isize::MAX as usize)
+            .ok_or_else(invalid)?;
+        Ok(KeyBatchEncoding {
+            header,
+            lengths,
+            layouts: &self.layouts,
+            data,
+            body_start,
+            len,
+        })
     }
 
     pub fn decode(bytes: Bytes, max_rows: usize, kind: BatchKind) -> Result<(Self, Bytes)> {
@@ -1365,11 +1488,98 @@ mod tests {
         for row in 0..typed.batch().num_rows() {
             assert_eq!(Tuple::Arrow(&typed, row).compare(Tuple::Arrow(&legacy, row)), Ordering::Equal);
         }
+        assert_eq!(
+            typed.encode(b"", b"").unwrap(),
+            legacy.encode(b"", b"").unwrap()
+        );
         let independently_gathered = KeyBatch::gather(
             &[Tuple::Arrow(&typed, 0), Tuple::Arrow(&typed, 2)],
             BatchKind::Correction, vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(Int64Array::from(vec![3, 4]))],
         ).unwrap();
         assert_eq!(Tuple::Arrow(&independently_gathered, 1).compare(Tuple::Arrow(&legacy, 2)), Ordering::Equal);
+    }
+
+    #[test]
+    fn source_projection_retains_compatible_spans_and_serializes_canonical_keys() {
+        let text = StringArray::from([["skip"; 8], ["word"; 8]].concat());
+        let binary = BinaryArray::from([[&b"skip"[..]; 8], [&b"data"[..]; 8]].concat());
+        let uuid = FixedSizeBinaryArray::try_from_iter(
+            [[[0_u8; 16]; 8], [[1; 16]; 8]].into_iter().flatten(),
+        )
+        .unwrap();
+        let bits = BooleanArray::from([[false; 8], [true; 8]].concat());
+        let times =
+            TimestampMicrosecondArray::from([[0; 8], [-7; 8]].concat()).with_timezone("+01:00");
+        let arrays: [&dyn Array; 5] = [&text, &binary, &uuid, &bits, &times];
+        let mut fields = arrays.map(|array| Field::new("key", array.data_type().clone(), false));
+        fields[2] = fields[2].clone().with_metadata(HashMap::from([(
+            rtdb_columnar::EXTENSION_NAME_KEY.into(),
+            "uuid".into(),
+        )]));
+        let rows: Vec<u32> = (8..16).collect();
+        let columns = fields
+            .iter()
+            .zip(arrays)
+            .map(|(field, array)| KeyColumn::new(Some((field, array))).select(&rows).unwrap())
+            .collect();
+        let projected = KeyBatch::project(columns, rows).unwrap();
+        for (slot, source) in arrays.into_iter().enumerate() {
+            let source_data = source.to_data();
+            let output_data = projected.batch().column(slot).to_data();
+            assert!(
+                source_data
+                    .buffers()
+                    .iter()
+                    .zip(output_data.buffers())
+                    .all(|(source, output)| { source.data_ptr() == output.data_ptr() })
+            );
+        }
+        let canonical = [
+            AtomRef::Text("word"),
+            AtomRef::Binary(b"data"),
+            AtomRef::Uuid([1; 16]),
+            AtomRef::Bool(true),
+            AtomRef::InstantMicros(-7),
+        ];
+        let copied =
+            KeyBatch::build(&[Tuple::Cells(&canonical); 8], BatchKind::Keys, vec![]).unwrap();
+        assert_eq!(
+            projected.encode(b"", b"").unwrap(),
+            copied.encode(b"", b"").unwrap()
+        );
+        let tuples = (0..8)
+            .map(|row| Tuple::Arrow(&projected, row))
+            .collect::<Vec<_>>();
+        let rebuilt = KeyBatch::gather(&tuples, BatchKind::Keys, vec![]).unwrap();
+        let text_data = rebuilt.batch().column(0).to_data();
+        assert_ne!(text_data.buffers()[1].data_ptr(), text.values().data_ptr());
+        assert_eq!(
+            rebuilt.encode(b"", b"").unwrap(),
+            copied.encode(b"", b"").unwrap()
+        );
+    }
+
+    #[test]
+    fn source_projection_copies_oversized_buffers_and_partial_boolean_bytes() {
+        let text = StringArray::from(vec!["kept".to_owned(), "x".repeat(4096)]);
+        let bits = BooleanArray::from(vec![true; 8]);
+        let arrays: [&dyn Array; 2] = [&text, &bits];
+        let rows = vec![0];
+        let fields = arrays.map(|array| Field::new("key", array.data_type().clone(), false));
+        let columns = fields
+            .iter()
+            .zip(arrays)
+            .map(|(field, array)| KeyColumn::new(Some((field, array))).select(&rows).unwrap())
+            .collect();
+        let projected = KeyBatch::project(columns, rows).unwrap();
+        let canonical = [AtomRef::Text("kept"), AtomRef::Bool(true)];
+        let copied = KeyBatch::build(&[Tuple::Cells(&canonical)], BatchKind::Keys, vec![]).unwrap();
+        assert_eq!(
+            projected.encode(b"", b"").unwrap(),
+            copied.encode(b"", b"").unwrap()
+        );
+        assert!(projected.share_slices);
+        assert!(projected.batch().column(0).get_buffer_memory_size() < 4096);
     }
 
     #[test]

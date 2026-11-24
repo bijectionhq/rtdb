@@ -312,10 +312,11 @@ impl Builder {
         Ok(())
     }
 
-    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: &mut Output<impl Write>) -> Result<(Vec<Section>, TermSummaries)> {
+    fn finish(mut self, columns: &[String], version: Option<i64>, identity: &str, output: &mut Output<impl Write>) -> Result<(Vec<Section>, TermSummaries, Option<super::tree_file::WrittenRoot>)> {
         if self.members.is_empty() { return Err(fault("A search file holds at least one member")); }
         let sections: Vec<_> = self.sections.into_values().collect();
         let mut summaries = TermSummaries::default();
+        let mut root = None;
         let header = Table::Header.array(vec![
             Arc::new(Int32Array::from(vec![self.format])),
             Arc::new(Int32Array::from(vec![rtdb_text::ANALYZER_VERSION])),
@@ -392,8 +393,10 @@ impl Builder {
                     ])?)
                 } else { None };
                 let Output::File(writer) = output else { unreachable!("Tree pages require durable offsets"); };
-                summaries = super::tree_file::write(writer, directory, visibility, plan,
+                let (terms, written_root) = super::tree_file::write(writer, directory, visibility, plan,
                     (self.format >= PACKED_FORMAT_VERSION).then_some(positions), revisions, documents, erases)?;
+                summaries = terms;
+                root = Some(written_root);
             } else {
                 output.page(directory)?;
                 output.page(visibility)?;
@@ -410,7 +413,7 @@ impl Builder {
             }
         }
         summaries.retain(self.reservation)?;
-        Ok((sections, summaries))
+        Ok((sections, summaries, root))
     }
 }
 
@@ -478,13 +481,13 @@ pub(super) fn write_group<P, I>(
 ) -> Result<Vec<Section>>
 where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
-    write_group_as(columns, members, identity, version, ceiling, output, reservation, format, BuildMode::Combined).map(|(sections, _)| sections)
+    write_group_as(columns, members, identity, version, ceiling, output, reservation, format, BuildMode::Combined).map(|(sections, _, _)| sections)
 }
 
 pub(crate) fn write_group_as<P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: Option<i64>,
     ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<MemoryReservation>>, format: i32, mode: BuildMode,
-) -> Result<(Vec<Section>, TermSummaries)>
+) -> Result<(Vec<Section>, TermSummaries, Option<super::tree_file::WrittenTree>)>
 where P: IntoIterator<Item = Result<I>>, I: SearchPage,
 {
     if format == super::TANTIVY_FORMAT_VERSION {
@@ -492,14 +495,14 @@ where P: IntoIterator<Item = Result<I>>, I: SearchPage,
         let directory = tempfile::tempdir().map_err(fault)?;
         let store = tantivy::directory::MmapDirectory::open(directory.path()).map_err(fault)?;
         let sections = super::legacy11::write_versioned_group(columns, members, identity, version, ceiling, store, output)?;
-        return Ok((sections.into_iter().map(super::legacy11::Section::into_arrow).collect(), TermSummaries::default()));
+        return Ok((sections.into_iter().map(super::legacy11::Section::into_arrow).collect(), TermSummaries::default(), None));
     }
     let builder = build_group(columns, members, ceiling, reservation, format, mode)?;
     let mut output = Output::File(Writer::new(output, format)?);
-    let result = builder.finish(columns, version, identity, &mut output)?;
+    let (sections, summaries, root) = builder.finish(columns, version, identity, &mut output)?;
     let Output::File(writer) = output else { unreachable!() };
-    writer.finish()?;
-    Ok(result)
+    let length = writer.finish()?;
+    Ok((sections, summaries, root.map(|root| root.finish(length, format))))
 }
 
 pub(super) fn query_batches<I: SearchPage>(columns: &[String], pages: impl IntoIterator<Item = Result<I>>,

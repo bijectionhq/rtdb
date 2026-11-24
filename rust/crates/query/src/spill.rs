@@ -4,8 +4,12 @@ use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use arrow_array::{RecordBatch};
 use arrow_buffer::Buffer;
-use arrow_ipc::{reader::{StreamDecoder, read_record_batch}, writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter}};
-use arrow_schema::SchemaRef;
+use arrow_ipc::{
+    MetadataVersion,
+    reader::{StreamDecoder, read_record_batch},
+    writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, write_message},
+};
+use arrow_schema::{ArrowError, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::Result;
 use tempfile::{NamedTempFile, TempDir, TempPath};
@@ -60,11 +64,20 @@ impl SpillWriter {
     fn write_frame_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
         let overflow = || invalid("row-size", "Spill row size overflow");
         let length = parts.iter().try_fold(0u64, |bytes, part| bytes.checked_add(part.len() as u64).ok_or_else(overflow))?;
-        let count = length.checked_add(8).ok_or_else(overflow)?;
+        self.write_frame_with(length, |file| {
+            for part in parts { file.write_all(part).map_err(io_error)?; }
+            Ok(())
+        })
+    }
+
+    fn write_frame_with(
+        &mut self, length: u64, write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+    ) -> Result<()> {
+        let count = length.checked_add(8).ok_or_else(|| invalid("row-size", "Spill row size overflow"))?;
         self.retained.region.reserve(count)?;
         self.retained.bytes.fetch_add(count, Ordering::Relaxed);
         self.file.write_all(&length.to_le_bytes()).map_err(io_error)?;
-        for part in parts { self.file.write_all(part).map_err(io_error)?; }
+        write(&mut self.file)?;
         self.position += count;
         Ok(())
     }
@@ -93,10 +106,34 @@ impl SpillWriter {
             .and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| invalid(error, "Arrow spill allocation bound overflow"))?;
         let _scratch = memory.reserve(bound)?;
-        let ipc_error = |cause: arrow_schema::ArrowError| invalid(error, cause);
-        let mut ipc = StreamWriter::try_new(Vec::new(), batch.schema().as_ref()).map_err(ipc_error)?;
-        ipc.write(batch).map_err(ipc_error)?;
-        self.write_frame(&ipc.into_inner().map_err(ipc_error)?)
+        const ALIGNMENT: usize = 64;
+        const MESSAGE_PREFIX_BYTES: usize = 8;
+        const END_MARKER: [u8; MESSAGE_PREFIX_BYTES] = [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0];
+        let ipc_error = |cause| match cause {
+            ArrowError::IoError(_, cause) => io_error(cause),
+            cause => invalid(error, cause),
+        };
+        let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5).map_err(ipc_error)?;
+        let generator = IpcDataGenerator::default();
+        let mut tracker = DictionaryTracker::new(false);
+        let schema = generator.schema_to_bytes_with_dictionary_tracker(batch.schema_ref(), &mut tracker, &options);
+        let (dictionaries, record) = generator.encode(batch, &mut tracker, &options, &mut CompressionContext::default())
+            .map_err(ipc_error)?;
+        let overflow = || invalid(error, "Arrow spill frame size overflow");
+        let length = [&schema].into_iter().chain(&dictionaries).chain([&record])
+            .try_fold(END_MARKER.len(), |length, message| {
+                let metadata = message.ipc_message.len().checked_add(MESSAGE_PREFIX_BYTES)
+                    .and_then(|bytes| bytes.checked_next_multiple_of(ALIGNMENT)).ok_or_else(overflow)?;
+                i32::try_from(metadata - MESSAGE_PREFIX_BYTES).map_err(|_| overflow())?;
+                length.checked_add(metadata)
+                    .and_then(|bytes| bytes.checked_add(message.arrow_data.len())).ok_or_else(overflow)
+            })?;
+        self.write_frame_with(u64::try_from(length).map_err(|_| overflow())?, |file| {
+            for message in [schema].into_iter().chain(dictionaries).chain([record]) {
+                write_message(&mut *file, message, &options).map_err(ipc_error)?;
+            }
+            file.write_all(&END_MARKER).map_err(io_error)
+        })
     }
 
     pub fn write_columns(&mut self, batch: &ColumnBatch, schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>) -> Result<()> {
@@ -199,9 +236,11 @@ impl SpillReader {
                 ColumnBatch::from_owned(batch).map(Some)
             }
             [2] => {
-                let (bytes, _charge) = self.read_frame(1)?
+                let (bytes, charge) = self.read_frame(1)?
                     .ok_or_else(|| invalid("invalid-spill", "Spilled Arrow fragments are absent"))?;
-                let mut batches = decode_batches(&bytes, &self.memory)?;
+                let bytes = rtdb_columnar::retain_buffer(&Buffer::from_vec(bytes), &charge);
+                drop(charge);
+                let mut batches = decode_batches(bytes, &self.memory)?;
                 if batches.len() == 1 { return Ok(batches.pop()); }
                 if batches.is_empty() { return Err(invalid("invalid-spill", "Spilled page has no Arrow fragments")); }
                 let rows = batches.iter().try_fold(0usize, |count, batch| {
@@ -285,6 +324,40 @@ fn arrow_records_share_one_schema_across_spill_offsets() {
 
 
 #[test]
+fn homogeneous_spill_writes_exact_ipc_framing_and_checks_quota_before_writing() {
+    use arrow_array::{Array, builder::StringDictionaryBuilder, types::Int32Type};
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{Field, Schema};
+
+    let memory = MemoryBudget::new(1 << 20);
+    let mut dictionary = StringDictionaryBuilder::<Int32Type>::new();
+    dictionary.append_value("left");
+    dictionary.append_value("right");
+    dictionary.append_value("left");
+    let dictionary = dictionary.finish();
+    let schema = Arc::new(Schema::new(vec![Field::new("key", dictionary.data_type().clone(), false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(dictionary)]).unwrap();
+    let batch = OwnedBatch::new(batch, &memory).unwrap();
+    let mut reference = StreamWriter::try_new(Vec::new(), batch.batch().schema_ref()).unwrap();
+    reference.write(batch.batch()).unwrap();
+    let expected = reference.into_inner().unwrap();
+    let size = expected.len() as u64 + 8;
+
+    let spill = Arc::new(SpillRegion::new(size).unwrap());
+    let mut writer = spill.create().unwrap();
+    writer.write_arrow(&batch, 0, &memory, "spill-columns").unwrap();
+    assert_eq!(writer.write_arrow(&batch, 0, &memory, "spill-columns").unwrap_err().code, "rtdb.query/spill-limit");
+    assert_eq!(writer.position().unwrap(), size);
+    assert_eq!(spill.retained_bytes(), size);
+    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    assert_eq!(reader.read_frame(1).unwrap().unwrap().0, expected);
+    assert!(reader.read_frame(1).unwrap().is_none());
+    drop((reader, batch));
+    assert_eq!(spill.retained_bytes(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn spill_replays_mixed_struct_fields_as_arrow_positions() {
     use crate::columnar::{Column, ColumnBatch, pack_evaluated_column};
     use rtdb_plan::{Binder, Schema};
@@ -305,11 +378,35 @@ fn spill_replays_mixed_struct_fields_as_arrow_positions() {
 
     let mut writer = spill.create().unwrap();
     writer.write_columns(&batch, &schema, &memory).unwrap();
-    let mut reader = writer.finish().unwrap().reader(Arc::clone(&memory)).unwrap();
+    let file = writer.finish().unwrap();
+    let wire_bytes = usize::try_from(spill.retained_bytes()).unwrap();
+    let tight_memory = MemoryBudget::new(wire_bytes + (14 << 10));
+    let mut tight_reader = file.reader(Arc::clone(&tight_memory)).unwrap();
+    let detached = tight_reader.read_columns(1).unwrap().unwrap();
+    for (row, expected) in values.iter().enumerate() {
+        assert_eq!(&detached.columns[0].value(row).unwrap(), expected);
+    }
+    assert!(tight_reader.read_columns(1).unwrap().is_none());
+    drop((tight_reader, detached));
+    assert_eq!(tight_memory.used_bytes(), 0);
+
+    let replay_memory = MemoryBudget::new(1 << 23);
+    let mut reader = file.reader(Arc::clone(&replay_memory)).unwrap();
+    drop(file);
     let replayed = reader.read_columns(1).unwrap().unwrap();
-    assert!(matches!(replayed.columns[0], Column::Selected(_)));
+    let Column::Selected(selected) = &replayed.columns[0] else { panic!("Expected mixed Arrow fields") };
+    let retained = {
+        let (source, _, _) = selected.source_layouts().next().unwrap();
+        let source = source.as_any().downcast_ref::<arrow_array::StructArray>().unwrap();
+        Arc::clone(source.column(0))
+    };
     for (row, expected) in values.into_iter().enumerate() {
         assert_eq!(replayed.columns[0].value(row).unwrap(), expected);
     }
     assert!(reader.read_columns(1).unwrap().is_none());
+    drop((reader, replayed));
+    assert_eq!(spill.retained_bytes(), 0);
+    assert!(replay_memory.used_bytes() > 0);
+    drop(retained);
+    assert_eq!(replay_memory.used_bytes(), 0);
 }

@@ -30,11 +30,15 @@
 -- Staged Flight shadows borrow text from the admitted Arrow batch through analysis.
 -- A staged null text cell shadows its identity in the selected partition without contributing a document.
 -- Held corpus accounting uses the complete identity's typed payload size and the fixed allowance for its retained entry.
+-- A staged corpus entry owns its partition's shadow identity and any match frequencies for that identity.
+-- An exact Root corpus entry keeps its complete identity with any match frequencies for that identity.
 -- A declared optional text column with only null or absent values contributes an empty corpus.
 -- Owned runs carry their full typed identity.
+-- Covered owned corpus deduplication compares complete identity slices from the selected run pages.
 -- Owned ranked candidates share a projected primary cursor in bounded batches.
 -- Each cursor retains the candidate's complete keys as slices of their posting file's Arrow buffers.
 -- The scan checks each candidate's complete Arrow identity, microsecond revision, and declared text leg at the held cut.
+-- A covered rank window borrows the verified identities from the admitted run pages through Arrow output construction.
 -- The ranker uses posting frequencies and stored lengths when the winning revision identifies an unambiguous event in its run.
 -- Overlapping events at the same revision use the resolved text to verify the match and score.
 -- Owned ranking uses only the held corpus and breaks score ties by the complete typed identity, then by the requested partition ordinal.
@@ -235,6 +239,7 @@ rule SearchJobRuns {
     -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
     -- Readers authenticate the selected forward-witness range and decode Arrow from its retained bytes.
     -- A resolved event must identify itself before a forward witness can certify its score.
+    -- A posting run receipt carries the SHA-256 of the complete Arrow file, including its footer and trailer.
     -- The writer stores a search-pending intent with its staging owner before uploading the immutable body.
     -- A successful upload supplies the immutable publication for ordered adoption when the provider exposes it.
     -- An unsuccessful upload leaves the intent for collection under the same writer-drain rules.
@@ -566,6 +571,7 @@ contract SearchCorrectness {
         -- A newer commit or block boundary does not advance search evidence held by an earlier snapshot.
         -- A partially admitted segment keeps its coverage frontier.
         -- Commit deltas and live postings read a selected text child once per Arrow batch and retain the existing input and page admission limits.
+        -- Each live posting page writes row ordinals and frequencies to their final columns and derives score bounds within each term's page-local span.
         -- If a query cannot cover the frontier within the accelerated tail budget, ordinary SQL evaluation supplies the answer.
 
     @invariant SearchFilesFromTheSnapshot

@@ -175,8 +175,11 @@ The application keeps the original unit and family admission through response-pa
 A shared field uses its same-cut Root winner selector and carrier, with its current original unit fence.
 A nested hold also certifies the frozen ancestry edge and relation coverage before an earlier Root parent point.
 At an exact frozen Held publication, the predecessor certifies the same transaction and accepted reading for the opaque carrier and protected journal.
-The returned positive overlay points identify the physical authoring world. The application must verify that the carrier and journal name the same writer and publication and keep the original family and response admission.
-A frozen overlay tombstone without positioned winner evidence refuses.
+Hosted protocol 225 uses `rtdb.owned.ReadHeldWorldPointAt.v2` for these exact earlier effective points.
+For an exact frozen overlay winner on the live installed writer, `rtdb.owned.frozen_world_winner` carries 48 bytes as lowercase hex: authoring world UUID, system micros (i64), original event transaction (i64), original event ordinal (u64), and accepted Held reading micros (i64), in big-endian order.
+RTDB verifies the original event transaction against the authoring world's accepted publication. The application checks that the carrier and its protected journal have distinct events from the same writer and transaction, with the same accepted reading.
+A positive carrier still requires its family assertion ordinal and the original family and response admission. The protected journal uses its retained event position.
+An explicit overlay tombstone returns zero rows and no positive point revision. The application admits a frozen negative only when both the carrier and journal have matching, explicit tombstone evidence. It refuses missing or mismatched evidence.
 A successor archive copy needs a durable route authenticated to the Original deployment, incarnation, ordered journal position and current family authority.
 A frozen capture proves the historical assertion and bytes. Recall through a new deployment also needs access to the Original ordered marker and release owner through any source retirement.
 Successor replay of a family carrier refuses until that route is available.

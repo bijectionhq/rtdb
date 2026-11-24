@@ -3,7 +3,8 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use bytes::{Bytes, BytesMut};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody, SourceMessage}, keys::oversized_key, log::proto};
-use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail}};
+use rtdb_storage::{Error as StorageError, IoRegion, ObjectKey, ObjectStore, cache::BufferPool, log::{AppendBuffer, AppendCapacity, AppendMode, AppendReceipt, GuardedAppend, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
+use rtdb_storage::object_store::ReadReservation;
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 use crate::maintenance_class::is_maintenance;
@@ -29,6 +30,20 @@ impl ReplicaRecord { pub fn retained_bytes(&self) -> usize { self.reservation.by
 pub(crate) enum DecodedReplica {
     Known(ReplicaRecord),
     Unrecognized { term: Term, sequence: Option<TermSequence> },
+}
+
+enum OversizedDecode {
+    Retained(Option<ReplicaFingerprint>),
+    Detached,
+}
+
+struct ChargedPayload {
+    bytes: Bytes,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl AsRef<[u8]> for ChargedPayload {
+    fn as_ref(&self) -> &[u8] { &self.bytes }
 }
 
 pub struct ReplicaReceipt { receipt: AppendReceipt, epoch: StorageEpoch }
@@ -331,6 +346,13 @@ impl PartitionLogs {
     pub fn decode_replica(&self, record: LogRecord) -> Result<Option<ReplicaRecord>> {
         Ok(self.decode_readback(record, None, None, None)?.known())
     }
+    pub(crate) fn decode_detached_replica(&self, record: LogRecord) -> Result<Option<ReplicaRecord>> {
+        let reservation = self.memory.reserve(replica_decode_bound(record.payload.len())?)?;
+        Ok(self.decode_reserved_replica(record, reservation)?.map(|mut record| {
+            charge_detached_tables(Arc::make_mut(&mut record.envelope), &record.reservation);
+            record
+        }))
+    }
     pub(crate) fn decode_reserved_replica(&self, record: LogRecord, reservation: Arc<MemoryReservation>) -> Result<Option<ReplicaRecord>> {
         Ok(self.decode_readback(record, Some(reservation), None, None)?.known())
     }
@@ -382,21 +404,26 @@ impl PartitionLogs {
     }
 
     pub(crate) async fn resolve_oversized_for_readback(&self, mut record: ReplicaRecord, expected: Option<ReplicaFingerprint>) -> Result<ReplicaRecord> {
+        let decode = OversizedDecode::Retained(expected);
         if record.oversized_delivery.as_ref().is_some_and(|delivery| delivery.replica_objects.is_some()) {
-            return self.resolve_oversized_fresh_with(record, expected).await;
+            return self.resolve_oversized_fresh_with(record, decode).await;
         }
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
         let lease = IoRegion::retaining(Arc::new(delivery), self.cache.get(&key)).await?;
-        self.decode_oversized(record, lease.as_slice(), expected)
+        self.decode_oversized(record, lease, decode)
     }
 
     pub(crate) async fn resolve_oversized_fresh(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
-        self.resolve_oversized_fresh_with(record, None).await
+        self.resolve_oversized_fresh_with(record, OversizedDecode::Retained(None)).await
     }
 
-    async fn resolve_oversized_fresh_with(&self, mut record: ReplicaRecord, expected: Option<ReplicaFingerprint>) -> Result<ReplicaRecord> {
+    pub(crate) async fn resolve_oversized_fresh_detached(&self, record: ReplicaRecord) -> Result<ReplicaRecord> {
+        self.resolve_oversized_fresh_with(record, OversizedDecode::Detached).await
+    }
+
+    async fn resolve_oversized_fresh_with(&self, mut record: ReplicaRecord, decode: OversizedDecode) -> Result<ReplicaRecord> {
         let Some(key) = record.envelope.oversized_payload(self.storage_version, self.storage_epoch)? else { return Ok(record); };
         let delivery = record.take_oversized_delivery()?;
         let key = ObjectKey::new(key)?;
@@ -406,34 +433,61 @@ impl PartitionLogs {
                     "The replica payload permit does not match this delivery"));
             }
             let payload = custody.redeem(self.store.as_ref(), &self.memory).await?;
-            return self.decode_oversized(record, payload.as_ref(), expected);
+            return self.decode_oversized(record, payload, decode);
         }
         IoRegion::retaining(Arc::new(delivery), async {
             let store = &self.store;
             let length = usize::try_from(store.head_fresh(&key).await?.size).map_err(|_| size_overflow())?;
             let allocation = store.exact_object_allocation(&key, length)?;
-            let charge = allocation.retained_bytes.checked_add(allocation.scratch_bytes).ok_or_else(size_overflow)?;
-            let charge = self.memory.reserve(charge)?;
-            let payload = IoRegion::retaining(charge.clone(), store.get_fresh_exact(&key, length)).await?;
-            self.decode_oversized(record, &payload, expected)
+            let reservation = self.memory.reserve(allocation.retained_bytes)?;
+            let scratch = (allocation.scratch_bytes > 0).then(|| self.memory.reserve(allocation.scratch_bytes)).transpose()?;
+            let read = ReadReservation::funded(length, Arc::clone(&reservation), scratch);
+            let bytes = read.retaining_io(store.get_fresh_exact(&key, length)).await?;
+            drop(read);
+            self.decode_oversized(record, ChargedPayload { bytes, _reservation: reservation }, decode)
         }).await
     }
 
-    fn decode_oversized(&self, record: ReplicaRecord, payload: &[u8], expected: Option<ReplicaFingerprint>) -> Result<ReplicaRecord> {
-        let reservation = self.memory.reserve(replica_decode_bound(payload.len())?)?;
-        let digest = expected.map(|_| fingerprint(payload));
-        let envelope = if let (Some(digest), ReplicaBody::OversizedMessage(reference)) = (digest, &record.envelope.message)
-            && Some(digest) == expected && reference.payload_sha256.as_deref() == Some(digest.as_slice())
-            && let Some(peek) = ReplicaPeek::read(payload)
-            && (peek.term, peek.term_sequence) == (record.envelope.term, record.envelope.term_sequence)
-            && let ReplicaPeekBody::Resolved { tx_id, search_delta, .. } = peek.body
-        {
-            ReplicaEnvelope { term: peek.term, term_sequence: peek.term_sequence, message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
-                tx_id, search_delta: search_delta.map(Bytes::copy_from_slice), ..Default::default()
-            }) }
-        } else { record.envelope.unwrap_payload(payload)? };
-        let fingerprint = record.fingerprint.map(|_| digest.unwrap_or_else(|| fingerprint(payload)));
+    fn decode_oversized(
+        &self, record: ReplicaRecord, payload: impl AsRef<[u8]> + Send + 'static, decode: OversizedDecode,
+    ) -> Result<ReplicaRecord> {
+        let reservation = self.memory.reserve(replica_decode_bound(payload.as_ref().len())?)?;
+        let digest = (record.fingerprint.is_some() || matches!(decode, OversizedDecode::Retained(Some(_))))
+            .then(|| fingerprint(payload.as_ref()));
+        let envelope = match decode {
+            OversizedDecode::Detached => {
+                let mut envelope = record.envelope.unwrap_payload(payload.as_ref())?;
+                charge_detached_tables(&mut envelope, &reservation);
+                envelope
+            }
+            OversizedDecode::Retained(expected) => {
+                let payload = Bytes::from_owner(payload);
+                if let (Some(digest), ReplicaBody::OversizedMessage(reference)) = (digest, &record.envelope.message)
+                    && Some(digest) == expected && reference.payload_sha256.as_deref() == Some(digest.as_slice())
+                    && let Some(peek) = ReplicaPeek::read(&payload)
+                    && (peek.term, peek.term_sequence) == (record.envelope.term, record.envelope.term_sequence)
+                    && let ReplicaPeekBody::Resolved { tx_id, search_delta, .. } = peek.body
+                {
+                    ReplicaEnvelope { term: peek.term, term_sequence: peek.term_sequence, message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
+                        tx_id, search_delta: search_delta.map(|delta| payload.slice_ref(delta)), ..Default::default()
+                    }) }
+                } else { record.envelope.unwrap_payload_bytes(payload)? }
+            }
+        };
+        let fingerprint = record.fingerprint.and(digest);
         Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation, fingerprint, oversized_delivery: None })
+    }
+}
+
+fn charge_detached_tables(envelope: &mut ReplicaEnvelope, reservation: &Arc<MemoryReservation>) {
+    // Arrow can retain the copied table bytes after the decoded record is dropped.
+    if let ReplicaBody::ResolvedTx(tx) = &mut envelope.message {
+        for bytes in tx.table_data.values_mut().filter(|bytes| !bytes.is_empty()) {
+            *bytes = Bytes::from_owner(ChargedPayload {
+                bytes: std::mem::take(bytes),
+                _reservation: Arc::clone(reservation),
+            });
+        }
     }
 }
 

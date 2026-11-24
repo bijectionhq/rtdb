@@ -1,18 +1,27 @@
 use std::{
     collections::{BTreeSet, VecDeque},
+    mem::size_of,
     sync::{Arc, Mutex},
 };
 
-use arrow_buffer::Buffer;
+use arrow_array::{
+    Array, ArrayRef, RecordBatch,
+    cast::AsArray,
+    types::{
+        ArrowPrimitiveType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type,
+        UInt32Type, UInt64Type,
+    },
+};
+use arrow_buffer::{Buffer, ScalarBuffer};
 use arrow_flight::FlightData;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field, Schema};
 use prost::Message;
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_crypt::tokens::{PageToken, ReceiverClockObservation, TokenIssuer};
 use rtdb_node::{Database, PreparedSql, ResultSignaturePolicy, serving::QuerySource};
 use rtdb_query::{QueryContext, QueryCursor};
 use rtdb_tx::transact::CustodyGroupId;
-use rtdb_types::{LogicalType, Timestamp, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
+use rtdb_types::{LogicalType, Timestamp, Value, rtdb_v1::{At, Basis, ClaimEvidence, ClaimFootprint, ClaimScope, LabelScope, Layer}};
 use sha2::{Digest, Sha256};
 use tonic::{Response, Status};
 
@@ -392,7 +401,7 @@ fn applied_source(
 }
 
 struct Parameters {
-    batch: rtdb_columnar::OwnedBatch,
+    batch: OwnedBatch,
     types: wire::ParameterTypes,
 }
 
@@ -408,15 +417,15 @@ impl Parameters {
         if batch.batch().num_rows() != 1 {
             return Err(error::incorrect("Parameters require exactly one row"));
         }
-        let types = wire::ParameterTypes::from_batch(batch.batch(), memory)
-            .map_err(error::map_status)?;
+        let types =
+            wire::ParameterTypes::from_batch(batch.batch(), memory).map_err(error::map_status)?;
         Ok(Self {
             batch: batch.clone(),
             types,
         })
     }
 
-    fn can_bind_arrow(&self) -> bool {
+    fn binds_arrow_without_row_admission(&self) -> bool {
         let batch = self.batch.batch();
         !batch.columns().is_empty()
             && batch
@@ -439,6 +448,184 @@ impl Parameters {
                         && column.is_valid(0)
                 })
     }
+
+    fn can_bind_arrow(&self) -> bool {
+        let batch = self.batch.batch();
+        batch.num_columns() != 0
+            && batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .zip(self.types.as_slice())
+                .all(|((field, array), logical)| match field.data_type() {
+                    DataType::Union(..) | DataType::RunEndEncoded(..) => false,
+                    DataType::List(child) => {
+                        plain_float_list(field, child)
+                            && array.is_valid(0)
+                            && array.as_list::<i32>().value_length(0) > 0
+                    }
+                    DataType::FixedSizeList(child, width) => {
+                        plain_float_list(field, child) && array.is_valid(0) && *width > 0
+                    }
+                    _ => match logical {
+                        LogicalType::Scalar(_) | LogicalType::Null => true,
+                        LogicalType::Maybe(inner) => {
+                            matches!(inner.as_ref(), LogicalType::Scalar(_))
+                        }
+                        _ => false,
+                    },
+                })
+    }
+
+    fn reserve_scalar_row_bound(
+        &self,
+        memory: &Arc<MemoryBudget>,
+    ) -> Result<Arc<MemoryReservation>, Status> {
+        let batch = self.batch.batch();
+        let base = wire::add(
+            1024,
+            wire::mul(batch.num_columns(), 3 * size_of::<Value>())?,
+        )?;
+        let bound = batch
+            .schema_ref()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .try_fold(base, |bytes, (field, array)| {
+                let read = rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), 0)
+                    .map_err(error::anomaly)?;
+                let copy = rtdb_columnar::estimate_read_cell_bytes(field, array.as_ref(), 0)
+                    .map_err(error::anomaly)?;
+                wire::add(bytes, wire::add(read, copy)?)
+            })?;
+        memory.reserve(bound).map_err(error::anomaly)
+    }
+
+    async fn try_open_arrow(
+        &self,
+        prepared: &PreparedSql,
+        context: &Arc<QueryContext>,
+    ) -> Result<Option<QueryCursor>, Status> {
+        let types = self.types.as_slice();
+        let skip_row_admission = self.binds_arrow_without_row_admission();
+        // Use the scalar path to report its original error if its eager row admission may fail.
+        let _scalar_row = if skip_row_admission {
+            None
+        } else {
+            if prepared.parameter_count() != types.len() || !self.can_bind_arrow() {
+                return Ok(None);
+            }
+            let Ok(row) = self.reserve_scalar_row_bound(&context.memory) else {
+                return Ok(None);
+            };
+            Some(row)
+        };
+        let result = if skip_row_admission {
+            prepared
+                .try_open_query_arrow(Arc::clone(context), &self.batch, types)
+                .await
+        } else {
+            let batch = self.batch.batch();
+            let (_metadata, signed) = if batch
+                .schema_ref()
+                .fields()
+                .iter()
+                .any(|field| field.data_type().is_unsigned_integer())
+            {
+                let Ok(metadata) = wire::schema_bound(batch.schema_ref())
+                    .and_then(|bytes| context.memory.reserve(bytes).map_err(error::anomaly))
+                else {
+                    return Ok(None);
+                };
+                let Some(signed) = self.signed_batch() else {
+                    return Ok(None);
+                };
+                (Some(metadata), Some(signed))
+            } else {
+                (None, None)
+            };
+            // The prepared plan keeps the declared types. Where it has no declaration, the
+            // cursor falls back to the same observed type it would get from a decoded value.
+            let observed = types
+                .iter()
+                .zip(batch.columns())
+                .map(|(logical, array)| {
+                    if array.is_null(0) {
+                        LogicalType::Null
+                    } else {
+                        match logical {
+                            LogicalType::Maybe(inner) => rtdb_columnar::execution_type(inner),
+                            other => rtdb_columnar::execution_type(other),
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+            prepared
+                .try_open_query_arrow(
+                    Arc::clone(context),
+                    signed.as_ref().unwrap_or(&self.batch),
+                    &observed,
+                )
+                .await
+        };
+        match result {
+            Err(error)
+                if error.code == "rtdb.query/column-plan"
+                    || (!skip_row_admission && error.code == "rtdb/memory-budget-exceeded") =>
+            {
+                Ok(None)
+            }
+            result => result.map_err(error::anomaly),
+        }
+    }
+
+    fn signed_batch(&self) -> Option<OwnedBatch> {
+        let batch = self.batch.batch();
+        let mut fields = batch.schema_ref().fields().to_vec();
+        let mut arrays = batch.columns().to_vec();
+        for (field, array) in fields.iter_mut().zip(&mut arrays) {
+            let signed: ArrayRef = match field.data_type() {
+                DataType::UInt8 => signed_view::<UInt8Type, Int8Type>(array),
+                DataType::UInt16 => signed_view::<UInt16Type, Int16Type>(array),
+                DataType::UInt32 => signed_view::<UInt32Type, Int32Type>(array),
+                DataType::UInt64 => signed_view::<UInt64Type, Int64Type>(array),
+                _ => continue,
+            };
+            *field = Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(signed.data_type().clone()),
+            );
+            *array = signed;
+        }
+        let schema = Arc::new(Schema::new_with_metadata(
+            fields,
+            batch.schema_ref().metadata().clone(),
+        ));
+        let signed = RecordBatch::try_new(schema, arrays).ok()?;
+        OwnedBatch::with_reservation(signed, Arc::clone(self.batch.reservation())).ok()
+    }
+}
+
+fn signed_view<Unsigned: ArrowPrimitiveType, Signed: ArrowPrimitiveType>(
+    array: &ArrayRef,
+) -> ArrayRef {
+    let array = array.as_primitive::<Unsigned>();
+    let values = ScalarBuffer::from(array.values().inner().clone());
+    Arc::new(arrow_array::PrimitiveArray::<Signed>::new(
+        values,
+        array.nulls().cloned(),
+    ))
+}
+
+fn plain_float_list(field: &Field, child: &Field) -> bool {
+    field.metadata().is_empty()
+        && child.metadata().is_empty()
+        && child.name() == "$data$"
+        && !child.is_nullable()
+        && matches!(child.data_type(), DataType::Float32 | DataType::Float64)
 }
 
 async fn open_query(
@@ -449,18 +636,13 @@ async fn open_query(
 ) -> Result<(QueryCursor, ClaimFootprint), Status> {
     let (row, types, _values) = if let Some(parameters) = parameters {
         let arguments = wire::arguments(&parameters.batch, &context.memory).map_err(error::map_status)?;
-        if !track && parameters.can_bind_arrow()
-            && let Some(cursor) = prepared
-                .try_open_query_arrow(Arc::clone(&context), &parameters.batch, types)
-                .await
-                .map_err(error::anomaly)?
-        {
+        if !track && let Some(cursor) = parameters.try_open_arrow(&prepared, &context).await? {
             return Ok((cursor, ClaimFootprint::default()));
         }
         let row = arguments.rows().next().ok_or_else(|| error::incorrect("Parameters require one row"))?
             .map_err(error::anomaly)?;
         let size = row.iter().try_fold(1024usize, |bytes, value| {
-            wire::add(wire::add(bytes, std::mem::size_of::<rtdb_types::Value>())?, value.retained_bytes().map_err(error::anomaly)?)
+            wire::add(wire::add(bytes, size_of::<Value>())?, value.retained_bytes().map_err(error::anomaly)?)
         }).map_err(error::map_status)?;
         let values = context.memory.reserve(size).map_err(error::anomaly)?;
         (row.to_vec(), parameters.types.as_slice(), Some(values))
@@ -477,34 +659,157 @@ async fn open_query(
 mod tests {
     use super::*;
     use arrow_array::{
-        ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, RecordBatch, UInt64Array,
+        BinaryArray, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
+        ListArray, NullArray, StringArray, UInt64Array,
     };
-    use arrow_schema::{Field, Schema};
+    use arrow_buffer::OffsetBuffer;
 
     #[test]
-    fn arrow_execution_requires_present_unannotated_supported_scalars() {
+    fn arrow_binding_accepts_scalar_and_type_preserving_float_list_profiles() {
         let memory = MemoryBudget::new(1 << 20);
         let signed = Arc::new(Int64Array::from(vec![Some(42)])) as ArrayRef;
+        let item = Arc::new(Field::new("$data$", DataType::Float32, false));
+        let list = |child, components: Vec<f32>| -> ArrayRef {
+            let end = i32::try_from(components.len()).unwrap();
+            Arc::new(ListArray::new(
+                child,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0, end])),
+                Arc::new(Float32Array::from(components)),
+                None,
+            ))
+        };
+        let fixed = Arc::new(FixedSizeListArray::new(
+            Arc::clone(&item),
+            2,
+            Arc::new(Float32Array::from(vec![-0.0, 1.0])),
+            None,
+        )) as ArrayRef;
         for (other, annotated, expected) in [
-            (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, false, true),
-            (Arc::new(Float32Array::from(vec![-0.0])) as ArrayRef, false, true),
-            (Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef, false, true),
-            (Arc::new(Float64Array::from(vec![1.0])) as ArrayRef, true, false),
-            (Arc::new(Float32Array::from(vec![None])) as ArrayRef, false, false),
-            (Arc::new(Int64Array::from(vec![None])) as ArrayRef, false, false),
-            (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, false, false),
+            (
+                Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
+                false,
+                true,
+            ),
+            (
+                Arc::new(Float32Array::from(vec![-0.0])) as ArrayRef,
+                false,
+                true,
+            ),
+            (
+                Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef,
+                false,
+                true,
+            ),
+            (
+                Arc::new(Float64Array::from(vec![1.0])) as ArrayRef,
+                true,
+                true,
+            ),
+            (
+                Arc::new(Float32Array::from(vec![None])) as ArrayRef,
+                false,
+                true,
+            ),
+            (
+                Arc::new(Int64Array::from(vec![None])) as ArrayRef,
+                false,
+                true,
+            ),
+            (Arc::new(NullArray::new(1)) as ArrayRef, false, true),
+            (
+                Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef,
+                false,
+                true,
+            ),
+            (
+                Arc::new(StringArray::from(vec!["text"])) as ArrayRef,
+                false,
+                true,
+            ),
+            (
+                Arc::new(BinaryArray::from(vec![&b"\0\xff"[..]])) as ArrayRef,
+                false,
+                true,
+            ),
+            (list(Arc::clone(&item), vec![-0.0, 1.0]), false, true),
+            (fixed, false, true),
+            (list(Arc::clone(&item), vec![]), false, false),
+            (
+                list(
+                    Arc::new(item.as_ref().clone().with_nullable(true)),
+                    vec![1.0],
+                ),
+                false,
+                false,
+            ),
+            (list(item, vec![1.0]), true, false),
         ] {
             let mut field = Field::new("b", other.data_type().clone(), true);
             if annotated {
                 field = field.with_metadata([("tag".into(), "parameter".into())].into());
             }
-            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false), field]));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int64, false),
+                field,
+            ]));
             let batch = RecordBatch::try_new(schema, vec![Arc::clone(&signed), other]).unwrap();
-            let ipc = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
-                .unwrap();
+            let ipc =
+                rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+                    .unwrap();
             let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
             assert_eq!(parameters.can_bind_arrow(), expected);
         }
+    }
+
+    #[test]
+    fn unsigned_views_keep_the_ipc_values_and_validity() {
+        let memory = MemoryBudget::new(1 << 20);
+        for value in [Some(u64::MAX), None] {
+            let source = Arc::new(UInt64Array::from(vec![value])) as ArrayRef;
+            let batch = RecordBatch::try_from_iter([("u", source)]).unwrap();
+            let bytes =
+                rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+                    .unwrap();
+            let parameters = Parameters::read(Buffer::from_vec(bytes), &memory).unwrap();
+            let signed = parameters.signed_batch().unwrap();
+            let source = parameters
+                .batch
+                .batch()
+                .column(0)
+                .as_primitive::<UInt64Type>();
+            let array = signed.batch().column(0).as_primitive::<Int64Type>();
+            assert_eq!(
+                source.values().as_ptr().cast::<i64>(),
+                array.values().as_ptr()
+            );
+            assert_eq!(array.iter().next(), Some(value.map(|value| value as i64)));
+            assert_eq!(
+                parameters.batch.batch().schema_ref().field(0).data_type(),
+                &DataType::UInt64
+            );
+        }
+    }
+
+    #[test]
+    fn direct_binding_checks_eager_payload_bounds_without_retaining_row_memory() {
+        let memory = MemoryBudget::new(1 << 22);
+        let text = "x".repeat(1 << 14);
+        let batch = RecordBatch::try_from_iter([(
+            "p",
+            Arc::new(StringArray::from(vec![text.as_str()])) as ArrayRef,
+        )])
+        .unwrap();
+        let ipc = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
+            .unwrap();
+        let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();
+        let small = MemoryBudget::new(1 << 14);
+        assert!(parameters.reserve_scalar_row_bound(&small).is_err());
+        assert_eq!(small.used_bytes(), 0);
+        let before = memory.used_bytes();
+        let reserved = parameters.reserve_scalar_row_bound(&memory).unwrap();
+        assert!(reserved.bytes() > text.len());
+        drop(reserved);
+        assert_eq!(memory.used_bytes(), before);
     }
 
     #[test]

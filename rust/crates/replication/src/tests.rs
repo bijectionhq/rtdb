@@ -876,6 +876,71 @@ async fn retained_replay_requires_the_offload_even_when_readback_cached_it() {
 }
 
 #[tokio::test]
+async fn fresh_offload_keeps_body_charge_without_retaining_the_delivery() {
+    use rtdb_storage::{ObjectKey, log::{ReplicaObjectCustody, ReplicaPayload, ReplicaPayloadBroker}, object_store::ReadReservation};
+
+    struct Broker(Arc<MemoryStore>);
+
+    #[async_trait]
+    impl ReplicaPayloadBroker for Broker {
+        async fn read(&self, custody: &ReplicaObjectCustody, memory: &Arc<MemoryBudget>) -> rtdb_storage::Result<ReplicaPayload> {
+            custody.read_from(self.0.as_ref(), memory).await
+        }
+    }
+
+    let fixture = fixture(ReplicationConfig::default(), 256).await;
+    let body = ReplicaEnvelope {
+        term: Term(1), term_sequence: Some(TermSequence(0)),
+        message: ReplicaBody::ResolvedTx(proto::ResolvedTx {
+            table_data: [("public/docs".into(), Bytes::from_static(b"table IPC"))].into(),
+            ..Default::default()
+        }),
+    };
+    let bytes = Bytes::from(body.encode());
+    let table_start = bytes.windows(9).position(|window| window == b"table IPC").unwrap();
+    let table_ptr = bytes[table_start..].as_ptr();
+    let epoch = StorageEpoch(0);
+    let proxy = body.offloaded(CURRENT_STORAGE_VERSION, epoch, BlockIndex(0), "body-charge".into(), &bytes);
+    let key = ObjectKey::new(proxy.oversized_payload(CURRENT_STORAGE_VERSION, epoch).unwrap().unwrap()).unwrap();
+    fixture.store.put(&key, bytes.clone()).await.unwrap();
+
+    for (brokered, detached) in [(false, false), (true, false), (false, true), (true, true)] {
+        let before = fixture.memory.used_bytes();
+        let hold = Arc::new(());
+        let released = Arc::downgrade(&hold);
+        let mut delivery = LogRecord::new(LogMetadata { offset: LogOffset(0), timestamp: Timestamp(0) }, proxy.encode().into());
+        if brokered {
+            delivery.replica_objects = ReplicaObjectCustody::from_brokered_delivery(
+                Arc::new(Broker(Arc::clone(&fixture.store))), delivery.metadata.offset, &delivery.payload,
+                CURRENT_STORAGE_VERSION, epoch, hold.clone(),
+            ).unwrap();
+        }
+        let delivery = delivery.retain(ReadReservation::new(4096, hold)).unwrap();
+        let resolved = if detached {
+            let record = fixture.logs.decode_detached_replica(delivery).unwrap().unwrap();
+            fixture.logs.resolve_oversized_fresh_detached(record).await.unwrap()
+        } else {
+            let record = fixture.logs.decode_replica(delivery).unwrap().unwrap();
+            fixture.logs.resolve_oversized_fresh(record).await.unwrap()
+        };
+        let ReplicaBody::ResolvedTx(tx) = &resolved.envelope.message else { panic!("expected resolved transaction"); };
+        let field = tx.table_data["public/docs"].clone();
+        drop(resolved);
+        assert!(released.upgrade().is_none());
+        assert_eq!(&field[..], b"table IPC");
+        if detached {
+            assert_ne!(field.as_ptr(), table_ptr);
+            assert_eq!(fixture.memory.used_bytes(), before + replica_decode_bound(bytes.len()).unwrap());
+        } else {
+            assert_eq!(field.as_ptr(), table_ptr);
+            assert_eq!(fixture.memory.used_bytes(), before + bytes.len());
+        }
+        drop(field);
+        assert_eq!(fixture.memory.used_bytes(), before);
+    }
+}
+
+#[tokio::test]
 async fn cancelled_fresh_offload_read_keeps_its_delivery_until_provider_drain() {
     use rtdb_storage::{IoRegion, ObjectKey, StoredObject};
 
@@ -2644,14 +2709,14 @@ async fn own_transaction_readback_projects_verified_wire_bytes_without_decoding_
 
     let reference = envelope.offloaded(CURRENT_STORAGE_VERSION, StorageEpoch(0), BlockIndex(1), "readback".into(), &payload);
     let path = rtdb_storage::ObjectKey::new(reference.oversized_payload(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().unwrap()).unwrap();
-    fixture.store.put(&path, payload).await.unwrap();
+    fixture.store.put(&path, payload.clone()).await.unwrap();
     let raw = LogRecord::new(LogMetadata { offset: LogOffset(1), timestamp: Timestamp(42) }, reference.encode().into());
     let super::DecodedReplica::Known(proxy) = fixture.logs.decode_readback(raw, None, Some(Term(2)), Some(&expected)).unwrap() else { panic!("expected offload reference") };
     let projected = fixture.logs.resolve_oversized_for_readback(proxy, Some(digest)).await.unwrap();
     assert_eq!(projected.fingerprint, Some(digest));
     let ReplicaBody::ResolvedTx(tx) = &projected.envelope.message else { panic!("expected projected offload") };
     assert!(tx.table_data.is_empty());
-    assert_eq!(tx.search_delta.as_deref(), Some(b"delta".as_slice()));
+    assert_eq!(tx.search_delta.as_ref().unwrap().as_ptr(), payload[offset..].as_ptr());
 }
 
 #[tokio::test]

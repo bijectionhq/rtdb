@@ -8,6 +8,7 @@ use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_format::ipc::OwnedStream;
 use rtdb_types::{Anomaly, Result};
+use sha2::{Digest, Sha256};
 
 use crate::RetainedBytes;
 
@@ -29,15 +30,7 @@ impl Output {
         let capacity = self.data.capacity();
         if required <= capacity { return Ok(()); }
 
-        let preferred = required.saturating_add((capacity / 2).max(256));
-        let reserve = |capacity: usize| {
-            self.reservation.budget().reserve(capacity.checked_add(128).ok_or_else(overflow)?)
-        };
-        // A reallocating growth can briefly keep the old allocation live.
-        let (capacity, reservation) = match reserve(preferred) {
-            Err(_) if preferred > required => (required, reserve(required)?),
-            result => (preferred, result?),
-        };
+        let (capacity, reservation) = reserve_growth(&self.reservation, capacity, required)?;
         let additional = capacity - self.len();
         self.data.try_reserve_exact(additional)
             .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
@@ -56,6 +49,20 @@ impl Output {
     }
 }
 
+fn reserve_growth(
+    reservation: &MemoryReservation, capacity: usize, required: usize,
+) -> Result<(usize, Arc<MemoryReservation>)> {
+    let preferred = required.saturating_add((capacity / 2).max(256));
+    let reserve = |capacity: usize| {
+        reservation.budget().reserve(capacity.checked_add(128).ok_or_else(overflow)?)
+    };
+    // A reallocating growth can briefly keep the old allocation live.
+    Ok(match reserve(preferred) {
+        Err(_) if preferred > required => (required, reserve(required)?),
+        result => (preferred, result?),
+    })
+}
+
 impl Write for Output {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.reserve(bytes.len()).map_err(io::Error::other)?;
@@ -70,6 +77,103 @@ pub(crate) fn encode<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a Re
     output.write_stream(schema, pages)?;
     let (data, reservation) = output.into_parts();
     RetainedBytes::with_reservation(data, reservation)
+}
+
+pub(crate) fn hash_batch(batch: &RecordBatch, memory: &Arc<MemoryBudget>, hash: &mut Sha256) -> Result<()> {
+    let mut output = DigestOutput {
+        hash,
+        prefix: Vec::new(),
+        framing: DigestFraming::Prefix { offset: 0 },
+        len: 0,
+        capacity: 0,
+        reservation: memory.reserve(128)?,
+    };
+    let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(batch.schema_ref())?)?;
+    rtdb_format::ipc::write_stream_to(batch.schema_ref(), [batch], &mut output)?;
+    match output.framing {
+        DigestFraming::Body { stream_len } if stream_len == output.len => Ok(()),
+        _ => Err(invalid("Receipt IPC stream length differs from its framing")),
+    }
+}
+
+struct DigestOutput<'a> {
+    hash: &'a mut Sha256,
+    prefix: Vec<u8>,
+    framing: DigestFraming,
+    len: usize,
+    capacity: usize,
+    reservation: Arc<MemoryReservation>,
+}
+
+#[derive(Clone, Copy)]
+enum DigestFraming {
+    Prefix { offset: usize },
+    Metadata { start: usize, end: usize },
+    Body { stream_len: usize },
+}
+
+impl Write for DigestOutput<'_> {
+    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let written = bytes.len();
+        let len = self.len.checked_add(written).ok_or_else(|| io::Error::other(overflow()))?;
+        // Receipt admission keeps the buffered writer's growth checkpoints.
+        if len > self.capacity {
+            (self.capacity, self.reservation) = reserve_growth(&self.reservation, self.capacity, len)
+                .map_err(io::Error::other)?;
+        }
+        self.len = len;
+
+        while !bytes.is_empty() {
+            let end = match self.framing {
+                DigestFraming::Prefix { offset } => offset.checked_add(8).ok_or_else(|| io::Error::other(overflow()))?,
+                DigestFraming::Metadata { end, .. } => end,
+                DigestFraming::Body { .. } => {
+                    self.hash.update(bytes);
+                    break;
+                }
+            };
+            let count = (end - self.prefix.len()).min(bytes.len());
+            self.prefix.try_reserve_exact(count).map_err(|error| {
+                io::Error::other(Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))
+            })?;
+            let (prefix, rest) = bytes.split_at(count);
+            self.prefix.extend_from_slice(prefix);
+            bytes = rest;
+            if self.prefix.len() < end { break; }
+
+            self.framing = match self.framing {
+                DigestFraming::Prefix { offset } => {
+                    let (marker, size) = self.prefix[offset..end].split_at(4);
+                    let length = i32::from_le_bytes(size.try_into().expect("four length bytes"));
+                    if marker != [0xff; 4] || length <= 0 {
+                        return Err(io::Error::other(invalid("Invalid receipt IPC frame prefix")));
+                    }
+                    let metadata_end = end.checked_add(length as usize)
+                        .ok_or_else(|| io::Error::other(overflow()))?;
+                    DigestFraming::Metadata { start: end, end: metadata_end }
+                }
+                DigestFraming::Metadata { start, end } => {
+                    let message = arrow_ipc::root_as_message(&self.prefix[start..end])
+                        .map_err(|error| io::Error::other(invalid(error.to_string())))?;
+                    let body_len = usize::try_from(message.bodyLength()).map_err(io::Error::other)?;
+                    let next = end.checked_add(body_len).ok_or_else(|| io::Error::other(overflow()))?;
+                    if message.header_type() == arrow_ipc::MessageHeader::RecordBatch {
+                        // The one record batch's Java-layout body is followed by a single zero i32.
+                        let stream_len = next.checked_add(4).ok_or_else(|| io::Error::other(overflow()))?;
+                        self.hash.update((stream_len as u64).to_be_bytes());
+                        self.hash.update(std::mem::take(&mut self.prefix));
+                        DigestFraming::Body { stream_len }
+                    } else {
+                        DigestFraming::Prefix { offset: next }
+                    }
+                }
+                DigestFraming::Body { .. } => unreachable!("the receipt is already hashing body bytes"),
+            };
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
 }
 
 pub(crate) fn decode(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<Vec<OwnedBatch>> {
@@ -142,6 +246,44 @@ fn ipc_output_falls_back_to_exact_growth_and_releases_failed_growth() {
 
     drop(output);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn batch_digest_matches_buffered_ipc_bytes_and_admission() {
+    use arrow_array::{ArrayRef, DictionaryArray, Int8Array, StringArray, types::Int8Type};
+
+    let dictionary = DictionaryArray::<Int8Type>::try_new(
+        Int8Array::from(vec![Some(0), None, Some(1)]),
+        Arc::new(StringArray::from(vec!["first", "second"])),
+    ).unwrap();
+    let payload = "x".repeat(16_384);
+    let page = RecordBatch::try_from_iter([
+        ("labels", Arc::new(dictionary) as ArrayRef),
+        ("payload", Arc::new(StringArray::from(vec![Some(payload.as_str()), None, Some("tail")]))),
+    ]).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let buffered = encode(page.schema_ref(), [&page], &memory).unwrap();
+    let mut expected = Sha256::new();
+    expected.update((buffered.as_slice().len() as u64).to_be_bytes());
+    expected.update(buffered.as_slice());
+    let expected = expected.finalize();
+
+    let peak = memory.peak_bytes();
+    let schema_bytes = rtdb_format::ipc::schema_translation_bound(page.schema_ref()).unwrap();
+    for limit in [127, 128 + schema_bytes, peak - 1, peak] {
+        let memory = MemoryBudget::new(limit);
+        let buffered = encode(page.schema_ref(), [&page], &memory).map(drop);
+        let mut actual = Sha256::new();
+        match (buffered, hash_batch(&page, &memory, &mut actual)) {
+            (Ok(()), Ok(())) => assert_eq!(actual.finalize(), expected),
+            (Err(buffered), Err(streamed)) => {
+                assert_eq!(buffered.code, streamed.code);
+                assert_eq!(buffered.message, streamed.message);
+            }
+            (buffered, streamed) => panic!("budget {limit}: buffered {buffered:?}, streamed {streamed:?}"),
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }
 
 #[test]

@@ -187,7 +187,8 @@ impl Service {
         match kind {
             BatchKind::AudiencePoints => unreachable!("audience points use the reserved action allowance"),
             BatchKind::Selection if selector == 8 => {
-                self.held_owned_valid_during(call, request, ValidHistoryMode::Timeline, true).await
+                self.held_owned_valid_during(call, request, ValidHistoryMode::Timeline, true, false)
+                    .await.map(OwnedIpcReply::into_unary)
             },
             BatchKind::Point | BatchKind::Selection => {
                 let compact = matches!(kind, BatchKind::Selection);
@@ -356,15 +357,57 @@ pub(crate) enum OwnedIpcReply {
 }
 
 impl OwnedIpcReply {
+    pub(crate) fn encode(
+        memory: &Arc<MemoryBudget>,
+        schema: &Schema,
+        pages: &[RecordBatch],
+        stream: bool,
+        maximum: usize,
+    ) -> Result<Self, Status> {
+        let bytes = pages.iter().try_fold(0, |bytes, batch| {
+            wire::add(bytes, batch.get_array_memory_size())
+        })?;
+        let bound = wire::add(wire::schema_bound(schema)?, wire::mul(bytes, 8)?)?;
+        let _encoding = memory.reserve(bound).map_err(status)?;
+        if stream && pages.iter().all(|page| page.schema_ref().as_ref() == schema)
+            && let Ok(frames) = encode_ipc_frames(schema, pages)
+        {
+            return retain_ipc_frames(memory, frames, maximum);
+        }
+        // The original writer determines the status and precedence of codec refusals.
+        let bytes = rtdb_format::ipc::write_arrow_stream(schema, pages, IpcWriteOptions::default()).map_err(status)?;
+        let reply = ActionResult { body: bytes.into() };
+        if reply.encoded_len() > maximum {
+            return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
+        }
+        let retained = memory.reserve(reply.body.len()).map_err(status)?;
+        Ok(Self::Unary(ActionResult { body: wire::retain(reply.body, retained) }))
+    }
+
     pub(crate) fn into_unary(self) -> ActionResult {
         match self {
             Self::Unary(reply) => reply,
             Self::Frames(_) => unreachable!("unary reply encoding was requested"),
         }
     }
+
+    pub(crate) fn prepend_frame(self, prefix: ActionResult, maximum: usize) -> Result<Self, Status> {
+        let mut frames = match self {
+            Self::Frames(frames) => frames,
+            Self::Unary(reply) => IpcFrames(reply.body).collect::<Result<Vec<_>, _>>()?,
+        };
+        let encoded = frames.iter().try_fold(prefix.encoded_len(), |bytes, frame| {
+            wire::add(bytes, frame.encoded_len())
+        })?;
+        if encoded > maximum {
+            return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
+        }
+        frames.insert(0, prefix);
+        Ok(Self::Frames(frames))
+    }
 }
 
-pub(crate) fn encode_ipc_frames(schema: &Schema, batches: &[RecordBatch]) -> Result<Vec<Bytes>, Status> {
+fn encode_ipc_frames(schema: &Schema, batches: &[RecordBatch]) -> Result<Vec<Bytes>, Status> {
     let options = IpcWriteOptions::default();
     let schema_frame = rtdb_format::ipc::write_schema_message_with_options(schema, &options).map_err(status)?;
     let message = arrow_ipc::root_as_message(&schema_frame[8..]).map_err(arrow)?;
@@ -402,7 +445,7 @@ fn register_dictionaries(field: arrow_ipc::Field<'_>, tracker: &mut DictionaryTr
     }
 }
 
-pub(crate) fn retain_ipc_frames(
+fn retain_ipc_frames(
     memory: &Arc<MemoryBudget>, frames: Vec<Bytes>, maximum: usize,
 ) -> Result<OwnedIpcReply, Status> {
     let bytes = frames.iter().try_fold(0, |size, frame| wire::add(size, frame.len()))?;
@@ -509,11 +552,37 @@ mod tests {
             amount_field,
         ], [("decision".into(), "held".into())].into()));
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(nested), kind, Arc::new(amount)]).unwrap();
-        for batches in [&[][..], std::slice::from_ref(&batch)] {
-            let expected = rtdb_format::ipc::write_arrow_stream(&schema, batches, IpcWriteOptions::default()).unwrap();
-            let expected = IpcFrames(expected.into()).map(|reply| reply.unwrap().body).collect::<Vec<_>>();
-            assert_eq!(encode_ipc_frames(&schema, batches).unwrap(), expected);
+        let mut changed = batch.columns().to_vec();
+        changed[1] = dictionary("replacement");
+        let changed = RecordBatch::try_new(Arc::clone(&schema), changed).unwrap();
+        let pages = [batch.clone(), batch, changed];
+        let memory = MemoryBudget::new(1 << 20);
+        for batches in [&pages[..0], &pages[..1], &pages[..]] {
+            let unary = OwnedIpcReply::encode(&memory, &schema, batches, false, 1 << 20).unwrap().into_unary();
+            let maximum = unary.encoded_len();
+            let expected = IpcFrames(unary.body).collect::<Result<Vec<_>, _>>().unwrap();
+            let OwnedIpcReply::Frames(frames) = OwnedIpcReply::encode(&memory, &schema, batches, true, maximum).unwrap() else {
+                panic!("expected one Flight result per IPC message");
+            };
+            assert_eq!(frames, expected);
         }
+    }
+
+    #[test]
+    fn negotiated_ipc_preserves_the_unary_schema_refusal() {
+        let memory = MemoryBudget::new(1 << 20);
+        let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+        let schema = Schema::empty().with_metadata([("present".into(), "1".into())].into());
+        let pages = [batch];
+        let Err(unary) = OwnedIpcReply::encode(&memory, &schema, &pages, false, 1 << 20) else {
+            panic!("expected the original writer to reject a mismatched schema");
+        };
+        let Err(stream) = OwnedIpcReply::encode(&memory, &schema, &pages, true, 1 << 20) else {
+            panic!("expected negotiated framing to reject a mismatched schema");
+        };
+        assert_eq!(stream.code(), unary.code());
+        assert_eq!(stream.message(), unary.message());
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]
@@ -538,5 +607,29 @@ mod tests {
         assert_eq!(memory.used_bytes(), original.body.len());
         drop(held);
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn ranked_reply_prefix_counts_toward_the_limit_and_reuses_ipc_frames() {
+        let memory = MemoryBudget::new(1 << 20);
+        let prefix = ActionResult { body: Bytes::from_static(b"inventory") };
+        let frames = encode_ipc_frames(&Schema::empty(), &[]).unwrap();
+        let retained_schema = frames[0].clone();
+        let maximum = frames.iter().fold(prefix.encoded_len(), |size, body| {
+            size + ActionResult { body: body.clone() }.encoded_len()
+        });
+        let make_reply = || retain_ipc_frames(&memory, frames.clone(), maximum).unwrap();
+        let Err(error) = make_reply().prepend_frame(prefix.clone(), maximum - 1) else {
+            panic!("ranked reply exceeded its aggregate message limit");
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let OwnedIpcReply::Frames(replies) = make_reply().prepend_frame(prefix.clone(), maximum).unwrap() else {
+            panic!("expected ranked IPC messages");
+        };
+        assert_eq!(replies[0], prefix);
+        assert_eq!(replies[1].body.as_ptr(), retained_schema.as_ptr());
+        assert_eq!(replies[2].body.as_ref(), IPC_EOS);
     }
 }

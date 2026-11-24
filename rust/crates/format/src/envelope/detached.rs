@@ -10,6 +10,8 @@ use super::digest_leaf::{digest_matches, sha256};
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 #[cfg(not(verus_keep_ghost))]
+use prost::bytes::Bytes;
+#[cfg(not(verus_keep_ghost))]
 use sha2::{Digest, Sha256};
 
 #[cfg(not(verus_keep_ghost))]
@@ -42,6 +44,30 @@ impl ReplicaEnvelope {
                 && body == Some(payload.message)),
     ))]
     pub fn unwrap_payload(&self, bytes: &[u8]) -> Result<Self> {
+        self.check_payload_digest(bytes)?;
+        let Some(payload) = decode_replica_envelope(bytes)? else {
+            return Err(invalid("Oversized payload has no replica message"));
+        };
+        self.check_payload_envelope(&payload)?;
+        Ok(payload)
+    }
+
+    /// Decoded protobuf byte fields can retain the fetched allocation.
+    #[cfg(not(verus_keep_ghost))]
+    pub fn unwrap_payload_bytes(&self, bytes: Bytes) -> Result<Self> {
+        self.check_payload_digest(&bytes)?;
+        let Some(payload) = super::ReplicaFrame::decode_bytes(bytes)?.into_envelope() else {
+            return Err(invalid("Oversized payload has no replica message"));
+        };
+        self.check_payload_envelope(&payload)?;
+        Ok(payload)
+    }
+
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out is Ok ==> self.message matches ReplicaBody::OversizedMessage(reference)
+            && (reference.payload_sha256 matches Some(expected) ==> expected@ == sha256(bytes@)),
+    ))]
+    fn check_payload_digest(&self, bytes: &[u8]) -> Result<()> {
         let ReplicaBody::OversizedMessage(reference) = &self.message else {
             return Err(invalid("Only an oversized envelope has an external payload"));
         };
@@ -50,9 +76,15 @@ impl ReplicaEnvelope {
                 return Err(Anomaly::fault("rtdb.format/oversized-payload-mismatch", "Oversized payload bytes differ from their replica reference"));
             }
         }
-        let Some(payload) = decode_replica_envelope(bytes)? else {
-            return Err(invalid("Oversized payload has no replica message"));
-        };
+        Ok(())
+    }
+
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out is Ok ==> payload.term == self.term && payload.term_sequence == self.term_sequence
+            && !(payload.message is OversizedMessage)
+            && (payload.message matches ReplicaBody::ResolvedTx(tx) ==> tx.acceptance_stage is None),
+    ))]
+    fn check_payload_envelope(&self, payload: &Self) -> Result<()> {
         let same_sequence = match (payload.term_sequence, self.term_sequence) {
             (Some(observed), Some(expected)) => observed.0 == expected.0,
             (None, None) => true,
@@ -67,6 +99,6 @@ impl ReplicaEnvelope {
         if matches!(&payload.message, ReplicaBody::ResolvedTx(tx) if tx.acceptance_stage.is_some()) {
             return Err(invalid("Strict acceptance requires an inline replica record"));
         }
-        Ok(payload)
+        Ok(())
     }
 }

@@ -2,8 +2,8 @@ use rtdb_types::StructFields;
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_array::{Array, ArrayRef, BinaryArray, FixedSizeBinaryArray, ListArray, RecordBatch, StructArray, UnionArray, cast::AsArray};
+use arrow_buffer::{Buffer, NullBuffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::{BufMut, Bytes};
 use prost::{Message, encoding::{WireType, encode_key, encode_varint, encoded_len_varint, key_len}};
@@ -355,30 +355,46 @@ impl SourceTransaction {
     pub(crate) fn body_digest(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
-        let mut field = |bytes: &[u8]| { hash.update((bytes.len() as u64).to_be_bytes()); hash.update(bytes); };
         let batch = self.operation_batch(None, SourcePurpose::Receipt)?;
-        field(crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)?.as_slice());
-        field(self.options.default_tz.as_bytes());
+        crate::ipc::hash_batch(batch.batch(), &self.memory, &mut hash)?;
+        let timezone = self.options.default_tz.as_bytes();
+        hash.update((timezone.len() as u64).to_be_bytes());
+        hash.update(timezone);
         if let Some(Value::Struct(fields)) = self.options.user_metadata.as_ref().map(UserMetadata::value) {
             let mut rest = fields.clone();
             rest.remove("idempotency_key");
             if matches!(self.guard, Some(SourceGuard::Bounded(_))) { rest.remove(BOUNDED_RETRY_METADATA_KEY); }
-            field(encode_metadata(&UserMetadata::new(Value::Struct(rest), &self.memory)?, &self.memory)?.as_slice());
+            let metadata = UserMetadata::new(Value::Struct(rest), &self.memory)?;
+            let batch = metadata_batch(&metadata, &self.memory)?;
+            crate::ipc::hash_batch(batch.batch(), &self.memory, &mut hash)?;
         }
         Ok(hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
-    pub(crate) fn encode_landing_footprint(&self) -> Result<RetainedBytes> {
+    pub(crate) fn landing_footprint(&self) -> Result<Self> {
         let batch = self.operation_batch(None, SourcePurpose::Log)?;
-        crate::ipc::encode(batch.batch().schema().as_ref(), [batch.batch()], &self.memory)
-    }
+        let schema = batch.batch().schema_ref();
+        let schema_bytes = rtdb_format::ipc::schema_translation_bound(schema)?;
+        let decode = |pages: &[OwnedBatch]| {
+            let mut scratch = self.memory.reserve(4096)?;
+            let scratch = Arc::get_mut(&mut scratch).expect("source decoding owns its reservation");
+            let operations = decode_operation_pages(pages, false, &self.memory, scratch)?;
+            Self::from_operations(operations, self.options.clone(), &self.memory)
+        };
+        if schema.fields().iter().zip(batch.batch().columns())
+            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref()))
+        {
+            let _schema = self.memory.reserve(schema_bytes)?;
+            let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch())? {
+                Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation()))?,
+                None => batch,
+            };
+            return decode(std::slice::from_ref(&batch));
+        }
 
-    pub(crate) fn decode_landing_footprint(&self, footprint: &Bytes) -> Result<Self> {
-        let pages = crate::ipc::decode(footprint, &self.memory)?;
-        let mut scratch = self.memory.reserve(4096)?;
-        let scratch = Arc::get_mut(&mut scratch).expect("source decoding owns its reservation");
-        let operations = decode_operation_pages(&pages, false, &self.memory, scratch)?;
-        Self::from_operations(operations, self.options.clone(), &self.memory)
+        let footprint = crate::ipc::encode(schema, [batch.batch()], &self.memory)?;
+        drop(batch);
+        decode(&crate::ipc::decode(&footprint.into_bytes(), &self.memory)?)
     }
 
     pub fn encode(&self) -> Result<RetainedBytes> {
@@ -527,6 +543,33 @@ impl SourceTransaction {
     }
 }
 
+fn landing_field_matches_ipc(field: &Field, array: &dyn Array) -> bool {
+    // The Java stream layout drops validity buffers for non-nullable fields, including masked child nulls.
+    if (!field.is_nullable() && array.null_count() != 0) || rtdb_columnar::decimal_field_parameters(field).is_err() {
+        return false;
+    }
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().zip(array.as_struct().columns())
+            .all(|(field, column)| landing_field_matches_ipc(field, column.as_ref())),
+        DataType::Union(fields, UnionMode::Dense) => fields.iter()
+            .all(|(id, field)| landing_field_matches_ipc(field, array.as_union().child(id).as_ref())),
+        DataType::List(item) => landing_field_matches_ipc(item, array.as_list::<i32>().values().as_ref()),
+        DataType::LargeList(item) => landing_field_matches_ipc(item, array.as_list::<i64>().values().as_ref()),
+        DataType::FixedSizeList(item, _) => landing_field_matches_ipc(item, array.as_fixed_size_list().values().as_ref()),
+        DataType::Map(entries, _) => landing_field_matches_ipc(entries, array.as_map().entries()),
+        // Arrow IPC omits an empty timezone string from the schema.
+        DataType::Timestamp(_, zone) => zone.as_ref().is_none_or(|zone| !zone.is_empty()),
+        DataType::Null | DataType::Boolean
+        | DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+        | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+        | DataType::Float16 | DataType::Float32 | DataType::Float64
+        | DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_)
+        | DataType::Date32 | DataType::Date64 | DataType::Time32(_) | DataType::Time64(_) | DataType::Duration(_) | DataType::Interval(_)
+        | DataType::Decimal32(..) | DataType::Decimal64(..) | DataType::Decimal128(..) | DataType::Decimal256(..) => true,
+        _ => false,
+    }
+}
+
 fn decode_operation_pages(
     pages: &[OwnedBatch], legacy: bool, memory: &Arc<MemoryBudget>, parsed_fields: &mut MemoryReservation,
 ) -> Result<Vec<Operation>> {
@@ -562,13 +605,27 @@ struct SourceOperation<'a> {
 }
 
 enum SourceOperationBody<'a> {
-    Values { fields: StructFields<Value>, arguments: Option<Cow<'a, RetainedBytes>> },
+    Values { fields: StructFields<Value>, arguments: Option<SourceArgumentBytes<'a>> },
     Path {
         relation: &'a str,
         name: &'a str,
         columns: Option<&'a [String]>,
         encoding: Option<rtdb_types::SpatialGeometryEncoding>,
     },
+}
+
+enum SourceArgumentBytes<'a> {
+    Direct { bytes: Vec<u8>, _reservation: Arc<MemoryReservation> },
+    Encoded(Cow<'a, RetainedBytes>),
+}
+
+impl SourceArgumentBytes<'_> {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Direct { bytes, .. } => bytes,
+            Self::Encoded(bytes) => bytes.as_slice(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -686,13 +743,19 @@ fn operation_value<'a>(operation: &'a Operation, memory: &Arc<MemoryBudget>, pur
         Operation::Public(TxOp::Sql { sql, args }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), Value::Null);
-            arguments = args.as_ref().map(|args| encode_arguments(args, memory).map(Cow::Owned)).transpose()?;
+            arguments = args.as_ref().map(|args| match purpose {
+                SourcePurpose::Log => {
+                    let (bytes, reservation) = argument_output(args, memory, purpose)?.into_parts();
+                    Ok(SourceArgumentBytes::Direct { bytes, _reservation: reservation })
+                }
+                SourcePurpose::Receipt => encode_arguments(args, memory).map(|bytes| SourceArgumentBytes::Encoded(Cow::Owned(bytes))),
+            }).transpose()?;
             "sql"
         }
         Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
             body.insert("query".into(), Value::Utf8(sql.clone()));
             body.insert("args".into(), Value::Null);
-            arguments = (!arg_bytes.as_slice().is_empty()).then_some(Cow::Borrowed(arg_bytes));
+            arguments = (!arg_bytes.as_slice().is_empty()).then_some(SourceArgumentBytes::Encoded(Cow::Borrowed(arg_bytes)));
             "sql"
         }
         Operation::Public(TxOp::OwnedCheckCapacity { relation, column, prefix, at_most }) => {
@@ -1211,17 +1274,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder, me
         let column = if name == "iids" {
             iid_vector(&iids, &field, arrays)?
         } else if name == "args" {
-            let bytes = arguments.iter().flatten().try_fold(0usize, |bytes, value| {
-                bytes.checked_add(value.as_slice().len()).ok_or_else(overflow)
-            })?;
-            i32::try_from(bytes).map_err(|_| overflow())?;
-            let bound = arguments.len().checked_mul(16).and_then(|size| size.checked_add(bytes.checked_mul(2)?))
-                .and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?;
-            arrays.column(bound, || {
-                let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(arguments.len(), bytes);
-                for args in &arguments { builder.append_option(args.as_ref().map(|bytes| bytes.as_slice())); }
-                Ok(Arc::new(builder.finish()) as ArrayRef)
-            })?
+            argument_column(std::mem::take(&mut arguments), arrays)?
         } else {
             let cells = || values.iter().map(|value| struct_field_cell(value, &name, &ty));
             let bound = estimate_builder_bytes_refs(&ty, cells())?;
@@ -2915,7 +2968,43 @@ impl SourceOperationReader<'_> {
     }
 }
 
+fn argument_column(mut arguments: Vec<Option<SourceArgumentBytes<'_>>>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
+    let bytes = arguments.iter().flatten().try_fold(0usize, |bytes, value| {
+        bytes.checked_add(value.as_slice().len()).ok_or_else(overflow)
+    })?;
+    let end = i32::try_from(bytes).map_err(|_| overflow())?;
+    let bound = arguments.len().checked_mul(16).and_then(|size| size.checked_add(bytes.checked_mul(2)?))
+        .and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?;
+    let mut populated = arguments.iter().enumerate().filter_map(|(index, args)| args.as_ref().map(|args| (index, args)));
+    if let Some((index, SourceArgumentBytes::Direct { .. })) = populated.next()
+        && populated.next().is_none()
+    {
+        return arrays.column(bound, || {
+            let Some(SourceArgumentBytes::Direct { bytes, _reservation }) = arguments[index].take() else { unreachable!() };
+            let mut offsets = vec![0; arguments.len() + 1];
+            offsets[index + 1..].fill(end);
+            let mut nulls = NullBufferBuilder::new(arguments.len());
+            for row in 0..arguments.len() { nulls.append(row == index); }
+            // Release the writer's spare capacity before transferring the allocation to the batch's reservation.
+            let values = Buffer::from_vec(bytes.into_boxed_slice().into_vec());
+            let array = BinaryArray::try_new(OffsetBuffer::new(offsets.into()), values, nulls.finish())
+                .map_err(|error| invalid(error.to_string()))?;
+            Ok(Arc::new(array) as ArrayRef)
+        });
+    }
+    arrays.column(bound, || {
+        let mut builder = arrow_array::builder::BinaryBuilder::with_capacity(arguments.len(), bytes);
+        for args in &arguments { builder.append_option(args.as_ref().map(SourceArgumentBytes::as_slice)); }
+        Ok(Arc::new(builder.finish()) as ArrayRef)
+    })
+}
+
 pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    let (bytes, reservation) = argument_output(arguments, memory, SourcePurpose::Receipt)?.into_parts();
+    RetainedBytes::with_reservation(bytes, reservation)
+}
+
+fn argument_output(arguments: &SqlArguments, memory: &Arc<MemoryBudget>, purpose: SourcePurpose) -> Result<crate::ipc::Output> {
     if arguments.retains_uploaded_source_layout() && let Some(pages) = arguments.uniform_arrow_pages() {
         let first = pages[0];
         let _reservation = memory.reserve(pages.iter().try_fold(4096usize, |bytes, page| {
@@ -2925,20 +3014,34 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
             field.as_ref().clone().with_name(format!("?_{index}"))
         }).collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(fields));
+        let mut populated = pages.iter().copied().filter(|page| page.num_rows() != 0);
         let combined;
         let page = if pages.len() == 1 {
             first
+        } else if purpose == SourcePurpose::Log
+            && let Some(page) = populated.next()
+            && populated.next().is_none()
+            && page.schema_ref().fields().iter().zip(page.columns()).all(|(field, column)| {
+                field.data_type().is_numeric() && field.metadata().is_empty() && column.null_count() == 0
+            })
+        {
+            page
         } else {
+            // Replay uses IPC page boundaries for SQL error indices and single-page execution.
             combined = arrow_select::concat::concat_batches(first.schema_ref(), pages).map_err(|error| invalid(error.to_string()))?;
             &combined
         };
         let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(page.num_rows()));
         let page = RecordBatch::try_new_with_options(Arc::clone(&schema), page.columns().to_vec(), &options)
             .map_err(|error| invalid(error.to_string()))?;
-        return crate::ipc::encode(&schema, [&page], memory);
+        let mut output = crate::ipc::Output::new(memory, 0)?;
+        output.write_stream(&schema, [&page])?;
+        return Ok(output);
     }
     let batch = arguments.source_columnar_batch(memory)?;
-    crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], memory)
+    let mut output = crate::ipc::Output::new(memory, 0)?;
+    output.write_stream(batch.batch().schema_ref(), [batch.batch()])?;
+    Ok(output)
 }
 
 pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudget>) -> Result<SqlArguments> {
@@ -2966,11 +3069,15 @@ pub(crate) fn decode_arguments(bytes: impl Into<Buffer>, memory: &Arc<MemoryBudg
 }
 
 fn encode_metadata(metadata: &UserMetadata, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    let owned = metadata_batch(metadata, memory)?;
+    crate::ipc::encode(owned.batch().schema_ref(), [owned.batch()], memory)
+}
+
+fn metadata_batch(metadata: &UserMetadata, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     let ty = metadata.value().logical_type().maybe();
     let reservation = memory.reserve(estimate_builder_bytes(&ty, std::slice::from_ref(metadata.value()))?)?;
     let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("user-metadata", &ty)?])), vec![build_array(&ty, std::slice::from_ref(metadata.value()))?]).map_err(|error| invalid(error.to_string()))?;
-    let owned = OwnedBatch::with_reservation(batch, reservation)?;
-    crate::ipc::encode(owned.batch().schema().as_ref(), [owned.batch()], memory)
+    OwnedBatch::with_reservation(batch, reservation)
 }
 fn decode_metadata(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<UserMetadata> {
     let _value_reservation = memory.reserve(crate::ipc::allocation_bound(bytes)?)?;
@@ -3474,6 +3581,40 @@ mod tests {
             (index, values[0].clone())
         }).collect();
         assert_eq!(rows, [(0, Value::U64(u64::MAX)), (1, Value::Null), (2, Value::U64(5))]);
+    }
+
+    #[test]
+    fn sql_source_adopts_the_only_argument_stream_with_canonical_bytes_and_null_offsets() {
+        let memory = budget();
+        let schema = Arc::new(Schema::new(vec![Field::new("client_value", DataType::Float64, true)]));
+        let values = arrow_array::Float64Array::from(vec![1.0, -0.0, f64::from_bits(0x7ff8_0000_0000_0007), 3.0]);
+        let page = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap().slice(1, 2);
+        let upload = |page| SqlArguments::from_arrow(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
+        let mut arguments = upload(page.slice(0, 0));
+        arguments.append(upload(page.clone())).unwrap();
+        arguments.append(upload(page.slice(2, 0))).unwrap();
+        let arg_bytes = encode_arguments(&arguments, &memory).unwrap();
+
+        let sql = "UPDATE docs SET v = ?";
+        let request = |bound| {
+            SourceTransaction::new(vec![
+                TxOp::Sql { sql: "ASSERT TRUE".into(), args: None },
+                bound,
+                TxOp::Sql { sql: "ASSERT TRUE".into(), args: None },
+            ], SubmitOptions::default(), &memory).unwrap()
+        };
+        let legacy = request(TxOp::SqlBytes { sql: sql.into(), arg_bytes });
+        let source = request(TxOp::Sql { sql: sql.into(), args: Some(arguments) });
+        assert_eq!(source.encode().unwrap().as_slice(), legacy.encode().unwrap().as_slice());
+        assert_eq!(source.body_digest().unwrap(), legacy.body_digest().unwrap());
+
+        let replayed = roundtrip(&source);
+        assert_eq!(source.body_digest().unwrap(), replayed.body_digest().unwrap());
+        let Operation::Public(TxOp::Sql { args: Some(arguments), .. }) = &replayed.operations[1] else {
+            panic!("Expected SQL arguments");
+        };
+        assert_eq!(arguments.single_arrow_page().unwrap().batch().num_rows(), 2);
+        assert_eq!(arguments.indexed_rows().map(|row| row.unwrap().0).collect::<Vec<_>>(), [0, 1]);
     }
 
     #[test]
@@ -4779,9 +4920,64 @@ mod tests {
             relation, documents, valid_from: Some(Timestamp::MIN), valid_to: None,
         }], SubmitOptions::default(), &memory).unwrap();
         let replay = roundtrip(&source);
-        assert!(matches!(&replay.operations[0], Operation::OwnedArrowIids { .. }));
-        assert!(crate::hosted_control::proposal_landing_frontier_rows(&replay.operations[0]).is_some());
+        let footprint = source.landing_footprint().unwrap();
+        for transaction in [&replay, &footprint] {
+            assert!(matches!(&transaction.operations[0], Operation::OwnedArrowIids { .. }));
+            assert!(crate::hosted_control::proposal_landing_frontier_rows(&transaction.operations[0]).is_some());
+        }
         assert_eq!(source.body_digest().unwrap(), replay.body_digest().unwrap());
+    }
+
+    #[test]
+    fn landing_footprint_reuses_compatible_payloads_and_normalizes_masked_children() {
+        use arrow_array::{Int64Array, StringArray};
+
+        let memory = budget();
+        let values = [Value::I64(7), Value::Utf8("text".into()), Value::Null];
+        let types = values.each_ref().map(Value::logical_type);
+        let value_type = LogicalType::join_all(&types);
+        let items = to_field("item", &value_type).unwrap();
+        for masked_child in [false, true] {
+            let field = Field::new("code", DataType::Int64, false);
+            let codes = Int64Array::from(vec![Some(10), (!masked_child).then_some(20), Some(30)]);
+            let detail = StructArray::new(
+                vec![field].into(), vec![Arc::new(codes)], Some(NullBuffer::from(vec![true, false, true])),
+            );
+            let ids = Arc::new(StringArray::from(vec!["first", "second", "third"]));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_id", DataType::Utf8, false),
+                items.clone(),
+                Field::new("detail", detail.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![
+                ids.clone(), build_array(&value_type, &values).unwrap(), Arc::new(detail),
+            ]).unwrap();
+            let batch = OwnedBatch::new(batch, &memory).unwrap();
+            let documents = ArrowDocuments::from_owned_payload(&batch, &memory).unwrap().unwrap();
+            let source = SourceTransaction::new(vec![
+                TxOp::OwnedArrowDocs {
+                    relation: rtdb_types::OwnedRelation::new("facts").unwrap(), documents, create_only: true,
+                    valid_from: Some(Timestamp(10)), valid_to: None,
+                },
+                TxOp::HostedConstraintRefusal,
+            ], SubmitOptions::default(), &memory).unwrap();
+
+            let footprint = source.landing_footprint().unwrap();
+            let replay = roundtrip(&source);
+            assert_eq!(footprint.encode().unwrap().as_slice(), replay.encode().unwrap().as_slice());
+            let [
+                Operation::OwnedArrowIids { documents, iids, presence: Some(presence), valid_from: Some(Timestamp(10)), .. },
+                Operation::Public(TxOp::HostedConstraintRefusal),
+            ] = footprint.operations.as_slice() else { panic!("expected the ordered landing footprint"); };
+            assert_eq!(iids[1], EntityId::String("second".into()).iid());
+            assert!(presence[2].contains("item"));
+            assert!(documents.array().fields()[1].is_nullable());
+            let retained_ids = documents.array().column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            assert_eq!(retained_ids.value(0).as_ptr() == ids.value(0).as_ptr(), !masked_child);
+            let detail = documents.array().column(2).as_struct();
+            assert!(detail.is_null(1));
+            assert!(detail.column(0).is_valid(1));
+        }
     }
 
     #[test]
@@ -4938,6 +5134,37 @@ mod tests {
         let cell = DocumentCell::Arrow { cell: ArrowCell { field: &field, array: &array, row: 0 }, declared: Some(&LogicalType::Nothing) };
         assert_eq!(cell.bound().unwrap(), 0);
         assert_eq!(*cell.value().unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn receipt_digest_matches_buffered_java_ipc_and_length_prefixes() {
+        use sha2::{Digest, Sha256};
+
+        let memory = budget();
+        let business_metadata = StructFields::from([("business".into(), Value::Utf8("audit".into()))]);
+        let mut receipt_metadata = business_metadata.clone();
+        receipt_metadata.insert(BOUNDED_RETRY_METADATA_KEY.into(), Value::Struct(StructFields::from([
+            ("nonce".into(), Value::Utf8("0123456789abcdef0123456789abcdef".into())),
+            ("not_after_micros".into(), Value::I64(10)),
+        ])));
+        let source = SourceTransaction::new(vec![TxOp::Sql {
+            sql: format!("ASSERT TRUE /*{}*/", "x".repeat(16_384)), args: None,
+        }], SubmitOptions {
+            default_tz: "Europe/Paris".into(),
+            user_metadata: Some(UserMetadata::new(Value::Struct(receipt_metadata), &memory).unwrap()),
+            ..Default::default()
+        }, &memory).unwrap();
+
+        let batch = source.operation_batch(None, SourcePurpose::Receipt).unwrap();
+        let ops = crate::ipc::encode(batch.batch().schema_ref(), [batch.batch()], &memory).unwrap();
+        let metadata = UserMetadata::new(Value::Struct(business_metadata), &memory).unwrap();
+        let metadata = encode_metadata(&metadata, &memory).unwrap();
+        let mut expected = Sha256::new();
+        for field in [ops.as_slice(), b"Europe/Paris", metadata.as_slice()] {
+            expected.update((field.len() as u64).to_be_bytes());
+            expected.update(field);
+        }
+        assert_eq!(source.body_digest().unwrap(), format!("{:x}", expected.finalize()));
     }
 
     #[test]

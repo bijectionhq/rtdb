@@ -49,6 +49,7 @@ pub(crate) fn term_stats(nodes: &StructArray, row: usize, doc_freq: u32) -> Resu
     Ok(crate::term_directory::TermStats { doc_freq, max_tf: node.frequency, min_len: node.length,
         unit_bound: node.unit_score, first_window: node.first, last_window: node.last })
 }
+pub(crate) use layout::FileDigestWriter;
 pub(crate) use page_tree::PageCache;
 pub(crate) use tree_file::{EncodedTreeLocator, MAX_ROOT_BYTES, TreeFile, TreeLocator};
 pub(crate) use tree_file::LogicalDocument;
@@ -322,6 +323,7 @@ where P: IntoIterator<Item = Result<Vec<SearchRow>>>,
     write::write_group(columns, members, identity, None, ceiling, output, None, FORMAT_VERSION)
 }
 
+#[cfg(test)]
 pub(crate) fn write_versioned_group<P, I>(
     columns: &[String], members: impl IntoIterator<Item = P>, identity: &str, version: i64,
     ceiling: Option<i64>, output: impl Write, reservation: Option<Arc<rtdb_columnar::MemoryReservation>>, format: i32,

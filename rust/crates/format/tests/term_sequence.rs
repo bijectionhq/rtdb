@@ -2,7 +2,7 @@ use prost::{Message, bytes::Bytes};
 use rtdb_format::catalog::BlockCatalog;
 use rtdb_format::envelope::{ReplicaBody, ReplicaEnvelope, ReplicaFrame, ReplicaPeek, ReplicaPeekBody};
 use rtdb_format::generated::xtdb::{block::proto::Block, log::proto as pb};
-use rtdb_types::{PlacedAttemptScope, SourcePosition, Term, TermSequence, Timestamp};
+use rtdb_types::{BlockIndex, PlacedAttemptScope, SourcePosition, StorageEpoch, StorageVersion, Term, TermSequence, Timestamp};
 
 #[test]
 fn arrow_byte_path_every_message_kind_keeps_prost_envelope_bytes() {
@@ -63,7 +63,8 @@ fn a_strict_replica_record_preserves_and_checks_its_original_staging_sample() {
         ..Default::default() };
     let encode = |tx| ReplicaEnvelope { term: Term(5), term_sequence: Some(TermSequence(3)), message: ReplicaBody::ResolvedTx(tx) }.encode();
     let encoded = encode(tx.clone());
-    let Some(ReplicaEnvelope { message: ReplicaBody::ResolvedTx(decoded), .. }) = ReplicaEnvelope::decode(&encoded).unwrap() else {
+    let strict = ReplicaEnvelope::decode(&encoded).unwrap().unwrap();
+    let ReplicaBody::ResolvedTx(decoded) = &strict.message else {
         panic!("strict committed transaction should decode");
     };
     let stage = decoded.checked_acceptance_stage().unwrap().unwrap();
@@ -71,6 +72,12 @@ fn a_strict_replica_record_preserves_and_checks_its_original_staging_sample() {
     assert_eq!(stage.ordered_at, Timestamp(100));
     assert_eq!(stage.clock_upper, Timestamp(198));
     assert_eq!(stage.cutoff, Timestamp(200));
+
+    let proxy = strict.offloaded(StorageVersion(6), StorageEpoch(0), BlockIndex(1), "strict".into(), &encoded);
+    assert_eq!(
+        proxy.unwrap_payload_bytes(Bytes::copy_from_slice(&encoded)).unwrap_err().message.as_deref(),
+        Some("Strict acceptance requires an inline replica record"),
+    );
 
     let mut preflight = tx.clone();
     preflight.acceptance_stage.as_mut().unwrap().clock_upper_micros = Some(0);
@@ -153,11 +160,16 @@ fn an_oversized_payload_cannot_replace_an_admitted_term_or_sequence() {
     }) };
     let payload = ReplicaEnvelope { term: Term(4), term_sequence: Some(TermSequence(4)), message: ReplicaBody::NoOp(pb::NoOp::default()) };
     assert_eq!(envelope.unwrap_payload(&payload.encode()).unwrap_err().code, "rtdb.format/oversized-term-mismatch");
+    assert_eq!(envelope.unwrap_payload_bytes(payload.encode().into()).unwrap_err().code, "rtdb.format/oversized-term-mismatch");
+    assert_eq!(
+        envelope.unwrap_payload_bytes(envelope.encode().into()).unwrap_err().message.as_deref(),
+        Some("Nested oversized replica messages are invalid"),
+    );
 }
 
 #[test]
 fn a_collectable_offload_binds_an_exact_provider_version() {
-    use rtdb_types::{BlockIndex, PhysicalObjectVersion, S3ObjectNamespace, StorageEpoch, StorageVersion};
+    use rtdb_types::{PhysicalObjectVersion, S3ObjectNamespace};
 
     let body = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(4)), message: ReplicaBody::NoOp(pb::NoOp::default()) };
     let bytes = body.encode();
@@ -179,6 +191,7 @@ fn a_collectable_offload_binds_an_exact_provider_version() {
     other_bytes.extend([0xa0, 0x06, 0x01]);
     assert_eq!(ReplicaEnvelope::decode(&other_bytes).unwrap().unwrap(), body);
     assert_eq!(decoded.unwrap_payload(&other_bytes).unwrap_err().code, "rtdb.format/oversized-payload-mismatch");
+    assert_eq!(decoded.unwrap_payload_bytes(other_bytes.into()).unwrap_err().code, "rtdb.format/oversized-payload-mismatch");
 }
 
 #[test]

@@ -9,11 +9,13 @@ use rtdb_pg_codec::Format;
 use rtdb_plan::{CopyFormat, CopyOutFormat, Identifier};
 use rtdb_tx::{ArrowDocuments, TxOp};
 use rtdb_types::{Anomaly, Result, TableRef};
-use tempfile::NamedTempFile;
 use tokio_util::sync::CancellationToken;
 use crate::error::{cancelled, protocol};
+use crate::wire::Frame;
 
 mod history_labels;
+#[cfg(unix)]
+mod spool;
 mod stream_headers;
 mod transit;
 
@@ -148,18 +150,25 @@ fn arrow_output_error(error: arrow_schema::ArrowError) -> Anomaly {
 
 type ArrowCopyReader = Box<dyn Iterator<Item = Result<RecordBatch>> + Send>;
 
-struct RetainedStream {
+struct ArrowCopy {
+    table: TableRef,
+    batches: ArrowCopyReader,
+    _decoder: Arc<MemoryReservation>,
+    _input: Arc<MemoryReservation>,
+}
+
+struct RetainedInput {
     bytes: Vec<u8>,
     reservation: Arc<MemoryReservation>,
     limit: usize,
 }
 
-impl RetainedStream {
+impl RetainedInput {
     fn append(&mut self, bytes: &[u8]) -> bool {
         let Some(length) = self.bytes.len().checked_add(bytes.len()).filter(|length| *length <= self.limit) else {
             return false;
         };
-        if !self.is_extended() {
+        if length > self.bytes.capacity() {
             if length > COPY_INPUT_SCRATCH_BYTES {
                 let Ok(reservation) = self.reservation.budget().reserve(self.limit) else { return false; };
                 let mut retained = Vec::new();
@@ -167,8 +176,7 @@ impl RetainedStream {
                 retained.extend_from_slice(&self.bytes);
                 self.bytes = retained;
                 self.reservation = reservation;
-            } else if length > self.bytes.capacity()
-                && self.bytes.try_reserve_exact(COPY_INPUT_SCRATCH_BYTES - self.bytes.len()).is_err()
+            } else if self.bytes.try_reserve_exact(COPY_INPUT_SCRATCH_BYTES - self.bytes.len()).is_err()
             {
                 return false;
             }
@@ -177,20 +185,25 @@ impl RetainedStream {
         true
     }
 
-    fn is_extended(&self) -> bool { self.bytes.len() > COPY_INPUT_SCRATCH_BYTES }
+    fn is_extended(&self) -> bool { self.bytes.capacity() > COPY_INPUT_SCRATCH_BYTES }
 }
 
-impl AsRef<[u8]> for RetainedStream {
+impl AsRef<[u8]> for RetainedInput {
     fn as_ref(&self) -> &[u8] { &self.bytes }
 }
 
+enum CopyStorage {
+    Empty,
+    Retained(RetainedInput),
+    Spool(File),
+}
+
 pub(crate) struct CopyInput {
-    file: NamedTempFile,
+    storage: CopyStorage,
     format: CopyFormat,
     table: TableRef,
     length: u64,
     limit: u64,
-    retained_stream: Option<RetainedStream>,
     _reservation: Arc<MemoryReservation>,
 }
 
@@ -199,64 +212,97 @@ impl CopyInput {
         let format = format.ok_or_else(|| Anomaly::incorrect("xtdb.pgwire/invalid-copy-format", "COPY IN requires a valid format: 'arrow-file', 'arrow-stream', 'transit-json', 'transit-msgpack'").with_context("format", serde_json::Value::Null))?;
         let table = match table.as_slice() { [table] => TableRef::new("public", table.normalized()), [schema, table] => TableRef::new(schema.normalized(), table.normalized()), _ => return Err(protocol("COPY table requires a table or schema.table")) };
         let reservation = memory.reserve(table.schema.len() + table.table.len() + COPY_INPUT_SCRATCH_BYTES)?;
-        let retention_limit = if autocommit { COPY_RETAINED_STREAM_BYTES } else { COPY_INPUT_SCRATCH_BYTES };
+        let retention_limit = match format {
+            CopyFormat::ArrowStream if autocommit => COPY_RETAINED_STREAM_BYTES,
+            CopyFormat::ArrowStream => COPY_INPUT_SCRATCH_BYTES,
+            CopyFormat::ArrowFile if autocommit => COPY_INPUT_SCRATCH_BYTES,
+            _ => 0,
+        };
+        let storage = if retention_limit == 0 { CopyStorage::Empty } else {
+            CopyStorage::Retained(RetainedInput {
+                bytes: Vec::new(),
+                reservation: Arc::clone(&reservation),
+                limit: limit.min(retention_limit as u64) as usize,
+            })
+        };
         Ok(Self {
-            file: NamedTempFile::new().map_err(io_error)?,
+            storage,
             format,
             table,
             length: 0,
             limit,
-            retained_stream: (format == CopyFormat::ArrowStream).then(|| RetainedStream {
-                bytes: Vec::new(),
-                reservation: Arc::clone(&reservation),
-                limit: limit.min(retention_limit as u64) as usize,
-            }),
             _reservation: reservation,
         })
     }
     pub fn wire_format(&self) -> Format { if self.format == CopyFormat::TransitJson { Format::Text } else { Format::Binary } }
-    pub async fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        let length = self.length.checked_add(bytes.len() as u64).filter(|length| *length <= self.limit).ok_or_else(|| Anomaly::new(rtdb_types::AnomalyCategory::Busy, "xtdb.pgwire/copy-limit", "COPY input exceeds its disk limit"))?;
-        if let Some(stream) = &mut self.retained_stream {
-            if stream.append(bytes) {
-                self.length = length;
-                return Ok(());
+    pub fn append(&mut self, Frame { body, mut charge, .. }: Frame) -> Result<()> {
+        let length = self.checked_length(body.len())?;
+        if body.is_empty() { return Ok(()); }
+        if let CopyStorage::Retained(input) = &mut self.storage
+            && input.bytes.is_empty() && body.capacity() <= input.limit
+            && let Some(frame_charge) = Arc::get_mut(&mut charge)
+            && frame_charge.bytes() >= body.capacity()
+        {
+            if body.capacity() > COPY_INPUT_SCRATCH_BYTES {
+                frame_charge.shrink_to(body.capacity())?;
+                input.reservation = charge;
             }
-            // A retry after a partial spill must overwrite the retained prefix.
-            self.file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-            self.file.write_all(stream.as_ref()).map_err(io_error)?;
-            self.retained_stream = None;
+            input.bytes = body;
+            self.length = length;
+            return Ok(());
         }
-        self.file.write_all(bytes).map_err(io_error)?;
+        self.append_bytes(&body, length)
+    }
+
+    fn checked_length(&self, size: usize) -> Result<u64> {
+        self.length.checked_add(size as u64).filter(|length| *length <= self.limit)
+            .ok_or_else(|| Anomaly::new(rtdb_types::AnomalyCategory::Busy, "xtdb.pgwire/copy-limit", "COPY input exceeds its disk limit"))
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8], length: u64) -> Result<()> {
+        match &mut self.storage {
+            CopyStorage::Retained(input) if self.format == CopyFormat::ArrowStream => {
+                if !input.append(bytes) {
+                    self.storage = CopyStorage::Spool(spill(input.as_ref(), bytes)?);
+                }
+            }
+            CopyStorage::Retained(input) => self.storage = CopyStorage::Spool(spill(input.as_ref(), bytes)?),
+            CopyStorage::Empty => self.storage = CopyStorage::Spool(spill(&[], bytes)?),
+            CopyStorage::Spool(file) => file.write_all(bytes).map_err(io_error)?,
+        }
         self.length = length;
         Ok(())
     }
     pub async fn finish(mut self, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<u64> {
-        self.file.flush().map_err(io_error)?;
+        if let CopyStorage::Spool(file) = &mut self.storage { file.flush().map_err(io_error)?; }
         if session.state().is_read_only() { return Err(Anomaly::incorrect("xtdb/copy-in-read-only-tx", "COPY is not allowed in a READ ONLY transaction")); }
         match self.format {
             CopyFormat::TransitJson | CopyFormat::TransitMsgpack => {
                 let size = usize::try_from(self.length).map_err(io_error)?;
                 let _scratch = node.memory().reserve(size.checked_mul(256).and_then(|n| n.checked_add(65_536)).ok_or_else(|| protocol("COPY allocation overflow"))?)?;
                 let owns_transaction = session.state().status() == TransactionStatus::Idle;
-                let documents = transit::read(self.file.as_file_mut(), self.format, size, owns_transaction, node.memory())?;
+                let mut file = match self.storage {
+                    CopyStorage::Spool(file) => file,
+                    _ => tempfile::tempfile().map_err(io_error)?,
+                };
+                let documents = transit::read(&mut file, self.format, size, owns_transaction, node.memory())?;
                 let count = documents.row_count() as u64;
-                self.submit(|| documents.into_operation(self.table.clone(), node.memory()), session, node, cancellation).await?;
+                Self::submit(|| documents.into_operation(self.table.clone(), node.memory()), session, node, cancellation).await?;
                 Ok(count)
             }
             CopyFormat::ArrowFile | CopyFormat::ArrowStream => {
                 let autocommit = session.state().status() == TransactionStatus::Idle;
-                let (_arrow, reader) = self.arrow_reader(node.memory(), autocommit)?;
+                let ArrowCopy { table, batches, _decoder, _input } = self.arrow_reader(node.memory(), autocommit)?;
                 let mut count = 0u64;
-                for batch in reader {
+                for batch in batches {
                     if cancellation.is_cancelled() { return Err(cancelled()); }
                     let batch = batch?;
                     count = count.checked_add(batch.num_rows() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
                     // An explicit transaction can hold this batch after COPY releases its decoder reservation.
                     let batch = OwnedBatch::new(batch, node.memory())?;
                     if let Some(documents) = ArrowDocuments::from_ingest_batch(&batch, node.memory())? {
-                        let operation = TxOp::PutArrowDocs { table: self.table.clone(), documents };
-                        self.submit(|| Ok(operation), session, node, cancellation).await?;
+                        let operation = TxOp::PutArrowDocs { table: table.clone(), documents };
+                        Self::submit(|| Ok(operation), session, node, cancellation).await?;
                     }
                 }
                 Ok(count)
@@ -264,50 +310,83 @@ impl CopyInput {
         }
     }
 
-    fn arrow_reader(&mut self, memory: &Arc<MemoryBudget>, autocommit: bool) -> Result<(Arc<MemoryReservation>, ArrowCopyReader)> {
-        if let Some(stream) = self.retained_stream.take() {
-            let extended = stream.is_extended();
-            if autocommit || !extended {
-                let admission = arrow_stream_allocation(&mut Cursor::new(stream.as_ref()), self.length, memory, None)
-                    .and_then(|bound| memory.reserve(bound));
-                match admission {
-                    Ok(reservation) => {
-                        // Explicit transactions can retain decoded batches after COPY releases its input scratch.
-                        let reader: ArrowCopyReader = if autocommit {
-                            Box::new(rtdb_format::ipc::ArrowStream::from_bytes(Bytes::from_owner(stream), None)?)
-                        } else {
-                            Box::new(rtdb_format::ipc::ArrowStream::from_reader(Cursor::new(stream.bytes), None)?)
-                        };
-                        return Ok((reservation, reader));
+    fn arrow_reader(self, memory: &Arc<MemoryBudget>, autocommit: bool) -> Result<ArrowCopy> {
+        let Self { storage, format, table, length, _reservation: input, .. } = self;
+        let is_file = format == CopyFormat::ArrowFile;
+        let mut file = match storage {
+            CopyStorage::Retained(retained) => {
+                let extended = retained.is_extended();
+                if autocommit || !extended {
+                    let mut cursor = Cursor::new(retained.as_ref());
+                    let admission = if is_file {
+                        arrow_file_allocation(&mut cursor, length, memory)
+                    } else {
+                        arrow_stream_allocation(&mut cursor, length, memory, None)
+                    }.and_then(|bound| memory.reserve(bound));
+                    match admission {
+                        Ok(decoder) => {
+                            // Explicit transactions can retain decoded batches after COPY releases its input scratch.
+                            let batches: ArrowCopyReader = match (is_file, autocommit) {
+                                (true, true) => {
+                                    let bytes = Bytes::from_owner(retained);
+                                    let reader = Cursor::new(bytes.clone());
+                                    let retain = move |range: std::ops::Range<u64>| {
+                                        let range = range.start as usize..range.end as usize;
+                                        (range.end <= bytes.len()).then(|| bytes.slice(range))
+                                    };
+                                    // SAFETY: the cursor and callback share this immutable input allocation.
+                                    Box::new(unsafe { rtdb_format::ipc::ArrowFile::from_reader_with_retained_ranges(reader, None, retain) }?)
+                                }
+                                (true, false) => Box::new(rtdb_format::ipc::ArrowFile::from_reader(Cursor::new(retained.bytes), None)?),
+                                (false, true) => Box::new(rtdb_format::ipc::ArrowStream::from_bytes(Bytes::from_owner(retained), None)?),
+                                (false, false) => Box::new(rtdb_format::ipc::ArrowStream::from_reader(Cursor::new(retained.bytes), None)?),
+                            };
+                            return Ok(ArrowCopy { table, batches, _decoder: decoder, _input: input });
+                        }
+                        Err(error) if !extended || error.code != "rtdb/memory-budget-exceeded" => return Err(error),
+                        Err(_) => {}
                     }
-                    Err(error) if !extended || error.code != "rtdb/memory-budget-exceeded" => return Err(error),
-                    Err(_) => {}
                 }
+                let mut file = spill(retained.as_ref(), &[])?;
+                file.flush().map_err(io_error)?;
+                file
             }
-            self.file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-            self.file.write_all(stream.as_ref()).map_err(io_error)?;
-            self.file.flush().map_err(io_error)?;
-        }
-        let mut file = self.file.reopen().map_err(io_error)?;
-        let mut headers = StreamHeaders::default();
-        let is_file = self.format == CopyFormat::ArrowFile;
-        let bound = if is_file {
-            arrow_file_allocation(&mut file, memory)?
-        } else {
-            let length = file.metadata().map_err(io_error)?.len();
-            arrow_stream_allocation(&mut file, length, memory, Some(&mut headers))?
+            CopyStorage::Spool(file) => file,
+            CopyStorage::Empty => tempfile::tempfile().map_err(io_error)?,
         };
-        let reservation = memory.reserve(bound)?;
+        let mut headers = StreamHeaders::default();
+        let spooled_length = file.metadata().map_err(io_error)?.len();
+        let bound = if is_file {
+            arrow_file_allocation(&mut file, spooled_length, memory)?
+        } else {
+            arrow_stream_allocation(&mut file, spooled_length, memory, Some(&mut headers))?
+        };
+        let decoder = memory.reserve(bound)?;
         file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        let reader: ArrowCopyReader = if is_file {
+        #[cfg(unix)]
+        let ranges = if autocommit {
+            // SAFETY: this method consumed the only writer and will use its descriptor only for reads and seeks.
+            unsafe { spool::retained_ranges(&file, length, &input, &decoder) }
+        } else { None };
+        #[cfg(unix)]
+        if let Some(retain) = ranges {
+            let batches: ArrowCopyReader = if is_file {
+                // SAFETY: both views come from the same completed, immutable spool descriptor.
+                Box::new(unsafe { rtdb_format::ipc::ArrowFile::from_reader_with_retained_ranges(file, None, retain) }?)
+            } else {
+                Box::new(rtdb_format::ipc::ArrowStream::from_reader_with_retained_ranges(headers.replay(file), None, retain)?)
+            };
+            return Ok(ArrowCopy { table, batches, _decoder: decoder, _input: input });
+        }
+        let batches: ArrowCopyReader = if is_file {
             Box::new(rtdb_format::ipc::ArrowFile::from_reader(file, None)?)
         } else {
             Box::new(rtdb_format::ipc::ArrowStream::from_reader(headers.replay(file), None)?)
         };
-        Ok((reservation, reader))
+        Ok(ArrowCopy { table, batches, _decoder: decoder, _input: input })
     }
 
-    async fn submit(&self, operation: impl FnOnce() -> Result<TxOp>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
+    async fn submit(operation: impl FnOnce() -> Result<TxOp>, session: &mut NativeSession, node: &Node, cancellation: &CancellationToken) -> Result<()> {
         let owns_transaction = session.state().status() == TransactionStatus::Idle;
         if owns_transaction { session.state_mut().begin_with(TransactionSettings { access: Some(AccessSettings::ReadWrite(Default::default())), ..Default::default() })?; }
         let work = async {
@@ -321,8 +400,14 @@ impl CopyInput {
     }
 }
 
-fn arrow_file_allocation(file: &mut File, memory: &Arc<MemoryBudget>) -> Result<usize> {
-    let length = file.metadata().map_err(io_error)?.len();
+fn spill(prefix: &[u8], bytes: &[u8]) -> Result<File> {
+    let mut file = tempfile::tempfile().map_err(io_error)?;
+    file.write_all(prefix).map_err(io_error)?;
+    file.write_all(bytes).map_err(io_error)?;
+    Ok(file)
+}
+
+fn arrow_file_allocation(file: &mut (impl Read + Seek), length: u64, memory: &Arc<MemoryBudget>) -> Result<usize> {
     let mut permanent = 65_536usize; let mut record = 0usize;
     if length < 10 { return Err(protocol("Arrow file has no footer")); }
     file.seek(SeekFrom::End(-10)).map_err(io_error)?; let mut tail = [0; 10]; file.read_exact(&mut tail).map_err(io_error)?;
@@ -407,11 +492,26 @@ fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb
 mod tests {
     use super::{
         COPY_CHUNK_BYTES, COPY_INPUT_SCRATCH_BYTES, COPY_RETAINED_STREAM_BYTES, CopyChunks, CopyFormat, CopyInput,
-        Cursor, Identifier, MemoryBudget, NamedTempFile, RecordBatch, Seek, SeekFrom, StreamHeaders, Write,
+        CopyStorage, Cursor, Frame, Identifier, MemoryBudget, Read, RecordBatch, Seek, SeekFrom, StreamHeaders, Write,
         arrow_file_allocation, arrow_stream_allocation,
     };
     use rtdb_types::Value;
     use std::sync::Arc;
+    use tempfile::NamedTempFile;
+
+    fn append(copy: &mut CopyInput, bytes: &[u8]) -> rtdb_types::Result<()> {
+        copy.append_bytes(bytes, copy.checked_length(bytes.len())?)
+    }
+
+    fn spool_bytes(copy: &mut CopyInput) -> Option<Vec<u8>> {
+        let CopyStorage::Spool(file) = &mut copy.storage else { return None; };
+        let position = file.stream_position().unwrap();
+        file.rewind().unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        file.seek(SeekFrom::Start(position)).unwrap();
+        Some(bytes)
+    }
 
     #[test]
     fn missing_and_unrecognized_copy_formats_fail_before_table_or_file_admission() {
@@ -428,17 +528,18 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn copy_disk_limit_and_drop_release_temp_file_and_memory() {
+    #[test]
+    fn copy_checks_disk_limit_before_spooling_and_releases_memory_on_drop() {
         for format in [CopyFormat::TransitJson, CopyFormat::ArrowStream] {
             let memory = MemoryBudget::new(1 << 20);
             let mut copy = CopyInput::new(vec![Identifier { text: "docs".into(), quoted: false }], Some(format), &memory, 3, true).unwrap();
-            let path = copy.file.path().to_owned(); assert!(path.exists());
-            copy.append(b"abc").await.unwrap();
-            assert_eq!(copy.append(b"d").await.unwrap_err().code, "xtdb.pgwire/copy-limit");
-            let expected: &[u8] = if format == CopyFormat::ArrowStream { b"" } else { b"abc" };
-            assert_eq!(std::fs::read(&path).unwrap().as_slice(), expected);
-            assert_eq!(copy.length, 3); drop(copy); assert!(!path.exists()); assert_eq!(memory.used_bytes(), 0);
+            assert!(spool_bytes(&mut copy).is_none());
+            assert_eq!(append(&mut copy, b"abcd").unwrap_err().code, "xtdb.pgwire/copy-limit");
+            assert!(spool_bytes(&mut copy).is_none());
+            append(&mut copy, b"abc").unwrap();
+            assert_eq!(append(&mut copy, b"d").unwrap_err().code, "xtdb.pgwire/copy-limit");
+            assert_eq!(spool_bytes(&mut copy).as_deref(), (format == CopyFormat::TransitJson).then_some(b"abc".as_slice()));
+            assert_eq!(copy.length, 3); drop(copy); assert_eq!(memory.used_bytes(), 0);
         }
     }
 
@@ -463,7 +564,7 @@ mod tests {
                 let mut file = NamedTempFile::new().unwrap(); file.write_all(&bytes).unwrap();
                 let mut input = file.reopen().unwrap();
                 let mut headers = StreamHeaders::default();
-                let bound = if is_file { arrow_file_allocation(&mut input, &memory) }
+                let bound = if is_file { arrow_file_allocation(&mut input, bytes.len() as u64, &memory) }
                     else { arrow_stream_allocation(&mut input, bytes.len() as u64, &memory, Some(&mut headers)) }.unwrap();
                 let reservation = memory.reserve(bound).unwrap(); input.seek(SeekFrom::Start(0)).unwrap();
                 let page = if is_file { rtdb_format::ipc::ArrowFile::from_reader(input, None).unwrap().next().unwrap().unwrap() }
@@ -474,8 +575,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn fragmented_stream_reuses_bounded_bytes_and_keeps_compressed_dictionary_and_end_semantics() {
+    #[test]
+    fn fragmented_stream_reuses_bounded_bytes_and_keeps_compressed_dictionary_and_end_semantics() {
         use arrow_array::{ArrayRef, builder::StringDictionaryBuilder, types::Int8Type};
         use arrow_ipc::{CompressionType, writer::IpcWriteOptions};
 
@@ -504,23 +605,21 @@ mod tests {
             let table = vec![Identifier { text: "docs".into(), quoted: false }];
             let mut copy = CopyInput::new(table, Some(CopyFormat::ArrowStream), &memory, length as u64, autocommit).unwrap();
             let scratch = memory.used_bytes();
-            for chunk in input.chunks(11) { copy.append(chunk).await.unwrap(); }
-            assert_eq!(copy.retained_stream.as_ref().map(|stream| stream.as_ref()), retains_bytes.then_some(input.as_slice()));
+            for chunk in input.chunks(11) { append(&mut copy, chunk).unwrap(); }
+            assert_eq!(matches!(&copy.storage, CopyStorage::Retained(stream) if stream.as_ref() == input.as_slice()), retains_bytes);
             assert_eq!(memory.used_bytes(), scratch);
-            assert_eq!(copy.append(&[0]).await.unwrap_err().code, "xtdb.pgwire/copy-limit");
-            assert_eq!(std::fs::read(copy.file.path()).unwrap().as_slice(), if retains_bytes { &[] } else { input.as_slice() });
-            copy.file.flush().unwrap();
-            let (reservation, reader) = copy.arrow_reader(&memory, autocommit).unwrap();
-            assert_eq!(*decode_bound.get_or_insert(reservation.bytes()), reservation.bytes());
-            assert_eq!(reader.collect::<rtdb_types::Result<Vec<_>>>().unwrap(), [batch.clone(), batch.clone()]);
-            drop(reservation);
-            drop(copy);
+            assert_eq!(append(&mut copy, &[0]).unwrap_err().code, "xtdb.pgwire/copy-limit");
+            assert_eq!(spool_bytes(&mut copy).as_deref(), (!retains_bytes).then_some(input.as_slice()));
+            let mut reader = copy.arrow_reader(&memory, autocommit).unwrap();
+            assert_eq!(*decode_bound.get_or_insert(reader._decoder.bytes()), reader._decoder.bytes());
+            assert_eq!(reader.batches.by_ref().collect::<rtdb_types::Result<Vec<_>>>().unwrap(), [batch.clone(), batch.clone()]);
+            drop(reader);
             assert_eq!(memory.used_bytes(), 0);
         }
     }
 
-    #[tokio::test]
-    async fn arrow_stream_spills_the_retained_prefix_once_and_keeps_the_disk_limit() {
+    #[test]
+    fn arrow_stream_spills_the_retained_prefix_once_and_keeps_the_disk_limit() {
         for (autocommit, cap) in [(false, COPY_INPUT_SCRATCH_BYTES), (true, COPY_RETAINED_STREAM_BYTES)] {
             let memory = MemoryBudget::new(1 << 20);
             let prefix = vec![7; cap];
@@ -528,22 +627,21 @@ mod tests {
             let table = vec![Identifier { text: "docs".into(), quoted: false }];
             let mut copy = CopyInput::new(table, Some(CopyFormat::ArrowStream), &memory, limit, autocommit).unwrap();
             let baseline = memory.used_bytes();
-            copy.append(&prefix).await.unwrap();
-            assert_eq!(copy.append(b"abc").await.unwrap_err().code, "xtdb.pgwire/copy-limit");
-            assert_eq!(copy.file.as_file().metadata().unwrap().len(), 0);
-            copy.append(b"a").await.unwrap();
-            copy.append(b"b").await.unwrap();
+            append(&mut copy, &prefix).unwrap();
+            assert_eq!(append(&mut copy, b"abc").unwrap_err().code, "xtdb.pgwire/copy-limit");
+            assert!(spool_bytes(&mut copy).is_none());
+            append(&mut copy, b"a").unwrap();
+            append(&mut copy, b"b").unwrap();
             assert_eq!(copy.length, limit);
-            assert!(copy.retained_stream.is_none());
             assert_eq!(memory.used_bytes(), baseline);
-            let file = std::fs::read(copy.file.path()).unwrap();
+            let file = spool_bytes(&mut copy).unwrap();
             assert_eq!(&file[..prefix.len()], &prefix);
             assert_eq!(&file[prefix.len()..], b"ab");
         }
     }
 
-    #[tokio::test]
-    async fn larger_arrow_stream_retains_its_input_or_spools_on_memory_pressure() {
+    #[test]
+    fn larger_arrow_stream_retains_its_input_or_spools_on_memory_pressure() {
         use arrow_array::{ArrayRef, BinaryArray};
 
         let memory = MemoryBudget::new(1 << 20);
@@ -558,25 +656,114 @@ mod tests {
             let baseline = memory.used_bytes();
             let append_charge = (pressure == Some("append"))
                 .then(|| memory.reserve(memory.available_bytes() - COPY_RETAINED_STREAM_BYTES + 1).unwrap());
-            for chunk in bytes.chunks(137) { copy.append(chunk).await.unwrap(); }
+            for chunk in bytes.chunks(137) { append(&mut copy, chunk).unwrap(); }
             drop(append_charge);
             let retained = pressure != Some("append");
-            assert_eq!(copy.retained_stream.is_some(), retained);
+            assert_eq!(matches!(&copy.storage, CopyStorage::Retained(_)), retained);
             assert_eq!(memory.used_bytes(), baseline + if retained { COPY_RETAINED_STREAM_BYTES } else { 0 });
-            assert_eq!(copy.file.as_file().metadata().unwrap().len(), if retained { 0 } else { bytes.len() as u64 });
+            assert_eq!(spool_bytes(&mut copy).as_deref(), (!retained).then_some(bytes.as_slice()));
 
             let preflight_charge = (pressure == Some("preflight"))
                 .then(|| memory.reserve(memory.available_bytes() - bound + 1).unwrap());
-            let (reservation, reader) = copy.arrow_reader(&memory, true).unwrap();
-            assert_eq!(reservation.bytes(), bound);
-            assert_eq!(reader.collect::<rtdb_types::Result<Vec<_>>>().unwrap(), [batch.clone(), batch.clone()]);
-            assert_eq!(copy.file.as_file().metadata().unwrap().len(), if pressure.is_none() { 0 } else { bytes.len() as u64 });
+            let mut reader = copy.arrow_reader(&memory, true).unwrap();
+            assert_eq!(reader._decoder.bytes(), bound);
+            assert_eq!(reader.batches.by_ref().collect::<rtdb_types::Result<Vec<_>>>().unwrap(), [batch.clone(), batch.clone()]);
             drop(preflight_charge);
-            drop(reservation);
-            assert_eq!(memory.used_bytes(), baseline);
-            drop(copy);
+            drop(reader);
             assert_eq!(memory.used_bytes(), 0);
         }
+    }
+
+    fn arrow_input(format: CopyFormat, payload_size: usize, pages: usize) -> (Vec<u8>, RecordBatch) {
+        use arrow_array::{ArrayRef, BinaryArray};
+        use arrow_ipc::writer::{FileWriter, StreamWriter};
+
+        let payload = vec![42; payload_size];
+        let column = Arc::new(BinaryArray::from(vec![Some(payload.as_slice())])) as ArrayRef;
+        let batch = RecordBatch::try_from_iter([("payload", column)]).unwrap();
+        let mut bytes = Vec::new();
+        if format == CopyFormat::ArrowFile {
+            let mut writer = FileWriter::try_new(&mut bytes, batch.schema_ref()).unwrap();
+            for _ in 0..pages { writer.write(&batch).unwrap(); }
+            writer.finish().unwrap();
+        } else {
+            let mut writer = StreamWriter::try_new(&mut bytes, batch.schema_ref()).unwrap();
+            for _ in 0..pages { writer.write(&batch).unwrap(); }
+            writer.finish().unwrap();
+        }
+        (bytes, batch)
+    }
+
+    fn copy_data(memory: &Arc<MemoryBudget>, body: Vec<u8>) -> Frame {
+        let charge = memory.reserve(body.len() * 16 + 8192).unwrap();
+        Frame { tag: b'd', body, charge }
+    }
+
+    #[test]
+    fn sole_arrow_frame_is_adopted_and_explicit_decode_detaches() {
+        for format in [CopyFormat::ArrowFile, CopyFormat::ArrowStream] {
+            for autocommit in [true, false] {
+                let memory = MemoryBudget::new(1 << 22);
+                let (bytes, expected) = arrow_input(format, 64, 1);
+                let bytes = bytes.into_boxed_slice().into_vec();
+                let start = bytes.as_ptr() as usize;
+                let len = bytes.len();
+                let table = vec![Identifier { text: "docs".into(), quoted: false }];
+                let mut copy = CopyInput::new(table, Some(format), &memory, len as u64, true).unwrap();
+                let scratch = memory.used_bytes();
+                copy.append(copy_data(&memory, bytes)).unwrap();
+                assert!(matches!(&copy.storage, CopyStorage::Retained(input) if input.bytes.as_ptr() as usize == start));
+                assert_eq!(memory.used_bytes(), scratch);
+                let mut reader = copy.arrow_reader(&memory, autocommit).unwrap();
+                let batch = reader.batches.next().unwrap().unwrap();
+                let payload = batch.column(0).as_any().downcast_ref::<arrow_array::BinaryArray>().unwrap().value(0);
+                let shares_input = autocommit && start % std::mem::align_of::<u128>() == 0;
+                assert_eq!((start..start + len).contains(&(payload.as_ptr() as usize)), shares_input);
+                assert_eq!(batch, expected);
+                drop(reader);
+                assert_eq!(memory.used_bytes(), if shares_input { scratch } else { 0 });
+                drop(batch);
+                assert_eq!(memory.used_bytes(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_spools_map_one_record_window_and_fall_back_while_it_is_retained() {
+        for format in [CopyFormat::ArrowFile, CopyFormat::ArrowStream] {
+            let memory = MemoryBudget::new(1 << 23);
+            let (bytes, expected) = arrow_input(format, COPY_RETAINED_STREAM_BYTES / 2 + 64, 2);
+            let table = vec![Identifier { text: "docs".into(), quoted: false }];
+            let mut copy = CopyInput::new(table, Some(format), &memory, bytes.len() as u64, true).unwrap();
+            append(&mut copy, &bytes).unwrap();
+            assert!(matches!(&copy.storage, CopyStorage::Spool(_)));
+            let mut reader = copy.arrow_reader(&memory, true).unwrap();
+            let charge = reader._decoder.bytes();
+            let first = reader.batches.next().unwrap().unwrap();
+            let second = reader.batches.next().unwrap().unwrap();
+            assert_eq!(first, expected);
+            assert_eq!(second, expected);
+            assert!(reader.batches.next().is_none());
+            drop(reader);
+            assert_eq!(memory.used_bytes(), charge);
+            drop(first);
+            assert_eq!(memory.used_bytes(), 0);
+            assert_eq!(second, expected);
+        }
+    }
+
+    #[test]
+    fn truncated_last_stream_body_refuses_before_a_reader_is_returned() {
+        let memory = MemoryBudget::new(1 << 24);
+        let (mut bytes, _) = arrow_input(CopyFormat::ArrowStream, COPY_RETAINED_STREAM_BYTES / 2 + 64, 2);
+        bytes.truncate(bytes.len() - 9);
+        let table = vec![Identifier { text: "docs".into(), quoted: false }];
+        let mut copy = CopyInput::new(table, Some(CopyFormat::ArrowStream), &memory, bytes.len() as u64, true).unwrap();
+        append(&mut copy, &bytes).unwrap();
+        let error = copy.arrow_reader(&memory, true).err().unwrap();
+        assert_eq!(error, super::protocol("IPC body exceeds file"));
+        assert_eq!(memory.used_bytes(), 0);
     }
 
     #[test]

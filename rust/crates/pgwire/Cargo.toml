@@ -31,6 +31,9 @@ tempfile.workspace = true
 uuid.workspace = true
 tokio-rustls = "=0.26.6"
 
+[target.'cfg(unix)'.dependencies]
+memmap2.workspace = true
+
 [dev-dependencies]
 async-trait.workspace = true
 rtdb-maintenance.workspace = true

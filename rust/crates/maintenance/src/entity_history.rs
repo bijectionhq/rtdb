@@ -10,7 +10,7 @@ use rtdb_types::{Result, TableRef};
 use tokio_util::sync::CancellationToken;
 
 use crate::{ArtefactBuilder, ArtefactDatabase, ArtefactDefinition, ArtefactJob, ArtefactKind, ArtefactSource,
-    input::{download, open_input, read_page}};
+    input::read_page, merge::{PrimaryData, primary_data_budget}};
 
 pub struct EntityHistoryArtefacts;
 
@@ -57,12 +57,14 @@ impl ArtefactBuilder for EntityHistoryBuilder {
         cancellation: &CancellationToken) -> Result<ArtefactRecord> {
         let ArtefactOwner::Trie(trie) = &job.owner else { return Err(crate::invalid("Entity history covers one primary trie")); };
         let table = value.table_catalog().entry(&job.definition.table).ok_or_else(|| crate::invalid("History table has no storage slug"))?;
-        let temporary = tempfile::tempdir().map_err(crate::invalid)?;
+        let temporary = Arc::new(tempfile::tempdir().map_err(crate::invalid)?);
         let input = match source {
-            ArtefactSource::Local { data, .. } => File::open(data).map_err(crate::invalid)?,
+            ArtefactSource::Local { data, .. } => PrimaryData::File(File::open(data).map_err(crate::invalid)?),
             ArtefactSource::Stored => {
                 let key = ObjectKey::new(table.slug.data_key(trie))?;
-                download(self.store.as_ref(), &self.memory, &key, &temporary.path().join("source.arrow"), cancellation).await?
+                let size = self.store.head(&key).await?.size;
+                PrimaryData::stored(self.store.as_ref(), &key, temporary.path().join("source.arrow"), size,
+                    &self.memory, &primary_data_budget(&self.memory), cancellation).await?
             }
         };
         let output = temporary.path().join("history.arrow");
@@ -70,18 +72,21 @@ impl ArtefactBuilder for EntityHistoryBuilder {
         let memory = Arc::clone(&self.memory);
         let token = cancellation.clone();
         let writer_path = output.clone();
+        let worker_directory = temporary.clone();
         let (root, size) = tokio::task::spawn_blocking(move || {
-            let (mut reader, _opening) = open_input(input, &memory)?;
-            let file = File::create(writer_path).map_err(crate::invalid)?;
-            let mut writer = HistoryWriter::new(BufWriter::new(file), owner, &memory)?;
-            for page in 0..reader.page_count() {
-                if token.is_cancelled() { return Err(crate::closed()); }
-                let batch = read_page(&mut reader, page, &memory)?;
-                writer.append(u32::try_from(page).map_err(crate::invalid)?, &EventBatch::new(batch.batch().clone())?)?;
-            }
-            let (sink, root) = writer.finish()?;
-            let size = i64::try_from(sink.get_ref().metadata().map_err(crate::invalid)?.len()).map_err(crate::invalid)?;
-            Ok::<_, rtdb_types::Anomaly>((root, size))
+            let _directory = worker_directory;
+            input.read(&memory, &token, |mut input| {
+                let file = File::create(&writer_path).map_err(crate::invalid)?;
+                let mut writer = HistoryWriter::new(BufWriter::new(file), owner, &memory)?;
+                for page in 0..input.reader.page_count() {
+                    if token.is_cancelled() { return Err(crate::closed()); }
+                    let batch = read_page(&mut input.reader, page, &memory)?;
+                    writer.append(u32::try_from(page).map_err(crate::invalid)?, &EventBatch::new(batch.batch().clone())?)?;
+                }
+                let (sink, root) = writer.finish()?;
+                let size = i64::try_from(sink.get_ref().metadata().map_err(crate::invalid)?.len()).map_err(crate::invalid)?;
+                Ok((root, size))
+            })
         }).await.map_err(crate::invalid)??;
         if cancellation.is_cancelled() { return Err(crate::closed()); }
         let mut record = ArtefactRecord { kind: Some(entity_history::KIND.into()), definition_id: Some(entity_history::ID.into()),

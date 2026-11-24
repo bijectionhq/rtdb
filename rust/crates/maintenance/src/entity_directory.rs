@@ -17,7 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ArtefactBuilder, ArtefactDatabase, ArtefactDefinition, ArtefactJob, ArtefactSource,
-    input::{download, open_input, read_page},
+    input::read_page,
+    merge::{PrimaryData, primary_data_budget},
 };
 
 pub(crate) struct EntityDirectoryBuilder {
@@ -59,18 +60,22 @@ impl EntityDirectoryBuilder {
         let sources = catalog.l0_source(table, after, BlockIndex(through.0 - 1));
         let mut read = 0i64;
         let mut input = Vec::new();
+        let retained = primary_data_budget(&self.memory);
         for source in sources {
             let temp = tempfile::tempdir().map_err(crate::invalid)?;
             let key = ObjectKey::new(entry.slug.data_key(&source.key))?;
-            let file = download(
+            let size = self.store.head(&key).await?.size;
+            let data = PrimaryData::stored(
                 self.store.as_ref(),
-                &self.memory,
                 &key,
-                &temp.path().join("directory-source.arrow"),
+                temp.path().join("directory-source.arrow"),
+                size,
+                &self.memory,
+                &retained,
                 cancellation,
             )
             .await?;
-            let rows = self.read(file, source.key.clone(), cancellation).await?;
+            let rows = self.read(data, Some(temp), source.key.clone(), cancellation).await?;
             read = read
                 .checked_add(i64::try_from(rows.0.len()).map_err(crate::invalid)?)
                 .ok_or_else(overflow)?;
@@ -83,7 +88,8 @@ impl EntityDirectoryBuilder {
         }
         input.push(
             self.read(
-                File::open(path).map_err(crate::invalid)?,
+                PrimaryData::File(File::open(path).map_err(crate::invalid)?),
+                None,
                 trie.clone(),
                 cancellation,
             )
@@ -233,47 +239,50 @@ impl EntityDirectoryBuilder {
 
     async fn read(
         &self,
-        file: File,
+        input: PrimaryData,
+        temporary: Option<tempfile::TempDir>,
         trie: TrieKey,
         cancellation: &CancellationToken,
     ) -> Result<(Vec<LogicalEvent>, Arc<MemoryReservation>)> {
         let memory = self.memory.clone();
         let cancellation = cancellation.clone();
         tokio::task::spawn_blocking(move || {
-            let (mut reader, _opening) = open_input(file, &memory)?;
-            let mut reservation = memory.reserve(4096)?;
-            let mut events = Vec::new();
-            for page in 0..reader.page_count() {
-                if cancellation.is_cancelled() {
-                    return Err(crate::closed());
+            let _temporary = temporary;
+            input.read(&memory, &cancellation, |mut input| {
+                let mut reservation = memory.reserve(4096)?;
+                let mut events = Vec::new();
+                for page in 0..input.reader.page_count() {
+                    if cancellation.is_cancelled() {
+                        return Err(crate::closed());
+                    }
+                    let batch = read_page(&mut input.reader, page, &memory)?;
+                    let batch = EventBatch::new(batch.batch().clone())?;
+                    for row in 0..batch.len() {
+                        let origin = batch
+                            .origin(row)?
+                            .filter(|origin| origin.source_block() == trie.block_index())
+                            .ok_or_else(|| {
+                                crate::invalid(
+                                    "Directory requires a stable origin for each accepted event",
+                                )
+                            })?;
+                        let key = batch.entity_key(row)?;
+                        charge(&mut reservation, 256 + key.map_or(0, <[u8]>::len))?;
+                        let hint = (
+                            trie.clone(),
+                            u32::try_from(page).map_err(crate::invalid)?,
+                            u32::try_from(row).map_err(crate::invalid)?,
+                        );
+                        events.push(LogicalEvent {
+                            header: batch.header(row)?,
+                            origin,
+                            entity_key: key.map(<[u8]>::to_vec),
+                            payload_hint: Some(hint),
+                        });
+                    }
                 }
-                let batch = read_page(&mut reader, page, &memory)?;
-                let batch = EventBatch::new(batch.batch().clone())?;
-                for row in 0..batch.len() {
-                    let origin = batch
-                        .origin(row)?
-                        .filter(|origin| origin.source_block() == trie.block_index())
-                        .ok_or_else(|| {
-                            crate::invalid(
-                                "Directory requires a stable origin for each accepted event",
-                            )
-                        })?;
-                    let key = batch.entity_key(row)?;
-                    charge(&mut reservation, 256 + key.map_or(0, <[u8]>::len))?;
-                    let hint = (
-                        trie.clone(),
-                        u32::try_from(page).map_err(crate::invalid)?,
-                        u32::try_from(row).map_err(crate::invalid)?,
-                    );
-                    events.push(LogicalEvent {
-                        header: batch.header(row)?,
-                        origin,
-                        entity_key: key.map(<[u8]>::to_vec),
-                        payload_hint: Some(hint),
-                    });
-                }
-            }
-            Ok((events, reservation))
+                Ok((events, reservation))
+            })
         })
         .await
         .map_err(crate::invalid)?

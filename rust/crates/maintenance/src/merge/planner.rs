@@ -1,14 +1,14 @@
 use rtdb_format::data::EncodedEvent;
 use rtdb_format::{data::PageEvent, metadata::MetadataNode};
 use rtdb_types::{Iid, Result};
-use super::{InputSegment, row_heap};
+use super::{InputMetadata, row_heap};
 
 #[derive(Clone, Copy)]
 pub(super) struct Page { pub segment: usize, pub page: usize }
 pub(super) struct Task { pub path: Vec<u8>, pub pages: Vec<Page> }
 
-fn expand(segment: usize, index: usize, inputs: &[InputSegment], output: &mut Vec<(usize, usize)>) {
-    match &inputs[segment].metadata.nodes()[index] {
+fn expand(segment: usize, index: usize, inputs: &[InputMetadata], output: &mut Vec<(usize, usize)>) {
+    match &inputs[segment].file.nodes()[index] {
         MetadataNode::Nil => (),
         MetadataNode::RecencyBranch(children) => for (_, child) in children { expand(segment, *child, inputs, output); },
         _ => output.push((segment, index)),
@@ -21,22 +21,22 @@ pub(super) fn bucket(iid: Iid, depth: usize) -> u8 {
     rtdb_trie::base4_bucket(&iid.0, depth).expect("the compaction path fits in the IID")
 }
 
-pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
+pub(super) fn plan(inputs: &[InputMetadata], part: &[u8]) -> Result<Vec<Task>> {
     if part.len() > 64 || part.iter().any(|bucket| *bucket > 3) { return Err(crate::invalid("Compaction IID path is invalid")); }
     let mut initial = Vec::new();
     for (segment, input) in inputs.iter().enumerate() {
-        if let Some(root) = input.metadata.nodes().len().checked_sub(1) { expand(segment, root, inputs, &mut initial); }
+        if let Some(root) = input.file.root_index() { expand(segment, root, inputs, &mut initial); }
     }
     let mut stack = vec![(Vec::new(), initial)];
     let mut tasks = Vec::new();
     while let Some((path, nodes)) = stack.pop() {
         if nodes.is_empty() || path.iter().zip(part).any(|(left, right)| left != right) { continue; }
-        if nodes.iter().any(|(segment, index)| matches!(inputs[*segment].metadata.nodes()[*index], MetadataNode::IidBranch(_))) {
+        if nodes.iter().any(|(segment, index)| matches!(inputs[*segment].file.nodes()[*index], MetadataNode::IidBranch(_))) {
             if path.len() == 64 { return Err(crate::invalid("Metadata trie exceeds IID width")); }
             for bucket in (0..4).rev() {
                 let mut children = Vec::new();
                 for &(segment, index) in &nodes {
-                    match &inputs[segment].metadata.nodes()[index] {
+                    match &inputs[segment].file.nodes()[index] {
                         MetadataNode::IidBranch(branch) => if let Some(child) = branch.get(bucket).copied().flatten() { expand(segment, child, inputs, &mut children); },
                         _ => children.push((segment, index)),
                     }
@@ -47,7 +47,7 @@ pub(super) fn plan(inputs: &[InputSegment], part: &[u8]) -> Result<Vec<Task>> {
             }
         } else {
             let pages = nodes.into_iter().map(|(segment, index)| {
-                let MetadataNode::Leaf { data_page_index, .. } = &inputs[segment].metadata.nodes()[index] else { return Err(crate::invalid("Merge task has a non-leaf node")); };
+                let MetadataNode::Leaf { data_page_index, .. } = &inputs[segment].file.nodes()[index] else { return Err(crate::invalid("Merge task has a non-leaf node")); };
                 Ok(Page { segment, page: *data_page_index })
             }).collect::<Result<_>>()?;
             tasks.push(Task { path, pages });

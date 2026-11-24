@@ -167,7 +167,8 @@ impl RecoveredPartition {
             .await.ok_or_else(crate::progress::cancelled)??
         {
             let offset = raw.metadata.offset;
-            let record = logs.decode_replica(raw)?.ok_or_else(unretained)?;
+            // Applied Arrow state may outlive the protected replay delivery.
+            let record = logs.decode_detached_replica(raw)?.ok_or_else(unretained)?;
             let position = record.metadata.position;
             if reached.0.checked_add(1) != Some(position.0) || position > cut.through {
                 return Err(unretained());
@@ -175,7 +176,7 @@ impl RecoveredPartition {
             reached = position;
             let (_, admitted) = self.fence.admit_record(record)?;
             let Some(admitted) = admitted else { continue; };
-            let record = cancellation.run_until_cancelled(admitted.resolve_payload_fresh(logs))
+            let record = cancellation.run_until_cancelled(admitted.resolve_payload_fresh_detached(logs))
                 .await.ok_or_else(crate::progress::cancelled)??;
             let term = record.envelope.term;
             let at = record.metadata.timestamp;
