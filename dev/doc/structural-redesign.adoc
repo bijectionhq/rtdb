@@ -59,6 +59,7 @@ GC-2::
 Only the physical owner may grant deletion of an immutable provider publication.
 In one ordered decision it consumes retirement evidence, establishes that the publication has no eligible dependencies, and permanently excludes new references or a late publication that could re-establish the dependency.
 The grant names the exact provider version or terminal creation identity and remains valid through retry and owner replacement.
+The owner keeps a publication in custody whenever a dependency lacks exact replacement evidence or future use lacks exact exclusion evidence. An incomplete inventory leaves the affected scope in custody.
 
 DUR-2::
 Every selectable recovery path authenticates a complete checkpoint and sufficient committed replay under the current recovery authority.
@@ -68,6 +69,7 @@ A pointer in a fenced journal range confers no access to a detached payload, inc
 LIVE-2::
 Each retired physical publication becomes eligible after its last dependency drains and future use is fenced.
 Fair collection and eventual provider settlement or conclusive absence reclaim it while unrelated holds survive or excluded historical journals are unavailable.
+A publication awaiting exact replacement or exclusion evidence stays in custody. The collection obligation starts once the evidence establishes eligibility.
 Media disposal has independent evidence.
 
 == Mechanisms
