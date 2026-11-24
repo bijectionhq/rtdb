@@ -27,7 +27,8 @@ use rtdb_format::ipc::OwnedStream;
 use rtdb_node::{ChangeEdgeOrder, HeldSpatialNearest, HeldSpatialProbe, OwnedChangeEdge, NativeSession, OwnedCountRequest, OwnedRangeRequest, OwnedRangeWitness, OwnedReadSession, OwnedValidHistory, OwnedVersionOrder, OwnedVersionRequest, OwnedWorldWitness, TransactionStatus};
 use rtdb_query::QueryCursor;
 use rtdb_tx::{ArrowDocuments, Documents, OwnedClockSlot, OwnedRelativePeriod, TxOp};
-use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation, StructFields, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, OwnedIdentityScan, EntityId, TransactionKey, Interval, LogicalType, OwnedRelation,
+    SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, StructFields, TimeUnit, Timestamp, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 use tonic::Status;
@@ -306,10 +307,10 @@ pub(crate) enum WorldIdentityRead { Effective, Overlay, OverlayAt, EffectiveAt, 
 pub(crate) const HELD_WORLD_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldIdentityPage.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentitiesAt.v1";
 pub(crate) const HELD_WORLD_OVERLAY_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldWorldOverlayIdentityPage.v1";
-pub(crate) const HELD_PROTECTED_COVERAGE_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v1";
+pub(crate) const HELD_PROTECTED_COVERAGE_V2: &str = "rtdb.owned.ReadHeldProtectedCarrierCoverage.v2";
 pub(crate) const HELD_ROW_CARRIER_EXISTS_V1: &str = "rtdb.owned.ReadHeldRowCarrierExists.v1";
-pub(crate) const HELD_PROTECTED_CARRIERS_V1: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v1";
-pub(crate) const HELD_WORLD_SHARED_COLUMN_CENSUS_V1: &str = "rtdb.owned.ReadHeldWorldSharedColumnCensus.v1";
+pub(crate) const HELD_PROTECTED_CARRIERS_V2: &str = "rtdb.owned.ReadHeldProtectedCarrierPage.v2";
+pub(crate) const HELD_WORLD_SHARED_COLUMN_CENSUS_V2: &str = "rtdb.owned.ReadHeldWorldSharedColumnCensus.v2";
 pub(crate) const HELD_OWNED_IDENTITIES_V1: &str = "rtdb.owned.ReadHeldIdentityPage.v1";
 pub(crate) const HELD_OWNED_IDENTITIES_ALL_VALID_V1: &str = "rtdb.owned.ReadHeldIdentityPageAllValid.v1";
 pub(crate) const HELD_WORLD_PARENT_TOUCH_KEYS_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentTouchKeysAt.v1";
@@ -588,23 +589,33 @@ impl Leased for OwnedWorldReadResource {
 
 struct RetainedWorldWitness {
     evidence: OwnedWorldWitness,
+    second: Option<OwnedWorldWitness>,
     absent_in_parent_and_overlay: bool,
     _reservation: Arc<MemoryReservation>,
 }
 
 impl OwnedWorldReadResource {
     fn remember(&self, call: &Call, evidence: OwnedWorldWitness, absent_in_parent_and_overlay: bool) -> Result<Uuid, Status> {
+        self.remember_checks(call, evidence, None, absent_in_parent_and_overlay)
+    }
+
+    fn remember_checks(
+        &self, call: &Call, evidence: OwnedWorldWitness, second: Option<OwnedWorldWitness>,
+        absent_in_parent_and_overlay: bool,
+    ) -> Result<Uuid, Status> {
         self.snapshot.check().map_err(status)?;
         let mut conditions = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
-        if conditions.len() >= MAX_WORLD_WITNESSES {
+        let retained = conditions.len() + conditions.values().filter(|witness| witness.second.is_some()).count();
+        if retained + 1 + usize::from(second.is_some()) > MAX_WORLD_WITNESSES {
             return Err(Status::resource_exhausted("The held world read has too many point witnesses"));
         }
         let nonce = Uuid::new_v4();
         if conditions.contains_key(&nonce) {
             return Err(Status::unavailable("Could not issue an owned world point witness"));
         }
-        let charge = call.reserve(evidence.allocation_bound())?;
-        conditions.insert(nonce, RetainedWorldWitness { evidence, absent_in_parent_and_overlay, _reservation: charge });
+        let charge = call.reserve(wire::add(evidence.allocation_bound(),
+            second.as_ref().map_or(0, OwnedWorldWitness::allocation_bound))?)?;
+        conditions.insert(nonce, RetainedWorldWitness { evidence, second, absent_in_parent_and_overlay, _reservation: charge });
         Ok(nonce)
     }
 
@@ -614,14 +625,17 @@ impl OwnedWorldReadResource {
         let stored = self.conditions.lock().map_err(|_| Status::internal("Owned world witness storage is unavailable"))?;
         let mut seen = BTreeSet::new();
         let mut charge = call.reserve(4096)?;
-        let conditions = nonces.chunks_exact(16).map(|bytes| {
+        let mut conditions = Vec::new();
+        for bytes in nonces.chunks_exact(16) {
             let nonce = Uuid::from_slice(bytes).map_err(arrow)?;
             if !seen.insert(nonce) { return Err(invalid("Owned world commit has a duplicate point witness")); }
             let condition = stored.get(&nonce).ok_or_else(|| Status::not_found("unknown owned world point witness"))?;
             let reservation = Arc::get_mut(&mut charge).expect("world commit owns its reservation");
-            reservation.grow_to(wire::add(reservation.bytes(), condition.evidence.allocation_bound())?).map_err(status)?;
-            Ok(condition.evidence.clone())
-        }).collect::<Result<_, _>>()?;
+            for evidence in std::iter::once(&condition.evidence).chain(condition.second.as_ref()) {
+                reservation.grow_to(wire::add(reservation.bytes(), evidence.allocation_bound())?).map_err(status)?;
+                conditions.push(evidence.clone());
+            }
+        }
         Ok((conditions, charge))
     }
 
@@ -2797,9 +2811,8 @@ impl Service {
         if batch.num_columns() != 1 || batch.num_rows() != 1 {
             return Err(invalid("Protected carrier coverage needs one prefix"));
         }
-        let prefix = batch.column_by_name("prefix").and_then(|array| array.as_any().downcast_ref::<StringArray>())
-            .filter(|column| !column.is_null(0)).ok_or_else(|| invalid("Protected carrier prefix must be Utf8"))?;
-        let (coverage, witness) = held.snapshot.protected_carrier_coverage(&relation, prefix.value(0), scope)
+        let prefix = protected_carrier_prefix(batch)?;
+        let (coverage, witness) = held.snapshot.protected_carrier_coverage(&relation, prefix, scope)
             .await.map_err(status)?;
         let nonce = held.remember(call, &relation, witness)?;
         let schema = Schema::empty().with_metadata([
@@ -2837,20 +2850,17 @@ impl Service {
         if batch.num_columns() != 3 || batch.num_rows() != 1 {
             return Err(invalid("Protected carrier page requires a prefix, bound, and limit"));
         }
-        let text = |name: &str| {
-            batch.column_by_name(name).and_then(|array| array.as_any().downcast_ref::<StringArray>())
-                .ok_or_else(|| invalid("Protected carrier key must be Utf8"))
+        let prefix = protected_carrier_prefix(batch)?;
+        let scan = identity_scan_request(batch)?;
+        let OwnedIdentityScan::Binary(after) = &scan else {
+            return Err(invalid("Protected carrier bound must be Binary"));
         };
-        let prefix = text("prefix")?;
-        if prefix.is_null(0) { return Err(invalid("Protected carrier prefix is absent")); }
-        let after = text("after")?;
-        let after = (!after.is_null(0)).then(|| after.value(0));
         let limit = usize::try_from(history_request_integer(batch, "limit")?)
             .map_err(|_| invalid("Protected carrier page limit is out of range"))?;
         let (page, witness) = held.snapshot.protected_carrier_page(
-            &relation, prefix.value(0), after, limit, scope,
+            &relation, prefix, after.as_deref(), limit, scope,
         ).await.map_err(status)?;
-        let (rows, _copy) = identity_scan_reply(call, &OwnedIdentityScan::text(None), &page.keys)?;
+        let (rows, _copy) = identity_scan_reply(call, &scan, &page.keys)?;
         let mut metadata = std::collections::HashMap::from([
             (OWNED_IDENTITY_MORE.into(), u8::from(page.more).to_string()),
         ]);
@@ -4855,9 +4865,15 @@ impl Service {
         let (mode, body) = body.split_first().ok_or_else(|| invalid("Owned world point has no observation flag"))?;
         let (relation, id, valid, _identity) = selected_point_request(call, envelope, body, PointTime::Required, compact)?;
         let valid_at = valid.ok_or_else(|| invalid("Owned point requires a valid_micros instant"))?;
+        let original_scope = if relation.name() == SHARED_COLUMN_CARRIERS {
+            if !matches!(*mode, 2 | 3) || !self.supports_hosted_upload(call) { return Err(unsupported()); }
+            Some(self.hosted_control_scope(call).await?)
+        } else {
+            None
+        };
         let mut result = match mode {
             0 | 1 => held.snapshot.read_point(&relation, &id, valid_at, *mode == 1).await,
-            2 | 3 => held.snapshot.read_parent_point(&relation, &id, valid_at, *mode == 3).await,
+            2 | 3 => held.snapshot.read_parent_point(&relation, &id, valid_at, *mode == 3, original_scope).await,
             4 => held.snapshot.read_ancestor_root_point(&relation, &id, valid_at).await,
             _ => return Err(invalid("Invalid owned world point source")),
         }.map_err(status)?;
@@ -4953,20 +4969,21 @@ impl Service {
         let (valid, body) = body.split_first_chunk::<8>()
             .ok_or_else(|| invalid("Shared field census has no valid instant"))?;
         let valid = Timestamp(i64::from_be_bytes(*valid));
-        let (length, body) = body.split_first_chunk::<2>()
-            .ok_or_else(|| invalid("Shared field census has no Root carrier scope"))?;
-        let (root, world) = body.split_at_checked(usize::from(u16::from_be_bytes(*length)))
-            .ok_or_else(|| invalid("Incomplete shared field census scope"))?;
-        let root = std::str::from_utf8(root).map_err(|_| invalid("Invalid Root carrier scope"))?;
-        let world = std::str::from_utf8(world).map_err(|_| invalid("Invalid world carrier scope"))?;
-        let (page, witness) = held.snapshot.shared_column_census(scope, valid, root, world).await.map_err(status)?;
-        let (rows, _copy) = identity_scan_reply(call, &OwnedIdentityScan::text(None), &page.keys)?;
-        let nonce = held.remember(call, witness, false)?;
+        let (root, world) = shared_column_scopes(body)?;
+        let (page, [root_witness, overlay_witness]) = held.snapshot.shared_column_census(scope, valid, root, world).await.map_err(status)?;
+        let bytes = page.keys.iter().try_fold(4096, |size, key| wire::add(size, key.retained_bytes()))?;
+        let _copy = call.reserve(wire::add(wire::mul(bytes, 2)?, wire::mul(page.keys.len(), 64)?)?)?;
+        let rows = shared_column_census_rows(&page.keys)?;
+        let nonce = held.remember_checks(call, root_witness, Some(overlay_witness), false)?;
         let schema = rows.schema_ref().as_ref().clone().with_metadata(
             [(WORLD_RANGE_WITNESS.into(), nonce.simple().to_string())].into()
         );
-        self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), held.snapshot.present(), valid,
-            None, None, reply_format)
+        let reply = self.encode_owned_point_reply(self.memory(), &schema, Some(&rows), held.snapshot.present(), valid,
+            None, None, reply_format)?;
+        for name in [SHARED_COLUMN_CARRIERS, "fact_unit_column_payloads"] {
+            held.snapshot.check_relation(&OwnedRelation::new(name).map_err(status)?).map_err(status)?;
+        }
+        Ok(reply)
     }
 
     pub(crate) async fn held_world_identities_action(
@@ -5458,12 +5475,12 @@ impl Service {
                 return Err(invalid("Invalid or repeated world batch attempt identity"));
             }
             let ([kind], rest) = rest.split_first_chunk::<1>().ok_or_else(|| invalid("Missing world publication effect"))?;
-            rows_left = rows_left.checked_sub(count * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
             let resource = self.owned_world_resource(call, &Bytes::copy_from_slice(handle))?;
             if !resource.snapshot.clock_mode().is_writable() && *kind != 2 {
                 return Err(unsupported());
             }
             let (checks, charge) = resource.conditions(call, world, nonces)?;
+            rows_left = rows_left.checked_sub(checks.len() * 2 + 2).ok_or_else(|| invalid("World batch exceeds its effect limit"))?;
             reservations.push(charge);
             let parent_basis = resource.snapshot.parent_basis();
             let parent_pin = resource.snapshot.parent_pin();
@@ -6118,9 +6135,34 @@ fn identity_scan_request(batch: &RecordBatch) -> Result<OwnedIdentityScan<'_>, S
         return Ok(OwnedIdentityScan::text((!text.is_null(0)).then(|| text.value(0))));
     }
     if let Some(binary) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(OwnedIdentityScan::Binary((!binary.is_null(0)).then(|| binary.value(0).into())));
+        return Ok(OwnedIdentityScan::binary((!binary.is_null(0)).then(|| binary.value(0))));
     }
     Err(invalid("Owned identity bound must be nullable Utf8 or Binary"))
+}
+
+fn protected_carrier_prefix(batch: &RecordBatch) -> Result<SharedColumnCarrierPrefix<'_>, Status> {
+    let (column, _) = batch.schema_ref().column_with_name("prefix")
+        .filter(|(_, field)| field.metadata().is_empty())
+        .ok_or_else(|| invalid("Protected carrier prefix is absent"))?;
+    batch.column(column).as_any().downcast_ref::<BinaryArray>()
+        .filter(|column| !column.is_null(0))
+        .and_then(|column| SharedColumnCarrierPrefix::parse(column.value(0)))
+        .ok_or_else(|| invalid("Protected carrier prefix must be raw Binary BFCP2 scope bytes"))
+}
+
+fn shared_column_scopes(body: &[u8]) -> Result<(SharedColumnCarrierPrefix<'_>, &str), Status> {
+    let (length, body) = body.split_first_chunk::<2>()
+        .ok_or_else(|| invalid("Shared field census has no Root carrier scope"))?;
+    let (root, world) = body.split_at_checked(usize::from(u16::from_be_bytes(*length)))
+        .ok_or_else(|| invalid("Incomplete shared field census scope"))?;
+    let root = SharedColumnCarrierPrefix::parse(root).ok_or_else(|| invalid("Invalid Root carrier scope"))?;
+    let world = std::str::from_utf8(world).map_err(|_| invalid("Invalid world carrier scope"))?;
+    Ok((root, world))
+}
+
+fn shared_column_census_rows(keys: &[EntityId]) -> Result<RecordBatch, Status> {
+    let ids = rtdb_columnar::entity_id_array(keys.iter().map(EntityIdRef::from)).map_err(status)?;
+    RecordBatch::try_from_iter([("_id", ids)]).map_err(arrow)
 }
 
 fn identity_scan_reply(
@@ -6387,6 +6429,52 @@ fn owned_capacity_declaration(relation: OwnedRelation, row: &StructFields<Value>
 
 #[cfg(test)]
 mod commit_tests;
+
+#[cfg(test)]
+mod protected_carrier_wire_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray};
+    use rtdb_columnar::{EntityIdRef, read_owned_entity_id};
+    use rtdb_types::{EntityId, SharedColumnCarrierPrefix};
+
+    use super::{protected_carrier_prefix, shared_column_census_rows, shared_column_scopes};
+
+    #[test]
+    fn protected_prefix_frames_require_raw_binary_and_keep_the_world_prefix_text() {
+        let mut prefix = [0xff; SharedColumnCarrierPrefix::WIDTH];
+        prefix[..6].copy_from_slice(b"BFCP2\0");
+        let world = format!("world-column/{}/", "01".repeat(32));
+        let frame = |prefix: &[u8]| [(prefix.len() as u16).to_be_bytes().as_slice(), prefix, world.as_bytes()].concat();
+        let body = frame(&prefix);
+        let (root, overlay) = shared_column_scopes(&body).unwrap();
+        assert_eq!((root.as_bytes(), overlay), (prefix.as_slice(), world.as_str()));
+        let hex = prefix.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().concat();
+        assert!(shared_column_scopes(&frame(hex.as_bytes())).is_err());
+        assert!(shared_column_scopes(&frame(&prefix[..prefix.len() - 1])).is_err());
+
+        let raw = RecordBatch::try_from_iter([("prefix", Arc::new(BinaryArray::from_iter_values([prefix.as_slice()])) as ArrayRef)]).unwrap();
+        let text = RecordBatch::try_from_iter([("prefix", Arc::new(StringArray::from(vec![hex])) as ArrayRef)]).unwrap();
+        let missing = RecordBatch::try_from_iter([("prefix", Arc::new(BinaryArray::from(vec![None::<&[u8]>])) as ArrayRef)]).unwrap();
+        assert_eq!(protected_carrier_prefix(&raw).unwrap().as_bytes(), prefix.as_slice());
+        assert!(protected_carrier_prefix(&text).is_err());
+        assert!(protected_carrier_prefix(&missing).is_err());
+    }
+
+    #[test]
+    fn census_replies_retain_the_binary_and_text_identity_legs_even_when_empty() {
+        let mut raw = vec![0xff; SharedColumnCarrierPrefix::ID_WIDTH];
+        raw[..6].copy_from_slice(b"BFCP2\0");
+        let world = format!("world-column/{}/{}", "01".repeat(32), "02".repeat(32));
+        let ids = [EntityId::Binary(raw.clone()), EntityId::String(world.clone())];
+        let rows = shared_column_census_rows(&ids).unwrap();
+        assert_eq!(shared_column_census_rows(&[]).unwrap().schema(), rows.schema());
+        let field = rows.schema_ref().field(0);
+        let column = rows.column(0).as_ref();
+        assert_eq!(read_owned_entity_id(field, column, 0).unwrap(), EntityIdRef::Binary(&raw));
+        assert_eq!(read_owned_entity_id(field, column, 1).unwrap(), EntityIdRef::String(&world));
+    }
+}
 
 #[cfg(test)]
 mod audience_projection_tests {

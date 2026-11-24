@@ -10,6 +10,9 @@
 -- The captured registration fences new opens after ordered drop while an earlier handle stays inside its retained read admission.
 -- A held point condition preserves the local shadow revision, including a tombstone, or verified local absence.
 -- The protected shared column census binds the archived Root parent, frozen ancestors and selected overlay to the original ordering witness.
+-- The installed Root shared-column relation uses complete Binary carrier identities scoped by the raw BFCP2 prefix.
+-- The census enumerates that archived Root prefix and the text World-slot prefix across the frozen and local overlays.
+-- A single census completion binds the Root carrier purge frontier, the World-slot relation purge frontier and the selected overlay relation frontier.
 -- Ordered conditional world writes validate the witnessed placement, deadline and all local conditions before applying effects.
 --
 -- Scope: hosting an unbounded number of deployments on one shared, autoscaling infrastructure.

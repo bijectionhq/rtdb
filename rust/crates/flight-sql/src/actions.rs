@@ -70,7 +70,7 @@ fn fresh_replica_action(action: &str) -> bool {
         | HELD_OWNED_POINT_V2
         | HELD_OWNED_ABSENT_KEYS_V1
         | HELD_OWNED_FIXED_POINT_V1
-        | HELD_PROTECTED_COVERAGE_V1
+        | HELD_PROTECTED_COVERAGE_V2
         | HELD_OWNED_IDENTITIES_V1
         | HELD_OWNED_IDENTITIES_ALL_VALID_V1
         | HELD_OWNED_VERSIONS_V2
@@ -376,12 +376,12 @@ impl Service {
                     };
                     return self.held_world_identities_action(&call, &action.body, mode, reply_format).await.map(ActionReplies::Owned);
                 }
-                crate::owned_actions::HELD_PROTECTED_COVERAGE_V1 =>
+                crate::owned_actions::HELD_PROTECTED_COVERAGE_V2 =>
                     return self.held_protected_coverage_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_ROW_CARRIER_EXISTS_V1 => Ok(vec![Ok(self.held_row_carrier_exists_action(&call, &action.body).await?)]),
-                crate::owned_actions::HELD_PROTECTED_CARRIERS_V1 =>
+                crate::owned_actions::HELD_PROTECTED_CARRIERS_V2 =>
                     return self.held_protected_carriers_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HELD_WORLD_SHARED_COLUMN_CENSUS_V1 =>
+                crate::owned_actions::HELD_WORLD_SHARED_COLUMN_CENSUS_V2 =>
                     return self.held_world_shared_column_census_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_IDENTITIES_V1 =>
                     return self.held_owned_identities_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),

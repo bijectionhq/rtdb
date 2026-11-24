@@ -268,8 +268,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
         Box::pin(HeldCheckpointWorld::measure(self, relation, path, request))
     }
     fn shared_column_census<'a>(
-        &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp, root_prefix: &'a str, world_prefix: &'a str,
-    ) -> BoxFuture<'a, Result<(WorldIdentityPage, OwnedWorldWitness)>> {
+        &'a self, scope: rtdb_types::PlacedAttemptScope, valid: Timestamp,
+        root_prefix: rtdb_types::SharedColumnCarrierPrefix<'a>, world_prefix: &'a str,
+    ) -> BoxFuture<'a, Result<(WorldIdentityPage, [OwnedWorldWitness; 2])>> {
         Box::pin(async move {
             let (page, witness) = HeldCheckpointWorld::shared_column_census(self, scope, valid, root_prefix, world_prefix).await?;
             Ok((WorldIdentityPage { keys: page.keys, more: page.more, reservations: page.reservations }, witness))
@@ -496,8 +497,9 @@ impl OwnedWorldRead for HeldCheckpointWorld {
 
     fn read_parent_point<'a>(
         &'a self, relation: &'a OwnedRelation, id: &'a EntityId, valid_at: Timestamp, observed: bool,
+        original_scope: Option<rtdb_types::PlacedAttemptScope>,
     ) -> BoxFuture<'a, Result<WorldPointResult>> {
-        Box::pin(async move { self.parent_point(relation, id, valid_at, observed).await.map(point_result) })
+        Box::pin(async move { self.parent_point(relation, id, valid_at, observed, original_scope).await.map(point_result) })
     }
 }
 

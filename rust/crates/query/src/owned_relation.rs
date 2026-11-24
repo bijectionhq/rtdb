@@ -335,10 +335,11 @@ pub async fn open_owned_world_constraint_projection(
 /// Restrict a receiver projection to one complete installed identity prefix.
 pub async fn open_owned_root_prefix_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str], prefix: &str,
+    valid: Timestamp, columns: &[&str], prefix: EntityIdRef<'_>,
 ) -> Result<Option<QueryCursor>> {
-    if owner.is_empty() || !relation.is_root_data() || prefix.is_empty()
-        || !prefix.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'/' || byte == b'-')
+    if owner.is_empty() || !relation.is_root_data()
+        || matches!(prefix, EntityIdRef::String(text) if text.is_empty() || !text.bytes().all(|byte|
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'/' || byte == b'-'))
         || columns.first() != Some(&"_id")
     {
         return Err(address_unavailable());
@@ -348,7 +349,7 @@ pub async fn open_owned_root_prefix_projection(
 
 async fn open_constraint_projection(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    valid: Timestamp, columns: &[&str], prefix: Option<&str>, iids: Option<BTreeSet<Iid>>,
+    valid: Timestamp, columns: &[&str], prefix: Option<EntityIdRef<'_>>, iids: Option<BTreeSet<Iid>>,
 ) -> Result<Option<QueryCursor>> {
     let name = QualifiedTable {
         database: context.catalog.default_database().to_owned(),
@@ -362,14 +363,10 @@ async fn open_constraint_projection(
     }).collect::<Vec<_>>();
     let mut predicates = Vec::new();
     if let Some(prefix) = prefix {
-        let mut upper = prefix.to_owned();
-        let last = upper.pop().ok_or_else(address_unavailable)?;
-        upper.push(char::from(last as u8 + 1));
-        let id = columns[0].expression();
-        predicates.extend([
-            Expr::binary(BinaryOp::GtEq, id.clone(), Expr::Literal(Value::Utf8(prefix.to_owned()))),
-            Expr::binary(BinaryOp::Lt, id, Expr::Literal(Value::Utf8(upper))),
-        ]);
+        if matches!(prefix, EntityIdRef::Binary(_)) && !OwnedIdentityScan::binary(None).accepts(&columns[0].data_type) {
+            return Err(address_unavailable());
+        }
+        predicates.extend(identity_prefix_predicates(columns[0].expression(), prefix)?);
     }
     let scan = Arc::new(Relation::scan(Scan {
         table, columns,
@@ -438,20 +435,65 @@ pub async fn open_owned_identity_page_all_valid(
 /// Read complete keys only within the installed protected carrier prefix.
 pub async fn open_owned_identity_prefix(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
-    at: Timestamp, after: Option<&str>, prefix: &str, fetch: i64,
+    at: Timestamp, after: &OwnedIdentityScan<'_>, prefix: EntityIdRef<'_>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
-    if relation.world().is_some() || relation.is_world_catalog() || prefix.is_empty()
-        || !prefix.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || after.is_some_and(|id| !id.starts_with(prefix))
+    if relation.world().is_some() || relation.is_world_catalog() || !prefix_accepts_bound(prefix, after)
     {
         return Err(address_unavailable());
     }
-    open_owned_identity_candidates(context, owner, relation, at, at, &OwnedIdentityScan::text(after), Some(prefix), fetch).await
+    open_owned_identity_candidates(context, owner, relation, at, at, after, Some(prefix), fetch).await
+}
+
+fn prefix_accepts_bound(prefix: EntityIdRef<'_>, after: &OwnedIdentityScan<'_>) -> bool {
+    match (prefix, after) {
+        (EntityIdRef::String(prefix), OwnedIdentityScan::Text(after)) =>
+            !prefix.is_empty() && prefix.is_ascii() && !prefix.ends_with('\x7f')
+                && after.as_deref().is_none_or(|after| after.starts_with(prefix)),
+        (EntityIdRef::Binary(prefix), OwnedIdentityScan::Binary(after)) =>
+            !prefix.is_empty() && after.as_deref().is_none_or(|after| after.starts_with(prefix)),
+        _ => false,
+    }
+}
+
+fn identity_has_prefix(prefix: EntityIdRef<'_>, id: EntityIdRef<'_>) -> bool {
+    match (prefix, id) {
+        (EntityIdRef::String(prefix), EntityIdRef::String(id)) => id.starts_with(prefix),
+        (EntityIdRef::Binary(prefix), EntityIdRef::Binary(id)) => id.starts_with(prefix),
+        _ => false,
+    }
+}
+
+fn identity_prefix_bounds(prefix: EntityIdRef<'_>) -> Result<(Value, Option<Value>)> {
+    let bounds = match prefix {
+        EntityIdRef::String(prefix) if prefix.is_ascii() && !prefix.ends_with('\x7f') => {
+            let mut upper = prefix.to_owned();
+            let last = upper.pop().ok_or_else(address_unavailable)?;
+            upper.push(char::from(last as u8 + 1));
+            (Value::Utf8(prefix.to_owned()), Some(Value::Utf8(upper)))
+        }
+        EntityIdRef::Binary(prefix) if !prefix.is_empty() => {
+            let upper = prefix.iter().rposition(|&byte| byte != u8::MAX).map(|last| {
+                let mut upper = prefix[..=last].to_vec();
+                upper[last] += 1;
+                Value::Binary(upper)
+            });
+            (Value::Binary(prefix.to_vec()), upper)
+        }
+        _ => return Err(address_unavailable()),
+    };
+    Ok(bounds)
+}
+
+fn identity_prefix_predicates(id: Expr, prefix: EntityIdRef<'_>) -> Result<Vec<Expr>> {
+    let (lower, upper) = identity_prefix_bounds(prefix)?;
+    let mut predicates = vec![Expr::binary(BinaryOp::GtEq, id.clone(), Expr::Literal(lower))];
+    predicates.extend(upper.map(|upper| Expr::binary(BinaryOp::Lt, id, Expr::Literal(upper))));
+    Ok(predicates)
 }
 
 async fn open_owned_identity_candidates(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: &OwnedIdentityScan<'_>, prefix: Option<&str>, fetch: i64,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, prefix: Option<EntityIdRef<'_>>, fetch: i64,
 ) -> Result<Option<QueryCursor>> {
     let context = owned_context_at_system(context, system)?;
     if owner.is_empty() { return Err(address_unavailable()); }
@@ -471,13 +513,7 @@ async fn open_owned_identity_candidates(
         BinaryOp::Gt, order.clone(), Expr::Literal(after),
     )).into_iter().collect();
     if let Some(prefix) = prefix {
-        let mut upper = prefix.to_owned();
-        let last = upper.pop().ok_or_else(address_unavailable)?;
-        upper.push(char::from(last as u8 + 1));
-        predicates.extend([
-            Expr::binary(BinaryOp::GtEq, order.clone(), Expr::Literal(Value::Utf8(prefix.into()))),
-            Expr::binary(BinaryOp::Lt, order.clone(), Expr::Literal(Value::Utf8(upper))),
-        ]);
+        predicates.extend(identity_prefix_predicates(order.clone(), prefix)?);
     }
     let scan = Arc::new(Relation::scan(Scan {
         table,
@@ -519,16 +555,12 @@ pub async fn owned_identity_candidates(
 /// Read an exact bounded identity page in a caller-admitted opaque scope.
 pub async fn owned_identity_candidates_in_prefix(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, system: Timestamp,
-    valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<&str>,
+    valid: Timestamp, after: &OwnedIdentityScan<'_>, fetch: usize, prefix: Option<EntityIdRef<'_>>,
 ) -> Result<OwnedIdentityCandidates> {
     let unavailable = || Anomaly::new(AnomalyCategory::Unavailable, "rtdb.owned/world-identities",
         "The held world identity candidates exceed their exact coverage or byte bound");
     if !(1..=129).contains(&fetch) || relation.is_world_catalog()
-        || prefix.is_some_and(|prefix| prefix.is_empty() || !prefix.is_ascii() || prefix.ends_with('\x7f')
-            || match after {
-                OwnedIdentityScan::Text(after) => after.as_deref().is_some_and(|after| !after.starts_with(prefix)),
-                _ => true,
-            })
+        || prefix.is_some_and(|prefix| !prefix_accepts_bound(prefix, after))
     {
         return Err(unavailable());
     }
@@ -551,7 +583,7 @@ pub async fn owned_identity_candidates_in_prefix(
                 let id = rtdb_columnar::read_owned_entity_id(field, array, row)
                     .map_err(|_| unavailable())?.into_owned();
                 if keys.len() == fetch
-                    || prefix.is_some_and(|prefix| !matches!(&id, EntityId::String(key) if key.starts_with(prefix)))
+                    || prefix.is_some_and(|prefix| !identity_has_prefix(prefix, EntityIdRef::from(&id)))
                     || keys.last().or(bound.as_ref()).is_some_and(|prior| prior >= &id)
                 {
                     return Err(unavailable());

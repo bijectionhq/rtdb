@@ -1,80 +1,100 @@
 //! The hosted shared-field server census. Only opaque carrier addresses cross
 //! the Flight boundary. The installed field owner opens and compares values.
 
-use super::*;
+use rtdb_columnar::EntityIdRef;
+use rtdb_node::OwnedWorldWitness;
+use rtdb_types::{EntityId, OwnedIdentityScan, OwnedRelation, OwnedSchema, OwnedWorld, PlacedAttemptScope, Result,
+    SHARED_COLUMN_CARRIERS, SharedColumnCarrierPrefix, Timestamp, WorldClockMode};
+
+use super::{HeldCheckpointWorld, WorldIdentityPage};
 
 const MAX_CARRIERS: usize = 512;
 const PAGE_ROWS: usize = 64;
-const ROOT_PREFIX_BYTES: usize = 2 * (5 + 16 + 32 + 16 + 1 + 16 + 16 + 4);
-const ROOT_ADDRESS_BYTES: usize = 8192;
 const WORLD_SCOPE: &str = "world-column/";
 const WORLD_ADDRESS_BYTES: usize = 64;
 
-fn lower_hex(bytes: &[u8]) -> bool {
-    bytes.iter().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+fn world_component(component: &str) -> bool {
+    component.len() == WORLD_ADDRESS_BYTES
+        && component.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl HeldCheckpointWorld {
-    /// The frozen parent and the selected mutable overlay share one placed
-    /// scope. A completed census retains the local relation frontier and the
-    /// inherited purge frontier required by the next ordered mutation.
+    pub(super) fn shared_root_schema(&self, relation: &OwnedRelation) -> Result<&OwnedSchema> {
+        self.open.record.schemas.relation(relation)
+            .filter(|schema| relation.name() == SHARED_COLUMN_CARRIERS && schema.is_shared_column_carrier())
+            .ok_or_else(OwnedWorld::unavailable)
+    }
+
     pub(crate) async fn shared_column_census(
         &self,
         scope: PlacedAttemptScope,
         valid: Timestamp,
-        root_prefix: &str,
+        root_prefix: SharedColumnCarrierPrefix<'_>,
         world_prefix: &str,
-    ) -> Result<(WorldIdentityPage, OwnedWorldWitness)> {
+    ) -> Result<(WorldIdentityPage, [OwnedWorldWitness; 2])> {
         let unavailable = OwnedWorld::unavailable;
-        let relation = OwnedRelation::new("fact_unit_column_payloads")?;
+        let root = OwnedRelation::new(SHARED_COLUMN_CARRIERS)?;
+        let overlay = OwnedRelation::new("fact_unit_column_payloads")?;
         let world_scope = world_prefix.strip_prefix(WORLD_SCOPE).and_then(|scope| scope.strip_suffix('/'));
         let expected_valid = match self.clock_mode() {
             WorldClockMode::Proposal => self.present().system_time,
             WorldClockMode::Held { .. } => self.application_publication().map_or(self.initial_clock(), |(clock, _)| clock),
             _ => return Err(unavailable()),
         };
-        if valid != expected_valid
-            || root_prefix.len() != ROOT_PREFIX_BYTES
-            || !root_prefix.starts_with("4246435032")
-            || !lower_hex(root_prefix.as_bytes())
-            || world_scope.is_none_or(|scope| scope.len() != WORLD_ADDRESS_BYTES || !lower_hex(scope.as_bytes()))
-        {
+        if valid != expected_valid || !world_scope.is_some_and(world_component) {
             return Err(unavailable());
         }
-        self.world_point_schema(&relation)?;
-        let witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [&relation])
+        self.shared_root_schema(&root)?;
+        if !overlay.admits_world_ciphertext_points(self.world_point_schema(&overlay)?) {
+            return Err(unavailable());
+        }
+        let root_witness = self.open.snapshot.world_parent_witness(self.open.record.id, &root).await?;
+        self.require_original_carrier_scope(&root_witness, Some(scope)).await?;
+        let overlay_witness = self.open.snapshot.world_relation_witnesses(self.open.record.id, [&overlay])
             .await?.pop().filter(|witness| witness.matches_scope(scope)).ok_or_else(unavailable)?;
-        self.require_overlay_coverage(&relation, &witness).await?;
+        let guard = self.open.snapshot.relation_release_guard([&root, &overlay])?;
+        self.require_archive_coverage(vec![
+            (root.clone(), root_witness.purge_frontier()),
+            (overlay.clone(), overlay_witness.purge_frontier()),
+        ], guard).await?;
 
         let mut census = WorldIdentityPage { keys: Vec::new(), more: false, reservations: Vec::new() };
-        for (prefix, width, overlay) in [
-            (root_prefix, ROOT_ADDRESS_BYTES, false),
-            (world_prefix, WORLD_ADDRESS_BYTES, true),
-        ] {
-            // Root holds separate exact winner selectors in the world slot
-            // namespace. Count only the overlay carriers in that namespace.
-            let mut after = None;
+        for prefix in [EntityIdRef::Binary(root_prefix.as_bytes()), EntityIdRef::String(world_prefix)] {
+            let start = census.keys.len();
             loop {
-                let candidates = if overlay {
-                    self.open.snapshot.world_identity_candidates_in_prefix(
-                        self.open.record.id, &relation, valid, after, PAGE_ROWS + 1, prefix,
-                    ).await?
-                } else {
-                    self.archive_identity_candidates(&relation, valid, &OwnedIdentityScan::text(after), PAGE_ROWS + 1, None, Some(prefix)).await?
-                };
-                let page = if overlay {
-                    self.merge_overlay_identities(
-                        &relation, valid, &OwnedIdentityScan::text(after), PAGE_ROWS, candidates, Some(prefix),
-                    ).await?
-                } else {
-                    self.finish_overlay_identities(&relation, candidates, PAGE_ROWS)?
+                let previous = census.keys.get(start..).and_then(|leg| leg.last());
+                let page = match prefix {
+                    EntityIdRef::Binary(_) => {
+                        let after = previous.map(OwnedIdentityScan::seek).transpose()?
+                            .unwrap_or_else(|| OwnedIdentityScan::binary(None));
+                        let candidates = self.archive_identity_candidates(
+                            &root, valid, &after, PAGE_ROWS + 1, None, Some(root_prefix),
+                        ).await?;
+                        self.finish_overlay_identities(&root, candidates, PAGE_ROWS)?
+                    }
+                    EntityIdRef::String(prefix) => {
+                        let after = match previous {
+                            Some(EntityId::String(key)) => Some(key.as_str()),
+                            Some(_) => return Err(unavailable()),
+                            None => None,
+                        };
+                        let candidates = self.open.snapshot.world_identity_candidates_in_prefix(
+                            self.open.record.id, &overlay, valid, after, PAGE_ROWS + 1, prefix,
+                        ).await?;
+                        self.merge_overlay_identities(
+                            &overlay, valid, &OwnedIdentityScan::text(after), PAGE_ROWS, candidates, Some(prefix),
+                        ).await?
+                    }
+                    _ => unreachable!(),
                 };
                 for key in page.keys {
-                    let EntityId::String(text) = &key else { return Err(unavailable()); };
-                    let suffix = text.strip_prefix(prefix).ok_or_else(unavailable)?;
-                    if suffix.len() != width || !lower_hex(suffix.as_bytes())
-                        || census.keys.last().is_some_and(|previous| previous >= &key)
-                    {
+                    let valid_key = match (prefix, EntityIdRef::from(&key)) {
+                        (EntityIdRef::Binary(_), EntityIdRef::Binary(id)) => root_prefix.contains(id),
+                        (EntityIdRef::String(prefix), EntityIdRef::String(id)) =>
+                            id.strip_prefix(prefix).is_some_and(world_component),
+                        _ => false,
+                    };
+                    if !valid_key || census.keys[start..].last().is_some_and(|previous| previous >= &key) {
                         return Err(unavailable());
                     }
                     if census.keys.len() == MAX_CARRIERS {
@@ -84,9 +104,9 @@ impl HeldCheckpointWorld {
                             "The protected shared-field census exceeds its ordered carrier bound",
                         ));
                     }
-                    if !overlay {
+                    if matches!(prefix, EntityIdRef::Binary(_)) {
                         self.open.snapshot.check_point_purge_floor(
-                            &relation, &key, self.parent_basis().system_time,
+                            &root, &key, self.parent_basis().system_time,
                         ).await?;
                     }
                     census.keys.push(key);
@@ -95,11 +115,10 @@ impl HeldCheckpointWorld {
                 if !page.more {
                     break;
                 }
-                let Some(EntityId::String(key)) = census.keys.last() else { return Err(unavailable()); };
-                after = Some(key.as_str());
             }
         }
-        self.check_relation(&relation)?;
-        Ok((census, witness))
+        self.check_relation(&root)?;
+        self.check_relation(&overlay)?;
+        Ok((census, [root_witness, overlay_witness]))
     }
 }

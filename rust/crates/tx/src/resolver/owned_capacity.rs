@@ -509,10 +509,18 @@ impl OpenTransaction<'_> {
                     if world.is_some() || !schema.has_acceptance_validity() {
                         return Err(uncovered());
                     }
-                    if matches!(ProtectedProjection::decode(prefix)?, ProtectedProjection::Rows(_))
-                        && schema.path_column_type("membership_until") != Some(ScalarType::Binary)
-                    {
-                        return Err(uncovered());
+                    match ProtectedProjection::decode(prefix)? {
+                        ProtectedProjection::Rows(_) if schema.path_column_type("membership_until") != Some(ScalarType::Binary) =>
+                            return Err(uncovered()),
+                        ProtectedProjection::SharedUnit { .. } => {
+                            let carriers = OwnedRelation::new(rtdb_types::SHARED_COLUMN_CARRIERS)?;
+                            if !self.read_owned_schema(owner, &carriers).await?
+                                .is_some_and(|(schema, _)| schema.is_shared_column_carrier())
+                            {
+                                return Err(uncovered());
+                            }
+                        }
+                        _ => (),
                     }
                 } else if schema.has_opaque_columns() {
                     return Err(uncovered());
