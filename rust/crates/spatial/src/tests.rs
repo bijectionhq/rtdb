@@ -1,9 +1,9 @@
-use geometry::{Coords, Geometry, GeometrySpace, GeometryWork, Kind};
+use geometry::{Coords, Geometry, GeometryDeclaration, GeometrySpace, GeometryWork, Gv, Kind, Size};
 use rtdb_columnar::MemoryBudget;
-use rtdb_types::Iid;
+use rtdb_types::{Iid, SpatialGeometryEncoding};
 
 use crate::{
-    Predicate,
+    Predicate, bijection_geometry,
     kernel::Location,
     postings::{self, Partition, Postings},
 };
@@ -28,6 +28,240 @@ fn checked_candidates(
 ) -> rtdb_types::Result<()> {
     postings::verify_digest(postings::sha256(&bytes, &check)?, digest)?;
     postings::candidates(bytes, partition, ranges, memory, check, insert)
+}
+
+fn canonical_float(value: f64) -> Vec<u8> {
+    let bits = value.to_bits();
+    let encoded = if value.is_sign_negative() {
+        !bits
+    } else {
+        bits ^ (1 << 63)
+    };
+    [vec![5], encoded.to_be_bytes().to_vec()].concat()
+}
+
+fn canonical_text(value: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for byte in value.bytes() {
+        bytes.push(byte);
+        if byte == 0 {
+            bytes.push(0xff);
+        }
+    }
+    bytes.extend([0, 1]);
+    bytes
+}
+
+fn canonical_array(values: impl IntoIterator<Item = Vec<u8>>) -> Vec<u8> {
+    let mut bytes = vec![12];
+    bytes.extend(values.into_iter().flatten());
+    bytes.extend([0, 0]);
+    bytes
+}
+
+fn canonical_object(fields: impl IntoIterator<Item = (&'static str, Vec<u8>)>) -> Vec<u8> {
+    let mut bytes = vec![13];
+    for (key, value) in fields {
+        bytes.extend(canonical_text(key));
+        bytes.extend(value);
+    }
+    bytes.extend([0, 0]);
+    bytes
+}
+
+fn canonical_shape(key: &'static str, contents: Vec<u8>, kind: &str) -> Vec<u8> {
+    canonical_object([(key, contents), ("type", [vec![9], canonical_text(kind)].concat())])
+}
+
+fn canonical_point(x: f64, y: f64) -> Vec<u8> {
+    canonical_shape(
+        "coordinates",
+        canonical_array([canonical_float(x), canonical_float(y)]),
+        "Point",
+    )
+}
+
+const DECLARATION: GeometryDeclaration = GeometryDeclaration {
+    space: GeometrySpace::wgs84_xy(),
+    size: Size::Large,
+};
+
+#[test]
+fn canonical_geometry_preserves_work_and_tagged_wkb_results() {
+    let subnormal = f64::from_bits(1);
+    let image = canonical_point(-0.0, subnormal);
+    let expected_bytes = 5 * std::mem::size_of::<Gv>()
+        + 2 * std::mem::size_of::<String>()
+        + 23
+        + DECLARATION.space.retained_bytes()
+        + 256;
+    let mut admission = GeometryWork::with_limits(58, expected_bytes);
+    let location = Location::decode_stored(
+        &image,
+        SpatialGeometryEncoding::BijectionGeometry,
+        &mut admission,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(admission.usage().steps, 58);
+    assert_eq!(admission.usage().peak_allocated_bytes, expected_bytes);
+    for (steps, bytes) in [(57, expected_bytes), (58, expected_bytes - 1)] {
+        let mut work = GeometryWork::with_limits(steps, bytes);
+        let error = Location::decode_stored(
+            &image,
+            SpatialGeometryEncoding::BijectionGeometry,
+            &mut work,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "rtdb.spatial/work-limit");
+    }
+    let mut work = GeometryWork::default();
+    let value = bijection_geometry::decode(&image, &mut work).unwrap();
+    let geometry = geometry::admit_view_with_work(value, &DECLARATION, &mut work).unwrap();
+    let Coords::Point(coords) = geometry.coords else {
+        panic!("expected a point");
+    };
+    assert_eq!(coords.map(f64::to_bits), [0, 1]);
+    let wkb = Location::decode_stored(
+        &point(0.0, subnormal),
+        SpatialGeometryEncoding::TaggedWkb,
+        &mut work,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        location.keys(&mut work).unwrap(),
+        wkb.keys(&mut work).unwrap()
+    );
+    let exact = Predicate::WithinDistance(0.0);
+    assert_eq!(
+        exact.evaluate(&location, &wkb, &mut work).unwrap(),
+        Some(None)
+    );
+}
+
+#[test]
+fn canonical_collections_and_position_accuracy_keep_their_typed_values() {
+    let image = canonical_shape(
+        "geometries",
+        canonical_array([
+            canonical_point(3.0, 4.0),
+            canonical_shape(
+                "coordinates",
+                canonical_array([
+                    canonical_array([]),
+                    canonical_array([canonical_float(1.0), canonical_float(2.0)]),
+                ]),
+                "MultiPoint",
+            ),
+        ]),
+        "GeometryCollection",
+    );
+    let mut work = GeometryWork::default();
+    let value = bijection_geometry::decode(&image, &mut work).unwrap();
+    let geometry = geometry::admit_view_with_work(value, &DECLARATION, &mut work).unwrap();
+    let Coords::Collection(members) = geometry.coords else {
+        panic!("expected a collection");
+    };
+    assert!(matches!(&members[0].coords, Coords::Point(point) if *point == [3.0, 4.0]));
+    assert!(matches!(
+        &members[1].coords,
+        Coords::MultiPoint(points) if points.as_slice() == &[None, Some([1.0, 2.0])]
+    ));
+
+    for (accuracy, bits) in [
+        (vec![2], None),
+        (canonical_float(-0.0), Some((-0.0f64).to_bits())),
+    ] {
+        let image = canonical_object([
+            ("accuracy_m", accuracy),
+            ("point", canonical_point(1.0, 2.0)),
+        ]);
+        let value = bijection_geometry::decode(&image, &mut work).unwrap();
+        let position = geometry::admit_position_view_with_work(value, &DECLARATION, &mut work).unwrap();
+        assert_eq!(position.point, [1.0, 2.0]);
+        assert_eq!(position.accuracy_m.map(f64::to_bits), bits);
+
+        let location = Location::decode_stored(
+            &image,
+            SpatialGeometryEncoding::BijectionPosition,
+            &mut work,
+        )
+        .unwrap()
+        .unwrap();
+        let mut tagged = if bits.is_some() {
+            [vec![2], (-0.0f64).to_le_bytes().to_vec()].concat()
+        } else {
+            vec![1]
+        };
+        tagged.extend_from_slice(&point(1.0, 2.0)[1..]);
+        let legacy = Location::decode(&tagged, &mut work).unwrap();
+        assert_eq!(
+            location.keys(&mut work).unwrap(),
+            legacy.keys(&mut work).unwrap()
+        );
+    }
+    for encoding in [
+        SpatialGeometryEncoding::BijectionGeometry,
+        SpatialGeometryEncoding::BijectionPosition,
+    ] {
+        assert!(Location::decode_stored(&[2], encoding, &mut work).unwrap().is_none());
+    }
+}
+
+#[test]
+fn canonical_geometry_validates_the_complete_image_before_shape_admission() {
+    let too_deep = [vec![12; 65], vec![2], vec![0; 130]].concat();
+    let cases = [
+        (vec![3, 2], "Invalid Bijection geometry boolean"),
+        (vec![5], "Bijection geometry is truncated"),
+        (
+            canonical_float(f64::from_bits(0x7ff8_0000_0000_0001)),
+            "Invalid Bijection geometry float",
+        ),
+        (vec![2, 2], "Bijection geometry has trailing bytes"),
+        (
+            vec![9, 0xc3, 0, 0xff, 0xa9, 0, 1],
+            "Bijection geometry text must be UTF-8",
+        ),
+        (
+            vec![9, 0xff, 0, 0xff, 0, 2],
+            "Invalid Bijection geometry text delimiter",
+        ),
+        (too_deep, "Bijection geometry is too deeply nested"),
+        (
+            canonical_object([("a\0", vec![2]), ("a", vec![2])]),
+            "Bijection geometry fields must be strictly ordered",
+        ),
+        (
+            canonical_object([("é", vec![2]), ("é", vec![2])]),
+            "Bijection geometry fields must be strictly ordered",
+        ),
+        (
+            canonical_object([("a", vec![2]), ("a\0", vec![2])]),
+            "Invalid geometry: unsupported geometry type",
+        ),
+        (
+            canonical_object([("ignored", vec![0xff])]),
+            "Unsupported canonical Bijection geometry value",
+        ),
+        (
+            canonical_float(f64::from_bits(0x7ff8_0000_0000_0000)),
+            "Invalid geometry: expected geometry object",
+        ),
+    ];
+    for (image, message) in cases {
+        let error = Location::decode_stored(
+            &image,
+            SpatialGeometryEncoding::BijectionGeometry,
+            &mut GeometryWork::default(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "rtdb.spatial/invalid");
+        assert_eq!(error.message.as_deref(), Some(message));
+    }
 }
 
 #[test]

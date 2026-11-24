@@ -27,14 +27,10 @@ fn truncated() -> rtdb_types::Anomaly {
     invalid("Bijection geometry is truncated")
 }
 
-fn text<'a>(bytes: &mut &'a [u8], mut work: Option<&mut GeometryWork>) -> Result<Cow<'a, str>> {
+fn text<'a>(bytes: &mut &'a [u8]) -> Result<Cow<'a, str>> {
     let mut escaped = None::<Vec<u8>>;
     loop {
         let end = bytes.iter().position(|&byte| byte == 0).ok_or_else(truncated)?;
-        if let Some(work) = work.as_deref_mut() {
-            work.charge(end + 2).map_err(geometry_error)?;
-            work.allocate(end + 1).map_err(geometry_error)?;
-        }
         let chunk = take(bytes, end)?;
         match take(bytes, 2)? {
             [0, 1] => {
@@ -55,6 +51,31 @@ fn text<'a>(bytes: &mut &'a [u8], mut work: Option<&mut GeometryWork>) -> Result
             _ => return Err(invalid("Invalid Bijection geometry text delimiter")),
         }
     }
+}
+
+fn validate_text<'a>(bytes: &mut &'a [u8], work: &mut GeometryWork) -> Result<&'a [u8]> {
+    let start = *bytes;
+    let mut valid_utf8 = true;
+    loop {
+        let end = bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or_else(truncated)?;
+        work.charge(end + 2).map_err(geometry_error)?;
+        work.allocate(end + 1).map_err(geometry_error)?;
+        let chunk = take(bytes, end)?;
+        // An escaped NUL separates complete UTF-8 sequences.
+        valid_utf8 &= std::str::from_utf8(chunk).is_ok();
+        match take(bytes, 2)? {
+            [0, 1] => break,
+            [0, 0xff] => (),
+            _ => return Err(invalid("Invalid Bijection geometry text delimiter")),
+        }
+    }
+    if !valid_utf8 {
+        return Err(invalid("Bijection geometry text must be UTF-8"));
+    }
+    Ok(&start[..start.len() - bytes.len() - 2])
 }
 
 fn float(bytes: &[u8]) -> f64 {
@@ -83,7 +104,7 @@ fn validate(bytes: &mut &[u8], depth: usize, work: &mut GeometryWork) -> Result<
                 return Err(invalid("Invalid Bijection geometry float"));
             }
         }
-        9 => { text(bytes, Some(work))?; }
+        9 => { validate_text(bytes, work)?; }
         12 => {
             while !bytes.starts_with(&[0, 0]) {
                 validate(bytes, depth + 1, work)?;
@@ -93,8 +114,8 @@ fn validate(bytes: &mut &[u8], depth: usize, work: &mut GeometryWork) -> Result<
         13 => {
             let mut previous = None;
             while !bytes.starts_with(&[0, 0]) {
-                let key = text(bytes, Some(work))?;
-                if previous.as_ref().is_some_and(|previous| previous >= &key) {
+                let key = validate_text(bytes, work)?;
+                if previous.is_some_and(|previous| previous >= key) {
                     return Err(invalid("Bijection geometry fields must be strictly ordered"));
                 }
                 work.allocate(std::mem::size_of::<String>()).map_err(geometry_error)?;
@@ -148,7 +169,7 @@ impl<'a> ValueView<'a> for Value<'a> {
 
     fn text(self) -> Option<Cow<'a, str>> {
         let mut rest = self.0.strip_prefix(&[9])?;
-        Some(text(&mut rest, None).expect("validated text"))
+        Some(text(&mut rest).expect("validated text"))
     }
 
     fn array(self) -> Option<impl ExactSizeIterator<Item = Self>> {
@@ -170,7 +191,7 @@ impl<'a> ValueView<'a> for Value<'a> {
         let mut rest = self.0.strip_prefix(&[13])?;
         Some(std::iter::from_fn(move || {
             if rest.starts_with(&[0, 0]) { return None; }
-            let key = text(&mut rest, None).expect("validated key");
+            let key = text(&mut rest).expect("validated key");
             let value = Self(rest);
             skip(&mut rest);
             Some((key, value))
