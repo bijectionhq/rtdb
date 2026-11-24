@@ -19,13 +19,13 @@ mod pipeline;
 
 pub use pipeline::{Decision, Terminal, TransactPipeline, TxKey};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Window {
     pub not_before: Option<Timestamp>,
     pub before: Option<Timestamp>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transact {
     pub key: Vec<u8>,
     #[serde(serialize_with = "serialize_features")]
@@ -34,7 +34,7 @@ pub struct Transact {
     pub guards: Vec<Guard>,
     pub ops: Vec<Op>,
     pub otherwise: Vec<Op>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Guard>,
     #[serde(skip)]
     pub custody_request_digest: Option<[u8; 32]>,
@@ -58,7 +58,29 @@ impl Transact {
         to_raw_value(self).map_err(|error| Anomaly::incorrect("rtdb/transaction-encoding", error.to_string()))
     }
 
+    /// Decode a request captured by an input log. The caller still resolves it
+    /// at the writer's ordered prefix with the route's verified authority.
+    pub fn decode_canonical_request(bytes: &[u8]) -> Result<Self> {
+        let request: Self = serde_json::from_slice(bytes).map_err(|error| {
+            Anomaly::incorrect("rtdb/transaction-encoding", error.to_string())
+        })?;
+        validate_key(&request.key)?;
+        if request.canonical_request()?.get().as_bytes() != bytes {
+            return Err(Anomaly::incorrect("rtdb/transaction-encoding", "The logged transaction request is not canonical"));
+        }
+        Ok(request)
+    }
+
     pub fn uses_custody(&self) -> bool { self.ops.iter().chain(&self.otherwise).any(Op::uses_custody) }
+
+    pub fn require_sealed_custody(&self, features: &[&str]) -> Result<()> {
+        if !self.has_unsealed_custody() { return Ok(()); }
+        Err(if features.contains(&ROW_CUSTODY) {
+            Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed before admission")
+        } else {
+            feature_required(ROW_CUSTODY)
+        })
+    }
 
     fn has_unsealed_custody(&self) -> bool {
         self.ops.iter().chain(&self.otherwise).any(|op| {
@@ -86,7 +108,7 @@ fn serialize_cells<S: Serializer>(cells: &StructFields<Cell>, serializer: S) -> 
     cells.iter().collect::<BTreeMap<_, _>>().serialize(serializer)
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Guard {
     Unchanged(Claim),
     Version {
@@ -99,13 +121,13 @@ pub enum Guard {
     CountAtMost { branch: Branch, range: CountRange, when: When },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Version { Absent, Present, Written(Basis) }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum When { Before, After }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Cell { Value(Value), TxTime, TxBasis }
 
 impl Cell {
@@ -120,7 +142,7 @@ impl Cell {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
     pub id: EntityId,
     pub valid: Option<ValidTime>,
@@ -128,21 +150,21 @@ pub struct Row {
     pub cells: StructFields<Cell>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_group: Option<CustodyGroupId>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(serialize_with = "serialize_features")]
     pub protected_columns: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custody_payload: Option<CustodyPayload>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ValidTime {
     Literal(Interval),
     Relative { from: ValidTimeBound, to: ValidTimeBound },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidTimeBound {
     Instant(Timestamp),
     TransactionMicros(i64),
@@ -178,7 +200,7 @@ impl From<Interval> for ValidTime {
     fn from(interval: Interval) -> Self { Self::Literal(interval) }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Op {
     Put { branch: Branch, table: TableRef, rows: Vec<Row>, if_absent: bool },
     Delete { branch: Branch, table: TableRef, ids: Vec<EntityId>, valid: Option<ValidTime> },
@@ -202,7 +224,7 @@ impl Op {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Declaration {
     Schema(StructFields<LogicalType>),
     Index(IndexDefinition),
@@ -495,13 +517,7 @@ impl TransactState {
         authority: Option<ScopedTransact<'_>>,
     ) -> Result<(Resolution, Option<BranchIndex>)> {
         validate_key(&request.key)?;
-        if request.has_unsealed_custody() {
-            return Err(if features.contains(&ROW_CUSTODY) {
-                Anomaly::incorrect("rtdb/custody-payload", "Protected columns must be sealed before admission")
-            } else {
-                feature_required(ROW_CUSTODY)
-            });
-        }
+        request.require_sealed_custody(features)?;
         let receipt_namespace = authority.map(|authority| authority.receipt_namespace);
         let canonical_request = request.canonical_request()?;
         let fingerprint = request.custody_request_digest.unwrap_or_else(|| {

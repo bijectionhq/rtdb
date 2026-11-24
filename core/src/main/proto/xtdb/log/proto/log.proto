@@ -20,6 +20,7 @@ message SourceLogMessage {
         Tx tx = 6;
         ArtefactsAdded artefacts_added = 7;
         ArtefactsRemoved artefacts_removed = 8;
+        bytes serving_transact = 9;
     }
 }
 
