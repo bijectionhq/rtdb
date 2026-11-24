@@ -78,15 +78,21 @@ def run_case_with_timeout(command, directory, evidence, case, env, timeout):
 
 
 def rust_function_at(source, line):
-    signature = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:proof\s+)?fn (\w+)\s*[<(]")
+    signature = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?(?:proof\s+)?fn (\w+)\s*[<(]")
     function = None
+    function_indent = None
     contract = False
     for index, text in enumerate(source.read_text().splitlines(), 1):
-        if text.lstrip().startswith(("#[verus_spec(", "#[cfg_attr(verus_keep_ghost, verus_spec(")):
+        stripped = text.lstrip()
+        indent = len(text) - len(stripped)
+        if (function_indent is None or indent <= function_indent) and stripped.startswith(
+            ("#[verus_spec(", "#[cfg_attr(verus_keep_ghost, verus_spec("),
+        ):
             contract = True
-        match = signature.match(text)
+        match = signature.match(stripped)
         if match:
             function = match[1]
+            function_indent = indent
             contract = False
         if index >= line and not contract:
             return function
