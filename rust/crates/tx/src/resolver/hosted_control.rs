@@ -189,7 +189,9 @@ impl OpenTransaction<'_> {
                 replay.check_base(control, point.row.as_ref().map(|(row, _)| row.batch()))?;
             }
             let revision = point.row.map(|(_, revision)| revision);
-            if revision != control.expected() {
+            if !super::control_order::revision_matches(
+                revision.map(|time| time.0), control.expected().map(|time| time.0),
+            ) {
                 return Err(Anomaly::new(
                     AnomalyCategory::Conflict,
                     "rtdb.hosted/stale-control",

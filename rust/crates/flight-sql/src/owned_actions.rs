@@ -1,4 +1,5 @@
 mod hosted_control;
+mod prepared_landing;
 mod hosted_observation;
 mod unique;
 
@@ -4339,7 +4340,7 @@ impl Service {
         let delete_root = *root_kind == 4;
         let proposal_overlay = *root_kind == 5;
         let proposal_land = *root_kind == 6;
-        if proposal_land != prepared_proposal || (proposal_land && slot.is_none()) {
+        if !prepared_landing::admits(proposal_land, prepared_proposal, slot.is_some()) {
             return Err(invalid("A prepared Proposal switch requires its landing and offered clock"));
         }
         if !proposal_land && counts.iter().any(|condition| matches!(

@@ -940,7 +940,9 @@ impl TransactionBuffer {
         if event.entity_key.is_some() != table.is_owned_event_data() {
             return Err(invalid("The transaction event has the wrong physical entity-key layout"));
         }
-        if event.system_from != self.tx_key.system_time { return Err(invalid("Transaction event has another system time")); }
+        if !crate::event_revision::matches_transaction(event.system_from.0, self.tx_key.system_time.0) {
+            return Err(invalid("Transaction event has another system time"));
+        }
         if event.commit_position != 0 || event.position.is_some() {
             return Err(invalid("The transaction buffer assigns commit and event positions"));
         }
