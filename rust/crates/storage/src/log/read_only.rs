@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
+use uuid::Uuid;
 use super::{AppendReceipt, Log, LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead};
+use super::journal_file::JournalFile;
 use super::local::{corrupt, inspect_record, inspect_record_body, is_record_separator, physical_maximum, read_record, read_record_body, read_record_header_at};
 use crate::{Error, IoRegion, Result, object_store::ReadReservation, sealing::{ClassicKeyVault, ClassicObjectKeys}};
 
@@ -27,6 +28,7 @@ impl Default for ReadOnlyLocalLogOptions {
 
 pub struct ReadOnlyLocalLog {
     path: Arc<PathBuf>,
+    lineage: Option<Uuid>,
     options: ReadOnlyLocalLogOptions,
     reads: Arc<IoRegion>,
     reserved_replay: bool,
@@ -35,7 +37,7 @@ pub struct ReadOnlyLocalLog {
 
 impl ReadOnlyLocalLog {
     /// Opens the caller-selected LOG or REPLICA_LOG path without creating it or taking a writer lock.
-    /// The external writer must preserve the append-only file and its record framing.
+    /// The external writer must preserve the append-only record sequence and offsets.
     pub fn open(path: impl AsRef<Path>, options: ReadOnlyLocalLogOptions) -> Result<Arc<Self>> {
         Self::open_with_reads(path.as_ref(), options, None, None)
     }
@@ -72,28 +74,26 @@ impl ReadOnlyLocalLog {
         if options.maximum_message_bytes > i32::MAX as usize || options.poll_interval.is_zero() || options.maximum_poll_records == 0 || options.maximum_poll_bytes < options.maximum_message_bytes {
             return Err(Error::Task("read-only log requires a positive polling interval and record limit, an i32 message limit, and room for a maximum-size message".into()));
         }
-        let log = Arc::new(Self { path, options, reads, reserved_replay, keys });
-        log.latest()?;
-        Ok(log)
+        let lineage = match JournalFile::open(&path, None)? {
+            Some(mut file) => {
+                file.cached_lineage(&path)?;
+                latest_in_file(&mut file, &path, options.maximum_message_bytes)?;
+                file.lineage()
+            }
+            None => None,
+        };
+        Ok(Arc::new(Self { path, lineage, options, reads, reserved_replay, keys }))
     }
 }
 
-fn open_existing(path: &Path) -> Result<Option<File>> {
-    match File::open(path) {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(Error::io(path, error)),
-    }
-}
-
-fn latest_in_file(file: &mut File, path: &Path, maximum: usize) -> Result<(LogOffset, u64)> {
-    let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+fn latest_in_file(file: &mut JournalFile, path: &Path, maximum: usize) -> Result<(LogOffset, u64)> {
+    let length = file.records_len().map_err(|error| Error::io(path, error))?;
     Ok((latest_at_length(file, path, maximum, length, TipInspection::CurrentFile)?, length))
 }
 
 enum TipInspection { CurrentFile, CapturedPrefix }
 
-fn latest_at_length(file: &mut File, path: &Path, maximum: usize, length: u64, inspection: TipInspection) -> Result<LogOffset> {
+fn latest_at_length(file: &mut JournalFile, path: &Path, maximum: usize, length: u64, inspection: TipInspection) -> Result<LogOffset> {
     if length == 0 { return Ok(LogOffset(-1)); }
     if length < 21 || length >= 1 << 48 { return Err(corrupt(path, length, "local log length is outside its framing bounds")); }
     file.seek(SeekFrom::Start(length - 8)).map_err(|error| Error::io(path, error))?;
@@ -117,7 +117,7 @@ fn latest_at_length(file: &mut File, path: &Path, maximum: usize, length: u64, i
 
 fn unavailable(position: LogOffset) -> Error { Error::UnavailableLogRange { requested: position.0, first_retained: 0 } }
 
-fn read_batch(file: &mut File, path: &Path, options: &ReadOnlyLocalLogOptions, from: u64, to: u64, latest: LogOffset, keys: Option<&ClassicObjectKeys>) -> Result<(Vec<LogRecord>, u64)> {
+fn read_batch(file: &mut JournalFile, path: &Path, options: &ReadOnlyLocalLogOptions, from: u64, to: u64, latest: LogOffset, keys: Option<&ClassicObjectKeys>) -> Result<(Vec<LogRecord>, u64)> {
     file.seek(SeekFrom::Start(from)).map_err(|error| Error::io(path, error))?;
     let mut records = Vec::new();
     let mut bytes = 0usize;
@@ -134,21 +134,22 @@ fn read_batch(file: &mut File, path: &Path, options: &ReadOnlyLocalLogOptions, f
 
 #[async_trait]
 impl Log for ReadOnlyLocalLog {
+    fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
-        file_range(self.reads.clone(), self.path.clone(), self.options.maximum_message_bytes, from, to, None, self.keys.clone())
+        file_range(self.reads.clone(), self.path.clone(), self.options.maximum_message_bytes, from, to, None, self.keys.clone(), self.lineage)
     }
     async fn enqueue(&self, _: Bytes, _: Timestamp) -> Result<AppendReceipt> { Err(Error::ReadOnlyLog(self.path.as_ref().clone())) }
 
     fn latest(&self) -> Result<LogOffset> {
         let _discovery = self.reads.admit_read(self.path.clone(), ())?;
-        let Some(mut file) = open_existing(&self.path)? else { return Ok(LogOffset(-1)); };
+        let Some(mut file) = JournalFile::open(&self.path, self.lineage)? else { return Ok(LogOffset(-1)); };
         latest_in_file(&mut file, &self.path, self.options.maximum_message_bytes).map(|(latest, _)| latest)
     }
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         if after.0 < -1 { return Err(unavailable(after)); }
         let _discovery = self.reads.admit_read(self.path.clone(), after)?;
-        let (next, observed_length) = match open_existing(&self.path)? {
+        let (next, observed_length) = match JournalFile::open(&self.path, self.lineage)? {
             None if after.0 == -1 => (0, 0),
             None => return Err(unavailable(after)),
             Some(mut file) => {
@@ -165,7 +166,7 @@ impl Log for ReadOnlyLocalLog {
         let tail = ReadOnlyTail {
             path: Arc::clone(&self.path),
             options: self.options.clone(),
-            cursor: ReadOnlyCursor { after, next, observed_length },
+            cursor: ReadOnlyCursor { after, next, observed_length, lineage: self.lineage },
             reads: self.reads.clone(),
             reserved_replay: self.reserved_replay,
             keys: self.keys.clone(),
@@ -177,7 +178,7 @@ impl Log for ReadOnlyLocalLog {
         if from.0 < 0 { return Err(unavailable(from)); }
         if to < from { return Err(Error::Task("log range end precedes its start".into())); }
         let _read = self.reads.admit_read(self.path.clone(), (from, to))?;
-        let Some(mut file) = open_existing(&self.path)? else {
+        let Some(mut file) = JournalFile::open(&self.path, self.lineage)? else {
             return if from.0 == 0 { Ok(Vec::new()) } else { Err(unavailable(from)) };
         };
         let (latest, end) = latest_in_file(&mut file, &self.path, self.options.maximum_message_bytes)?;
@@ -194,7 +195,7 @@ impl Log for ReadOnlyLocalLog {
     }
 }
 
-fn frame_end(file: &mut File, path: &Path, start: u64, maximum: usize) -> Result<u64> {
+fn frame_end(file: &mut JournalFile, path: &Path, start: u64, maximum: usize) -> Result<u64> {
     file.seek(SeekFrom::Start(start)).map_err(|error| Error::io(path, error))?;
     let mut header = [0; 13];
     file.read_exact(&mut header).map_err(|error| corrupt(path, start, error.to_string()))?;
@@ -208,13 +209,14 @@ fn frame_end(file: &mut File, path: &Path, start: u64, maximum: usize) -> Result
     Ok(end)
 }
 
-pub(super) fn file_range(reads: Arc<IoRegion>, path: Arc<PathBuf>, maximum: usize, from: LogOffset, to: LogOffset, durable: Option<LogOffset>, keys: Option<Arc<ClassicObjectKeys>>) -> Result<Box<dyn super::LogRange>> {
+pub(super) fn file_range(reads: Arc<IoRegion>, path: Arc<PathBuf>, maximum: usize, from: LogOffset, to: LogOffset, durable: Option<LogOffset>, keys: Option<Arc<ClassicObjectKeys>>, lineage: Option<Uuid>)
+    -> Result<Box<dyn super::LogRange>> {
     if from.0 < 0 { return Err(unavailable(from)); }
     if to < from { return Err(Error::Task("log range end precedes its start".into())); }
     let _discovery = reads.admit_read(path.clone(), (from, to, durable))?;
-    let mut file = open_existing(&path)?;
+    let mut file = JournalFile::open(&path, lineage)?;
     let end = if let Some(file) = &mut file {
-        let length = file.metadata().map_err(|error| Error::io(path.as_ref(), error))?.len();
+        let length = file.records_len().map_err(|error| Error::io(path.as_ref(), error))?;
         let latest = match durable {
             Some(latest) => latest,
             None if length == 0 => LogOffset(-1),
@@ -241,7 +243,7 @@ pub(super) fn file_range(reads: Arc<IoRegion>, path: Arc<PathBuf>, maximum: usiz
     Ok(Box::new(FileRange { file, path, reads, maximum, next: from.0 as u64, end, keys }))
 }
 
-struct FileRange { file: Option<File>, path: Arc<PathBuf>, reads: Arc<IoRegion>, maximum: usize, next: u64, end: u64, keys: Option<Arc<ClassicObjectKeys>> }
+struct FileRange { file: Option<JournalFile>, path: Arc<PathBuf>, reads: Arc<IoRegion>, maximum: usize, next: u64, end: u64, keys: Option<Arc<ClassicObjectKeys>> }
 #[async_trait]
 impl super::LogRange for FileRange {
     fn allocation_bound(&self) -> usize { self.maximum.saturating_mul(if self.keys.is_some() { 2 } else { 1 }).saturating_add(256) }
@@ -258,11 +260,11 @@ impl super::LogRange for FileRange {
 }
 
 #[derive(Clone, Copy)]
-struct ReadOnlyCursor { after: LogOffset, next: u64, observed_length: u64 }
+struct ReadOnlyCursor { after: LogOffset, next: u64, observed_length: u64, lineage: Option<Uuid> }
 
 impl ReadOnlyCursor {
-    fn observe(self, path: &Path, maximum: usize) -> Result<Option<(File, LogOffset, u64)>> {
-        let Some(mut file) = open_existing(path)? else {
+    fn observe(self, path: &Path, maximum: usize) -> Result<Option<(JournalFile, LogOffset, u64)>> {
+        let Some(mut file) = JournalFile::open(path, self.lineage)? else {
             return if self.observed_length == 0 { Ok(None) } else { Err(corrupt(path, self.next, "observed log disappeared")) };
         };
         let (latest, end) = latest_in_file(&mut file, path, maximum)?;
@@ -284,8 +286,8 @@ impl ReadOnlyCursor {
         if head.metadata.offset.0 != self.next as i64 {
             return Err(Error::Task("log replay head does not match the next position".into()));
         }
-        let mut file = open_existing(path)?.ok_or_else(|| corrupt(path, self.next, "observed log disappeared"))?;
-        let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+        let mut file = JournalFile::open(path, self.lineage)?.ok_or_else(|| corrupt(path, self.next, "observed log disappeared"))?;
+        let length = file.records_len().map_err(|error| Error::io(path, error))?;
         if length < self.observed_length { return Err(corrupt(path, length, "observed log was truncated")); }
         let latest = latest_at_length(&mut file, path, maximum, self.observed_length, TipInspection::CapturedPrefix)?;
         if head.metadata.offset > latest { return Err(Error::Task("log replay head exceeds the observed tip".into())); }

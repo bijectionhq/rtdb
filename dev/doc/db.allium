@@ -585,6 +585,8 @@ variant DetachDbMessage : SourceMessage {
 
 ---- Replica Log Messages
 
+-- A native replica journal with embedded search lineage keeps its record offsets across lineage binding, replay, and prefix retirement.
+
 -- Messages on the replica log, written by the leader for its term.
 -- Consumed by every node, the leader itself included on read-back, and by its own follower after a demote.
 

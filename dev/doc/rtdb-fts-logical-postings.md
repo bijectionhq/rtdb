@@ -20,6 +20,7 @@ The same pinned catalog determines which version is visible and where its payloa
 | `TermSummaries`, `PreparedLogicalRun`, `DirectoryUpdate`, `TermEdits`, and `MaxUnitBound` | Passive objects | Writer-owned Arrow summaries and staged run receipts, a directory build request, sorted tree edits, and the bound fold for immutable pages. |
 | `ObjectPageStore` and `ArchiveTermPages` | Passive storage adapters | The term directory's table prefix and access to authenticated pages. |
 | `RetainedArtefactJournal` and `PrepareSearch` | Passive adapters | Access to verified retained replay and to the file builders invoked by sealing. |
+| `JournalFile` and `NativeTableReplay` | Passive objects | The replica journal's embedded lineage and record offset space, and the opened history used to issue native repair receipts. |
 | `ReplicationDriver` and the artefact driver | Active objects | Ordered adoption and replay, and selection and scheduling of independent build work. |
 | `TrieCollector` | Passive cycle worker | The eligibility observations and receipts used by a collection cycle. |
 | `QueryRanking` | Monitor | One frontier, work admission, and the verified SQL prefix across the pinned partitions. |
@@ -119,6 +120,14 @@ Hosted storage authenticates ranges of new logical runs and history sidecars wit
 
 The lane can reconstruct a run from retained L0 files.
 For supported native local journals, it can recover from the captured checkpoint's verified replica prefix when original primary files are missing.
+Native repair receipts use the lineage stored in the replica journal header.
+A writable logical-search open assigns a new journal a fresh UUID and upgrades a legacy journal in place while preserving its replica offsets.
+The upgrade takes the UUID from `REPLICA_LOG.lineage` when a legacy journal has record frames and a valid sidecar, and generates one when the sidecar is absent.
+An existing sidecar also triggers the upgrade on a writable open.
+The upgrade stages a full copy in the journal directory and publishes it atomically under the writer lock.
+The header carries the same UUID when `REPLICA_LOG` moves or its record prefix is retired.
+A sidecar that disagrees with the header blocks the open, as does a sidecar beside an empty journal without a header.
+Read-only legacy attachments can replay records and expose the embedded identity after a writable upgrade and reopen.
 The repair checks the table's replayed event count and the requested extent before publication.
 Replay supplies the erase frontier, so recovery can discard pre-erase text and preserve later writes.
 Events in the same commit retain source order for erasure.

@@ -1,16 +1,17 @@
 use super::{AppendReceipt, AppendTimestampSource, LOG_RECORD_OVERHEAD_BYTES, Log, LogMetadata, LogOffset, LogRecord, LogReplayTail, LogTail, Progress, ReplayHead, SuppliedTimestamp, await_tip};
+use super::journal_file::JournalFile;
 use crate::{Error, IoRegion, Result, object_store::ReadReservation, sealing::{ClassicKeyVault, ClassicObjectKeys, LOG_SEAL_OVERHEAD}};
 use async_trait::async_trait;
 use bytes::Bytes;
-use fs2::FileExt;
 use rtdb_types::Timestamp;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, ErrorKind, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 const HEADER_BYTES: u64 = 13;
 const TRAILER_BYTES: u64 = 8;
@@ -43,6 +44,7 @@ impl Queued {
 
 pub struct LocalLog {
     path: Arc<PathBuf>,
+    lineage: Option<Uuid>,
     queue: mpsc::Sender<Queued>,
     progress: Arc<Progress>,
     maximum_message_bytes: usize,
@@ -56,7 +58,7 @@ pub struct LocalLogDriver {
     progress: Arc<Progress>,
 }
 
-struct Writer { file: File, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource>, keys: Option<Arc<ClassicObjectKeys>> }
+struct Writer { file: JournalFile, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource>, keys: Option<Arc<ClassicObjectKeys>> }
 
 pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Error {
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
@@ -80,18 +82,18 @@ impl RecordHeader {
     }
 }
 
-fn read_record_header(file: &mut File, path: &Path, maximum: usize) -> Result<RecordHeader> {
+fn read_record_header(file: &mut JournalFile, path: &Path, maximum: usize) -> Result<RecordHeader> {
     let offset = file.stream_position().map_err(|error| Error::io(path, error))?;
-    let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+    let length = file.records_len().map_err(|error| Error::io(path, error))?;
     parse_record_header(file, path, maximum, offset, length)
 }
 
-pub(super) fn read_record_header_at(file: &mut File, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
+pub(super) fn read_record_header_at(file: &mut JournalFile, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
     file.seek(SeekFrom::Start(offset)).map_err(|error| Error::io(path, error))?;
     parse_record_header(file, path, maximum, offset, length)
 }
 
-fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
+fn parse_record_header(file: &mut JournalFile, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
     let mut header = [0; HEADER_BYTES as usize];
     file.read_exact(&mut header).map_err(|error| corrupt(path, offset, format!("incomplete record header: {error}")))?;
     if !is_record_separator(header[0]) { return Err(corrupt(path, offset, "invalid local log record separator")); }
@@ -108,7 +110,7 @@ fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64
         payload_size: size as usize, retired: matches!(header[0], RETIRED_SEPARATOR | RETIRED_SEALED_SEPARATOR), sealed })
 }
 
-fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Result<()> {
+fn read_record_trailer(file: &mut JournalFile, path: &Path, offset: LogOffset) -> Result<()> {
     let mut trailer = [0; TRAILER_BYTES as usize];
     file.read_exact(&mut trailer).map_err(|error| Error::io(path, error))?;
     if i64::from_be_bytes(trailer) != offset.0 {
@@ -117,12 +119,12 @@ fn read_record_trailer(file: &mut File, path: &Path, offset: LogOffset) -> Resul
     Ok(())
 }
 
-pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
+pub(super) fn read_record(file: &mut JournalFile, path: &Path, maximum: usize, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
     let header = read_record_header(file, path, maximum)?;
     read_record_body(file, path, header, keys)
 }
 
-pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeader, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
+pub(super) fn read_record_body(file: &mut JournalFile, path: &Path, header: RecordHeader, keys: Option<&ClassicObjectKeys>) -> Result<LogRecord> {
     if header.retired {
         let requested = header.metadata.offset.0;
         return Err(Error::UnavailableLogRange {
@@ -140,12 +142,12 @@ pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeade
     Ok(LogRecord::new(header.metadata, payload))
 }
 
-pub(super) fn inspect_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogMetadata> {
+pub(super) fn inspect_record(file: &mut JournalFile, path: &Path, maximum: usize) -> Result<LogMetadata> {
     let header = read_record_header(file, path, maximum)?;
     inspect_record_body(file, path, header)
 }
 
-pub(super) fn inspect_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogMetadata> {
+pub(super) fn inspect_record_body(file: &mut JournalFile, path: &Path, header: RecordHeader) -> Result<LogMetadata> {
     if header.retired {
         file.seek(SeekFrom::Current(header.payload_size as i64)).map_err(|error| Error::io(path, error))?;
         read_record_trailer(file, path, header.metadata.offset)?;
@@ -162,9 +164,9 @@ pub(super) fn inspect_record_body(file: &mut File, path: &Path, header: RecordHe
     Ok(header.metadata)
 }
 
-pub(crate) fn prefix_end(file: &mut File, path: &Path, maximum: usize, boundary: LogOffset, inclusive: bool) -> Result<u64> {
+pub(crate) fn prefix_end(file: &mut JournalFile, path: &Path, maximum: usize, boundary: LogOffset, inclusive: bool) -> Result<u64> {
     let mut next = 0;
-    let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+    let length = file.records_len().map_err(|error| Error::io(path, error))?;
     let boundary = u64::try_from(boundary.0).map_err(|_| corrupt(path, 0, "negative checkpoint log boundary"))?;
     while next <= boundary && next < length {
         let header = read_record_header_at(file, path, maximum, next, length)?;
@@ -177,7 +179,7 @@ pub(crate) fn prefix_end(file: &mut File, path: &Path, maximum: usize, boundary:
     Err(corrupt(path, boundary, "the checkpoint boundary does not name a complete record"))
 }
 
-pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u64, keys: Option<&ClassicObjectKeys>) -> Result<()> {
+pub(crate) fn settle_prefix(file: &mut JournalFile, path: &Path, maximum: usize, end: u64, keys: Option<&ClassicObjectKeys>) -> Result<()> {
     let zeros = [0; 8192];
     let mut next = 0;
     while next < end {
@@ -197,7 +199,7 @@ pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u
                 .map_err(|error| Error::io(path, error))?;
             if header.sealed {
                 // The frame identity survives until its retirement marker is durable.
-                crate::sync_file(file).map_err(|error| Error::io(path, error))?;
+                file.sync().map_err(|error| Error::io(path, error))?;
             }
         }
         file.seek(SeekFrom::Start(next + HEADER_BYTES)).map_err(|error| Error::io(path, error))?;
@@ -209,11 +211,11 @@ pub(crate) fn settle_prefix(file: &mut File, path: &Path, maximum: usize, end: u
         }
         next += HEADER_BYTES + header.payload_size as u64 + TRAILER_BYTES;
     }
-    crate::sync_file(file).map_err(|error| Error::io(path, error))
+    file.sync().map_err(|error| Error::io(path, error))
 }
 
-fn inspect(file: &mut File, path: &Path, maximum: usize, sealed: bool) -> Result<LogOffset> {
-    let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+fn inspect(file: &mut JournalFile, path: &Path, maximum: usize, sealed: bool) -> Result<LogOffset> {
+    let length = file.records_len().map_err(|error| Error::io(path, error))?;
     if length >= 1 << 48 { return Err(corrupt(path, length, "local log exceeds the 48-bit offset space")); }
     file.seek(SeekFrom::Start(0)).map_err(|error| Error::io(path, error))?;
     let mut latest = LogOffset(-1);
@@ -254,7 +256,21 @@ impl LocalLog {
     pub fn open_with_key_slots(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
         reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
     ) -> Result<(Arc<Self>, LocalLogDriver)> {
-        let path = Arc::new(path.as_ref().to_path_buf());
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, false)
+    }
+
+    /// Durably binds a native replica journal's lineage, preserving any existing record offsets.
+    /// The returned driver has the same run/cancel/join obligation as [`Self::open`].
+    pub fn open_replica(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>,
+    ) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_journal(path.as_ref(), options, timestamps, reads, keys, true)
+    }
+
+    fn open_journal(path: &Path, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>,
+        reads: Arc<IoRegion>, keys: Option<Arc<ClassicObjectKeys>>, bind_lineage: bool,
+    ) -> Result<(Arc<Self>, LocalLogDriver)> {
+        let path = Arc::new(path.to_path_buf());
         let _operation = reads.admit_read(path.clone(), ())?;
         let file_path = path.as_path();
         if keys.is_none() {
@@ -265,17 +281,18 @@ impl LocalLog {
             return Err(Error::Task("local log requires a positive queue and an i32 payload limit".into()));
         }
         if let Some(parent) = file_path.parent() { fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?; }
-        let mut file = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(file_path)
-            .map_err(|error| Error::io(file_path, error))?;
-        file.try_lock_exclusive().map_err(|error| Error::io(file_path, error))?;
+        let mut file = JournalFile::lock(file_path, true)?;
+        let cached = file.cached_lineage(file_path)?;
         let latest = inspect(&mut file, file_path, maximum, keys.is_some())?;
-        crate::sync_file(&file).map_err(|error| Error::io(file_path, error))?;
-        if let Some(parent) = file_path.parent() {
-            crate::sync_directory(parent).map_err(|error| Error::io(parent, error))?;
+        if file.lineage().is_none() && (bind_lineage || cached.is_some()) {
+            file = file.bind_lineage(file_path, cached.unwrap_or_else(Uuid::new_v4))?;
+        } else {
+            file.sync_open(file_path)?;
         }
         let progress = Arc::new(Progress::new(latest));
         let (send, queue) = mpsc::channel(options.queue_capacity);
-        let log = Arc::new(Self { path: path.clone(), queue: send, progress: progress.clone(), maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads });
+        let log = Arc::new(Self { path: path.clone(), lineage: file.lineage(), queue: send, progress: progress.clone(),
+            maximum_message_bytes: options.maximum_message_bytes, keys: keys.clone(), reads });
         Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps, keys }), queue, progress }))
     }
 
@@ -310,11 +327,11 @@ impl Writer {
                 [IoSlice::new(header), IoSlice::new(payload), IoSlice::new(trailer)]
             }).collect();
             write_frames(&mut self.file, &mut slices).map_err(|error| Error::io(self.path.as_ref(), error))?;
-            crate::sync_file(&self.file).map_err(|error| Error::io(self.path.as_ref(), error))?;
+            self.file.sync().map_err(|error| Error::io(self.path.as_ref(), error))?;
             Ok(metadata)
         })();
         if result.is_err() {
-            if let Err(rollback) = self.file.set_len(start).and_then(|_| crate::sync_file(&self.file)) {
+            if let Err(rollback) = self.file.truncate_records(start).and_then(|_| self.file.sync()) {
                 return Err(corrupt(&self.path, start, format!("append failed: {}; rollback failed: {rollback}", result.as_ref().unwrap_err())));
             }
         }
@@ -464,19 +481,20 @@ impl LocalLog {
     async fn open_tail(&self, after: LogOffset) -> Result<LocalTail> {
         let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
         let (path, progress) = (self.path.clone(), self.progress.clone());
+        let lineage = self.lineage;
         let latest = progress.latest()?;
         if after.0 < -1 || after > latest {
             return Err(Error::UnavailableLogRange { requested: after.0, first_retained: 0 });
         }
         let next = if after.0 < 0 { 0 } else {
             self.reads.read(path.clone(), after, move |path, &after| {
-                let mut file = File::open(path.as_path()).map_err(|error| Error::io(path.as_path(), error))?;
+                let mut file = open_at(path, lineage, 0)?;
                 file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(path.as_path(), error))?;
                 inspect_record(&mut file, path, maximum)?;
                 file.stream_position().map_err(|error| Error::io(path.as_path(), error))
             }).await?
         };
-        Ok(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() })
+        Ok(LocalTail { path, lineage, progress, maximum, after, next, reads: Arc::clone(&self.reads), keys: self.keys.clone() })
     }
 }
 
@@ -495,12 +513,13 @@ impl super::SharedLog for LocalLog {
 
 #[async_trait]
 impl Log for LocalLog {
+    fn journal_lineage(&self) -> Option<Uuid> { self.lineage }
     fn retains_synced_history(&self) -> bool { true }
     fn maximum_append_bytes(&self) -> Option<usize> { Some(self.maximum_message_bytes) }
 
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
         let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
-        super::read_only::file_range(self.reads.clone(), self.path.clone(), maximum, from, to, Some(self.progress.latest()?), self.keys.clone())
+        super::read_only::file_range(self.reads.clone(), self.path.clone(), maximum, from, to, Some(self.progress.latest()?), self.keys.clone(), self.lineage)
     }
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         self.append_record(payload, timestamp).await
@@ -516,10 +535,11 @@ impl Log for LocalLog {
         let latest = self.progress.latest()?;
         let maximum = physical_maximum(self.maximum_message_bytes, self.keys.is_some())?;
         let keys = self.keys.clone();
+        let lineage = self.lineage;
         if from.0 < 0 { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         if to < from { return Err(Error::Task("log range end precedes its start".into())); }
         self.reads.read(self.path.clone(), (from, to, latest), move |path, &(from, to, latest)| {
-            let mut file = File::open(path.as_path()).map_err(|error| Error::io(path.as_path(), error))?;
+            let mut file = open_at(path, lineage, 0)?;
             if from > latest {
                 let end = if latest.0 < 0 { 0 } else {
                     file.seek(SeekFrom::Start(latest.0 as u64)).map_err(|error| Error::io(path.as_path(), error))?;
@@ -545,7 +565,7 @@ impl Log for LocalLog {
 }
 
 struct LocalTail {
-    path: Arc<PathBuf>, progress: Arc<Progress>, maximum: usize, after: LogOffset, next: u64,
+    path: Arc<PathBuf>, lineage: Option<Uuid>, progress: Arc<Progress>, maximum: usize, after: LogOffset, next: u64,
     reads: Arc<IoRegion>,
     keys: Option<Arc<ClassicObjectKeys>>,
 }
@@ -557,9 +577,9 @@ impl LocalTail {
         let maximum = self.maximum;
         let keys = self.keys.clone();
         let payload_limit = payload_limit.max(maximum);
+        let lineage = self.lineage;
         let (records, next) = self.reads.read(self.path.clone(), (self.next, tip), move |path, &(next, tip)| {
-            let mut file = File::open(path.as_path()).map_err(|error| Error::io(path.as_path(), error))?;
-            file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path.as_path(), error))?;
+            let mut file = open_at(path, lineage, next)?;
             let mut records = Vec::new();
             let mut payload_bytes = 0usize;
             while file.stream_position().map_err(|error| Error::io(path.as_path(), error))? <= tip.0 as u64 {
@@ -591,8 +611,8 @@ impl LogTail for LocalTail {
     fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
 }
 
-fn open_at(path: &Path, next: u64) -> Result<File> {
-    let mut file = File::open(path).map_err(|error| Error::io(path, error))?;
+fn open_at(path: &Path, lineage: Option<Uuid>, next: u64) -> Result<JournalFile> {
+    let mut file = JournalFile::open(path, lineage)?.ok_or_else(|| corrupt(path, next, "local log file disappeared"))?;
     file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path, error))?;
     Ok(file)
 }
@@ -605,8 +625,9 @@ impl LogReplayTail for LocalTail {
         if self.next > tip.0 as u64 { return Err(corrupt(&self.path, self.next, "durable tip yielded no record")); }
 
         let maximum = self.maximum;
+        let lineage = self.lineage;
         self.reads.read(self.path.clone(), self.next, move |path, &next| {
-            let mut file = open_at(path, next)?;
+            let mut file = open_at(path, lineage, next)?;
             Ok(Some(read_record_header(&mut file, path, maximum)?.replay_head()))
         }).await
     }
@@ -621,8 +642,9 @@ impl LogReplayTail for LocalTail {
         }
         let maximum = self.maximum;
         let keys = self.keys.clone();
+        let lineage = self.lineage;
         let (record, next) = self.reads.read(self.path.clone(), self.next, move |path, &next| {
-            let mut file = open_at(path, next)?;
+            let mut file = open_at(path, lineage, next)?;
             let header = read_record_header(&mut file, path, maximum)?;
             if header.replay_head() != head {
                 return Err(corrupt(path, next, "log replay head changed before delivery"));
@@ -643,6 +665,110 @@ impl LogReplayTail for LocalTail {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::ReadOnlyLocalLog;
+    use std::fs::OpenOptions;
+
+    fn replica_options() -> LocalLogOptions { LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 2 } }
+
+    fn open_replica(path: &Path) -> Result<(Arc<LocalLog>, LocalLogDriver)> {
+        LocalLog::open_replica(path, replica_options(), Arc::new(SuppliedTimestamp), IoRegion::new(), None)
+    }
+
+    #[test]
+    fn replica_journal_lineage_rejects_an_orphaned_or_mismatched_sidecar() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("REPLICA_LOG");
+        let sidecar = path.with_extension("lineage");
+        let (log, driver) = open_replica(&path)?;
+        let old_lineage = log.journal_lineage().unwrap();
+        drop((log, driver));
+        fs::remove_file(&path).unwrap();
+        fs::write(&sidecar, old_lineage.as_bytes()).unwrap();
+        assert!(matches!(open_replica(&path), Err(Error::CorruptLog { reason, .. }) if reason.contains("orphaned lineage sidecar")));
+
+        fs::remove_file(&sidecar).unwrap();
+        let (log, driver) = open_replica(&path)?;
+        assert_ne!(log.journal_lineage().unwrap(), old_lineage);
+        assert_eq!(log.latest()?, LogOffset(-1));
+        drop((log, driver));
+
+        fs::write(&sidecar, old_lineage.as_bytes()).unwrap();
+        let mismatch = |error| matches!(error, Error::CorruptLog { reason, .. } if reason.contains("lineage disagrees"));
+        assert!(open_replica(&path).is_err_and(mismatch));
+        assert!(ReadOnlyLocalLog::open(&path, Default::default()).is_err_and(mismatch));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replica_journal_lineage_migrates_legacy_offsets_and_keeps_the_identity_after_retirement() -> Result<()> {
+        for with_sidecar in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("REPLICA_LOG");
+            let sidecar = path.with_extension("lineage");
+            let (legacy, driver) = LocalLog::open(&path, replica_options())?;
+            let shutdown = CancellationToken::new();
+            let task = tokio::spawn(driver.run(shutdown.clone()));
+            let first = legacy.enqueue(Bytes::from_static(b"legacy"), Timestamp(1)).await?.durable().await?;
+            #[cfg(unix)]
+            let mut old_range = legacy.range(first.offset, LogOffset(i64::MAX)).await?;
+            shutdown.cancel();
+            task.await.unwrap()?;
+            let original = fs::read(&path).unwrap();
+            assert!(legacy.journal_lineage().is_none());
+
+            let cached = Uuid::new_v4();
+            if with_sidecar { fs::write(&sidecar, cached.as_bytes()).unwrap(); }
+            let interrupted = path.with_file_name(".REPLICA_LOG.rtdb-lineage-migration");
+            fs::write(&interrupted, b"interrupted staging contents").unwrap();
+            let (migrated, driver) = open_replica(&path)?;
+            let lineage = migrated.journal_lineage().unwrap();
+            assert!(!interrupted.exists());
+            if with_sidecar { assert_eq!(lineage, cached); }
+            assert_eq!(migrated.latest()?, first.offset);
+            assert!(fs::read(&path).unwrap().ends_with(&original));
+            if with_sidecar { fs::remove_file(&sidecar).unwrap(); }
+
+            let shutdown = CancellationToken::new();
+            let task = tokio::spawn(driver.run(shutdown.clone()));
+            let second = migrated.enqueue(Bytes::from_static(b"after migration"), Timestamp(2)).await?.durable().await?;
+            assert_eq!(second.offset, LogOffset(original.len() as i64));
+            let mut tail = migrated.tail(LogOffset(-1)).await?;
+            let records = tail.poll(Duration::ZERO).await?;
+            assert_eq!(records.iter().map(|record| record.metadata).collect::<Vec<_>>(), [first, second]);
+
+            let reader = ReadOnlyLocalLog::open_in(&path, Default::default(), IoRegion::new())?;
+            assert_eq!(reader.journal_lineage(), Some(lineage));
+            assert_eq!(reader.read_range(first.offset, second.offset).await?[0].payload.as_ref(), b"legacy");
+            let mut range = migrated.range(first.offset, second.offset).await?;
+            let charge = range.allocation_bound();
+            let memory = rtdb_types::MemoryBudget::new(charge);
+            let reservation = ReadReservation::new(charge, memory.reserve(charge).unwrap());
+            assert_eq!(range.next(reservation).await?.unwrap().metadata, first);
+            drop(range);
+            #[cfg(unix)]
+            {
+                let reservation = ReadReservation::new(charge, memory.reserve(charge).unwrap());
+                assert!(matches!(old_range.next(reservation).await, Err(Error::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::InvalidData));
+            }
+            shutdown.cancel();
+            task.await.unwrap()?;
+
+            let mut file = JournalFile::lock(&path, false)?;
+            let end = prefix_end(&mut file, &path, 1024, second.offset, false)?;
+            settle_prefix(&mut file, &path, 1024, end, None)?;
+            drop(file);
+            let (reopened, _driver) = open_replica(&path)?;
+            assert_eq!(reopened.journal_lineage(), Some(lineage));
+            assert_eq!(reopened.latest()?, second.offset);
+            let mut tail = reader.tail(first.offset).await?;
+            let replay = tail.replay().unwrap();
+            let head = replay.poll_head(Duration::ZERO).await?.unwrap();
+            let reservation = ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
+            assert_eq!(replay.read_head(head, reservation).await?.metadata, second);
+        }
+        Ok(())
+    }
 
     #[test]
     fn sealing_byte_path_writes_original_record_bytes_after_short_writes() {
@@ -772,7 +898,7 @@ mod tests {
         };
         let committed = writer.append(&[record(b"acknowledged", 1)])?[0];
         let metadata = writer.append(&[record(b"complete", 2), record(b"torn", 3), record(b"absent", 4)])?;
-        writer.file.set_len(metadata[1].offset.0 as u64 + HEADER_BYTES + 2)
+        writer.file.truncate_records(metadata[1].offset.0 as u64 + HEADER_BYTES + 2)
             .map_err(|error| Error::io(&path, error))?;
         drop(writer);
         assert!(matches!(LocalLog::open(&path, options()), Err(Error::CorruptLog { offset, .. })
@@ -805,6 +931,7 @@ mod tests {
         }
         let mut tail = LocalTail {
             path: Arc::clone(&log.path),
+            lineage: log.lineage,
             progress: Arc::clone(&log.progress),
             maximum: log.maximum_message_bytes,
             after: LogOffset(-1),
@@ -839,8 +966,7 @@ mod retention_tests {
         let path = Arc::new(payloads.path().join("REPLICA_LOG"));
         let keys = key_vault.log_keys(&path, true, IoRegion::new()).map_err(|error| Error::Task(error.to_string()))?;
         let mut writer = Writer {
-            file: File::options().read(true).write(true).create_new(true).open(path.as_ref())
-                .map_err(|error| Error::io(path.as_ref(), error))?,
+            file: JournalFile::lock(&path, true)?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
             keys: Some(Arc::clone(&keys)),
@@ -869,7 +995,7 @@ mod retention_tests {
         let scratch = tempfile::NamedTempFile::new().map_err(|error| Error::Task(error.to_string()))?;
         let path = Arc::new(scratch.path().to_path_buf());
         let mut writer = Writer {
-            file: scratch.reopen().map_err(|error| Error::io(path.as_ref(), error))?,
+            file: JournalFile::lock(&path, false)?,
             path: Arc::clone(&path),
             timestamps: Arc::new(SuppliedTimestamp),
             keys: None,

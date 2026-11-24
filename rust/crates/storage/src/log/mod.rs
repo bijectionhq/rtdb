@@ -1,4 +1,5 @@
 mod guarded_sample;
+pub(crate) mod journal_file;
 pub(crate) mod local;
 mod memory;
 mod read_only;
@@ -273,6 +274,8 @@ impl AppendBuffer {
 
 #[async_trait]
 pub trait Log: Send + Sync {
+    /// The identity stored in the opened native replica journal, if it has a lineage header.
+    fn journal_lineage(&self) -> Option<uuid::Uuid> { None }
     fn needs_published_recovery_checkpoint(&self) -> bool { false }
     /// This replica log confers offload access only through a delivered payload permit.
     fn requires_replica_payload_permit(&self) -> bool { false }

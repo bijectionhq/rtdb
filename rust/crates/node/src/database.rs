@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Write};
-use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
 use std::time::Duration;
 
@@ -409,6 +407,9 @@ impl DatabaseFactory {
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
         let access = if read_only { crate::LogAccess::ReadOnly } else if self.options.replication.may_lead { crate::LogAccess::ReadWrite } else { crate::LogAccess::SourceWriter };
+        let event_history = !read_only && self.options.artefact_threads != 0
+            && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
+        let native_history = event_history && matches!(&configuration.log, Some(database_config::Log::LocalLog(_)));
         let mut resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let checkpoint_metadata = resources.checkpoint_metadata.take();
@@ -418,7 +419,12 @@ impl DatabaseFactory {
             let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now(), resources.blocks).await?;
-            let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
+            let opened_logs = if native_history {
+                self.resources.open_logs_with_replica_lineage(&name, &configuration, access, log_cancellation.clone(), &resources).await?
+            } else {
+                self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?
+            };
+            let journal_lineage = opened_logs.replica.journal_lineage();
             if let crate::AwaitAuthority::Checkpoint { block, through, root, .. } = &opened_logs.await_authority
                 && (!read_only || through.0 < 0 || through.epoch() != opened_logs.replica_epoch
                     || !matches!(resources.blocks,
@@ -453,8 +459,6 @@ impl DatabaseFactory {
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
-            let event_history = !read_only && self.options.artefact_threads != 0
-                && self.artefact_kinds.iter().any(|kind| kind.enables_event_history());
             let resolve = Arc::new(ResolveContext {
                 decision_clock: self.decision_clock.clone(),
                 write_event_origins: event_history || !read_only && matches!(&opened_logs.await_authority, crate::AwaitAuthority::Live { .. }),
@@ -480,7 +484,8 @@ impl DatabaseFactory {
             let mut builders = if read_only || self.options.artefact_threads == 0 { Vec::new() } else {
                 let history = match self.resources.table_history(&configuration)? {
                     Some(hosted) => Some(hosted),
-                    None if event_history => NativeTableReplay::for_database(Arc::clone(&logs), &configuration)?,
+                    None if native_history => journal_lineage.map(|lineage|
+                        Arc::new(NativeTableReplay { logs: Arc::clone(&logs), lineage }) as Arc<dyn rtdb_maintenance::TableHistorySource>),
                     None => None,
                 };
                 self.artefact_kinds.iter().map(|kind| {
@@ -571,60 +576,6 @@ impl DatabaseFactory {
 struct NativeTableReplay {
     logs: Arc<PartitionLogs>,
     lineage: uuid::Uuid,
-}
-
-impl NativeTableReplay {
-    fn for_database(logs: Arc<PartitionLogs>, configuration: &DatabaseConfig) -> Result<Option<Arc<dyn rtdb_maintenance::TableHistorySource>>> {
-        let Some(database_config::Log::LocalLog(log)) = &configuration.log else { return Ok(None); };
-        let directory = log.path.as_deref().ok_or_else(|| Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", "Local log has no path"))?;
-        let lineage = native_log_lineage(Path::new(directory))?;
-        Ok(Some(Arc::new(Self { logs, lineage })))
-    }
-}
-
-fn native_log_lineage(directory: &Path) -> Result<uuid::Uuid> {
-    let path = directory.join("REPLICA_LOG.lineage");
-    let io = |error| Anomaly::fault("rtdb.node/local-log-lineage", format!("{}: {error}", path.display()));
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let id = uuid::Uuid::new_v4();
-            let mut staged = tempfile::NamedTempFile::new_in(directory).map_err(io)?;
-            staged.write_all(id.as_bytes()).map_err(io)?;
-            rtdb_storage::sync_file(staged.as_file()).map_err(io)?;
-            match staged.persist_noclobber(&path) {
-                Ok(_) => id.as_bytes().to_vec(),
-                Err(error) if error.error.kind() == ErrorKind::AlreadyExists => std::fs::read(&path).map_err(io)?,
-                Err(error) => return Err(io(error.error)),
-            }
-        }
-        Err(error) => return Err(io(error)),
-    };
-    rtdb_storage::sync_directory(directory).map_err(io)?;
-    uuid::Uuid::from_slice(&bytes).ok().filter(|id| !id.is_nil()).ok_or_else(||
-        Anomaly::fault("rtdb.node/local-log-lineage", format!("{} has an invalid journal identity", path.display())))
-}
-
-#[cfg(test)]
-#[test]
-fn native_search_lineage_follows_the_journal_after_its_directory_moves() {
-    use rtdb_storage::log::{LocalLog, LocalLogOptions};
-
-    let files = tempfile::tempdir().unwrap();
-    let original = files.path().join("original");
-    let moved = files.path().join("moved");
-    let open = |directory: &Path| {
-        LocalLog::open(directory.join("REPLICA_LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 1 }).unwrap()
-    };
-    let journal = open(&original);
-    let lineage = native_log_lineage(&original).unwrap();
-    drop(journal);
-    std::fs::rename(&original, &moved).unwrap();
-
-    let _moved_journal = open(&moved);
-    let _new_journal = open(&original);
-    assert_eq!(native_log_lineage(&moved).unwrap(), lineage);
-    assert_ne!(native_log_lineage(&original).unwrap(), lineage);
 }
 
 #[async_trait::async_trait]

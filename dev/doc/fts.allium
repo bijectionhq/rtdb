@@ -275,6 +275,11 @@ rule RepairUnreadableSearchFile {
     -- A report is dropped when no live member still records that search file or the definition has left force.
     -- A damaged format 16 run with readable source inputs is repaired by ordered publication of a new immutable run over the same extents.
     -- A native repair can read the retained accepted journal up to the pinned checkpoint boundary.
+    -- A native source receipt takes its lineage from the replica journal and retains that identity when the journal moves.
+    -- A writable logical-search open assigns a new journal its own lineage and adopts an existing legacy lineage only for a journal with record frames.
+    -- A conflicting legacy sidecar or an orphaned sidecar beside an empty unbound journal blocks the open.
+    -- A read-only legacy journal provides replay without a journal lineage identity.
+    -- A read-only open exposes that identity after a writable upgrade.
     -- A hosted repair reads a directory root anchored in the published checkpoint and verifies the committed replica suffix through the pinned boundary.
     -- A hosted checkpoint published with a semantic serving inventory can be opened after loss of its logical search runs and term-directory pages.
     -- The installed table directory authenticates the surviving event headers and erase frontier at that boundary.

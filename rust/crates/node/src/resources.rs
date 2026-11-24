@@ -155,6 +155,13 @@ pub trait ResourceFactory: Send + Sync {
     /// Storage must come from this factory's `open_storage` for the same name and configuration.
     /// An error drops partial log owners; the caller must then drain the storage region.
     async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs>;
+    /// Opens logs for native logical history, binding the replica journal's identity where supported.
+    /// A read-only legacy journal can remain unbound. Storage and driver obligations follow [`Self::open_logs`].
+    async fn open_logs_with_replica_lineage(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken,
+        storage: &DatabaseStorage,
+    ) -> Result<OpenedLogs> {
+        self.open_logs(name, configuration, access, log_cancellation, storage).await
+    }
     /// No driver may run before this returns; an error releases partial owners and drains their admitted I/O.
     /// This convenience operation opens storage and logs without recovering persisted database state between them.
     async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken) -> Result<DatabaseResources> {
@@ -222,7 +229,8 @@ impl NativeResources {
         if self.storage_factories.insert(name, factory).is_some() { return Err(invalid("A storage factory is already registered for this protobuf type")); }
         Ok(self)
     }
-    fn local_log(&self, path: PathBuf, source: bool, read_only: bool, cancellation: CancellationToken, io: Arc<IoRegion>) -> Result<(Arc<dyn Log>, Option<ResourceDriver>)> {
+    fn local_log(&self, path: PathBuf, source: bool, read_only: bool, cancellation: CancellationToken, io: Arc<IoRegion>, bind_lineage: bool)
+        -> Result<(Arc<dyn Log>, Option<ResourceDriver>)> {
         let keys = self.classic_vault.as_ref().map(|vault| vault.log_keys(&path, !read_only, Arc::clone(&io))).transpose()?;
         if read_only {
             let log = match keys {
@@ -232,7 +240,12 @@ impl NativeResources {
             return Ok((log, None));
         }
         let timestamps = Arc::new(NativeLogTimestamps { clock: Arc::clone(&self.local_log_clock), source, use_for_non_transactions: self.local_log_uses_clock_for_non_transactions });
-        let (log, driver) = LocalLog::open_with_key_slots(path, LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity }, timestamps, io, keys)?;
+        let options = LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity };
+        let (log, driver) = if bind_lineage {
+            LocalLog::open_replica(path, options, timestamps, io, keys)?
+        } else {
+            LocalLog::open_with_key_slots(path, options, timestamps, io, keys)?
+        };
         Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
     }
 }
@@ -401,6 +414,20 @@ impl ResourceFactory for NativeResources {
     }
 
     async fn open_logs(&self, _: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        self.open_selected_logs(configuration, access, log_cancellation, storage, false).await
+    }
+
+    async fn open_logs_with_replica_lineage(&self, _: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken,
+        storage: &DatabaseStorage,
+    ) -> Result<OpenedLogs> {
+        self.open_selected_logs(configuration, access, log_cancellation, storage, true).await
+    }
+}
+
+impl NativeResources {
+    async fn open_selected_logs(&self, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken,
+        storage: &DatabaseStorage, bind_lineage: bool,
+    ) -> Result<OpenedLogs> {
         let io = &storage.io;
         match &configuration.log {
             None | Some(database_config::Log::InMemoryLog(_)) => {
@@ -415,8 +442,8 @@ impl ResourceFactory for NativeResources {
             }
             Some(database_config::Log::LocalLog(log)) => {
                 let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
-                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io))?;
-                let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io))?;
+                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io), false)?;
+                let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io), bind_lineage)?;
                 let epoch = StorageEpoch(log.epoch.unwrap_or(0));
                 Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,
                     drivers: source_driver.into_iter().chain(replica_driver).collect() })
@@ -451,6 +478,40 @@ mod cache_namespace_tests {
         assert_ne!(key(b"bucket-a", 0), key(b"bucket-a", 1), "another storage epoch");
     }
 
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn native_search_lineage_follows_the_journal_after_its_directory_moves() -> Result<()> {
+    let files = tempfile::tempdir().unwrap();
+    let original = files.path().join("original");
+    let moved = files.path().join("moved");
+    let native = NativeResources::default();
+    let config = |path: &std::path::Path| DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(rtdb_format::database::proto::LocalLog {
+            path: Some(path.to_str().unwrap().into()), epoch: None,
+        })),
+        ..Default::default()
+    };
+    let original_config = config(&original);
+    let storage = native.open_storage("xtdb", &original_config).await?;
+    let open = || native.open_logs_with_replica_lineage("xtdb", &original_config, LogAccess::ReadWrite, CancellationToken::new(), &storage);
+    let journal = open().await?;
+    let lineage = journal.replica.journal_lineage().unwrap();
+    assert_eq!(journal.source.journal_lineage(), None);
+    drop(journal);
+    std::fs::rename(&original, &moved).unwrap();
+
+    let moved_config = config(&moved);
+    let moved_storage = native.open_storage("xtdb", &moved_config).await?;
+    let moved_journal = native.open_logs("xtdb", &moved_config, LogAccess::ReadOnly, CancellationToken::new(), &moved_storage).await?;
+    let new_journal = open().await?;
+    assert_eq!(moved_journal.replica.journal_lineage(), Some(lineage));
+    assert_ne!(new_journal.replica.journal_lineage().unwrap(), lineage);
+    drop((moved_journal, new_journal));
+    moved_storage.io.close_and_wait().await;
+    storage.io.close_and_wait().await;
+    native.close().await
 }
 
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", message) }

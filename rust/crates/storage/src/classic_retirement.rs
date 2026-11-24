@@ -1,13 +1,11 @@
-use std::{fs::{File, OpenOptions}, path::{Path, PathBuf}, sync::Arc};
-
-use fs2::FileExt;
+use std::{path::{Path, PathBuf}, sync::Arc};
 
 use bytes::Bytes;
 use rtdb_format::{catalog::BlockCatalog, log::proto::PublishedObjectVersion, keys::{block_key, is_compacted_catalog_file, is_compacted_primary_file, is_receipt_l0_file, skipped_tx_position}, search_manifest::is_ranged_run, trie_retirement::InstalledRetirement};
 use rtdb_types::{Anomaly, CatalogCut, PhysicalObjectVersion, Result, S3ObjectNamespace, SourcePosition};
 
-use crate::{Error, IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
-    log::{LogOffset, local::{physical_maximum, prefix_end, settle_prefix}}, sealing::{ClassicKeyVault, ClassicObjectKeys, ObjectCipher, UnitOperation}};
+use crate::{IoRegion, LocalRepairAnchor, LocalStore, ObjectKey, ObjectStore,
+    log::{LogOffset, journal_file::JournalFile, local::{physical_maximum, prefix_end, settle_prefix}}, sealing::{ClassicKeyVault, ClassicObjectKeys, ObjectCipher, UnitOperation}};
 
 
 struct TrieDeletionGrant<'a> {
@@ -126,8 +124,8 @@ pub(crate) async fn retire_search_run(
 }
 
 struct ClassicLogDeletionGrant {
-    source: (PathBuf, File, u64, Option<Arc<ClassicObjectKeys>>),
-    replica: (PathBuf, File, u64, Option<Arc<ClassicObjectKeys>>),
+    source: (PathBuf, JournalFile, u64, Option<Arc<ClassicObjectKeys>>),
+    replica: (PathBuf, JournalFile, u64, Option<Arc<ClassicObjectKeys>>),
     storage_keys: Option<Arc<ClassicObjectKeys>>,
     source_through: SourcePosition,
     maximum: usize,
@@ -174,12 +172,9 @@ impl ClassicLogDeletionGrant {
             .filter(|source| source.after_offset(anchor.boundary.epoch()) >= 0).ok_or_else(unavailable)?;
         let replica = replica.to_path_buf();
         store.io_region().run(move || {
-            let open = |path: &Path| OpenOptions::new().read(true).write(true).open(path)
-                .map_err(|error| Error::io(path, error));
-            let mut source_file = open(&source)?;
-            FileExt::try_lock_exclusive(&source_file).map_err(|error| Error::io(&source, error))?;
-            let mut replica_file = open(&replica)?;
-            FileExt::try_lock_exclusive(&replica_file).map_err(|error| Error::io(&replica, error))?;
+            let mut source_file = JournalFile::lock(&source, false)?;
+            let mut replica_file = JournalFile::lock(&replica, false)?;
+            replica_file.cached_lineage(&replica)?;
             let source_end = prefix_end(&mut source_file, &source, maximum,
                 LogOffset(source_through.after_offset(anchor.boundary.epoch())), true)?;
             let replica_end = prefix_end(&mut replica_file, &replica, maximum,
