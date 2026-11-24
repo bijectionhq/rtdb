@@ -30,6 +30,11 @@ pub(super) fn request(
                 not_before: window.not_before_micros.map(Timestamp),
                 before: window.before_micros.map(Timestamp),
             }),
+        requires: request
+            .requires
+            .into_iter()
+            .map(|guard| decode_guard(guard, memory))
+            .collect::<Result<_, _>>()?,
         guards: request
             .guards
             .into_iter()

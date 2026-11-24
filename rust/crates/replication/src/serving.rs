@@ -5,7 +5,7 @@ use rtdb_crypt::Kms;
 use rtdb_format::journal::ObjectId;
 use rtdb_format::log::proto;
 use rtdb_index::branches::{BranchCut, BranchIndex, BranchWrite};
-use rtdb_tx::transact::{Decision, LINEARIZABLE, Receipt, Transact, TransactPipeline, TransactState, TransactionRecord};
+use rtdb_tx::transact::{Decision, LINEARIZABLE, Receipt, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
 use rtdb_types::{Anomaly, AnomalyCategory, Result, Term, Timestamp, rtdb_v1::{At, Basis, ClaimSealer}};
@@ -23,7 +23,7 @@ const FRAME_HEADER_BYTES: usize = 65;
 
 pub const NATIVE_WRITE_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", LINEARIZABLE, "branches",
-    "changes", "changes.progress-only", "transact", "tx-status", "sql.history",
+    "changes", "changes.progress-only", "transact", TRANSACT_REQUIRES, "tx-status", "sql.history",
 ];
 pub const NATIVE_READ_FEATURES: &[&str] = &[
     "query", "query.track", "query.page", "query.linearizable", "branches",
@@ -394,6 +394,7 @@ mod tests {
             source: Bytes::from_static(b"\x0a\x02\x03\x04\xf8\x07\x01"),
             transaction: Transact {
                 key: vec![key; 16], require: Vec::new(), window: Window::default(), guards: Vec::new(), otherwise: Vec::new(),
+                requires: Vec::new(),
                 ops: vec![Op::Put { branch: "main".into(), table: TableRef::new("public", "items"), if_absent: false,
                     rows: vec![Row { id, valid: None, cells: StructFields::from([("value".into(), Cell::Value(Value::Utf8("row".into())))]) }] }],
             },

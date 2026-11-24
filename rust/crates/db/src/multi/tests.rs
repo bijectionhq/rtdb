@@ -9,7 +9,7 @@ use rtdb_crypt::LocalKms;
 use rtdb_logkeeper::simulation::{Fault, FaultJournal};
 use rtdb_store::{MemoryStore, read_file};
 use rtdb_tx::transact::{
-    Cell, Declaration, Guard, Outcome, Resolution, Row, Version, Visibility, Window,
+    Cell, Declaration, Guard, Outcome, REQUIREMENT_FAILED, Resolution, Row, Version, Visibility, Window,
 };
 use rtdb_types::{
     EntityId, StructFields, TableRef, Value,
@@ -121,6 +121,7 @@ fn request(key: u8, op: Op) -> Transact {
         guards: vec![],
         ops: vec![op],
         otherwise: vec![],
+        requires: vec![],
     }
 }
 
@@ -147,6 +148,46 @@ async fn text_at(node: &mut MultiDatabase, branch: &str, id: i64) -> Option<Valu
     view.row(&table(), &EntityId::Integer(id), time)
         .and_then(|row| row.image_at(time))
         .and_then(|image| image.cells.get("text").cloned())
+}
+
+#[tokio::test]
+async fn multi_driver_requires_refuses_a_displaced_owner_and_recovers_the_receipt() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut writer = cluster.node(1, Arc::new(journal.handle(Identity(1))));
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    let writes = WritePipeline::start(Arc::new(Mutex::new(writer)));
+    let original = writes.transact(put(1, 1, "original owner")).await.unwrap();
+    let successor = writes.transact(put(2, 1, "new owner")).await.unwrap();
+
+    let version = |id, expect| Guard::Version {
+        branch: MAIN_BRANCH.into(), table: table(), id: EntityId::Integer(id), valid_at: None, expect,
+    };
+    let mut stale = put(3, 2, "then");
+    stale.requires = vec![version(1, Version::Written(original.basis))];
+    stale.guards = vec![version(2, Version::Present)];
+    stale.otherwise = put(3, 3, "otherwise").ops;
+    let refused = writes.transact(stale.clone()).await.unwrap();
+    assert_eq!(refused.outcome, Outcome::Refused {
+        error: Anomaly::new(AnomalyCategory::Conflict, REQUIREMENT_FAILED, "Requirement 0 failed"),
+    });
+
+    cluster.at(30);
+    let mut follower = cluster.node(2, Arc::new(journal.handle(Identity(2))));
+    let replayed = Receipt { replayed: true, ..refused };
+    assert_eq!(follower.tx_status(&stale.key).await.unwrap(), replayed);
+    assert_eq!(writes.transact(stale.clone()).await.unwrap(), replayed);
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 1).await, Some(Value::Utf8("new owner".into())));
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, None);
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 3).await, None);
+
+    stale.key = vec![4; 16];
+    stale.requires = vec![version(1, Version::Written(successor.basis))];
+    let receipt = writes.transact(stale).await.unwrap();
+    assert_eq!(receipt.outcome, Outcome::Otherwise { failed: vec![0] });
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 2).await, None);
+    assert_eq!(text_at(&mut follower, MAIN_BRANCH, 3).await, Some(Value::Utf8("otherwise".into())));
 }
 
 #[tokio::test]

@@ -600,6 +600,7 @@ mod tests {
                                 require: vec![],
                                 window: Default::default(),
                                 guards: vec![],
+                                requires: vec![],
                                 otherwise: vec![],
                                 ops: vec![Op::Put {
                                     branch: "main".into(),

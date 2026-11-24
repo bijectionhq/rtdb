@@ -30,6 +30,7 @@ fn put(n: u64) -> Transact {
         require: Vec::new(),
         window: Window::default(),
         guards: Vec::new(),
+        requires: Vec::new(),
         ops: vec![Op::Put { branch: MAIN_BRANCH.into(), table: TableRef::new("public", "bench"), rows: vec![row], if_absent: false }],
         otherwise: Vec::new(),
     }

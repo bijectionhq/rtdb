@@ -6,6 +6,7 @@ use prost::{Message, Name};
 use rtdb_node::serving::{ROW_VISIBILITY, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
+use rtdb_tx::transact::TRANSACT_REQUIRES;
 use rtdb_types::Timestamp;
 use tonic::{Response, Status};
 
@@ -110,7 +111,8 @@ impl Service {
                         database.serving_driver().is_some_and(|driver| self.serving_scope(&call, driver).is_ok())
                     });
                     features.retain(|feature| admitted && matches!(feature.as_str(), ROW_VISIBILITY | "query" |
-                        "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" | "tx-status" | "sql.history"));
+                        "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" |
+                        TRANSACT_REQUIRES | "tx-status" | "sql.history"));
                 }
                 proto::CapabilitiesResponse {
                     api: API.into(),

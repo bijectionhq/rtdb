@@ -63,7 +63,17 @@ surface StatelessDatabase {
         -- A route that advertises writes returns its selected outcome with the applied basis and system time.
         -- A matching committed request returns the stored receipt for its key.
         -- The carrier passes the attempt identity, its submission time, and the exact admitted request bytes to the selected driver.
-        -- Validation evaluates the guards at a fresh basis and leaves the applied position unchanged.
+        -- Validation evaluates requirements and guards at a fresh basis and leaves the applied position unchanged.
+
+    @guarantee TransactionRequirements
+        -- A write route that supports requirements advertises transact.requires.
+        -- TransactRequest carries the ordered requires list as repeated Guard at protobuf field 7.
+        -- Each requirement is a precondition on the original state.
+        -- Passing all requirements allows guards to select an arm.
+        -- The first failed requirement selects a Refused receipt with category conflict and code rtdb/requirement-failed.
+        -- The refusal carries only the zero-based requirement index in its message and applies no row or catalog effects.
+        -- A request with operations in either arm records that receipt for replay and TxStatus.
+        -- A scoped receipt carries the basis and system time of the admitted projection.
 
     @guarantee ChangesCoverage
         -- Changes reports its covered interval even when there are no changes for the selected tables.
