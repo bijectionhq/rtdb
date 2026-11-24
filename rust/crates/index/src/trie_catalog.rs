@@ -7,8 +7,10 @@ use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 #[path = "replayed_reset_epochs.rs"]
 mod reset_epochs;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrieState { Nascent, Live, Garbage { as_of: Timestamp } }
+#[path = "trie_membership.rs"]
+mod membership;
+
+pub type TrieState = membership::TrieState<Timestamp>;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogTrie {
@@ -236,7 +238,8 @@ impl TrieCatalog {
         result
     }
     pub fn current_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
-        self.all_tries(table).into_iter().filter(|trie| trie.state == TrieState::Live).collect()
+        let inventory: Vec<_> = self.all_tries(table).into_iter().map(|trie| (trie, trie.state)).collect();
+        membership::select_live(&inventory)
     }
     /// The entry the catalog holds for `key`, live, nascent or garbage.
     pub fn trie(&self, table: &TableRef, key: &TrieKey) -> Option<&CatalogTrie> {
