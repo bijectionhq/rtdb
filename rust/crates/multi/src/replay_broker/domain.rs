@@ -46,6 +46,24 @@ pub struct Operation {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SqlIntent {
+    pub placement: ordered_logkeeper::ordered::Placement,
+    pub transaction: rtdb_types::TransactionKey,
+    pub position: rtdb_types::ReplicaPosition,
+}
+
+impl SqlIntent {
+    pub fn target(self) -> Result<[u8; 32]> {
+        sql_target(self.placement, self.transaction, self.position)
+    }
+
+    pub(crate) fn signing_bytes(self, domain: Uuid, generation: u64) -> Result<Vec<u8>> {
+        statement(b"rtdb.custody/sql-intent/v1\0", &(domain, generation, self))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RootDrain {
     pub original_head: [u8; 32],
     pub successor: [u8; 32],
@@ -146,6 +164,7 @@ struct State {
     roots: BTreeMap<Uuid, Root>,
     duties: BTreeMap<Uuid, Work>,
     operation: Option<Operation>,
+    sql_intents: BTreeMap<Uuid, SqlIntent>,
     root_drains: BTreeMap<Uuid, SignedRootDrain>,
     destruction: BTreeMap<Uuid, RootDestruction>,
     last_completed: Option<Completion>,
@@ -161,6 +180,7 @@ impl State {
             roots: BTreeMap::new(),
             duties: BTreeMap::new(),
             operation: None,
+            sql_intents: BTreeMap::new(),
             root_drains: BTreeMap::new(),
             destruction: BTreeMap::new(),
             last_completed: None,
@@ -204,6 +224,7 @@ impl State {
         Ok(View {
             generation: self.generation,
             operation: self.operation,
+            next_sql: self.sql_intents.values().copied().next(),
             membership,
             roster,
             drained,
@@ -256,6 +277,29 @@ impl State {
                     return Err(conflict("A root needs an exact history and custody signer"));
                 }
                 self.roots.insert(*root, *enrollment);
+            }
+            Action::RecordSql { generation, intent, signature } => {
+                if *generation != self.generation {
+                    return Err(conflict("The SQL initiation belongs to a closed custody generation"));
+                }
+                let root = intent.placement.deployment;
+                let enrollment = self.roots.get(&root)
+                    .ok_or_else(|| conflict("The SQL source is outside the custody membership"))?;
+                if enrollment.history != installed_history(intent.placement)? {
+                    return Err(conflict("The committed erase addresses a different root history"));
+                }
+                verify(enrollment.admission_key, &intent.signing_bytes(self.domain, *generation)?, signature)?;
+                let target = intent.target()?;
+                if self.last_completed.is_some_and(|done| done.operation.target == target) {
+                    return Ok(());
+                }
+                if let Some(prior) = self.sql_intents.get(&root) {
+                    if *prior != *intent {
+                        return Err(conflict("An earlier committed erase still owns this root's next cut"));
+                    }
+                } else {
+                    self.sql_intents.insert(root, *intent);
+                }
             }
             Action::Begin {
                 operation,
@@ -459,6 +503,14 @@ impl State {
                         "The provider has not settled every root in the domain",
                     ));
                 }
+                let mut source = None;
+                for (root, intent) in &self.sql_intents {
+                    if intent.target()? == operation.target {
+                        source = Some(*root);
+                        break;
+                    }
+                }
+                if let Some(source) = source { self.sql_intents.remove(&source); }
                 let evidence = fingerprint(
                     b"rtdb.custody/domain-destruction/v1\0",
                     &(*operation, &self.destruction),
@@ -495,6 +547,11 @@ pub enum Action {
         generation: u64,
         root: Uuid,
         enrollment: Root,
+    },
+    RecordSql {
+        generation: u64,
+        intent: SqlIntent,
+        signature: Vec<u8>,
     },
     Begin {
         operation: Uuid,
@@ -552,6 +609,7 @@ impl Action {
 pub struct View {
     pub generation: u64,
     pub operation: Option<Operation>,
+    pub next_sql: Option<SqlIntent>,
     pub membership: [u8; 32],
     pub roster: [u8; 32],
     pub drained: Option<[u8; 32]>,
@@ -722,6 +780,43 @@ pub(super) async fn execute(store: &dyn ObjectStore, domain: Uuid, action: Actio
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
+
+    #[test]
+    fn first_sql_intent_requires_the_enrolled_history_and_generation() {
+        let mut state = State::new(Uuid::new_v4());
+        let admission = Ed25519KeyPair::from_seed_unchecked(&[16; 32]).unwrap();
+        let placement = ordered_logkeeper::ordered::Placement {
+            deployment: Uuid::new_v4(), incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(), generation: 1,
+        };
+        let intent = SqlIntent {
+            placement,
+            transaction: rtdb_types::TransactionKey {
+                tx_id: rtdb_types::TxId(9), system_time: rtdb_types::Timestamp(11),
+            },
+            position: rtdb_types::ReplicaPosition(12),
+        };
+        state.apply(&Action::Enroll {
+            generation: 1, root: placement.deployment,
+            enrollment: Root {
+                history: installed_history(placement).unwrap(),
+                verification_key: [17; 32],
+                admission_key: admission.public_key().as_ref().try_into().unwrap(),
+            },
+        }).unwrap();
+        let authority = state.domain;
+        let record = |generation, intent: SqlIntent| Action::RecordSql {
+            generation, intent,
+            signature: admission.sign(&intent.signing_bytes(authority, generation).unwrap()).as_ref().to_vec(),
+        };
+        assert!(state.apply(&record(2, intent)).is_err());
+        state.apply(&record(1, intent)).unwrap();
+        state.apply(&record(1, intent)).unwrap();
+        let other = SqlIntent { position: rtdb_types::ReplicaPosition(13), ..intent };
+        assert!(state.apply(&record(1, other)).is_err());
+        assert_eq!(state.view().unwrap().next_sql, Some(intent));
+        assert!(state.operation.is_none());
+    }
 
     #[test]
     fn closure_requires_every_enrolled_root_and_every_admitted_duty() {

@@ -10,7 +10,7 @@ use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::Da
 use rtdb_index::{CatalogCut, CatalogTrie, PartitionState, ServingSearch, Snapshot, StagedWrite, TrieCatalog};
 use rtdb_storage::{log::{AppendCapacity, LogOffset, LogRecord, LogTail, ReplayHead}, object_store::ReadReservation};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver, WriterPublication};
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, EventOp, PlacedReservation, PlacedTerminal, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -85,6 +85,12 @@ pub struct InstalledPrefix {
     pub source: SourcePosition,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedErasure {
+    pub transaction: TransactionKey,
+    pub position: ReplicaPosition,
+}
+
 #[derive(Clone, Debug)]
 pub struct DriverStatus {
     pub role: Role,
@@ -95,6 +101,7 @@ pub struct DriverStatus {
     pub installed: Option<InstalledPrefix>,
     pub open_block: BlockIndex,
     pub adopted_block: Option<Arc<BlockCatalog>>,
+    pub first_erasure: Option<CommittedErasure>,
     pub promotion_failure: Option<Anomaly>,
     pub last_block_upload_epoch_seconds: i64,
 }
@@ -410,6 +417,7 @@ pub struct ReplicationDriver {
     track_catalog_cut: bool,
     recognized_prefix: bool,
     installed: Option<InstalledPrefix>,
+    first_erasure: Option<CommittedErasure>,
     historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
@@ -450,7 +458,7 @@ impl ReplicationDriver {
         let read_position = recovered.replica_start(&logs)?;
         let track_catalog_cut = config.enabled && recovered.allows_catalog_cut_tracking();
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
-            installed: None,
+            installed: None, first_erasure: None,
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
@@ -462,7 +470,7 @@ impl ReplicationDriver {
         } else { None };
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
@@ -860,9 +868,23 @@ impl ReplicationDriver {
         let value = self.partition.value();
         let (promotion_failure, last_block_upload_epoch_seconds) = { let status = self.status.borrow(); (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds) };
         self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
-            installed: self.installed,
+            installed: self.installed, first_erasure: self.first_erasure,
             open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
     }
+    fn observe_erasure(&mut self, position: ReplicaPosition, write: &StagedWrite) -> Result<()> {
+        if !self.track_catalog_cut || self.first_erasure.is_some() { return Ok(()); }
+        for (_, table) in write.tables() {
+            let Some(batch) = table.batch() else { continue; };
+            for row in 0..batch.len() {
+                if batch.header(row)?.op == EventOp::Erase {
+                    self.first_erasure = Some(CommittedErasure { transaction: write.tx_key(), position });
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn update_installed_prefix(&mut self) -> Result<()> {
         let apply_deferred = self.leader.as_ref().is_some_and(|leader| !leader.held.is_empty());
         if let Some(through) = crate::catalog_cut::completed_prefix(
@@ -1156,8 +1178,9 @@ impl ReplicationDriver {
                         let applied: Result<_> = async {
                             let head = head.filter(|head| Arc::ptr_eq(head, &expected)).ok_or_else(|| readback_mismatch(message.tx_id))?;
                             self.apply_transaction(head.writes(), message.search_delta.as_deref()).await?;
-                            if head.result().committed() && let Some(operation) = head.db_op() {
-                                self.effects.apply_db_op(operation).await?;
+                            if head.result().committed() {
+                                self.observe_erasure(record.metadata.position, head.writes())?;
+                                if let Some(operation) = head.db_op() { self.effects.apply_db_op(operation).await?; }
                             }
                             let result = Arc::new(head.result().clone());
                             self.progress.applied(Some(head.source_position()), Some(AppliedTransaction::new(Arc::clone(&result), head.placed_attempt())), head.external_token().map(<[u8]>::to_vec))?;
@@ -1180,6 +1203,7 @@ impl ReplicationDriver {
                         let value = self.partition.value();
                         let rtdb_tx::ReplayedTransaction { writes, result, placed_attempt } = rtdb_tx::decode_replica(message, value.live().latest_completed_tx(), value.live().block_index(), &self.resolve.memory)?;
                         self.apply_transaction(&writes, message.search_delta.as_deref()).await?;
+                        if result.committed() { self.observe_erasure(record.metadata.position, &writes)?; }
                         if !leading && message.committed.unwrap_or(false) {
                             if let Some(operation) = &message.db_op {
                                 if let Err(error) = self.effects.apply_db_op(operation).await { if !error.is_caller_error() { return Err(error); } }

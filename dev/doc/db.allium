@@ -22,6 +22,7 @@
 -- A native hosted Proposal source record carries immutable table batches prepared by the submitter against its authenticated installed cut.
 -- Source resolution admits that generation at the same durable predecessor and offered clock and adds order-assigned metadata.
 -- Replica read-back remains the visibility fence for the one selected success or refusal transaction.
+-- The installed writer reports the first admitted committed erase together with its replica position.
 
 -- Two heads, two homes — callers choose:
 --   RESOLVED head (on the resolver): the highest transaction resolved, and so staged.

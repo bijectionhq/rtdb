@@ -374,6 +374,18 @@ fn worker_endpoints(peers: Vec<WorkerEndpoint>) -> Result<BTreeMap<Enrollment, W
 }
 
 impl Placement {
+    pub(crate) async fn checkpoint_precedes_erasure(
+        &self, status: &rtdb_replication::DriverStatus, candidate: Option<RtdbCheckpoint>,
+    ) -> Result<bool> {
+        let (Some(owner), Some(marker)) = (&self.custody_work, status.first_erasure) else { return Ok(true); };
+        owner.record_sql(crate::replay_broker::domain::SqlIntent {
+            placement: self.worker.placement(),
+            transaction: marker.transaction,
+            position: marker.position,
+        }).await?;
+        Ok(candidate.is_none_or(|candidate| candidate.boundary < marker.position.after_offset(self.worker.log_epoch())))
+    }
+
     pub(crate) async fn stage_sql_erasure(
         &self, node: &rtdb_node::Node, database: &rtdb_node::Database, admission: WriterAdmission,
         broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>, request: erasure::SqlErasureRequest,

@@ -879,6 +879,10 @@ impl NodeAgent {
                 let block = flush_local(&database).await?;
                 let checkpoint = checkpoint_for_block(&block, placement.worker.log_epoch())
                     .ok_or_else(|| Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush has no exact ordered checkpoint"))?;
+                if !placement.checkpoint_precedes_erasure(&database.status(), Some(checkpoint)).await? {
+                    return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb.multi/sql-erasure-pending",
+                        "An earlier committed SQL erase owns the next checkpoint"));
+                }
                 placement.publish_checkpoint(&self.keys, Some((admission, checkpoint)),
                     &self.options.storage, self.node.memory(), &self.ordered_releases).await?.ok_or_else(||
                         Anomaly::fault("rtdb.multi/flush-checkpoint", "The flush did not choose a checkpoint"))
@@ -1784,10 +1788,15 @@ impl NodeAgent {
             };
             let running = database.upgrade().filter(|db| db.status().role != DriverRole::Stopped);
             if grant == Some(admission.grant) && let Some(database) = running {
-                if let Some(checkpoint) = database.status().adopted_block
-                    .and_then(|block| checkpoint_for_block(&block, placement.worker.log_epoch()))
-                {
-                    offered.insert(name, (admission, checkpoint));
+                let status = database.status();
+                let checkpoint = status.adopted_block.as_ref()
+                    .and_then(|block| checkpoint_for_block(block, placement.worker.log_epoch()));
+                match placement.checkpoint_precedes_erasure(&status, checkpoint).await {
+                    Ok(true) => {
+                        if let Some(checkpoint) = checkpoint { offered.insert(name, (admission, checkpoint)); }
+                    }
+                    Ok(false) => {},
+                    Err(error) => tracing::warn!(code = %error.code, "SQL erasure initiation awaits its custody broker"),
                 }
                 continue;
             }

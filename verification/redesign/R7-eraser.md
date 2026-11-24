@@ -161,3 +161,7 @@ The transition at the deadline assumes a provider that can revoke all applicable
 Runtime provider qualification and the protocol for outstanding same-domain provider operations are separate obligations.
 
 [R4](R4-residence-ledger.md) · [R5](R5-recovery-roots.md) · [R6](R6-sealing.md) · [Authority boundaries](authority-boundaries.md)
+
+The installed writer discovers the first erase during certified transaction apply.
+The root admission signer records the exact transaction and replica position in the broker generation.
+Ordinary checkpoint publication preserves the replay suffix that contains that marker.

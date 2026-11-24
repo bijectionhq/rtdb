@@ -68,6 +68,15 @@ impl WorkOwner {
         self.domain
     }
 
+    pub(super) async fn record_sql(&self, intent: domain::SqlIntent) -> Result<()> {
+        let view = self.broker.custody_domain(self.domain, Action::Status).await?;
+        if view.next_sql == Some(intent) { return Ok(()); }
+        let generation = view.generation;
+        let signature = self.admission.sign(&intent.signing_bytes(self.domain, generation)?).as_ref().to_vec();
+        self.broker.custody_domain(self.domain, Action::RecordSql { generation, intent, signature }).await?;
+        Ok(())
+    }
+
     pub(super) async fn hold(
         &self,
         kind: CustodyWork,

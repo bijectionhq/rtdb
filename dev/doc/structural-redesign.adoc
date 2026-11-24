@@ -285,6 +285,8 @@ A new domain generation opens after every enrolled root records its provider dis
 Detached broker replay egress and copy requests participate when the broker enables custody control.
 SQL declarations persist separately from inferred row types in replica transactions and table checkpoints.
 Protected replay extracts the committed erase effects and authenticates their exact selected head. SQL staging rebuilds the selected placement’s primary survivor closure from live and persisted events and keeps derivatives out of the staged checkpoint until they rebuild. The installed SQL writer can initiate exact-head staging from a broker-selected committed erase marker.
+The installed SQL apply path reports the first authenticated committed erase to the custody broker under its enrolled history and admission signer.
+An ordinary recovery checkpoint cannot supersede that marker.
 Logkeeper fences appends and normal grants while that erasure preparation owns the head.
 The coordinator requires the broker's signed domain drain before enabling provider retirement.
 An enrolled installed worker registers signed plaintext and egress duties with its catalog hold and registers checkpoint copies before reading.

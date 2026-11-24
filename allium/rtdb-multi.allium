@@ -518,6 +518,8 @@ contract LogService {
         -- A detached replica object reader uses the lease captured at its admission for cryptography.
 
     @invariant InstalledJournalErasureCommit
+        -- An enrolled writer reports the first committed SQL erase under its exact replica position and custody history.
+        -- Ordinary checkpoint selection preserves replay of that committed marker.
         -- The custody authority closes new serving and copy admissions and retains that fence through restart until the erasure attempt is durably resolved.
         -- The incumbent drains outstanding appends before the custodian fixes the journal head.
         -- The clean successor at that head preserves surviving history and excludes targeted history and retired key dependencies from the full recovery closure.
