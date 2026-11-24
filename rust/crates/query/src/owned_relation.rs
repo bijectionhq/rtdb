@@ -147,6 +147,70 @@ pub async fn open_owned_artefact_candidates(
     open_owned_table_selection(context, relation.table(owner), iids, selection, Some(valid), Some(&columns), false, false, false).await
 }
 
+/// Certifies a covered range page from the winning rows at the original held cut.
+#[doc(hidden)]
+pub async fn try_owned_lifetime_range_expiry(
+    context: &Arc<QueryContext>, owner: &str, relation: &OwnedRelation,
+    page: &arrow_array::RecordBatch, valid: Interval, duration: i64,
+) -> Result<Option<Timestamp>> {
+    use crate::context::{OwnedArtefactKeys, OwnedSelection};
+    use rtdb_columnar::{ColumnReader, IidView};
+    use std::collections::btree_map::Entry;
+
+    // A failed speculative read consumes part of the audience's work allowance.
+    if !(2..=128).contains(&page.num_rows()) || owner.is_empty() || !relation.is_root_data()
+        || !valid.is_point() || rtdb_storage::audience_work::is_bounded()
+    {
+        return Ok(None);
+    }
+    let Some((column, field)) = page.schema_ref().column_with_name("_id") else { return Ok(None); };
+    let mut reservation = context.memory.reserve(4096)?;
+    let reader = ColumnReader::new(field)?;
+    let ids = page.column(column).as_ref();
+    let mut candidates = BTreeMap::new();
+    let mut by_iid = BTreeMap::new();
+    for row in 0..page.num_rows() {
+        context.check_cancelled()?;
+        let Some(id) = reader.read_entity_id(ids, row)? else { return Ok(None); };
+        let iid = id.iid();
+        let Entry::Vacant(candidate) = candidates.entry(iid) else { return Ok(None); };
+        let bytes = id.owned_payload_bytes().saturating_mul(2).saturating_add(512);
+        let lease = Arc::get_mut(&mut reservation).expect("Unpublished range lookup owns its reservation");
+        lease.grow_to(lease.bytes().saturating_add(bytes))?;
+        candidate.insert((id, None));
+        let key = arrow_buffer::Buffer::from_vec(id.into_owned().handle_bytes());
+        by_iid.insert(iid, vec![key]);
+    }
+    let iids = by_iid.keys().copied().collect();
+    let selection = OwnedSelection::Artefacts(Arc::new(OwnedArtefactKeys { by_iid, _reservation: Arc::clone(&reservation) }));
+    let columns = ["_iid", "_id", "_system_from", "_valid_from", "_valid_to"];
+    let Some(mut cursor) = open_owned_table_selection(Arc::clone(context), relation.table(owner), iids,
+        selection, Some(valid), Some(&columns), false, false, false).await? else { return Ok(None); };
+
+    let present = valid.lower();
+    while let Some(batch) = cursor.next_batch().await? {
+        let batch = batch.batch();
+        let Some(iids) = batch.column_by_name("_iid") else { return Ok(None); };
+        let iids = IidView::new(iids.as_ref())?;
+        for row in 0..batch.num_rows() {
+            context.check_cancelled_at(row)?;
+            let Some((id, verified)) = candidates.get_mut(&iids.get(row)?) else { return Ok(None); };
+            if verified.is_some() { return Ok(None); }
+            let revision = owned_row_revision_for(batch, row, *id, &context.memory)?;
+            let (_, cutoff) = owned_row_lifetime(batch, row, revision, duration)?;
+            if revision > present || cutoff <= present { return Ok(None); }
+            *verified = Some((revision, cutoff));
+        }
+    }
+
+    let mut earliest = Timestamp::MAX;
+    for (_, verified) in candidates.values() {
+        let Some((_, cutoff)) = verified else { return Ok(None); };
+        earliest = earliest.min(*cutoff);
+    }
+    Ok(Some(earliest))
+}
+
 /// Opens a point at a caller-certified system cut within this retained catalog.
 pub async fn open_owned_point_at_system(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, id: &EntityId,

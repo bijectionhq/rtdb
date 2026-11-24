@@ -1006,13 +1006,19 @@ async fn held_ranges_read_arrow_ids_at_lifetime_and_historical_cuts() {
     let mut settings = options();
     settings.owned_relations = true;
     settings.automatic_artefacts = false;
-    let (node, driver) = running(settings, services()).await;
+    let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    let runtime = NodeServices {
+        resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)),
+        clock: clock.clone(),
+        ..services()
+    };
+    let (node, driver) = running(settings, runtime).await;
     let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
     let ids = [Value::Utf8("order/first".into()), Value::Utf8("order/second".into())];
     let lifetime = 10_000_000;
     for (name, policy) in [
-        ("lifetime-range", format!(r#""validity":"acceptance","lifetime_micros":{lifetime}"#)),
         ("historical-range", r#""validity":"explicit""#.into()),
+        ("lifetime-range", format!(r#""validity":"acceptance","lifetime_micros":{lifetime}"#)),
     ] {
         let relation = OwnedRelation::new(name).unwrap();
         let path = OwnedRelation::new(format!("by-priority-{name}")).unwrap();
@@ -1027,7 +1033,7 @@ async fn held_ranges_read_arrow_ids_at_lifetime_and_historical_cuts() {
             let result = writer.state_mut().execute_tx(vec![operation], AutonomousTxOptions::default()).await.unwrap();
             assert!(result.committed(), "{:?}", result.error());
         }
-        let mut first = None;
+        let mut revisions = Vec::new();
         for (offset, id) in ids.iter().enumerate() {
             let documents = Documents::new(vec![StructFields::from([
                 ("_id".into(), id.clone()), ("priority".into(), Value::I64(offset as i64)),
@@ -1036,26 +1042,52 @@ async fn held_ranges_read_arrow_ids_at_lifetime_and_historical_cuts() {
                 relation: relation.clone(), documents, valid_from: (!governed).then_some(Timestamp(0)), valid_to: None,
             }], AutonomousTxOptions::default()).await.unwrap();
             assert!(result.committed(), "{:?}", result.error());
-            first.get_or_insert(result.tx_key().system_time);
+            revisions.push(result.tx_key().system_time);
         }
 
-        let first = first.unwrap();
+        let first = revisions[0];
         let held = writer.open_owned_read().await.unwrap();
-        let request = OwnedRangeRequest { lower: None, upper: None, after: None, descending: false, limit: 2 };
+        let request = |descending, limit| OwnedRangeRequest { lower: None, upper: None, after: None, descending, limit };
+        let read_ids = |page: OwnedRangePage| {
+            let batch = page.batch.unwrap();
+            let (index, field) = page.schema.column_with_name("_id").unwrap();
+            (0..batch.batch().num_rows()).map(|row| {
+                read_value(field, batch.batch().column(index).as_ref(), row).unwrap()
+            }).collect::<Vec<_>>()
+        };
         let (page, expected) = if governed {
-            let (page, _, expiry) = held.range_page_by_key_lifetime(&relation, &path, request, None).await.unwrap();
-            assert_eq!(expiry, Some(Timestamp(first.0 + lifetime)));
+            let (page, _, expiry) = held.range_page_by_key_lifetime(&relation, &path, request(false, 2), None).await.unwrap();
+            let cutoff = Timestamp(first.0 + lifetime);
+            assert_eq!(expiry, Some(cutoff));
+            let present = held.present().system_time;
+            let (reverse, _, reverse_expiry) = held.range_page_by_key_lifetime(&relation, &path, request(true, 2), Some(present)).await.unwrap();
+            assert_eq!(read_ids(reverse), [ids[1].clone(), ids[0].clone()]);
+            assert_eq!(reverse_expiry, expiry);
+            let (single, _, single_expiry) = held.range_page_by_key_lifetime(&relation, &path, request(true, 1), None).await.unwrap();
+            assert_eq!(read_ids(single), [ids[1].clone()]);
+            assert_eq!(single_expiry, Some(Timestamp(revisions[1].0 + lifetime)));
+
+            let bound = StructFields::from([("priority".into(), Value::I64(2)), ("_id".into(), ids[1].clone())]);
+            let empty = OwnedRangeRequest { lower: Some(OwnedKeyBound::Values(&bound)), ..request(false, 2) };
+            let (empty, _, empty_expiry) = held.range_page_by_key_lifetime(&relation, &path, empty, None).await.unwrap();
+            assert!(empty.batch.is_none());
+            assert_eq!(empty_expiry, None);
+            let Err(error) = held.range_page_by_key_lifetime(&relation, &path, request(false, 0), Some(first)).await else {
+                panic!("lifetime ranges require the held present");
+            };
+            assert_eq!(error.code, "rtdb.owned/lifetime-uncovered");
+            let Err(error) = held.range_page_by_key_lifetime(&relation, &path, request(false, 0), Some(present)).await else {
+                panic!("lifetime ranges require an admitted page limit");
+            };
+            assert_eq!(error.code, "rtdb.owned/range-limit");
+            clock.0.fetch_max(cutoff.0, Ordering::Relaxed);
+            assert_eq!(held.check_lifetime_range_release(&relation, expiry).unwrap_err().code, "rtdb.owned/lifetime-expired");
             (page, ids.as_slice())
         } else {
-            let page = held.range_page_by_key_at_system(&relation, &path, request, first, Timestamp(0)).await.unwrap();
+            let page = held.range_page_by_key_at_system(&relation, &path, request(false, 2), first, Timestamp(0)).await.unwrap();
             (page, &ids[..1])
         };
-        let batch = page.batch.unwrap();
-        let (index, field) = page.schema.column_with_name("_id").unwrap();
-        let actual = (0..batch.batch().num_rows()).map(|row| {
-            read_value(field, batch.batch().column(index).as_ref(), row).unwrap()
-        }).collect::<Vec<_>>();
-        assert_eq!(actual.as_slice(), expected);
+        assert_eq!(read_ids(page).as_slice(), expected);
     }
     drop(writer);
     stop(&node, driver).await;

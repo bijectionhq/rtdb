@@ -2836,8 +2836,7 @@ impl OwnedReadSession {
         Ok((page, evidence))
     }
 
-    /// A live lifetime page reuses the covered path at held present, then
-    /// hydrates each nominated identity to certify its release horizon.
+    /// A live lifetime page certifies its release horizon at held present.
     pub async fn range_page_by_key_lifetime(
         &self, relation: &rtdb_types::OwnedRelation, path: &rtdb_types::OwnedRelation,
         request: crate::OwnedRangeRequest<'_>, valid_at: Option<Timestamp>,
@@ -2857,36 +2856,50 @@ impl OwnedReadSession {
         context.check_cancelled()?;
         let page = crate::ordered_index::owned_range(Arc::clone(&context), &self.owner, relation, path,
             crate::ordered_index::RowBounds::Compound(request), Some(present)).await?;
-        let mut expiry: Option<Timestamp> = None;
-        if let Some(batch) = &page.batch {
+        let expiry = if let Some(batch) = &page.batch {
             let batch = batch.batch();
-            let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(lifetime_read_unavailable)?;
-            let ids = batch.column(column).as_ref();
-            for row in 0..batch.num_rows() {
-                context.check_cancelled()?;
-                let size = rtdb_columnar::estimate_read_value_bytes(field, ids, row)?;
-                let _identity = context.memory.reserve(size.saturating_add(4096))?;
-                let id = owned_range_id(ColumnReader::new(field)?.read_entity_id(ids, row)?)?;
-                let mut point = rtdb_query::open_owned_point(
-                    Arc::clone(&context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from", "_valid_from", "_valid_to"]),
-                ).await?.ok_or_else(lifetime_read_unavailable)?;
-                let mut until = None;
-                while let Some(part) = point.next_batch().await? {
-                    for index in 0..part.batch().num_rows() {
-                        if until.is_some() { return Err(lifetime_read_unavailable()); }
-                        let revision = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
-                        let (_, cutoff) = rtdb_query::owned_row_lifetime(part.batch(), index, revision, duration)?;
-                        if revision > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
-                        until = Some(cutoff);
-                    }
-                }
-                let until = until.ok_or_else(lifetime_read_unavailable)?;
-                expiry = Some(expiry.map_or(until, |prior| prior.min(until)));
+            match rtdb_query::try_owned_lifetime_range_expiry(&context, &self.owner, relation, batch, valid, duration).await {
+                Ok(Some(expiry)) => Some(expiry),
+                // A batch can encounter failures in IID order. Reopen the
+                // points in page order to preserve the first refusal.
+                _ => self.lifetime_range_expiry_by_point(&context, relation, batch, valid, duration).await?,
             }
-        }
+        } else { None };
         self.check_lifetime_range_release(relation, expiry)?;
         let evidence = self.relation_witness_for(relation, true, expiry)?;
         Ok((page, evidence, expiry))
+    }
+
+    async fn lifetime_range_expiry_by_point(
+        &self, context: &Arc<QueryContext>, relation: &rtdb_types::OwnedRelation,
+        batch: &arrow_array::RecordBatch, valid: Interval, duration: i64,
+    ) -> Result<Option<Timestamp>> {
+        let present = valid.lower();
+        let (column, field) = batch.schema_ref().column_with_name("_id").ok_or_else(lifetime_read_unavailable)?;
+        let ids = batch.column(column).as_ref();
+        let mut expiry: Option<Timestamp> = None;
+        for row in 0..batch.num_rows() {
+            context.check_cancelled()?;
+            let size = rtdb_columnar::estimate_read_value_bytes(field, ids, row)?;
+            let _identity = context.memory.reserve(size.saturating_add(4096))?;
+            let id = owned_range_id(ColumnReader::new(field)?.read_entity_id(ids, row)?)?;
+            let mut point = rtdb_query::open_owned_point(
+                Arc::clone(context), &self.owner, relation, &id, Some(valid), Some(&["_id", "_system_from", "_valid_from", "_valid_to"]),
+            ).await?.ok_or_else(lifetime_read_unavailable)?;
+            let mut until = None;
+            while let Some(part) = point.next_batch().await? {
+                for index in 0..part.batch().num_rows() {
+                    if until.is_some() { return Err(lifetime_read_unavailable()); }
+                    let revision = rtdb_query::owned_row_revision(part.batch(), index, &id, &context.memory)?;
+                    let (_, cutoff) = rtdb_query::owned_row_lifetime(part.batch(), index, revision, duration)?;
+                    if revision > present || cutoff <= present { return Err(lifetime_read_unavailable()); }
+                    until = Some(cutoff);
+                }
+            }
+            let until = until.ok_or_else(lifetime_read_unavailable)?;
+            expiry = Some(expiry.map_or(until, |prior| prior.min(until)));
+        }
+        Ok(expiry)
     }
 
     pub fn check_lifetime_range_release(

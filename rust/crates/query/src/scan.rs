@@ -3024,6 +3024,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn held_lifetime_lookup_requires_each_complete_key_and_uses_its_original_expiry() {
+        use arrow_array::{ArrayRef, RecordBatch, StringArray};
+
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
+        let table = relation.table("alice");
+        let memory = MemoryBudget::new(1 << 24);
+        let first = EntityId::String("first".into());
+        let colliding = EntityId::Uuid(first.iid().0);
+        let present = Timestamp(400);
+        for (tx_id, (id, revision, created, expires)) in [
+            (EntityId::String("malformed".into()), 250, 150, 1151),
+            (EntityId::String("second".into()), 275, 200, 1200),
+            (first, 350, 100, 1100),
+            (colliding, present.0, 50, 1050),
+        ].into_iter().enumerate() {
+            let key = TransactionKey { tx_id: TxId(tx_id as i64), system_time: Timestamp(revision) };
+            let mut write = TransactionBuffer::new(state.value().snapshot(), key, Arc::clone(&memory)).unwrap();
+            write.append(table.clone(), StoredEvent {
+                position: None, origin: None, commit_position: 0,
+                entity_key: Some(id.handle_bytes().into()), iid: id.iid(), system_from: key.system_time,
+                valid_time: Interval::from_micros(created, expires).unwrap(),
+                operation: StoredOperation::Put(StructFields::from([("_id".into(), id.as_value())])), recency: None,
+            }).unwrap();
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        let snapshot = state.value().snapshot().with_system_time_cap(Some(present)).unwrap();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let context = QueryContext::new(catalog, memory, present, "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let page = |ids: [&str; 2]| {
+            RecordBatch::try_from_iter([("_id", Arc::new(StringArray::from(Vec::from(ids))) as ArrayRef)]).unwrap()
+        };
+        let valid = Interval::at(present).unwrap();
+        for (ids, expiry) in [
+            (["second", "first"], Some(Timestamp(1100))),
+            (["missing", "first"], None),
+            (["first", "first"], None),
+        ] {
+            let expiry_for_page = crate::try_owned_lifetime_range_expiry(&context, "alice", &relation, &page(ids), valid, 1000).await.unwrap();
+            assert_eq!(expiry_for_page, expiry);
+        }
+        let error = crate::try_owned_lifetime_range_expiry(&context, "alice", &relation, &page(["first", "malformed"]), valid, 1000)
+            .await.unwrap_err();
+        assert_eq!(error.code, "rtdb.owned/creation-lifetime");
+    }
+
+    #[tokio::test]
     async fn owned_position_points_and_windows_hide_only_the_selected_commit_suffix() {
         let state = PartitionState::empty(TrieConfig::default()).unwrap();
         let relation = rtdb_types::OwnedRelation::new("docs").unwrap();
