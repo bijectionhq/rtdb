@@ -184,3 +184,44 @@ An inline view with protected contributors has no release proof and refuses deli
 Qualify a sealed checkpoint selection or verified survivor adoption before serving protected data from a newly attached Default database.
 Run `physical_receipt_follows_the_original_source_and_the_settled_replica`, `previously_persisted_native_rows_keep_their_exact_basis_without_a_physical_witness`, and the mounted owner test's held-generation retirement case.
 The Default feature and source admission gates stay closed for the joint qualification of the source projection, protected readers, provider drain and erasure.
+
+The Default checkpoint integration at `82af9f61db` includes the sealed object identity and the authenticated selected-checkpoint repair path.
+Qualification must cover the crate-visible checkpoint bytes accessor and the pending-erasure refusal on ordinary reopen.
+
+### Protected Multi checkpoint transfer
+
+`PinnedExport::checkpoint_identity()` provides the verified v1 Basis, pin UUID bytes, exact manifest identity and ordered pin lifetime.
+The Basis includes the source v1 incarnation.
+The protected transfer requires a pin without a deadline so expiry cannot skip the positive copy drain.
+`FamilyTransferSource` additionally pins the original hosted deployment, custody incarnation, source history, installation and writer commitment.
+The destination binds a different deployment and v1 incarnation plus the immutable preparation commitment of its trusted installed owner.
+
+`FamilyTransferAuthority::source_export` must independently resolve the complete protected contributor census of that exact live export and authenticate the agreement for the chosen destination.
+`destination_custody` must independently resolve the same agreement from the destination's durable reverse binding.
+The inventory includes all original occurrences and selected derived rows, with the original capabilities and SHA-256 of each exact opaque envelope.
+The contract orders contributors by family UUID, original position and assertion ID, and orders each derived list by its `DerivedRow` identity.
+The v1 digests cover the corresponding domain string in `transfer.rs` followed by the typed compact JSON bytes in declaration order.
+The original vault addresses the record by source deployment, v1 incarnation and pin so a replacement cut, manifest, inventory or destination cannot use the same pin identity.
+
+`prepare_checkpoint_transfer` confirms both observations and enrolls the same forward entry in every known contributing family before marking the reciprocal agreement bound.
+It retains the exact agreement across restart and commits each forward entry in the same family CAS as the fence inventory.
+Already bound state can replay its acknowledgement without providing a read grant.
+An unknown family, a missing reverse agreement or a partial preparation cannot open the destination.
+
+`record_checkpoint_transfer_drain` retains either positive proof of installed durable destination backing and closed destination copy workers or positive discard evidence for the exact transfer.
+`source_copy_drain` must independently verify that the source closed all of its copy activity under the same agreement and destination terminal before the vault records drain.
+`require_checkpoint_transfer_drained` consults that retained terminal before source pin release, including after reply loss.
+The original family drain also waits on these transfer terminals while preserving the existing response hold drain.
+An installed destination stays in the original family fanout after the export has drained.
+`require_checkpoint_transfer_read` checks the exact original or derived envelope, current reciprocal installed binding, all forward entries and the original position and family fences.
+An installed original reader also attaches the contributing family markers to the existing plaintext delivery scope.
+Use it around opening and at the final held delivery barrier with the original payload capability and response hold.
+
+The vault contract runs on the existing Local and S3 conditional record interface.
+The installed provider still needs an authenticated census of legacy family and derived carriers at the exact v1 pinned cut, a trusted destination installer that retains and proves the reciprocal binding, and the transfer-aware pin release and reader calls.
+Governed Root derivatives without their own family capability also need the authenticated dependent erasure projection and settlement before their inherited views can open.
+`FamilyFence.transfers` exposes the exact forward roster to that trusted projection, while the installed Flight fence reply retains its existing shape.
+The generic protected export and restore guards and the hosted governed fork refusal stay closed until those components share the same binding and drain.
+
+Qualify `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
+At the installed boundary, lose replies on both sides of the publication, reopen from trimmed history, fence either contributing family while copying, and verify that neither changed ciphertext nor a reinterpreted destination can open.

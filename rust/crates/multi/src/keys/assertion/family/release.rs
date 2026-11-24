@@ -476,7 +476,7 @@ impl<'a> AssertionFamilies<'a> {
         if family.fenced != Some(expected.order) || family.fence_inventory(expected.order).vault_inventory() != expected.inventory {
             return Err(conflict());
         }
-        Ok(family.release_holds.is_empty())
+        Ok(family.release_holds.is_empty() && self.checkpoint_transfers_drained(&family).await?)
     }
 
     fn require_release_owner(&self, owner: CarrierJournalIdentity) -> Result<()> {

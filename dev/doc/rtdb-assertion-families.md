@@ -476,6 +476,18 @@ Physical erasure follows the fixed assertion deadline.
 Its assertion-vault obligation retires every assertion, link and derived capability in the fence inventory through the original vault routes.
 Ciphertext then ages out with its world or archive.
 
+### Destination-bound checkpoint custody
+
+The private vault can retain a `FamilyTransfer` for the original source history, its exact pinned checkpoint and one prepared destination incarnation.
+The agreement preserves every admitted original occurrence and selected derived artifact with its original capability and exact envelope commitment.
+A source observation authenticates the pinned manifest, complete inventory and chosen destination at the original boundary.
+A destination observation authenticates the reciprocal agreement, the prepared destination identity and, once installed, its durable backing and drained copy workers.
+Every contributing family stores the same forward agreement in its fence inventory.
+An agreement with unbound contributors supplies no access.
+A positive copy terminal independently proves that both source and destination copy work have drained before permitting source pin cleanup, including after a family fence has won.
+The installed destination continues to resolve and recheck the same independent original vault before releasing protected data.
+The installed hosted fork and generic checkpoint routes still decline protected transfers pending the provider and reader wiring described in the custody handoff.
+
 ## Errors
 
 | Code | Category | Meaning |

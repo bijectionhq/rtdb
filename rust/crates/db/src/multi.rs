@@ -537,6 +537,10 @@ impl MultiDatabase {
     }
 
     pub async fn open_pin(&mut self, id: Uuid) -> Result<VerifiedManifest> {
+        self.open_pinned_manifest(id).await.map(|(_, image)| image)
+    }
+
+    async fn open_pinned_manifest(&mut self, id: Uuid) -> Result<(Pin, VerifiedManifest)> {
         self.refresh().await?;
         let closure = self.reachability(self.authority()?).await?;
         let pin = closure
@@ -558,7 +562,7 @@ impl MultiDatabase {
                 "The pin is unavailable",
             ));
         }
-        Ok(image)
+        Ok((pin.clone(), image))
     }
 
     pub async fn release_pin(&mut self, id: Uuid) -> Result<()> {

@@ -5,7 +5,7 @@ use rtdb_format::journal::{Checkpoint, Manifest, ObjectId, Pin, Record};
 use rtdb_index::branches::BranchCut;
 use rtdb_store::{ObjectStore, VerifiedManifest, read_file, read_manifest};
 use rtdb_tx::transact::TransactState;
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::Basis};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{Basis, PinnedCheckpointIdentity}};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -16,13 +16,22 @@ use super::{MultiDatabase, next, no_writer};
 const EXACT_EXPORT: &[u8; 5] = b"RTEX1";
 
 pub struct PinnedExport {
-    pin: Uuid,
+    pin: Pin,
     image: VerifiedManifest,
     store: Arc<dyn ObjectStore>,
     kms: Arc<dyn Kms>,
 }
 
 impl PinnedExport {
+    pub fn checkpoint_identity(&self) -> Result<PinnedCheckpointIdentity> {
+        Ok(PinnedCheckpointIdentity {
+            basis: exact_payload(&self.image)?.0.basis,
+            pin: *self.pin.id.as_bytes(),
+            manifest_sha256: manifest_identity(self.image.id()),
+            until: self.pin.until.map(Timestamp),
+        })
+    }
+
     pub fn manifest(&self) -> &Manifest {
         self.image.contents()
     }
@@ -104,9 +113,9 @@ impl MultiDatabase {
     }
 
     pub async fn open_export(&mut self, id: Uuid) -> Result<PinnedExport> {
-        let image = self.open_pin(id).await?;
+        let (pin, image) = self.open_pinned_manifest(id).await?;
         Ok(PinnedExport {
-            pin: id,
+            pin,
             image,
             store: Arc::clone(&self.store),
             kms: Arc::clone(&self.stream.kms),
@@ -121,8 +130,8 @@ impl MultiDatabase {
     pub async fn open_export_ticket(&mut self, ticket: &[u8]) -> Result<PinnedExport> {
         let ticket = self.tokens.open_export(ticket).await?;
         let export = self.open_export(ticket.pin).await?;
-        if manifest_identity(export.image.id()) != ticket.manifest_sha256
-            || exact_payload(&export.image)?.0.basis != ticket.basis
+        let identity = export.checkpoint_identity()?;
+        if identity.manifest_sha256 != ticket.manifest_sha256 || identity.basis != ticket.basis
         {
             return Err(Anomaly::incorrect("rtdb/invalid-export", "The pinned checkpoint does not match the export ticket"));
         }
@@ -181,7 +190,7 @@ impl MultiDatabase {
             origin: Some(RestoreOrigin {
                 digest: source_identity,
                 through: cut.basis.position(),
-                source: Some(CheckpointSource { cut: source_cut, pin: export.pin }),
+                source: Some(CheckpointSource { cut: source_cut, pin: export.pin.id }),
             }),
         };
         coordinates.position(next(next(through)?)?)?;

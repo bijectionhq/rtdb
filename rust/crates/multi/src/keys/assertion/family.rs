@@ -2,8 +2,12 @@
 
 mod release;
 mod root_landing;
+mod transfer;
 
 pub use release::{CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
+pub use transfer::{FamilyTransfer, FamilyTransferArtifact, FamilyTransferAuthority, FamilyTransferContributor, FamilyTransferDestination,
+    FamilyTransferDestinationObservation, FamilyTransferDestinationState, FamilyTransferFanout, FamilyTransferSource,
+    FamilyTransferRead, FamilyTransferSourceDrain, FamilyTransferSourceObservation};
 
 use std::{collections::BTreeSet, fmt, fs, io::ErrorKind, sync::Arc};
 
@@ -186,6 +190,7 @@ pub struct FamilyFence {
     pub assertion_capabilities: BTreeSet<AssertionStage>,
     pub link_capabilities: BTreeSet<AssertionStage>,
     pub derived: BTreeSet<DerivedRow>,
+    pub transfers: BTreeSet<FamilyTransferFanout>,
 }
 
 impl FamilyFence {
@@ -225,6 +230,11 @@ impl FamilyFence {
                 }
                 None => inventory.update(&[0]),
             }
+        }
+        for transfer in &self.transfers {
+            inventory.update(&[4]);
+            inventory.update(&transfer.address);
+            inventory.update(&transfer.agreement_sha256);
         }
         let mut result = [0; 32];
         result.copy_from_slice(inventory.finish().as_ref());
@@ -292,6 +302,8 @@ struct Family {
     release_holds: Vec<release::ReleaseHold>,
     #[serde(default)]
     release_sequence: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    transfers: Vec<FamilyTransferFanout>,
 }
 
 impl Family {
@@ -347,7 +359,8 @@ impl Family {
         }
         assertion_capabilities.extend(self.derived.iter().filter_map(|row| row.capability));
         let derived = self.derived.iter().cloned().collect();
-        FamilyFence { order, positions, assertion_capabilities, link_capabilities, derived }
+        let transfers = self.transfers.iter().copied().collect();
+        FamilyFence { order, positions, assertion_capabilities, link_capabilities, derived, transfers }
     }
 
     fn require_unclaimed(&self) -> Result<()> {
@@ -372,12 +385,13 @@ pub(in crate::keys) enum AssertionVaultRecord {
     Denial(Position),
     Issuer(AssertionIssuerScope),
     ReleaseTerminal { family: Uuid, attempt: [u8; 32] },
+    CheckpointTransfer([u8; 32]),
 }
 
 impl AssertionVaultRecord {
     fn local_prefix(self) -> &'static str {
         match self {
-            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. } => LOCAL_PREFIX,
+            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. } | Self::CheckpointTransfer(_) => LOCAL_PREFIX,
             Self::Issuer(_) => LOCAL_ISSUER_PREFIX,
         }
     }
@@ -394,6 +408,7 @@ impl fmt::Display for AssertionVaultRecord {
             Self::Issuer(scope) => formatter.write_str(&URL_SAFE_NO_PAD.encode(scope.address())),
             Self::ReleaseTerminal { family, attempt } =>
                 write!(formatter, "release-{family}-{}", URL_SAFE_NO_PAD.encode(attempt)),
+            Self::CheckpointTransfer(address) => write!(formatter, "checkpoint-transfer-{}", URL_SAFE_NO_PAD.encode(address)),
         }
     }
 }
@@ -441,7 +456,7 @@ impl<'a> AssertionFamilies<'a> {
             }
             let record = Family {
                 original, original_position: None, rewrites: Vec::new(),
-                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None, release_holds: Vec::new(), release_sequence: 0,
+                landings: Vec::new(), derived: Vec::new(), fenced: None, pending_fence: None, release_holds: Vec::new(), release_sequence: 0, transfers: Vec::new(),
             };
             if self.write(family, None, &record).await? {
                 return Ok(());
@@ -794,7 +809,7 @@ impl<'a> AssertionFamilies<'a> {
                 return Ok(());
             }
             let record = decode_family(&bytes)?;
-            if !record.release_holds.is_empty() { return Err(conflict()); }
+            if !record.release_holds.is_empty() || !self.checkpoint_transfers_drained(&record).await? { return Err(conflict()); }
             let fence = record.fence_inventory(record.fenced.ok_or_else(conflict)?);
             deadline.require_settled_family(&fence, custody_key).await?;
             for position in fence.positions {

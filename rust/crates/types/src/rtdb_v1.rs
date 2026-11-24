@@ -64,6 +64,15 @@ fn invalid_basis() -> Anomaly {
     Anomaly::incorrect("rtdb/invalid-basis", "Invalid basis encoding")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedCheckpointIdentity {
+    pub basis: Basis,
+    pub pin: [u8; 16],
+    pub manifest_sha256: [u8; 32],
+    pub until: Option<Timestamp>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum At {
     #[default]

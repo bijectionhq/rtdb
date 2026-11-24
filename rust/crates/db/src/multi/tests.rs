@@ -286,6 +286,11 @@ async fn exact_export_pins_the_selected_branch_ancestry_after_trim() {
     *changed.last_mut().unwrap() ^= 1;
     assert_eq!(writer.open_export_ticket(&changed).await.err().unwrap().code, "rtdb/invalid-export");
     let export = writer.open_export_ticket(&ticket).await.unwrap();
+    let identity = export.checkpoint_identity().unwrap();
+    assert_eq!(identity.pin, *id.as_bytes());
+    assert_eq!(identity.basis, selected.basis);
+    assert_eq!(identity.until, None);
+    assert_eq!(writer.open_export_ticket(&ticket).await.unwrap().checkpoint_identity().unwrap(), identity);
     let (cut, checkpoint) = export.exact_checkpoint().await.unwrap();
     assert_eq!(cut.basis, selected.basis);
     let view = checkpoint.index().view("report", At::Exactly(cut.basis), Layer::Merged, cut.system_time).unwrap();
