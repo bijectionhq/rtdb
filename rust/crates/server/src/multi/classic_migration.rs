@@ -4,7 +4,7 @@ use journal_contract::{JournalError, StreamId};
 use rtdb_db::{ClassicInstallation, Role, discover_nodes};
 use rtdb_tx::transact::TransactState;
 use rtdb_types::{Anomaly, AnomalyCategory, Result, TransactionKey, rtdb_v1::Basis};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
@@ -13,7 +13,7 @@ use super::{
     open_database, validate_deployment_name,
 };
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ClassicCandidate {
     pub reserved_at: Basis,
     pub projection_sha256: [u8; 32],
@@ -22,7 +22,7 @@ pub struct ClassicCandidate {
 
 impl MultiRuntime {
     /// Reserves a closed native catalog entry for a verified Classic source.
-    pub async fn stage_classic_candidate(
+    pub(super) async fn stage_classic_candidate(
         &self,
         name: &str,
         incarnation: Uuid,
@@ -81,11 +81,12 @@ impl MultiRuntime {
             .catalog
             .reserve_classic_candidate(name, incarnation, request, projection)
             .await?;
-        self.inspect_classic_candidate(selected, projection).await
+        self.inspect_classic_candidate(selected, request, projection)
+            .await
     }
 
     /// A closed candidate has no serving driver. This operation uses only its private writer lease.
-    pub async fn install_classic_candidate(
+    pub(super) async fn install_classic_candidate(
         &self,
         name: &str,
         incarnation: Uuid,
@@ -100,7 +101,9 @@ impl MultiRuntime {
         if expected != projection {
             return Err(conflict());
         }
-        let mut candidate = self.inspect_classic_candidate(selected, projection).await?;
+        let mut candidate = self
+            .inspect_classic_candidate(selected, request, projection)
+            .await?;
         if candidate.installation.is_some() {
             return Ok(candidate);
         }
@@ -124,14 +127,14 @@ impl MultiRuntime {
         }
         candidate.installation = Some(
             database
-                .install_classic_checkpoint(projection, transactions)
+                .install_classic_checkpoint(request, transactions)
                 .await?,
         );
         Ok(candidate)
     }
 
     /// Reads the closed reservation and committed restore without acquiring a writer lease.
-    pub async fn classic_candidate_status(
+    pub(super) async fn classic_candidate_status(
         &self,
         name: &str,
         incarnation: Uuid,
@@ -143,19 +146,20 @@ impl MultiRuntime {
             return Ok(None);
         };
         Ok(Some(
-            self.inspect_classic_candidate(selected, projection).await?,
+            self.inspect_classic_candidate(selected, request, projection)
+                .await?,
         ))
     }
 
     /// Checks an exact historical cut against the closed native stream and its reservation.
-    pub async fn classic_candidate_cut(
+    pub(super) async fn classic_candidate_cut(
         &self,
         name: &str,
         incarnation: Uuid,
         request: [u8; 32],
         original: TransactionKey,
     ) -> Result<Basis> {
-        let (selected, projection) = self
+        let (selected, _) = self
             .classic_candidate(name, incarnation, request)
             .await?
             .ok_or_else(conflict)?;
@@ -167,7 +171,7 @@ impl MultiRuntime {
         )
         .await?;
         Ok(database
-            .classic_checkpoint_cut(projection, original)
+            .classic_checkpoint_cut(request, original)
             .await?
             .basis)
     }
@@ -196,6 +200,7 @@ impl MultiRuntime {
     async fn inspect_classic_candidate(
         &self,
         selected: Deployment,
+        request: [u8; 32],
         projection: [u8; 32],
     ) -> Result<ClassicCandidate> {
         let installation = match self
@@ -212,7 +217,7 @@ impl MultiRuntime {
                     DatabaseOpen::Prepared,
                 )
                 .await?;
-                database.classic_checkpoint_status(projection).await?
+                database.classic_checkpoint_status(request).await?
             }
             Ok(_) | Err(JournalError::NotFound) => None,
             Err(error) => {

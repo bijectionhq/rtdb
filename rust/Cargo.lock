@@ -5503,6 +5503,7 @@ dependencies = [
  "journal-contract",
  "regex",
  "reqwest 0.13.4",
+ "ring",
  "rtdb-auth",
  "rtdb-azure",
  "rtdb-columnar",

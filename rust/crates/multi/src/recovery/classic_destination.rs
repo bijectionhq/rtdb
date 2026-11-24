@@ -1,7 +1,15 @@
 use std::sync::Arc;
 
 use rtdb_directory::{CheckpointTransferTerminal, DeploymentRecord, Directory, Lifecycle};
-use rtdb_server::multi::ClassicCandidate;
+use rtdb_server::multi::{
+    ClassicCandidate,
+    classic_ingress::{
+        Authorization, Binding, MAX_CHECKPOINT_BYTES, Operation as CandidateOperation, Response,
+    },
+};
+
+mod relay;
+pub(crate) use relay::Relay;
 use rtdb_types::{Anomaly, EntityId, Result, TableRef, TransactionKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -93,12 +101,19 @@ impl Selection {
 }
 
 pub(super) enum Operation {
-    Stage,
+    Prepare {
+        begin_sha256: [u8; 32],
+    },
+    Stage {
+        authorization: Option<Authorization>,
+    },
     Install {
         projection_sha256: [u8; 32],
+        authorization: Option<Authorization>,
     },
     Status {
         classic_cut: Option<TransactionKey>,
+        authorization: Option<Authorization>,
     },
     OriginalReceipt {
         id: EntityId,
@@ -127,6 +142,10 @@ pub(super) struct Evidence {
     request_sha256: [u8; 32],
     selection: Selection,
     candidate: Option<ClassicCandidate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_binding: Option<Binding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_blocker: Option<&'static str>,
     projection: Option<ClassicProjection>,
     original_receipt: Option<ReceiptHistory>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -191,6 +210,8 @@ impl RecoveryService {
             request_sha256,
             selection,
             candidate: None,
+            candidate_binding: None,
+            candidate_blocker: None,
             projection: None,
             original_receipt: None,
             original_receipt_coverage: None,
@@ -228,38 +249,49 @@ impl RecoveryService {
             evidence.original_receipt_coverage = readback.coverage;
             return Ok(Reply::ClassicMigrationDestination { evidence });
         }
-        let Some(runtime) = self.classic_destination.as_ref() else {
+        let Some(relay) = self.classic_destination.as_ref() else {
             return Ok(Reply::Refused);
         };
-        let candidate = runtime
-            .classic_candidate_status(&evidence.name, authority, request_sha256)
-            .await?;
-        if let Operation::Status { classic_cut } = operation {
-            if let Some(cut) = classic_cut
-                && candidate
-                    .as_ref()
-                    .is_some_and(|candidate| candidate.installation.is_some())
-            {
-                if !cut.at_or_before(evidence.terminal) {
+        let (begin_sha256, authorization) = match operation {
+            Operation::Prepare { begin_sha256 } if begin_sha256 != [0; 32] => (begin_sha256, None),
+            Operation::Stage {
+                authorization: Some(authorization),
+            } => {
+                relay.verify(&authorization, CandidateOperation::Stage)?;
+                (
+                    authorization.grant.binding.begin_sha256,
+                    Some(authorization),
+                )
+            }
+            Operation::Install {
+                projection_sha256,
+                authorization: Some(authorization),
+            } if projection_sha256 == authorization.grant.binding.projection_sha256 => {
+                relay.verify(&authorization, CandidateOperation::Install)?;
+                (
+                    authorization.grant.binding.begin_sha256,
+                    Some(authorization),
+                )
+            }
+            Operation::Status {
+                classic_cut,
+                authorization: Some(authorization),
+            } => {
+                relay.verify(&authorization, CandidateOperation::Status { classic_cut })?;
+                if !evidence.matches_binding(&authorization.grant.binding) {
                     return Err(conflict());
                 }
-                let basis = runtime
-                    .classic_candidate_cut(&evidence.name, authority, request_sha256, cut)
-                    .await?;
-                evidence.mapped_cut = Some((cut, basis));
-            }
-            evidence.candidate = candidate;
-            return Ok(Reply::ClassicMigrationDestination { evidence });
-        }
-        if let Operation::Install { projection_sha256 } = &operation {
-            let selected = candidate
-                .as_ref()
-                .filter(|candidate| candidate.projection_sha256 == *projection_sha256)
-                .ok_or_else(conflict)?;
-            if selected.installation.is_some() {
-                evidence.candidate = candidate;
+                evidence.candidate_binding = Some(authorization.grant.binding.clone());
+                evidence.observe_candidate(relay.forward(authorization, &[]).await?)?;
                 return Ok(Reply::ClassicMigrationDestination { evidence });
             }
+            _ => return Ok(Reply::Refused),
+        };
+        if authorization
+            .as_ref()
+            .is_some_and(|authorization| !evidence.matches_binding(&authorization.grant.binding))
+        {
+            return Err(conflict());
         }
         let (_, prepared, _) = Box::pin(archive::read_classic_migration(
             directory,
@@ -273,44 +305,45 @@ impl RecoveryService {
         ))
         .await?;
         let prepared = prepared.ok_or_else(conflict)?;
-        if let Some(transactions) = &prepared.transactions {
-            let projection = prepared.proof.sha256;
-            evidence.candidate = Some(match operation {
-                Operation::Stage => {
-                    runtime
-                        .stage_classic_candidate(
-                            &evidence.name,
-                            authority,
-                            request_sha256,
-                            projection,
-                        )
-                        .await?
-                }
-                Operation::Install { projection_sha256 } if projection == projection_sha256 => {
-                    runtime
-                        .install_classic_candidate(
-                            &evidence.name,
-                            authority,
-                            request_sha256,
-                            projection,
-                            transactions,
-                        )
-                        .await?
-                }
-                Operation::Install { .. } => return Err(conflict()),
-                Operation::Status { .. } | Operation::OriginalReceipt { .. } => unreachable!(),
-            });
-        } else if candidate.is_some() {
-            return Err(conflict());
-        }
-        if let Some(installed) = evidence
-            .candidate
+        if prepared
+            .checkpoint
             .as_ref()
-            .and_then(|candidate| candidate.installation.as_ref())
-            && (installed.basis != prepared.proof.native_basis
-                || installed.system_time != prepared.proof.terminal.system_time
-                || Some(installed.checkpoint_sha256) != prepared.proof.checkpoint_sha256)
+            .is_some_and(|checkpoint| checkpoint.len() > MAX_CHECKPOINT_BYTES)
         {
+            if authorization.is_some() {
+                return Err(conflict());
+            }
+            evidence.candidate_blocker = Some("checkpoint_exceeds_ingress_bound");
+        } else if let Some(checkpoint) = &prepared.checkpoint {
+            let binding = Binding {
+                begin_sha256,
+                request_sha256,
+                catalog: relay.catalog(),
+                name: evidence.name.clone(),
+                destination: authority,
+                capture,
+                scratch: evidence.selection.stage_operation,
+                terminal: evidence.terminal,
+                terminal_sha256: evidence.terminal_sha256,
+                artifact_sha256: evidence.selection.ciphertext_sha256,
+                projection_sha256: prepared.proof.sha256,
+                checkpoint_sha256: prepared.proof.checkpoint_sha256.ok_or_else(conflict)?,
+                checkpoint_bytes: checkpoint.len() as u32,
+                basis: prepared.proof.native_basis,
+            };
+            if let Some(authorization) = authorization {
+                if authorization.grant.binding != binding {
+                    return Err(conflict());
+                }
+                let bytes = if authorization.grant.operation == CandidateOperation::Install {
+                    checkpoint.as_ref()
+                } else {
+                    &[]
+                };
+                evidence.observe_candidate(relay.forward(authorization, bytes).await?)?;
+            }
+            evidence.candidate_binding = Some(binding);
+        } else if authorization.is_some() {
             return Err(conflict());
         }
         evidence.projection = Some(prepared.proof);
@@ -325,6 +358,33 @@ impl RecoveryService {
             source: Some((evidence.authority, evidence.capture, self.org.clone())),
             transfer_only: true,
         }
+    }
+}
+
+impl Evidence {
+    fn matches_binding(&self, binding: &Binding) -> bool {
+        binding.name == self.name
+            && binding.destination == self.authority
+            && binding.capture == self.capture
+            && binding.scratch == self.selection.stage_operation
+            && binding.terminal == self.terminal
+            && binding.terminal_sha256 == self.terminal_sha256
+            && binding.artifact_sha256 == self.selection.ciphertext_sha256
+            && binding.request_sha256 == self.request_sha256
+    }
+
+    fn observe_candidate(&mut self, response: Response) -> Result<()> {
+        let Response::Observed {
+            candidate,
+            mapped_cut,
+            ..
+        } = response
+        else {
+            return Err(conflict());
+        };
+        self.candidate = candidate;
+        self.mapped_cut = mapped_cut;
+        Ok(())
     }
 }
 

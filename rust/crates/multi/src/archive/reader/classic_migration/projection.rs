@@ -24,7 +24,7 @@ use super::{RelationInventory, RelationKind, RetainedInventory, inconsistent, is
 use crate::archive::{encode, sha256};
 
 pub(crate) struct ClassicPrepared {
-    pub(crate) transactions: Option<TransactState>,
+    pub(crate) checkpoint: Option<bytes::Bytes>,
     pub(crate) proof: ClassicProjection,
     _charges: Vec<Arc<MemoryReservation>>,
 }
@@ -281,7 +281,7 @@ impl Projection {
                 }
             }
         }
-        let checkpoint_sha256 = if blocked {
+        let checkpoint = if blocked {
             None
         } else {
             let bytes = transactions.encode_checkpoint()?;
@@ -291,8 +291,9 @@ impl Projection {
                         inconsistent("Classic checkpoint exceeds the memory bound")
                     })?)?,
             );
-            Some(sha256(&bytes))
+            Some(bytes)
         };
+        let checkpoint_sha256 = checkpoint.as_deref().map(sha256);
         let sha256 = sha256(&encode(&(
             "rtdb.multi/classic-destination-projection/v1",
             self.request,
@@ -312,7 +313,7 @@ impl Projection {
             outstanding.push("retained_original_custody");
         }
         Ok(ClassicPrepared {
-            transactions: (!blocked).then_some(transactions),
+            checkpoint,
             proof: ClassicProjection {
                 sha256,
                 terminal: self.terminal,

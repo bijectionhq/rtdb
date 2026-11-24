@@ -38,6 +38,7 @@ use crate::config::NodeConfiguration;
 pub use rtdb_flight_sql::NativeFollowerAssignment;
 
 mod catalog;
+pub mod classic_ingress;
 mod classic_migration;
 pub use classic_migration::ClassicCandidate;
 mod managed_transfer;
@@ -103,6 +104,7 @@ pub struct MultiRuntime {
     native_checkpoint_source: Option<native_checkpoint::NativeCheckpointSource>,
     managed_operations: TaskTracker,
     follower: Option<NativeFollowerAssignment>,
+    classic_ingress: Option<Arc<classic_ingress::Ingress>>,
 }
 
 impl MultiRuntime {
@@ -311,6 +313,7 @@ impl MultiRuntime {
         let mut runtime = Self::open(config, memory, databases, backends, follower).await?;
         if runtime.follower.is_none() {
             runtime.native_checkpoint_source = Some(native_checkpoint::NativeCheckpointSource);
+            runtime.classic_ingress = classic_ingress::Ingress::installed()?;
         }
         Ok(runtime)
     }
@@ -419,6 +422,7 @@ impl MultiRuntime {
             native_checkpoint_source: None,
             managed_operations: TaskTracker::new(),
             follower,
+            classic_ingress: None,
         })
     }
 
@@ -897,6 +901,8 @@ impl MultiRuntime {
         }
         tokio::select! {
             result = self.drive_databases(node, stop) => result,
+            result = async { self.classic_ingress.as_ref().expect("Classic ingress enabled").serve(self, stop).await },
+                if self.classic_ingress.is_some() => result,
             result = self.drive_managed_transfers(stop), if self.native_checkpoint_source.is_some() || !self.managed_sources.is_empty() => result,
             result = async { self.peer.as_ref().expect("peer enabled").serve(self, node, stop).await },
                 if self.peer.is_some() => result,

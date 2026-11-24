@@ -7,6 +7,7 @@ use rtdb_directory::{
     CheckpointCaptureRetirement, CheckpointStageIntent, CheckpointSuffixCustody, ClassicMigration, ClassicMigrationSource,
     DeploymentRecord, Directory, DisposalReceipt, HostedTask, ServingInventory,
 };
+use rtdb_server::multi::classic_ingress::Authorization as CandidateAuthorization;
 use rtdb_storage::sealing::DeliveryIo;
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,7 @@ mod classic_destination;
 
 const FRAME_BYTES: usize = 2048;
 const ORIGINAL_RECEIPT_FRAME_BYTES: usize = 4096;
+const CANDIDATE_FRAME_BYTES: usize = 16 << 10;
 const MAX_REPLY_BYTES: usize = 4 << 20;
 const SOCKET_DEADLINE: Duration = Duration::from_secs(15);
 
@@ -163,9 +165,10 @@ enum Action {
         staged_manifest_sha256: String,
         ciphertext_sha256: [u8; 32],
     },
-    StageClassicMigrationDestination { selection: classic_destination::Selection },
-    InstallClassicMigrationDestination { selection: classic_destination::Selection, projection_sha256: [u8; 32] },
-    ClassicMigrationDestinationStatus { selection: classic_destination::Selection, classic_cut: Option<rtdb_types::TransactionKey> },
+    PrepareClassicMigrationDestination { selection: classic_destination::Selection, begin_sha256: [u8; 32] },
+    StageClassicMigrationDestination { selection: classic_destination::Selection, authorization: Option<CandidateAuthorization> },
+    InstallClassicMigrationDestination { selection: classic_destination::Selection, projection_sha256: [u8; 32], authorization: Option<CandidateAuthorization> },
+    ClassicMigrationDestinationStatus { selection: classic_destination::Selection, classic_cut: Option<rtdb_types::TransactionKey>, authorization: Option<CandidateAuthorization> },
     ReadClassicMigrationOriginalReceipt { selection: classic_destination::Selection, id: rtdb_types::EntityId, coverage: Option<classic_destination::CoveragePoint> },
     InspectCheckpointStageOwnedRelations {
         destination: Uuid,
@@ -356,7 +359,7 @@ pub struct RecoveryService {
     hosted_task: Option<HostedTask>,
     control: ControlKey,
     memory: Arc<MemoryBudget>,
-    classic_destination: Option<rtdb_server::multi::MultiRuntime>,
+    classic_destination: Option<classic_destination::Relay>,
 }
 
 impl RecoveryService {
@@ -384,9 +387,9 @@ impl RecoveryService {
         })
     }
 
-    pub fn with_classic_destination(mut self, runtime: rtdb_server::multi::MultiRuntime) -> Self {
-        self.classic_destination = Some(runtime);
-        self
+    pub fn with_classic_destination(mut self, configuration: &Path) -> Result<Self> {
+        self.classic_destination = Some(classic_destination::Relay::from_file(configuration)?);
+        Ok(self)
     }
 
     async fn authorize(
@@ -878,14 +881,17 @@ impl RecoveryService {
                 )).await?;
                 Ok(Reply::TransferTargetVerified { bootstrap })
             },
-            Action::StageClassicMigrationDestination { selection } => Box::pin(self.classic_destination(
-                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Stage,
+            Action::PrepareClassicMigrationDestination { selection, begin_sha256 } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Prepare { begin_sha256 },
             )).await,
-            Action::InstallClassicMigrationDestination { selection, projection_sha256 } => Box::pin(self.classic_destination(
-                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Install { projection_sha256 },
+            Action::StageClassicMigrationDestination { selection, authorization } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Stage { authorization },
             )).await,
-            Action::ClassicMigrationDestinationStatus { selection, classic_cut } => Box::pin(self.classic_destination(
-                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Status { classic_cut },
+            Action::InstallClassicMigrationDestination { selection, projection_sha256, authorization } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Install { projection_sha256, authorization },
+            )).await,
+            Action::ClassicMigrationDestinationStatus { selection, classic_cut, authorization } => Box::pin(self.classic_destination(
+                directory, installation, request.authority, request.capture, selection, classic_destination::Operation::Status { classic_cut, authorization },
             )).await,
             Action::ReadClassicMigrationOriginalReceipt { selection, id, coverage } => Box::pin(self.classic_destination(
                 directory, installation, request.authority, request.capture, selection, classic_destination::Operation::OriginalReceipt { id, coverage },
@@ -1265,10 +1271,11 @@ pub async fn serve(
 }
 
 fn admits_frame_size(action: &Action, bytes: usize) -> bool {
-    let maximum = if matches!(action, Action::ReadClassicMigrationOriginalReceipt { .. }) {
-        ORIGINAL_RECEIPT_FRAME_BYTES
-    } else {
-        FRAME_BYTES
+    let maximum = match action {
+        Action::StageClassicMigrationDestination { .. } | Action::InstallClassicMigrationDestination { .. }
+        | Action::ClassicMigrationDestinationStatus { .. } => CANDIDATE_FRAME_BYTES,
+        Action::ReadClassicMigrationOriginalReceipt { .. } => ORIGINAL_RECEIPT_FRAME_BYTES,
+        _ => FRAME_BYTES,
     };
     bytes <= maximum
 }
@@ -1281,7 +1288,7 @@ async fn read_request(
     // The caller waits for the acknowledgement before it starts PgWire.
     // Reject trailing bytes so the line reader cannot swallow its first frame.
     let mut line = String::new();
-    let mut reader = BufReader::new((&mut socket).take(ORIGINAL_RECEIPT_FRAME_BYTES as u64));
+    let mut reader = BufReader::new((&mut socket).take(CANDIDATE_FRAME_BYTES as u64));
     reader.read_line(&mut line).await?;
     if !line.ends_with('\n') || !reader.buffer().is_empty() {
         return Err(std::io::Error::new(

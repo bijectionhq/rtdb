@@ -8,7 +8,7 @@ use crate::replay::{Committed, JournalCoordinates, RestoreOrigin};
 
 use super::{MultiDatabase, next, no_writer};
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ClassicInstallation {
     pub basis: Basis,
     pub system_time: rtdb_types::Timestamp,

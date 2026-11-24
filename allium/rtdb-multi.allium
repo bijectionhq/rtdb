@@ -622,15 +622,19 @@ contract LogService {
     @invariant ClassicMigrationNativeCandidate
         -- The authenticated recovery operator selects the exact fenced source name and authority, capture, scratch artifact and migration request.
         -- The recovery envelope authenticates the Original tenant name and the sealed stage binds its independently determined scratch name.
-        -- Native catalog reservation compares both name and physical stream identity and retains the exact projection commitment.
-        -- Candidate admission stays closed while a private writer appends the restored checkpoint to the native stream.
+        -- The Original owner prepares the verified projection and exact candidate binding while retaining its own source, scratch and receipt authority.
+        -- A current operator grant and the separate Original attestation authorize one exact candidate operation, binding the same Begin, destination, terminal, replay artifact and projection.
+        -- The enrolled native peer admits the private operation under its own runtime authority and resolves install to the selected native stream writer.
+        -- Native catalog reservation compares both name and physical stream identity and commits the exact candidate binding and projection.
+        -- Candidate admission stays closed while the selected writer appends the exact binding and restored checkpoint under its private stream lease.
         -- The import preserves admitted literal event times and retains their exact transaction cuts under the candidate's native coordinates.
         -- Canonical receipt imports preserve their original namespace, key, fingerprint and outcome under the mapped cut.
         -- Authenticated Original receipt read-through selects the exact control row at the certified scratch replay and returns its retained event coordinates.
         -- Registered receipt read-through can select the companion coverage control from the same certified scratch replay.
         -- Original receipt readback depends on Original custody and can proceed during native catalog unavailability.
         -- The retained replay, its covered relations and remaining Original custody remain distinguishable in the private proof.
-        -- Status reopens the same native manifest through the ordered restore terminal after an interrupted append or reply.
+        -- A fresh exact status grant reopens the same native manifest through the ordered restore terminal after an interrupted append or reply, using the retained Original selectors without replaying scratch.
+        -- Expiry or an unavailable response leaves the ordered outcome to be resolved by exact status.
         -- Route readiness and authority publication require the caller's separate guarded decision.
 
     @invariant InstalledJournalErasureCommit

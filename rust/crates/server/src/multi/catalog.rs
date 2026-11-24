@@ -173,6 +173,8 @@ impl Catalog {
         self.database.lock().await.transact(request).await
     }
 
+    pub(super) fn incarnation(&self) -> Uuid { self.incarnation }
+
     pub(super) fn deployment_id(&self, name: &str) -> Uuid {
         identity(b"deployment", self.incarnation, name)
     }
@@ -757,7 +759,6 @@ async fn write(
         ),
         ("ready".into(), Cell::Value(Value::Bool(status.ready()))),
     ]);
-    let private_classic = matches!(status, Status::ClassicCandidate { .. });
     let phase = match status {
         Status::Reserved => b"reserve".to_vec(),
         Status::Ready => b"ready".to_vec(),
@@ -914,7 +915,6 @@ async fn write(
         });
     }
     let receipt = match &catalog.peer {
-        Some(peer) if private_classic => peer.forward_classic_catalog(catalog.incarnation, &request).await?,
         Some(peer) => match peer.forward_catalog(catalog.incarnation, &request).await? {
             Some(receipt) => receipt,
             None => control.transact(&request).await?,

@@ -446,13 +446,14 @@ After fencing, recover the same attempt from its retained state.
 
 ### Private native candidate
 
-Enable candidate stage, install and status on the recovery listener with `--recovery-native-destination` and the installed native Multi journal, catalog and storage configuration.
-The recovery task uses an enrolled native peer's network identity and its own journal credential slot.
-Send install to the peer selected for the destination stream and use any admitted recovery owner for status.
-The listener authenticates the ordinary recovery envelope against the exact fenced Classic `name`, `authority` and `capture`.
-The destination keeps that name and authority UUID and uses a separately reserved native catalog row, native stream and encrypted manifest.
+The Original recovery owner authenticates the existing recovery envelope against the exact fenced Classic `name`, `authority` and `capture`.
+The destination keeps that name and authority UUID, with a separately proved native catalog reservation, physical stream and encrypted manifest.
+Candidate operations cross a private RTDB relay between the Original recovery owner and an enrolled native Multi peer.
+The peer executes inside its running runtime with its own journal credential slot and storage authority.
+The native ingress uses server-authenticated TLS and requires both an operation grant from the migration operator and proof from the Original recovery owner.
+The operator approves the recorded Bijection Begin through its trusted approval signer.
 
-The four actions take a `selection` with `destination`, `stage_operation`, `staged_manifest_sha256`, `ciphertext_sha256`, `command_id`, `command_digest` and optional `original_receipt_table`.
+All actions take a `selection` with `destination`, `stage_operation`, `staged_manifest_sha256`, `ciphertext_sha256`, `command_id`, `command_digest` and optional `original_receipt_table`.
 `destination` equals the original authority UUID.
 `stage_operation` selects the independent Classic scratch installation named `checkpoint-stage-{stage_operation}`.
 The sealed stage intent and scratch directory record must authenticate that scratch name.
@@ -460,9 +461,15 @@ The command ID and digest identify Bijection's retained migration request.
 Choose the exact public receipt-control table with `{schema, table}` when the migration needs Classic receipt read-through.
 Every reply uses `classic_migration_destination` and returns the exact `selection`, old terminal transaction and frontiers, `terminal_sha256` and `request_sha256` in `evidence`.
 
-- `stage_classic_migration_destination` verifies the scratch replay and returns `projection` and the closed native `candidate` when the projection is installable.
-- `install_classic_migration_destination` takes the exact staged `projection_sha256` and commits the native restore checkpoint under the private stream lease.
-- `classic_migration_destination_status` reports the same catalog reservation and, once present, reopens the committed native checkpoint without acquiring a writer lease.
+- `prepare_classic_migration_destination` takes the exact retained `begin_sha256` and verifies the scratch replay.
+  It returns `projection` and, for an installable projection within the 64 MiB checkpoint limit, `candidate_binding`.
+  Repeat the same authenticated preparation after a lost reply to recover the same binding while the exact verified scratch remains held.
+- `stage_classic_migration_destination` takes a stage `authorization`, verifies that scratch replay yields the approved binding and returns `projection` and the closed native `candidate`.
+- `install_classic_migration_destination` takes an install `authorization` and the exact staged `projection_sha256`.
+  The relay resolves the candidate stream's selected native peer, which needs the actual private writer lease to commit the restore checkpoint.
+- `classic_migration_destination_status` takes a status `authorization` and reports the exact ordered reservation.
+  Once the restore commits, any enrolled ingress peer can reopen that checkpoint through the native journal without acquiring a writer lease.
+  The Original owner checks the retained directory fence and scratch bootstrap for status without replaying the artifact.
   Supply optional `classic_cut` with the old `tx_id` and `system_time` to verify an exact retained cut against the reopened native checkpoint and return `mapped_cut`.
 - `read_classic_migration_original_receipt` takes a typed `id`, such as `{"String":"<original receipt row ID>"}`, and returns the selected Original control row history from the exact scratch replay.
   Each retained event includes its original valid-time extent, system time, position, digest and literal document where present.
@@ -470,11 +477,37 @@ Every reply uses `classic_migration_destination` and returns the exact `selectio
   This read uses the Original recovery authority and scratch hold and can proceed independently of the native catalog.
   The receipt request frame is bounded at 4 KiB including its newline, and each returned control history is bounded at 1 MiB.
 
-Keep the same selection and staged projection digest after any indeterminate response.
+Once prepared, keep the same selection and full `candidate_binding` after any indeterminate response.
+Stage, install and status echo that binding in `evidence` on success.
+For a lost install response or an expired grant, get a fresh status grant for the same binding.
+Grant expiry or an unavailable reply leaves the install outcome unresolved.
 The native proof reports the candidate's catalog reservation basis and the restore record's LSN, writer epoch, key generation, manifest address, ciphertext digest, and checkpoint state digest.
 The source and destination terminal times must agree.
 A native terminal establishes private installation only.
 The ordered catalog leaves the candidate closed to serving, workload claim and automatic attachment while Bijection establishes readiness and independently guards the route decision.
+
+The Original reaper takes `--recovery-native-destination FILE` for relay configuration.
+The JSON file has `entry` (host), `port`, `server_name`, `ca_file` (PEM), `catalog` (native catalog UUID), `approval_public_key` and `source_signing_key_file` (Ed25519 PKCS#8 DER).
+Enrolled native runtimes take `RTDB_CLASSIC_CANDIDATE_INGRESS_FILE` with `port`, `certificate_file` and `private_key_file` (PEM), `approval_public_key` and `source_public_key`.
+The TLS trust profile covers the ingress entry and eligible native peers on the configured private port so the Original relay can follow a selected-writer redirect within RTDB.
+Keep the Original recovery authority and source signing key on the Original owner.
+Keep the approval signing key under the independent migration approval authority.
+The mounted files, private reachability and exact native ingress endpoint require operator commissioning.
+
+`authorization` has fields `grant` and `signature` in that order in the signed relay transcript.
+The `grant` fields in signing order are `binding`, `operation` and `expires_at_micros`.
+The `binding` fields in signing order are `begin_sha256`, `request_sha256`, `catalog`, `name`, `destination`, `capture`, `scratch`, `terminal`, `terminal_sha256`, `artifact_sha256`, `projection_sha256`, `checkpoint_sha256`, `checkpoint_bytes` and `basis`.
+`operation` is `{"operation":"stage"}`, `{"operation":"install"}` or `{"operation":"status","classic_cut":null}` with an optional exact transaction key in place of `null`.
+A transaction key serializes as `{"tx_id":7,"system_time":200}` and a basis as `{"incarnation":[…],"position":8}`.
+Use lowercase hyphenated UUIDs, decimal integers and JSON integer arrays for keys, digests and signatures.
+The operator produces a 64-byte Ed25519 signature over `SHA-256("rtdb.multi/classic-candidate-approval/v1\0" || compact typed JSON(grant))`.
+The Original relay separately signs `SHA-256("rtdb.multi/classic-candidate-original/v1\0" || compact typed JSON(authorization))`.
+Each domain ends in one zero byte.
+Expiry is in Unix microseconds and must be more than 250 ms and at most five minutes ahead of the verifier's clock.
+The ordered catalog and restore record bind `SHA-256("rtdb.multi/classic-candidate-binding/v1\0" || compact typed JSON(binding))`.
+The private relay request frames its `authorization` and `source_signature` JSON with a big-endian 32-bit length, then adds a big-endian 32-bit checkpoint length and the exact checkpoint bytes.
+Stage and status carry zero checkpoint bytes.
+The reply is a length-framed JSON outcome.
 
 The literal projection covers positioned clear puts and deletes with unambiguous physical addresses.
 It preserves valid intervals, system times and original written transaction identity.
