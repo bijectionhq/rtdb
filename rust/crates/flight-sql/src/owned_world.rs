@@ -35,6 +35,8 @@ pub trait OwnedWorldHost: std::fmt::Debug + Send + Sync {
         controls: Vec<rtdb_node::HostedControlWrite>, deadline: Timestamp,
     ) -> BoxFuture<'a, Result<TransactionKey>>;
 
+    fn root_rank_authority(&self, call: WorldCall<'_>) -> Result<Arc<dyn rtdb_storage::sealing::RootRankAuthority>>;
+
     /// The placed deployment's assertion-family vault (dev/doc/rtdb-assertion-families.md).
     fn assertion_family<'a>(
         &'a self, call: WorldCall<'a>, request: crate::FamilyRequest,

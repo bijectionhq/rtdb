@@ -9,7 +9,7 @@ use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Int64Array, RecordBatch, StringArray,
     TimestampMicrosecondArray,
 };
-use arrow_buffer::{NullBuffer, OffsetBuffer};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_flight::FlightData;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit as ArrowTime};
 use prost::Message;
@@ -42,10 +42,12 @@ const IMAGE_HEADER: &str = "x-rtdb-changes-images";
 const IMAGE_STREAM: &str = "stream-v1";
 const IMAGE_END: [u8; 4] = [0; 4];
 const MAX_PACKED_BYTES: usize = 1 << 20;
-const MAX_FIXED_IMAGE_FIELDS: usize = 4;
-const MAX_FIXED_IMAGE_BYTES: usize = 1024;
-const MAX_FIXED_IMAGE_SCRATCH: usize = 24 << 10;
-const MIN_FIXED_IMAGE_ROW_BOUND: usize = MAX_FIXED_IMAGE_SCRATCH + 8 * MAX_FIXED_IMAGE_BYTES;
+const MAX_DEFERRED_IMAGE_FIELDS: usize = 4;
+const MAX_DEFERRED_IMAGE_BYTES: usize = 1024;
+const MAX_DEFERRED_IMAGE_SCRATCH: usize = 24 << 10;
+const MAX_DEFERRED_VARIABLE_BYTES: usize = 256;
+const MIN_DEFERRED_IMAGE_ROW_BOUND: usize =
+    MAX_DEFERRED_IMAGE_SCRATCH + 8 * MAX_DEFERRED_IMAGE_BYTES;
 
 struct Request {
     tables: BTreeSet<TableRef>,
@@ -152,42 +154,79 @@ impl Image {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ImageCell<B> {
+    Fixed(i64),
+    Bytes(B),
+}
+
 struct DeferredImage {
     schema: SchemaRef,
-    values: [i64; MAX_FIXED_IMAGE_FIELDS],
+    cells: [ImageCell<Buffer>; MAX_DEFERRED_IMAGE_FIELDS],
     stream: Option<Arc<RowStreamEncoder>>,
     legacy_len: usize,
 }
 
 impl DeferredImage {
-    fn fixed_values(
+    fn candidate(
         batch: &RecordBatch,
         schema_bound: usize,
-    ) -> Option<[i64; MAX_FIXED_IMAGE_FIELDS]> {
-        const CELL_SCRATCH: usize = 4 * (size_of::<Int64Array>() + size_of::<i64>());
+    ) -> Option<([ImageCell<&[u8]>; MAX_DEFERRED_IMAGE_FIELDS], usize)> {
         let fields = batch.num_columns();
         let schema = batch.schema_ref();
-        if !(1..=MAX_FIXED_IMAGE_FIELDS).contains(&fields)
-            || schema_bound > MAX_FIXED_IMAGE_SCRATCH - CELL_SCRATCH * fields
+        if !(1..=MAX_DEFERRED_IMAGE_FIELDS).contains(&fields)
+            || schema_bound > MAX_DEFERRED_IMAGE_SCRATCH
             || !schema.metadata().is_empty()
         {
             return None;
         }
-        let mut values = [0; MAX_FIXED_IMAGE_FIELDS];
-        for ((value, field), array) in values.iter_mut().zip(schema.fields()).zip(batch.columns()) {
+        let mut cells = [ImageCell::Fixed(0); MAX_DEFERRED_IMAGE_FIELDS];
+        let mut scratch = schema_bound;
+        let mut variable_body_bytes = 0;
+        for ((cell, field), array) in cells.iter_mut().zip(schema.fields()).zip(batch.columns()) {
             if array.null_count() != 0 || !field.metadata().is_empty() {
                 return None;
             }
-            *value = match field.data_type() {
-                DataType::Int64 => array.as_any().downcast_ref::<Int64Array>()?.value(0),
-                DataType::Timestamp(ArrowTime::Microsecond, _) => array
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()?
-                    .value(0),
+            *cell = match field.data_type() {
+                DataType::Int64 => {
+                    ImageCell::Fixed(array.as_any().downcast_ref::<Int64Array>()?.value(0))
+                }
+                DataType::Timestamp(ArrowTime::Microsecond, _) => ImageCell::Fixed(
+                    array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()?
+                        .value(0),
+                ),
+                DataType::Utf8 => ImageCell::Bytes(
+                    array
+                        .as_any()
+                        .downcast_ref::<StringArray>()?
+                        .value(0)
+                        .as_bytes(),
+                ),
+                DataType::Binary => {
+                    ImageCell::Bytes(array.as_any().downcast_ref::<BinaryArray>()?.value(0))
+                }
                 _ => return None,
             };
+            let compact_array_size = match cell {
+                ImageCell::Fixed(_) => size_of::<Int64Array>() + size_of::<i64>(),
+                ImageCell::Bytes(bytes) => {
+                    if bytes.len() > MAX_DEFERRED_VARIABLE_BYTES {
+                        return None;
+                    }
+                    // The uncompressed V5 image stream pads each value buffer to 8 bytes.
+                    variable_body_bytes += bytes.len().next_multiple_of(8);
+                    size_of::<StringArray>().max(size_of::<BinaryArray>())
+                        + 2 * size_of::<i32>()
+                        + bytes.len()
+                }
+            };
+            scratch += 4 * compact_array_size;
         }
-        Some(values)
+        (scratch <= MAX_DEFERRED_IMAGE_SCRATCH
+            && variable_body_bytes <= MAX_DEFERRED_VARIABLE_BYTES)
+            .then_some((cells, variable_body_bytes))
     }
 
     fn encode(&self) -> Result<Image, Status> {
@@ -195,18 +234,33 @@ impl DeferredImage {
             .schema
             .fields()
             .iter()
-            .zip(self.values)
-            .map(|(field, value)| -> ArrayRef {
-                match field.data_type() {
-                    DataType::Int64 => Arc::new(Int64Array::from(vec![value])),
-                    DataType::Timestamp(ArrowTime::Microsecond, timezone) => Arc::new(
-                        TimestampMicrosecondArray::from(vec![value])
+            .zip(&self.cells)
+            .map(|(field, cell)| -> Result<ArrayRef, ArrowError> {
+                let array: ArrayRef = match (field.data_type(), cell) {
+                    (DataType::Int64, ImageCell::Fixed(value)) => {
+                        Arc::new(Int64Array::from(vec![*value]))
+                    }
+                    (
+                        DataType::Timestamp(ArrowTime::Microsecond, timezone),
+                        ImageCell::Fixed(value),
+                    ) => Arc::new(
+                        TimestampMicrosecondArray::from(vec![*value])
                             .with_timezone_opt(timezone.clone()),
                     ),
-                    _ => unreachable!("deferred images have a fixed-width layout"),
-                }
+                    (data_type @ (DataType::Utf8 | DataType::Binary), ImageCell::Bytes(bytes)) => {
+                        let offsets = OffsetBuffer::new(vec![0, bytes.len() as i32].into());
+                        if *data_type == DataType::Utf8 {
+                            Arc::new(StringArray::try_new(offsets, bytes.clone(), None)?)
+                        } else {
+                            Arc::new(BinaryArray::try_new(offsets, bytes.clone(), None)?)
+                        }
+                    }
+                    _ => unreachable!("deferred image cell differs from its field"),
+                };
+                Ok(array)
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(batch_error)?;
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(batch_error)?;
         Image::encode(&batch, self.stream.as_ref())
     }
@@ -222,7 +276,7 @@ struct ImageProjection<'a> {
     columns: &'a [usize],
     projected: Option<RecordBatch>,
     schema_bound: Option<usize>,
-    fixed_len: Option<usize>,
+    base_wire_len: Option<usize>,
     encoding: ImageEncoding,
 }
 
@@ -233,7 +287,7 @@ impl<'a> ImageProjection<'a> {
             columns,
             projected: None,
             schema_bound: None,
-            fixed_len: None,
+            base_wire_len: None,
             encoding: if shared_images {
                 ImageEncoding::Stream(None)
             } else {
@@ -277,12 +331,19 @@ impl<'a> ImageProjection<'a> {
                 Some(&*encoder)
             }
         };
-        let values = DeferredImage::fixed_values(&batch, schema_bound);
-        if let (Some(values), Some(legacy_len)) = (values, self.fixed_len) {
+        let candidate = DeferredImage::candidate(&batch, schema_bound);
+        if let (Some((cells, variable_body_bytes)), Some(base_len)) =
+            (candidate, self.base_wire_len)
+            && let Some(legacy_len) = base_len.checked_add(variable_body_bytes)
+            && legacy_len <= MAX_DEFERRED_IMAGE_BYTES
+        {
             return Ok((
                 Image::Deferred(DeferredImage {
                     schema: batch.schema(),
-                    values,
+                    cells: cells.map(|cell| match cell {
+                        ImageCell::Fixed(value) => ImageCell::Fixed(value),
+                        ImageCell::Bytes(bytes) => ImageCell::Bytes(Buffer::from(bytes.to_vec())),
+                    }),
                     stream: stream.cloned(),
                     legacy_len,
                 }),
@@ -290,11 +351,10 @@ impl<'a> ImageProjection<'a> {
             ));
         }
         let image = Image::encode(&batch, stream)?;
-        // For present fixed-width cells, uncompressed framing depends only on the projection.
-        // Use a successful encode to establish its exact length under the original scratch charge.
-        if values.is_some() {
-            let length = image.legacy_len();
-            self.fixed_len = (length <= MAX_FIXED_IMAGE_BYTES).then_some(length);
+        // Present flat cells have fixed-size IPC nodes, buffer descriptors and offsets.
+        // Only the padded variable payload changes the length observed on the first successful encode.
+        if let (None, Some((_, variable_body_bytes))) = (self.base_wire_len, candidate) {
+            self.base_wire_len = image.legacy_len().checked_sub(variable_body_bytes);
         }
         Ok((image, charge))
     }
@@ -854,9 +914,9 @@ async fn change_page(
                                 images,
                                 charge,
                             };
-                            // Only defer small images together so their scratch fits in the
-                            // singleton charge before allocating the outer batch.
-                            if !(MIN_FIXED_IMAGE_ROW_BOUND..=pack_limit).contains(&bound)
+                            // The singleton charge covers the retained images and one image's
+                            // encoding scratch. Image encoding finishes before outer encoding.
+                            if !(MIN_DEFERRED_IMAGE_ROW_BOUND..=pack_limit).contains(&bound)
                                 || row
                                     .images
                                     .iter()
@@ -1134,7 +1194,7 @@ mod tests {
         let schema = Arc::new(schema());
         let table: Arc<str> = Arc::from("public.rows");
         let base = singleton_base(&schema, &table).unwrap();
-        assert!(base >= MIN_FIXED_IMAGE_ROW_BOUND);
+        assert!(base >= MIN_DEFERRED_IMAGE_ROW_BOUND);
         let candidate = batch.slice(1, 1);
         let scratch_bound = wire::batch_bound(&candidate).unwrap();
         let expected =
@@ -1179,6 +1239,85 @@ mod tests {
             assert!(!matches!(null, Image::Deferred(_)));
         }
         assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn variable_images_keep_legacy_admission_and_bytes_across_padding_boundaries() {
+        let oversized = vec![0xab; MAX_DEFERRED_VARIABLE_BYTES + 1];
+        let batch = RecordBatch::try_from_iter([
+            (
+                "_id",
+                Arc::new(StringArray::from(vec![
+                    Some("seed"),
+                    Some("é"),
+                    Some(""),
+                    Some("more than eight bytes"),
+                    Some("one"),
+                    None,
+                ])) as ArrayRef,
+            ),
+            (
+                "payload",
+                Arc::new(BinaryArray::from_iter_values([
+                    &b"\x00"[..],
+                    &b"123456789"[..],
+                    &b""[..],
+                    &b"\xff\x00"[..],
+                    oversized.as_slice(),
+                    &b"\x01"[..],
+                ])) as ArrayRef,
+            ),
+            (
+                "number",
+                Arc::new(Int64Array::from(vec![0, 1, 2, 3, 4, 5])) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let memory = MemoryBudget::new(1 << 20);
+        let table: Arc<str> = Arc::from("public.rows");
+        let base = singleton_base(&Arc::new(schema()), &table).unwrap();
+        for shared in [false, true] {
+            let mut projection = ImageProjection::new(&batch, &[0, 1, 2], shared);
+            for (index, deferred) in [false, true, true, true, false, false]
+                .into_iter()
+                .enumerate()
+            {
+                let candidate = batch.slice(index, 1);
+                let bound = wire::batch_bound(&candidate).unwrap();
+                if deferred {
+                    let restricted = MemoryBudget::new(bound - 1);
+                    let expected = error::anomaly(restricted.reserve(bound).err().unwrap());
+                    let rejection = projection.prepare(index, &restricted).err().unwrap();
+                    assert_eq!(rejection.code(), expected.code());
+                    assert_eq!(rejection.details(), expected.details());
+                }
+
+                let expected = rtdb_format::ipc::write_stream(
+                    candidate.schema_ref(),
+                    std::slice::from_ref(&candidate),
+                )
+                .unwrap();
+                let (image, scratch) = projection.prepare(index, &memory).unwrap();
+                assert_eq!(scratch.bytes(), bound);
+                assert_eq!(matches!(&image, Image::Deferred(_)), deferred);
+                assert_eq!(image.legacy_len(), expected.len());
+                let charge = memory
+                    .reserve(singleton_bound(base, [None, None, Some(expected.len())]).unwrap())
+                    .unwrap();
+                let mut row = ReservedRow {
+                    table: Arc::clone(&table),
+                    time: Timestamp(1),
+                    opened: true,
+                    images: [None, None, Some(image)],
+                    charge,
+                };
+                drop(scratch);
+                row.finish_images().unwrap();
+                let singleton = image_array(std::slice::from_ref(&row), 2).unwrap();
+                assert_eq!(singleton.value(0), expected.as_slice());
+            }
+            assert_eq!(memory.used_bytes(), 0);
+        }
     }
 
     #[test]

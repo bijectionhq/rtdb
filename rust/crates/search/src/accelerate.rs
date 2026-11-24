@@ -545,6 +545,9 @@ fn uncovered_owned_search() -> Anomaly {
 pub async fn owned_corpus(
     context: Arc<QueryContext>, owner: &str, relation: &OwnedRelation, path: &OwnedRelation, text: &str,
 ) -> Result<rtdb_text::Corpus> {
+    if crate::rank_family::needs_rank_family(&context, owner, relation).await? {
+        return Err(crate::rank_family::unavailable());
+    }
     let partition = [(relation.clone(), path.clone())];
     let analyzer = crate::owned_search_analyzer(Arc::clone(&context), owner, &partition).await?;
     let query = Query::analyzed(analyzer, text);

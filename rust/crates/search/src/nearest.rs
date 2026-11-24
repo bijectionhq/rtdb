@@ -2,17 +2,19 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
     sync::Arc,
 };
 
 use arrow_array::{Array, Float32Array, Float64Array, RecordBatch, UInt64Array};
 use arrow_buffer::{Buffer, ScalarBuffer};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, UnionMode};
 use rtdb_columnar::{ArrowCell, EntityIdRef, MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_plan::Catalog;
 use rtdb_query::QueryContext;
-use rtdb_types::{Anomaly, AnomalyCategory, EntityId, Interval, OwnedRelation, Result, TemporalBounds, Timestamp, Value};
+use rtdb_types::{
+    Anomaly, AnomalyCategory, EntityId, Interval, ListValue, NumericCell, NumericSpan, OwnedRelation, Result,
+    TemporalBounds, Timestamp, Value,
+};
 
 use crate::OwnedSearchBatch;
 
@@ -306,6 +308,7 @@ pub async fn owned_nearest_batch(
         let mut columns = vec!["_id", partition.vector.as_str()];
         columns.extend(partition.filters.iter().map(String::as_str));
         let sealed = crate::rank_family::needs_rank_family(&context, owner, &partition.relation).await?;
+        if sealed { columns.push("_system_from"); }
         if query.approximate && !sealed {
             let bounds = TemporalBounds { valid_time: Interval::at(valid)?, system_time: Interval::at(present)? };
             let cut = rtdb_vector::Cut { snapshot, storage: &database.storage, memory: &context.memory, cancellation: &context.cancellation, bounds };
@@ -368,6 +371,8 @@ async fn rank_rows(
     shadows: Option<&BTreeSet<EntityId>>, ordinal: usize, window: &mut NearestWindow,
     sealed: Option<(&str, Timestamp)>,
 ) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    let mut identities = context.memory.reserve(0)?;
     while let Some(batch) = cursor.next_batch().await? {
         let batch = batch.batch();
         let schema = batch.schema_ref();
@@ -378,6 +383,18 @@ async fn rank_rows(
             .collect::<Result<Vec<_>>>()?;
         for row in 0..batch.num_rows() {
             context.check_cancelled_at(row)?;
+            let read_id = || rtdb_columnar::read_entity_id(id_field, batch.column(id_column).as_ref(), row);
+            let is_shadowed = |id| shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id));
+            let admitted_id = if let Some((owner, valid)) = sealed {
+                let protected = crate::rank_family::RootProjectionId::parse(read_id()?)?;
+                let id = protected.canonical();
+                if is_shadowed(id) { continue; }
+                protected.require(context, owner, &partition.relation, valid, batch, row).await?;
+                let charge = Arc::get_mut(&mut identities).expect("exclusive candidate identity reservation");
+                charge.grow_to(charge.bytes().saturating_add(id.owned_payload_bytes()).saturating_add(192))?;
+                if !seen.insert(id.into_owned()) { return Err(crate::rank_family::unavailable()); }
+                Some(id)
+            } else { None };
             let mut cells = [None; MAX_NEAREST_FILTERS];
             for (cell, &(column, field)) in cells.iter_mut().zip(&filters) {
                 *cell = rtdb_columnar::binary_cell(field, batch.column(column).as_ref(), row)?;
@@ -389,12 +406,14 @@ async fn rank_rows(
             let _cell = context.memory.reserve(bytes.saturating_mul(2))?;
             let Some(vector) = read_vector(ArrowCell { field: vector_field, array: vectors, row })? else { continue; };
             let Some(distance) = vector.distance(query)? else { continue; };
-            let ids = batch.column(id_column).as_ref();
-            let id = rtdb_columnar::read_entity_id(id_field, ids, row)?;
-            if shadows.is_some_and(|shadows| shadows.iter().any(|shadow| EntityIdRef::from(shadow) == id)) { continue; }
-            if let Some((owner, valid)) = sealed {
-                crate::rank_family::root_contributor(context, owner, &partition.relation, id, valid).await?;
-            }
+            let id = match admitted_id {
+                Some(id) => id,
+                None => {
+                    let id = read_id()?;
+                    if is_shadowed(id) { continue; }
+                    id
+                }
+            };
             window.admit(ordinal, id, distance)?;
         }
     }
@@ -404,6 +423,7 @@ async fn rank_rows(
 enum VectorCell<'a> {
     F32(&'a [f32]),
     F64(&'a [f64]),
+    Numeric(NumericSpan<'a>),
     Decoded(Vec<f64>),
 }
 
@@ -412,6 +432,7 @@ impl VectorCell<'_> {
         match self {
             Self::F32(values) => values.len(),
             Self::F64(values) => values.len(),
+            Self::Numeric(values) => values.len(),
             Self::Decoded(values) => values.len(),
         }
     }
@@ -420,12 +441,21 @@ impl VectorCell<'_> {
         match self {
             Self::F32(values) => query.distance(values.iter().copied().map(f64::from)),
             Self::F64(values) => query.distance(values.iter().copied()),
+            Self::Numeric(values) => query.distance(values.iter().map(|value| match value {
+                NumericCell::F32(value) => f64::from(value),
+                NumericCell::F64(value) => value,
+                NumericCell::I8(value) => f64::from(value),
+                NumericCell::I16(value) => f64::from(value),
+                NumericCell::I32(value) => f64::from(value),
+                NumericCell::I64(value) => value as f64,
+                _ => unreachable!("admitted vector component"),
+            })),
             Self::Decoded(values) => query.distance(values.into_iter()),
         }
     }
 }
 
-fn float_span(cell: ArrowCell<'_>) -> Option<(&dyn Array, Range<usize>)> {
+fn plain_vector_list(cell: ArrowCell<'_>) -> Option<ArrowCell<'_>> {
     let cell = match cell.field.data_type() {
         DataType::Union(..) | DataType::RunEndEncoded(..) => {
             let (selected, logical) = cell.logical_position(None).ok()?;
@@ -443,24 +473,50 @@ fn float_span(cell: ArrowCell<'_>) -> Option<(&dyn Array, Range<usize>)> {
         }
         _ => return None,
     }
-    let (field, array, range) = cell.sequence_range()?;
-    (field.metadata().is_empty() && matches!(field.data_type(), DataType::Float32 | DataType::Float64))
-        .then_some((array, range))
+    Some(cell)
+}
+
+fn packed_vector_element(field: &Field) -> bool {
+    let signed = |ty: &DataType| matches!(ty, DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64);
+    ListValue::supports_numeric_arrow(field) && match field.data_type() {
+        DataType::Union(fields, UnionMode::Dense) => fields.iter().all(|(_, child)| {
+            let ty = child.data_type();
+            signed(ty) || matches!(ty, DataType::Float32 | DataType::Float64 | DataType::Null)
+        }),
+        ty => signed(ty),
+    }
 }
 
 fn read_vector(cell: ArrowCell<'_>) -> Result<Option<VectorCell<'_>>> {
     let ArrowCell { field, array, row } = cell;
     if array.is_null(row) { return Ok(None); }
-    if let Some((values, mut range)) = float_span(cell)
-        && let Some(vector) = values.as_any().downcast_ref::<Float32Array>()
-            .map(|array| VectorCell::F32(&array.values()[range.clone()]))
-            .or_else(|| values.as_any().downcast_ref::<Float64Array>()
-                .map(|array| VectorCell::F64(&array.values()[range.clone()])))
+    if let Some(list) = plain_vector_list(cell)
+        && let Some((element, values, range)) = list.sequence_range()
     {
-        if values.nulls().is_some_and(|nulls| range.any(|index| nulls.is_null(index))) {
-            return Err(not_a_vector());
+        let has_primitive_null = || {
+            values.nulls().is_some_and(|nulls| range.clone().any(|index| nulls.is_null(index)))
+        };
+        if element.metadata().is_empty() && matches!(element.data_type(), DataType::Float32 | DataType::Float64)
+            && let Some(vector) = values.as_any().downcast_ref::<Float32Array>()
+                .map(|array| VectorCell::F32(&array.values()[range.clone()]))
+                .or_else(|| values.as_any().downcast_ref::<Float64Array>()
+                    .map(|array| VectorCell::F64(&array.values()[range.clone()])))
+        {
+            if has_primitive_null() { return Err(not_a_vector()); }
+            return Ok(Some(vector));
         }
-        return Ok(Some(vector));
+        if packed_vector_element(element)
+            && rtdb_columnar::decimal_field_parameters(list.field).is_ok()
+            && let Some(span) = list.numeric_list_span_range(0..range.len())
+        {
+            let has_null = if matches!(element.data_type(), DataType::Union(..)) {
+                span.iter().any(|value| matches!(value, NumericCell::Null))
+            } else {
+                has_primitive_null()
+            };
+            if has_null { return Err(not_a_vector()); }
+            return Ok(Some(VectorCell::Numeric(span)));
+        }
     }
     let value = rtdb_columnar::read_value(field, array, row)?;
     let list = match &value {
@@ -506,7 +562,12 @@ fn uncovered() -> Anomaly {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{BinaryArray, FixedSizeListArray, ListArray, types::Float32Type};
+    use arrow_array::{
+        BinaryArray, FixedSizeListArray, Int64Array, ListArray, NullArray, UnionArray,
+        types::{Float32Type, UInt64Type},
+    };
+    use arrow_buffer::OffsetBuffer;
+    use arrow_schema::UnionFields;
 
     fn query(filters: Vec<BTreeSet<Vec<u8>>>, k: usize) -> NearestQuery {
         NearestQuery::new(vec![1.0, 0.0], filters, k).unwrap()
@@ -572,6 +633,60 @@ mod tests {
         let array = ListArray::from_iter_primitive::<Float32Type, _, _>([Some([Some(f32::NAN), None, Some(1.0)])]);
         let field = Field::new("vector", array.data_type().clone(), false);
         let cell = ArrowCell { field: &field, array: &array, row: 0 };
+        assert_eq!(read_vector(cell).err(), Some(not_a_vector()));
+    }
+
+    #[test]
+    fn nearest_borrows_sliced_signed_and_mixed_lists_in_component_order() {
+        let large = (1_i64 << 53) + (1 << 30) + 1;
+        let integers = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, false)), 3,
+            Arc::new(Int64Array::from(vec![9, 7, 6, large, -large, 125])), None,
+        ).slice(1, 1);
+        let fields = UnionFields::try_new([7, 4, 2, 5], [
+            Field::new("i64", DataType::Int64, false),
+            Field::new("f32", DataType::Float32, false),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("null", DataType::Null, true),
+        ]).unwrap();
+        let mixed = UnionArray::try_new(
+            fields, vec![4, 7, 4, 2, 4, 5, 4, 7, 2].into(), Some(vec![0, 0, 1, 0, 2, 0, 2, 0, 0].into()),
+            vec![
+                Arc::new(Int64Array::from(vec![large])),
+                Arc::new(Float32Array::from(vec![9.0, -0.3, f32::NAN])),
+                Arc::new(Float64Array::from(vec![0.125])),
+                Arc::new(NullArray::new(1)),
+            ],
+        ).unwrap();
+        let mixed = ListArray::try_new(
+            Arc::new(Field::new("item", mixed.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 1, 4, 6, 9].into()), Arc::new(mixed), None,
+        ).unwrap().slice(1, 3);
+        let nearest = NearestQuery::new(vec![0.2, -0.9, 0.5], Vec::new(), 1).unwrap();
+        for (array, expected) in [
+            (&integers as &dyn Array, [large as f64, (-large) as f64, 125.0]),
+            (&mixed as &dyn Array, [large as f64, f64::from(-0.3_f32), 0.125]),
+        ] {
+            let field = Field::new("vector", array.data_type().clone(), false);
+            let cell = read_vector(ArrowCell { field: &field, array, row: 0 }).unwrap().unwrap();
+            assert!(matches!(&cell, VectorCell::Numeric(_)));
+            let expected = nearest.distance(expected.into_iter()).unwrap().unwrap();
+            assert_eq!(cell.distance(&nearest).unwrap().unwrap().to_bits(), expected.to_bits());
+        }
+
+        let field = Field::new("vector", mixed.data_type().clone(), false);
+        let malformed = ArrowCell { field: &field, array: &mixed, row: 1 };
+        assert_eq!(read_vector(malformed).err(), Some(not_a_vector()));
+        let nonfinite = read_vector(ArrowCell { row: 2, ..malformed }).unwrap().unwrap();
+        assert!(nonfinite.distance(&nearest).is_err());
+    }
+
+    #[test]
+    fn nearest_refuses_unsigned_components_even_when_the_numeric_span_opens() {
+        let array = ListArray::from_iter_primitive::<UInt64Type, _, _>([Some([Some(u64::MAX), Some(1)])]);
+        let field = Field::new("vector", array.data_type().clone(), false);
+        let cell = ArrowCell { field: &field, array: &array, row: 0 };
+        assert!(cell.numeric_list_span().is_some());
         assert_eq!(read_vector(cell).err(), Some(not_a_vector()));
     }
 

@@ -254,10 +254,22 @@ Flight and archive rank outputs also carry a bounded current marker check throug
 
 Protocol 222 includes a complete bounded family inventory in each held text and nearest reply, including replies with no hits.
 The inventory comes from the admitted corpus before result slicing. It covers non-hit text statistics and vector candidates, and includes protected world shadows that affect the inherited corpus.
-The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field. Root contributors resolve their exact carrier on the same held cut.
+The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field.
+Protected partitions require the installed original rank owner before corpus or scoring work.
+The statistics-only artefact route refuses protected partitions.
+An indexed Root landing registers its physical derivative under `bjrl1/<family hex>/<destination assertion hex>/<canonical AddressRef>` before publication.
+The family and assertion fields are 32 and 64 lowercase hexadecimal characters, respectively, and the full physical selector fits the 512-byte derivative key bound.
+The ranker uses the canonical address for overlay masks, candidate identity, tie breaks, and output.
+Custody and erasure use the full physical selector.
+Before admitting an unshadowed protected Root projection, the ranker reads the payload carrier at `row/<AddressRef>` on the same held valid and system cut.
+For a landed carrier, it also reads `row-position/row/<AddressRef>` from the installed base relation underlying the search relation.
+The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
+The Root contributor uses the journal assertion ordinal.
+Undecorated family-linked projections and multiple visible physical selectors for an unshadowed canonical address refuse.
 The inventory is `rtdb.owned.rank_families` in the authenticated Arrow schema, as lowercase hex of a big-endian u16 entry count and canonical sorted entries.
-An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root carrier publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
-The bounds are 512 entries of at most 1024 bytes and at most 512 Root carrier probes per rank. Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
+An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root protected journal publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
+The bounds are 512 entries of at most 1024 bytes, at most 512 Root carrier probes per rank, and one journal probe per decorated Root selector.
+Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.
 `FamilyResponseRelease.v2` adds exact world-derived input kind 2 and exact Root-derived input kind 3 to the existing response-part hold.
 The consumer retains the inventory in the invocation's original output custody even when it returns only counts, cursors or derived scores.
 Hybrid reads retain the combined text and vector dependencies under that same bound.

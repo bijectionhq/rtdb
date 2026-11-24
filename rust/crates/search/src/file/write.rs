@@ -367,10 +367,8 @@ impl Builder {
             directory.push((Table::Blocks, plan.directory()?));
             if self.format >= TREE_FORMAT_VERSION {
                 let revisions = if self.mode == BuildMode::History {
-                    let digests = self.revisions.into_iter().map(|mut values| values.finish()).collect::<Vec<_>>();
-                    let references = digests.iter().map(|values| values as &dyn Array).collect::<Vec<_>>();
-                    Some(Table::TextRevisions.array(vec![list(arrow_select::concat::concat(&references).map_err(fault)?,
-                        std::iter::repeat_n(self.rows as usize, columns.len()), item_of(&Table::TextRevisions.fields()[0]))?])?)
+                    if self.revisions.is_empty() { return Err(fault("History requires at least one revision field")); }
+                    Some(self.revisions.into_iter().map(|mut values| values.finish()).collect())
                 } else { None };
                 let documents = if self.mode == BuildMode::Postings {
                     let tokens = self.doc_tokens.finish();

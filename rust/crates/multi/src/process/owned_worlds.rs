@@ -158,6 +158,13 @@ impl OwnedWorldHost for PlacedWorldHost {
         })
     }
 
+    fn root_rank_authority(&self, call: WorldCall<'_>) -> Result<Arc<dyn rtdb_storage::sealing::RootRankAuthority>> {
+        let deployment = self.deployment(&call)?;
+        assertion_families::root_rank_authority(
+            call.session, deployment, Arc::clone(&self.directory), Arc::clone(&self.keys), call.cancellation.clone(),
+        )
+    }
+
     fn assertion_family<'a>(
         &'a self, call: WorldCall<'a>, request: rtdb_flight_sql::FamilyRequest,
     ) -> BoxFuture<'a, Result<rtdb_flight_sql::FamilyReply>> {
