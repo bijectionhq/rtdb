@@ -28,10 +28,8 @@ impl Upload {
             match &mut arguments { Some(arguments) => arguments.append(next).map_err(status)?, None => arguments = Some(next) }
         }
         if arguments.is_none() {
-            if let Some(schema) = self.decoder.schema().filter(|schema| !schema.fields().is_empty()) {
-                let memory = self.service.memory();
-                let batch = OwnedBatch::new(RecordBatch::new_empty(Arc::clone(schema)), memory).map_err(status)?;
-                arguments = Some(SqlArguments::from_arrow(batch, memory).map_err(status)?);
+            if let Some(batch) = self.decoder.empty_batch()? {
+                arguments = Some(SqlArguments::from_arrow(batch, self.service.memory()).map_err(status)?);
             }
         }
         Ok(arguments)
@@ -55,8 +53,8 @@ impl Service {
                     let params = match upload.next().await? {
                         Some(batch) if batch.batch().num_columns() != 0 => Some(wire::BoundParameters::new(batch, self.memory())?),
                         Some(_) => None,
-                        None => upload.decoder.schema().filter(|schema| !schema.fields().is_empty())
-                            .map(|schema| wire::BoundParameters::empty(schema, self.memory())).transpose()?,
+                        None => upload.decoder.empty_batch()?
+                            .map(|batch| wire::BoundParameters::new(batch, self.memory())).transpose()?,
                     };
                     *prepared.params.lock().expect("prepared parameters lock") = params; Ok(Vec::new())
                 }

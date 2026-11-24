@@ -7,11 +7,13 @@ use arrow_flight::FlightData;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use bytes::Bytes;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
+use rtdb_columnar::{BufferIdentity, MemoryBudget, MemoryReservation, OwnedBatch, RetainedArray, from_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::LogicalType;
 use tonic::Status;
 use crate::error::{arrow, invalid, status};
+
+mod dictionary;
 
 struct RetainedBytes { bytes: Bytes, _reservation: Arc<MemoryReservation> }
 impl AsRef<[u8]> for RetainedBytes { fn as_ref(&self) -> &[u8] { &self.bytes } }
@@ -75,16 +77,61 @@ impl Encoder {
         Ok(dictionaries.into_iter().chain(std::iter::once(data)).map(|encoded| { let mut data: FlightData = encoded.into(); data.data_header = retain(data.data_header, Arc::clone(&charge)); data.data_body = retain(data.data_body, Arc::clone(&charge)); data }).collect())
     }
 }
-pub(crate) struct Decoder { schema: Option<SchemaRef>, dictionaries: HashMap<i64, ArrayRef>, permanent: Vec<Arc<MemoryReservation>>, memory: Arc<MemoryBudget> }
+struct UploadSchema {
+    schema: SchemaRef,
+    reservation: Arc<MemoryReservation>,
+}
+
+impl UploadSchema {
+    fn decode(header: &[u8], grant: &mut MemoryReservation) -> Result<Self, Status> {
+        let schema = rtdb_format::ipc::read_schema_header(header).map_err(status)?;
+        let bytes = add(128, mul(schema.metadata().capacity(), 64)?)?;
+        let bytes = schema.metadata().iter().try_fold(bytes, |bytes, (key, value)| {
+            add(bytes, add(key.capacity(), value.capacity())?)
+        })?;
+        let bytes = schema.fields().iter().try_fold(bytes, |bytes, field| add(bytes, add(field.size(), 32)?))?;
+        let reservation = grant.split_off(bytes).map_err(status)?;
+        Ok(Self { schema: Arc::new(schema), reservation })
+    }
+}
+
+pub(crate) struct Decoder {
+    schema: Option<UploadSchema>,
+    dictionaries: HashMap<i64, RetainedArray>,
+    memory: Arc<MemoryBudget>,
+}
+
 impl Decoder {
-    pub fn new(memory: Arc<MemoryBudget>) -> Self { Self { schema: None, dictionaries: HashMap::new(), permanent: Vec::new(), memory } }
-    pub fn schema(&self) -> Option<&SchemaRef> { self.schema.as_ref() }
+    pub fn new(memory: Arc<MemoryBudget>) -> Self { Self { schema: None, dictionaries: HashMap::new(), memory } }
+
+    pub fn empty_batch(&self) -> Result<Option<OwnedBatch>, Status> {
+        let Some(schema) = self.schema.as_ref().filter(|schema| !schema.schema.fields().is_empty()) else { return Ok(None); };
+        let mut scratch = self.memory.reserve(mul(schema_bound(&schema.schema)?, 2)?).map_err(status)?;
+        let grant = Arc::get_mut(&mut scratch).expect("empty upload owns its grant");
+        let batch = RecordBatch::new_empty(Arc::clone(&schema.schema));
+        OwnedBatch::with_shared_buffers(batch, grant, Arc::clone(&schema.reservation), |_| false).map(Some).map_err(status)
+    }
+
+    fn funds(&self, buffer: BufferIdentity) -> bool {
+        self.dictionaries.values().any(|dictionary| dictionary.funds(buffer))
+    }
+
+    fn dictionary_refs(&self, grant: &mut MemoryReservation, extra: usize) -> Result<HashMap<i64, ArrayRef>, Status> {
+        let scratch = self.dictionaries.values().try_fold(extra, |bytes, dictionary| {
+            add(bytes, add(128, mul(dictionary.descriptor_bytes(), 4)?)?)
+        })?;
+        grant.grow_to(add(grant.bytes(), scratch)?).map_err(status)?;
+        Ok(self.dictionaries.iter().map(|(&id, dictionary)| (id, Arc::clone(dictionary.array()))).collect())
+    }
+
     pub fn decode(&mut self, data: FlightData) -> Result<Option<OwnedBatch>, Status> {
         if data.data_header.is_empty() { return Ok(None); }
         let message = arrow_ipc::root_as_message(&data.data_header).map_err(arrow)?;
-        let (bound, codec) = message_bound(&message, data.data_header.len(), &data.data_body, self.schema.as_deref())?;
-        let charge = self.memory.reserve(bound).map_err(status)?;
-        let _codec_workspace = codec.map(|codec| self.memory.reserve(codec_workspace(codec))).transpose().map_err(status)?;
+        let schema = self.schema.as_ref().map(|schema| schema.schema.as_ref());
+        let (bound, codec) = message_bound(&message, data.data_header.len(), &data.data_body, schema)?;
+        let mut charge = self.memory.reserve(bound).map_err(status)?;
+        let grant = Arc::get_mut(&mut charge).expect("Flight message owns its grant");
+        let codec_workspace = codec.map(|codec| self.memory.reserve(codec_workspace(codec))).transpose().map_err(status)?;
         if codec == Some(arrow_ipc::CompressionType::LZ4_FRAME) {
             validate_lz4_lengths(&message, &data.data_body)?;
         }
@@ -92,27 +139,42 @@ impl Decoder {
             arrow_ipc::MessageHeader::NONE => Ok(None),
             arrow_ipc::MessageHeader::Schema => {
                 if self.schema.is_some() { return Err(invalid("Flight upload contains more than one schema")); }
-                self.schema = Some(Arc::new(rtdb_format::ipc::read_schema_header(&data.data_header).map_err(status)?)); self.permanent.push(charge); Ok(None)
+                self.schema = Some(UploadSchema::decode(&data.data_header, grant)?);
+                Ok(None)
             }
             arrow_ipc::MessageHeader::DictionaryBatch => {
                 let schema = self.schema.as_ref().ok_or_else(|| invalid("Dictionary arrived before schema"))?;
                 let dictionary = message.header_as_dictionary_batch().ok_or_else(|| invalid("Invalid dictionary message"))?;
-                let body = rtdb_format::ipc::align_ipc_body(Buffer::from(data.data_body));
-                arrow_ipc::reader::read_dictionary(&body, dictionary, schema, &mut self.dictionaries, &message.version()).map_err(arrow)?;
-                self.permanent.push(charge); Ok(None)
+                let id = dictionary.id();
+                let is_delta = dictionary.isDelta();
+                let dictionaries = self.dictionary_refs(grant, schema.reservation.bytes())?;
+                let values = dictionary::decode(dictionary, &schema.schema, &dictionaries, data.data_body, &message.version())?;
+                drop(codec_workspace);
+                drop(dictionaries);
+                let incoming = RetainedArray::new(values, grant, |buffer| self.funds(buffer)).map_err(status)?;
+                drop(data.data_header);
+                drop(charge);
+                let owner = if is_delta {
+                    let current = self.dictionaries.get(&id).ok_or_else(|| invalid(format!("No existing dictionary for delta dictionary with id '{id}'")))?;
+                    dictionary::append(current, &incoming, &self.memory, |buffer| self.funds(buffer))?
+                } else {
+                    incoming
+                };
+                self.dictionaries.insert(id, owner);
+                Ok(None)
             }
             arrow_ipc::MessageHeader::RecordBatch => {
-                let schema = self.schema.clone().ok_or_else(|| invalid("Record batch arrived before schema"))?;
+                let schema = self.schema.as_ref().ok_or_else(|| invalid("Record batch arrived before schema"))?;
                 let batch = message.header_as_record_batch().ok_or_else(|| arrow(arrow_schema::ArrowError::ParseError(
                     "Unable to convert flight data header to a record batch".to_owned(),
                 )))?;
+                let dictionaries = self.dictionary_refs(grant, 0)?;
                 let body = rtdb_format::ipc::align_ipc_body(Buffer::from(data.data_body));
                 let batch = arrow_ipc::reader::read_record_batch(
-                    &body, batch, schema, &self.dictionaries, None, &message.version(),
+                    &body, batch, Arc::clone(&schema.schema), &dictionaries, None, &message.version(),
                 ).map_err(arrow)?;
-                let retained = self.memory.reserve(rtdb_columnar::shared_allocation_size(&batch).map_err(status)?).map_err(status)?;
-                let owned = OwnedBatch::with_reservation(batch, retained).map_err(status)?;
-                drop(charge); Ok(Some(owned))
+                OwnedBatch::with_shared_buffers(batch, grant, Arc::clone(&schema.reservation), |buffer| self.funds(buffer))
+                    .map(Some).map_err(status)
             }
             _ => Err(invalid("Unexpected Arrow Flight payload")),
         }
@@ -291,19 +353,21 @@ fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBat
 
 pub(crate) struct BoundParameters {
     batch: OwnedBatch,
-    _schema: Arc<MemoryReservation>,
+    _schema: Option<Arc<MemoryReservation>>,
 }
 
 impl BoundParameters {
     pub fn new(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>, Status> {
         let schema = memory.reserve(schema_bound(batch.batch().schema_ref())?).map_err(status)?;
-        let batch = match rtdb_format::ipc::adapt_stream_batch(batch.batch()).map_err(status)? {
-            Some(adapted) => OwnedBatch::with_reservation(adapted, Arc::clone(batch.reservation())).map_err(status)?,
-            None => batch,
+        let (batch, schema) = match rtdb_format::ipc::adapt_stream_batch(batch.batch()).map_err(status)? {
+            Some(adapted) => (batch.with_retained_buffers(adapted), Some(schema)),
+            None if batch.owns_schema() => (batch, None),
+            None => (batch, Some(schema)),
         };
         Ok(Arc::new(Self { batch, _schema: schema }))
     }
 
+    #[cfg(test)]
     pub fn empty(schema: &SchemaRef, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>, Status> {
         let bound = schema_bound(schema)?;
         let scratch = memory.reserve(mul(bound, 2)?).map_err(status)?;
