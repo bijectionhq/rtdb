@@ -23,6 +23,13 @@ pub struct ChangeHistory<'a> {
     pub now: Timestamp,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Rotation {
+    pub(crate) cut: Lsn,
+    pub(crate) generation: u64,
+    pub(crate) committed: bool,
+}
+
 pub(crate) struct Committed {
     pub(crate) transactions: TransactState,
     pub(crate) floor: Lsn,
@@ -32,6 +39,7 @@ pub(crate) struct Committed {
     pub(crate) lease: Option<(Epoch, i64)>,
     pub(crate) records: Vec<Record>,
     pub(crate) effects: Vec<AppliedEffects>,
+    pub(crate) rotation: Option<Rotation>,
 }
 
 impl Committed {
@@ -45,10 +53,26 @@ impl Committed {
             lease: None,
             records: Vec::new(),
             effects: Vec::new(),
+            rotation: None,
         }
     }
 
     pub(crate) async fn read_through(
+        stream: &Stream,
+        store: &dyn ObjectStore,
+        end: Lsn,
+        previous: Option<Self>,
+    ) -> Result<Self> {
+        match Self::read_prefix(stream, store, end, previous).await {
+            Err(error) if error.code == "rtdb/erased-under-view" => {
+                let cut = find_clean_checkpoint(stream, end).await?.ok_or(error)?;
+                Self::read_prefix(stream, store, end, Some(Self::empty(stream, cut))).await
+            }
+            result => result,
+        }
+    }
+
+    async fn read_prefix(
         stream: &Stream,
         store: &dyn ObjectStore,
         end: Lsn,
@@ -113,6 +137,13 @@ impl Committed {
         if lsn != next(self.head)? || entry.epoch < self.epoch {
             return Err(invalid("The journal records are out of order"));
         }
+        if let Some(rotation) = self.rotation
+            && !rotation.committed
+            && lsn > rotation.cut
+            && !matches!(&entry.record, Record::KeyRotate { .. })
+        {
+            return Err(invalid("The clean checkpoint is awaiting key rotation"));
+        }
         let mut receipt = None;
         let mut effects = None;
         let previous = self.transactions.index().head();
@@ -168,6 +199,16 @@ impl Committed {
                         "The checkpoint does not cover the preceding position",
                     ));
                 }
+                if checkpoint.key_generation != self.generation {
+                    if self.generation.checked_add(1) != Some(checkpoint.key_generation) {
+                        return Err(invalid("The checkpoint skips a key generation"));
+                    }
+                    self.rotation = Some(Rotation {
+                        cut: lsn,
+                        generation: checkpoint.key_generation,
+                        committed: false,
+                    });
+                }
                 checkpoint.key_generation
             }
             Record::KeyRotate { generation, at } => {
@@ -177,6 +218,16 @@ impl Committed {
                 {
                     return Err(invalid("Key rotation must follow its clean checkpoint"));
                 }
+                let rotation = self
+                    .rotation
+                    .as_mut()
+                    .filter(|rotation| {
+                        !rotation.committed
+                            && rotation.cut == Lsn(*at)
+                            && rotation.generation == *generation
+                    })
+                    .ok_or_else(|| invalid("Key rotation has no staged checkpoint"))?;
+                rotation.committed = true;
                 *generation
             }
             Record::Pin(_) | Record::Unpin { .. } => self.generation,
@@ -225,11 +276,20 @@ impl Committed {
         let (header, bytes) = image
             .contents()
             .payload
-            .split_first_chunk::<24>()
+            .split_first_chunk::<25>()
             .ok_or_else(|| invalid("The checkpoint image has no basis"))?;
         let position = u64::from_be_bytes(header[..8].try_into().unwrap());
         let system_time = Timestamp(i64::from_be_bytes(header[8..16].try_into().unwrap()));
-        let until = i64::from_be_bytes(header[16..].try_into().unwrap());
+        let until = i64::from_be_bytes(header[16..24].try_into().unwrap());
+        if header[24] == 1 {
+            self.rotation = Some(Rotation {
+                cut: lsn,
+                generation: checkpoint.key_generation,
+                committed: false,
+            });
+        } else if header[24] != 0 {
+            return Err(invalid("The checkpoint has an unknown generation marker"));
+        }
         if position > checkpoint.through {
             return Err(invalid("The checkpoint image extends past its cut"));
         }
@@ -242,13 +302,18 @@ impl Committed {
         Ok(())
     }
 
-    pub(crate) fn checkpoint_payload(&self, until: i64) -> Result<Vec<u8>> {
-        let cut = self.transactions.index().head();
-        let bytes = self.transactions.encode_checkpoint()?;
-        let mut payload = Vec::with_capacity(24 + bytes.len());
+    pub(crate) fn checkpoint_payload(
+        transactions: &TransactState,
+        until: i64,
+        rotating: bool,
+    ) -> Result<Vec<u8>> {
+        let cut = transactions.index().head();
+        let bytes = transactions.encode_checkpoint()?;
+        let mut payload = Vec::with_capacity(25 + bytes.len());
         payload.extend_from_slice(&cut.basis.position().to_be_bytes());
         payload.extend_from_slice(&cut.system_time.0.to_be_bytes());
         payload.extend_from_slice(&until.to_be_bytes());
+        payload.push(u8::from(rotating));
         payload.extend_from_slice(&bytes);
         Ok(payload)
     }
@@ -295,6 +360,54 @@ impl Committed {
         }
         Reachability::from_records(stream.database, epoch.0, &self.records, manifests.values())
     }
+}
+
+async fn find_clean_checkpoint(stream: &Stream, head: Lsn) -> Result<Option<Lsn>> {
+    let mut at = Lsn(1);
+    let mut possible = None;
+    let mut clean = None;
+    while at <= head {
+        let page = match stream.read(at).await {
+            Ok(page) => page,
+            Err(JournalError::Trimmed { floor }) if floor > at => {
+                possible = None;
+                at = floor;
+                continue;
+            }
+            Err(error) => return Err(journal_error(error)),
+        };
+        if page.records.first().is_none_or(|(lsn, _)| *lsn != at) {
+            return Err(journal_error(JournalError::Unavailable));
+        }
+        for (lsn, bytes) in page.records.into_iter().take_while(|(lsn, _)| *lsn <= head) {
+            if lsn != at {
+                return Err(invalid(
+                    "The journal page omitted part of the rotation prefix",
+                ));
+            }
+            at = next(lsn)?;
+            match stream.decode(lsn, &bytes).await {
+                Ok(Entry {
+                    record: Record::Checkpoint(checkpoint),
+                    ..
+                }) => possible = Some((lsn, checkpoint.key_generation)),
+                Ok(Entry {
+                    record:
+                        Record::KeyRotate {
+                            generation,
+                            at: cut,
+                        },
+                    ..
+                }) if possible == Some((Lsn(cut), generation)) => {
+                    clean = Some(Lsn(cut));
+                    possible = None;
+                }
+                Err(error) if error.code != "rtdb/erased-under-view" => return Err(error),
+                _ => possible = None,
+            }
+        }
+    }
+    Ok(clean)
 }
 
 fn invalid(message: &str) -> Anomaly {

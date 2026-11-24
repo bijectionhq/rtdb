@@ -4,15 +4,17 @@ use std::{
     sync::Arc,
 };
 
-use journal_contract::{JournalError, Lsn};
-use rtdb_crypt::tokens::TokenAuthority;
+use bytes::Bytes;
+use journal_contract::{Epoch, JournalError, Lsn};
+use rtdb_crypt::tokens::{TokenAuthority, VerifiedClaims};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
-    LINEARIZABLE, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, Transact, TransactState,
+    Decision, LINEARIZABLE, Receipt, ScopedTransact, TIMED_TRANSACT, Terminal, Transact,
+    TransactPipeline, TransactState, TransactionRecord, TxKey,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::LabelScope};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{ClaimVerifier, LabelScope}};
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, OnceCell, mpsc, oneshot},
     task::JoinHandle,
 };
 
@@ -21,39 +23,105 @@ use super::{
 };
 
 const CAPACITY: usize = 64;
+const FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT];
+const SCOPED_FEATURES: &[&str] = &[LINEARIZABLE, TIMED_TRANSACT, "row-visibility"];
 type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
-    Transact(Transact, Reply<Receipt>),
-    ScopedTransact(Transact, LabelScope, [u8; 32], Reply<Receipt>),
+    Transact(Work),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
+}
+
+struct Scope {
+    labels: LabelScope,
+    namespace: [u8; 32],
+}
+
+impl Scope {
+    fn authority(&self) -> ScopedTransact<'_> {
+        ScopedTransact {
+            labels: &self.labels,
+            receipt_namespace: self.namespace,
+        }
+    }
+}
+
+struct Work {
+    request: Transact,
+    scope: Option<Scope>,
+    claims: VerifiedClaims,
+    reply: Reply<Receipt>,
+}
+
+impl Work {
+    fn key(&self) -> TxKey {
+        TxKey {
+            namespace: self.scope.as_ref().map(|scope| scope.namespace),
+            key: self.request.key.clone(),
+        }
+    }
+
+    fn writes(&self) -> bool {
+        !self.request.ops.is_empty() || !self.request.otherwise.is_empty()
+    }
+
+    fn timed(&self) -> bool {
+        self.request.window.before.is_some()
+    }
 }
 
 pub struct WritePipeline {
     input: mpsc::Sender<Command>,
     task: JoinHandle<()>,
+    database: Arc<Mutex<MultiDatabase>>,
+    tokens: OnceCell<TokenAuthority>,
 }
 
 impl WritePipeline {
     pub fn start(database: Arc<Mutex<MultiDatabase>>) -> Self {
         let (input, receive) = mpsc::channel(CAPACITY);
-        let task = tokio::spawn(run(database, receive));
-        Self { input, task }
+        let task = tokio::spawn(run(Arc::clone(&database), receive));
+        Self { input, task, database, tokens: OnceCell::new() }
     }
 
     pub async fn transact(&self, request: Transact) -> Result<Receipt> {
-        let (reply, result) = oneshot::channel();
-        self.input
-            .send(Command::Transact(request, reply))
-            .await
-            .map_err(|_| pipeline_closed())?;
-        result.await.map_err(|_| pipeline_closed())?
+        self.submit(request, None).await
     }
 
-    pub async fn transact_scoped(&self, request: Transact, labels: LabelScope, receipt_namespace: [u8; 32]) -> Result<Receipt> {
+    pub async fn transact_scoped(
+        &self,
+        request: Transact,
+        labels: LabelScope,
+        receipt_namespace: [u8; 32],
+    ) -> Result<Receipt> {
+        self.submit(
+            request,
+            Some(Scope {
+                labels,
+                namespace: receipt_namespace,
+            }),
+        )
+        .await
+    }
+
+    async fn submit(&self, request: Transact, scope: Option<Scope>) -> Result<Receipt> {
+        let tokens = self
+            .tokens
+            .get_or_init(|| async { self.database.lock().await.token_authority() })
+            .await;
+        let claims = tokens
+            .verify_claims_in(request.claims(), scope.as_ref().map(|scope| &scope.labels))
+            .await;
         let (reply, result) = oneshot::channel();
-        self.input.send(Command::ScopedTransact(request, labels, receipt_namespace, reply))
-            .await.map_err(|_| pipeline_closed())?;
+        self.input
+            .send(Command::Transact(Work {
+                request,
+                scope,
+                claims,
+                reply,
+            }))
+            .await
+            .map_err(|_| pipeline_closed())?;
         result.await.map_err(|_| pipeline_closed())?
     }
 
@@ -73,79 +141,82 @@ impl Drop for WritePipeline {
     }
 }
 
-enum Staged {
-    Append {
-        write: Append,
-        reply: Reply<Receipt>,
-    },
-    Answer {
-        result: Result<Receipt>,
-        reply: Reply<Receipt>,
-    },
+struct Staged {
+    work: Work,
+    write: Append,
+    original_timed: bool,
 }
 
-impl Staged {
-    fn reject(self, error: Anomaly) {
-        let reply = match self {
-            Staged::Append { reply, .. } | Staged::Answer { reply, .. } => reply,
-        };
-        let _ = reply.send(Err(error));
-    }
+pub(super) struct Append {
+    pub(super) at: Lsn,
+    pub(super) entry: Entry,
 }
 
-struct Append {
-    at: Lsn,
-    receipt: Receipt,
-    entry: Entry,
-}
-
-struct Overlay {
-    transactions: TransactState,
-    head: Lsn,
-    generation: u64,
-    tokens: TokenAuthority,
-}
-
-struct Authority {
+pub(super) struct Authority {
     stream: Stream,
     clock: Arc<dyn Fn() -> Timestamp + Send + Sync>,
     drift_micros: i64,
-    lease: Lease,
+    pub(super) lease: Lease,
+    next: Lsn,
 }
 
 impl Authority {
-    async fn append(&self, write: &Append) -> std::result::Result<(), AttemptError> {
-        let bytes = self
-            .stream
-            .encode(write.at, &write.entry)
-            .await
-            .map_err(AttemptError::Local)?;
-        if (self.clock)().0.saturating_add(self.drift_micros) >= self.lease.until {
+    fn upper(&self) -> Timestamp {
+        Timestamp((self.clock)().0.saturating_add(self.drift_micros))
+    }
+
+    fn limit(&self) -> usize {
+        if self.stream.batch.is_some() {
+            CAPACITY
+        } else {
+            1
+        }
+    }
+
+    pub(super) async fn append(
+        &self,
+        writes: &[Append],
+    ) -> std::result::Result<Timestamp, AttemptError> {
+        let mut records = Vec::with_capacity(writes.len());
+        for (offset, write) in writes.iter().enumerate() {
+            if self.next.0.checked_add(offset as u64) != Some(write.at.0) {
+                return Err(AttemptError::Local(order_error(
+                    "The append group must follow the acknowledged prefix",
+                )));
+            }
+            let bytes = self
+                .stream
+                .encode(write.at, &write.entry)
+                .await
+                .map_err(AttemptError::Local)?;
+            records.push((write.at, bytes));
+        }
+        if self.upper().0 >= self.lease.until {
             return Err(AttemptError::Local(no_writer()));
         }
+        let expected = writes.last().expect("nonempty append group").at;
         let appended = self
             .stream
-            .append(self.lease.epoch, write.at, bytes)
+            .append_group(self.lease.epoch, records)
             .await
             .map_err(AttemptError::Journal)?;
-        if appended != write.at {
-            return Err(AttemptError::Local(Anomaly::fault(
-                "rtdb/journal-position",
-                "The append acknowledged a different position",
+        let upper = self.upper();
+        if appended != expected {
+            return Err(AttemptError::Local(order_error(
+                "The journal acknowledged a different group head",
             )));
         }
-        Ok(())
+        Ok(upper)
     }
 }
 
-enum AttemptError {
+pub(super) enum AttemptError {
     Local(Anomaly),
     Journal(JournalError),
 }
 
 async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Command>) {
     let mut barrier = None;
-    let mut cached_overlay = None;
     loop {
         let command = match barrier.take() {
             Some(command) => command,
@@ -155,37 +226,19 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             },
         };
         match command {
-            Command::Transact(request, reply) if ordinary(&request) => {
-                burst(
-                    &database,
-                    &mut input,
-                    &mut barrier,
-                    &mut cached_overlay,
-                    request,
-                    reply,
-                )
-                .await;
+            Command::Transact(work) if work.writes() => {
+                burst(&database, &mut input, &mut barrier, work).await;
             }
-            Command::Transact(request, reply) => {
-                let mut database = database.lock().await;
-                let result = database.transact(&request).await;
-                if database.role() == Role::Follower {
-                    cached_overlay = None;
-                }
-                let _ = reply.send(result);
-            }
-            Command::ScopedTransact(request, labels, receipt_namespace, reply) => {
-                let mut database = database.lock().await;
-                let scope = ScopedTransact { labels: &labels, receipt_namespace };
-                let result = database.transact_scoped(&request, scope).await;
-                cached_overlay = None;
-                let _ = reply.send(result);
+            Command::Transact(work) => {
+                let result = database
+                    .lock()
+                    .await
+                    .transact_in(&work.request, work.scope.as_ref().map(Scope::authority))
+                    .await;
+                let _ = work.reply.send(result);
             }
             Command::Tick(live, reply) => {
                 let result = database.lock().await.tick(&live).await;
-                if !matches!(result, Ok(Role::Writer(_))) {
-                    cached_overlay = None;
-                }
                 let _ = reply.send(result);
             }
         }
@@ -196,241 +249,544 @@ async fn burst(
     database: &Mutex<MultiDatabase>,
     input: &mut mpsc::Receiver<Command>,
     barrier: &mut Option<Command>,
-    cached_overlay: &mut Option<(Overlay, Authority)>,
-    first: Transact,
-    reply: Reply<Receipt>,
+    first: Work,
 ) {
-    let prepared = database
-        .lock()
-        .await
-        .start_overlay(cached_overlay.take())
-        .await;
-    let (mut overlay, authority) = match prepared {
-        Ok(values) => values,
-        Err(error) => {
-            let _ = reply.send(Err(error));
-            return;
-        }
-    };
-    let mut staged = VecDeque::from([overlay.stage(&authority, first, reply).await]);
+    let mut queued = vec![first];
+    fill(input, barrier, &mut queued, CAPACITY);
+    let mut staged = VecDeque::new();
+    stage_batch(&mut *database.lock().await, &mut staged, queued);
     let mut input_open = true;
-    loop {
-        while barrier.is_none() && staged.len() < CAPACITY {
-            let Ok(command) = input.try_recv() else { break };
-            overlay.admit(&authority, command, &mut staged, barrier).await;
-        }
-        let Some(next) = staged.pop_front() else {
-            *cached_overlay = Some((overlay, authority));
-            return;
-        };
-        let (write, reply) = match next {
-            Staged::Answer { result, reply } => {
-                let _ = reply.send(result);
-                continue;
+    while let Some(front) = staged.front() {
+        let authority = database
+            .lock()
+            .await
+            .append_authority(front.write.entry.epoch);
+        let authority = match authority {
+            Ok(authority) => authority,
+            Err(error) => {
+                fail(
+                    database,
+                    &mut staged,
+                    Vec::new(),
+                    AttemptError::Local(error),
+                )
+                .await;
+                return;
             }
-            Staged::Append { write, reply } => (write, reply),
         };
+        let mut writes = Vec::new();
+        let mut waiters = Vec::new();
+        let mut position = front.write.at;
+        while writes.len() < authority.limit()
+            && staged.front().is_some_and(|next| next.write.at == position)
+        {
+            let Staged {
+                work,
+                write,
+                original_timed,
+            } = staged.pop_front().expect("checked queue");
+            position = Lsn(write.at.0.saturating_add(1));
+            writes.push(write);
+            waiters.push((work, original_timed));
+            if original_timed {
+                break;
+            }
+        }
         let result = {
-            let append = authority.append(&write);
+            let append = authority.append(&writes);
             tokio::pin!(append);
             loop {
+                let occupied = staged.len() + writes.len();
                 tokio::select! {
                     result = &mut append => break result,
-                    command = input.recv(), if input_open && barrier.is_none() && staged.len() < CAPACITY => {
-                        if let Some(command) = command {
-                            overlay.admit(&authority, command, &mut staged, barrier).await;
-                        } else {
-                            input_open = false;
+                    command = input.recv(), if input_open && barrier.is_none() && occupied < CAPACITY => {
+                        match command {
+                            Some(Command::Transact(work)) if work.writes() => {
+                                let mut group = vec![work];
+                                fill(input, barrier, &mut group, CAPACITY - occupied);
+                                stage_batch(&mut *database.lock().await, &mut staged, group);
+                            }
+                            Some(command) => *barrier = Some(command),
+                            None => input_open = false,
                         }
                     }
                 }
             }
         };
-        let result = database
-            .lock()
-            .await
-            .publish_staged(authority.lease, write, result)
-            .await;
-        match result {
-            Ok(receipt) => {
-                let _ = reply.send(Ok(receipt));
-            }
+        let upper = match result {
+            Ok(upper) => upper,
             Err(error) => {
-                let _ = reply.send(Err(error));
-                for request in staged {
-                    request.reject(Anomaly::new(
-                        AnomalyCategory::Unavailable,
-                        "rtdb/speculative-write-withdrawn",
-                        "An earlier append failed before this write was issued",
-                    ));
-                }
+                fail(database, &mut staged, waiters, error).await;
                 return;
+            }
+        };
+        let positions: Vec<_> = writes.iter().map(|write| write.at).collect();
+        let mut database_guard = database.lock().await;
+        let mut receipts = match database_guard.publish_staged(authority.lease, writes).await {
+            Ok(receipts) => receipts.into_iter(),
+            Err(error) => {
+                drop(database_guard);
+                fail(database, &mut staged, waiters, AttemptError::Local(error)).await;
+                return;
+            }
+        };
+        for ((work, original_timed), position) in waiters.into_iter().zip(positions) {
+            if original_timed {
+                let terminal = database_guard.decide_terminal(authority.lease, position, upper);
+                let result = terminal.and_then(|(write, redecide)| {
+                    let queued = take_redecisions(&mut staged, &redecide)?;
+                    stage_batch(&mut database_guard, &mut staged, queued);
+                    Ok(write)
+                });
+                match result {
+                    Ok(write) => staged.push_front(Staged {
+                        work,
+                        write,
+                        original_timed: false,
+                    }),
+                    Err(error) => {
+                        drop(database_guard);
+                        fail(
+                            database,
+                            &mut staged,
+                            vec![(work, false)],
+                            AttemptError::Local(error),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            } else {
+                let result = match receipts.next() {
+                    Some(receipt)
+                        if receipt.basis.position() == position.0
+                            && receipt.key == work.key().key =>
+                    {
+                        database_guard
+                            .project_receipt(receipt, work.scope.as_ref().map(Scope::authority))
+                    }
+                    _ => Err(missing_receipt()),
+                };
+                let _ = work.reply.send(result);
             }
         }
     }
 }
 
-impl Overlay {
-    async fn admit(
-        &mut self,
-        authority: &Authority,
-        command: Command,
-        staged: &mut VecDeque<Staged>,
-        barrier: &mut Option<Command>,
-    ) {
-        match command {
-            Command::Transact(request, reply) if ordinary(&request) => {
-                staged.push_back(self.stage(authority, request, reply).await);
+fn take_redecisions(staged: &mut VecDeque<Staged>, keys: &[TxKey]) -> Result<Vec<Work>> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !staged
+        .iter()
+        .map(|item| item.work.key())
+        .eq(keys.iter().cloned())
+    {
+        return Err(order_error(
+            "The refused timed write returned a different queued suffix",
+        ));
+    }
+    Ok(staged.drain(..).map(|item| item.work).collect())
+}
+
+fn fill(
+    input: &mut mpsc::Receiver<Command>,
+    barrier: &mut Option<Command>,
+    queued: &mut Vec<Work>,
+    limit: usize,
+) {
+    while barrier.is_none() && queued.len() < limit {
+        match input.try_recv() {
+            Ok(Command::Transact(work)) if work.writes() => queued.push(work),
+            Ok(command) => *barrier = Some(command),
+            Err(_) => break,
+        }
+    }
+}
+
+fn stage_batch(database: &mut MultiDatabase, staged: &mut VecDeque<Staged>, queued: Vec<Work>) {
+    let mut eligible = Vec::with_capacity(queued.len());
+    for work in queued {
+        match reject_erasure(&work.request) {
+            Ok(()) => eligible.push(work),
+            Err(error) => {
+                let _ = work.reply.send(Err(error));
             }
-            command => *barrier = Some(command),
         }
     }
-
-    async fn stage(&mut self, authority: &Authority, request: Transact, reply: Reply<Receipt>) -> Staged {
-        match self.prepare(authority, &request).await {
-            Ok(Ok(write)) => Staged::Append { write, reply },
-            Ok(Err(answer)) => Staged::Answer {
-                result: Ok(answer),
-                reply,
-            },
-            Err(error) => Staged::Answer {
-                result: Err(error),
-                reply,
-            },
+    if eligible.is_empty() {
+        return;
+    }
+    if database.stream.batch.is_some()
+        && eligible.len() > 1
+        && eligible
+            .iter()
+            .all(|work| work.scope.is_none() && !work.timed())
+    {
+        let requests: Vec<_> = eligible.iter().map(|work| work.request.clone()).collect();
+        let claims = VerifiedClaims::union(eligible.iter().map(|work| &work.claims));
+        match database.decide_group(&requests, &claims) {
+            Ok(decisions) => {
+                for (work, decision) in eligible.into_iter().zip(decisions) {
+                    stage(database, staged, work, decision);
+                }
+            }
+            Err(error) => {
+                for work in eligible {
+                    let _ = work.reply.send(Err(error.clone()));
+                }
+            }
+        }
+    } else {
+        for work in eligible {
+            let decision = database.decide_one(
+                &work.request,
+                work.scope.as_ref().map(Scope::authority),
+                &work.claims,
+            );
+            stage(database, staged, work, decision);
         }
     }
+}
 
-    async fn prepare(
-        &mut self,
-        authority: &Authority,
-        request: &Transact,
-    ) -> Result<std::result::Result<Append, Receipt>> {
-        reject_erasure(request)?;
-        let at = next(self.head)?;
-        let claims = self.tokens.verify_claims(request.claims()).await;
-        let resolution = self.transactions.resolve(
-            request,
-            at.0,
-            (authority.clock)(),
-            &[LINEARIZABLE, TIMED_TRANSACT, "row-visibility"],
-            &claims,
-        )?;
-        let prepared = match resolution {
-            Resolution::Answer(answer) => return Ok(Err(answer)),
-            Resolution::Append(prepared) => prepared,
-        };
-        let record = prepared.into_record();
-        let payload = record.encode()?;
-        let receipt = self
-            .transactions
-            .apply(at.0, record)?
-            .ok_or_else(missing_receipt)?;
-        self.head = at;
-        let entry = Entry {
-            epoch: authority.lease.epoch,
-            generation: self.generation,
-            record: Record::Tx {
-                payload: payload.to_vec(),
-                objects: Vec::new(),
-            },
-        };
-        Ok(Ok(Append { at, receipt, entry }))
+fn stage(
+    database: &MultiDatabase,
+    staged: &mut VecDeque<Staged>,
+    work: Work,
+    decision: Result<Planned>,
+) {
+    match decision {
+        Ok(Planned::Append(write)) => staged.push_back(Staged {
+            original_timed: work.timed(),
+            work,
+            write,
+        }),
+        Ok(Planned::Answer(receipt)) => {
+            let receipt =
+                database.project_receipt(receipt, work.scope.as_ref().map(Scope::authority));
+            let _ = work.reply.send(receipt);
+        }
+        Err(error) => {
+            let _ = work.reply.send(Err(error));
+        }
     }
+}
+
+async fn fail(
+    database: &Mutex<MultiDatabase>,
+    staged: &mut VecDeque<Staged>,
+    waiters: Vec<(Work, bool)>,
+    error: AttemptError,
+) {
+    let error = database.lock().await.begin_write_recovery(error);
+    for (work, _) in waiters {
+        let _ = work.reply.send(Err(error.clone()));
+    }
+    for Staged { work, .. } in staged.drain(..) {
+        let _ = work.reply.send(Err(Anomaly::new(
+            AnomalyCategory::Interrupted,
+            "rtdb/speculative-write-withdrawn",
+            "An earlier append failed. Recover the write outcome with TxStatus",
+        )));
+    }
+    let mut database = database.lock().await;
+    if database.writer.is_some() {
+        let _ = database.recover_writer().await;
+    } else {
+        let _ = database.refresh().await;
+    }
+}
+
+pub(super) enum Planned {
+    Answer(Receipt),
+    Append(Append),
 }
 
 impl MultiDatabase {
-    async fn start_overlay(
+    pub(super) fn new_pipeline(&self) -> Result<TransactPipeline> {
+        let state = self.state();
+        let durable = &state.transactions;
+        let copy = TransactState::decode_checkpoint(
+            &durable.encode_checkpoint()?,
+            durable.index().head(),
+        )?;
+        TransactPipeline::new(copy, next(state.head)?.0, CAPACITY)
+    }
+
+    pub(super) fn decide_one(
         &mut self,
-        cached: Option<(Overlay, Authority)>,
-    ) -> Result<(Overlay, Authority)> {
-        if self.committed.is_none() {
-            self.refresh().await?;
+        request: &Transact,
+        scope: Option<ScopedTransact<'_>>,
+        claims: &dyn ClaimVerifier,
+    ) -> Result<Planned> {
+        let now = (self.clock)();
+        let decide = |pipeline: &mut TransactPipeline| match scope {
+            Some(scope) => {
+                pipeline.decide_scoped(request, now, SCOPED_FEATURES, claims, scope)
+            }
+            None => pipeline.decide(request, now, FEATURES, claims),
+        };
+        if request.ops.is_empty() && request.otherwise.is_empty() {
+            let validation = match self.writer.as_mut().filter(|writer| !writer.recovering) {
+                Some(writer) => decide(&mut writer.pipeline)?,
+                None => decide(&mut self.new_pipeline()?)?,
+            };
+            return match validation {
+                Decision::Answer(receipt) => Ok(Planned::Answer(receipt)),
+                Decision::Append { .. } => {
+                    Err(order_error("Validation allocated a journal record"))
+                }
+            };
         }
         let lease = self.authority()?;
-        self.refuse_pending(lease).await?;
-        let state = self.state();
-        if let Some((overlay, authority)) = cached
-            && overlay.head == state.head
-            && overlay.generation == state.generation
-            && authority.lease.epoch == lease.epoch
-            && authority.lease.until == lease.until
-        {
-            return Ok((overlay, authority));
-        }
+        self.require_armed_rotation()?;
+        let generation = self.state().generation;
+        let decision = decide(&mut self.writer.as_mut().ok_or_else(no_writer)?.pipeline)?;
+        plan(decision, lease, generation)
+    }
+
+    fn decide_group(
+        &mut self,
+        requests: &[Transact],
+        claims: &dyn ClaimVerifier,
+    ) -> Result<Vec<Result<Planned>>> {
+        let lease = self.authority()?;
+        self.require_armed_rotation()?;
+        let generation = self.state().generation;
+        let now = (self.clock)();
+        let writer = self.writer.as_mut().ok_or_else(no_writer)?;
+        Ok(writer
+            .pipeline
+            .decide_batch(requests, now, FEATURES, claims)
+            .into_iter()
+            .map(|decision| decision.and_then(|decision| plan(decision, lease, generation)))
+            .collect())
+    }
+
+    pub(super) fn decide_terminal(
+        &mut self,
+        lease: Lease,
+        at: Lsn,
+        upper: Timestamp,
+    ) -> Result<(Append, Vec<TxKey>)> {
+        let generation = self.state().generation;
+        let Terminal {
+            position,
+            record,
+            redecide,
+        } = self
+            .writer
+            .as_mut()
+            .ok_or_else(no_writer)?
+            .pipeline
+            .terminal(at.0, upper)?;
         Ok((
-            Overlay {
-                transactions: state.transactions.clone(),
-                head: state.head,
-                generation: state.generation,
-                tokens: self.tokens.clone(),
+            Append {
+                at: Lsn(position),
+                entry: Entry {
+                    epoch: lease.epoch,
+                    generation,
+                    record: journal_record(record)?,
+                },
             },
-            Authority {
-                stream: self.stream.clone(),
-                clock: Arc::clone(&self.clock),
-                drift_micros: self.options.drift_micros,
-                lease,
-            },
+            redecide,
         ))
     }
 
-    async fn publish_staged(
+    pub(super) fn append_authority(&self, epoch: Epoch) -> Result<Authority> {
+        let lease = self.authority()?;
+        if lease.epoch != epoch {
+            return Err(no_writer());
+        }
+        let acknowledged = self.writer.as_ref().ok_or_else(no_writer)?.acknowledged;
+        Ok(Authority {
+            stream: self.stream.clone(),
+            clock: Arc::clone(&self.clock),
+            drift_micros: self.options.drift_micros,
+            lease,
+            next: next(acknowledged)?,
+        })
+    }
+
+    pub(super) async fn publish_staged(
+        &mut self,
+        lease: Lease,
+        writes: Vec<Append>,
+    ) -> Result<Vec<Receipt>> {
+        let through = writes.last().expect("nonempty append group").at;
+        if self.committed.is_none() {
+            self.catch_up(through).await?;
+        }
+        let mut state = self.committed.take().ok_or_else(no_writer)?;
+        for Append { at, entry } in writes {
+            if at > state.head {
+                state.apply(at, entry)?;
+            }
+        }
+        self.committed = Some(state);
+        self.require_authority(lease)?;
+        let writer = self
+            .writer
+            .as_mut()
+            .filter(|writer| !writer.recovering && writer.lease.epoch == lease.epoch)
+            .ok_or_else(no_writer)?;
+        match writer.pipeline.acknowledge(through.0) {
+            Ok(receipts) => {
+                writer.acknowledged = through;
+                Ok(receipts)
+            }
+            Err(error) => {
+                self.withdraw_writer();
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn begin_write_recovery(&mut self, error: AttemptError) -> Anomaly {
+        let anomaly = match error {
+            AttemptError::Journal(
+                error @ (JournalError::Fenced { .. } | JournalError::Deleted),
+            ) => self.mutation_failed(error),
+            AttemptError::Journal(error) => super::journal_error(error),
+            AttemptError::Local(error) => error,
+        };
+        if let Some(writer) = &mut self.writer {
+            writer.pipeline.withdraw();
+            writer.recovering = true;
+        }
+        interrupted(anomaly)
+    }
+
+    pub(super) async fn recover_writer(&mut self) -> Result<()> {
+        let Some(writer) = self.writer.as_ref().filter(|writer| writer.recovering) else {
+            return Ok(());
+        };
+        let lease = writer.lease;
+        let acknowledged = writer.acknowledged;
+        self.require_authority(lease)?;
+        let head = match self.stream.seal(lease.epoch).await {
+            Ok(head) => head,
+            Err(error @ (JournalError::Fenced { .. } | JournalError::Deleted)) => {
+                return Err(self.mutation_failed(error));
+            }
+            Err(error) => return Err(super::journal_error(error)),
+        };
+        self.catch_up(head).await?;
+        self.require_authority(lease)?;
+        let state = self.committed.as_ref().ok_or_else(no_writer)?;
+        if state.epoch > lease.epoch
+            || acknowledged.0.saturating_add(1) < state.floor.0
+            || head < acknowledged
+        {
+            self.withdraw_writer();
+            return Err(no_writer());
+        }
+        let writer = self.writer.as_mut().ok_or_else(no_writer)?;
+        for (offset, record) in state.records.iter().enumerate() {
+            let position = state.floor.0 + offset as u64;
+            if position <= acknowledged.0 {
+                continue;
+            }
+            let recovered = match record {
+                Record::Tx { payload, .. } => Some(writer.pipeline.recover(position, payload)),
+                Record::Settle { tx_lsn } => {
+                    let bytes = TransactionRecord::Settle { tx_lsn: *tx_lsn }.encode()?;
+                    Some(writer.pipeline.recover(position, &bytes))
+                }
+                Record::Refuse { tx_lsn } => {
+                    let bytes = TransactionRecord::Refuse { tx_lsn: *tx_lsn }.encode()?;
+                    Some(writer.pipeline.recover(position, &bytes))
+                }
+                _ => None,
+            };
+            if let Some(recovered) = recovered {
+                recovered?;
+            }
+            writer.acknowledged = Lsn(position);
+        }
+        writer.pipeline.resume(next(head)?.0)?;
+        if let Some((epoch, until)) = state.lease
+            && epoch == lease.epoch
+        {
+            writer.lease.until = writer.lease.until.max(until);
+        }
+        writer.recovering = false;
+        if let Some(TransactionRecord::Refuse { tx_lsn }) = state.transactions.recover_pending() {
+            let (terminal, _) = self
+                .decide_terminal(lease, Lsn(tx_lsn), Timestamp::MAX)
+                .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
+            self.commit_one(lease, terminal).await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn commit_one(
         &mut self,
         lease: Lease,
         write: Append,
-        result: std::result::Result<(), AttemptError>,
-    ) -> Result<Receipt> {
-        match result {
-            Ok(()) => {}
-            Err(AttemptError::Journal(error)) => return Err(self.mutation_failed(error)),
-            Err(AttemptError::Local(error)) => {
-                self.writer = None;
-                return Err(error);
-            }
+    ) -> Result<(Timestamp, Vec<Receipt>)> {
+        let authority = self.append_authority(lease.epoch)?;
+        let writes = vec![write];
+        let upper = authority
+            .append(&writes)
+            .await
+            .map_err(|error| self.begin_write_recovery(error))?;
+        let receipts = self
+            .publish_staged(lease, writes)
+            .await
+            .map_err(|error| self.begin_write_recovery(AttemptError::Local(error)))?;
+        Ok((upper, receipts))
+    }
+
+    pub(super) fn withdraw_writer(&mut self) {
+        if let Some(mut writer) = self.writer.take() {
+            writer.pipeline.withdraw();
         }
-        let Append { at, receipt, entry } = write;
-        let previous = Lsn(at.0 - 1);
-        let landed = match self.committed.as_mut() {
-            Some(state) if state.head == previous => match state
-                .apply(at, entry)
-                .and_then(|receipt| receipt.ok_or_else(missing_receipt))
-            {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    self.committed = None;
-                    self.writer = None;
-                    return Err(error);
-                }
-            },
-            Some(state) if state.head >= at => Receipt {
-                replayed: false,
-                ..state.transactions.tx_status(&receipt.key)?
-            },
-            _ => {
-                self.refresh().await?;
-                Receipt {
-                    replayed: false,
-                    ..self.state().transactions.tx_status(&receipt.key)?
-                }
-            }
-        };
-        if landed != receipt {
-            self.committed = None;
-            self.writer = None;
-            return Err(Anomaly::fault(
-                "rtdb/journal-receipt",
-                "The committed receipt differs from the resolved write",
-            ));
-        }
-        self.require_authority(lease)?;
-        if self.authority()?.epoch != lease.epoch {
-            return Err(no_writer());
-        }
-        Ok(receipt)
     }
 }
 
-fn ordinary(request: &Transact) -> bool {
-    request.window.before.is_none() && (!request.ops.is_empty() || !request.otherwise.is_empty())
+fn plan(decision: Decision, lease: Lease, generation: u64) -> Result<Planned> {
+    Ok(match decision {
+        Decision::Answer(receipt) => Planned::Answer(receipt),
+        Decision::Append { position, record } => Planned::Append(Append {
+            at: Lsn(position),
+            entry: Entry {
+                epoch: lease.epoch,
+                generation,
+                record: journal_record(record)?,
+            },
+        }),
+    })
+}
+
+fn journal_record(payload: Bytes) -> Result<Record> {
+    Ok(match TransactionRecord::decode(&payload)? {
+        TransactionRecord::Tx(_) => Record::Tx {
+            payload: payload.to_vec(),
+            objects: Vec::new(),
+        },
+        TransactionRecord::Settle { tx_lsn } => Record::Settle { tx_lsn },
+        TransactionRecord::Refuse { tx_lsn } => Record::Refuse { tx_lsn },
+    })
+}
+
+pub(super) fn receipt_for(receipts: Vec<Receipt>, position: Lsn, key: &[u8]) -> Result<Receipt> {
+    receipts
+        .into_iter()
+        .find(|receipt| receipt.basis.position() == position.0 && receipt.key == key)
+        .ok_or_else(missing_receipt)
+}
+
+fn interrupted(error: Anomaly) -> Anomaly {
+    Anomaly::new(
+        AnomalyCategory::Interrupted,
+        error.code,
+        "The write outcome is unknown. Recover it with TxStatus",
+    )
+}
+
+fn order_error(message: &str) -> Anomaly {
+    Anomaly::fault("rtdb/transaction-order", message)
 }
 
 fn pipeline_closed() -> Anomaly {

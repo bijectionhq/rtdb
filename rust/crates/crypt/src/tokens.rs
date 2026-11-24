@@ -379,6 +379,19 @@ impl TokenIssuer {
 
 pub struct VerifiedClaims(Vec<(Claim, Result<ClaimEvidence>)>);
 
+impl VerifiedClaims {
+    /// Combines verifications made under the same read scope, for a group resolved in one pass.
+    pub fn union<'a>(sets: impl IntoIterator<Item = &'a VerifiedClaims>) -> Self {
+        let mut verified: Vec<(Claim, Result<ClaimEvidence>)> = Vec::new();
+        for (claim, result) in sets.into_iter().flat_map(|set| set.0.iter()) {
+            if !verified.iter().any(|(known, _)| known == claim) {
+                verified.push((claim.clone(), result.clone()));
+            }
+        }
+        Self(verified)
+    }
+}
+
 impl ClaimVerifier for VerifiedClaims {
     fn verify(&self, claim: &Claim) -> Result<ClaimEvidence> {
         self.0

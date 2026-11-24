@@ -847,12 +847,17 @@ contract FencedStreamWriter {
         -- The writer appends Settle only after the original durable acknowledgement arrives before the exclusive cutoff under the clock bound.
         -- Recovery appends Refuse for a pending timed transaction before admitting writes.
         -- A pending transaction has no visible effects.
+        -- The writer may decide later requests against the tentative settled state while the original append is in flight.
+        -- The terminal slot precedes every later append.
+        -- Refuse returns the unsent suffix for redecision against the refused state.
 
     @invariant SpeculativeWriteSuffix
         -- The writer resolves ordinary requests in order against a private overlay of its durable prefix and staged writes.
         -- An ordinary transaction has one journal append.
         -- A reply that depends on staged writes follows their durable acknowledgements.
         -- A rejected append withdraws the dependent unacknowledged suffix.
+        -- A writer that still holds its epoch recovers the committed suffix before resuming at the next journal position.
+        -- Receipt identity includes both the receipt namespace and the idempotency key.
         -- Reads and status lookups use the committed fold.
 
     @invariant CheckpointRecovery
@@ -900,6 +905,8 @@ contract EpochScopedStorage {
         -- Erasure publishes a clean checkpoint recoverable under the next generation and then commits rotation at its cut.
         -- The writer arms the retiring generation's key-grant deadline and trims to the clean checkpoint.
         -- Key custody refuses old-generation delivery at the deadline and destroys the retiring generation once the deadline has elapsed.
+        -- A replacement resumes an incomplete rotation from the adjacent checkpoint and rotation records.
+        -- The original durable rotation time fixes the deadline across retries and writer replacement.
 }
 
 ------------------------------------------------------------
