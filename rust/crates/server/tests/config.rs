@@ -85,7 +85,7 @@ fn startup_auth_rules_remain_ordered_and_default_oidc_to_reference_trust() {
     let AuthConfig::UserList { users, rules, .. } = config.auth else { panic!() };
     assert_eq!(users["alice"].encoded(), "encoded");
     assert_eq!(rules[0].method, Method::Password);
-    assert_eq!(rules[1].remote_address.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rules[1].remote_address.as_ref().map(|block| block.as_str()), Some("127.0.0.1"));
     let config = decode("authn: !OpenIdConnect\n  issuerUrl: http://localhost:8080/realm\n  clientId: db\n  clientSecret: secret").unwrap();
     let AuthConfig::OpenIdConnect(config) = config.auth else { panic!() };
     assert_eq!(config.rules[0].method, Method::Trust);
@@ -129,6 +129,12 @@ fn scan_tie_order_uses_an_explicit_positive_naming_epoch() {
     let config = decode("compactor: {scanTieOrderFromNamingEpoch: 7}").unwrap();
     let options = config.node_options(1 << 20).unwrap();
     assert_eq!(options.compaction.scan_tie_order_from_naming_epoch.unwrap().get(), 7);
+}
+
+#[test]
+fn a_malformed_auth_rule_remote_address_stops_the_configuration_loading() {
+    let error = decode("authn: !UserList\n  users: {}\n  rules:\n    - method: TRUST\n      remoteAddress: 10.0.0.0/33\n").unwrap_err();
+    assert_eq!(error.code, "xtdb.authn/invalid-remote-address");
 }
 
 #[test]

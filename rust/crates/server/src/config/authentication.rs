@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use rtdb_auth::{AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret};
+use rtdb_auth::{AddressBlock, AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
 use rtdb_types::{Anomaly, Result};
 use super::invalid;
@@ -54,7 +54,7 @@ fn rules(values: Option<Vec<Yaml>>, default: Method) -> Result<Vec<MethodRule>> 
             "TRUST" => Method::Trust, "PASSWORD" => Method::Password, "DEVICE_AUTH" => Method::DeviceAuth, "CLIENT_CREDENTIALS" => Method::ClientCredentials,
             _ => return Err(invalid("Unknown authentication method")),
         };
-        let rule = MethodRule { method, user: fields.nullable_string("user")?, remote_address: fields.nullable_string("remoteAddress")? };
+        let rule = MethodRule { method, user: fields.nullable_string("user")?, remote_address: fields.nullable_string("remoteAddress")?.as_deref().map(AddressBlock::parse).transpose()? };
         fields.finish()?;
         Ok::<_, Anomaly>(rule)
     }).collect()).unwrap_or_else(|| Ok(vec![MethodRule::any(default)]))

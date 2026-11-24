@@ -16,6 +16,8 @@ Root authentication requires the username `xtdb` when a password is configured.
 Absent a password, its network rule selects trust.
 The user-list authenticator retains tagged Argon2id and bcrypt encodings and applies the first matching rule.
 An unknown remote address rejects a matching address-constrained rule before later rules are considered.
+A rule's remote address is an IP address or CIDR block, parsed at configuration load; a malformed one fails the load.
+A caller matches it under the prefix mask, with IPv4-mapped IPv6 compared as IPv4, and a caller address that is not an IP literal counts as unknown.
 Trusted embedded callers may construct principals independently of network rules, as in the pinned public API.
 Unauthenticated embedded connections retain a null user.
 

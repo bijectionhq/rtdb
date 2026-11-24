@@ -36,7 +36,7 @@ fn edn_authentication_retains_its_default_differences_from_yaml() {
     let AuthConfig::UserList { users, rules, .. } = config.auth else { panic!("expected user list") };
     assert_eq!(users["alice"].encoded(), "encoded");
     assert_eq!(rules[0].method, Method::Password);
-    assert_eq!(rules[0].remote_address.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rules[0].remote_address.as_ref().map(|block| block.as_str()), Some("127.0.0.1"));
 }
 
 #[test]

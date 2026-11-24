@@ -3,6 +3,7 @@ mod oidc;
 mod password;
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,22 +38,68 @@ pub enum Method { Trust, Password, DeviceAuth, ClientCredentials }
 pub struct MethodRule {
     pub method: Method,
     pub user: Option<String>,
-    pub remote_address: Option<String>,
+    pub remote_address: Option<AddressBlock>,
 }
 impl MethodRule {
     pub fn any(method: Method) -> Self { Self { method, user: None, remote_address: None } }
 }
 
+/// An IP address or CIDR block that a rule's `remoteAddress` names; a bare address is a full /32 or /128.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AddressBlock { text: String, network: IpAddr, prefix_length: u8 }
+
+impl AddressBlock {
+    pub fn parse(text: &str) -> Result<Self> {
+        let malformed = || Anomaly::incorrect("xtdb.authn/invalid-remote-address", format!("remoteAddress must be an IP address or CIDR block: {text}"));
+        let (address, prefix) = match text.split_once('/') { Some((address, prefix)) => (address, Some(prefix)), None => (text, None) };
+        // Java turns IPv4-mapped IPv6 into plain IPv4, so `::ffff:10.0.0.0/8` is 10.0.0.0/8 and `::ffff:0:0/96` is malformed.
+        let network = address.parse::<IpAddr>().map_err(|_| malformed())?.to_canonical();
+        let maximum = if network.is_ipv4() { 32 } else { 128 };
+        let prefix_length = match prefix {
+            None => maximum,
+            Some(prefix) if (1..=3).contains(&prefix.len()) && prefix.bytes().all(|byte| byte.is_ascii_digit()) =>
+                prefix.parse::<u8>().ok().filter(|length| *length <= maximum).ok_or_else(malformed)?,
+            Some(_) => return Err(malformed()),
+        };
+        Ok(Self { text: text.to_owned(), network, prefix_length })
+    }
+
+    pub fn as_str(&self) -> &str { &self.text }
+
+    pub fn contains(&self, address: IpAddr) -> bool {
+        let mask = |bits: u32| if self.prefix_length == 0 { 0 } else { u128::MAX << (bits - u32::from(self.prefix_length)) };
+        match (self.network, address.to_canonical()) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let mask = mask(32) as u32;
+                u32::from(network) & mask == u32::from(address) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let mask = mask(128);
+                u128::from(network) & mask == u128::from(address) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl TryFrom<String> for AddressBlock {
+    type Error = Anomaly;
+    fn try_from(text: String) -> Result<Self> { Self::parse(&text) }
+}
+impl From<AddressBlock> for String {
+    fn from(block: AddressBlock) -> Self { block.text }
+}
+
 /// Matches in order; an address-constrained matching user rejects an unknown address immediately.
+/// A remote address that isn't an IP literal is treated as unknown.
 pub fn method_for(rules: &[MethodRule], user: Option<&str>, remote_address: Option<&str>) -> Option<Method> {
+    let caller = remote_address.and_then(|address| address.parse::<IpAddr>().ok());
     for rule in rules {
         if rule.user.as_deref().is_some_and(|required| Some(required) != user) { continue; }
-        match (&rule.remote_address, remote_address) {
-            (None, _) => return Some(rule.method),
-            (Some(_), None) => return None,
-            (Some(required), Some(actual)) if required == actual => return Some(rule.method),
-            _ => (),
-        }
+        let Some(block) = &rule.remote_address else { return Some(rule.method) };
+        let caller = caller?;
+        if block.contains(caller) { return Some(rule.method); }
     }
     None
 }
