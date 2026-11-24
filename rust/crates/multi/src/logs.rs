@@ -93,7 +93,7 @@ struct DeploymentReceipts {
 }
 
 const RECEIPT_ASSOCIATED: &str = "rtdb.multi/placed-await/v1";
-const SQL_SNAPSHOT_ASSOCIATED: &str = "rtdb.multi/sql-snapshot/v1";
+const SQL_SNAPSHOT_ASSOCIATED: &str = "rtdb.multi/sql-snapshot/v2";
 
 impl PlacedReceiptCodec for DeploymentReceipts {
     fn scope(&self) -> PlacedAttemptScope { self.scope }
@@ -670,8 +670,19 @@ impl Log for SealedLog {
         Ok(Box::new(SealedTail { inner: self.inner.tail(after).await?, units: Arc::clone(&self.units), hold: None, admission: self.recovery.clone() }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
-        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, units: Arc::clone(&self.units), admission: self.recovery.clone() }))
+        Ok(Box::new(SealedRange { inner: self.inner.range(from, to).await?, units: Arc::clone(&self.units), admission: self.recovery.clone(), protected: None }))
     }
+    async fn protect_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<rtdb_storage::log::ProtectedLogRange> {
+        let absent = || rtdb_storage::Error::Closed("The replica interval has no durable custody hold".into());
+        let admission = self.recovery.as_ref().ok_or_else(absent)?;
+        let after = from.0.checked_sub(1).map(LogOffset).ok_or_else(absent)?;
+        let through = to.0.checked_sub(1).map(LogOffset).ok_or_else(absent)?;
+        let hold = Arc::new(admission.hold(after, through).await?.ok_or_else(absent)?);
+        let inner = self.inner.range(from, to).await?;
+        let range = Box::new(SealedRange { inner, units: Arc::clone(&self.units), admission: None, protected: Some(Arc::clone(&hold)) });
+        Ok(rtdb_storage::log::ProtectedLogRange { range, hold })
+    }
+
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {
         let mut records = open_records(&self.units, self.inner.read_range(from, to).await?).await?;
         if let Some(admission) = &self.recovery { admission.retain_offloaded(&mut records).await?; }
@@ -754,7 +765,12 @@ async fn open_records(units: &JournalUnits, records: Vec<LogRecord>) -> rtdb_sto
     Ok(opened)
 }
 
-struct SealedRange { inner: Box<dyn LogRange>, units: Arc<JournalUnits>, admission: Option<RecoveryAdmission> }
+struct SealedRange {
+    inner: Box<dyn LogRange>,
+    units: Arc<JournalUnits>,
+    admission: Option<RecoveryAdmission>,
+    protected: Option<Arc<ReplayHold>>,
+}
 
 #[async_trait]
 impl LogRange for SealedRange {
@@ -765,7 +781,11 @@ impl LogRange for SealedRange {
         }
         let Some(record) = self.inner.next(reservation).await? else { return Ok(None); };
         let mut record = self.units.open_record(record).await?;
-        if let Some(admission) = &self.admission { admission.retain_offloaded(std::slice::from_mut(&mut record)).await?; }
+        if let Some(hold) = &self.protected {
+            hold.retain_record(&mut record)?;
+        } else if let Some(admission) = &self.admission {
+            admission.retain_offloaded(std::slice::from_mut(&mut record)).await?;
+        }
         Ok(Some(record))
     }
 }

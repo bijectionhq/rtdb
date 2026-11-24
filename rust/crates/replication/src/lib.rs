@@ -13,6 +13,7 @@ mod replay_closure;
 mod repair;
 mod repair_decision;
 mod retirement_receipt;
+mod snapshot_replay;
 mod state;
 mod table_replay;
 

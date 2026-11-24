@@ -164,6 +164,13 @@ impl PartitionLogs {
         let (from, to) = inspection_offsets(from.0, to.0, self.replica_epoch)?;
         self.replica.range(from, to).await.map_err(Into::into)
     }
+    pub(crate) async fn protected_snapshot_range(
+        &self, start: ReplicaPosition, end: ReplicaPosition,
+    ) -> Result<rtdb_storage::log::ProtectedLogRange> {
+        let (from, to) = inspection_offsets(start.0, end.0, self.replica_epoch)?;
+        self.replica.protect_range(from, to).await.map_err(Into::into)
+    }
+
     pub fn validate_source_boundary(&self, database: &str, after: SourcePosition) -> Result<()> {
         let offset = after.after_offset(self.source_epoch);
         let latest = self.source.latest()?.0;

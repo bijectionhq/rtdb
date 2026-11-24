@@ -163,6 +163,10 @@
 -- The clock target must be at or before source append.
 -- An ordered receipt reads the assigned transaction position from its winning assertion after publication.
 -- Attempt recovery can join that position to its original receiver observation on the retained Root cut.
+-- A placed SQL snapshot token seals its journal generation and checkpoint digest.
+-- After restart, the reader can rebuild the exact retained cut from that checkpoint and its protected suffix.
+-- Suffix replay retains custody through answer release and refuses a missing interval or a different installed data head.
+-- An erased replay interval reports erasure.
 -- An installed finite-period FactStore relation can count its complete owned membership at the receiver's valid-time cut.
 -- In a Proposal, local period rows and absence shadows mask the same identity in the held parent at that cut.
 -- An installed sample projection folds the complete assertion population per series in accepted order and counts each surviving sample coordinate once.

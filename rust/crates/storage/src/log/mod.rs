@@ -97,6 +97,12 @@ impl LogRecord {
     }
 }
 
+/// An authenticated interval with a custody owner retained through answer release.
+pub struct ProtectedLogRange {
+    pub range: Box<dyn LogRange>,
+    pub hold: Arc<dyn Send + Sync>,
+}
+
 #[async_trait]
 pub trait LogRange: Send {
     /// The caller reserves this many bytes before each read; returned payloads retain that charge.
@@ -245,6 +251,10 @@ pub trait Log: Send + Sync {
     /// Captures record starts in [from, to), bounded by the current durable tip.
     /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn LogRange>>;
+    /// Acquires the original retained interval and its erasure protection.
+    async fn protect_range(&self, _from: LogOffset, _to: LogOffset) -> Result<ProtectedLogRange> {
+        Err(Error::Closed("The journal does not admit protected exact replay".into()))
+    }
     /// Reads record starts in [from, to), rejecting a missing retained start position.
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>>;
 }

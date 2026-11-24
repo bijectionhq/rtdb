@@ -1346,17 +1346,8 @@ impl ReplicationDriver {
     fn stale(&self, record: &ReplicaRecord) -> bool {
         let progress = self.progress.current();
         let block = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
-        match &record.envelope.message {
-            ReplicaBody::ResolvedTx(message) => self.leader.as_ref().is_none_or(|leader| leader.term != record.envelope.term)
-                && message.tx_id.unwrap_or_default() <= progress.tx_id().0,
-            ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
-            ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
-            ReplicaBody::ArtefactsRemoved(message) => message.source_msg_id.unwrap_or_default() <= progress.source_position.0,
-            ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
-            ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
-            ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|source| source <= progress.source_position.0),
-            ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::OversizedMessage(_) => false,
-        }
+        stale_replica_body(&record.envelope.message, progress.tx_id().0, progress.source_position.0, block,
+            self.leader.as_ref().is_some_and(|leader| leader.term == record.envelope.term))
     }
     fn complete_control(&mut self, record: &ReplicaRecord) {
         if let Some(leader) = &mut self.leader {
@@ -1780,7 +1771,22 @@ impl ReplicationDriver {
     }
 }
 
-fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<TableRef, Vec<CatalogTrie>>> {
+pub(crate) fn stale_replica_body(
+    body: &ReplicaBody, transaction: i64, source: i64, block: i64, own_term: bool,
+) -> bool {
+    match body {
+        ReplicaBody::ResolvedTx(message) => !own_term && message.tx_id.unwrap_or_default() <= transaction,
+        ReplicaBody::TriesAdded(message) => message.source_msg_id.unwrap_or_default() <= source,
+        ReplicaBody::ArtefactsAdded(message) => message.source_msg_id.unwrap_or_default() <= source,
+        ReplicaBody::ArtefactsRemoved(message) => message.source_msg_id.unwrap_or_default() <= source,
+        ReplicaBody::BlockBoundary(message) => message.block_index.unwrap_or_default() <= block,
+        ReplicaBody::BlockUploaded(message) => message.block_index.unwrap_or_default() <= block,
+        ReplicaBody::NoOp(message) => message.src_msg_id.is_some_and(|position| position <= source),
+        ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::OversizedMessage(_) => false,
+    }
+}
+
+pub(crate) fn additions(details: &[proto::TrieDetails]) -> Result<BTreeMap<TableRef, Vec<CatalogTrie>>> {
     let mut result = BTreeMap::new();
     for detail in details {
         let table = legacy_table_ref(detail.table_name.as_deref().unwrap_or_default())?;

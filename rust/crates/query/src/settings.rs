@@ -29,6 +29,7 @@ impl SqlSnapshotView {
 
     pub fn from_exact_partition(
         current: &QueryContext, snapshot: rtdb_index::Snapshot, current_time: Instant,
+        suffix: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Self> {
         let mut catalog = current.catalog.clone();
         let database = Arc::make_mut(&mut catalog.databases).get_mut(&catalog.default_database)
@@ -36,7 +37,7 @@ impl SqlSnapshotView {
             .ok_or_else(|| invalid("snapshot-scope", "An exact partition must replace one admitted partition"))?;
         database.partitions[0] = snapshot;
         // Resolve all file grants again for the replacement partition.
-        catalog.reset_sql_snapshot_view();
+        catalog.reset_sql_snapshot_view(suffix);
         Ok(Self { catalog, current_time, timezone: current.timezone.clone() })
     }
 }

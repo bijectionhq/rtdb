@@ -255,6 +255,11 @@ impl BlockStore {
         self.restore(config, source_floor, now, discovery, published, selected, false)
     }
 
+    /// An exact SQL replay beginning before its first checkpoint.
+    pub fn empty_snapshot_base(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp) -> Result<RecoveredPartition> {
+        self.restore(config, source_floor, now, BlockDiscovery::At(BlockIndex(-1)), None, None, false)
+    }
+
     /// Restore an exact published business checkpoint without opening its receipt tables.
     pub async fn recover_held(&self, config: TrieConfig, source_floor: SourcePosition, now: Timestamp, checkpoint: PublishedCheckpoint) -> Result<RecoveredPartition> {
         IoRegion::reading_recovery(self.store.as_ref(), async {

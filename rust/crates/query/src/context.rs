@@ -60,6 +60,7 @@ pub struct CatalogSnapshot {
     pub(crate) fragment_residence: Option<crate::FragmentResidence>,
     read_lease: Option<Arc<rtdb_storage::ReadLease>>,
     read_view: Arc<tokio::sync::OnceCell<Arc<rtdb_storage::HeldView>>>,
+    snapshot_suffix: Option<Arc<dyn Send + Sync>>,
 }
 
 impl CatalogSnapshot {
@@ -70,7 +71,7 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default() })
+        Ok(Self { default_database, databases: Arc::new(databases), transaction_scoped, owned_relation: None, owned_position_mask: None, owned_read_guard: None, runtime: None, ordered_indexes: None, fragmenter: None, fragment_residence: None, read_lease: None, read_view: Arc::default(), snapshot_suffix: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn with_ordered_indexes(mut self, inventory: Arc<dyn OrderedIndexInventory>) -> Self {
@@ -86,8 +87,9 @@ impl CatalogSnapshot {
     /// Provider requests for this catalog's files begin only while the lease admits them.
     pub fn with_read_lease(mut self, lease: Arc<rtdb_storage::ReadLease>) -> Self { self.read_lease = Some(lease); self }
     pub fn read_lease(&self) -> Option<Arc<rtdb_storage::ReadLease>> { self.read_lease.clone() }
-    pub(crate) fn reset_sql_snapshot_view(&mut self) {
+    pub(crate) fn reset_sql_snapshot_view(&mut self, suffix: Option<Arc<dyn Send + Sync>>) {
         self.read_view = Arc::default();
+        self.snapshot_suffix = suffix;
         self.fragmenter = None;
         self.fragment_residence = None;
     }

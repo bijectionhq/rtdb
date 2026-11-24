@@ -622,21 +622,25 @@ impl Node {
             .map(|context| context.with_query_cpu(query_cpu))
     }
 
-    pub(crate) async fn recover_sql_snapshot_checkpoint(
-        &self, database: &Database, cut: CatalogCut, checkpoint: rtdb_replication::PublishedCheckpoint,
+    pub(crate) async fn recover_sql_snapshot(
+        &self, database: &Database, cut: CatalogCut, checkpoint: Option<rtdb_replication::PublishedCheckpoint>,
         cancellation: &CancellationToken,
-    ) -> Result<rtdb_index::Snapshot> {
+    ) -> Result<(rtdb_index::Snapshot, Option<Arc<dyn Send + Sync>>)> {
         let storage = &database.storage;
         let hold = storage.hold_catalog(Some(cut)).await?;
         if !hold.is_registered() { return Err(crate::sql_snapshots::unretained()); }
         let blocks = rtdb_replication::BlockStore::new(Arc::clone(storage.object_store()),
             Arc::clone(storage), Arc::clone(self.memory()), self.factory.options.file_size_target)?;
-        let recovered = cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
-            database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
-            .await.ok_or_else(cancelled)??;
+        let mut recovered = match checkpoint {
+            Some(checkpoint) => cancellation.run_until_cancelled(blocks.recover(self.factory.options.trie,
+                database.logs.source_floor()?, self.now(), rtdb_replication::BlockDiscovery::AtPublished(checkpoint)))
+                .await.ok_or_else(cancelled)??,
+            None => blocks.empty_snapshot_base(self.factory.options.trie, database.logs.source_floor()?, self.now())?,
+        };
+        let suffix = recovered.replay_snapshot_suffix(&database.logs, cut, cancellation).await?;
         recovered.partition.publish_catalog_cut(cut)?;
         let snapshot = recovered.partition.snapshot().with_catalog_read(hold);
-        rtdb_query::retain_catalog_snapshot(snapshot, storage).await
+        Ok((rtdb_query::retain_catalog_snapshot(snapshot, storage).await?, suffix))
     }
 
     pub(crate) async fn catalog_read_lease(&self, database: &Database) -> Result<Option<Arc<rtdb_storage::ReadLease>>> {

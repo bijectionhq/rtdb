@@ -2,14 +2,14 @@ use std::{collections::VecDeque, sync::{Arc, Weak}, time::Duration};
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_query::QueryContext;
-use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, Instant, PlacedAttemptScope, Result, Timestamp, TransactionKey};
+use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, CatalogCut, Instant, PlacedAttemptScope, ReplicaPosition, Result, Timestamp, TransactionKey};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const CAPACITY: usize = 128;
 const HOLD_FOR: Duration = Duration::from_secs(60);
-const DURABLE_PREFIX: &str = "rtdb-snapshot-v1:";
+const DURABLE_PREFIX: &str = "rtdb-snapshot-v2:";
 const MAX_ENVELOPE_BYTES: usize = 2048;
 
 #[derive(Serialize, Deserialize)]
@@ -25,7 +25,14 @@ struct ExactSnapshot {
     clock: Instant,
     timezone: String,
     issued: Timestamp,
-    checkpoint_root: Option<[u8; 32]>,
+    replay: Option<SnapshotReplayBase>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum SnapshotReplayBase {
+    Genesis,
+    Checkpoint { block: BlockIndex, boundary: ReplicaPosition, root: [u8; 32] },
 }
 
 impl ExactSnapshot {
@@ -42,17 +49,18 @@ impl ExactSnapshot {
             return Ok(None);
         }
         let Some(cut) = snapshot.catalog_cut() else { return Ok(None); };
-        let checkpoint_root = snapshot.table_catalog().block().and_then(|block| {
-            // The checkpoint must describe precisely this applied prefix and data head.
-            (block.boundary_replica_position() == Some(cut.through)
-                && block.latest_completed_tx() == snapshot.tx_basis())
-                .then(|| block.publication_sha256()).flatten()
-        });
+        let replay = match snapshot.table_catalog().block() {
+            Some(block) => block.boundary_replica_position().zip(block.publication_sha256())
+                .filter(|(boundary, _)| *boundary <= cut.through && boundary.epoch() == cut.replica_epoch)
+                .map(|(boundary, root)| SnapshotReplayBase::Checkpoint { block: block.block_index(), boundary, root }),
+            None if snapshot.block_index() == BlockIndex(0) => Some(SnapshotReplayBase::Genesis),
+            None => None,
+        };
         Ok(Some(Self {
             owner: owner.map(str::to_owned), database: view.database().to_owned(),
             history: scope.history_fingerprint(), cut, head: snapshot.tx_basis(),
             block: snapshot.block_index(), cap: snapshot.system_time_cap(),
-            clock: view.current_time, timezone: view.timezone.clone(), issued, checkpoint_root,
+            clock: view.current_time, timezone: view.timezone.clone(), issued, replay,
         }))
     }
 
@@ -200,24 +208,35 @@ impl SqlSnapshotAdmission {
             return Err(unretained());
         }
         let [partition] = current_database.partitions.as_slice() else { return Err(unretained()); };
-        let snapshot = if exact.matches(partition) {
-            partition.clone()
+        let (snapshot, suffix) = if exact.matches(partition) {
+            (partition.clone(), None)
         } else {
             let cut = partition.catalog_cut().filter(|cut| cut.storage_version == exact.cut.storage_version
                 && cut.storage_epoch == exact.cut.storage_epoch && cut.replica_epoch == exact.cut.replica_epoch)
                 .ok_or_else(unretained)?;
-            let checkpoint = rtdb_replication::PublishedCheckpoint {
-                block: BlockIndex(exact.block.0.checked_sub(1).filter(|block| *block >= 0).ok_or_else(unretained)?),
-                boundary: exact.cut.through,
-                root_sha256: Some(exact.checkpoint_root.ok_or_else(unretained)?),
+            if cut.through < exact.cut.through { return Err(unretained()); }
+            let checkpoint = match exact.replay.as_ref().ok_or_else(unretained)? {
+                SnapshotReplayBase::Genesis if exact.block == BlockIndex(0) => None,
+                SnapshotReplayBase::Genesis => return Err(unretained()),
+                SnapshotReplayBase::Checkpoint { block, boundary, root } => Some(rtdb_replication::PublishedCheckpoint {
+                    block: *block, boundary: *boundary, root_sha256: Some(*root),
+                }),
             };
-            if cut.through < checkpoint.boundary { return Err(unretained()); }
-            self.node.recover_sql_snapshot_checkpoint(&database, exact.cut, checkpoint, cancellation)
-                .await.map_err(|_| unretained())?
+            self.node.recover_sql_snapshot(&database, exact.cut, checkpoint, cancellation)
+                .await.map_err(|error| {
+                    if error.code == "rtdb/erased-under-view" { error } else { unretained() }
+                })?
         };
         if !exact.matches(&snapshot) || !exact.is_live(self.node.now()) { return Err(unretained()); }
         let snapshot = snapshot.with_system_time_cap(exact.cap).map_err(|_| unretained())?;
-        let view = rtdb_query::SqlSnapshotView::from_exact_partition(current, snapshot, exact.clock)?;
+        let mut view = rtdb_query::SqlSnapshotView::from_exact_partition(current, snapshot, exact.clock, suffix)?;
+        let expiry = exact.issued.0.checked_add(HOLD_FOR.as_micros() as i64).ok_or_else(unretained)?;
+        let remaining = expiry.checked_sub(self.node.now().0).and_then(|micros| u64::try_from(micros).ok())
+            .filter(|micros| *micros > 0 && *micros <= HOLD_FOR.as_micros() as u64).ok_or_else(unretained)?;
+        let deadline = std::time::Instant::now().checked_add(Duration::from_micros(remaining)).ok_or_else(unretained)?;
+        let lease = Arc::new(rtdb_storage::ReadLease::until(deadline));
+        let lease = view.catalog.read_lease().map_or_else(|| Arc::clone(&lease), |original| original.earlier(Arc::clone(&lease)));
+        view.catalog = view.catalog.with_read_lease(lease);
         self.node.admit_retained_catalog(&view.catalog, self.identity.as_ref(), cancellation).await?;
         Ok(view)
     }
@@ -234,7 +253,7 @@ impl rtdb_query::SnapshotAdmission for SqlSnapshotAdmission {
 mod tests {
     use super::*;
     use rtdb_index::{PartitionState, TransactionBuffer};
-    use rtdb_types::{ReplicaPosition, StorageEpoch, StorageVersion, TxId};
+    use rtdb_types::{StorageEpoch, StorageVersion, TxId};
 
     #[test]
     fn an_exact_resume_distinguishes_tied_appends_and_keeps_the_original_clock() {
@@ -256,7 +275,7 @@ mod tests {
         let exact = ExactSnapshot {
             owner: Some("alice".to_owned()), database: "xtdb".to_owned(), history: [3; 32], cut,
             head: Some(head), block: snapshot.block_index(), cap: Some(Timestamp(19)),
-            clock, timezone: "UTC".to_owned(), issued: Timestamp(61_000_000), checkpoint_root: None,
+            clock, timezone: "UTC".to_owned(), issued: Timestamp(61_000_000), replay: Some(SnapshotReplayBase::Genesis),
         };
         let restored: ExactSnapshot = serde_json::from_slice(&serde_json::to_vec(&exact).unwrap()).unwrap();
         assert!(restored.matches(&snapshot));

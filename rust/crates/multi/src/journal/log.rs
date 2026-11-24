@@ -828,6 +828,17 @@ impl Log for JournalLog {
         Ok(Box::new(self.capture(from, to).await?))
     }
 
+    async fn protect_range(&self, from: LogOffset, to: LogOffset) -> Result<rtdb_storage::log::ProtectedLogRange> {
+        let range = self.capture(from, to).await?;
+        if range.end != u64::try_from(to.0).ok() || from >= to {
+            return Err(Error::Closed("The exact protected replica interval is unavailable".into()));
+        }
+        let hold = range.held.as_ref()
+            .ok_or_else(|| Error::Closed("The replica interval has no ordered custody hold".into()))?
+            .clone();
+        Ok(rtdb_storage::log::ProtectedLogRange { range: Box::new(range), hold })
+    }
+
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
         let mut cursor = self.capture(from, to).await?;
         let mut records = Vec::new();

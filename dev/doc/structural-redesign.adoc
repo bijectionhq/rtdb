@@ -12,7 +12,9 @@ The second review's Multi serving and custody boundaries extend that design.
   A system-time cap filters the chosen prefix, and a fresh admission can include later corrections below that cap.
   An issued exact snapshot token identifies the same applied cut on every successful re-admission under current authorization, retention and custody.
   A placed SQL token seals the original owner, partition position, physical generation, historical cap and clock interpretation.
-  A reopened node can serve the identical installed cut or its retained exact checkpoint.
+  A reopened node can serve the identical installed cut or reconstruct it from the sealed checkpoint and its protected replica suffix.
+  A genesis cut requires the retained replica range from the initial position.
+  Reconstruction retains journal custody through answer release and requires the exact target tail and data head.
   An advanced head with the same historical timestamp never substitutes for the captured position.
 * A view admitted before an erasure keeps its answers until the erasure deadline; afterwards a read that needs destroyed key material fails with `rtdb/erased-under-view`.
   SNAP-1 and DUR-1 are amended accordingly.
