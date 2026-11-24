@@ -87,13 +87,29 @@ pub(super) fn clock_command_matches(record: &Json) -> bool {
     else { return false };
     let address = serde_json::json!(["bijection.native-clock-await.v1", original, name]).to_string();
     let key = format!("bj1-{:x}", Sha256::digest(address.as_bytes()));
-    ordered[0].as_str() == Some("bijection.task.await-clock.v1")
+    await_origin_matches(&waiting["origin"])
+        && ordered[0].as_str() == Some("bijection.task.await-clock.v1")
         && &ordered[1] == waiting
         && waiting["digest"].as_str().is_some_and(digest)
         && task["key"].as_str() == Some(key.as_str())
         && ordered[2]["name"].as_str() == Some(name)
         && ordered[2]["handler"] == task["continuation"]["handler"]
         && ordered[2]["onFailure"] == task["continuation"]["on_failure"]
+}
+
+fn await_origin_matches(origin: &Json) -> bool {
+    let Some(origin) = origin.as_object() else { return false };
+    let request = origin.get("request").and_then(Json::as_str);
+    match origin.get("kind").and_then(Json::as_str) {
+        Some("clock") => origin.len() == 1,
+        Some("gate") => origin.len() == 2 && request
+            .and_then(|id| id.strip_prefix("public-gate-request:"))
+            .is_some_and(digest),
+        Some("action") => origin.len() == 2 && request
+            .and_then(|id| id.strip_prefix(ACTION))
+            .is_some_and(|id| !id.is_empty() && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())),
+        _ => false,
+    }
 }
 
 fn continuation_policy_matches(continuation: &Json) -> bool {
@@ -207,6 +223,30 @@ pub(super) fn validate(operations: &[Operation]) -> Result<()> {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn a_named_await_cannot_substitute_the_original_owner() {
+        let original = format!("bj1-{}", "e".repeat(64));
+        let source = serde_json::json!({
+            "key": original,
+            "digest": "a".repeat(64),
+            "origin": { "kind": "gate", "request": format!("public-gate-request:{}", "b".repeat(64)) }
+        });
+        let name = "delivery";
+        let args = serde_json::json!({"name": name, "handler": "f:deliver", "onFailure": "retry"});
+        let command = serde_json::json!(["bijection.task.await-clock.v1", source, args, {}]).to_string();
+        let address = serde_json::json!(["bijection.native-clock-await.v1", original, name]).to_string();
+        let mut row = serde_json::json!({"task": {
+            "key": format!("bj1-{:x}", Sha256::digest(address.as_bytes())),
+            "digest": format!("{:x}", Sha256::digest(command.as_bytes())),
+            "command": command,
+            "wait_for": source,
+            "continuation": {"name": name, "handler": "f:deliver", "on_failure": "retry"}
+        }});
+        assert!(clock_command_matches(&row));
+        row["task"]["wait_for"]["origin"] = serde_json::json!({"kind": "clock"});
+        assert!(!clock_command_matches(&row));
+    }
 
     #[test]
     fn an_emitted_action_cannot_substitute_its_command() {

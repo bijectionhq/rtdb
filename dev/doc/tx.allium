@@ -428,6 +428,7 @@ value CommitOpts {
     --                   The installed catalog determines retention even when a query selects an earlier system time.
     --                   A settled retry keeps its original causal coordinate after that metadata expires.
     --                   An idempotency_key field names an exact transaction retry identity scoped to the registered receiver, database and authenticated principal.
+    --                   The hosted named-await carrier binds the Original task owner, request address and descriptor to the ordered command.
     --                   A same-body retry within the receipt window returns the original outcome and a changed body aborts with rtdb/idempotency-conflict.
     --                   Application owners register business intents and compare any labelled commands at their own decision boundaries.
     --                   Within one installed history, receipt admission and expiry use the original certified decision reading.
