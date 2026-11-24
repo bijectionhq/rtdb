@@ -804,13 +804,20 @@ impl TreeFile {
     }
 
     pub(crate) async fn documents(&self) -> Result<Vec<LogicalDocument>> {
+        let mut documents = Vec::new();
+        self.visit_documents(|document| { documents.push(document); Ok(()) }).await?;
+        Ok(documents)
+    }
+
+    pub(crate) async fn visit_documents(&self, mut visit: impl FnMut(LogicalDocument) -> Result<()> + Send) -> Result<()> {
         use rtdb_columnar::EntityIdRef;
         if self.format != LOGICAL_FORMAT_VERSION { return Err(corrupt("Expected a logical search run")); }
-        let mut documents = Vec::new();
-        let records = self.all(DOCUMENT).await?;
-        let payload = self.all(VISIBILITY).await?;
+        let records = self.reader.leaves(self.directories[&DOCUMENT]).await?;
+        let payload = self.reader.leaves(self.directories[&VISIBILITY]).await?;
         if records.len() != payload.len() { return Err(corrupt("Search run omits analyzed token pages")); }
-        for (batch, payload) in records.into_iter().zip(payload) {
+        for (record, payload) in records.into_iter().zip(payload) {
+            let batch = self.reader.page(record, page_kind(DOCUMENT)).await?;
+            let payload = self.reader.page(payload, page_kind(VISIBILITY)).await?;
             let runs = table(&batch, Table::Runs);
             let sequences = table(&payload, Table::TokenSequences);
             if sequences.len() != runs.len() { return Err(corrupt("Search run is missing token sequences")); }
@@ -823,15 +830,15 @@ impl TreeFile {
                 let sql_id = if ids.is_valid(row) {
                     match EntityIdRef::from_handle_bytes(ids.value(row))? { EntityIdRef::Integer(id) => Some(id), _ => None }
                 } else { None };
-                documents.push(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
+                visit(LogicalDocument { iid: Iid::from_slice(iids.value(row))?, sql_id,
                     field: fields.value(row) as usize, revision: revisions.value(row).try_into().map_err(fault)?,
                     tokens: tokens.value(row).as_string::<i32>().clone(),
                     position: (Timestamp(sequences.column(3).as_primitive::<Int64Type>().value(row)),
                         super::read_event_position(sequences.column(5).as_ref(), row),
-                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) });
+                        sequences.column(4).as_primitive::<UInt32Type>().value(row)) })?;
             }
         }
-        Ok(documents)
+        Ok(())
     }
 
     pub(crate) async fn erases(&self, memory: &Arc<rtdb_types::MemoryBudget>) -> Result<(BTreeMap<Iid, super::SearchPosition>, Arc<rtdb_types::MemoryReservation>)> {
