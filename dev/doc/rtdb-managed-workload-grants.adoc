@@ -7,6 +7,67 @@ Caller inputs can select an existing intent but cannot establish its authority o
 
 == Operator configuration
 
+=== Independent Create and assignment issuers on Multi
+
+Select `!ManagedWorkloadOidc` in the native Multi node YAML to accept both Bijection workload issuers on the ordinary managed Flight listener.
+For the hosted preview, supply that complete YAML through `rtdb_cluster_previews[<cell>].multi_configuration_secret`.
+
+[source,yaml]
+----
+authn: !ManagedWorkloadOidc
+  create:
+    issuerUrl: https://create-oidc.example.invalid/
+    issuerCaCertificate: !Env RTDB_CREATE_OIDC_ISSUER_CA_PEM
+    audience: rtdb-cell-create
+    clientIdPrefix: rtdb-create-
+  assignment:
+    issuerUrl: https://assignment-oidc.example.invalid/
+    issuerCaCertificate: !Env RTDB_ASSIGNMENT_OIDC_ISSUER_CA_PEM
+    audience: rtdb-cell-assignment
+    clientIdPrefix: rtdb-assignment-
+    authorityPoint:
+      relation: public.app_installation
+      rowId: authority
+      validAtMicros: 0
+----
+
+Each issuer needs a distinct HTTPS origin and its own configured PEM trust bundle, up to 64 KiB, supplied inline or through a resolved `!Env` value.
+Embed the PEM bundles in the complete node YAML when the deployment does not project the two environment values.
+Each HTTPS client trusts only its configured bundle, checks the issuer hostname and refuses redirects.
+The discovery issuer must equal the configured URL, with token and UserInfo endpoints at its origin.
+The private roots here authenticate the OIDC server listeners and are independent of the Flight TLS and credential-acquisition mTLS trust bundles.
+
+Set the exact audience and a reserved prefix for each issuer.
+Prefixes take 1 to 128 printable ASCII bytes excluding `:` and are case-sensitive.
+Startup rejects a prefix that equals or starts with the other prefix.
+The existing Flight `Client` authorization scheme selects exactly one prefix and sends the grant-bearing client ID and secret only to that issuer.
+The profile requires client credentials and a verified workload grant for every authentication.
+The Create issuer can authenticate only version 1 `create-deployment` for the name and UUID authorized by the accepted INSTALL.
+The assignment issuer can authenticate only version 2 with one typed authority for the exact Original name and UUID.
+The issuer establishes the exact permission, and the native ordered writer applies the existing placement, writer and expiry checks before an effect.
+
+For Create, match `issuerUrl` to the cell-management `rtdb_create_issuer.oidc_origin` and match `audience` and `clientIdPrefix` to `rtdb_admin.workload_issuer.audience` and `client_id_prefix`.
+Install the PEM roots for the Create OIDC listener's server certificate under `create.issuerCaCertificate`.
+The separate Create acquisition listener authenticates the assigned cell manager and rechecks its accepted INSTALL.
+The Create producer and projection are included in Bijection ideal through `c8b9706917e`.
+
+For assignment, match `issuerUrl`, `audience` and `clientIdPrefix` to `hosting_fleets[<cell>].rtdb_runtime.managed_placement.workload.{issuer,audience,client_id_prefix}`.
+Use the serialized HTTPS origin with a trailing slash, matching the Bijection receipt namespace input.
+Install the PEM roots for the server certificate of `managed_placement.first_placement_issuer.oidc` under `assignment.issuerCaCertificate`.
+The separate assignment acquisition listener admits the enrolled placement controller and checks the exact retained stamped placement intent.
+Bijection ideal `fc0b8b5f626` and deployment commits `3c8f7f5611d` and `41c550cb77f` provide first `advance-placement` with an empty predecessor.
+Successor, Conductor, custody and recovery roles need separately admitted issuance before enabling those operations in production.
+
+Use the same assignment issuer, audience, prefix and `authorityPoint` on all peers that relay managed assignment to the active writer.
+The authority point is on `main` and is configured by the operator.
+Only the assignment settings supply the ordered assignment peer profile.
+Grant renewal and selection of the combined configuration preserve the receipt namespace when the issuer, audience, subject, grant ID, database and incarnation are unchanged.
+
+=== Single-provider and fixed qualification profiles
+
+Continue using a single `!OpenIdConnect` provider for the existing separate OIDC qualification and `!UserList` for fixed per-database qualification.
+Default local and Kafka mode keep their existing authentication configurations.
+
 Add the optional `workloadGrants` mapping to the existing native `!OpenIdConnect` configuration.
 The issuer URL, service credential, audience, and dedicated workload client ID prefix are operator inputs.
 Use an authenticated Flight HTTPS endpoint and an audience unique to the intended RTDB service.
@@ -111,7 +172,7 @@ The operator enables assignment on the intended Multi service by adding the trus
       validAtMicros: 0
 ----
 
-Put these fields under `authn.workloadGrants`.
+Put these fields under `authn.workloadGrants` for a single provider or use `authn.assignment.authorityPoint` in the combined Multi profile.
 Use the same point for the life of the original incarnation and across its writers.
 The branch is always `main`.
 The assignment profile admits only reserved-prefix OIDC clients under explicit `CLIENT_CREDENTIALS` rules.

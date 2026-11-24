@@ -44,6 +44,13 @@ surface StatelessDatabase {
         -- The catalog orders that identity before provisioning and the reply confirms the current matching attachment.
         -- A retry with a renewed grant can recover the same ordered identity.
 
+    @guarantee IndependentManagedWorkloadIssuers
+        -- A native Multi listener can enroll distinct HTTPS issuer origins, each with its own private roots, audience and reserved client ID prefix.
+        -- Client credentials select exactly one issuer by disjoint prefix before token exchange.
+        -- The Create issuer supplies a verified version 1 Create grant and the assignment issuer supplies a verified version 2 grant with one exact typed authority.
+        -- Each issuer's verified subject and grant retain their receipt identity across the corresponding single-provider and combined profiles.
+        -- The assignment issuer and configured Original authority point supply the ordered peer profile.
+
     @guarantee ManagedWorkloadAssignment
         -- A bounded issuer grant authorizes one exact operation on the Original incarnation.
         -- The deployment owner configures the original main-branch authority point.

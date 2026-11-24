@@ -147,6 +147,10 @@ impl VerifiedWorkloadGrant {
 
     pub fn is_assignment(&self) -> bool { matches!(self.permission, Permission::Assignment { .. }) }
 
+    pub(super) fn is_create(&self) -> bool {
+        matches!(self.permission, Permission::Create(WorkloadOperation::CreateDeployment))
+    }
+
     pub fn is_custody_reader(&self) -> bool {
         matches!(&self.permission, Permission::Assignment { authority, .. }
             if matches!(authority.as_ref(), Authority::ReadCustody { .. }))

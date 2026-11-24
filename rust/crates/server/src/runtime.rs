@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use std::io::Write;
 
-use rtdb_auth::{Authenticator, NativeHttp};
+use rtdb_auth::{AuthConfig, Authenticator};
 use rtdb_columnar::MemoryBudget;
 use rtdb_metrics::Registry;
 use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock, TransactionClock, NativeResources, ResourceFactory};
@@ -142,6 +142,7 @@ impl ServerDriver {
 
     #[cfg(feature = "multi")]
     pub async fn open_with_multi_tls(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime, tls: Option<tokio_rustls::rustls::ServerConfig>) -> Result<(ServerHandle, Self)> {
+        multi.validate_assignment_peer_auth(&config.auth)?;
         Self::open_mode(config, limit, memory, false, None, None, Backend::Configured(Some(multi.resource_override()), tls.map(Arc::new))).await
     }
 
@@ -181,6 +182,11 @@ impl ServerDriver {
     }
 
     async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>, placed: Option<PlacedOptions>, backend: Backend) -> Result<(ServerHandle, Self)> {
+        if matches!(&config.auth, AuthConfig::ManagedWorkloadOidc(_))
+            && !matches!(&backend, Backend::Configured(Some(_), _))
+        {
+            return Err(Anomaly::incorrect("rtdb.auth/managed-workload-oidc-config", "Managed workload OIDC requires a native Multi runtime"));
+        }
         let mut options = config.node_options(allocation_limit_bytes)?;
         options.owned_relations = config.flight_sql.as_ref().is_some_and(|flight| flight.port >= 0 && flight.owned_native_actions);
         if let Some(placed) = &placed {
@@ -198,14 +204,9 @@ impl ServerDriver {
             match crate::tracing::TraceExporter::open(&config.tracing, Arc::clone(&memory)) { Ok(tracing) => Some(tracing), Err(error) => { let _ = writeln!(std::io::stderr().lock(), "Failed to create tracer; tracing is disabled: {error}"); None } }
         } else { None };
         let tracer = tracing.as_ref().map(|(handle, _)| handle.recorder().clone() as Arc<dyn rtdb_plan::Tracer>);
-        let issuer_ca_pem = match &config.auth {
-            rtdb_auth::AuthConfig::OpenIdConnect(config) => config.issuer_ca_pem.as_deref(),
-            _ => None,
-        };
-        let http = Arc::new(NativeHttp::with_issuer_ca(
-            Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024, issuer_ca_pem,
-        )?);
-        let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
+        let auth = Authenticator::open_native(
+            config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), Duration::from_secs(30), 4 * 1024 * 1024,
+        ).await?;
         let authority: Arc<dyn TransactionAuthorization> = match config.flight_sql.as_ref()
             .filter(|flight| flight.port >= 0 && flight.owned_native_actions)
             .and_then(|flight| flight.hosted_controls.as_ref())

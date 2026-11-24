@@ -1,4 +1,5 @@
 mod http;
+mod managed_workload_oidc;
 mod oidc;
 mod password;
 mod visibility_scope;
@@ -7,6 +8,7 @@ mod workload_grant;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -19,6 +21,7 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 pub use http::{HttpRequest, HttpResponse, HttpTransport, NativeHttp};
+pub use managed_workload_oidc::{ManagedWorkloadOidcConfig, WorkloadIssuerConfig};
 pub use oidc::{DeviceAuthorization, OidcConfig};
 pub use password::PasswordHash;
 pub use visibility_scope::VerifiedLabelScope;
@@ -114,6 +117,7 @@ pub enum AuthConfig {
     /// A named user's exact database rule takes priority over its `*` default.
     UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants },
     OpenIdConnect(OidcConfig),
+    ManagedWorkloadOidc(Box<ManagedWorkloadOidcConfig>),
 }
 
 /// For each user limited to some databases, the access granted on each.
@@ -139,7 +143,7 @@ impl GrantedAccess {
 impl AuthConfig {
     pub fn uses_remote_address(&self) -> bool {
         let rules = match self {
-            Self::SingleRootUser { .. } => return false,
+            Self::SingleRootUser { .. } | Self::ManagedWorkloadOidc(_) => return false,
             Self::UserList { rules, .. } => rules,
             Self::OpenIdConnect(config) => &config.rules,
         };
@@ -155,16 +159,39 @@ enum Authentication {
     SingleRootUser { password: Option<Secret> },
     UserList { users: BTreeMap<String, PasswordHash>, rules: Vec<MethodRule>, grants: Grants },
     OpenIdConnect(Arc<oidc::Provider>),
+    ManagedWorkloadOidc(managed_workload_oidc::ManagedWorkloadOidc),
 }
 
 pub struct Authenticator { authentication: Authentication, memory: Arc<MemoryBudget> }
 impl Authenticator {
+    pub async fn open_native(config: AuthConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>,
+        timeout: Duration, maximum_response_bytes: usize) -> Result<Arc<Self>> {
+        let config = match config {
+            AuthConfig::ManagedWorkloadOidc(config) => {
+                let providers = managed_workload_oidc::ManagedWorkloadOidc::open(
+                    *config, Arc::clone(&memory), clock, timeout, maximum_response_bytes,
+                ).await?;
+                return Ok(Arc::new(Self { authentication: Authentication::ManagedWorkloadOidc(providers), memory }));
+            }
+            config => config,
+        };
+        let issuer_ca_pem = match &config {
+            AuthConfig::OpenIdConnect(config) => config.issuer_ca_pem.as_deref(),
+            _ => None,
+        };
+        let http = Arc::new(NativeHttp::with_issuer_ca(Arc::clone(&memory), timeout, maximum_response_bytes, issuer_ca_pem)?);
+        Self::open(config, memory, clock, http).await
+    }
+
     /// Discovery completes before returning; no task or runtime is started by this factory.
     pub async fn open(config: AuthConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
         let authentication = match config {
             AuthConfig::SingleRootUser { password } => Authentication::SingleRootUser { password },
             AuthConfig::UserList { users, rules, grants } => Authentication::UserList { users, rules, grants },
             AuthConfig::OpenIdConnect(config) => Authentication::OpenIdConnect(oidc::Provider::open(config, Arc::clone(&memory), clock, http).await?),
+            AuthConfig::ManagedWorkloadOidc(_) => return Err(Anomaly::incorrect(
+                "rtdb.auth/managed-workload-oidc-config", "Managed workload issuers require separate native HTTPS transports",
+            )),
         };
         Ok(Arc::new(Self { authentication, memory }))
     }
@@ -173,12 +200,15 @@ impl Authenticator {
             Authentication::SingleRootUser { password } => Some(if password.is_some() { Method::Password } else { Method::Trust }),
             Authentication::UserList { rules, .. } => method_for(rules, user, remote_address),
             Authentication::OpenIdConnect(provider) => method_for(&provider.rules, user, remote_address),
+            Authentication::ManagedWorkloadOidc(_) => Some(Method::ClientCredentials),
         }
     }
     pub fn known_users(&self) -> Vec<String> {
         match &self.authentication { Authentication::UserList { users, .. } => users.keys().cloned().collect(), _ => vec!["xtdb".into()] }
     }
-    pub fn is_superuser(&self, user: &str) -> bool { user == "xtdb" && !matches!(self.authentication, Authentication::OpenIdConnect(_)) }
+    pub fn is_superuser(&self, user: &str) -> bool {
+        user == "xtdb" && !matches!(self.authentication, Authentication::OpenIdConnect(_) | Authentication::ManagedWorkloadOidc(_))
+    }
 
     /// Trusted embedded callers may construct a principal regardless of network authentication rules.
     pub fn authenticate_trusted(&self, user: &str) -> Result<Arc<Principal>> { self.principal(Some(user)) }
@@ -207,11 +237,13 @@ impl Authenticator {
                 Err(password_failed(user))
             }
             Authentication::OpenIdConnect(provider) => provider.password(user, password).await,
+            Authentication::ManagedWorkloadOidc(_) => Err(workload_grant::invalid_grant()),
         }
     }
     pub async fn verify_client_credentials(&self, client_id: &str, client_secret: &str) -> Result<Arc<Principal>> {
         match &self.authentication {
             Authentication::OpenIdConnect(provider) => provider.client_credentials(client_id, client_secret).await,
+            Authentication::ManagedWorkloadOidc(providers) => providers.verify(client_id, client_secret).await,
             _ => Err(Anomaly::unsupported("verifyClientCredentials", "Authenticator does not support client credentials")),
         }
     }

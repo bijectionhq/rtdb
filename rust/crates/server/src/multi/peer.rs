@@ -45,6 +45,7 @@ pub(super) struct Peer {
     workload_profile: Option<WorkloadProfile>,
 }
 
+#[derive(PartialEq, Eq)]
 pub(super) struct WorkloadProfile {
     point: workload::Point,
     identity: [u8; 32],
@@ -134,6 +135,10 @@ enum Answer {
 }
 
 impl Peer {
+    pub(super) fn workload_profile(&self) -> Option<&WorkloadProfile> {
+        self.workload_profile.as_ref()
+    }
+
     pub(super) fn new(
         address: IpAddr,
         tokens: TokenAuthority,

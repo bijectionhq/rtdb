@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use rtdb_auth::{AddressBlock, AuthConfig, GrantedAccess, Method, MethodRule, OidcConfig, PasswordHash, Secret, WorkloadGrantConfig};
+use rtdb_auth::{AddressBlock, AuthConfig, GrantedAccess, ManagedWorkloadOidcConfig, Method, MethodRule, OidcConfig, PasswordHash, Secret, WorkloadGrantConfig, WorkloadIssuerConfig};
 use rtdb_format::config::{Yaml, YamlFields, scalar_string};
 use rtdb_tx::transact::workload::Point;
 use rtdb_types::{Anomaly, Result, Timestamp};
@@ -56,6 +56,11 @@ pub(super) fn decode(value: Yaml, environment: &impl Fn(&str) -> Option<String>)
             }
             AuthConfig::OpenIdConnect(config)
         },
+        "!ManagedWorkloadOidc" => {
+            let create = workload_issuer(fields.require("create")?, "authn.create", false)?;
+            let assignment = workload_issuer(fields.require("assignment")?, "authn.assignment", true)?;
+            AuthConfig::ManagedWorkloadOidc(Box::new(ManagedWorkloadOidcConfig::new(create, assignment)?))
+        }
         _ => return Err(invalid(format!("Unknown authentication configuration tag '{tag}'"))),
     };
     fields.finish()?;
@@ -74,16 +79,36 @@ fn workload_grants(value: Yaml) -> Result<WorkloadGrantConfig> {
         fields.required_string("clientIdPrefix")?,
     )?;
     if let Some(assignment) = fields.take("assignment") {
-        let mut fields = YamlFields::new(assignment, "workloadGrants.assignment")?;
-        let relation = fields.required_string("relation")?;
-        let row_id = fields.required_string("rowId")?;
-        let valid_at = fields.required_string("validAtMicros")?.parse()
-            .map_err(|_| invalid("workloadGrants.assignment.validAtMicros must be an integer"))?;
-        fields.finish()?;
-        config = config.with_assignment(Point::new(&relation, row_id, Timestamp(valid_at))?);
+        config = config.with_assignment(authority_point(assignment, "workloadGrants.assignment")?);
     }
     fields.finish()?;
     Ok(config)
+}
+
+fn workload_issuer(value: Yaml, path: &str, assignment: bool) -> Result<WorkloadIssuerConfig> {
+    let mut fields = YamlFields::new(value, path)?;
+    let issuer = fields.required_string("issuerUrl")?.parse()
+        .map_err(|_| invalid("issuerUrl must be an absolute URL"))?;
+    let ca = fields.required_string("issuerCaCertificate")?;
+    let mut grants = WorkloadGrantConfig::new(
+        fields.required_string("audience")?,
+        fields.required_string("clientIdPrefix")?,
+    )?;
+    if assignment {
+        grants = grants.with_assignment(authority_point(fields.require("authorityPoint")?, "authn.assignment.authorityPoint")?);
+    }
+    fields.finish()?;
+    WorkloadIssuerConfig::new(issuer, ca, grants)
+}
+
+fn authority_point(value: Yaml, path: &str) -> Result<Point> {
+    let mut fields = YamlFields::new(value, path)?;
+    let relation = fields.required_string("relation")?;
+    let row_id = fields.required_string("rowId")?;
+    let valid_at = fields.required_string("validAtMicros")?.parse()
+        .map_err(|_| invalid(format!("{path}.validAtMicros must be an integer")))?;
+    fields.finish()?;
+    Point::new(&relation, row_id, Timestamp(valid_at))
 }
 
 fn rules(values: Option<Vec<Yaml>>, default: Method) -> Result<Vec<MethodRule>> {

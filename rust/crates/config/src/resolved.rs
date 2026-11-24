@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use prost::Message;
-use rtdb_auth::AuthConfig;
+use rtdb_auth::{AuthConfig, WorkloadGrantConfig, WorkloadIssuerConfig};
 use rtdb_format::{database::proto::{DatabaseConfig, database_config::{Log, Storage}}, generated::xtdb::{aws, azure, gcp, kafka, postgres}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
 use rtdb_server::config::{ModuleSettings, NodeConfiguration, RemoteConfig};
 use rtdb_storage::ObjectKey;
@@ -19,16 +19,15 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
                 authentication["issuer_ca_configured"] = json!(true);
             }
             if let Some(grants) = &oidc.workload_grants {
-                authentication["workload_grants"] = json!({"audience":grants.audience(), "client_id_prefix":grants.client_id_prefix()});
-                if let Some(point) = grants.assignment() {
-                    authentication["workload_grants"]["assignment"] = json!({
-                        "relation": format!("{}.{}", point.table.schema, point.table.table),
-                        "row_id": point.id, "valid_at_micros": point.valid_at.0,
-                    });
-                }
+                authentication["workload_grants"] = describe_workload_grants(grants);
             }
             authentication
         }
+        AuthConfig::ManagedWorkloadOidc(config) => json!({
+            "kind": "managed-workload-oidc",
+            "create": describe_workload_issuer(config.create(), "authn.create.issuerUrl", report),
+            "assignment": describe_workload_issuer(config.assignment(), "authn.assignment.issuerUrl", report),
+        }),
     });
     for (name, remote) in &config.remotes {
         let path = format!("remotes.{name}");
@@ -88,6 +87,25 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
         database_report("xtdb", &config.primary, config, report);
         report.gap("attached-databases-uninventoried", "databases", "Durable attached databases live in the primary catalog and cannot be discovered offline; supply their separately captured configurations in an ingest inventory report.");
     }
+}
+
+fn describe_workload_issuer(issuer: &WorkloadIssuerConfig, path: &str, report: &mut QualificationReport) -> Value {
+    json!({
+        "issuer": endpoint(issuer.issuer_url().as_str(), path, report),
+        "issuer_ca_configured": true,
+        "workload_grants": describe_workload_grants(issuer.grants()),
+    })
+}
+
+fn describe_workload_grants(grants: &WorkloadGrantConfig) -> Value {
+    let mut description = json!({"audience": grants.audience(), "client_id_prefix": grants.client_id_prefix()});
+    if let Some(point) = grants.assignment() {
+        description["assignment"] = json!({
+            "relation": format!("{}.{}", point.table.schema, point.table.table),
+            "row_id": point.id, "valid_at_micros": point.valid_at.0,
+        });
+    }
+    description
 }
 
 fn database_report(name: &str, database: &DatabaseConfig, node: &NodeConfiguration, report: &mut QualificationReport) {

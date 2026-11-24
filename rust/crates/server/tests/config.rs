@@ -4,6 +4,60 @@ use rtdb_server::config::{NodeConfiguration, RemoteConfig, parse_duration};
 
 fn decode(yaml: &str) -> rtdb_types::Result<NodeConfiguration> { NodeConfiguration::from_yaml_with_environment(yaml, &|_| None, false) }
 
+const MANAGED_WORKLOAD_OIDC: &str = r#"
+authn: !ManagedWorkloadOidc
+  create:
+    issuerUrl: https://create.example.invalid/
+    issuerCaCertificate: create fixture CA
+    audience: create-cell
+    clientIdPrefix: create-
+  assignment:
+    issuerUrl: https://assignment.example.invalid/
+    issuerCaCertificate: assignment fixture CA
+    audience: assignment-cell
+    clientIdPrefix: assignment-
+    authorityPoint:
+      relation: public.bj_installation
+      rowId: authority
+      validAtMicros: 0
+"#;
+
+#[test]
+fn managed_workload_oidc_has_disjoint_issuer_enrollments_and_one_authority_point() {
+    let config = decode(MANAGED_WORKLOAD_OIDC).unwrap();
+    let AuthConfig::ManagedWorkloadOidc(auth) = config.auth else { panic!("expected managed workload OIDC"); };
+    assert_eq!(auth.create().issuer_url().as_str(), "https://create.example.invalid/");
+    assert_eq!(auth.create().grants().audience(), "create-cell");
+    assert!(auth.create().grants().assignment().is_none());
+    assert_eq!(auth.assignment().issuer_url().as_str(), "https://assignment.example.invalid/");
+    assert_eq!(auth.assignment().grants().client_id_prefix(), "assignment-");
+    let point = rtdb_tx::transact::workload::Point::new(
+        "public.bj_installation", "authority".into(), rtdb_types::Timestamp(0),
+    ).unwrap();
+    assert_eq!(auth.assignment().grants().assignment(), Some(&point));
+
+    for prefix in ["create-".into(), "create-assignment-".into(), "cre".into(), "''".into(), "bad:prefix".into(), "a".repeat(129)] {
+        let yaml = MANAGED_WORKLOAD_OIDC.replace("clientIdPrefix: assignment-", &format!("clientIdPrefix: {prefix}"));
+        assert!(decode(&yaml).is_err(), "accepted prefix {prefix}");
+    }
+    for (original, replacement) in [
+        ("https://assignment.example.invalid/", "https://CREATE.example.invalid:443/other-path"),
+        ("https://assignment.example.invalid/", "http://assignment.example.invalid/"),
+        ("issuerCaCertificate: assignment fixture CA", "issuerCaCertificate: ''"),
+        ("    issuerCaCertificate: create fixture CA\n", ""),
+        ("    authorityPoint:", "    unexpectedAuthorityPoint:"),
+    ] {
+        assert!(decode(&MANAGED_WORKLOAD_OIDC.replace(original, replacement)).is_err());
+    }
+}
+
+#[tokio::test]
+async fn default_runtime_refuses_the_managed_workload_oidc_profile() {
+    let config = decode(MANAGED_WORKLOAD_OIDC).unwrap();
+    let result = rtdb_server::ServerDriver::open(config, 1 << 30).await;
+    assert_eq!(result.err().expect("Default requires another profile").code, "rtdb.auth/managed-workload-oidc-config");
+}
+
 #[test]
 fn cluster_default_image_config_funds_the_required_remote_disk_cache() {
     let environment = |name: &str| match name {

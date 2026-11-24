@@ -341,13 +341,7 @@ impl MultiRuntime {
         }
         let control_open = if follower.is_some() { DatabaseOpen::Prepared } else { DatabaseOpen::Required };
         let control = open_database(&backends, &kms, control, control_open).await?;
-        let workload_profile = match &config.auth {
-            AuthConfig::OpenIdConnect(oidc) => oidc.workload_grants.as_ref().and_then(|grants| {
-                let point = grants.assignment()?.clone();
-                Some(peer::WorkloadProfile::new(point, oidc.issuer_url.as_str(), grants.audience(), grants.client_id_prefix()))
-            }),
-            _ => None,
-        };
+        let workload_profile = assignment_peer_profile(&config.auth);
         let peer = backends.peers.as_ref().map(|_| {
             peer::Peer::new(
                 backends.node,
@@ -431,6 +425,15 @@ impl MultiRuntime {
     ) -> Box<dyn FnOnce(NativeResources) -> Arc<dyn ResourceFactory> + Send> {
         let runtime = self.clone();
         Box::new(move |native| Arc::new(ServingResources { native, runtime }))
+    }
+
+    pub(crate) fn validate_assignment_peer_auth(&self, auth: &AuthConfig) -> Result<()> {
+        if let Some(peer) = &self.peer
+            && peer.workload_profile() != assignment_peer_profile(auth).as_ref()
+        {
+            return Err(invalid("Multi authentication must match the assignment peer profile"));
+        }
+        Ok(())
     }
 
     async fn provision(&self, name: &str, expected: Option<Uuid>) -> Result<(DatabaseConfig, Uuid)> {
@@ -1091,6 +1094,20 @@ struct Backends {
     _journal_lock: Option<Arc<File>>,
 }
 
+fn assignment_peer_profile(auth: &AuthConfig) -> Option<peer::WorkloadProfile> {
+    let (issuer, grants) = match auth {
+        AuthConfig::OpenIdConnect(oidc) => (&oidc.issuer_url, oidc.workload_grants.as_ref()?),
+        AuthConfig::ManagedWorkloadOidc(config) => {
+            let assignment = config.assignment();
+            (assignment.issuer_url(), assignment.grants())
+        }
+        _ => return None,
+    };
+    Some(peer::WorkloadProfile::new(
+        grants.assignment()?.clone(), issuer.as_str(), grants.audience(), grants.client_id_prefix(),
+    ))
+}
+
 fn serving_driver(
     database: MultiDatabase,
     name: &str,
@@ -1603,6 +1620,21 @@ mod tests {
     };
     use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact};
     use rtdb_types::{EntityId, TableRef, Value};
+
+    #[test]
+    fn managed_workload_oidc_reuses_the_assignment_peer_profile() {
+        use rtdb_auth::{ManagedWorkloadOidcConfig, WorkloadGrantConfig, WorkloadIssuerConfig};
+
+        let create_grants = WorkloadGrantConfig::new("create-cell".into(), "create-".into()).unwrap();
+        let assignment_grants = WorkloadGrantConfig::new("assignment-cell".into(), "assignment-".into()).unwrap();
+        let point = rtdb_tx::transact::workload::Point::new("public.app_installation", "authority".into(), Timestamp(0)).unwrap();
+        let create = WorkloadIssuerConfig::new("https://create.example.invalid/".parse().unwrap(), "create CA".into(), create_grants).unwrap();
+        let assignment = WorkloadIssuerConfig::new("https://assignment.example.invalid/".parse().unwrap(), "assignment CA".into(), assignment_grants.with_assignment(point.clone())).unwrap();
+        let config = AuthConfig::ManagedWorkloadOidc(Box::new(ManagedWorkloadOidcConfig::new(create, assignment).unwrap()));
+        let profile = assignment_peer_profile(&config).unwrap();
+        assert!(profile == peer::WorkloadProfile::new(point.clone(), "https://assignment.example.invalid/", "assignment-cell", "assignment-"));
+        assert!(profile != peer::WorkloadProfile::new(point, "https://create.example.invalid/", "assignment-cell", "assignment-"));
+    }
 
     #[test]
     fn development_stream_journal_requires_three_distinct_loopback_tls_endpoints() {

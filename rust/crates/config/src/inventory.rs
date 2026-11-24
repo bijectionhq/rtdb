@@ -33,6 +33,10 @@ fn walk(value: &Yaml, shape: Shape, path: &str, report: &mut QualificationReport
             (Shape::Auth, "!SingleRootUser") => Some(&["password"]),
             (Shape::Auth, "!UserList") => Some(&["users", "rules"]),
             (Shape::Auth, "!OpenIdConnect") => Some(&["issuerUrl", "clientId", "clientSecret", "rules"]),
+            (Shape::Auth, "!ManagedWorkloadOidc") => {
+                report.gap("native-multi-authentication", path, "This authentication profile requires the native Multi runtime.");
+                return;
+            }
             (Shape::Module, "!CloudWatch") => Some(&["namespace"]),
             (Shape::Module, "!AzureMonitor") => Some(&["connectionString"]),
             (Shape::Source, "!Postgres") => Some(&["remote", "slotName", "publicationName", "indexer", "ignoreTables"]),

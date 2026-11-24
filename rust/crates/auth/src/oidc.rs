@@ -27,8 +27,7 @@ pub(crate) struct Provider {
     token_endpoint: Url,
     userinfo_endpoint: Url,
     device_endpoint: Option<Url>,
-    client_id: String,
-    client_secret: Secret,
+    service_client: Option<(String, Secret)>,
     pub rules: Vec<MethodRule>,
     workload_grants: Option<WorkloadGrantConfig>,
     clock: Arc<dyn Clock>,
@@ -91,15 +90,25 @@ impl Credentials {
 
 impl Provider {
     pub async fn open(config: OidcConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
-        if let Some(grants) = &config.workload_grants {
-            grants.validate_rules(&config.rules)?;
+        Self::discover(config.issuer_url, Some((config.client_id, config.client_secret)), config.rules,
+            config.workload_grants, memory, clock, http).await
+    }
+
+    pub(crate) async fn open_workload(issuer: Url, grants: WorkloadGrantConfig, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>, http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
+        Self::discover(issuer, None, vec![MethodRule::any(crate::Method::ClientCredentials)],
+            Some(grants), memory, clock, http).await
+    }
+
+    async fn discover(issuer: Url, service_client: Option<(String, Secret)>, rules: Vec<MethodRule>,
+        workload_grants: Option<WorkloadGrantConfig>, memory: Arc<MemoryBudget>, clock: Arc<dyn Clock>,
+        http: Arc<dyn HttpTransport>) -> Result<Arc<Self>> {
+        if let Some(grants) = &workload_grants {
+            grants.validate_rules(&rules)?;
         }
-        if config.workload_grants.is_some()
-            && (!https_endpoint(&config.issuer_url) || config.issuer_url.query().is_some())
-        {
+        if workload_grants.is_some() && !workload_issuer_url(&issuer) {
             return Err(discovery_failed("Workload grants require an HTTPS issuer"));
         }
-        let discovery_url = Url::parse(&format!("{}/.well-known/openid-configuration", config.issuer_url.as_str().trim_end_matches('/')))
+        let discovery_url = Url::parse(&format!("{}/.well-known/openid-configuration", issuer.as_str().trim_end_matches('/')))
             .map_err(|_| discovery_failed("Invalid OIDC discovery URL"))?;
         let response = http.request(HttpRequest::Get { url: discovery_url.clone(), bearer: None }).await
             .map_err(|_| discovery_failed(format!("Error thrown when fetching OIDC configuration from {discovery_url}")))?;
@@ -111,21 +120,24 @@ impl Provider {
         let device_endpoint = response.body.get("device_authorization_endpoint").map(|_| endpoint("device_authorization_endpoint")).transpose()?;
         let token_endpoint = endpoint("token_endpoint")?;
         let userinfo_endpoint = endpoint("userinfo_endpoint")?;
-        if config.workload_grants.is_some() {
-            if endpoint("issuer")? != config.issuer_url {
+        if workload_grants.is_some() {
+            if endpoint("issuer")? != issuer {
                 return Err(discovery_failed("The discovery issuer does not match the configured workload issuer"));
             }
             for endpoint in [&token_endpoint, &userinfo_endpoint] {
-                if !https_endpoint(endpoint) || endpoint.origin() != config.issuer_url.origin() {
+                if !https_endpoint(endpoint) || endpoint.origin() != issuer.origin() {
                     return Err(discovery_failed("Workload grants require issuer-origin HTTPS token and UserInfo endpoints"));
                 }
             }
         }
-        Ok(Arc::new(Self { issuer: config.issuer_url, token_endpoint, userinfo_endpoint, device_endpoint,
-            client_id: config.client_id, client_secret: config.client_secret, rules: config.rules,
-            workload_grants: config.workload_grants, clock, http, memory }))
+        Ok(Arc::new(Self { issuer, token_endpoint, userinfo_endpoint, device_endpoint,
+            service_client, rules, workload_grants, clock, http, memory }))
     }
-    fn base_fields(&self) -> BTreeMap<String, Secret> { fields([("client_id", self.client_id.as_str()), ("client_secret", self.client_secret.expose())]) }
+    fn base_fields(&self) -> BTreeMap<String, Secret> {
+        self.service_client.as_ref().map_or_else(BTreeMap::new, |(id, secret)| {
+            fields([("client_id", id.as_str()), ("client_secret", secret.expose())])
+        })
+    }
     async fn token(&self, fields: BTreeMap<String, Secret>) -> Result<HttpResponse> {
         let mut body = self.base_fields(); body.extend(fields);
         self.http.request(HttpRequest::Form { url: self.token_endpoint.clone(), fields: body }).await
@@ -133,7 +145,7 @@ impl Provider {
     async fn userinfo(&self, token: &Token) -> Result<HttpResponse> {
         self.http.request(HttpRequest::Get { url: self.userinfo_endpoint.clone(), bearer: Some(token.access.clone()) }).await
     }
-    fn workload_config(&self, client_id: &str) -> Option<&WorkloadGrantConfig> {
+    pub(crate) fn workload_config(&self, client_id: &str) -> Option<&WorkloadGrantConfig> {
         self.workload_grants.as_ref().filter(|config| client_id.starts_with(config.client_id_prefix()))
     }
     async fn principal(self: &Arc<Self>, token: Token, grant: RefreshGrant) -> Result<Arc<Principal>> {
@@ -169,7 +181,7 @@ impl Provider {
         Ok(Arc::new(Principal { user: Some(user.to_owned()), credentials, static_grants: None, _reservation: reservation }))
     }
     pub async fn password(self: &Arc<Self>, user: &str, password: &str) -> Result<Arc<Principal>> {
-        if self.workload_config(user).is_some()
+        if self.service_client.is_none() || self.workload_config(user).is_some()
             || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some())
         {
             return Err(workload_grant::invalid_grant());
@@ -180,8 +192,8 @@ impl Provider {
     }
     pub async fn client_credentials(self: &Arc<Self>, id: &str, secret: &str) -> Result<Arc<Principal>> {
         let workload_started = self.workload_config(id).map(|_| self.clock.now());
-        if workload_started.is_none()
-            && self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some())
+        if workload_started.is_none() && (self.service_client.is_none()
+            || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()))
         {
             return Err(workload_grant::invalid_grant());
         }
@@ -201,7 +213,7 @@ impl Provider {
         self.principal(Token::parse(&response.body, token_time, None, &self.memory)?, RefreshGrant::ClientCredentials { id: id.into(), secret: Secret::new(secret), _reservation: reservation }).await
     }
     pub async fn device(self: &Arc<Self>) -> Result<DeviceAuthorization> {
-        if self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()) {
+        if self.service_client.is_none() || self.workload_grants.as_ref().is_some_and(|config| config.assignment().is_some()) {
             return Err(workload_grant::invalid_grant());
         }
         let endpoint = self.device_endpoint.as_ref().ok_or_else(|| Anomaly::unsupported("xtdb.authn/device-auth-unsupported", "OIDC provider does not support device authorization flow - missing device_authorization_endpoint"))?;
@@ -254,6 +266,7 @@ fn expires_at(body: &Value, now: Timestamp) -> Result<Option<Timestamp>> {
 }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("rtdb.auth/invalid-response", message) }
 fn discovery_failed(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb.authn/oidc-discovery-failed", message) }
+pub(crate) fn workload_issuer_url(url: &Url) -> bool { https_endpoint(url) && url.query().is_none() }
 fn https_endpoint(url: &Url) -> bool {
     url.scheme() == "https" && url.host_str().is_some() && url.username().is_empty()
         && url.password().is_none() && url.fragment().is_none()
