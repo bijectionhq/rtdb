@@ -98,6 +98,7 @@ pub struct NativeServingHandle {
 
 impl NativeServingHandle {
     pub fn authority(&self) -> &NativeServingAuthority { &self.authority }
+    pub fn is_compatible(&self) -> bool { self.view.borrow().compatible }
 
     pub async fn view(&self, at: At, cancellation: &CancellationToken) -> Result<NativeServingView> {
         if at == At::Linearizable {

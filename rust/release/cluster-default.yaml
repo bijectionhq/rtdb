@@ -1,6 +1,7 @@
 remotes:
   cluster: !Kafka
     bootstrapServers: !Env RTDB_KAFKA_BOOTSTRAP
+defaultV1Serving: true
 log: !Kafka
   cluster: cluster
   topic: !Env RTDB_KAFKA_TOPIC

@@ -25,6 +25,12 @@ Set `kafka_bootstrap` to brokers reachable from the private subnets and `kafka_t
 Create the source topic and its `<topic>-replica` topic before startup.
 The native node opens the ordinary Kafka source and replica logs and stores its database files in S3.
 Each task caches remote files in its own ephemeral disk under `/var/lib/rtdb/cache`.
+The bundled `cluster-default.yaml` enables `defaultV1Serving` for the primary database.
+Provision v1 writes on a primary with fresh topics and object storage.
+Bring all replica-log readers up with v1 serving enabled before admitting those writes.
+Each replica opens the same database incarnation from S3.
+An applied Classic transaction makes the primary database's v1 branch route unavailable.
+Tracked queries, page continuations and claim guards require a shared token-key vault in the runtime.
 
 == Multi mode
 

@@ -39,6 +39,12 @@ The local `xtdb` user has no password, and both listeners bind to loopback.
 Use `--port` and `--flight-sql-port` to run alongside other instances, `0` to choose a free port, or `-1` to disable a listener.
 Startup prints the bound addresses.
 
+On a fresh default development directory, the primary database serves `rtdb.v1.Transact` over its local replica log.
+Its database incarnation and v1 receipts survive restart in that directory.
+Ordinary SQL uses the Classic partition, which has its own history.
+An applied Classic transaction makes the v1 branch route unavailable for that database.
+Use separate development directories when exercising Classic writes and v1 writes.
+
 Run `rtdb dev --multi --data .rtdb-multi` with a Multi-enabled runtime to develop against the fenced Journal driver.
 Multi binds Flight SQL to loopback on port 3000 and accepts writes through `rtdb.v1.Transact`.
 The selected directory holds the FileJournal, filesystem objects, database identity and generation keys.

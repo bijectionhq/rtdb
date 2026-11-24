@@ -11,7 +11,10 @@
 -- Source and replica are always separate logs — an invariant, not a convention.
 -- The default source and replica logs share the `SharedLog` port for ordered append, latest position, and replay from a prior position.
 -- A default attachment with a stable branch authority can use the applied-position serving route for an independent branch fold.
+-- Default development and the bundled default cluster configuration enable this route for the primary database.
+-- Replicas use the incarnation published in that database's object store.
 -- A classic resolved transaction outside that fold makes the branch route unavailable for the attachment.
+-- The classic partition continues to apply transactions from its source log.
 -- Each ordinary branch Transact appends one resolved record carrying its admission identifier, submission time and commitment to the admitted bytes.
 -- The matching record's ordered read-back advances the fold, releases the receipt and publishes settled effect keys with the applied basis.
 -- A block produced for the branch attachment carries its fold and receipt checkpoint at the block boundary.

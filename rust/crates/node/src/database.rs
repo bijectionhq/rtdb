@@ -582,7 +582,8 @@ impl DatabaseFactory {
                 storage, replica_epoch: logs.replica_epoch.0,
             });
             let mut serving = self.resources.serving_driver(&name, &configuration, &cancellation)?;
-            let native_authority = if serving.is_none() && self.options.replication.enabled && configuration.external_source.is_none() {
+            let can_attach_native = serving.is_none() && self.options.replication.enabled && configuration.external_source.is_none();
+            let native_authority = if can_attach_native {
                 self.resources.native_serving_authority(&name, &configuration)?
             } else {
                 None
@@ -592,6 +593,15 @@ impl DatabaseFactory {
                 .map(uuid::Uuid::from_bytes);
             let tokens = Arc::new(tokens::DatabaseTokens::new(&name, &configuration, read_only, Arc::clone(storage.object_store()),
                 self.resources.token_kms(), Arc::clone(&self.clock), incarnation));
+            let native_authority = match native_authority {
+                None if can_attach_native && self.options.default_v1_serving && name == "xtdb" => {
+                    Some(crate::serving::NativeServingAuthority {
+                        incarnation: *tokens.incarnation().await?.as_bytes(),
+                        checkpoints: None,
+                    })
+                }
+                authority => authority,
+            };
             if let Some(authority) = native_authority {
                 let handle = replica_driver.attach_native_serving(replication.clone(), authority, self.options.automatic_gc).await?;
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {

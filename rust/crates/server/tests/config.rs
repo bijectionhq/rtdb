@@ -18,6 +18,7 @@ fn cluster_default_image_config_funds_the_required_remote_disk_cache() {
         include_str!("../../../release/cluster-default.yaml"), &environment, false,
     ).unwrap();
     assert!(matches!(config.primary.storage, Some(rtdb_format::database::proto::database_config::Storage::RemoteStorage(_))));
+    assert!(config.node_options(1 << 30).unwrap().default_v1_serving);
     let cache = config.disk_cache.unwrap();
     assert_eq!(cache.path, std::path::Path::new("/var/lib/rtdb/cache"));
     assert_eq!(cache.maximum_bytes, Some(8 << 30));

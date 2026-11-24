@@ -20,6 +20,7 @@ surface StatelessDatabase {
     @guarantee CapabilityDiscovery
         -- A caller learns which operations and optional features the selected route can serve.
         -- An unavailable optional feature returns its name for comparison with Capabilities.
+        -- The default applied-position route withdraws its capabilities when Classic resolved history renders its branch fold unavailable.
 
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
