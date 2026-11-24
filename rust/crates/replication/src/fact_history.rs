@@ -1,6 +1,6 @@
 //! Evidence for replacing the live physical history of an owned relation.
 
-use std::{collections::{BTreeMap, BTreeSet, btree_map::Entry}, io::Cursor, sync::Arc};
+use std::{cmp::Reverse, collections::{BTreeMap, BTreeSet, btree_map::Entry}, io::Cursor, sync::Arc};
 
 use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
@@ -150,13 +150,20 @@ async fn visit(
         let _page = memory.reserve(reader.page_allocation_bound(page)?)?;
         let batch = EventBatch::new(reader.read_page(page)?)?;
         remaining = remaining.checked_sub(batch.len()).ok_or_else(|| uncovered("The trie exceeded its recorded row count"))?;
+        let mut previous = None;
         for row in 0..batch.len() {
+            let header = batch.header(row)?;
+            let rank = (header.iid, Reverse(header.precedence()));
+            if previous.is_some_and(|prior| rank < prior) {
+                return Err(uncovered("A selected page changed original winner order"));
+            }
+            previous = Some(rank);
             let borrowed = batch.borrow_event(row)?;
             let size = borrowed.document_allocation_bound()?.checked_add(borrowed.physical_entity_key().map_or(0, |key| key.len()))
                 .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| uncovered("A positioned event exceeds its decode bound"))?;
             let _decoded = memory.reserve(size)?;
             let value = batch.read_event(row)?;
-            if value.header().op == EventOp::Erase {
+            if header.op == EventOp::Erase {
                 return Err(uncovered("Owned erasure requires its ordered custody successor"));
             }
             for (depth, bucket) in path.iter().enumerate() {
