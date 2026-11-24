@@ -130,8 +130,10 @@ config {
 -- The meta file aligns page statistics to the trie's joined Arrow schema and retains their persisted branch order and Bloom bytes.
 --
 -- Writing the data file has two stages.
--- Intermediate results spill to disk between stages to bound memory usage.
--- Native compaction can retain a single already-sized page for a job with one merge task and one output under the shared memory budget and a fixed retention ceiling.
+-- Intermediate results use bounded disk spill or admitted Arrow batches between stages.
+-- Native compaction can retain merged pages for a single task with one output or for two to four tasks that preserve recency and write a current trie.
+-- Each retained batch fits the configured page size and the declared flat scalar output layout with plain IIDs and no `_recency` column.
+-- The retained Arrow reservations total at most 2 MiB per job and count against the shared memory budget.
 --
 -- == Stage 1: Merge pages ==
 --
@@ -168,20 +170,23 @@ config {
 --   With `within_file_recency_branching` off, no output file carries `_recency`.
 --
 -- At the end of each merge task (i.e. for each IID path prefix), accumulated rows for a spilled output are flushed to a temporary file on disk.
--- This bounds the memory usage of the compactor.
+-- A retention candidate that exceeds the row or byte ceiling spills after writing the retained prefix in merge-task order.
+-- Multi-task retention that encounters memory admission pressure during assembly can retry from its held inputs with disk spill.
+-- The spill path handles mixed or nested output fields, encoded IIDs, recency branching, and jobs outside the retention profile.
 --
 -- == Stage 2: Normalise page sizes ==
 --
--- The final writer reads the spill files or an admitted retained page and writes the resulting data and metadata files.
--- A retained page follows the same final write and page statistics rules as a spill leaf that already fits the page size.
--- For spilled outputs, the input is a tree structure representing the pages written during stage 1, along with their row counts.
+-- The final writer reads the spill files or admitted retained batches and writes the resulting data and metadata files.
+-- Ordinary IID normalization uses the same tree of merge pages and row counts for both sources.
+-- The final writer computes page statistics over the normalized output.
+-- Retained normalization that encounters memory admission pressure discards partial final files and retries through the bounded spill writer.
 --
 -- For each node in the tree:
 --   If a leaf has more rows than the page size: split by re-partitioning rows by IID.
 --     This recurses until each leaf fits within the page size limit.
---   If a branch has fewer rows than the page size: coalesce all descendant leaves into a single page.
+--   If a branch has at most a page of rows: coalesce all descendant leaves into a single page.
 --   A spill leaf that already fits the page size uses its decoded buffers with the declared output schema when IPC decoding only adapted field nullability.
---   Splitting and coalescing compatible spill pages select row ranges in Arrow and compact their columns in page order.
+--   Splitting and coalescing compatible merge pages select row ranges in Arrow and compact their columns in page order.
 --
 -- A file whose data carries `_recency` is laid out as RecencyCellLayout sets out instead.
 -- In native compaction, one IID's history can occupy several historical files when its assertions have different recency partitions.
