@@ -25,7 +25,10 @@ use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
 use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, NativeServingScope, SourceRequest};
-use rtdb_tx::transact::{Outcome as ServingOutcome, Receipt as ServingReceipt};
+use rtdb_tx::transact::{Erasure, Outcome as ServingOutcome, Receipt as ServingReceipt};
+use crate::default_erasure::{self, AppliedErasure, DefaultErasure, ErasureCut};
+
+mod default_erasure_runtime;
 
 #[async_trait]
 pub trait DatabaseEffects: Send + Sync {
@@ -515,6 +518,8 @@ pub struct ReplicationDriver {
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     serving_search: Option<Arc<dyn ServingSearchBuilder>>,
     serving: Option<NativeServing>,
+    default_erasure: Option<DefaultErasure>,
+    default_erasure_grant_micros: Option<u64>,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
     compaction_replay_cutoff: Option<ReplicaPosition>,
     track_catalog_cut: bool,
@@ -574,7 +579,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -597,6 +602,12 @@ impl ReplicationDriver {
             self.resolve.owned_witness_scope.is_none() && !self.config.external_source,
             checkpoint.as_ref().is_some_and(NativeServing::is_shared_checkpoint),
         ).await?;
+        if let Some(block) = &block {
+            let selected = default_erasure::recover_rewrite(&authority, &self.blocks, &self.logs, block,
+                checkpoint.as_ref(), &self.cancellation).await?;
+            if serving.pending_erasure().is_some() != selected.is_some() { return Err(default_erasure::invalid()); }
+            self.default_erasure = selected.map(DefaultErasure::Selected);
+        }
         let source_authority = Arc::clone(&serving.source_authority);
         let source_replies = Arc::clone(&serving.source_replies);
         self.serving = Some(serving);
@@ -642,8 +653,10 @@ impl ReplicationDriver {
         };
         if cancellation.is_cancelled() { return Ok(()); }
         let tail = tail?;
-        let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
-        self.historical_confirmations = history.unwrap_or_default();
+        if self.default_erasure.is_none() {
+            let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
+            self.historical_confirmations = history.unwrap_or_default();
+        }
         if self.cancellation.is_cancelled() { return Ok(()); }
         self.require_transferred_debt(self.read_position)?;
         self.update_installed_prefix()?;
@@ -657,6 +670,7 @@ impl ReplicationDriver {
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }
             self.drive_serving_terminal().await?;
+            self.drive_default_erasure().await?;
             self.drive_placed_slot()?;
             self.prepare_polls();
             enum Event { ReplicaBatch(PartitionReplay, Result<TailPoll>), Replica, SourceBatch(PartitionReplay, Result<TailPoll>), Source, Command(Option<Command>), Deferred, Appender(Result<()>), Resolved(TxResolver, Result<Arc<ResolvedTx>>), Produced(ProductionResult), Claimed(Result<crate::ReplicaMetadata>), Capacity }
@@ -664,11 +678,13 @@ impl ReplicationDriver {
             let waiting_for_checkpoint = self.waiting_for_checkpoint();
             let placed_open = self.placed_slot.is_some();
             let serving_timed = self.serving_holds_checkpoint();
-            let serving_source_ready = self.serving.as_ref().is_none_or(NativeServing::source_ready);
+            let erasure_pending = self.default_erasure.is_some();
+            let serving_source_ready = !erasure_pending && self.serving.as_ref().is_none_or(NativeServing::source_ready);
             let accept_commands = self.leader.as_ref().is_none_or(|leader| {
-                (!waiting_for_checkpoint && !placed_open && !serving_timed && leader.accepting_commands())
+                (!waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands())
                     || leader.deferred_commands.len() < 128
             });
+            let retry_erasure = self.retry_default_erasure();
             let check_capacity = waiting_for_checkpoint && self.pending_block.is_none()
                 && self.leader.as_ref().is_some_and(|leader| leader.confirmed && leader.accepting());
             let mut empty_poll = None;
@@ -678,7 +694,7 @@ impl ReplicationDriver {
             let (source_poll, job, resolution, production, ready_source, ready_deferred) = match self.leader.as_mut() {
                 Some(leader) => {
                     let ready_source = !waiting_for_checkpoint && !placed_open && serving_source_ready && leader.ready_source();
-                    let ready_deferred = !waiting_for_checkpoint && !placed_open && !serving_timed && leader.accepting_commands()
+                    let ready_deferred = !waiting_for_checkpoint && !placed_open && !serving_timed && !erasure_pending && leader.accepting_commands()
                         && !leader.deferred_commands.is_empty();
                     (&mut leader.source_poll, &mut leader.job, &mut leader.resolution, &mut leader.production, ready_source, ready_deferred)
                 }
@@ -696,7 +712,7 @@ impl ReplicationDriver {
                 _ = async {}, if ready_source => Event::Source,
                 _ = async {}, if ready_deferred => Event::Deferred,
                 command = self.commands.recv(), if accept_commands => Event::Command(command),
-                _ = capacity_poll.tick(), if check_capacity => Event::Capacity,
+                _ = capacity_poll.tick(), if check_capacity || retry_erasure => Event::Capacity,
             };
             match event {
                 Event::ReplicaBatch(tail, records) => {
@@ -741,7 +757,7 @@ impl ReplicationDriver {
                 Event::Command(Some(command)) => self.command(command).await?,
                 Event::Command(None) => return Ok(()),
                 Event::Capacity => {
-                    if let Ok(Some(capacity)) = self.logs.available_append_capacity().await {
+                    if check_capacity && let Ok(Some(capacity)) = self.logs.available_append_capacity().await {
                         self.advance_capacity_checkpoint(capacity).await?;
                     }
                 }
@@ -908,7 +924,7 @@ impl ReplicationDriver {
                 self.replica_poll = Some(start_poll(tail, timeout));
             }
         }
-        if !self.waiting_for_checkpoint() && self.placed_slot.is_none() && let Some(leader) = &mut self.leader {
+        if !self.waiting_for_checkpoint() && self.default_erasure.is_none() && self.placed_slot.is_none() && let Some(leader) = &mut self.leader {
             if leader.can_poll_source() && leader.waiting_strict_source.is_none()
                 && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
                 if let Some(tail) = leader.source_tail.take() { leader.source_poll = Some(start_poll(tail, self.config.assertion_interval)); }
@@ -989,7 +1005,9 @@ impl ReplicationDriver {
         let cancellation = self.cancellation.child_token();
         // Reopen from the installed source position after adopting an inherited block
         // or settling a recovered timed original.
-        let source_tail = if self.pending_block.is_some() || self.waiting_for_checkpoint() || self.serving_holds_checkpoint() {
+        let source_tail = if self.pending_block.is_some() || self.waiting_for_checkpoint() || self.serving_holds_checkpoint()
+            || self.default_erasure.is_some()
+        {
             None
         } else {
             Some(self.logs.source_replay(progress.source_position).await?)
@@ -1266,7 +1284,10 @@ impl ReplicationDriver {
         } else { false };
 
         if let Some(index) = historical { self.historical_confirmations.remove(index); }
-        if current { self.recovered_confirmation = None; }
+        if current {
+            self.observe_default_erasure_upload(record)?;
+            self.recovered_confirmation = None;
+        }
         if own {
             if let Err(error) = self.continue_recovery().await {
                 self.promotion_failed(error).await?;
@@ -1309,6 +1330,7 @@ impl ReplicationDriver {
         let mut work = VecDeque::from([record]);
         let mut adopted = false;
         while let Some(record) = work.pop_front() {
+            self.require_default_erasure_order(&record)?;
             let closes = match (&self.pending_block, &record.envelope.message) {
                 (Some(pending), ReplicaBody::BlockUploaded(message)) => pending.matches_upload(message, self.logs.storage_version, self.logs.storage_epoch),
                 _ => false,
@@ -1324,7 +1346,15 @@ impl ReplicationDriver {
                 crate::blocks::validate_boundary(&catalog, &pending.prepared, &pending.boundary)?;
                 validate_uploaded_root(&catalog, message, self.logs.requires_checkpoint_digest())?;
                 let tries = additions(&message.tries)?;
-                self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
+                let selected = self.verify_default_erasure_upload(&catalog, &pending.boundary, &record).await?;
+                if let Some(selected) = selected {
+                    let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
+                    self.partition.adopt_rewritten_block(pending.prepared.clone(), catalog, &table_blocks, record.metadata.timestamp)?;
+                    serving.adopt_erasure_generation(selected.generation);
+                    self.default_erasure = Some(DefaultErasure::Selected(selected));
+                } else {
+                    self.partition.adopt_block(pending.prepared.clone(), catalog, &table_blocks, &tries, record.metadata.timestamp)?;
+                }
                 self.progress.applied(message.latest_processed_msg_id.map(SourcePosition), None, message.external_source_token.clone())?;
                 let pending = self.pending_block.take().ok_or_else(|| invalid("Adopted block disappeared"))?;
                 let mut held = pending.into_records();
@@ -1335,7 +1365,7 @@ impl ReplicationDriver {
                     leader.cycle.adopted();
                     complete_record(&mut leader.pending, record.envelope.term_sequence, Ok(Applied::Control));
                 }
-                if self.leader.is_some() && !tries.is_empty() {
+                if self.leader.is_some() && self.default_erasure.is_none() && !tries.is_empty() {
                     self.logs.append_source(&SourceMessage::Protobuf(SourceBody::TriesAdded(proto::TriesAdded {
                         storage_version: Some(self.logs.storage_version.0), storage_epoch: Some(self.logs.storage_epoch.0),
                         tries: message.tries.clone(), source_msg_id: None,
@@ -1349,6 +1379,7 @@ impl ReplicationDriver {
                 && matches_confirmation(installed, upload, self.logs.storage_version, self.logs.storage_epoch)
             {
                 validate_uploaded_root(installed, upload, self.logs.requires_checkpoint_digest())?;
+                self.observe_default_erasure_upload(&record)?;
             }
             if self.pending_block.is_some() && self.upload_for_installed_block(&record) {
                 self.complete_control(&record);
@@ -1489,6 +1520,10 @@ impl ReplicationDriver {
                 }
                 ReplicaBody::BlockUploaded(_) => return Err(invalid("Block upload has no matching pending boundary")),
                 ReplicaBody::NoOp(message) => {
+                    if self.apply_default_erasure_control(message, record.metadata.position)? {
+                        self.complete_control(&record);
+                        continue;
+                    }
                     let mut released_checkpoint = false;
                     if message.serving_record.is_some() {
                         if message.placed_slot_reservation.is_some() || self.placed_slot.is_some() {
@@ -1504,6 +1539,8 @@ impl ReplicationDriver {
                         let held = serving.holds_checkpoint();
                         let mut physical = None;
                         let mut first_erasure = None;
+                        let mut captured_erasure = None;
+                        let logs = &self.logs;
                         let ready = serving.apply_ordered(message, own, Some((record.metadata.position, record.envelope.term)), |source, receipt, prior, effects| {
                             let write = serving::classic::stage_source(partition.snapshot(), prior, source, receipt, effects, memory)?;
                             let key = write.tx_key();
@@ -1513,11 +1550,24 @@ impl ReplicationDriver {
                                 _ => TransactionResult::Committed { tx_key: key },
                             };
                             first_erasure = first_write_erasure(record.metadata.position, &write)?;
+                            if receipt.erasure == Some(Erasure::Pending) {
+                                captured_erasure = Some(AppliedErasure::capture(ErasureCut {
+                                    basis: receipt.basis, source, replica: record.metadata.position, term: record.envelope.term,
+                                }, &write, logs)?);
+                            }
                             partition.apply(&write)?;
                             physical = Some(Arc::new(result));
                             Ok(())
                         })?;
                         if self.track_catalog_cut && self.first_erasure.is_none() { self.first_erasure = first_erasure; }
+                        if let Some(captured) = captured_erasure {
+                            if self.default_erasure.is_some()
+                                || serving.pending_erasure_installation() != Some(captured.cut.installation())
+                            {
+                                return Err(default_erasure::invalid());
+                            }
+                            self.default_erasure = Some(DefaultErasure::Applied(captured));
+                        }
                         if let Some((source, reply)) = ready {
                             if let Some(result) = &physical && let Some(leader) = &mut self.leader {
                                 leader.resolver_mut()?.observe_applied_serving(result.tx_key())?;
@@ -1526,7 +1576,7 @@ impl ReplicationDriver {
                             self.progress.applied(Some(source), physical.map(|result| AppliedTransaction::new(result, None)), None)?;
                         }
                         released_checkpoint = held && !serving.holds_checkpoint();
-                        if released_checkpoint {
+                        if released_checkpoint && self.default_erasure.is_none() {
                             let source = self.progress.source_position();
                             let resume = !self.waiting_for_checkpoint();
                             if let Some(leader) = &mut self.leader && leader.source_tail.is_none()
@@ -1605,7 +1655,7 @@ impl ReplicationDriver {
             if let Some(leader) = &mut self.leader {
                 if leader.resolver()?.staged_rows()? != 0 { return Err(invalid("A block adoption retained unresolved transaction writes")); }
                 leader.resolver = Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?);
-                if !waiting_for_checkpoint && self.pending_block.is_none() && leader.source_tail.is_none() && leader.source_poll.is_none() {
+                if !waiting_for_checkpoint && self.default_erasure.is_none() && self.pending_block.is_none() && leader.source_tail.is_none() && leader.source_poll.is_none() {
                     leader.source_tail = Some(self.logs.source_replay(progress.source_position).await?);
                 }
             }
@@ -1640,9 +1690,21 @@ impl ReplicationDriver {
         let search = self.serving_search.clone();
         let leader = self.leader.as_mut().ok_or_else(|| invalid("Follower attempted block production"))?;
         if leader.production.is_some() { return Err(invalid("Block production is already running")); }
-        let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(leader.term, leader.confirmed)).transpose()?;
+        let rewrite = match &self.default_erasure {
+            Some(DefaultErasure::Applied(captured)) => Some(captured.clone()),
+            Some(_) => return Err(default_erasure::invalid()),
+            None => None,
+        };
+        let term = rewrite.as_ref().map_or(leader.term, |_| boundary.envelope.term);
+        let serving_checkpoint = self.serving.as_mut().map(|serving| serving.checkpoint(term, leader.confirmed && rewrite.is_none())).transpose()?;
+        let logs = Arc::clone(&self.logs);
         let cancellation = leader.cancellation.clone();
         leader.production = Some(Production::Writing(Box::pin(async move {
+            if let Some(rewrite) = rewrite {
+                if !databases.is_empty() { return Err(default_erasure::unsupported()); }
+                return rewrite.produce(&blocks, &logs, &prepared, &boundary,
+                    serving_checkpoint.ok_or_else(default_erasure::unsupported)?, &cancellation).await;
+            }
             blocks.produce_with_search(&prepared, &boundary, databases, &cancellation, search.as_deref(), serving_checkpoint).await
         })));
         Ok(())
@@ -1845,6 +1907,7 @@ impl ReplicationDriver {
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
         let request = match request {
             Ok(request) if serving.request_pending(&request)
+                || request.transaction.uses_erasure() && !leader.drained_for_strict_source()
                 || leader.pending.iter().any(|write| matches!(&write.body, WriteBody::Resolved(..))) =>
             {
                 leader.waiting_strict_source = Some(StrictSource::Serving { position, request });
@@ -2070,7 +2133,13 @@ impl ReplicationDriver {
     }
     async fn flush_if_due(&mut self) -> Result<()> {
         let persisted = self.partition.value().table_catalog().block().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
-        if !self.waiting_for_checkpoint() && self.leader.as_ref().is_some_and(LeaderState::accepting_commands) && self.flush_timer.should_flush((self.clock)(), persisted) { self.cut().await?; }
+        if self.default_erasure.is_none()
+            && !self.waiting_for_checkpoint()
+            && self.leader.as_ref().is_some_and(LeaderState::accepting_commands)
+            && self.flush_timer.should_flush((self.clock)(), persisted)
+        {
+            self.cut().await?;
+        }
         Ok(())
     }
     async fn command(&mut self, command: Command) -> Result<()> {
@@ -2082,7 +2151,8 @@ impl ReplicationDriver {
             let _ = completion.send(status);
             return Ok(());
         }
-        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some() || self.serving_holds_checkpoint();
+        let waiting_for_checkpoint = self.waiting_for_checkpoint() || self.placed_slot.is_some() || self.serving_holds_checkpoint()
+            || self.default_erasure.is_some();
         let Some(leader) = &mut self.leader else { command.fail(term_ended()); return Ok(()); };
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if waiting_for_checkpoint || !leader.accepting_commands() { leader.deferred_commands.push_back(command); return Ok(()); }

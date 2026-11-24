@@ -150,6 +150,7 @@ impl ReadOnlyLocalLog {
                 (next, end)
             }
         };
+        if let Some(keys) = &self.keys { keys.require_local_offset(next as i64)?; }
         Ok(ReadOnlyTail {
             path: Arc::clone(&self.path),
             options: self.options.clone(),

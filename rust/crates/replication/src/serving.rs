@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::ReplicationHandle;
+use crate::{ReplicationHandle, default_erasure::{self, RewriteEvidence}};
 
 pub(crate) mod classic;
 pub(crate) mod retained;
@@ -91,7 +91,7 @@ pub(crate) enum NativeCheckpointImage {
 }
 
 impl NativeCheckpointImage {
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         match self { Self::Inline(bytes) => bytes, Self::Sealed(opened) => &opened.bytes }
     }
 
@@ -256,8 +256,10 @@ impl NativeServingHandle {
             if error.category == AnomalyCategory::Interrupted { interrupted() } else { error }
         })?;
         let receipt = self.source_replies.get(position).ok_or_else(interrupted)??;
-        if receipt.erasure == Some(Erasure::Pending) { return Err(erasure_pending()); }
-        let Some(scope) = &scope else { return Ok(receipt); };
+        let Some(scope) = &scope else {
+            require_armed_erase_receipt(&receipt)?;
+            return Ok(receipt);
+        };
         let index = self.view.borrow().index.clone();
         project_receipt(&index, receipt, Some(scope))
     }
@@ -311,6 +313,7 @@ pub(crate) struct NativeServing {
     writer: Option<(Term, Arc<Mutex<WriterObjects>>)>,
     pending: BTreeMap<u64, proto::NoOp>,
     timed_source: Option<SourcePosition>,
+    erasure_in_flight: bool,
     pending_replies: usize,
     shares_main: bool,
     classic_charges: Vec<Arc<MemoryReservation>>,
@@ -333,6 +336,24 @@ struct CheckpointWriter {
 }
 
 impl ServingCheckpoint {
+    pub(crate) fn bind_rewrite(&mut self, evidence: RewriteEvidence) -> Result<()> {
+        let (prefix, state) = self.image.split_at_checked(CHECKPOINT_HEADER_BYTES + 1).ok_or_else(default_erasure::invalid)?;
+        if prefix.last() != Some(&SHARED_CHECKPOINT) || RewriteEvidence::read(state)?.0.is_some() {
+            return Err(default_erasure::invalid());
+        }
+        let writer = self.writer.as_mut().ok_or_else(default_erasure::unsupported)?;
+        writer.authority.generation = writer.authority.generation.checked_add(1).ok_or_else(default_erasure::invalid)?;
+        writer.collect = false;
+        self.image = evidence.frame(prefix, state)?;
+        Ok(())
+    }
+
+    pub(crate) async fn store_rewrite(self, blocks: &crate::BlockStore, cancellation: &CancellationToken) -> Result<String> {
+        let writer = self.writer.as_ref().ok_or_else(default_erasure::unsupported)?;
+        writer.authority.kms.create(Generation { database: writer.database, number: writer.authority.generation }).await?;
+        self.store(blocks, cancellation).await?.1.ok_or_else(default_erasure::invalid)
+    }
+
     pub(crate) async fn verify(&self, store: &dyn ObjectStore, inline: Option<&[u8]>, object: Option<&str>) -> Result<()> {
         let same = match (inline, object) {
             (Some(inline), None) => self.image.as_ref() == inline && self.writer.is_none(),
@@ -342,6 +363,7 @@ impl ServingCheckpoint {
                 if id.database != writer.database || id.epoch > writer.epoch { return Err(invalid()); }
                 let plaintext = rtdb_store::read_file(store, writer.authority.kms.as_ref(), id).await?;
                 self.image.as_ref() == plaintext.bytes.as_slice()
+                    && (checkpoint_rewrite(&self.image)?.is_none() || plaintext.generation.number == writer.authority.generation)
             }
             _ => false,
         };
@@ -379,7 +401,7 @@ impl NativeServing {
         Ok((Self {
             authority, fold: Some(fold), position, pipeline: None,
             collect_checkpoints, writer: None, pending: BTreeMap::new(),
-            timed_source: None, pending_replies: 0,
+            timed_source: None, erasure_in_flight: false, pending_replies: 0,
             shares_main: shared_checkpoint || position == 0, classic_charges: Vec::new(),
             view, source_authority, source_replies: Arc::default(),
         }, receiver))
@@ -405,6 +427,22 @@ impl NativeServing {
             Some(CheckpointWriter { allocator: Arc::clone(writer), authority: authority.clone(), database, epoch, collect: confirmed && self.collect_checkpoints })
         } else { None };
         Ok(ServingCheckpoint { image: frame.freeze(), writer })
+    }
+
+    pub(crate) fn checkpoint_authority(&self) -> &NativeServingAuthority { &self.authority }
+
+    pub(crate) fn pending_erasure(&self) -> Option<Basis> { self.durable().pending_erasure() }
+
+    pub(crate) fn pending_erasure_installation(&self) -> Option<(Basis, InstalledReceipt)> {
+        self.durable().pending_erasure_installation()
+    }
+
+    pub(crate) fn adopt_erasure_generation(&self, generation: u64) {
+        self.view.send_modify(|view| {
+            view.key_generation = Some(generation);
+            view.floor = view.index.head().basis;
+            view.changes = Arc::default();
+        });
     }
 
     pub(crate) fn source_ready(&self) -> bool {
@@ -442,6 +480,7 @@ impl NativeServing {
             Err(error) if error.is_caller_error() => self.source_reply(source, Err(error)),
             Err(error) => Err(error),
             Ok(Decision::Append { position, record }) => {
+                self.erasure_in_flight = request.transaction.uses_erasure();
                 let installs_source = request.transaction.window.before.is_none();
                 let message = decision_message(position, &record, Some(source), installs_source, self.shares_main);
                 self.pending.insert(position, message.clone());
@@ -472,7 +511,7 @@ impl NativeServing {
     }
 
     pub(crate) fn holds_checkpoint(&self) -> bool {
-        self.durable().recover_pending().is_some()
+        self.erasure_in_flight || self.durable().recover_pending().is_some()
             || self.pipeline.as_ref().is_some_and(|pipeline| pipeline.awaiting_terminal().next().is_some())
     }
 
@@ -547,6 +586,7 @@ impl NativeServing {
             return Ok(None);
         };
         self.timed_source = None;
+        self.erasure_in_flight = false;
         if installed != source || receipts.next().is_some() || receipt.basis.position() != position { return Err(invalid()); }
         if let Some((prior, effects, namespace)) = projection {
             let source = installed.ok_or_else(invalid)?;
@@ -605,6 +645,7 @@ impl NativeServing {
             self.fold = Some(pipeline.into_durable());
         }
         self.pending.clear();
+        self.erasure_in_flight = false;
         self.pending_replies = 0;
     }
 
@@ -719,10 +760,16 @@ impl NativeServing {
 }
 
 pub(crate) fn require_physical_replay_support(message: &proto::NoOp) -> Result<()> {
-    if message.serving_record.as_deref().and_then(|frame| frame.first()) == Some(&SHARED_DECISION_FRAME) {
+    if message.serving_record.as_deref().and_then(|frame| frame.first()) == Some(&SHARED_DECISION_FRAME)
+        || default_erasure::ErasureRetirement::decode(message)?.is_some() {
         return Err(Anomaly::unsupported("rtdb/shared-suffix-replay", "This replay path requires the shared transaction fold"));
     }
     Ok(())
+}
+
+fn replica_basis_position(replica: ReplicaPosition) -> Result<u64> {
+    let position = replica.0.checked_add(1).ok_or_else(invalid)?;
+    u64::try_from(position).map_err(|_| invalid())
 }
 
 pub(crate) fn decode_checkpoint_image(image: &[u8], incarnation: [u8; 16]) -> Result<(TransactState, u64, bool)> {
@@ -733,27 +780,35 @@ pub(crate) fn decode_checkpoint_image(image: &[u8], incarnation: [u8; 16]) -> Re
     let cut = BranchCut { basis, system_time: Timestamp(header.get_i64()) };
     if basis.incarnation() != incarnation || position < basis.position() { return Err(invalid()); }
     let shared = state.first() == Some(&SHARED_CHECKPOINT);
-    let state = if shared { &state[1..] } else { state };
-    Ok((TransactState::decode_checkpoint(state, cut)?, position, shared))
+    let (rewrite, state) = if shared { RewriteEvidence::read(&state[1..])? } else { (None, state) };
+    let fold = TransactState::decode_checkpoint(state, cut)?;
+    if rewrite.is_some_and(|evidence| fold.pending_erasure_installation() != Some(evidence.cut.installation())
+        || cut.basis != evidence.cut.basis) {
+        return Err(default_erasure::invalid());
+    }
+    Ok((fold, position, shared))
 }
 
-fn replica_basis_position(replica: ReplicaPosition) -> Result<u64> {
-    let position = replica.0.checked_add(1).ok_or_else(invalid)?;
-    u64::try_from(position).map_err(|_| invalid())
-}
-
-fn erasure_pending() -> Anomaly {
-    Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement")
+pub(crate) fn checkpoint_rewrite(image: &[u8]) -> Result<Option<RewriteEvidence>> {
+    if image.get(CHECKPOINT_HEADER_BYTES) != Some(&SHARED_CHECKPOINT) { return Ok(None); }
+    RewriteEvidence::read(&image[CHECKPOINT_HEADER_BYTES + 1..]).map(|(evidence, _)| evidence)
 }
 
 fn project_receipt(index: &BranchIndex, mut receipt: Receipt, scope: Option<&NativeServingScope>) -> Result<Receipt> {
-    if receipt.erasure == Some(Erasure::Pending) { return Err(erasure_pending()); }
+    require_armed_erase_receipt(&receipt)?;
     if let Some(scope) = scope {
         let cut = index.project_main_visibility(&scope.labels)?.projected_cut(receipt.basis)?;
         receipt.basis = cut.basis;
         receipt.system_time = cut.system_time;
     }
     Ok(receipt)
+}
+
+fn require_armed_erase_receipt(receipt: &Receipt) -> Result<()> {
+    if receipt.erasure == Some(Erasure::Pending) {
+        return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement"));
+    }
+    Ok(())
 }
 
 fn decision_message(position: u64, record: &[u8], source: Option<SourcePosition>, installs_source: bool, shared: bool) -> proto::NoOp {

@@ -428,6 +428,21 @@ impl KafkaFrameKeys {
     }
 }
 
+impl ClassicObjectKeys {
+    fn local_prefix_path(&self) -> PathBuf { self.path.join("local-prefix-retirement") }
+
+    pub(crate) fn with_local_prefix_retirement<T>(&self, work: impl FnOnce(&Path) -> crate::Result<T>) -> crate::Result<T> {
+        let path = self.local_prefix_path();
+        let _gate = lock(&path)?;
+        work(&path)
+    }
+
+    pub(crate) fn require_local_offset(&self, offset: i64) -> crate::Result<()> {
+        let first_retained = crate::log::local::erasure::read_floor(&self.local_prefix_path())?;
+        if offset < first_retained { return Err(Error::UnavailableLogRange { requested: offset, first_retained }); }
+        Ok(())
+    }
+
 fn kafka_publication(frame: &[u8]) -> crate::Result<Uuid> {
     frame.first_chunk::<16>()
         .filter(|_| frame.len() >= KAFKA_LOG_SEAL_OVERHEAD)
@@ -443,6 +458,7 @@ impl ClassicObjectKeys {
         timestamp: i64,
         payload: &[u8],
     ) -> crate::Result<Bytes> {
+        self.require_local_offset(offset)?;
         let publication = Uuid::new_v4();
         let name = ObjectKey::new(format!("frames/{publication}"))?;
         let associated = format!("rtdb.classic.log-frame/v1/{publication}/{offset}/{timestamp}");
@@ -457,6 +473,13 @@ impl ClassicObjectKeys {
         timestamp: i64,
         payload: &[u8],
     ) -> crate::Result<Bytes> {
+        let gate = open_slot_lock(&self.local_prefix_path())?;
+        gate.lock_shared().map_err(io(&self.local_prefix_path()))?;
+        self.require_local_offset(offset)?;
+        self.open_original_record(offset, timestamp, payload)
+    }
+
+    fn open_original_record(&self, offset: i64, timestamp: i64, payload: &[u8]) -> crate::Result<Bytes> {
         let (publication, ciphertext) = payload.split_at_checked(16).ok_or_else(|| {
             Error::Task("The sealed Classic log frame has no publication identity".into())
         })?;
@@ -488,7 +511,7 @@ impl ClassicObjectKeys {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 // Authenticate this offset and its original publication before
                 // recording authority to destroy its slot.
-                self.open_record(offset, timestamp, sealed)?;
+                self.open_original_record(offset, timestamp, sealed)?;
                 let mut intent = tempfile::NamedTempFile::new_in(self.path.as_ref()).map_err(io(&marker))?;
                 intent.write_all(binding.as_ref()).map_err(io(&marker))?;
                 crate::sync_file(intent.as_file()).map_err(io(&marker))?;

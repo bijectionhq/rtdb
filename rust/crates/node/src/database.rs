@@ -623,6 +623,12 @@ impl DatabaseFactory {
                 authority => authority,
             };
             if let Some(authority) = &native_authority {
+                if authority.checkpoints.is_some() && !read_only {
+                    let garbage = &self.options.garbage;
+                    let grant = garbage.reader_lease_micros()?.checked_add(garbage.reader_lease_margin_micros()?)
+                        .ok_or_else(|| Anomaly::incorrect("rtdb/default-erasure-grant", "The Default erasure grant horizon overflows"))?;
+                    replica_driver = replica_driver.with_default_erasure_grant(grant as u64);
+                }
                 let handle = replica_driver.attach_native_serving(replication.clone(), authority.clone(), self.options.automatic_gc).await?;
                 serving = Some(Arc::new(crate::serving::default::DefaultServing {
                     handle, memory: Arc::clone(&self.memory), storage: Arc::clone(&storage),

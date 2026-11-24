@@ -423,6 +423,11 @@ impl ObjectStore for EncryptingStore {
         }
     }
 
+    fn local_classic_key_slots(&self) -> Option<&dyn ObjectCipher> {
+        if self.classic_control.is_none() || self.inner.local_maintenance_store().is_none() { return None; }
+        match &self.keys { ObjectKeys::Units(units) => Some(units.as_ref()), _ => None }
+    }
+
     fn syncs_checkpoints(&self) -> bool {
         self.classic_control.is_some() && self.inner.syncs_checkpoints()
     }

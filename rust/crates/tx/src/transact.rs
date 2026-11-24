@@ -602,6 +602,12 @@ impl TransactState {
         self.receipts.get(&key.namespace)?.get(&key.key).map(|stored| stored.receipt.basis)
     }
 
+    pub fn pending_erasure_installation(&self) -> Option<(Basis, InstalledReceipt)> {
+        let key = self.pending_erasure.as_ref()?;
+        let stored = self.receipts.get(&key.namespace)?.get(&key.key)?;
+        Some((stored.receipt.basis, stored.installed?))
+    }
+
     pub fn arm_erasure(&mut self, basis: Basis, unreadable_by: Timestamp) -> Result<()> {
         let key = self.pending_erasure.as_ref().ok_or_else(invalid_record)?;
         let receipt = &mut self.receipts.get_mut(&key.namespace)

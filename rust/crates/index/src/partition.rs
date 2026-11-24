@@ -439,6 +439,31 @@ impl PartitionState {
         Ok(BlockPreparation { captured, metadata })
     }
 
+    /// Installs the full catalog from an independently rewritten recovery block.
+    pub fn adopt_rewritten_block(&self, prepared: BlockPreparation, block: BlockCatalog,
+        table_blocks: &BTreeMap<TableRef, TableBlock>, as_of: Timestamp,
+    ) -> Result<()> {
+        let naming_epoch = block.naming_epoch();
+        let durable = TrieCatalog::load(table_blocks, prepared.captured.trie_catalog.file_size_target(), as_of)?
+            .with_naming_epoch(naming_epoch);
+        let checkpoint_tries = Some(Arc::new(CheckpointTries::capture(&durable)));
+        let tables = TableCatalog::load(Some(block.clone()), table_blocks)?.with_system_tables()?;
+        let mut value = self.value.write();
+        if !Arc::ptr_eq(&value.live, &prepared.captured.live)
+            || block.block_index() != value.live.block_index()
+            || block.latest_completed_tx() != value.live.latest_completed_tx()
+            || value.trie_catalog.naming_epoch().checked_add(1) != Some(naming_epoch)
+        {
+            return Err(invalid("The rewrite no longer covers the installed partition boundary"));
+        }
+        let live = value.live.next_block()?;
+        *self.published.lock() = None;
+        *value = Arc::new(PartitionValue { trie_catalog: Arc::new(durable), checkpoint_tries,
+            table_catalog: Arc::new(tables), live: Arc::new(live), live_snapshot: None,
+            catalog_publication: CatalogPublication::Untracked });
+        Ok(())
+    }
+
     /// Storage must publish the root and its table blocks before this atomic adoption.
     /// Collection protects the tries used to restore the recorded checkpoint.
     pub fn adopt_block(&self, prepared: BlockPreparation, block: BlockCatalog, table_blocks: &BTreeMap<TableRef, TableBlock>,

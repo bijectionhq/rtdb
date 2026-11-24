@@ -43,9 +43,12 @@ async fn a_reopened_view_checks_the_actual_checkpoint_generation_at_delivery() -
     let checkpoint = authority
         .read_checkpoint(store.as_ref(), None, Some(&key))
         .await?;
-    let (_reopened, view) =
+    let (reopened, view) =
         NativeServing::open(authority.clone(), store, checkpoint.as_ref(), false)?;
-    let generation = view.borrow().key_generation.unwrap();
+    let original = view.borrow().clone();
+    reopened.adopt_erasure_generation(current.number);
+    let generation = original.key_generation.unwrap();
+    assert_eq!(view.borrow().key_generation, Some(current.number));
     assert_eq!(generation, selected.number);
     kms.retire(selected, 10).await?;
     authority.check_checkpoint_generation(generation).await?;

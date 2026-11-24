@@ -175,6 +175,7 @@ pub trait ObjectStore: Send + Sync {
     /// Whether returned bytes may be reused across reads without returning to this owner.
     fn permits_shared_read_cache(&self) -> bool { false }
     fn local_maintenance_store(&self) -> Option<&LocalStore> { None }
+    fn local_classic_key_slots(&self) -> Option<&dyn crate::sealing::ObjectCipher> { None }
     /// Resolves the single payload named by an authenticated replica delivery.
     async fn read_replica_payload(&self, _custody: &crate::log::ReplicaObjectCustody,
         _memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<crate::log::ReplicaPayload> {
