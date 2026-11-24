@@ -2,12 +2,12 @@ use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_crypt::{Kms, tokens::VerifiedClaims};
+use rtdb_crypt::{Generation, Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
 use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite}};
 use rtdb_tx::transact::{
-    COUNT_RANGE_CONSTRAINT, Decision, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact,
+    COUNT_RANGE_CONSTRAINT, Decision, Erasure, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact,
     TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState,
     TransactionRecord, TrustedCustodyRelease,
 };
@@ -24,6 +24,8 @@ use crate::ReplicationHandle;
 
 pub(crate) mod classic;
 mod source;
+#[cfg(test)]
+mod checkpoint_delivery_tests;
 use source::SourceAuthority;
 pub(crate) use source::SourceRequest;
 
@@ -82,20 +84,41 @@ pub struct NativeCheckpointAuthority {
     pub generation: u64,
 }
 
+pub(crate) enum NativeCheckpointImage {
+    Inline(Bytes),
+    Sealed(rtdb_crypt::Plaintext),
+}
+
+impl NativeCheckpointImage {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self { Self::Inline(bytes) => bytes, Self::Sealed(opened) => &opened.bytes }
+    }
+
+    fn key_generation(&self) -> Option<u64> {
+        match self { Self::Inline(_) => None, Self::Sealed(opened) => Some(opened.generation.number) }
+    }
+}
+
 impl NativeServingAuthority {
-    pub(crate) async fn read_checkpoint(&self, store: &dyn ObjectStore, inline: Option<&[u8]>, object: Option<&str>) -> Result<Option<Bytes>> {
+    pub(crate) async fn read_checkpoint(&self, store: &dyn ObjectStore, inline: Option<&[u8]>, object: Option<&str>) -> Result<Option<NativeCheckpointImage>> {
         match (inline, object) {
-            (Some(bytes), None) => Ok(Some(Bytes::copy_from_slice(bytes))),
+            (Some(bytes), None) => Ok(Some(NativeCheckpointImage::Inline(Bytes::copy_from_slice(bytes)))),
             (None, None) => Ok(None),
             (None, Some(key)) => {
                 let id: ObjectId = key.parse()?;
                 if id.database.as_bytes() != &self.incarnation { return Err(invalid()); }
                 let checkpoints = self.checkpoints.as_ref().ok_or_else(unavailable)?;
                 let plaintext = rtdb_store::read_file(store, checkpoints.kms.as_ref(), id).await?;
-                Ok(Some(Bytes::copy_from_slice(&plaintext.bytes)))
+                Ok(Some(NativeCheckpointImage::Sealed(plaintext)))
             }
             (Some(_), Some(_)) => Err(invalid()),
         }
+    }
+
+    /// Rechecks the generation captured by the view before releasing its contents.
+    pub async fn check_checkpoint_generation(&self, generation: u64) -> Result<()> {
+        let checkpoints = self.checkpoints.as_ref().ok_or_else(unavailable)?;
+        checkpoints.kms.check_readable(Generation { database: Uuid::from_bytes(self.incarnation), number: generation }).await
     }
 }
 
@@ -104,6 +127,7 @@ pub struct NativeServingView {
     pub index: BranchIndex,
     pub floor: Basis,
     pub changes: Arc<VecDeque<(BranchCut, Vec<BranchWrite>)>>,
+    pub key_generation: Option<u64>,
     compatible: bool,
     classic_head: Option<ReplicaPosition>,
 }
@@ -231,7 +255,10 @@ impl NativeServingHandle {
             if error.category == AnomalyCategory::Interrupted { interrupted() } else { error }
         })?;
         let receipt = self.source_replies.get(position).ok_or_else(interrupted)??;
-        let Some(scope) = &scope else { return Ok(receipt); };
+        let Some(scope) = &scope else {
+            require_armed_erase_receipt(&receipt)?;
+            return Ok(receipt);
+        };
         let index = self.view.borrow().index.clone();
         project_receipt(&index, receipt, Some(scope))
     }
@@ -334,14 +361,15 @@ impl ServingCheckpoint {
 }
 
 impl NativeServing {
-    pub(crate) fn open(authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&[u8]>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
+    pub(crate) fn open(authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&NativeCheckpointImage>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
         let (fold, position, shared_checkpoint) = match checkpoint {
-            Some(checkpoint) => decode_checkpoint_image(checkpoint, authority.incarnation)?,
+            Some(checkpoint) => decode_checkpoint_image(checkpoint.bytes(), authority.incarnation)?,
             None => (TransactState::new(authority.incarnation), 0, false),
         };
         let (view, receiver) = watch::channel(NativeServingView {
             index: fold.index().clone(),
             floor: fold.index().head().basis,
+            key_generation: checkpoint.and_then(NativeCheckpointImage::key_generation),
             changes: Arc::default(), compatible: true, classic_head: None,
         });
         let source_authority = Arc::new(SourceAuthority::new(store, authority.incarnation));
@@ -668,12 +696,20 @@ pub(crate) fn decode_checkpoint_image(image: &[u8], incarnation: [u8; 16]) -> Re
 }
 
 fn project_receipt(index: &BranchIndex, mut receipt: Receipt, scope: Option<&NativeServingScope>) -> Result<Receipt> {
+    require_armed_erase_receipt(&receipt)?;
     if let Some(scope) = scope {
         let cut = index.project_main_visibility(&scope.labels)?.projected_cut(receipt.basis)?;
         receipt.basis = cut.basis;
         receipt.system_time = cut.system_time;
     }
     Ok(receipt)
+}
+
+fn require_armed_erase_receipt(receipt: &Receipt) -> Result<()> {
+    if receipt.erasure == Some(Erasure::Pending) {
+        return Err(Anomaly::new(AnomalyCategory::Busy, "rtdb/erasure-pending", "The erase receipt is waiting for durable key retirement"));
+    }
+    Ok(())
 }
 
 fn decision_message(position: u64, record: &[u8], source: Option<SourcePosition>, installs_source: bool, shared: bool) -> proto::NoOp {
@@ -757,7 +793,8 @@ mod tests {
     }
 
     fn open(checkpoint: Option<&[u8]>) -> (NativeServing, watch::Receiver<NativeServingView>) {
-        NativeServing::open(authority(), Arc::new(MemoryStore::default()), checkpoint, false).unwrap()
+        let image = checkpoint.map(|bytes| NativeCheckpointImage::Inline(Bytes::copy_from_slice(bytes)));
+        NativeServing::open(authority(), Arc::new(MemoryStore::default()), image.as_ref(), false).unwrap()
     }
 
     fn put(key: u8) -> Transact {

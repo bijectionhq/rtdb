@@ -23,7 +23,8 @@ pub(crate) struct DefaultServing {
 }
 
 impl DefaultServing {
-    async fn open_change_page(&self, view: &NativeServingView, page: ChangePage) -> Result<ChangePage> {
+    async fn open_change_page(&self, view: &NativeServingView, mut page: ChangePage) -> Result<ChangePage> {
+        page.key_generation = view.key_generation;
         if !view.index.has_custody_groups() {
             return Ok(page);
         }
@@ -70,11 +71,12 @@ impl ServingDriver for DefaultServing {
             None
         };
         let cut = branch.cut();
+        let key_generation = snapshot.key_generation;
         let (snapshot, custody_groups, custody_contributors) = if snapshot.index.has_custody_groups() {
             let vault = self.tokens.authority().await?.custody_vault();
             super::custody::snapshot(&branch, &self.memory, &vault).await?
         } else { (rtdb_query::branch_snapshot(&branch, &self.memory)?, BTreeSet::new(), Some(BTreeSet::new())) };
-        Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, key_generation: None })
+        Ok(QueryView { snapshot, cut, claim, custody_groups, custody_contributors, key_generation })
     }
 
     async fn transact(&self, mut request: Transact, cancellation: &CancellationToken) -> Result<Receipt> {
@@ -98,6 +100,14 @@ impl ServingDriver for DefaultServing {
         let view = self.handle.view(At::Linearizable, cancellation).await?;
         let vault = self.tokens.authority().await?.custody_vault();
         super::custody::check_delivery(&view.index, &vault, groups).await
+    }
+
+    async fn check_read_delivery(&self, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>, cancellation: &CancellationToken) -> Result<()> {
+        self.check_custody_delivery(groups, cancellation).await?;
+        if let Some(generation) = generation {
+            self.handle.authority().check_checkpoint_generation(generation).await?;
+        }
+        Ok(())
     }
 
     async fn current_custody(&self, cancellation: &CancellationToken) -> Result<BranchIndex> {
@@ -145,6 +155,7 @@ impl ServingDriver for DefaultServing {
             };
             match scope.query(&snapshot.index, source.clone(), now, &self.memory, vault.as_ref()).await {
                 Ok((mut view, raw)) => {
+                    view.key_generation = snapshot.key_generation;
                     if track {
                         view.claim = Some(self.tokens.authority().await?.issuer().await?
                             .seal_scoped_claim(raw, &scope.labels).await?);

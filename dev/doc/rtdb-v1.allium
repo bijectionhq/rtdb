@@ -116,8 +116,10 @@ surface StatelessDatabase {
         -- The clean native recovery cut binds the applied source position, its replica boundary and the exact uploaded block digest.
         -- The selected native checkpoint authenticates under the successor generation and retains the pending receipt at the erased basis.
         -- The receipt carries the unreadable-by deadline after the key authority has durably armed it.
+        -- A pending erasure receipt stays private to the fold until retirement is armed.
         -- Replayed erase receipts preserve that deadline after trim.
         -- Previously opened query and change streams verify their selected generation at each frame handoff.
+        -- A Default view reopened from a sealed checkpoint keeps the authenticated generation of that image through frame delivery.
 
     @guarantee ProtectedPlacement
         -- A route that serves row custody orders original placement, reservation, activation and revocation in the same database fold.
