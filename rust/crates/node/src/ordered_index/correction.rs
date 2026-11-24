@@ -8,7 +8,7 @@ use rtdb_types::{Iid, Interval, Result, Timestamp};
 use super::{
     PAGE_LAYOUT_VERSION, format_error,
     key::arrow,
-    postings::{BatchKind, KeyBatch, ProjectedKeys},
+    postings::{BatchKind, KeyBatch, KeyBatchEncoding, ProjectedKeys},
     tree::{AddressRef, Entry, Item, Key, Span},
 };
 
@@ -21,45 +21,72 @@ pub(super) const HEADER: [u8; 16] = {
 
 const GROUP_HEADER_BYTES: usize = 24;
 
-pub(super) fn encode(entries: &[Entry]) -> Result<Vec<u8>> {
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut groups = Vec::with_capacity(entries.len() * GROUP_HEADER_BYTES);
-    let mut from = Vec::new();
-    let mut to = Vec::new();
-    let mut tuples = Vec::new();
-    for entry in entries {
-        let (Key::Row(address), Item::Row(spans)) = (&entry.key, &entry.item) else {
-            return Err(invalid());
-        };
-        if spans.is_empty() {
-            return Err(invalid());
+pub(super) struct CorrectionPage<'a> {
+    entries: &'a [Entry],
+    batch: KeyBatch,
+    groups_len: usize,
+}
+
+impl<'a> CorrectionPage<'a> {
+    pub fn prepare(entries: &'a [Entry]) -> Result<Option<Self>> {
+        if entries.is_empty() {
+            return Ok(None);
         }
-        let address = address.view();
-        groups.extend_from_slice(address.iid.as_bytes());
-        groups.extend_from_slice(
-            &u32::try_from(spans.len())
-                .map_err(format_error)?
-                .to_le_bytes(),
-        );
-        groups.extend_from_slice(&u32::try_from(address.key.len()).map_err(format_error)?.to_le_bytes());
-        groups.extend_from_slice(address.key);
-        for span in spans.iter() {
-            from.push(span.valid.lower().0);
-            to.push(span.valid.upper().0);
-            tuples.push(span.tuple.view());
+        let mut groups_len = 0usize;
+        let mut from = Vec::new();
+        let mut to = Vec::new();
+        let mut tuples = Vec::new();
+        for entry in entries {
+            let (Key::Row(address), Item::Row(spans)) = (&entry.key, &entry.item) else {
+                return Err(invalid());
+            };
+            if spans.is_empty() {
+                return Err(invalid());
+            }
+            u32::try_from(spans.len()).map_err(format_error)?;
+            let key_len = address.view().key.len();
+            u32::try_from(key_len).map_err(format_error)?;
+            groups_len = groups_len
+                .checked_add(GROUP_HEADER_BYTES)
+                .and_then(|len| len.checked_add(key_len))
+                .ok_or_else(invalid)?;
+            for span in spans.iter() {
+                from.push(span.valid.lower().0);
+                to.push(span.valid.upper().0);
+                tuples.push(span.tuple.view());
+            }
+        }
+        let batch = KeyBatch::gather(
+            &tuples,
+            BatchKind::Correction,
+            vec![
+                Arc::new(Int64Array::from(from)),
+                Arc::new(Int64Array::from(to)),
+            ],
+        )?;
+        Ok(Some(Self {
+            entries,
+            batch,
+            groups_len,
+        }))
+    }
+
+    pub fn stage(&self) -> Result<KeyBatchEncoding<'_>> {
+        self.batch.stage(&HEADER, self.groups_len)
+    }
+
+    pub fn append_groups(&self, bytes: &mut Vec<u8>) {
+        for entry in self.entries {
+            let (Key::Row(address), Item::Row(spans)) = (&entry.key, &entry.item) else {
+                unreachable!("validated correction entry");
+            };
+            let address = address.view();
+            bytes.extend_from_slice(address.iid.as_bytes());
+            bytes.extend_from_slice(&(spans.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&(address.key.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(address.key);
         }
     }
-    KeyBatch::gather(
-        &tuples,
-        BatchKind::Correction,
-        vec![
-            Arc::new(Int64Array::from(from)),
-            Arc::new(Int64Array::from(to)),
-        ],
-    )?
-    .encode(&HEADER, &groups)
 }
 
 pub(super) fn decode(
@@ -140,7 +167,11 @@ mod tests {
     use rtdb_columnar::MemoryBudget;
 
     use super::*;
-    use crate::ordered_index::{key::Atom, postings::Tuple};
+    use crate::ordered_index::{
+        key::{Atom, Bucket},
+        postings::{Postings, Tuple},
+        tree::encode_leaf,
+    };
 
     #[test]
     fn a_correction_page_persists_only_the_spans_it_references() {
@@ -155,17 +186,40 @@ mod tests {
             valid: Interval::from_micros(12, 40).unwrap(),
             tuple: keys.row(0),
         };
-        let address = AddressRef { iid: Iid::MIN, key: &[] }.owned();
-        let entry = Entry {
+        let id = rtdb_types::EntityId::String("complete-identity".into());
+        let handle = id.handle_bytes();
+        let address = AddressRef {
+            iid: id.iid(),
+            key: &handle,
+        }.owned();
+        let entries = [Entry {
             key: Key::Row(address.clone()),
             item: Item::Row(Arc::from([span.clone()])),
-        };
-        let bytes = encode(&[entry]).unwrap();
+        }];
+        let bytes = encode_leaf(None, &entries).unwrap();
         assert!(
             !bytes
                 .windows(b"omitted-key".len())
                 .any(|slice| slice == b"omitted-key")
         );
+        let group_start = bytes.len() - GROUP_HEADER_BYTES - handle.len();
+        assert_eq!(&bytes[group_start..group_start + 16], id.iid().as_bytes());
+        assert_eq!(&bytes[group_start + 16..group_start + 20], &1u32.to_le_bytes());
+        assert_eq!(
+            &bytes[group_start + 20..group_start + GROUP_HEADER_BYTES],
+            &(handle.len() as u32).to_le_bytes()
+        );
+        assert_eq!(&bytes[group_start + GROUP_HEADER_BYTES..], handle.as_slice());
+
+        let postings = Postings::build(&[(
+            Bucket { level: 64, start: 0 },
+            cells[0],
+            address.view(),
+        )]).unwrap();
+        let leaf = encode_leaf(Some(&postings), &entries).unwrap();
+        let (_, suffix) = Postings::decode(Bytes::from(leaf).slice(16..), 64).unwrap();
+        assert_eq!(suffix.as_ref(), bytes.as_slice());
+
         let entries = decode(bytes.into(), 64, &reservation).unwrap();
         assert_eq!(entries[0].key, Key::Row(address));
         let Item::Row(decoded) = &entries[0].item else {

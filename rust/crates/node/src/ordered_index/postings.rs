@@ -10,7 +10,7 @@ use arrow_ipc::{
     MetadataVersion,
     reader::read_record_batch,
     root_as_message,
-    writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
+    writer::{CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions},
 };
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
 use bytes::Bytes;
@@ -579,8 +579,17 @@ impl Postings {
         self.0.batch.columns().get(self.0.prefix + slot)
     }
 
-    pub fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
-        self.0.encode(header, suffix)
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
+        self.0.stage(header, suffix_len)
+    }
+
+    #[cfg(test)]
+    fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
+        let encoding = self.stage(header, suffix.len())?;
+        let mut bytes = Vec::with_capacity(encoding.encoded_len());
+        encoding.append_batch(&mut bytes);
+        bytes.extend_from_slice(suffix);
+        Ok(bytes)
     }
 
     pub fn decode(bytes: Bytes, max_rows: usize) -> Result<(Self, Bytes)> {
@@ -838,6 +847,35 @@ pub(super) struct KeyBatch {
     share_slices: bool,
 }
 
+pub(super) struct KeyBatchEncoding<'a> {
+    header: &'a [u8],
+    lengths: [u32; 3],
+    layouts: &'a [Layout],
+    data: EncodedData,
+    body_start: usize,
+    len: usize,
+}
+
+impl KeyBatchEncoding<'_> {
+    pub fn encoded_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn append_batch(self, bytes: &mut Vec<u8>) {
+        let start = bytes.len();
+        bytes.extend_from_slice(self.header);
+        for length in self.lengths {
+            bytes.extend_from_slice(&length.to_le_bytes());
+        }
+        for layout in self.layouts {
+            bytes.extend_from_slice(&layout.0.to_le_bytes());
+        }
+        bytes.extend_from_slice(&self.data.ipc_message);
+        bytes.resize(start + self.body_start, 0);
+        bytes.extend_from_slice(&self.data.arrow_data);
+    }
+}
+
 impl KeyBatch {
     pub fn gather(tuples: &[Tuple<'_>], kind: BatchKind, mut prefix: Vec<ArrayRef>) -> Result<Self> {
         let selection = tuples.iter().map(|tuple| match tuple {
@@ -1035,7 +1073,7 @@ impl KeyBatch {
     }
 
     // One schema-bound IPC record batch. The short layout prefix identifies its typed columns.
-    pub fn encode(&self, header: &[u8], suffix: &[u8]) -> Result<Vec<u8>> {
+    pub fn stage<'a>(&'a self, header: &'a [u8], suffix_len: usize) -> Result<KeyBatchEncoding<'a>> {
         let options = IpcWriteOptions::try_new(ALIGNMENT, false, MetadataVersion::V5)
             .map_err(format_error)?;
         let (dictionaries, data) = IpcDataGenerator::default()
@@ -1049,18 +1087,33 @@ impl KeyBatch {
         if !dictionaries.is_empty() {
             return Err(invalid());
         }
-        let mut bytes = header.to_vec();
-        for length in [self.layouts.len(), data.ipc_message.len(), suffix.len()] {
-            bytes.extend_from_slice(&u32::try_from(length).map_err(format_error)?.to_le_bytes());
-        }
-        for layout in &self.layouts {
-            bytes.extend_from_slice(&layout.0.to_le_bytes());
-        }
-        bytes.extend_from_slice(&data.ipc_message);
-        bytes.resize(bytes.len().next_multiple_of(ALIGNMENT), 0);
-        bytes.extend_from_slice(&data.arrow_data);
-        bytes.extend_from_slice(suffix);
-        Ok(bytes)
+        let lengths = [
+            u32::try_from(self.layouts.len()).map_err(format_error)?,
+            u32::try_from(data.ipc_message.len()).map_err(format_error)?,
+            u32::try_from(suffix_len).map_err(format_error)?,
+        ];
+        let layouts_bytes = self.layouts.len()
+            .checked_mul(size_of::<u16>())
+            .ok_or_else(invalid)?;
+        let body_start = header.len()
+            .checked_add(size_of_val(&lengths))
+            .and_then(|len| len.checked_add(layouts_bytes))
+            .and_then(|len| len.checked_add(data.ipc_message.len()))
+            .and_then(|len| len.checked_next_multiple_of(ALIGNMENT))
+            .ok_or_else(invalid)?;
+        let len = body_start
+            .checked_add(data.arrow_data.len())
+            .and_then(|len| len.checked_add(suffix_len))
+            .filter(|&len| len <= isize::MAX as usize)
+            .ok_or_else(invalid)?;
+        Ok(KeyBatchEncoding {
+            header,
+            lengths,
+            layouts: &self.layouts,
+            data,
+            body_start,
+            len,
+        })
     }
 
     pub fn decode(bytes: Bytes, max_rows: usize, kind: BatchKind) -> Result<(Self, Bytes)> {
