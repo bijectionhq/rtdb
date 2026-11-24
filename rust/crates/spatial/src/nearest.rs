@@ -6,7 +6,7 @@ use arrow_array::{
 use arrow_buffer::{Buffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use rtdb_columnar::{
-    EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, read_entity_id,
+    EntityIdRef, IidView, MemoryBudget, MemoryReservation, OwnedBatch, read_entity_id, retain_buffer,
 };
 use rtdb_query::{OwnedSpatialScan, QueryContext, open_owned_spatial_scan};
 use rtdb_types::{Anomaly, Iid, OwnedRelation, Result, Timestamp};
@@ -175,13 +175,29 @@ impl PreparedNearest {
             };
             gather_selected(&selected, columns, &context.memory)?
         };
+        let values = &distances.values()[start..end];
+        let distance_bytes = size_of_val(values);
+        let (distances, distance_reservation) =
+            if distances.get_buffer_memory_size() <= distance_bytes {
+                (
+                    distances.slice(start, values.len()),
+                    Arc::clone(self.ranking.reservation()),
+                )
+            } else {
+                let reservation = context
+                    .memory
+                    .reserve(size_of::<Float64Array>() + distance_bytes)?;
+                let values = Buffer::from_vec(values.to_vec());
+                let distances = Float64Array::new(retain_buffer(&values, &reservation).into(), None);
+                (distances, reservation)
+            };
         Ok(Page {
             more,
             next_distance_m,
             rows,
             includes_documents: projection.has_documents(),
-            distances: distances.slice(start, end - start),
-            _distance_reservation: Arc::clone(self.ranking.reservation()),
+            distances,
+            _distance_reservation: distance_reservation,
             probe: None,
         })
     }
