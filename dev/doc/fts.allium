@@ -531,6 +531,43 @@ contract SearchCorrectness {
         -- An Arrow map converted from a Tantivy bundle under a prepaid query budget retains its allocation charge until the map is released.
 }
 
+contract SealedDerivedSearchSegments {
+    -- Search runs, term directories and vector columns built from a relation whose rows carry a protection label are sealed derived segments.
+    -- A derived segment can be partially inverted back to its source text, so it carries its source's protection and is erased with it.
+    -- This contract runs ahead of the implementation for labelled relations: Bijection does not yet write protected text into a searchable relation, and the term-directory building outcome after an erase is not yet served.
+
+    @invariant OneLabelSetPerSegment
+        -- A caller that labels rows places each label set in its own relation, and a search path is declared per relation.
+        -- A run, a term directory and a vector column cover the events of one relation only, so each derived segment holds entries of exactly one label set.
+        -- A ranked read names the relations its caller admitted and ranks only their segments, so the label filter applies before ranking.
+
+    @invariant SealedUnderItsOwnSlot
+        -- A labelled relation is searchable only on storage enrolled in sealing.
+        -- Each derived segment is a durable unit of its own (R6), published under a fresh key slot of the relation's custody domain and never under the slot of the trie it was built from.
+        -- A segment's plaintext exists only in memory under the reader's grant lease.
+        -- Log frames and live segments that carry the source text keep the sealing and erasure of the primary events they hold.
+
+    @invariant InventoryNamesTheSources
+        -- A run's source receipt is its dependency inventory: lineage, replica interval, table, shard, block extents, row count and erase frontier.
+        -- The inventory determines which runs an erasure affects without opening any segment.
+
+    @invariant ErasureRederivesFromSurvivors
+        -- An ERASE in the relation selects every run whose inventory covers an erased event.
+        -- The lane re-derives each selected run from the surviving events under a fresh slot and publishes it by ordered run replacement.
+        -- Once the replacement is published and the readers holding the old run have drained, the exact retirement owner withdraws the old run's slot under its deletion grant (R7).
+        -- Pre-erasure copies of the old run in backups and object versions are then unreadable.
+        -- From the erase onwards a ranked read is exact over the survivors: the erase frontier cuts the old run's rectangles until its replacement is published (VisibilityIsResolved).
+
+    @invariant RebuildOnlyStructuresReportBuilding
+        -- A term directory and an approximate vector generation cannot retract one entity's contribution.
+        -- After an erase that affects them they serve nothing until rebuilt from the replacement runs, and a reader that needs them receives a building outcome, never an earlier generation.
+        -- Exact ranking never needs them: its scores come from the held corpus or from explicit statistics.
+
+    @invariant StatisticsFromTheAdmittedCorpus
+        -- Corpus statistics come from the relations the reader admitted at its held cut, or from the five-argument SEARCH_SCORE with statistics the caller aggregated over its admitted rows.
+        -- No ambient artefact, term directory or unadmitted relation contributes a count, so a score never discloses rows of a label set the reader did not admit.
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
@@ -547,6 +584,7 @@ surface FullTextSearch {
 
     contracts:
         demands SearchCorrectness
+        demands SealedDerivedSearchSegments
 
     @guarantee MatchAtAnyTime
         -- MATCH answers at any valid time and system time the scan accepts, the default as-of-now included.
