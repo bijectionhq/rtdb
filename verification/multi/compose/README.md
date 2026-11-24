@@ -97,6 +97,20 @@ The production Verus areas cover the [installed read decisions](../../verus/inst
 The Lean witness combines a chosen acknowledgement, writer replacement, two cohort repairs, a fresh barrier, and a query using the protected capture.
 The added controls distinguish a cached route head, an alien digest at the same LSN, an ahead publication, a resampled query, an invalid empty capture, a lost invocation before its release horizon, and an unopened or unrelated append.
 
+## R11 · Exact-head survivor checkpoint
+
+[`SurvivorCheckpoint.lean`](SurvivorCheckpoint.lean) proves membership in the exact-head event set after filtering local marker positions and selected inherited origins.
+It also proves that declared members are in the freshly allocated produced set and rejects observations of an old member with the same extent.
+The [survivor checkpoint Verus area](../../verus/survivor_checkpoint/README.md) documents the production decisions and the native conformance fixture.
+
+## R8 · Fork and export custody
+
+[`ForkCustody.lean`](ForkCustody.lean) proves the custody invariant for every finite trace of one copy attempt between a source and a destination, with one source preparation and one copy hold.
+The hold persists while the destination is unpublished and undisposed, and source withdrawal requires the hold to have ended.
+Dependent publication keeps the source domain and independent export publication requires completed re-encryption.
+Witnesses reach dependent publication with the hold still live, independent publication followed by release and withdrawal, and rejected-stage disposal followed by release.
+The [fork custody Verus area](../../verus/fork_custody/README.md) relates the release guards to the replay broker.
+
 ## Hypotheses and evidence
 
 A named Lean witness establishes the result in the reference model.

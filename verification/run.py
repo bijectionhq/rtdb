@@ -1966,7 +1966,57 @@ def verify_native_acknowledgement_lean(args, scratch):
     }, 3)
 
 
+def verify_survivor_and_fork_lean(args, scratch):
+    path = Path("verification/multi/compose/SurvivorCheckpoint.lean")
+    verify_lean_model(args, scratch, path, "survivor-checkpoint", {
+        "include-another-head": (
+            "fun event => events exactHead event ∧",
+            "fun event => (events exactHead event ∨ ∃ head, events head event) ∧",
+            ["selects_exactly_the_surviving_events", "a_selected_head_can_keep_one_event_and_omit_another"],
+        ),
+        "keep-erased-origin": (
+            "keepInheritedEvent (selectedOrigin event) ∧ keepLocalEvent",
+            "keepInheritedEvent (selectedOrigin event && false) ∧ keepLocalEvent",
+            ["selects_exactly_the_surviving_events", "a_selected_head_can_keep_one_event_and_omit_another"],
+        ),
+        "drop-marker": (
+            "| some before => ¬ beforeMarker position before",
+            "| some before => position ≠ before ∧ ¬ beforeMarker position before",
+            ["selects_exactly_the_surviving_events", "keeps_the_marker_and_later_events"],
+        ),
+        "accept-old-member": (
+            "observed = expected ∧ observedBytes = expectedBytes",
+            "(observed = expected ∨ observed ≠ expected) ∧ observedBytes = expectedBytes",
+            ["rejects_a_same_extent_old_member"],
+        ),
+    }, 6)
+    path = Path("verification/multi/compose/ForkCustody.lean")
+    verify_lean_model(args, scratch, path, "fork-custody", {
+        "withdraw-while-held": (
+            "def mayWithdraw (held : Bool) : Prop := held = false",
+            "def mayWithdraw (held : Bool) : Prop := held = false ∨ held = true",
+            ["step_preserves_custody"],
+        ),
+        "release-unpublished-stage": (
+            "if !hasStage then some true else if deleted then some false else none",
+            "if !hasStage then some true else if deleted then some false else some false",
+            ["release_requires_a_settled_outcome", "step_preserves_custody"],
+        ),
+        "dependent-fork-in-another-domain": (
+            "| .dependent => some .source", "| .dependent => some .independent",
+            ["step_preserves_custody", "dependent_publication_is_in_the_source_domain",
+             "dependent_fork_reaches_publication_with_its_hold"],
+        ),
+        "export-before-reencryption": (
+            "| .export => if reencrypted then some .independent else none",
+            "| .export => if reencrypted then some .independent else some .independent",
+            ["step_preserves_custody", "export_refuses_before_reencryption"],
+        ),
+    }, 9)
+
+
 def verify_lean(args, scratch):
+    verify_survivor_and_fork_lean(args, scratch)
     verify_native_acknowledgement_lean(args, scratch)
     verify_installed_guards_lean(args, scratch)
     verify_fenced_replica_lean(args, scratch)

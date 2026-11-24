@@ -1,0 +1,153 @@
+{
+  "summary": "Exact-head survivor event selection and rebuilt checkpoint member declaration.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "member_production"
+  ],
+  "min_verified_functions": 8,
+  "controls": {
+    "keep_erased_origin": {
+      "defect": "Retain an event selected by inherited erasure.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "keep == !origin_selected,",
+          "replace": "keep == true,"
+        },
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "    !origin_selected\n",
+          "replace": "    true\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/survivor_checkpoint/laws.rs",
+          "function": "selects_exactly_the_surviving_events",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "keep_erased_ordinal": {
+      "defect": "Keep an earlier row in the same transaction as the local erase marker.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "!(transaction < tx || (transaction == tx && ordinal < row))",
+          "replace": "!(transaction < tx)"
+        },
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "marker_tx < transaction || (marker_tx == transaction && marker_ordinal <= ordinal)",
+          "replace": "marker_tx <= transaction"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/survivor_checkpoint/laws.rs",
+          "function": "selects_exactly_the_surviving_events",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "drop_surviving_marker": {
+      "defect": "Drop the erase marker at its own exact position.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "transaction == tx && ordinal < row",
+          "replace": "transaction == tx && ordinal <= row"
+        },
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "marker_ordinal <= ordinal",
+          "replace": "marker_ordinal < ordinal"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/survivor_checkpoint/laws.rs",
+          "function": "selects_exactly_the_surviving_events",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "skip_nonempty_trie": {
+      "defect": "Omit the only trie for a table with one surviving event.",
+      "mutate": [
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "write == (rows > 0),",
+          "replace": "write == (rows > 1),"
+        },
+        {
+          "file": "rust/crates/replication/src/sql_survivor/selection.rs",
+          "find": "    rows != 0\n",
+          "replace": "    rows > 1\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/survivor_checkpoint/laws.rs",
+          "function": "writes_a_trie_exactly_for_nonempty_survivors",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "reuse_previous_allocation": {
+      "defect": "Allow the old physical allocation to supply the successor members.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/custody/member_declaration.rs",
+          "find": "fresh == (candidate != previous),",
+          "replace": "fresh == true,"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/custody/member_declaration.rs",
+          "find": "    candidate != previous\n",
+          "replace": "    true\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/survivor_checkpoint/laws.rs",
+          "function": "declares_exactly_written_members",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "reference_old_member": {
+      "defect": "Declare a member of the same extent at an old physical address.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/journal/custody/member_declaration.rs",
+          "find": "declared == (address_matches && observed_bytes == expected_bytes)",
+          "replace": "declared == (observed_bytes == expected_bytes)"
+        },
+        {
+          "file": "rust/crates/multi/src/journal/custody/member_declaration.rs",
+          "find": "    address_matches && observed_bytes == expected_bytes\n",
+          "replace": "    observed_bytes == expected_bytes\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/survivor_checkpoint/laws.rs",
+          "function": "declares_exactly_written_members",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    }
+  }
+}

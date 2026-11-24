@@ -343,6 +343,141 @@ mod tests {
     use rtdb_storage::{cache::BufferPool, MemoryStore};
     use rtdb_types::TxId;
 
+    #[tokio::test]
+    async fn survivor_checkpoint_matches_the_exact_head_event_and_member_sets() -> Result<()> {
+        use rtdb_format::{
+            catalog::{BlockCatalog, CheckpointContents, TableBlock, publication_digest},
+            data::{EventBatch, StoredOperation},
+            ipc::ArrowFile,
+            keys::{CURRENT_STORAGE_VERSION, TrieKey, block_key},
+        };
+        use rtdb_index::TransactionBuffer;
+        use rtdb_storage::ObjectKey;
+        use rtdb_types::{EntityId, Interval, StorageEpoch, StructFields, TransactionKey, Value};
+        use std::io::Cursor;
+
+        let memory = MemoryBudget::new(64 << 20);
+        let store = Arc::new(MemoryStore::default());
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let blocks = crate::BlockStore::new(store.clone(), cache, Arc::clone(&memory), 1 << 20)?;
+        let config = rtdb_trie::TrieConfig::default();
+        let empty = blocks.empty_snapshot_base(config.clone(), SourcePosition(-1), Timestamp(0))?;
+        let table = TableRef::new("public", "orders");
+        let put = |partition: &RecoveredPartition, tx, id| -> Result<EventOrigin> {
+            let key = TransactionKey { tx_id: TxId(tx), system_time: Timestamp(tx) };
+            let mut write = TransactionBuffer::new(partition.partition.snapshot(), key, Arc::clone(&memory))?;
+            write.put(table.clone(), StructFields::from([
+                ("_id".into(), Value::I64(id)), ("v".into(), Value::I64(tx)),
+            ]), Interval::ALL)?;
+            let write = write.stage()?.assign_event_origins(&memory)?;
+            let batch = write.tables()[&table].batch().unwrap();
+            let origin = batch.view().origin(0)?.unwrap();
+            partition.partition.apply(&write)?;
+            Ok(origin)
+        };
+        let cancellation = CancellationToken::new();
+        let source = |partition: &RecoveredPartition, head, checkpoint, targets| SqlErasureSource {
+            authenticated_head: [head as u8; 32],
+            cut: CatalogCut {
+                storage_version: CURRENT_STORAGE_VERSION,
+                storage_epoch: StorageEpoch(0),
+                replica_epoch: StorageEpoch(0),
+                through: ReplicaPosition(head),
+            },
+            checkpoint,
+            source_position: SourcePosition(head),
+            first_marker: None,
+            targets,
+            inherited_erasure: None,
+            custody: Arc::new(()),
+            snapshot: partition.partition.snapshot(),
+            store: store.clone(),
+            memory: memory.clone(),
+            fence: partition.fence.clone(),
+            external_token: None,
+        };
+
+        put(&empty, 1, 10)?;
+        let inherited = put(&empty, 2, 20)?;
+        let persisted = put(&empty, 3, 30)?;
+        let base = source(&empty, 3, None, Vec::new())
+            .build_survivor(16 << 20, &cancellation).await?;
+        let old_members = base.store().list(None).await?;
+        for member in &old_members {
+            let bytes = base.store().get(&member.key).await?;
+            store.put(&member.key, bytes).await?;
+        }
+        let base_key = ObjectKey::new(block_key(base.catalog.block_index())?)?;
+        let checkpoint = crate::PublishedCheckpoint {
+            block: base.catalog.block_index(),
+            boundary: ReplicaPosition(3),
+            root_sha256: Some(publication_digest(&store.get(&base_key).await?)),
+        };
+        let recovered = blocks.recover(config, SourcePosition(-1), Timestamp(0),
+            crate::BlockDiscovery::AtErasure(checkpoint)).await?;
+        assert!(!recovered.partition.snapshot().trie_entries(&table).is_empty());
+
+        let mut write = TransactionBuffer::new(recovered.partition.snapshot(),
+            TransactionKey { tx_id: TxId(4), system_time: Timestamp(4) }, Arc::clone(&memory))?;
+        write.erase(table.clone(), &EntityId::Integer(10))?;
+        let write = write.stage()?.assign_event_origins(&memory)?;
+        let targets = erasure_targets(&write, &memory)?;
+        let marker_origin = write.tables()[&table].batch().unwrap().view().origin(0)?.unwrap();
+        recovered.partition.apply(&write)?;
+        let later = put(&recovered, 5, 10)?;
+        let exact = source(&recovered, 5, Some(checkpoint), targets)
+            .with_inherited_erasure(BTreeSet::from([inherited]));
+        put(&recovered, 6, 60)?;
+
+        let output = exact.build_survivor(16 << 20, &cancellation).await?;
+        let block = output.catalog.block_index();
+        let root = ObjectKey::new(block_key(block)?)?;
+        let catalog = BlockCatalog::decode(&output.store().get(&root).await?)?;
+        assert_eq!(catalog.boundary_replica_position(), Some(ReplicaPosition(5)));
+        assert_eq!(catalog.as_proto().latest_completed_tx.as_ref().unwrap().tx_id, Some(5));
+        let mut declared = BTreeSet::from([root.as_str().to_owned()]);
+        let mut events = BTreeMap::new();
+        for entry in catalog.table_entries()? {
+            let table_key = ObjectKey::new(entry.slug.block_key(block)?)?;
+            let bytes = output.store().get(&table_key).await?;
+            assert!(catalog.matches_table_block(entry.oid, &publication_digest(&bytes)));
+            declared.insert(table_key.as_str().to_owned());
+            let metadata = TableBlock::decode(&bytes)?;
+            declared.extend(metadata.checkpoint_trie_files(&entry, CheckpointContents::Replay)?);
+            if entry.table != table {
+                assert_eq!(metadata.row_count(), 0);
+                continue;
+            }
+            assert_eq!(metadata.row_count(), 3);
+            let trie = TrieKey::l0(block)?;
+            let bytes = output.store().get(&ObjectKey::new(entry.slug.data_key(&trie))?).await?;
+            let mut data = ArrowFile::from_reader(Cursor::new(bytes), None)?;
+            for page in 0..data.page_count() {
+                let batch = EventBatch::new(data.read_page(page)?)?;
+                for row in 0..batch.len() {
+                    let event = batch.read_event(row)?;
+                    assert!(events.insert(event.position.unwrap(), (event.origin, event.iid, event.operation)).is_none());
+                }
+            }
+        }
+
+        let put_event = |id, tx| StoredOperation::Put(StructFields::from([
+            ("_id".into(), Value::I64(id)), ("v".into(), Value::I64(tx)),
+        ]));
+        let coordinate = |tx| EventPosition { transaction: TxId(tx), ordinal: 0 };
+        let iid = |id| EntityId::Integer(id).iid();
+        assert_eq!(events, BTreeMap::from([
+            (coordinate(3), (Some(persisted), iid(30), put_event(30, 3))),
+            (coordinate(4), (Some(marker_origin), iid(10), StoredOperation::Erase)),
+            (coordinate(5), (Some(later), iid(10), put_event(10, 5))),
+        ]));
+        let written = output.store().list(None).await?.into_iter()
+            .map(|member| member.key.as_str().to_owned()).collect::<BTreeSet<_>>();
+        assert_eq!(declared, written);
+        assert!(old_members.iter().all(|member| !declared.contains(member.key.as_str())));
+        Ok(())
+    }
+
     #[test]
     fn snapshot_replay_keeps_order_across_tied_history_times() -> Result<()> {
         let memory = MemoryBudget::new(1 << 20);

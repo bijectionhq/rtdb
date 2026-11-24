@@ -1,0 +1,82 @@
+{
+  "summary": "Release of a pending dependent fork reservation after the durable directory outcome.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 4,
+  "controls": {
+    "ignore_source_preparation": {
+      "defect": "Reconcile the fork while the original exact source preparation is still held.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/replay_broker/fork_resolution.rs",
+          "find": "check == !preparation_held,",
+          "replace": "check == true,"
+        },
+        {
+          "file": "rust/crates/multi/src/replay_broker/fork_resolution.rs",
+          "find": "    !preparation_held\n",
+          "replace": "    true\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/fork_custody/laws.rs",
+          "function": "retained_preparation_cannot_release",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "release_unpublished_stage": {
+      "defect": "Release the reservation while a staged child is still unpublished and undisposed.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/replay_broker/fork_resolution.rs",
+          "find": "    (out == Some(false)) == (has_stage && deleted),\n    (out == None) == (has_stage && !deleted),",
+          "replace": "    (out == Some(false)) == has_stage,"
+        },
+        {
+          "file": "rust/crates/multi/src/replay_broker/fork_resolution.rs",
+          "find": "    } else if deleted {\n        Some(false)\n    } else {\n        None\n    }",
+          "replace": "    } else {\n        Some(false)\n    }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/fork_custody/laws.rs",
+          "function": "release_requires_a_settled_outcome",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    },
+    "enroll_disposed_stage": {
+      "defect": "Treat a disposed staged child as a durably published fork.",
+      "mutate": [
+        {
+          "file": "rust/crates/multi/src/replay_broker/fork_resolution.rs",
+          "find": "    (out == Some(true)) == !has_stage,\n    (out == Some(false)) == (has_stage && deleted),",
+          "replace": "    (out == Some(true)) == (!has_stage || deleted),"
+        },
+        {
+          "file": "rust/crates/multi/src/replay_broker/fork_resolution.rs",
+          "find": "    } else if deleted {\n        Some(false)\n",
+          "replace": "    } else if deleted {\n        Some(true)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/fork_custody/laws.rs",
+          "function": "release_requires_a_settled_outcome",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 3
+    }
+  }
+}
