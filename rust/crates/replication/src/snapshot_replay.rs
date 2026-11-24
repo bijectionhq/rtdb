@@ -11,6 +11,7 @@ use crate::{PartitionLogs, RecoveredPartition, blocks::{matches_confirmation, va
 pub struct SnapshotReplay {
     cut: CatalogCut,
     after: ReplicaPosition,
+    checkpoint: Option<crate::PublishedCheckpoint>,
     protected: Option<rtdb_storage::log::ProtectedLogRange>,
 }
 
@@ -40,7 +41,7 @@ impl SnapshotReplay {
         } else {
             return Err(unretained());
         };
-        Ok(Self { cut, after, protected })
+        Ok(Self { cut, after, checkpoint, protected })
     }
 }
 
@@ -50,9 +51,16 @@ impl RecoveredPartition {
     pub async fn replay_snapshot_suffix(
         &mut self, logs: &PartitionLogs, replay: SnapshotReplay, cancellation: &CancellationToken,
     ) -> Result<Option<Arc<dyn Send + Sync>>> {
-        let SnapshotReplay { cut, after, protected } = replay;
+        let SnapshotReplay { cut, after, checkpoint, protected } = replay;
         let base = self.replica_start(logs)?;
-        if base != after { return Err(unretained()); }
+        let loaded = self.block.as_ref().and_then(|block| Some(crate::PublishedCheckpoint {
+            block: block.block_index(),
+            boundary: block.boundary_replica_position()?,
+            root_sha256: Some(block.publication_sha256()?),
+        }));
+        if base != after || loaded != checkpoint || (loaded.is_none() && self.block.is_some()) {
+            return Err(unretained());
+        }
         let Some(protected) = protected else {
             return if crate::catalog_cut::completes_snapshot_replay(base.0, after.0, base.0, cut.through.0, false) {
                 Ok(None)
