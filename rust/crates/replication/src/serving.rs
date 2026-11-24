@@ -601,6 +601,12 @@ impl NativeServing {
         })
     }
 
+    pub(crate) fn needs_erasure_history(&self, request: &SourceRequest) -> bool {
+        self.physical_erasure && self.shares_main && request.scope.is_none()
+            && request.transaction.uses_erasure()
+            && self.durable().tx_status(&request.transaction.key).is_err()
+    }
+
     pub(crate) fn decide_source(&mut self, source: SourcePosition, now: Timestamp, time_floor: Option<Timestamp>, request: Result<SourceRequest>) -> Result<proto::NoOp> {
         if !self.source_ready() { return Err(invalid()); }
         let request = match request {

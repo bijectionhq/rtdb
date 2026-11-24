@@ -82,6 +82,44 @@ impl KafkaFrameKeys {
             .await
     }
 
+    pub async fn verifies_kafka_prefix_retirement(&self, retirement: KafkaPrefixRetirement) -> crate::Result<bool> {
+        let path = self.0.path.join(INTENT);
+        self.0.region.run_blocking(move || {
+            Ok(Intent::read(&path)?.is_some_and(|intent|
+                intent.retirement == retirement && intent.settled_before == retirement.before))
+        }).await
+    }
+
+    pub async fn validate_kafka_position_history(&self, recovery_next: i64, before: i64, broker_end: i64) -> crate::Result<()> {
+        let path = Arc::clone(&self.0.path);
+        self.0.region.run_blocking(move || {
+            let classic = path.join("retired-before");
+            let _gate = lock(&classic)?;
+            let settled = Intent::read(&path.join(INTENT))?;
+            if !(0..=before).contains(&recovery_next) || before > broker_end
+                || kafka_retired_before(&classic)? != 0
+                || settled.map_or(0, |intent| intent.retirement.before) != recovery_next
+                || settled.is_some_and(|intent| intent.settled_before != recovery_next)
+            {
+                return Err(invalid_intent());
+            }
+            let positions = path.join("positions");
+            for offset in 0..recovery_next { publication_at(&positions, offset)?; }
+            validate_slots(&positions, recovery_next, before, broker_end)
+        }).await
+    }
+
+    pub async fn first_unobserved_kafka_position(&self, from: i64, before: i64) -> crate::Result<Option<i64>> {
+        let path = self.0.path.join("positions");
+        self.0.region.run_blocking(move || {
+            for offset in from..before {
+                let marker = path.join(offset.to_string());
+                if !marker.try_exists().map_err(io(&marker))? { return Ok(Some(offset)); }
+            }
+            Ok(None)
+        }).await
+    }
+
     /// Closes new decryptions below a checkpoint-authorized cut and retains its receipt deadline.
     /// The caller must first order recovery from the exact checkpoint on this topic lineage.
     /// `broker_end` is the exclusive end of the same broker partition's observed committed prefix.
@@ -206,25 +244,29 @@ fn prepare(
     if settled_before > retirement.before {
         return Err(invalid_intent());
     }
-    let census = path.join("positions");
-    for offset in settled_before..retirement.before {
-        let marker = retirement_slot(&census, publication_at(&census, offset)?);
+    validate_slots(&path.join("positions"), settled_before, retirement.before, broker_end)?;
+    Ok(Intent {
+        retirement,
+        settled_before,
+    })
+}
+
+fn validate_slots(census: &Path, from: i64, before: i64, broker_end: i64) -> crate::Result<()> {
+    for offset in from..before {
+        let marker = retirement_slot(census, publication_at(census, offset)?);
         match retirement_offset(&marker)? {
             Some(prior) if prior == offset => (),
             Some(_) => return Err(aliased_publication()),
             None => write_kafka_marker(&marker, &offset.to_be_bytes(), false)?,
         }
     }
-    for offset in retirement.before..broker_end {
-        let marker = retirement_slot(&census, publication_at(&census, offset)?);
-        if retirement_offset(&marker)?.is_some_and(|prior| prior < retirement.before) {
+    for offset in before..broker_end {
+        let marker = retirement_slot(census, publication_at(census, offset)?);
+        if retirement_offset(&marker)?.is_some_and(|prior| prior < before) {
             return Err(aliased_publication());
         }
     }
-    Ok(Intent {
-        retirement,
-        settled_before,
-    })
+    Ok(())
 }
 
 fn retirement_slot(census: &Path, publication: Uuid) -> PathBuf {
@@ -366,8 +408,34 @@ mod tests {
             .await?;
         keys.record_kafka_publication(0, &publication)?;
         keys.record_kafka_publication(1, &publication)?;
+        assert!(keys.validate_kafka_position_history(0, 1, 2).await.is_err());
         assert!(keys.arm_kafka_prefix_retirement(cut(1), 2).await.is_err());
         assert_eq!(keys.kafka_erasure_floor()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn history_and_terminal_require_exact_positions_and_the_completed_cut() -> Result<()> {
+        let directory = tempfile::tempdir().unwrap();
+        let vault = ClassicKeyVault::open(directory.path())?;
+        let topic = Uuid::new_v4().into_bytes();
+        let owner = Uuid::new_v4().into_bytes();
+        let keys = vault.kafka_erasure_keys(topic, true, IoRegion::new(), owner, false)?;
+        let earlier = keys.seal_kafka_record(Bytes::from_static(b"old")).await?;
+        let later = keys.seal_kafka_record(Bytes::from_static(b"live")).await?;
+        keys.record_kafka_publication(0, &earlier)?;
+        assert_eq!(keys.first_unobserved_kafka_position(1, 2).await?, Some(1));
+        assert!(keys.validate_kafka_position_history(0, 1, 2).await.is_err());
+        assert_eq!(keys.open_kafka_publication(1, later).await?, Bytes::from_static(b"live"));
+        keys.validate_kafka_position_history(0, 1, 2).await?;
+        keys.arm_kafka_prefix_retirement(cut(1), 2).await?;
+        assert!(!keys.verifies_kafka_prefix_retirement(cut(1)).await?);
+        assert!(keys.validate_kafka_position_history(1, 2, 2).await.is_err());
+        assert!(keys.settle_kafka_prefix_retirement(cut(1)).await?);
+        let reopened = vault.kafka_erasure_keys(topic, false, IoRegion::new(), owner, false)?;
+        assert!(reopened.verifies_kafka_prefix_retirement(cut(1)).await?);
+        assert!(!reopened.verifies_kafka_prefix_retirement(cut(2)).await?);
+        reopened.validate_kafka_position_history(1, 2, 2).await?;
         Ok(())
     }
 }

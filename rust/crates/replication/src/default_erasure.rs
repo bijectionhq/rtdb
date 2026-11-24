@@ -414,20 +414,38 @@ impl ErasureRetirement {
         self.evidence.prior_generation.is_some()
     }
 
+    fn log_prefixes(self, logs: &PartitionLogs) -> [rtdb_storage::log::CheckpointPrefix; 2] {
+        let plan = |through| rtdb_storage::log::CheckpointPrefix {
+            through,
+            checkpoint_sha256: self.root_sha256,
+            unreadable_by: self.unreadable_by,
+        };
+        [
+            plan(self.evidence.cut.source.after_offset(logs.source_epoch)),
+            plan(self.evidence.boundary.after_offset(logs.replica_epoch)),
+        ]
+    }
+
+    async fn verify_kafka_log_prefixes(self, logs: &PartitionLogs) -> Result<()> {
+        if logs.default_erasure_kafka_topics().is_some() {
+            let (source, replica) = logs.checkpoint_log_keys().ok_or_else(unsupported)?;
+            let [source_plan, replica_plan] = self.log_prefixes(logs);
+            if !source.verifies_checkpoint_prefix(source_plan).await?
+                || !replica.verifies_checkpoint_prefix(replica_plan).await?
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
     pub async fn settle_log_prefixes(self, logs: &PartitionLogs) -> Result<bool> {
-        use rtdb_storage::log::CheckpointPrefix;
         let (source, replica) = logs.checkpoint_log_keys().ok_or_else(unsupported)?;
         let local = logs
             .storage()
             .local_maintenance_store()
             .ok_or_else(unsupported)?;
-        let plan = |through| CheckpointPrefix {
-            through,
-            checkpoint_sha256: self.root_sha256,
-            unreadable_by: self.unreadable_by,
-        };
-        let source_plan = plan(self.evidence.cut.source.after_offset(logs.source_epoch));
-        let replica_plan = plan(self.evidence.boundary.after_offset(logs.replica_epoch));
+        let [source_plan, replica_plan] = self.log_prefixes(logs);
         source.validate_checkpoint_prefix(source_plan).await?;
         replica.validate_checkpoint_prefix(replica_plan).await?;
         if !local.close_erasure_recovery(self.recovery_fence()?).await? {

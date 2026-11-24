@@ -140,14 +140,16 @@ surface StatelessDatabase {
         -- A route that supports physical erasure advertises erasure.
         -- An applied erase removes row values from the clean checkpoint and orders retirement of the preceding journal and checkpoint generation.
         -- Default requires evidence for the source prefix, replica prefix and every prior recovery dependency.
+        -- An enrolled Kafka route requires the original writable Local residence, both original sealed topics and a recoverable suffix.
+        -- The writer verifies the retained offset and replica reference evidence before a new Kafka erase decision.
         -- The clean native recovery cut binds the applied source position, its replica boundary and the exact uploaded block digest.
         -- The selected native checkpoint authenticates under the successor generation and retains the pending receipt at the erased basis.
         -- The Default writer holds later source decisions while it rewrites the physical main fold at that cut.
         -- The sealed shared image binds the rewritten table blocks and trie bodies to the exact recovery boundary.
         -- A term-admitted upload fixes the selected checkpoint before the writer records the original retirement deadline.
         -- A replacement recovers that deadline from the replica suffix before continuing retirement.
-        -- The receipt carries the unreadable-by deadline after the key authority has durably armed it.
-        -- A pending erasure receipt stays private to the fold until retirement is armed.
+        -- The receipt carries the original unreadable-by deadline after provider-specific completion.
+        -- A pending Default erasure receipt stays private to the fold until the ordered terminal verifies reader drain, log and object closure and predecessor key destruction.
         -- Replayed erase receipts preserve that deadline after trim.
         -- Previously opened query and change streams verify their selected generation at each frame handoff.
         -- A Default view reopened from a sealed checkpoint keeps the authenticated generation of that image through frame delivery.

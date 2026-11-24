@@ -14,6 +14,7 @@ use super::io;
 use crate::{Error, Result, sync_directory, sync_file};
 
 pub(super) const LINEAGE_VERSION: u8 = 1;
+pub(super) const KAFKA_LINEAGE_VERSION: u8 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Directory {
@@ -40,21 +41,33 @@ impl Directory {
 #[serde(deny_unknown_fields)]
 pub struct LocalErasureResidence {
     payload: Directory,
-    journal: Directory,
+    journal: Option<Directory>,
     checkpoint_vault: Directory,
     log_epoch: i32,
 }
 
 impl LocalErasureResidence {
     pub fn open(payload: &Path, journal: &Path, checkpoint_vault: &Path, log_epoch: i32) -> Result<Self> {
+        Self::open_residence(payload, Some(journal), checkpoint_vault, log_epoch)
+    }
+
+    pub fn open_kafka(payload: &Path, checkpoint_vault: &Path, log_epoch: i32) -> Result<Self> {
+        Self::open_residence(payload, None, checkpoint_vault, log_epoch)
+    }
+
+    fn open_residence(payload: &Path, journal: Option<&Path>, checkpoint_vault: &Path, log_epoch: i32) -> Result<Self> {
         let payload = Directory::open(payload)?;
-        let journal = Directory::open(journal)?;
+        let journal = journal.map(Directory::open).transpose()?;
         let checkpoint_vault = Directory::open(checkpoint_vault)?;
-        let paths = [&payload.path, &journal.path, &checkpoint_vault.path];
+        let paths: Vec<_> = [&payload, &checkpoint_vault].into_iter().chain(journal.iter()).map(|dir| &dir.path).collect();
         if log_epoch < 0 || paths.iter().enumerate().any(|(i, path)| {
             paths.iter().skip(i + 1).any(|other| path.starts_with(other) || other.starts_with(path))
         }) { return Err(invalid()); }
         Ok(Self { payload, journal, checkpoint_vault, log_epoch })
+    }
+
+    pub(super) fn version(&self) -> u8 {
+        if self.journal.is_some() { LINEAGE_VERSION } else { KAFKA_LINEAGE_VERSION }
     }
 
     pub(super) fn enroll_if_pristine(&self, scope: &Path) -> Result<bool> {
@@ -65,16 +78,18 @@ impl LocalErasureResidence {
             let file = entry.map_err(io(parent))?.file_name();
             if file != payload_name && file != boot_name { return Ok(false); }
         }
-        if !empty(&self.payload.path)? || !empty(&self.journal.path)? { return Ok(false); }
+        if !empty(&self.payload.path)? || self.journal.as_ref().map(|journal| empty(&journal.path)).transpose()? == Some(false) {
+            return Ok(false);
+        }
         persist(scope, "local-erasure-residence", &serde_json::to_vec(self).map_err(|_| invalid())?)?;
         Ok(true)
     }
 
-    pub(super) fn reopen(self, scope: PathBuf) -> Result<LocalErasureCustody> {
+    pub(super) fn reopen(self, scope: PathBuf, owner: Uuid) -> Result<LocalErasureCustody> {
         let expected = read(&scope.join("local-erasure-residence"), 16 << 10)?.ok_or_else(invalid)?;
         let enrolled: Self = serde_json::from_slice(&expected).map_err(|_| invalid())?;
         if enrolled != self { return Err(invalid()); }
-        Ok(LocalErasureCustody { scope, journal: self.journal.path })
+        Ok(LocalErasureCustody { scope, journal: self.journal.map(|journal| journal.path), owner })
     }
 }
 
@@ -98,22 +113,40 @@ pub fn open_local_residence(parent: &Path, exclusive: bool) -> Result<File> {
 /// Durable admission and drain under the original Classic object vault.
 pub struct LocalErasureCustody {
     scope: PathBuf,
-    journal: PathBuf,
+    journal: Option<PathBuf>,
+    owner: Uuid,
 }
 
 impl LocalErasureCustody {
+    pub fn kafka_owner(&self) -> Option<Uuid> { self.journal.is_none().then_some(self.owner) }
+
+    pub fn bound_kafka_topics(&self) -> Result<Option<[Uuid; 2]>> {
+        if self.kafka_owner().is_none() { return Err(invalid()); }
+        let _gate = self.gate()?;
+        let Some(bytes) = read(&self.scope.join("local-erasure-journals"), 32)? else { return Ok(None); };
+        let (source, replica) = bytes.split_at_checked(16).ok_or_else(invalid)?;
+        Ok(Some([Uuid::from_slice(source).map_err(|_| invalid())?, Uuid::from_slice(replica).map_err(|_| invalid())?]))
+    }
+
     pub fn bind(&self, database: Uuid, source: Uuid, replica: Uuid) -> Result<()> {
         let _gate = self.gate()?;
         if source.is_nil() || replica.is_nil() || source == replica { return Err(invalid()); }
         let mut identities = Vec::with_capacity(64);
-        for log in ["LOG", "REPLICA_LOG"] {
-            let marker = self.journal.join(log).with_extension("key-lineage");
-            let bytes = read(&marker, 16)?.ok_or_else(invalid)?;
-            let lineage = Uuid::from_slice(&bytes).map_err(|_| invalid())?;
-            if !self.scope.parent().ok_or_else(invalid)?.join(lineage.simple().to_string()).is_dir() { return Err(invalid()); }
-            identities.extend_from_slice(&bytes);
+        let vault = self.scope.parent().ok_or_else(invalid)?;
+        if let Some(journal) = &self.journal {
+            for log in ["LOG", "REPLICA_LOG"] {
+                let marker = journal.join(log).with_extension("key-lineage");
+                let bytes = read(&marker, 16)?.ok_or_else(invalid)?;
+                let lineage = Uuid::from_slice(&bytes).map_err(|_| invalid())?;
+                if !vault.join(lineage.simple().to_string()).is_dir() { return Err(invalid()); }
+                identities.extend_from_slice(&bytes);
+            }
+            if identities[..16] == identities[16..32] { return Err(invalid()); }
+        } else {
+            for (topic, replica) in [(source, false), (replica, true)] {
+                super::require_kafka_erasure_owner(vault, topic, Some((self.owner, replica)))?;
+            }
         }
-        if identities[..16] == identities[16..32] { return Err(invalid()); }
         identities.extend_from_slice(source.as_bytes());
         identities.extend_from_slice(replica.as_bytes());
         persist(&self.scope, "local-erasure-journals", &identities)?;
@@ -252,7 +285,7 @@ mod tests {
         assert!(!residence.enroll_if_pristine(vault.path()).unwrap());
         fs::remove_dir(object_root.join("v05")).unwrap();
         assert!(residence.enroll_if_pristine(vault.path()).unwrap());
-        assert!(residence.clone().reopen(vault.path().to_owned()).is_ok());
+        assert!(residence.clone().reopen(vault.path().to_owned(), Uuid::new_v4()).is_ok());
     }
 
     #[test]
@@ -265,7 +298,7 @@ mod tests {
             fs::create_dir(directory.path().join(id.simple().to_string())).unwrap();
             fs::write(directory.path().join(name).with_extension("key-lineage"), id.as_bytes()).unwrap();
         }
-        let owner = || LocalErasureCustody { scope: scope.clone(), journal: directory.path().to_owned() };
+        let owner = || LocalErasureCustody { scope: scope.clone(), journal: Some(directory.path().to_owned()), owner: Uuid::nil() };
         let database = Uuid::new_v4();
         let cut = [42; 32];
         owner().bind(database, Uuid::new_v4(), Uuid::new_v4()).unwrap();
@@ -280,5 +313,40 @@ mod tests {
         assert!(owner().verifies_drain(database, 1, cut).unwrap());
         assert!(!owner().verifies_drain(database, 1, [43; 32]).unwrap());
         assert!(owner().admit(database, 2).is_ok());
+    }
+
+    #[test]
+    fn kafka_residence_reopens_only_with_its_original_topic_pair_and_roles() -> rtdb_types::Result<()> {
+        let base = tempfile::tempdir().unwrap();
+        let vault_dir = tempfile::tempdir().unwrap();
+        let checkpoint = tempfile::tempdir().unwrap();
+        let payload = base.path().join("v06");
+        fs::create_dir(&payload).unwrap();
+        let owner = Uuid::new_v4();
+        let scope = vault_dir.path().join(owner.simple().to_string());
+        fs::create_dir(&scope).unwrap();
+        let residence = LocalErasureResidence::open_kafka(&payload, checkpoint.path(), 0)?;
+        assert!(residence.enroll_if_pristine(&scope)?);
+        let custody = residence.clone().reopen(scope.clone(), owner)?;
+        let vault = super::super::ClassicKeyVault::open(vault_dir.path())?;
+        let io = crate::IoRegion::new();
+        let [source, replica, other] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let database = Uuid::new_v4();
+        assert_eq!(custody.bound_kafka_topics()?, None);
+        vault.kafka_erasure_keys(source.into_bytes(), true, io.clone(), owner.into_bytes(), false)?;
+        vault.kafka_erasure_keys(replica.into_bytes(), true, io.clone(), owner.into_bytes(), true)?;
+        assert!(vault.kafka_log_keys(source.into_bytes(), false, io.clone()).is_err());
+        assert!(!vault_dir.path().join(format!("kafka-{}", source.simple())).exists());
+        assert!(vault.kafka_erasure_keys(replica.into_bytes(), false, io.clone(), owner.into_bytes(), false).is_err());
+        assert!(custody.bind(database, replica, source).is_err());
+        custody.bind(database, source, replica)?;
+        let reopened = residence.reopen(scope, owner)?;
+        assert_eq!(reopened.bound_kafka_topics()?, Some([source, replica]));
+        let legacy = Uuid::new_v4().into_bytes();
+        vault.kafka_log_keys(legacy, true, io.clone())?;
+        assert!(vault.kafka_erasure_keys(legacy, true, io.clone(), owner.into_bytes(), false).is_err());
+        vault.kafka_erasure_keys(other.into_bytes(), true, io, owner.into_bytes(), true)?;
+        assert!(reopened.bind(database, source, other).is_err());
+        Ok(())
     }
 }

@@ -164,6 +164,30 @@ impl PartitionLogs {
     pub(crate) fn checkpoint_log_keys(&self) -> Option<(&dyn rtdb_storage::log::CheckpointKeyRetirement, &dyn rtdb_storage::log::CheckpointKeyRetirement)> {
         Some((self.source.checkpoint_key_retirement()?, self.replica.checkpoint_key_retirement()?))
     }
+    pub(crate) fn default_erasure_kafka_topics(&self) -> Option<[uuid::Uuid; 2]> {
+        let (source, replica) = self.checkpoint_log_keys()?;
+        Some([uuid::Uuid::from_bytes(source.default_erasure_topic()?), uuid::Uuid::from_bytes(replica.default_erasure_topic()?)])
+    }
+
+    pub(crate) async fn validate_default_erasure_kafka_history(&self, source: SourcePosition, replica: ReplicaPosition) -> Result<()> {
+        let local = self.store.local_maintenance_store().ok_or_else(crate::default_erasure::unsupported)?;
+        let recovery = local.completed_erasure_recovery().await?;
+        if recovery.is_some_and(|cut| cut.source.after_offset(self.source_epoch) < 0
+            || cut.boundary.after_offset(self.replica_epoch) < 0)
+        {
+            return Err(crate::default_erasure::invalid());
+        }
+        let (source_keys, replica_keys) = self.checkpoint_log_keys().ok_or_else(crate::default_erasure::unsupported)?;
+        source_keys.validate_default_erasure_history(
+            LogOffset(source.after_offset(self.source_epoch)),
+            LogOffset(recovery.map_or(-1, |cut| cut.source.after_offset(self.source_epoch))),
+        ).await?;
+        replica_keys.validate_default_erasure_history(
+            LogOffset(replica.after_offset(self.replica_epoch)),
+            LogOffset(recovery.map_or(-1, |cut| cut.boundary.after_offset(self.replica_epoch))),
+        ).await
+    }
+
     pub(crate) fn requires_checkpoint_digest(&self) -> bool { self.replica.requires_checkpoint_digest() }
     pub(crate) async fn confirms_recovery_checkpoint(&self, catalog: &rtdb_format::catalog::BlockCatalog) -> bool {
         if !self.replica.needs_published_recovery_checkpoint() { return true; }

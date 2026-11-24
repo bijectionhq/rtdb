@@ -302,6 +302,17 @@ pub struct PriorCheckpointReferences {
 
 #[async_trait]
 pub trait CheckpointKeyRetirement: Send + Sync {
+    /// The immutable topic identity of an original Kafka Default erasure attachment.
+    fn default_erasure_topic(&self) -> Option<[u8; 16]> { None }
+
+    async fn validate_default_erasure_history(&self, _through: LogOffset, _recovery_after: LogOffset) -> rtdb_types::Result<()> {
+        Err(rtdb_types::Anomaly::unsupported("rtdb/default-erasure-history", "The log has no Default erasure history authority"))
+    }
+
+    async fn verifies_checkpoint_prefix(&self, _cut: CheckpointPrefix) -> rtdb_types::Result<bool> {
+        Ok(false)
+    }
+
     /// Dense offsets allow the inventory scan to reject a missing record within the retained prefix.
     fn checkpoint_offsets_are_dense(&self) -> bool { false }
 

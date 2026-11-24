@@ -606,7 +606,7 @@ impl ReplicationDriver {
         let replica_tail = recovered.take_replay_tail(&logs, read_position)?;
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
         Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, compaction_replay_cutoff: recovered.compaction_replay_cutoff, track_catalog_cut, recognized_prefix: true, installed: None, first_erasure: None, historical_confirmations: VecDeque::new(), fence: recovered.fence,
-            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
+            read_position, pending_block: None, claim: None, claiming: None, replica_tail, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer, serving_search: None, serving: None, default_erasure: None, default_erasure_read_fence: None, local_erasure_read_fence: None, default_erasure_grant_micros: None, required_append_bytes: None, deferred_cut: false, placed_slot: None }))
     }
 
     pub fn with_serving_search(mut self, builder: Arc<dyn ServingSearchBuilder>) -> Self {
@@ -615,6 +615,14 @@ impl ReplicationDriver {
     }
 
     pub async fn attach_native_serving(&mut self, replication: ReplicationHandle, authority: NativeServingAuthority, collect_checkpoints: bool) -> Result<NativeServingHandle> {
+        if self.logs.default_erasure_kafka_topics().is_some() {
+            if self.local_erasure_read_fence.is_none() || !self.config.enabled || !self.config.may_lead
+                || self.config.external_source || collect_checkpoints
+            {
+                return Err(default_erasure::unsupported());
+            }
+            self.logs.source_replay(self.progress.source_position()).await?;
+        }
         let block = self.status.borrow().adopted_block.clone();
         let checkpoint = match &block {
             Some(block) => authority.read_checkpoint(self.blocks.object_store(), block.as_proto().serving_checkpoint.as_deref(),
@@ -1969,7 +1977,7 @@ impl ReplicationDriver {
             request => request,
         };
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
-        let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
+        let serving = self.serving.as_ref().ok_or_else(serving::unavailable)?;
         let request = match request {
             Ok(request) if serving.request_pending(&request)
                 || request.transaction.uses_erasure() && !leader.drained_for_strict_source()
@@ -1982,6 +1990,15 @@ impl ReplicationDriver {
         };
         let time_floor = serving.shares_main().then(|| leader.resolver().map(|resolver| resolver.resolved_head()))
             .transpose()?.flatten().map(|key| key.system_time);
+        let request = match request {
+            Ok(request) if self.logs.default_erasure_kafka_topics().is_some() && serving.needs_erasure_history(&request) => {
+                self.cancellation.run_until_cancelled(self.logs.validate_default_erasure_kafka_history(position, self.read_position))
+                    .await.ok_or_else(stopped)?
+                    .map(|()| request)
+            }
+            request => request,
+        };
+        let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
         let message = serving.decide_source(position, (self.clock)(), time_floor, request)?;
         let block = self.partition.value().live().block_index();
         leader.cycle.resolved(1)?;

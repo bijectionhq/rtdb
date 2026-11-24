@@ -118,13 +118,13 @@ impl ClassicKeyVault {
                     let id = Uuid::new_v4();
                     let scope = vault.0.join(id.simple().to_string());
                     fs::create_dir(&scope).map_err(io(&scope))?;
-                    let strict = match proposed {
-                        Some(residence) => residence.enroll_if_pristine(&scope)?,
-                        None => false,
+                    let version = match proposed {
+                        Some(residence) if residence.enroll_if_pristine(&scope)? => Some(residence.version()),
+                        _ => None,
                     };
                     sync_directory(&vault.0).map_err(io(&vault.0))?;
                     let mut bytes = id.as_bytes().to_vec();
-                    if strict { bytes.push(local_erasure::LINEAGE_VERSION); }
+                    bytes.extend(version);
                     Ok(bytes)
                 }).await?;
                 let publication = store.put(&marker, Bytes::from(proposal)).await;
@@ -146,10 +146,11 @@ impl ClassicKeyVault {
         }
         let erasure = match anchor.get(16) {
             None => None,
-            Some(&local_erasure::LINEAGE_VERSION) => {
+            Some(&version) if matches!(version, local_erasure::LINEAGE_VERSION | local_erasure::KAFKA_LINEAGE_VERSION) => {
                 let residence = erasure.ok_or_else(|| invalid("The enrolled Local root requires its original erasure custody"))?;
+                if residence.version() != version { return Err(invalid("The Local root has another erasure journal provider")); }
                 let path = path.clone();
-                Some(Arc::new(region.run_blocking(move || residence.reopen(path)).await?))
+                Some(Arc::new(region.run_blocking(move || residence.reopen(path, id)).await?))
             }
             _ => return Err(invalid("The Classic key lineage version is unsupported")),
         };
@@ -231,18 +232,40 @@ impl ClassicKeyVault {
     /// Kafka's immutable topic ID selects a vault lineage. Only the caller
     /// that created the still-empty topic may enroll its vault namespace.
     pub fn kafka_log_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>) -> Result<Arc<KafkaFrameKeys>> {
+        self.kafka_topic_keys(topic, enroll, region, None)
+    }
+
+    pub fn kafka_erasure_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>, owner: [u8; 16], replica: bool) -> Result<Arc<KafkaFrameKeys>> {
+        self.kafka_topic_keys(topic, enroll, region, Some((Uuid::from_bytes(owner), replica)))
+    }
+
+    fn kafka_topic_keys(&self, topic: [u8; 16], enroll: bool, region: Arc<IoRegion>, owner: Option<(Uuid, bool)>) -> Result<Arc<KafkaFrameKeys>> {
         let topic = Uuid::from_bytes(topic);
         if topic.is_nil() {
             return Err(invalid("A Classic Kafka log must have a broker topic identity"));
         }
-        let path = self.0.join(format!("kafka-{}", topic.simple()));
-        if enroll {
-            match fs::create_dir(&path) {
+        let classic = self.0.join(format!("kafka-{}", topic.simple()));
+        let erasure = kafka_erasure_scope(&self.0, topic);
+        let _gate = (enroll || owner.is_some()).then(|| lock(&classic)).transpose()?;
+        if let Some(owner) = owner
+            && enroll
+            && !classic.try_exists().map_err(io(&classic))?
+            && !erasure.try_exists().map_err(io(&erasure))?
+        {
+            let staging = tempfile::tempdir_in(&self.0).map_err(io(&self.0))?;
+            write_kafka_marker(&staging.path().join("owner"), &kafka_owner_bytes(owner), false)?;
+            fs::rename(staging.path(), &erasure).map_err(io(&erasure))?;
+            sync_directory(&self.0).map_err(io(&self.0))?;
+        }
+        require_kafka_erasure_owner(&self.0, topic, owner)?;
+        if enroll && owner.is_none() {
+            match fs::create_dir(&classic) {
                 Ok(()) => sync_directory(&self.0).map_err(io(&self.0))?,
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(io(&path)(error).into()),
+                Err(error) => return Err(io(&classic)(error).into()),
             }
         }
+        let path = if owner.is_some() { erasure } else { classic };
         if !path.is_dir() {
             return Err(invalid("The Classic Kafka topic requires its original enrolled key vault"));
         }
@@ -271,6 +294,34 @@ impl ClassicKeyVault {
     }
 }
 
+fn kafka_erasure_scope(vault: &Path, topic: Uuid) -> PathBuf {
+    vault.join(format!("kafka-erasure-{}", topic.simple()))
+}
+
+fn kafka_owner_bytes((owner, replica): (Uuid, bool)) -> [u8; 17] {
+    let mut bytes = [0; 17];
+    bytes[..16].copy_from_slice(owner.as_bytes());
+    bytes[16] = u8::from(replica);
+    bytes
+}
+
+fn require_kafka_erasure_owner(vault: &Path, topic: Uuid, owner: Option<(Uuid, bool)>) -> crate::Result<()> {
+    let path = kafka_erasure_scope(vault, topic).join("owner");
+    let found: Option<[u8; 17]> = match fs::read(&path) {
+        Ok(bytes) => Some(bytes.try_into().map_err(|_| kafka_owner_mismatch())?),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(io(&path)(error)),
+    };
+    if found != owner.map(kafka_owner_bytes) {
+        return Err(kafka_owner_mismatch());
+    }
+    Ok(())
+}
+
+fn kafka_owner_mismatch() -> Error {
+    Error::Closed("The Kafka topic requires its original Default erasure residence".into())
+}
+
 pub struct ClassicObjectKeys {
     path: Arc<Path>,
     region: Arc<IoRegion>,
@@ -278,6 +329,8 @@ pub struct ClassicObjectKeys {
 }
 
 impl ClassicObjectKeys {
+    pub fn has_erasure_custody(&self) -> bool { self.erasure.is_some() }
+
     fn name(&self, key: &ObjectKey) -> PathBuf {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let digest = digest(&SHA256, key.as_str().as_bytes());

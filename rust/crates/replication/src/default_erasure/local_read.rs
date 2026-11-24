@@ -35,10 +35,14 @@ impl LocalErasureRead {
 impl LocalDefaultErasureReadFence {
     pub async fn open(logs: &PartitionLogs, kms: Arc<dyn Kms>, io: Arc<IoRegion>, database: Uuid) -> Result<Self> {
         let store = Arc::clone(logs.store());
-        let source_lineage = logs.source_journal_lineage().ok_or_else(unsupported)?;
-        let replica_lineage = logs.replica_journal_lineage().ok_or_else(unsupported)?;
         let custody = store.local_erasure_custody().cloned().ok_or_else(unsupported)?;
-        if !kms.supports_durable_generation_retirement() || !logs.retains_recovery_history()
+        let [source_lineage, replica_lineage] = if custody.kafka_owner().is_some() {
+            logs.default_erasure_kafka_topics().ok_or_else(unsupported)?
+        } else {
+            if !logs.retains_recovery_history() { return Err(unsupported()); }
+            [logs.source_journal_lineage().ok_or_else(unsupported)?, logs.replica_journal_lineage().ok_or_else(unsupported)?]
+        };
+        if !kms.supports_durable_generation_retirement() || !store.syncs_checkpoints() || !store.defers_trie_releases()
             || logs.checkpoint_log_keys().is_none() || store.local_maintenance_store().is_none()
             || store.local_classic_key_slots().is_none() || store.permits_shared_read_cache()
         { return Err(unsupported()); }

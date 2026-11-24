@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use rtdb_storage::log::{
-    CheckpointKeyRetirement, CheckpointPrefix, LogOffset, PriorCheckpointReferences,
+    CheckpointKeyRetirement, CheckpointPrefix, Log, LogOffset, PriorCheckpointReferences,
 };
+use rtdb_storage::object_store::ReadReservation;
 use rtdb_storage::sealing::{KafkaFrameKeys, KafkaPrefixRetirement};
 use rtdb_types::{Anomaly, Result};
 
@@ -46,7 +47,26 @@ impl KafkaLog {
                 "The authorized recovery cut is outside the verified broker interval",
             ));
         }
+        if self.default_erasure {
+            if broker_floor > retirement.before { return Err(incomplete_history()); }
+            if !keys.has_kafka_prefix_retirement(retirement).await? {
+                self.backfill_checkpoint_suffix(keys, retirement.before, broker_end).await?;
+            }
+        }
         Ok((keys, broker_end))
+    }
+
+    async fn backfill_checkpoint_suffix(&self, keys: &KafkaFrameKeys, before: i64, broker_end: i64) -> Result<()> {
+        let Some(missing) = keys.first_unobserved_kafka_position(before, broker_end).await? else { return Ok(()); };
+        let mut range = self.range(LogOffset(missing), LogOffset(broker_end)).await?;
+        let bound = range.allocation_bound();
+        // A broker acknowledgement can commit before the delivery callback records its offset.
+        for offset in missing..broker_end {
+            let record = range.next(ReadReservation::new(bound, self.memory.reserve(bound)?)).await?
+                .ok_or_else(incomplete_history)?;
+            if record.metadata.offset.0 != offset { return Err(incomplete_history()); }
+        }
+        Ok(())
     }
 
     pub(super) fn native_prefix_custody(&self) -> Result<(&KafkaFrameKeys, [u8; 16])> {
@@ -62,6 +82,36 @@ impl KafkaLog {
 
 #[async_trait]
 impl CheckpointKeyRetirement for KafkaLog {
+    fn default_erasure_topic(&self) -> Option<[u8; 16]> {
+        self.topic_id.filter(|_| self.default_erasure)
+    }
+
+    async fn validate_default_erasure_history(&self, through: LogOffset, recovery_after: LogOffset) -> Result<()> {
+        let (keys, topic) = self.native_prefix_custody()?;
+        let before = through.0.checked_add(1).ok_or_else(incomplete_history)?;
+        let recovery_next = recovery_after.0.checked_add(1).ok_or_else(incomplete_history)?;
+        let (broker_floor, broker_end) = self.verified_watermarks(topic).await?;
+        if !self.default_erasure || broker_floor < 0 || broker_floor > recovery_next
+            || keys.kafka_erasure_floor()? != recovery_next || recovery_next > before || before > broker_end
+        {
+            return Err(incomplete_history());
+        }
+        self.backfill_checkpoint_suffix(keys, before, broker_end).await?;
+        keys.validate_kafka_position_history(recovery_next, before, broker_end).await?;
+        if self.replica_references {
+            keys.prior_replica_references(before).await?;
+        }
+        Ok(())
+    }
+
+    async fn verifies_checkpoint_prefix(&self, cut: CheckpointPrefix) -> Result<bool> {
+        let (keys, topic) = self.native_prefix_custody()?;
+        let retirement = broker_cut(cut)?;
+        let (broker_floor, broker_end) = self.verified_watermarks(topic).await?;
+        Ok(self.default_erasure && broker_floor <= retirement.before && retirement.before <= broker_end
+            && keys.verifies_kafka_prefix_retirement(retirement).await?)
+    }
+
     fn checkpoint_offsets_are_dense(&self) -> bool {
         true
     }
@@ -106,6 +156,10 @@ impl CheckpointKeyRetirement for KafkaLog {
         self.arm_native_prefix_retirement(retirement).await?;
         self.settle_native_prefix_retirement(retirement).await
     }
+}
+
+pub(super) fn incomplete_history() -> Anomaly {
+    Anomaly::unsupported("rtdb.kafka/erasure-history", "Default erasure requires the original sealed Kafka history and recovery suffix")
 }
 
 fn broker_cut(cut: CheckpointPrefix) -> Result<KafkaPrefixRetirement> {

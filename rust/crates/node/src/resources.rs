@@ -96,6 +96,12 @@ pub trait LogFactory: Send + Sync {
     /// Opens distinct source and replica logs without spawning their drivers.
     /// Returned drivers finish all admitted appends when `cancellation` is cancelled.
     async fn open(&self, configuration: &Any, access: LogAccess, cancellation: CancellationToken) -> Result<OpenedLogs>;
+
+    async fn open_for_default_erasure(&self, _configuration: &Any, _access: LogAccess, _cancellation: CancellationToken,
+        _owner: uuid::Uuid, _topics: Option<[uuid::Uuid; 2]>,
+    ) -> Result<OpenedLogs> {
+        Err(Anomaly::unsupported("rtdb/default-erasure-history", "The log provider cannot reopen the original Default erasure history"))
+    }
 }
 
 pub struct OpenedRecoveryStore {
@@ -252,6 +258,7 @@ pub struct NativeResources {
     token_kms: Option<Arc<dyn rtdb_crypt::Kms>>,
     native_checkpoint_kms: Option<Arc<dyn rtdb_crypt::Kms>>,
     local_checkpoint_vault: Option<PathBuf>,
+    kafka_checkpoint_vault: Option<PathBuf>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<TransactionClock>,
@@ -262,7 +269,7 @@ pub struct NativeResources {
 impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
-            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, io: IoRegion::new(),
+            log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, classic_vault: None, token_kms: None, native_checkpoint_kms: None, local_checkpoint_vault: None, kafka_checkpoint_vault: None, io: IoRegion::new(),
             memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false,
             serving_authorities: BTreeMap::new() }
     }
@@ -277,11 +284,17 @@ impl NativeResources {
     pub fn with_native_checkpoint_kms(mut self, kms: Arc<dyn rtdb_crypt::Kms>) -> Self {
         self.native_checkpoint_kms = Some(kms);
         self.local_checkpoint_vault = None;
+        self.kafka_checkpoint_vault = None;
         self
     }
     /// Uses the original filesystem generation authority for a freshly sealed Local residence.
-    pub fn with_local_checkpoint_kms(mut self, kms: rtdb_crypt::FileKms) -> Self {
-        self.local_checkpoint_vault = Some(kms.vault_path().to_owned());
+    pub fn with_local_checkpoint_kms(self, kms: rtdb_crypt::FileKms) -> Self {
+        self.with_default_erasure_checkpoint_kms(kms, true, false)
+    }
+
+    pub fn with_default_erasure_checkpoint_kms(mut self, kms: rtdb_crypt::FileKms, local: bool, kafka: bool) -> Self {
+        self.local_checkpoint_vault = local.then(|| kms.vault_path().to_owned());
+        self.kafka_checkpoint_vault = kafka.then(|| kms.vault_path().to_owned());
         self.native_checkpoint_kms = Some(Arc::new(kms));
         self
     }
@@ -441,12 +454,21 @@ impl ResourceFactory for NativeResources {
         let local_erasure_vault = self.local_checkpoint_vault.as_deref().filter(|_| {
             name == "xtdb" && self.classic_vault.is_some() && configuration.external_source.is_none()
         });
+        let kafka = match &configuration.log {
+            Some(database_config::Log::OtherLog(log)) if type_name(log)? == "xtdb.kafka.proto.KafkaLogConfig" => Some(log),
+            _ => None,
+        };
+        let kafka_erasure_vault = self.kafka_checkpoint_vault.as_deref().filter(|_| {
+            name == "xtdb" && kafka.is_some() && self.classic_vault.is_some() && configuration.external_source.is_none()
+        });
         let residence = match (&configuration.storage, &configuration.log) {
-            (Some(database_config::Storage::LocalStorage(storage)), Some(database_config::Log::LocalLog(_)))
-                if configuration.mode.unwrap_or(0) != 1 || local_erasure_vault.is_some() =>
+            (Some(database_config::Storage::LocalStorage(storage)), log)
+                if configuration.mode.unwrap_or(0) != 1 || kafka.is_some()
+                    || matches!(log, Some(database_config::Log::LocalLog(_))) && local_erasure_vault.is_some() =>
             {
                 let path = PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?);
-                let exclusive = local_erasure_vault.is_some();
+                let exclusive = kafka_erasure_vault.is_some()
+                    || local_erasure_vault.is_some() && matches!(log, Some(database_config::Log::LocalLog(_)));
                 Some(Arc::new(self.io.run_blocking(move || {
                     std::fs::create_dir_all(&path).map_err(|error| rtdb_storage::Error::Task(error.to_string()))?;
                     rtdb_storage::sealing::open_local_residence(&path, exclusive)
@@ -474,13 +496,16 @@ impl ResourceFactory for NativeResources {
                 Some(database_config::Storage::LocalStorage(storage)) => {
                     let payload = PathBuf::from(storage.path.as_deref().ok_or_else(|| invalid("Local storage has no path"))?);
                     let store = LocalStore::open_in(payload.join(root.as_str()), Arc::clone(&io))?;
+                    let kafka_erasure_epoch = if let (Some(_), Some(log)) = (kafka_erasure_vault, kafka) {
+                        Some(kafka_log_epoch(log)?)
+                    } else { None };
                     let store = if let Some(database_config::Log::LocalLog(log)) = &configuration.log {
                         store.with_catalog_ledger(StorageEpoch(log.epoch.unwrap_or_default()))
                     } else { store };
                     if let Some(vault) = &self.classic_vault {
                         vault.require_separate_path(&payload)?;
-                        let residence = match (local_erasure_vault, &configuration.log) {
-                            (Some(checkpoint), Some(database_config::Log::LocalLog(log))) if epoch == 0 => {
+                        let residence = match (local_erasure_vault, kafka_erasure_vault, &configuration.log) {
+                            (Some(checkpoint), _, Some(database_config::Log::LocalLog(log))) if epoch == 0 => {
                                 let journal = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
                                 std::fs::create_dir_all(&journal).map_err(|error| rtdb_storage::Error::Task(error.to_string()))?;
                                 vault.require_separate_path(&journal)?;
@@ -488,9 +513,18 @@ impl ResourceFactory for NativeResources {
                                     store.root(), &journal, checkpoint, log.epoch.unwrap_or_default(),
                                 )?)
                             }
+                            (_, Some(checkpoint), _) if epoch == 0 => {
+                                Some(rtdb_storage::sealing::LocalErasureResidence::open_kafka(
+                                    store.root(), checkpoint, kafka_erasure_epoch.ok_or_else(|| invalid("Kafka erasure has no topic epoch"))?,
+                                )?)
+                            }
                             _ => None,
                         };
                         let keys = vault.local_units(&store, Arc::clone(&io), allow_enrollment, residence).await?;
+                        let store = match kafka_erasure_epoch {
+                            Some(epoch) if keys.has_erasure_custody() => store.with_catalog_ledger(StorageEpoch(epoch)),
+                            _ => store,
+                        };
                         Arc::new(rtdb_storage::sealing::ClassicKeyVault::wrap(Arc::new(store), keys)?)
                     } else {
                         rtdb_storage::sealing::ClassicKeyVault::require_unenrolled(&store).await?;
@@ -572,9 +606,32 @@ impl NativeResources {
                 Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, replica_read_index: None, placed_transfer: None, await_authority: crate::AwaitAuthority::SourcePosition,
                     drivers: source_driver.into_iter().chain(replica_driver).collect() })
             }
-            Some(database_config::Log::OtherLog(log)) => self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?.open(log, access, log_cancellation).await,
+            Some(database_config::Log::OtherLog(log)) => {
+                let factory = self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?;
+                if let Some(custody) = storage.store.local_erasure_custody()
+                    && let Some(owner) = custody.kafka_owner()
+                {
+                    let custody = Arc::clone(custody);
+                    let topics = io.run_blocking(move || custody.bound_kafka_topics()).await?;
+                    factory.open_for_default_erasure(log, access, log_cancellation, owner, topics).await
+                } else {
+                    factory.open(log, access, log_cancellation).await
+                }
+            }
         }
     }
+}
+
+#[cfg(feature = "kafka")]
+fn kafka_log_epoch(configuration: &Any) -> Result<i32> {
+    use prost::Message;
+    let wire = rtdb_format::generated::xtdb::kafka::proto::KafkaLogConfig::decode(configuration.value.as_slice()).map_err(|error| invalid(error.to_string()))?;
+    Ok(rtdb_kafka::KafkaLogConfig::from_proto(&wire).epoch)
+}
+
+#[cfg(not(feature = "kafka"))]
+fn kafka_log_epoch(_: &Any) -> Result<i32> {
+    Err(invalid("Default Kafka erasure requires the native Kafka provider"))
 }
 
 /// Cached objects belong to the store they came from, so the namespace is the store's identity, never the database's name.

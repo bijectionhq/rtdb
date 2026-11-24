@@ -56,10 +56,27 @@ A later erasure skips a retired Local replica prefix only when its journal proof
 
 ## Sealed Kafka
 
-Kafka uses the same inventory with a coordinated sealed Local object store.
+Set `RTDB_DEFAULT_KAFKA_ERASURE=1` with `defaultV1Serving`, `RTDB_CLASSIC_KEY_VAULT`, and `RTDB_V1_CHECKPOINT_KEY_VAULT` for a fresh Default primary with Kafka logs and a Local object store.
+The original writable node opens dedicated single-partition source and replica topics and enrolls each broker topic ID in its own role under the Local residence's Classic vault.
+The Local storage path and private checkpoint vault bind to the same enrollment.
+The first open creates the empty topics through the native Kafka provider with `autoCreateTopic` enabled.
+Reopen requires the original topic IDs, object residence and key vaults.
+Legacy Kafka uses a separate frame key namespace and its existing broker-floor settlement.
+
+The enrolled Kafka topics keep an uncompacted suffix with automatic broker retention disabled.
+Public Erase requires the active source and replica positions to be covered by the original sealed offset census and the recoverable suffix to begin at or before the exact Local recovery cut.
+The writer checks this evidence before deciding a new Erase.
+Retained broker frames can repair an unobserved suffix offset after an ambiguous acknowledgement.
+An exact retry of a decided request reads its original ordered outcome.
+
+Kafka uses the same inventory and drain as the sealed Local route.
+Classic SQL, native Query and Changes use the original catalog or generation holds.
+The enrolled profile excludes independent exports, plaintext spills, shared decrypted caches, row custody and background artefact publication.
 Offset continuity is checked through the ordered boundary before recording the inventory.
-The Kafka vault independently validates and withdraws frame keys, while broker retention remains under Classic policy.
-An exact durable Kafka intent can resume after the broker low watermark advances. [Kafka retirement](../../rust/crates/kafka/src/erasure.rs) · [Vault intent](../../rust/crates/storage/src/sealing/classic/kafka_retirement.rs)
+The Local recovery fence must cover the erased prefix before either Kafka key floor advances.
+The Kafka vault independently validates and withdraws frame keys.
+The ordered terminal verifies both exact settled topic cuts before releasing the original receipt.
+An exact durable Kafka intent can resume after the broker low watermark advances within the prefix covered by Local recovery. [Kafka retirement](../../rust/crates/kafka/src/erasure.rs) · [Vault intent](../../rust/crates/storage/src/sealing/classic/kafka_retirement.rs)
 
 A sealed Default replica topic persists reference evidence on acknowledgement and can backfill it when opening a retained frame.
 The vault binds each evidence record to the original offset and sealed publication identity.
@@ -67,4 +84,4 @@ It records either a detached address or an explicit inline frame and preserves b
 A new inventory requires evidence for every covered coordinate below the broker or key floor and scans the remaining interval directly.
 A position that expired before its evidence was recorded remains irrecoverable to this route. [Kafka range](../../rust/crates/kafka/src/lib.rs#L295) · [Reference evidence](../../rust/crates/storage/src/sealing/classic/kafka_references.rs)
 
-Public physical Erase remains gated for Kafka, hosted object storage, external pg-source, copied histories, and deployments without their original enrollment and reader authorities.
+Public physical Erase remains gated on shared Kafka attachments, hosted object storage, external pg-source, copied histories, and deployments without their original enrollment and reader authorities.

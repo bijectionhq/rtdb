@@ -45,26 +45,39 @@ enum Access {
     Writable { queue: mpsc::Sender<driver::Queued>, bytes: Arc<Semaphore>, records: Arc<Semaphore> },
 }
 
-pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access, keys: Option<Arc<KafkaFrameKeys>>, topic_id: Option<[u8; 16]>, replica_references: bool }
+pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access, keys: Option<Arc<KafkaFrameKeys>>, topic_id: Option<[u8; 16]>, replica_references: bool, default_erasure: bool, memory: Arc<MemoryBudget> }
 pub struct OpenedKafkaLog { pub log: Arc<KafkaLog>, pub driver: Option<KafkaLogDriver> }
+
+struct ErasureTopic {
+    owner: [u8; 16],
+    expected: Option<[u8; 16]>,
+}
 
 impl KafkaLog {
     /// The owner must run the returned driver, then cancel and join it before releasing a writable log.
     /// TLS material is admitted against `memory` and remains charged until the last derived native client is destroyed.
     pub async fn open(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>) -> Result<OpenedKafkaLog> {
-        Self::open_log(cluster, options, observer, memory, None, false).await
+        Self::open_log(cluster, options, observer, memory, None, false, None).await
     }
 
     pub async fn open_classic(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: ClassicKeyVault) -> Result<OpenedKafkaLog> {
-        Self::open_log(cluster, options, observer, memory, Some(vault), false).await
+        Self::open_log(cluster, options, observer, memory, Some(vault), false, None).await
     }
 
     pub async fn open_classic_replica(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: ClassicKeyVault) -> Result<OpenedKafkaLog> {
-        Self::open_log(cluster, options, observer, memory, Some(vault), true).await
+        Self::open_log(cluster, options, observer, memory, Some(vault), true, None).await
     }
 
-    async fn open_log(cluster: &KafkaClusterConfig, mut options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: Option<ClassicKeyVault>, replica_references: bool) -> Result<OpenedKafkaLog> {
+    pub async fn open_classic_erasure(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: ClassicKeyVault, replica: bool, owner: [u8; 16], expected: Option<[u8; 16]>) -> Result<OpenedKafkaLog> {
+        Self::open_log(cluster, options, observer, memory, Some(vault), replica, Some(ErasureTopic { owner, expected })).await
+    }
+
+    async fn open_log(cluster: &KafkaClusterConfig, mut options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>, vault: Option<ClassicKeyVault>, replica_references: bool, erasure: Option<ErasureTopic>) -> Result<OpenedKafkaLog> {
         options.validate()?;
+        if let Some(erasure) = &erasure {
+            if options.read_only { return Err(erasure::incomplete_history()); }
+            if erasure.expected.is_some() { options.auto_create_topic = false; }
+        }
         if vault.is_some() {
             options.maximum_message_bytes = options.maximum_message_bytes.checked_add(KAFKA_LOG_SEAL_OVERHEAD)
                 .ok_or_else(|| Anomaly::incorrect("xtdb.kafka/invalid-config", "Sealed Kafka frame limit overflows"))?;
@@ -73,15 +86,24 @@ impl KafkaLog {
                 options.auto_create_topic = false;
             }
         }
-        let configuration = LogConfiguration::from_cluster(cluster, memory)?;
+        let configuration = LogConfiguration::from_cluster(cluster, Arc::clone(&memory))?;
         let admin_config = configuration.prepare(Role::Admin)?;
         if admin_config.configuration.get("transactional.id").is_some() { return Err(Anomaly::incorrect("xtdb.kafka/invalid-config", "XTDB logs do not open Kafka producer transactions")); }
-        let identity = ensure_topic(admin_config, &options, observer.as_ref(), vault.is_some()).await?;
+        let identity = ensure_topic(admin_config, &options, observer.as_ref(), vault.is_some(), erasure.is_some()).await?;
         let consumer = consumer(&configuration, &options).map_err(Anomaly::from)?;
         let (start, end) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
         let topic_id = identity.map(|(topic, _)| topic);
         let keys = match (vault, identity) {
-            (Some(vault), Some((topic, created))) => Some(vault.kafka_log_keys(topic, created && start == 0 && end == 0, IoRegion::new())?),
+            (Some(vault), Some((topic, created))) => {
+                let enroll = created && start == 0 && end == 0;
+                let keys = if let Some(erasure) = &erasure {
+                    if erasure.expected.is_some_and(|expected| expected != topic) { return Err(erasure::incomplete_history()); }
+                    vault.kafka_erasure_keys(topic, enroll, IoRegion::new(), erasure.owner, replica_references)?
+                } else {
+                    vault.kafka_log_keys(topic, enroll, IoRegion::new())?
+                };
+                Some(keys)
+            }
             (None, None) => None,
             _ => return Err(Anomaly::fault("xtdb.kafka/topic-identity", "The broker did not bind the Classic log's topic")),
         };
@@ -100,10 +122,16 @@ impl KafkaLog {
             let access = Access::Writable { queue, bytes: Arc::clone(&bytes), records: Arc::clone(&records) };
             (access, Some(KafkaLogDriver::new(producer, receiver, Arc::clone(&progress), options.clone(), bytes, records)))
         };
-        Ok(OpenedKafkaLog { log: Arc::new(Self { configuration, options, progress, access, keys, topic_id, replica_references }), driver })
+        let log = Arc::new(Self { configuration, options, progress, access, keys, topic_id, replica_references, default_erasure: erasure.is_some(), memory });
+        if log.default_erasure {
+            let topic = topic_id.ok_or_else(erasure::incomplete_history)?;
+            log.verified_watermarks(topic).await?;
+        }
+        Ok(OpenedKafkaLog { log, driver })
     }
 
     pub async fn settle_classic_prefix(&self) -> Result<bool> {
+        if self.default_erasure { return Err(erasure::incomplete_history()); }
         let (Some(keys), Some(expected)) = (&self.keys, self.topic_id) else { return Ok(true); };
         let (low, _) = self.verified_watermarks(expected).await?;
         Ok(keys.retire_kafka_before(low).await?)
@@ -124,6 +152,11 @@ impl KafkaLog {
         let after = admin.topic_id(topic, &options).await.map_err(|error| transport_error(topic, error))?;
         if after != expected {
             return Err(Anomaly::incorrect("xtdb.kafka/topic-identity", "The Kafka floor belongs to another topic"));
+        }
+        if self.default_erasure && (watermarks.0 < 0 || watermarks.0 > watermarks.1
+            || watermarks.1 - 1 < self.progress.observed_tip.load(Ordering::Acquire))
+        {
+            return Err(erasure::incomplete_history());
         }
         Ok(watermarks)
     }
@@ -184,7 +217,13 @@ fn metadata(message: &BorrowedMessage<'_>, topic: &str) -> StorageResult<LogMeta
     Ok(LogMetadata { offset: LogOffset(message.offset()), timestamp: Timestamp(millis.checked_mul(1000).ok_or_else(|| Error::Remote { key: topic.into(), message: "Kafka timestamp exceeds microsecond range".into() })?) })
 }
 
-async fn ensure_topic(configuration: PreparedLogClient, options: &KafkaLogOptions, observer: &dyn KafkaObserver, require_identity: bool) -> Result<Option<([u8; 16], bool)>> {
+const ERASURE_TOPIC_CONFIG: [(&str, &str); 3] = [
+    ("cleanup.policy", "delete"),
+    ("retention.ms", "-1"),
+    ("retention.bytes", "-1"),
+];
+
+async fn ensure_topic(configuration: PreparedLogClient, options: &KafkaLogOptions, observer: &dyn KafkaObserver, require_identity: bool, default_erasure: bool) -> Result<Option<([u8; 16], bool)>> {
     let admin = configuration.open(|mut config| {
         config.set("allow.auto.create.topics", "false");
         config.create::<AdminClient<DefaultClientContext>>()
@@ -195,7 +234,10 @@ async fn ensure_topic(configuration: PreparedLogClient, options: &KafkaLogOption
     let mut created = false;
     if missing {
         if !options.auto_create_topic { return Err(Anomaly::incorrect("xtdb.kafka/missing-topic", format!("Kafka topic '{}' does not exist", options.topic))); }
-        let topic = NewTopic::new(&options.topic, 1, TopicReplication::Fixed(1)).set("message.timestamp.type", "LogAppendTime");
+        let mut topic = NewTopic::new(&options.topic, 1, TopicReplication::Fixed(1)).set("message.timestamp.type", "LogAppendTime");
+        if default_erasure {
+            for (key, value) in ERASURE_TOPIC_CONFIG { topic = topic.set(key, value); }
+        }
         let results = admin.create_topics([&topic], &admin_options).await.map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
         for result in results {
             match result { Ok(_) => created = true, Err((_, RDKafkaErrorCode::TopicAlreadyExists)) => (), Err((_, error)) => return Err(Anomaly::fault("xtdb.kafka/create-topic", error.to_string())) }
@@ -214,19 +256,27 @@ async fn ensure_topic(configuration: PreparedLogClient, options: &KafkaLogOption
     } else {
         None
     };
-    if replicas < 2 { return Ok(identity); }
+    if replicas < 2 && !default_erasure { return Ok(identity); }
     match admin.describe_configs([&ResourceSpecifier::Topic(&options.topic)], &admin_options).await {
-        Ok(resources) => for resource in resources {
-            match resource {
-                Ok(resource) => {
-                    if let Some(minimum) = resource.get("min.insync.replicas").and_then(|entry| entry.value.as_deref()).and_then(|value| value.parse::<i32>().ok()).filter(|minimum| *minimum < 2) {
-                        observer.warning(KafkaWarning::InsufficientReplicas { topic: options.topic.clone(), replicas, minimum_in_sync: minimum });
+        Ok(resources) => {
+            if default_erasure && resources.len() != 1 { return Err(erasure::incomplete_history()); }
+            for resource in resources {
+                match resource {
+                    Ok(resource) => {
+                        if default_erasure && ERASURE_TOPIC_CONFIG.iter().any(|(key, value)| {
+                            resource.get(key).and_then(|entry| entry.value.as_deref()) != Some(*value)
+                        }) { return Err(erasure::incomplete_history()); }
+                        if let Some(minimum) = resource.get("min.insync.replicas").and_then(|entry| entry.value.as_deref()).and_then(|value| value.parse::<i32>().ok()).filter(|minimum| *minimum < 2) {
+                            observer.warning(KafkaWarning::InsufficientReplicas { topic: options.topic.clone(), replicas, minimum_in_sync: minimum });
+                        }
+                        if resource.get("unclean.leader.election.enable").and_then(|entry| entry.value.as_deref()) == Some("true") { observer.warning(KafkaWarning::UncleanElection { topic: options.topic.clone() }); }
                     }
-                    if resource.get("unclean.leader.election.enable").and_then(|entry| entry.value.as_deref()) == Some("true") { observer.warning(KafkaWarning::UncleanElection { topic: options.topic.clone() }); }
+                    Err(_) if default_erasure => return Err(erasure::incomplete_history()),
+                    Err(_) => observer.warning(KafkaWarning::ConfigurationUnavailable { topic: options.topic.clone() }),
                 }
-                Err(_) => observer.warning(KafkaWarning::ConfigurationUnavailable { topic: options.topic.clone() }),
             }
-        },
+        }
+        Err(_) if default_erasure => return Err(erasure::incomplete_history()),
         Err(_) => observer.warning(KafkaWarning::ConfigurationUnavailable { topic: options.topic.clone() }),
     }
     Ok(identity)

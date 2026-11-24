@@ -85,6 +85,24 @@ struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::K
 #[async_trait]
 impl crate::LogFactory for KafkaFactory {
     async fn open(&self, configuration: &Any, access: crate::LogAccess, cancellation: tokio_util::sync::CancellationToken) -> Result<crate::OpenedLogs> {
+        self.open_pair(configuration, access, cancellation, None).await
+    }
+
+    async fn open_for_default_erasure(&self, configuration: &Any, access: crate::LogAccess, cancellation: tokio_util::sync::CancellationToken,
+        owner: uuid::Uuid, topics: Option<[uuid::Uuid; 2]>,
+    ) -> Result<crate::OpenedLogs> {
+        if access.source_read_only() || access.replica_read_only() {
+            return Err(invalid("Default Kafka erasure requires the original writable attachment"));
+        }
+        self.open_pair(configuration, access, cancellation, Some((owner, topics))).await
+    }
+}
+
+#[cfg(feature = "kafka")]
+impl KafkaFactory {
+    async fn open_pair(&self, configuration: &Any, access: crate::LogAccess, cancellation: tokio_util::sync::CancellationToken,
+        erasure: Option<(uuid::Uuid, Option<[uuid::Uuid; 2]>)>,
+    ) -> Result<crate::OpenedLogs> {
         use futures::FutureExt;
         use rtdb_kafka::{KafkaLog, KafkaLogConfig, KafkaLogOptions};
         let wire = rtdb_format::generated::xtdb::kafka::proto::KafkaLogConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
@@ -102,15 +120,24 @@ impl crate::LogFactory for KafkaFactory {
         replica_options.auto_create_topic = self.auto_create_topic;
         replica_options.pipelined = true;
         let vault = self.vault.clone().ok_or_else(|| invalid("Classic Kafka logs require RTDB_CLASSIC_KEY_VAULT"))?;
-        let source = KafkaLog::open_classic(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault.clone()).await?;
-        let replica = KafkaLog::open_classic_replica(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault).await?;
+        let (source, replica) = if let Some((owner, topics)) = erasure {
+            let source = KafkaLog::open_classic_erasure(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory),
+                vault.clone(), false, owner.into_bytes(), topics.map(|topics| topics[0].into_bytes())).await?;
+            let replica = KafkaLog::open_classic_erasure(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory),
+                vault, true, owner.into_bytes(), topics.map(|topics| topics[1].into_bytes())).await?;
+            (source, replica)
+        } else {
+            let source = KafkaLog::open_classic(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault.clone()).await?;
+            let replica = KafkaLog::open_classic_replica(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory), vault).await?;
+            (source, replica)
+        };
         if source.log.topic_id() == replica.log.topic_id() {
             return Err(invalid("Source and replica Kafka logs resolve to the same physical topic"));
         }
 
         let mut drivers = Vec::new();
         for (log, writable) in [(&source.log, !access.source_read_only()), (&replica.log, !access.replica_read_only())] {
-            if !writable { continue; }
+            if !writable || erasure.is_some() { continue; }
             let log = Arc::clone(log);
             let token = cancellation.clone();
             drivers.push(async move {

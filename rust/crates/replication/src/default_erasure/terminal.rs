@@ -7,7 +7,7 @@ use rtdb_types::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{BlockStore, NativeServingAuthority};
+use crate::{BlockStore, NativeServingAuthority, PartitionLogs};
 
 use super::{ErasureRetirement, MAX_CONTROL_BYTES, invalid, unsupported};
 
@@ -134,6 +134,7 @@ impl ErasureCompleted {
     pub async fn verify(
         self,
         blocks: &BlockStore,
+        logs: &PartitionLogs,
         authority: &NativeServingAuthority,
         reader_fence: &dyn DefaultErasureReadFence,
     ) -> Result<()> {
@@ -144,6 +145,7 @@ impl ErasureCompleted {
         {
             return Err(invalid());
         }
+        self.intent.verify_kafka_log_prefixes(logs).await?;
         let kms = authority
             .checkpoints
             .as_ref()

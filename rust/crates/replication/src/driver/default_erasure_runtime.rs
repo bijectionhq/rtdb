@@ -116,7 +116,7 @@ impl ReplicationDriver {
                         ordered_intent,
                         read_closure,
                     };
-                    completed.verify(&self.blocks, authority, fence).await?;
+                    completed.verify(&self.blocks, &self.logs, authority, fence).await?;
                     let block = self.partition.value().live().block_index();
                     self.leader.as_mut().ok_or_else(term_ended)?.enqueue(
                         WriteBody::Message(ReplicaBody::NoOp(completed.message()?)),
@@ -225,7 +225,7 @@ impl ReplicationDriver {
             .ok_or_else(default_erasure::unsupported)?;
         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
         completed
-            .verify(&self.blocks, serving.checkpoint_authority(), fence)
+            .verify(&self.blocks, &self.logs, serving.checkpoint_authority(), fence)
             .await?;
         let cut = intent.read_cut()?;
         serving.complete_erasure(intent.cut(), cut.successor, cut.unreadable_by)?;

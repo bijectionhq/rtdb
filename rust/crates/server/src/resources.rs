@@ -26,7 +26,14 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
         let kms = rtdb_crypt::FileKms::open(path, || rtdb_node::SystemClock.now().0)?;
         resources = resources.with_token_kms(Arc::new(kms));
     }
-    if let Some(path) = std::env::var_os("RTDB_V1_CHECKPOINT_KEY_VAULT").map(std::path::PathBuf::from) {
+    let local_erasure = config.default_v1_serving && std::env::var_os("RTDB_DEFAULT_LOCAL_ERASURE").is_some_and(|value| value == "1");
+    let kafka_erasure = std::env::var_os("RTDB_DEFAULT_KAFKA_ERASURE").is_some_and(|value| value == "1");
+    let checkpoint_vault = std::env::var_os("RTDB_V1_CHECKPOINT_KEY_VAULT").map(std::path::PathBuf::from);
+    if kafka_erasure && (!cfg!(feature = "kafka") || !config.default_v1_serving || classic_vault.is_none() || checkpoint_vault.is_none()) {
+        return Err(rtdb_types::Anomaly::incorrect("rtdb.server/kafka-erasure",
+            "Default Kafka erasure requires native Kafka, defaultV1Serving and both original key vaults"));
+    }
+    if let Some(path) = checkpoint_vault {
         use rtdb_node::Clock;
         if let Some(classic) = &classic_vault {
             classic.require_separate_path(&path)?;
@@ -46,8 +53,8 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
             }
         }
         let kms = rtdb_crypt::FileKms::open(&path, || rtdb_node::SystemClock.now().0)?;
-        resources = if config.default_v1_serving && std::env::var_os("RTDB_DEFAULT_LOCAL_ERASURE").is_some_and(|value| value == "1") {
-            resources.with_local_checkpoint_kms(kms)
+        resources = if local_erasure || kafka_erasure {
+            resources.with_default_erasure_checkpoint_kms(kms, local_erasure, kafka_erasure)
         } else {
             resources.with_native_checkpoint_kms(Arc::new(kms))
         };
