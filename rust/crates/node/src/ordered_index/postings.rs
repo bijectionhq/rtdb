@@ -1450,6 +1450,13 @@ impl<'de> Deserialize<'de> for KeyRow {
 mod tests {
     use super::*;
 
+    fn encode_keys(keys: &KeyBatch) -> Vec<u8> {
+        let encoding = keys.stage(&[], 0).unwrap();
+        let mut bytes = Vec::with_capacity(encoding.encoded_len());
+        encoding.append_batch(&mut bytes);
+        bytes
+    }
+
     #[test]
     fn typed_key_projection_matches_the_scalar_codec_for_selected_rows() {
         use arrow_array::{Date64Array, Float64Array};
@@ -1475,8 +1482,8 @@ mod tests {
             assert_eq!(Tuple::Arrow(&typed, row).compare(Tuple::Arrow(&legacy, row)), Ordering::Equal);
         }
         assert_eq!(
-            typed.encode(b"", b"").unwrap(),
-            legacy.encode(b"", b"").unwrap()
+            encode_keys(&typed),
+            encode_keys(&legacy)
         );
         let independently_gathered = KeyBatch::gather(
             &[Tuple::Arrow(&typed, 0), Tuple::Arrow(&typed, 2)],
@@ -1530,8 +1537,8 @@ mod tests {
         let copied =
             KeyBatch::build(&[Tuple::Cells(&canonical); 8], BatchKind::Keys, vec![]).unwrap();
         assert_eq!(
-            projected.encode(b"", b"").unwrap(),
-            copied.encode(b"", b"").unwrap()
+            encode_keys(&projected),
+            encode_keys(&copied)
         );
         let tuples = (0..8)
             .map(|row| Tuple::Arrow(&projected, row))
@@ -1540,8 +1547,8 @@ mod tests {
         let text_data = rebuilt.batch().column(0).to_data();
         assert_ne!(text_data.buffers()[1].data_ptr(), text.values().data_ptr());
         assert_eq!(
-            rebuilt.encode(b"", b"").unwrap(),
-            copied.encode(b"", b"").unwrap()
+            encode_keys(&rebuilt),
+            encode_keys(&copied)
         );
     }
 
@@ -1594,8 +1601,8 @@ mod tests {
         let canonical = [AtomRef::Text("kept"), AtomRef::Bool(true)];
         let copied = KeyBatch::build(&[Tuple::Cells(&canonical)], BatchKind::Keys, vec![]).unwrap();
         assert_eq!(
-            projected.encode(b"", b"").unwrap(),
-            copied.encode(b"", b"").unwrap()
+            encode_keys(&projected),
+            encode_keys(&copied)
         );
         assert!(projected.share_slices);
         assert!(projected.batch().column(0).get_buffer_memory_size() < 4096);
@@ -1635,8 +1642,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            projected.encode(b"", b"").unwrap(),
-            scalar.encode(b"", b"").unwrap()
+            encode_keys(&projected),
+            encode_keys(&scalar)
         );
     }
 
@@ -1656,7 +1663,7 @@ mod tests {
                 Arc::new(Int64Array::from_iter_values(1..=selection.len() as i64))];
             let typed = KeyBatch::gather(&keys, BatchKind::Correction, prefix.clone()).unwrap();
             let canonical = KeyBatch::build(&scalar, BatchKind::Correction, prefix).unwrap();
-            assert_eq!(typed.encode(b"", b"").unwrap(), canonical.encode(b"", b"").unwrap());
+            assert_eq!(encode_keys(&typed), encode_keys(&canonical));
         }
     }
 
@@ -1707,8 +1714,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            typed.encode(b"", b"").unwrap(),
-            canonical.encode(b"", b"").unwrap()
+            encode_keys(&typed),
+            encode_keys(&canonical)
         );
     }
 

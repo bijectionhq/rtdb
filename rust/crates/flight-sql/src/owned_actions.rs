@@ -1586,14 +1586,17 @@ impl Service {
         } else {
             (Vec::new(), primary)
         };
-        self.commit_hosted_with_reads(call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input).await
+        self.commit_hosted_with_reads(
+            call, envelope, primary, counted, worlds, refusal, recheck_at_staging, slot, funded.as_ref(), authority, input, ipc_stream,
+        ).await
     }
 
     async fn commit_hosted_with_reads(
         &self, call: &Call, envelope: &Bytes, body: &[u8], counted: bool, worlds: Vec<HostedWorldRead>,
         refusal: Option<&[u8]>, recheck_at_staging: bool, slot: Option<OwnedClockSlot>,
         funded: Option<&rtdb_node::FundedMutationClock>, authority: rtdb_tx::HostedAuthority, input: HostedDecisionInput<'_>,
-    ) -> Result<ActionResult, Status> {
+        ipc_stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (conditions, body, _counts) = if counted {
             owned_count_conditions(call, body, None, false)?
