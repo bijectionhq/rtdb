@@ -326,6 +326,12 @@
 -- The authenticated placed control owner supplies the deployment identity and up to four exact transaction ID and system-time pairs.
 -- The Flight reply carries the sampled applied position as Arrow columns only when the cut proves every supplied position.
 --
+-- An ordinary authenticated Flight session may publish a cell catalog batch when the owner advertises PublishCatalog.v1.
+-- The wire batch carries binary keys, dictionary-encoded operations and labels, unit lists and the ordered value stamp offsets.
+-- The owner lowers those values to the installed catalog relation layout and submits the caller's ordered guards, rows and optional attempt marker in one SQL transaction under the caller's database authority.
+-- A synchronous reply carries the exact transaction ID, ordered system timestamp, session await token and ordered outcome, including the first reached assertion refusal.
+-- An interrupted response leaves the transaction outcome to the attempt marker and durable source observation.
+--
 -- == Boundaries ==
 --
 -- Below: db.allium's submitTx / executeTx. A Writing commit drains the buffer and

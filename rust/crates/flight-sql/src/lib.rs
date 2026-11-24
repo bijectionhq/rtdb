@@ -4,6 +4,7 @@ mod config;
 mod error;
 mod execute;
 mod actions;
+mod catalog_actions;
 mod upload;
 mod lease;
 mod metadata;

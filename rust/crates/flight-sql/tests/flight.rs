@@ -2074,3 +2074,162 @@ async fn bulk_ingest_and_insert_select_preserve_fixed_float_embeddings() {
     assert_eq!(output.values().as_any().downcast_ref::<Float32Array>().unwrap().values().as_ref(), &[0.0, 3.0]);
     running.stop().await;
 }
+
+const PUBLISH_CATALOG: &str = "rtdb.owned.PublishCatalog.v1";
+const WATCH_RELATION: &str = "rtdb.owned.WatchRelation.v1";
+
+#[derive(Message)]
+struct CatalogPublication {
+    #[prost(message, repeated, tag = "1")]
+    before: Vec<CatalogStatement>,
+    #[prost(bytes = "bytes", tag = "2")]
+    rows: Bytes,
+    #[prost(message, optional, tag = "3")]
+    marker: Option<CatalogStatement>,
+}
+
+#[derive(Message)]
+struct CatalogStatement {
+    #[prost(string, tag = "1")]
+    sql: String,
+    #[prost(bytes = "bytes", tag = "2")]
+    args: Bytes,
+}
+
+#[derive(Message)]
+struct CatalogReceipt {
+    #[prost(int64, tag = "1")]
+    tx_id: i64,
+    #[prost(int64, tag = "2")]
+    system_micros: i64,
+    #[prost(string, tag = "3")]
+    await_token: String,
+    #[prost(bool, tag = "4")]
+    committed: bool,
+    #[prost(string, tag = "5")]
+    error_code: String,
+    #[prost(string, tag = "6")]
+    error_message: String,
+}
+
+#[derive(Message)]
+struct CatalogWatch {
+    #[prost(string, tag = "1")]
+    relation: String,
+    #[prost(int64, optional, tag = "2")]
+    after: Option<i64>,
+}
+
+fn catalog_ipc(names: &[&str], columns: Vec<arrow_array::ArrayRef>) -> Bytes {
+    let schema = Arc::new(Schema::new(names.iter().zip(&columns).map(|(name, column)| {
+        Field::new(*name, column.data_type().clone(), column.null_count() != 0)
+    }).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.into_inner().unwrap().into()
+}
+
+fn catalog_writes() -> Bytes {
+    use arrow_array::{BinaryArray, ListArray, builder::StringDictionaryBuilder, types::Int32Type};
+    let dictionary = |value: &str| {
+        let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+        builder.append(value).unwrap();
+        Arc::new(builder.finish()) as arrow_array::ArrayRef
+    };
+    catalog_ipc(
+        &["_id", "world", "key", "idx", "op", "value", "number", "label", "units", "stamp_offsets"],
+        vec![
+            Arc::new(StringArray::from(vec!["attempt/1/0"])),
+            Arc::new(Int64Array::from(vec![1])),
+            Arc::new(BinaryArray::from_vec(vec![&[0, 0xff]])),
+            Arc::new(Int64Array::from(vec![0])),
+            dictionary("put"),
+            Arc::new(BinaryArray::from_vec(vec![&[0x7f, 0x80]])),
+            Arc::new(Int64Array::from(vec![None])),
+            dictionary("catalog"),
+            Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                arrow_buffer::OffsetBuffer::new(vec![0, 1].into()),
+                Arc::new(StringArray::from(vec!["unit"])), None,
+            )),
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>([Some([Some(3), Some(2)])])),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn catalog_actions_publish_exact_position_and_wake_a_separate_session() {
+    let running = Running::start(None, FlightConfig { owned_native_actions: true, ..Default::default() }).await;
+    let mut writer = Client::connect(&running.server, None).await;
+    let mut watcher = Client::connect(&running.server, None).await;
+    let request = watcher.request(arrow_flight::Empty {});
+    let actions: Vec<_> = watcher.client.list_actions(request).await.unwrap().into_inner().try_collect().await.unwrap();
+    assert!(actions.iter().any(|action| action.r#type == PUBLISH_CATALOG));
+    assert!(actions.iter().any(|action| action.r#type == WATCH_RELATION));
+
+    let watch = |after| CatalogWatch { relation: "bj_kv_log".into(), after }.encode_to_vec().into();
+    let initial = watcher.action(WATCH_RELATION, watch(None)).await.unwrap();
+    assert_eq!(initial[0].body.as_ref(), 0i64.to_be_bytes());
+    let awaiting = watcher.action(WATCH_RELATION, watch(Some(0)));
+    tokio::pin!(awaiting);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut awaiting).await.is_err());
+
+    writer.update("INSERT INTO unrelated (_id) VALUES (1)", None).await;
+    let marker = || CatalogStatement {
+        sql: "INSERT INTO bj_kv_log (_id) VALUES ('attempt')".into(), args: Bytes::new(),
+    };
+    let refusal = CatalogPublication {
+        before: ["ASSERT FALSE, 'first'", "ASSERT FALSE, 'second'"].into_iter()
+            .map(|sql| CatalogStatement { sql: sql.into(), args: Bytes::new() }).collect(),
+        rows: catalog_writes(), marker: Some(marker()),
+    };
+    let declined = writer.action(PUBLISH_CATALOG, refusal.encode_to_vec().into()).await.unwrap();
+    let declined = CatalogReceipt::decode(declined[0].body.clone()).unwrap();
+    assert!(!declined.committed);
+    assert_eq!(declined.error_code, "xtdb/assert-failed");
+    assert_eq!(declined.error_message, "first");
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut awaiting).await.is_err());
+
+    let publication = CatalogPublication {
+        before: vec![CatalogStatement {
+            sql: "ASSERT $1 = 'guard'".into(),
+            args: catalog_ipc(&["_0"], vec![Arc::new(StringArray::from(vec!["guard"]))]),
+        }],
+        rows: catalog_writes(), marker: Some(marker()),
+    };
+    let receipt = writer.action(PUBLISH_CATALOG, publication.encode_to_vec().into()).await.unwrap();
+    let receipt = CatalogReceipt::decode(receipt[0].body.clone()).unwrap();
+    assert!(receipt.committed, "{receipt:?}");
+    assert!(!receipt.await_token.is_empty());
+    assert!(receipt.tx_id > declined.tx_id && receipt.system_micros > declined.system_micros);
+    let change = tokio::time::timeout(Duration::from_secs(5), awaiting).await.unwrap().unwrap();
+    assert_eq!(change[0].body.as_ref(), 1i64.to_be_bytes());
+    let resumed = writer.action(WATCH_RELATION, watch(Some(0))).await.unwrap();
+    assert_eq!(resumed[0].body.as_ref(), 1i64.to_be_bytes());
+
+    let check = format!(
+        "SELECT _id FROM bj_kernel_writes WHERE key = '00ff' AND idx = 0 AND op = 'put'
+         AND label = 'catalog' AND 'unit' = ANY(units) AND number IS NULL
+         AND value = OVERLAY(OVERLAY(X'7f80' PLACING EPOCH_NANOS_BE(_system_from) FROM 3 FOR 0)
+                       PLACING EPOCH_NANOS_BE(_system_from) FROM 2 FOR 0)
+         AND EPOCH_NANOS_BE(_system_from) = EPOCH_NANOS_BE(TIMESTAMP WITH TIME ZONE '{}')",
+        chrono::DateTime::from_timestamp_micros(receipt.system_micros).unwrap().to_rfc3339(),
+    );
+    let rows = writer.query(&check).await;
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn catalog_actions_are_absent_when_owner_actions_are_disabled() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let request = client.request(arrow_flight::Empty {});
+    let actions: Vec<_> = client.client.list_actions(request).await.unwrap().into_inner().try_collect().await.unwrap();
+    for name in [PUBLISH_CATALOG, WATCH_RELATION] {
+        assert!(actions.iter().all(|action| action.r#type != name));
+        assert_eq!(client.action(name, Bytes::new()).await.unwrap_err().code(), tonic::Code::Unimplemented);
+    }
+    running.stop().await;
+}

@@ -152,6 +152,8 @@ impl Service {
                 return Ok(vec![Ok(self.spatial_held_owned_action(&call, &action.body, wire).await?)]);
             }
             match action_type {
+                crate::catalog_actions::PUBLISH_CATALOG => Ok(vec![Ok(Box::pin(self.publish_catalog_action(&call, action.body)).await?)]),
+                crate::catalog_actions::WATCH_RELATION => Ok(vec![Ok(Box::pin(self.watch_relation_action(&call, action.body)).await?)]),
                 crate::owned_actions::SEAL_HOSTED_RANGES_V1 => Ok(vec![Ok(self.seal_hosted_ranges_action(&call, &action.body).await?)]),
                 crate::owned_actions::VALIDATE_FRESH_HOSTED_V1 => Ok(vec![Ok(self.validate_fresh_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::DECIDE_HOSTED_V4 | crate::owned_actions::DECIDE_HOSTED_IMPORT_PAGE_V1 => {

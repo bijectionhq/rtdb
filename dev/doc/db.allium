@@ -2090,6 +2090,12 @@ deferred FoldIntoTermPosition
   -- Fold one record into this node's highest term read and its position within that term, and return the verdict: fenced, discarded, voided or admitted.
   -- See: log-processor-lifecycle.allium, Rules: fold a record into the term position
 
+-- An authorized relation watcher waits on the replication driver's applied progress and samples the committed event count for a public relation.
+-- Its version is the sum of the installed table catalog count and the corresponding live index count from one partition value.
+-- The watcher can resume at its last observed version, and a flush preserves that version as events move from live memory to a block.
+-- The version is a wakeup for a fresh relation read and can coalesce multiple applied changes.
+-- A bounded wait may return the same version so the client can renew its subscription.
+--
 ---- Open Questions
 
 open question "Which already-applied query bases remain available after an ingestion failure?"

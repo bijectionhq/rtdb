@@ -1116,3 +1116,23 @@ A hosted Root publication can include the all-valid `fact_public_root_versions/h
 The placed Root fork form with clock selector 11 takes a public marker's original transaction position and history coordinate. The writer authenticates it on the live hold and checks the exact marker again when ordering a retained pin or advance.
 
 `rtdb.owned.ReadHeldHostedControlAtPublication.v1` reads the program or application admission in the original prefix of an authenticated public Root publication. It adds position and history before the relation in the held control request.
+
+== Catalog publication and watches
+
+The normal owned listener advertises `rtdb.owned.PublishCatalog.v1` and `rtdb.owned.WatchRelation.v1` through ListActions.
+Both actions use the database of the authenticated Flight session.
+
+For publication, the protobuf body has repeated preceding SQL statements (field 1), the Arrow IPC stream (bytes field 2) and an optional trailing marker statement (field 3).
+Each statement carries its SQL text (string field 1) and optional one-row Arrow IPC arguments (bytes field 2), with fields named `_0`, `_1` and so on.
+The write stream has one batch with `_id` Utf8, `world` Int64, `key` Binary, `idx` Int64, `op` Dictionary(Int32, Utf8), `value` nullable Binary, `number` nullable Int64, `label` Dictionary(Int32, Utf8), `units` List(Utf8), and `stamp_offsets` List(Int32).
+One-based stamp offsets are in descending order, and the owner inserts the original ordered timestamp at those offsets.
+An empty write field submits the guards and optional marker alone.
+The owner keeps the installed SQL catalog layout, including its lowercase hex text key index.
+A single result carries transaction ID (int64 field 1), system time in Unix microseconds (int64 field 2), await token (string field 3), committed (bool field 4), error code (string field 5) and error message (string field 6).
+A settled refusal reports its own transaction position in the same result.
+
+For the watch, the protobuf body has a public relation name (string field 1) and an optional previous event count (int64 field 2).
+The reply is one big-endian signed 64-bit event count from the installed and live table history.
+An initial call returns the current count for a subsequent relation read.
+A call with a previous count waits until it differs or until 20 seconds elapse, at which point it returns the previous count.
+A changed count signals the client to read its relation at a fresh basis using its existing cursor.

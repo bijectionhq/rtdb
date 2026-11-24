@@ -91,6 +91,37 @@ impl Database {
         status.installed.map(|prefix| prefix.replica).ok_or_else(stopped)
     }
 
+    /// Waits for a changed event count in the relation's applied history.
+    pub async fn wait_for_relation_change(&self, table: &TableRef, after: Option<i64>, span: Duration) -> Result<i64> {
+        let mut status = self.watch_status();
+        let stopped = || Anomaly::new(AnomalyCategory::Unavailable, crate::NOT_HELD, format!("This node no longer applies {}", self.name));
+        let deadline = tokio::time::sleep(span);
+        tokio::pin!(deadline);
+        loop {
+            if status.borrow_and_update().role == Role::Stopped || self.cancellation.is_cancelled() {
+                return Err(stopped());
+            }
+            if let Some(error) = self.progress().fault() { return Err(error); }
+            let value = self.partition.value();
+            let applied = self.progress().current().tx_id();
+            // The live index can advance just before that transaction is published to waiters.
+            if value.live().latest_completed_tx().is_none_or(|key| key.tx_id <= applied) {
+                let block = value.table_catalog().metadata(table).map_or(0, |meta| meta.row_count);
+                let live = value.live().tables().get(table).map_or(0, |table| i64::from(table.row_count()));
+                let count = block.checked_add(live).ok_or_else(|| Anomaly::fault("rtdb.node/relation-event-count", "Relation event count overflow"))?;
+                if Some(count) != after { return Ok(count); }
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => return Err(stopped()),
+                _ = &mut deadline => return after.ok_or_else(|| Anomaly::new(
+                    AnomalyCategory::Unavailable, "rtdb.node/relation-watch-not-ready", "Relation application is still in progress",
+                )),
+                updated = status.changed() => updated.map_err(|_| stopped())?,
+            }
+        }
+    }
+
     pub(crate) fn replica_read_deployment(&self) -> Option<uuid::Uuid> {
         self.replica_read_index.as_ref()?.deployment()
     }
