@@ -112,6 +112,9 @@ surface StatelessDatabase {
     @guarantee PhysicalErasure
         -- A route that supports physical erasure advertises erasure.
         -- An applied erase removes row values from the clean checkpoint and orders retirement of the preceding journal and checkpoint generation.
+        -- Default requires evidence for the source prefix, replica prefix and every prior recovery dependency.
+        -- The clean native recovery cut binds the applied source position, its replica boundary and the exact uploaded block digest.
+        -- The selected native checkpoint authenticates under the successor generation and retains the pending receipt at the erased basis.
         -- The receipt carries the unreadable-by deadline after the key authority has durably armed it.
         -- Replayed erase receipts preserve that deadline after trim.
         -- Previously opened query and change streams verify their selected generation at each frame handoff.
