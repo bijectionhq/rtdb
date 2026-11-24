@@ -24,6 +24,7 @@ surface StatelessDatabase {
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
         -- A basis orders cuts within the selected database incarnation.
+        -- The temporal read driver supplies a system-time boundary as the basis position.
         -- Exactly selects its named cut.
         -- AtLeast returns a cut at or beyond its requested basis.
         -- AsOf applies a system-time ceiling to the selected cut.
@@ -42,6 +43,7 @@ surface StatelessDatabase {
     @guarantee QueryClaim
         -- A tracked query returns authenticated evidence naming its basis and an affected region that covers the query's dependencies.
         -- The region may cover the entire database.
+        -- The serving process issues claims with its attachment's current authority.
 
     @guarantee ChangesCoverage
         -- Changes reports its covered interval even when there are no changes for the selected tables.

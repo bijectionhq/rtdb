@@ -17,7 +17,7 @@ use crate::{
     wire,
 };
 
-use super::{MAX_CHANGE_GROUPS, MAX_WAIT, error, head, proto, tokens::cursor_expired, trailer};
+use super::{MAX_CHANGE_GROUPS, MAX_WAIT, error, head, proto, tokens::{self, cursor_expired}, trailer};
 
 struct Request {
     tables: BTreeSet<TableRef>,
@@ -65,11 +65,7 @@ impl Service {
         if descending {
             entries.reverse();
         }
-        let through = self
-            .0
-            .v1
-            .tokens
-            .basis(database.wire_incarnation(), page.through);
+        let through = tokens::basis(database.wire_incarnation(), page.through).into();
         let service = self.clone();
         let schema = schema();
         let first = page.readers[0]
@@ -112,7 +108,6 @@ impl Service {
             .wire_database(call, &request.branch, proto::Layer::Merged)
             .await?;
         let scope = database.wire_incarnation();
-        let tokens = &self.0.v1.tokens;
         let tables = request
             .tables
             .iter()
@@ -128,11 +123,7 @@ impl Service {
                 "Changes requires one to sixteen distinct tables",
             ));
         }
-        let read_basis = |basis| {
-            tokens
-                .read_basis(scope, basis)
-                .map_err(|_| cursor_expired())
-        };
+        let read_basis = |basis| tokens::read_basis(scope, basis).map_err(|_| cursor_expired());
         let after = request
             .after
             .as_ref()

@@ -19,7 +19,7 @@ use crate::{
 use super::{
     MAX_PAGE_ROWS, MAX_WAIT, error, head,
     proto::{self, at::Selection},
-    tokens::{Continuation, cursor_expired},
+    tokens::{self, Continuation, cursor_expired},
     trailer,
 };
 
@@ -195,7 +195,7 @@ impl Service {
         if continuation.is_none()
             && let Some(Selection::AtLeast(basis)) = selection
         {
-            let minimum = tokens.read_basis(scope, basis)?;
+            let minimum = tokens::read_basis(scope, basis)?;
             if minimum != Timestamp::MIN {
                 self.0
                     .node
@@ -227,7 +227,7 @@ impl Service {
                         (present.min(Timestamp(*time)), Timestamp(*time))
                     }
                     Some(Selection::Exactly(basis)) => {
-                        let cut = tokens.read_basis(scope, basis)?;
+                        let cut = tokens::read_basis(scope, basis)?;
                         (cut, cut)
                     }
                     _ => (present, now),
@@ -262,10 +262,11 @@ impl Service {
             .plans
             .prepare(scope, &request.sql, &context, types)?;
         let cursor = open_query(prepared, context, parameters.as_ref()).await?;
+        let basis = tokens::basis(scope, page.cut);
         let reply = proto::QueryTrailer {
-            basis: Some(tokens.basis(scope, page.cut)),
+            basis: Some(basis.into()),
             system_time_micros: page.cut.0,
-            claim: request.track.then(|| tokens.claim(scope, page.cut)),
+            claim: request.track.then(|| tokens.claim(basis)).transpose()?,
             next: None,
         };
         Ok((cursor, database, page, limit, reply))

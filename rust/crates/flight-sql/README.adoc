@@ -1177,7 +1177,9 @@ Use a deterministic total `ORDER BY` for queries whose results span pages and re
 The request's basis and query clock are fixed across its pages.
 Tracking returns an authenticated claim covering the database at the reported basis.
 The current implementation accepts `main` with the merged layer.
-Query and Changes tokens are valid for the lifetime of the serving attachment and process.
+Query and Changes tokens are scoped to the serving attachment and process.
+The temporal read driver encodes system-time boundaries as positions in the shared basis format.
+Claims use the shared claim format with the process's sealing authority.
 
 `RTDB_SEARCH(table, column, query)` returns matching rows with `_score` in descending score order.
 `RTDB_NEAREST(table, column, vector, limit)` returns the nearest vectors with `_distance` in ascending cosine-distance order.

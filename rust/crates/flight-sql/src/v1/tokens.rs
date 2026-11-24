@@ -1,5 +1,8 @@
 use hmac::{Hmac, Mac};
-use rtdb_types::Timestamp;
+use rtdb_types::{
+    Timestamp,
+    rtdb_v1::{Basis, ClaimScope, ClaimSealer, Layer, MAIN_BRANCH},
+};
 use sha2::Sha256;
 use tonic::Status;
 use uuid::Uuid;
@@ -46,29 +49,23 @@ impl Tokens {
         body.try_into().ok()
     }
 
-    pub fn basis(&self, scope: Uuid, cut: Timestamp) -> proto::Basis {
-        let body = ((cut.0 as u64) ^ (1 << 63)).to_be_bytes();
-        proto::Basis {
-            value: self.seal(scope, b"basis", body.to_vec()),
-        }
+    fn claim_sealer(&self, incarnation: [u8; 16]) -> ClaimSealer {
+        let key = self.mac(Uuid::from_bytes(incarnation), b"claim-key", &[])
+            .finalize()
+            .into_bytes();
+        ClaimSealer::new(incarnation, key.into())
     }
 
-    pub fn read_basis(&self, scope: Uuid, basis: &proto::Basis) -> Result<Timestamp, Status> {
-        let body = self.open(scope, b"basis", &basis.value).ok_or_else(|| {
-            error::not_found(
-                "rtdb/unknown-basis",
-                "Basis is unknown in this database incarnation",
-            )
-        })?;
-        Ok(Timestamp((u64::from_be_bytes(body) ^ (1 << 63)) as i64))
-    }
-
-    pub fn claim(&self, scope: Uuid, cut: Timestamp) -> proto::Claim {
-        let mut body = cut.0.to_be_bytes().to_vec();
-        body.extend_from_slice(b"main\0database");
-        proto::Claim {
-            value: self.seal(scope, b"claim", body),
-        }
+    pub fn claim(&self, basis: Basis) -> Result<proto::Claim, Status> {
+        let value = self.claim_sealer(basis.incarnation())
+            .seal(&ClaimScope {
+                branch: MAIN_BRANCH.into(),
+                basis,
+                layer: Layer::Merged,
+            })
+            .map_err(error::anomaly)?
+            .into_bytes();
+        Ok(proto::Claim { value })
     }
 
     pub fn continuation(&self, scope: Uuid, page: &Continuation) -> Vec<u8> {
@@ -97,6 +94,63 @@ impl Tokens {
     }
 }
 
+// The temporal read driver names a system-time boundary, including between transactions.
+const TIMESTAMP_SIGN: u64 = 1 << 63;
+
+pub(super) fn basis(scope: Uuid, cut: Timestamp) -> Basis {
+    Basis::new(*scope.as_bytes(), (cut.0 as u64) ^ TIMESTAMP_SIGN)
+}
+
+impl From<Basis> for proto::Basis {
+    fn from(basis: Basis) -> Self {
+        Self { value: basis.to_bytes().to_vec() }
+    }
+}
+
+pub(super) fn read_basis(scope: Uuid, basis: &proto::Basis) -> Result<Timestamp, Status> {
+    let basis = Basis::from_bytes(&basis.value).map_err(error::anomaly)?;
+    if basis.incarnation() != *scope.as_bytes() {
+        return Err(error::not_found(
+            "rtdb/unknown-basis",
+            "Basis is unknown in this database incarnation",
+        ));
+    }
+    Ok(Timestamp((basis.position() ^ TIMESTAMP_SIGN) as i64))
+}
+
 pub(super) fn cursor_expired() -> Status {
     error::not_found("rtdb/cursor-expired", "Resume from a fresh query")
+}
+
+#[cfg(test)]
+mod tests {
+    use rtdb_types::rtdb_v1::Claim;
+
+    use super::*;
+
+    #[test]
+    fn wire_basis_and_claim_use_the_shared_codec() {
+        let scope = Uuid::from_u128(1);
+        let early = basis(scope, Timestamp(-1));
+        let cut = basis(scope, Timestamp(1));
+        let wire: proto::Basis = cut.into();
+        assert_eq!(Basis::from_bytes(&wire.value).unwrap(), cut);
+        assert!(early.to_bytes() < cut.to_bytes());
+        assert_eq!(read_basis(scope, &wire).unwrap(), Timestamp(1));
+        assert_eq!(
+            read_basis(Uuid::from_u128(2), &wire).unwrap_err().code(),
+            tonic::Code::NotFound,
+        );
+
+        let tokens = Tokens(Zeroizing::new([7; 32]));
+        let claim = Claim::from_bytes(tokens.claim(cut).unwrap().value);
+        assert_eq!(
+            tokens.claim_sealer(*scope.as_bytes()).open(&claim).unwrap(),
+            ClaimScope {
+                branch: MAIN_BRANCH.into(),
+                basis: cut,
+                layer: Layer::Merged,
+            },
+        );
+    }
 }

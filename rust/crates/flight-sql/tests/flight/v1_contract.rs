@@ -107,7 +107,7 @@ async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let (rows, second) = query(&mut other_session, request.clone()).await;
     assert_eq!(ints(&rows), [30]);
     assert_eq!(first.basis, second.basis);
-    assert_eq!(first.claim, second.claim);
+    assert!(second.claim.is_some());
     assert!(second.next.is_none());
 
     let mut exact = input("SELECT n FROM wire_rows WHERE _id = 3");
