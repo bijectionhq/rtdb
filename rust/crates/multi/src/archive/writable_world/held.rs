@@ -29,6 +29,24 @@ pub(crate) struct WorldArchive {
 
 #[async_trait::async_trait]
 impl rtdb_node::WorldConstraintArchive for WorldArchive {
+    async fn require_root_landing_derivative(
+        &self, derivative: rtdb_tx::PreparedFamilyDerivative<'_>,
+    ) -> Result<()> {
+        let unavailable = OwnedWorld::unavailable;
+        let installed = self.directory.deployment_by_name(derivative.database).await?.ok_or_else(unavailable)?;
+        let deployment = Uuid::parse_str(&installed.id).map_err(|_| unavailable())?;
+        if PlacedAttemptScope::new(&installed.stream("replica"), installed.epoch)? != derivative.placement
+            || installed.writer_pool().is_none()
+        {
+            return Err(unavailable());
+        }
+        let family = crate::keys::family_vault_address(deployment, Uuid::from_bytes(derivative.selector.family));
+        let families = self.keys.assertion_families(rtdb_storage::IoRegion::new()).ok_or_else(unavailable)?;
+        families.require_reserved_root_derivative(
+            family, derivative.selector.member, derivative.relation, derivative.key.as_bytes(),
+        ).await
+    }
+
     async fn claim_assertion_family_fence(&self, claim: rtdb_node::AssertionFenceClaim<'_>) -> Result<()> {
         let unavailable = OwnedWorld::unavailable;
         let installed = self.directory.deployment_by_name(claim.database).await?.ok_or_else(unavailable)?;

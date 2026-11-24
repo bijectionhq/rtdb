@@ -143,7 +143,15 @@ impl Scope {
         })
     }
 
-    fn derived(&self, row: FamilyDerivedRow) -> Result<DerivedRow> {
+    fn derived(&self, family: Uuid, row: FamilyDerivedRow) -> Result<DerivedRow> {
+        if row.world.is_none() {
+            let selector = std::str::from_utf8(&row.key).ok()
+                .and_then(|key| rtdb_types::RootFamilyDerivativeId::parse(key).ok().flatten())
+                .ok_or_else(|| scope_mismatch("Root derivatives require a reserved landing selector"))?;
+            if selector.family != *family.as_bytes() || selector.member != row.member {
+                return Err(scope_mismatch("Root derivative selector differs from its family member"));
+            }
+        }
         Ok(DerivedRow {
             member: row.member, world: row.world, relation: row.relation, key: row.key,
             capability: row.capability.map(|stage| self.stage(stage)).transpose()?,
@@ -259,7 +267,7 @@ pub(super) async fn serve(
             FamilyReply::Done
         }
         FamilyRequest::RegisterDerived { family, rows } => {
-            let rows = rows.into_iter().map(|row| scope.derived(row)).collect::<Result<Vec<_>>>()?;
+            let rows = rows.into_iter().map(|row| scope.derived(family, row)).collect::<Result<Vec<_>>>()?;
             families.register_derived(scope.family(family), &rows).await?;
             FamilyReply::Done
         }

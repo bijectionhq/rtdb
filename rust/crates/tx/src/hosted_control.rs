@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 mod direct_plan;
 
 use rtdb_types::{
-    Anomaly, EntityId, Interval, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope, Result, StructFields, TableRef,
-    TimeUnit, Timestamp, Value,
+    Anomaly, EntityId, Interval, OwnedPointVersion, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope,
+    Result, RootFamilyDerivativeId, StructFields, TableRef, TimeUnit, Timestamp, Value,
 };
 
 mod replay_worlds;
@@ -1524,6 +1524,79 @@ mod retained_release_tests {
     }
 
     #[test]
+    fn indexed_private_landing_ties_root_selector_to_one_ordered_world_winner() -> Result<()> {
+        let scope = PlacedAttemptScope::new("indexed-proposal-landing", 1)?;
+        let world = Iid([1; 16]);
+        let pin = Iid([2; 16]);
+        let admission = OwnedRelation::new("bj_fact_root_admission")?;
+        let fences = OwnedRelation::new(rtdb_types::ASSERTION_FAMILY_FENCES)?;
+        let carrier = OwnedRelation::new("fact_unit_column_payloads")?;
+        let journal = OwnedRelation::new("fact_row")?;
+        let search = OwnedRelation::new("fact_row_search")?;
+        let local_search = search.in_world(world)?;
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let row = |id: &str| StructFields::from([("_id".into(), Value::Utf8(id.into()))]);
+        let control = |slot: &str, expected| {
+            HostedControlWrite::new(admission.clone(), scope, expected, row(slot)).map(TxOp::HostedControl)
+        };
+        let mut ops = vec![
+            TxOp::HostedControl(HostedControlWrite::check(admission.clone(), scope, Some(Timestamp(1)), row("installed"))?),
+            TxOp::HostedControl(HostedControlWrite::check(fences, scope, None, row(&"01".repeat(16)))?),
+            control(&format!("root_proposal_head:{}", "a".repeat(64)), Some(Timestamp(2)))?,
+            control(&format!("root_proposal_private_landing:{}", "b".repeat(64)), None)?,
+            control(&format!("root_proposal_private_landing_proof:{}", "c".repeat(64)), None)?,
+        ];
+        let mut root = row("row/0102");
+        let mut body = b"BJRL1".to_vec();
+        body.extend([1; 16]);
+        body.extend([2; 40]);
+        body.extend([3; 32]);
+        root.insert("sealed_payload".into(), Value::Binary(body));
+        let selector = format!("bjrl1/{}/{}/0102", "01".repeat(16), "03".repeat(32));
+        let source = rtdb_types::OwnedPointVersion {
+            history: Timestamp(3),
+            position: rtdb_types::EventPosition { transaction: rtdb_types::TxId(2), ordinal: 1 },
+        };
+        for (relation, source_id, target_id, document) in [
+            (&carrier, "row/0102", "row/0102", root),
+            (&journal, "row-position/row/0102", "row-position/row/0102", row("row-position/row/0102")),
+            (&search, "0102", selector.as_str(), row(&selector)),
+        ] {
+            let local = relation.in_world(world)?;
+            ops.extend([
+                TxOp::OwnedCheck { relation: relation.clone(), id: EntityId::String(target_id.into()),
+                    valid_at: Timestamp(4), expected: None },
+                TxOp::OwnedInsertDocs { relation: relation.clone(), documents: crate::Documents::new(vec![document], &memory)?,
+                    valid_from: None, valid_to: None },
+                TxOp::OwnedCheckWorldPurge { relation: local.clone(), pin, frontier: 0, local_frontier: None },
+                TxOp::OwnedCheck { relation: local, id: EntityId::String(source_id.into()),
+                    valid_at: Timestamp(3), expected: Some(source) },
+            ]);
+        }
+        ops.extend([
+            TxOp::OwnedCheck { relation: search, id: EntityId::String("0102".into()),
+                valid_at: Timestamp(4), expected: None },
+            TxOp::OwnedPublishWorld {
+                world, parent_pin: pin, attempt: "0000000000000000000000".into(), fingerprint: [1; 32],
+                expected: Some(Timestamp(3)), advance_to: None, drop_world: true,
+                settlement_pin: None, delete_root: None, land_root: Some(pin),
+            },
+        ]);
+        let mut operations = ops.into_iter().map(Operation::Public).collect::<Vec<_>>();
+        assert_eq!(hosted_proposal_land(&operations), Some(HostedProposalLanding {
+            world, pin, effect: ProposalLandingEffect::WithPoints,
+        }));
+        let unrelated = operations.iter_mut().find_map(|op| match op {
+            Operation::Public(TxOp::OwnedCheck { relation, expected: Some(expected), .. })
+                if *relation == local_search => Some(expected),
+            _ => None,
+        }).unwrap();
+        unrelated.position.transaction = rtdb_types::TxId(1);
+        assert_eq!(hosted_proposal_land(&operations), None);
+        Ok(())
+    }
+
+    #[test]
     fn landing_orders_task_intents_with_their_dispatch_reservation() -> Result<()> {
         let scope = PlacedAttemptScope::new("proposal-landing-tasks", 1)?;
         let admission = OwnedRelation::new("bj_fact_root_admission")?;
@@ -1908,8 +1981,15 @@ impl<'a> OwnedDocumentRow<'a> {
     fn only_id(&self) -> bool {
         match self {
             Self::Values(row) => row.len() == 1,
+            Self::Arrow(..) => self.only_columns(&["_id"]),
+        }
+    }
+
+    fn only_columns(&self, names: &[&str]) -> bool {
+        match self {
+            Self::Values(row) => row.iter().all(|(name, _)| names.contains(&name.as_str())),
             Self::Arrow(page, _) => page.columns().iter().all(|name| {
-                name == "_id" || matches!(self.cell(name), Ok(None))
+                names.contains(&name.as_str()) || matches!(self.cell(name), Ok(None))
             }),
         }
     }
@@ -2275,6 +2355,58 @@ struct ProposalLandingKey<'a> {
     create_only: bool,
 }
 
+const ROOT_ROW_CARRIER: &str = "fact_unit_column_payloads";
+const ROOT_SEARCH_UNITS: &str = "fact_sealed_search_units";
+
+fn unique_landing_point<T>(mut points: impl Iterator<Item = T>) -> Option<T> {
+    let point = points.next()?;
+    points.next().is_none().then_some(point)
+}
+
+fn landing_local_point(
+    operations: &[crate::source::Operation], world: rtdb_types::Iid, pin: rtdb_types::Iid,
+    relation: &OwnedRelation, id: &EntityId,
+) -> Option<(Timestamp, OwnedPointVersion)> {
+    use crate::{TxOp, source::Operation};
+    let local = relation.in_world(world).ok()?;
+    unique_landing_point(operations.windows(2).filter_map(|pair| match pair {
+        [
+            Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
+            Operation::Public(TxOp::OwnedCheck { relation, id: observed, valid_at, expected: Some(revision) }),
+        ] if guarded == &local && relation == &local && observed == id && *original == pin =>
+            Some((*valid_at, *revision)),
+        _ => None,
+    }))
+}
+
+fn landing_root_absence(
+    operations: &[crate::source::Operation], relation: &OwnedRelation, id: &EntityId,
+) -> Option<Timestamp> {
+    use crate::{TxOp, source::Operation};
+    unique_landing_point(operations.iter().filter_map(|op| match op {
+        Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: None })
+            if checked == relation && observed == id => Some(*valid_at),
+        _ => None,
+    }))
+}
+
+fn root_search_unit_relation<'a>(row: &OwnedDocumentRow<'a>) -> Option<&'a str> {
+    let invalid = || Anomaly::incorrect("rtdb.owned/proposal-landing", "Invalid sealed search unit relation");
+    let id = row.string_id()?;
+    let (alias, relation) = id.split_once('/')?;
+    let unit = <&[u8; 32]>::try_from(row.binary("unit", invalid).ok()??).ok()?;
+    let body = row.binary("relation", invalid).ok()??;
+    if alias.len() != 64 || !alias.bytes().zip(unit.iter().flat_map(|byte| {
+        let hex = b"0123456789abcdef";
+        [hex[(byte >> 4) as usize], hex[(byte & 15) as usize]]
+    })).all(|(actual, expected)| actual == expected)
+        || relation.as_bytes() != body || !row.only_columns(&["_id", "unit", "relation"])
+    {
+        return None;
+    }
+    Some(relation)
+}
+
 /// One exact Proposal terminal effect and its matching witnessed Root writes.
 pub(crate) fn hosted_proposal_land(
     operations: &[crate::source::Operation],
@@ -2395,16 +2527,25 @@ pub(crate) fn hosted_proposal_land(
         return None;
     }
     let mut landing_families = std::collections::BTreeSet::new();
+    let mut root_members = std::collections::BTreeMap::new();
+    let mut destinations = std::collections::BTreeSet::new();
     for op in operations {
         let Some(write) = owned_document_write(op) else { continue; };
-        if write.relation.is_root_data() && write.relation.name() == "fact_unit_column_payloads" {
+        if write.relation.is_root_data() && write.relation.name() == ROOT_ROW_CARRIER {
             if !protected { return None; }
             for row in write.documents.rows() {
+                let carrier_id = row.string_id()?;
                 let carrier = row.binary("sealed_payload", || Anomaly::incorrect(
                     "rtdb.owned/proposal-landing", "Invalid protected landing carrier",
                 )).ok()??;
-                let (family, _) = carrier.strip_prefix(b"BJRL1")?.split_first_chunk::<16>()?;
-                if *family == [0; 16] { return None; }
+                let (family, body) = carrier.strip_prefix(b"BJRL1")?.split_first_chunk::<16>()?;
+                let (_, body) = body.split_first_chunk::<40>()?;
+                let (member, _) = body.split_first_chunk::<32>()?;
+                if *family == [0; 16] || *member == [0; 32] || !destinations.insert((*family, *member))
+                    || root_members.insert(carrier_id, (*family, *member)).is_some()
+                {
+                    return None;
+                }
                 landing_families.insert(*family);
             }
         }
@@ -2431,10 +2572,26 @@ pub(crate) fn hosted_proposal_land(
     {
         return None;
     }
-    for ProposalLandingKey { relation, id, extents, create_only } in writes.into_values() {
+    let mut derived_relations = std::collections::BTreeSet::new();
+    let mut derived_addresses = std::collections::BTreeSet::new();
+    let mut unit_slots = std::collections::BTreeMap::new();
+    if protected {
+        for write in operations.iter().filter_map(owned_document_write) {
+            if write.relation.is_root_data() && write.relation.name() == ROOT_SEARCH_UNITS {
+                if !write.create_only || write.from.is_some() || write.to.is_some() { return None; }
+                for row in write.documents.rows() {
+                    let relation = root_search_unit_relation(&row)?;
+                    if unit_slots.insert(row.string_id()?, relation).is_some() { return None; }
+                }
+            }
+        }
+    }
+    let carrier_relation = OwnedRelation::new(ROOT_ROW_CARRIER).ok()?;
+    for ProposalLandingKey { relation, id, extents, create_only } in writes.values() {
+        let create_only = *create_only;
         let root_checked = extents.iter().all(|extent| operations.iter().any(|op| matches!(op,
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected })
-                if checked == relation && observed == &id
+                if checked == *relation && observed == id
                     && extent.map_or_else(|| expected.is_none() == create_only, |extent| extent.lower() == *valid_at)
         )));
         if close {
@@ -2446,11 +2603,57 @@ pub(crate) fn hosted_proposal_land(
                     world, pin, effect: ProposalLandingEffect::Close,
                 });
         }
+        if protected && relation.name() == ROOT_SEARCH_UNITS {
+            let EntityId::String(slot) = id else { return None; };
+            if !root_checked || !unit_slots.contains_key(slot.as_str()) { return None; }
+            continue;
+        }
+        if relation.name().ends_with("_search")
+            && (protected || matches!(id, EntityId::String(key) if key.starts_with(RootFamilyDerivativeId::PREFIX)))
+        {
+            let EntityId::String(physical) = id else { return None; };
+            let selector = RootFamilyDerivativeId::parse(physical).ok()??;
+            if !protected || !root_checked || !create_only || extents.as_slice() != [None]
+                || !derived_addresses.insert(selector.address)
+            {
+                return None;
+            }
+            let carrier = format!("row/{}", selector.address);
+            if root_members.get(carrier.as_str()).copied() != Some((selector.family, selector.member.to_bytes())) {
+                return None;
+            }
+            let raw = EntityId::String(selector.address.to_owned());
+            let position = EntityId::String(format!("row-position/{carrier}"));
+            let carrier = EntityId::String(carrier);
+            let journal = OwnedRelation::new(relation.name().strip_suffix("_search")?).ok()?;
+            for (reln, key) in [(&carrier_relation, &carrier), (&journal, &position)] {
+                let matching = writes.get(&(reln.name(), key.handle_bytes()))?;
+                if !matching.create_only || matching.extents.as_slice() != [None] { return None; }
+            }
+            let hold = landing_root_absence(operations, relation, id)?;
+            if landing_root_absence(operations, relation, &raw) != Some(hold)
+                || landing_root_absence(operations, &carrier_relation, &carrier) != Some(hold)
+                || landing_root_absence(operations, &journal, &position) != Some(hold)
+            {
+                return None;
+            }
+            let (valid, source) = landing_local_point(operations, world, pin, relation, &raw)?;
+            for (reln, key) in [(&carrier_relation, &carrier), (&journal, &position)] {
+                let (at, witness) = landing_local_point(operations, world, pin, reln, key)?;
+                if at != valid || witness.history != source.history
+                    || witness.position.transaction != source.position.transaction
+                {
+                    return None;
+                }
+            }
+            derived_relations.insert(relation.name());
+            continue;
+        }
         let local = relation.in_world(world).ok()?;
         let local_checked = extents.iter().all(|extent| operations.windows(2).any(|pair| matches!(pair, [
             Operation::Public(TxOp::OwnedCheckWorldPurge { relation: guarded, pin: original, .. }),
             Operation::Public(TxOp::OwnedCheck { relation: checked, id: observed, valid_at, expected: Some(revision) })
-        ] if guarded == &local && checked == &local && observed == &id && *original == pin
+        ] if guarded == &local && checked == &local && observed == id && *original == pin
             && extent.is_none_or(|extent| {
                 extent.lower() == *valid_at && expected_clock.is_some_and(|tip| revision.history <= tip)
             }))));
@@ -2459,9 +2662,9 @@ pub(crate) fn hosted_proposal_land(
                 let Operation::Public(TxOp::OwnedCheckRange { relation: checked, region, .. }) = op else {
                     return false;
                 };
-                checked == relation && match region.as_deref() {
+                checked == *relation && match region.as_deref() {
                     None => true,
-                    Some(OwnedRangeEvidence::Entity { region, .. }) => region.id == id
+                    Some(OwnedRangeEvidence::Entity { region, .. }) => &region.id == id
                         && region.valid.lower() <= extent.lower() && extent.upper() <= region.valid.upper(),
                     Some(OwnedRangeEvidence::FixedPath(_)) => false,
                 }
@@ -2473,6 +2676,9 @@ pub(crate) fn hosted_proposal_land(
             if !root_window || !local_window { return None; }
         }
         if !root_checked || !local_checked { return None; }
+    }
+    if unit_slots.values().any(|relation| !derived_relations.contains(relation)) {
+        return None;
     }
     (expected_clock.is_some() && proposal_land_controls(controls)).then_some(HostedProposalLanding {
         world,

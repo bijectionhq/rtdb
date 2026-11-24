@@ -155,7 +155,10 @@ Records the derived search rows of a member in the family inventory.
 The member must be the original's assertion or a reserved landing's destination.
 A world entry must carry a capability, which the registration enrolls; that capability then seals exactly that derived row.
 A Root entry carries no capability, because Root derived relations are sealed under the broker-owned R6 slots of their relation.
-Root entries are deduplicated by relation and key.
+A Root entry names a reserved landing destination and uses the physical selector `bjrl1/<family hex>/<destination assertion hex>/<AddressRef>`.
+All hex is lowercase, including the canonical AddressRef. The full selector fits the 512-byte key bound.
+RTDB checks the selector's family and member against the request. Root entries are deduplicated by relation and physical selector.
+A refused or interrupted reservation may retain its inventory entry. Its selector is disjoint from every ordinary Root projection at that address.
 A world slot can enrol multiple fresh stages for the same member across rewrites.
 An exact retry succeeds and conflicting reuse of a stage or slot is refused.
 A family holds at most 2048 derived entries; the next registration is refused with `rtdb.multi/assertion-family-size`.
@@ -408,6 +411,13 @@ From the fence commit:
 * a dependent hosted fork never opens the family at all, since its deployment identity addresses a different vault record and its capabilities name another deployment.
 
 Root derived rows carry no family capability.
+For an indexed first publication the same private prepared switch creates the Root carrier, row journal and physical projection.
+It checks their exact absence, the absence of an ordinary projection at that AddressRef, and the absence of the ordered family fence.
+The Proposal's raw-address projection, row carrier and protected journal must be witnessed at the same valid instant and ordered source transaction under the original pin.
+The search relation must be the exact journal relation with `_search` appended.
+The original placed vault authenticates the projection's exact reservation and inventory entry before generation staging.
+The switch may also create missing, exactly checked search-relation aliases used by the existing label-unit erasure path.
+Those aliases must name the co-ordered derived relation.
 The fence inventory lists them, and the client's ordered erasure commit erases every listed Root row in the same commit as the protected row's erasure.
 That Root erasure follows R7: the replay broker projects the erase selectors through the authenticated fork bases of every dependent root.
 

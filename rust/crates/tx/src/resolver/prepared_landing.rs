@@ -91,6 +91,18 @@ impl SourceTransaction {
         let mut tx = OpenTransaction::new(base.clone(), key, &self.options, context)?;
         tx.terms_time = time;
         tx.check_owned_preconditions(primary, Some(scope), true).await?;
+        for write in primary.iter().filter_map(crate::hosted_control::owned_document_write) {
+            if !write.relation.is_root_data() || !write.relation.name().ends_with("_search") { continue; }
+            for row in write.documents.rows() {
+                let Some(key) = row.string_id() else { continue; };
+                let Some(selector) = rtdb_types::RootFamilyDerivativeId::parse(key).map_err(|_| invalid())?
+                    else { continue; };
+                let original = context.world_constraints.as_ref().ok_or_else(OwnedWorld::unavailable)?;
+                original.require_root_landing_derivative(PreparedFamilyDerivative {
+                    database: &context.database, placement: scope, selector, relation: write.relation.name(), key,
+                }).await?;
+            }
+        }
         for operation in primary {
             context.check_cancelled()?;
             validate_document_operation(operation, self.options.user.as_deref())?;

@@ -16,10 +16,24 @@ use super::{
 pub trait WorldConstraintArchive: Send + Sync {
     async fn check(&self, check: ArchivedWorldConstraints<'_>) -> Result<()>;
 
+    async fn require_root_landing_derivative(
+        &self, _derivative: PreparedFamilyDerivative<'_>,
+    ) -> Result<()> {
+        Err(OwnedWorld::unavailable())
+    }
+
     async fn claim_assertion_family_fence(&self, _claim: AssertionFenceClaim<'_>) -> Result<()> {
         Err(Anomaly::unsupported("rtdb.owned/assertion-family-fence-unavailable",
             "The original assertion authority does not admit ordered family fences"))
     }
+}
+
+pub struct PreparedFamilyDerivative<'a> {
+    pub database: &'a str,
+    pub placement: PlacedAttemptScope,
+    pub selector: rtdb_types::RootFamilyDerivativeId<'a>,
+    pub relation: &'a str,
+    pub key: &'a str,
 }
 
 pub struct AssertionFenceClaim<'a> {
