@@ -11,7 +11,7 @@ use crate::{BlockStore, NativeServingAuthority};
 
 use super::{ErasureRetirement, MAX_CONTROL_BYTES, invalid, unsupported};
 
-const COMPLETED_FRAME: u8 = 8;
+const COMPLETED_FRAME: u8 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DefaultErasureReadCut {
