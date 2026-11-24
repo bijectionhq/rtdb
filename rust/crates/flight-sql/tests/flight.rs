@@ -1121,7 +1121,7 @@ async fn owned_v2_layout_reads_both_legs_after_redeclaration() {
 
 #[tokio::test]
 async fn owned_v2_layout_keeps_wrapped_null_distinct_from_an_omitted_field() {
-    use arrow_array::{Array, ArrayRef, BinaryArray, NullArray, StructArray};
+    use arrow_array::{Array, ArrayRef, BinaryArray, Float64Array, NullArray, StructArray, UnionArray};
     use arrow_ipc::writer::IpcWriteOptions;
     use rtdb_format::ipc::write_arrow_stream;
     use rtdb_types::Value;
@@ -1143,25 +1143,42 @@ async fn owned_v2_layout_keeps_wrapped_null_distinct_from_an_omitted_field() {
     let wrapped = |values: ArrayRef| Arc::new(StructArray::from(vec![
         (Arc::new(Field::new("v2_value", values.data_type().clone(), true)), values),
     ])) as ArrayRef;
+    let mixed = UnionArray::try_new(
+        arrow_schema::UnionFields::try_new([0, 1, 2], [
+            Field::new("null", DataType::Null, true),
+            Field::new("i64", DataType::Int64, false),
+            Field::new("f64", DataType::Float64, false),
+        ]).unwrap(),
+        vec![2_i8].into(), Some(vec![0_i32].into()),
+        vec![Arc::new(NullArray::new(0)), Arc::new(Int64Array::from(Vec::<i64>::new())), Arc::new(Float64Array::from(vec![-0.0]))],
+    ).unwrap();
     for (id, payload) in [
         (1, Some(Arc::new(BinaryArray::from_iter_values([b"legacy"])) as ArrayRef)),
         (2, Some(wrapped(Arc::new(Int64Array::from(vec![11]))))),
-        (3, Some(wrapped(Arc::new(NullArray::new(1))))),
+        (3, Some(Arc::new(BinaryArray::from_iter_values([[2_u8]])) as ArrayRef)),
         (4, None),
+        (5, Some(wrapped(Arc::new(mixed)))),
     ] {
         client.action("rtdb.owned.Create.v1", request(id, payload)).await.unwrap();
     }
     for (id, expected) in [
         (1, Value::Binary(b"legacy".to_vec())),
         (2, Value::Struct(rtdb_types::StructFields::from([("v2_value".into(), Value::I64(11))]))),
-        (3, Value::Struct(rtdb_types::StructFields::from([("v2_value".into(), Value::Null)]))),
+        (3, Value::Binary(vec![2])),
         (4, Value::Null),
+        (5, Value::Struct(rtdb_types::StructFields::from([("v2_value".into(), Value::F64(-0.0))]))),
     ] {
         let output = client.action("rtdb.owned.ReadPoint.v1", request(id, None)).await.unwrap();
         let batch = StreamReader::try_new(output[0].body.as_ref(), None).unwrap().next().unwrap().unwrap();
         let schema = batch.schema();
         let (index, field) = schema.column_with_name("payload").unwrap();
-        assert_eq!(rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0).unwrap(), expected);
+        let actual = rtdb_columnar::read_value(field, batch.column(index).as_ref(), 0).unwrap();
+        assert_eq!(actual, expected);
+        if id == 5 {
+            let Value::Struct(fields) = actual else { unreachable!() };
+            let Some(Value::F64(value)) = fields.get("v2_value") else { unreachable!() };
+            assert_eq!(value.to_bits(), (-0.0_f64).to_bits());
+        }
     }
     running.stop().await;
 }

@@ -8,7 +8,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter, write_message};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef, UnionMode};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
 
@@ -441,10 +441,17 @@ impl OwnedStream {
         let (header, body) = stream_message(&bytes, &mut position)?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
         if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
         let schema = decoded_schema::adapt(&Arc::new(read_schema_header(header)?))?;
+        let dense_unions = schema.fields().iter().any(|field| contains_dense_union(field.data_type()));
         let mut dictionaries = HashMap::new();
         let mut pages = Vec::new();
         while let Some((header, body)) = stream_message(&bytes, &mut position)? {
             let body = bytes.slice_with_length(body.start, body.len());
+            // Arrow IPC creates dense union offsets before aligning ArrayData buffers.
+            let body = if dense_unions && body.as_ptr().align_offset(std::mem::align_of::<i32>()) != 0 {
+                Buffer::from_slice_ref(body.as_slice())
+            } else {
+                body
+            };
             if let Some(batch) = decode_stream_batch(Cow::Borrowed(header), &body, &schema, &mut dictionaries, None)? {
                 pages.push(OwnedBatch::with_reservation(batch, Arc::clone(&reservation))?);
             }
@@ -455,6 +462,19 @@ impl OwnedStream {
     pub fn schema(&self) -> &SchemaRef { &self.schema }
     pub fn pages(&self) -> &[OwnedBatch] { &self.pages }
     pub fn into_pages(self) -> Vec<OwnedBatch> { self.pages }
+}
+
+fn contains_dense_union(ty: &DataType) -> bool {
+    match ty {
+        DataType::Union(_, UnionMode::Dense) => true,
+        DataType::Union(legs, UnionMode::Sparse) => legs.iter().any(|(_, field)| contains_dense_union(field.data_type())),
+        DataType::Struct(fields) => fields.iter().any(|field| contains_dense_union(field.data_type())),
+        DataType::List(field) | DataType::LargeList(field) | DataType::ListView(field)
+        | DataType::LargeListView(field) | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) | DataType::RunEndEncoded(_, field) => contains_dense_union(field.data_type()),
+        DataType::Dictionary(_, value) => contains_dense_union(value),
+        _ => false,
+    }
 }
 
 fn decode_stream_batch(
