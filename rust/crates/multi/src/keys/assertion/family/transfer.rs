@@ -4,7 +4,7 @@ use rtdb_types::rtdb_v1::PinnedCheckpointIdentity;
 
 use super::*;
 
-const MAX_CONTRIBUTORS: usize = 512;
+pub(super) const MAX_CONTRIBUTORS: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -399,6 +399,21 @@ impl AssertionFamilies<'_> {
         self.require_transfer_original(agreement.source)?;
         let (record, _) = self.exact_transfer(agreement, fanout).await?;
         if !matches!(record.phase, TransferPhase::Drained { .. }) {
+            return Err(transfer_unavailable());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn require_checkpoint_transfer_terminal(
+        &self,
+        agreement: &FamilyTransfer,
+        destination: FamilyTransferDestinationState,
+        source_sha256: [u8; 32],
+    ) -> Result<()> {
+        let fanout = agreement.fanout()?;
+        self.require_transfer_original(agreement.source)?;
+        let (record, _) = self.exact_transfer(agreement, fanout).await?;
+        if record.phase != (TransferPhase::Drained { destination, source_sha256 }) {
             return Err(transfer_unavailable());
         }
         Ok(())
@@ -950,6 +965,13 @@ mod tests {
         restarted
             .require_checkpoint_transfer_drained(&agreement)
             .await?;
+        restarted
+            .require_checkpoint_transfer_terminal(&agreement, installed, [24; 32])
+            .await?;
+        assert!(restarted
+            .require_checkpoint_transfer_terminal(&agreement, installed, [25; 32])
+            .await
+            .is_err());
         assert!(
             restarted
                 .require_checkpoint_transfer_read(

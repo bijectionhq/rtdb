@@ -30,6 +30,7 @@ pub use unit::{UnitScope, UnitSlot};
 pub(crate) use unit::UnitLedger;
 pub(crate) use assertion::family::{assertion_root_line, family_vault_address, world_row_scope, world_row_slot_commitment};
 pub use assertion::family::{AssertionFamilies, DerivedRow, EnrolledWorldRow, FamilyFence, FamilyOccurrence, LandingLink, LandingReservation, WorldRowSlot, CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
+pub use assertion::family::ManagedFamilyTransfer;
 pub use assertion::family::{FamilyTransfer, FamilyTransferArtifact, FamilyTransferAuthority, FamilyTransferContributor, FamilyTransferDestination,
     FamilyTransferDestinationObservation, FamilyTransferDestinationState, FamilyTransferFanout, FamilyTransferSource,
     FamilyTransferRead, FamilyTransferSourceDrain, FamilyTransferSourceObservation};

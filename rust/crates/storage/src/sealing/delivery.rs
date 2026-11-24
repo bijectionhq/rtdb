@@ -275,6 +275,10 @@ impl PlaintextView {
         }).unwrap_or(Ok(()))
     }
 
+    pub fn has_delivery_scope() -> bool {
+        PLAINTEXT_VIEWS.try_with(|views| !views.is_empty()).unwrap_or(false)
+    }
+
     pub fn track_certified_read(read: &Arc<CertifiedRead>) -> rtdb_types::Result<()> {
         PLAINTEXT_VIEWS.try_with(|views| {
             for view in views.iter() {

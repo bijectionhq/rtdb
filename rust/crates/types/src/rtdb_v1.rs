@@ -73,6 +73,21 @@ pub struct PinnedCheckpointIdentity {
     pub until: Option<Timestamp>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointTarget {
+    pub incarnation: [u8; 16],
+    pub request: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedCheckpointReservation {
+    pub source: PinnedCheckpointIdentity,
+    pub target: ManagedCheckpointTarget,
+    pub reserved_at: Basis,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum At {
     #[default]

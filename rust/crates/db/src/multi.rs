@@ -521,6 +521,7 @@ impl MultiDatabase {
                 "The manifest is outside committed reachability",
             ));
         }
+        pin::require_ordinary_pin(&read_manifest(self.store.as_ref(), self.stream.kms.as_ref(), manifest).await?)?;
         if until.is_some_and(|deadline| !self.before(deadline.0)) {
             return Err(Anomaly::incorrect(
                 "rtdb/pin-expired",
@@ -537,7 +538,9 @@ impl MultiDatabase {
     }
 
     pub async fn open_pin(&mut self, id: Uuid) -> Result<VerifiedManifest> {
-        self.open_pinned_manifest(id, true).await.map(|(_, image)| image)
+        let (_, image) = self.open_pinned_manifest(id, true).await?;
+        pin::require_ordinary_pin(&image)?;
+        Ok(image)
     }
 
     async fn open_pinned_manifest(&mut self, id: Uuid, require_writer: bool) -> Result<(Pin, VerifiedManifest)> {
@@ -583,12 +586,10 @@ impl MultiDatabase {
     pub async fn release_pin(&mut self, id: Uuid) -> Result<()> {
         self.refresh().await?;
         let lease = self.authority()?;
-        if self
-            .reachability(lease)
-            .await?
-            .pins()
-            .any(|pin| pin.id == id)
-        {
+        let closure = self.reachability(lease).await?;
+        if let Some(pin) = closure.pins().find(|pin| pin.id == id) {
+            pin::require_ordinary_pin(&read_manifest(self.store.as_ref(), self.stream.kms.as_ref(), pin.manifest).await?)?;
+            self.require_authority(lease)?;
             self.append_control(lease, Record::Unpin { id }).await?;
         }
         Ok(())

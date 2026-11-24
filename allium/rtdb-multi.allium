@@ -577,9 +577,11 @@ contract LogService {
         -- The private deadline journal requires the exact stage inventory and all enrolled release drains before retiring the family capabilities.
         -- Signed terminal settlement preserves independent denials by original position and drops private family membership.
         -- A protected checkpoint transfer binds an exact source pin and cut to one prepared destination and the full original contributor inventory.
+        -- A managed checkpoint reserves one copy owner while the selected destination is still private.
         -- The original vault retains the reciprocal agreement and puts the same forward entry in every contributing family before the agreement can bind.
         -- Each forward entry remains in the original fence inventory through family settlement.
         -- A destination can use an inherited original envelope only under the exact installed reverse binding and current admission of all contributing original families.
+        -- Protected delivery checks the selected destination generation together with every contributing original family.
         -- An exact copy terminal can release the export pin and its copy holds while the installed destination remains subject to the original family fence.
 
     @invariant InstalledJournalErasureCommit

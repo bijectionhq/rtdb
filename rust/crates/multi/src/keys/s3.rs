@@ -291,6 +291,14 @@ impl KeyService for S3KeyService {
 
 #[async_trait::async_trait]
 impl AssertionKeyService for S3KeyService {
+    async fn verify_assertion_envelope(&self, stage: AssertionStage, authoring: AssertionAuthoring,
+        _region: &Arc<IoRegion>, envelope: AssertionEnvelope) -> Result<()> {
+        self.require_never_versioned().await?;
+        let (record, _) = self.read_vault_object(&assertion_path(stage), MAX_CAPABILITY_BYTES).await?
+            .ok_or_else(|| unavailable("read assertion wrapping capability"))?;
+        if record.is_empty() { return Err(Error::ErasedUnderView.into()); }
+        StagedCapability::read(record)?.verify(stage, authoring, envelope)
+    }
     async fn seal_assertion_stage(
         &self, stage: AssertionStage, authoring: AssertionAuthoring, _region: &Arc<IoRegion>,
         plaintext: Bytes,

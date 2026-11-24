@@ -16,7 +16,7 @@ use rtdb_tx::transact::{
 };
 use rtdb_types::{
     EntityId, StructFields, TableRef, Value,
-    rtdb_v1::{At, Basis, LabelScope, Layer, MAIN_BRANCH},
+    rtdb_v1::{At, Basis, LabelScope, Layer, MAIN_BRANCH, ManagedCheckpointReservation, ManagedCheckpointTarget},
 };
 
 use super::*;
@@ -257,6 +257,54 @@ async fn multi_driver_replays_genesis_settlement_and_a_file_checkpoint() {
     assert!(successor.transact(&timed).await.unwrap().replayed);
     timed.window.before = Some(Timestamp(31));
     assert_eq!(successor.transact(&timed).await.unwrap_err().code, "rtdb/idempotency-key");
+}
+
+#[tokio::test]
+async fn managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let mut source = cluster.node(1, Arc::new(journal.handle(NODE_1_IDENTITY)));
+    source.create().await.unwrap();
+    source.tick(&live(1)).await.unwrap();
+    let selected = source.transact(&put(1, 1, "at the reserved cut")).await.unwrap().basis;
+    let pin = Uuid::from_u128(3);
+    let destination = Uuid::from_u128(7);
+    let target = ManagedCheckpointTarget { incarnation: *destination.as_bytes(), request: [8; 32] };
+    let source_identity = source.pin_managed_checkpoint(pin, selected, target).await.unwrap();
+    let reservation = ManagedCheckpointReservation { source: source_identity, target, reserved_at: Basis::new([6; 16], 4) };
+
+    assert_eq!(source.pin_managed_checkpoint(pin, selected, target).await.unwrap(), source_identity);
+    assert_eq!(source.pin_checkpoint_at(pin, selected, None).await.unwrap_err().code, "rtdb/pin-id");
+    assert_eq!(source.open_pin(pin).await.err().unwrap().code, "rtdb/managed-checkpoint-custody");
+    assert_eq!(source.open_export(pin).await.err().unwrap().code, "rtdb/managed-checkpoint-custody");
+    assert_eq!(source.release_pin(pin).await.unwrap_err().code, "rtdb/managed-checkpoint-custody");
+    let changed = ManagedCheckpointReservation { target: ManagedCheckpointTarget { request: [9; 32], ..target }, ..reservation };
+    assert!(source.open_managed_checkpoint(changed).await.is_err());
+    source.checkpoint(Vec::new()).await.unwrap();
+    let mut follower = cluster.node(3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    let export = follower.open_managed_checkpoint(reservation).await.unwrap();
+
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_2_IDENTITY))));
+    let mut child = cluster.node_for(destination, 2, faults.clone());
+    child.create().await.unwrap();
+    child.tick(&live(2)).await.unwrap();
+    child.require_managed_checkpoint_destination(reservation).await.unwrap();
+    assert!(child.restore_export(&export).await.is_err());
+    assert!(child.restore_managed_checkpoint(&export, changed).await.is_err());
+    assert!(child.require_managed_checkpoint_restore(reservation).await.is_err());
+
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(child.restore_managed_checkpoint(&export, reservation).await.unwrap_err().category, AnomalyCategory::Interrupted);
+    let mut reopened = cluster.node_for(destination, 3, Arc::new(journal.handle(NODE_3_IDENTITY)));
+    let (basis, view, _) = reopened.require_managed_checkpoint_restore(reservation).await.unwrap();
+    assert_eq!(basis, Basis::new(target.incarnation, selected.position()));
+    assert_eq!(view.head().basis, basis);
+    assert_eq!(text_at(&mut reopened, MAIN_BRANCH, 1).await, Some(Value::Utf8("at the reserved cut".into())));
+    assert!(source.release_managed_checkpoint(changed).await.is_err());
+    source.release_managed_checkpoint(reservation).await.unwrap();
+    source.release_managed_checkpoint(reservation).await.unwrap();
+    assert_eq!(follower.open_managed_checkpoint(reservation).await.err().unwrap().code, "rtdb/unknown-pin");
+    assert_eq!(reopened.require_managed_checkpoint_restore(reservation).await.unwrap().0, basis);
 }
 
 #[tokio::test]

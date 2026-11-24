@@ -258,6 +258,17 @@ impl BranchIndex {
 
     pub fn head(&self) -> BranchCut { self.head }
 
+    /// Enumerates the stored images a checkpoint carries, including inactive branches and superseded rows.
+    pub fn retained_images(&self) -> impl Iterator<Item = (&str, &TableRef, &BranchEvent, &RowImage)> {
+        self.branches.iter().flat_map(|(branch, data)| {
+            data.tables.iter().flat_map(move |(table, rows)| {
+                rows.events.values().flat_map(|history| history.iter()).filter_map(move |(_, event)| {
+                    event.image.as_deref().map(|image| (branch.as_str(), table, event, image))
+                })
+            })
+        })
+    }
+
     /// Retained definitions also carry visibility rules for historical reads.
     pub fn has_visibility_history(&self) -> bool {
         self.catalog.values().any(|history| history.iter().any(|(_, definition)| definition.visibility.is_some()))

@@ -22,6 +22,7 @@ aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
 rtdb-affinity.workspace = true
 rtdb-columnar.workspace = true
+rtdb-db.workspace = true
 rtdb-directory = { workspace = true, features = ["network"] }
 rtdb-format.workspace = true
 rtdb-flight-sql.workspace = true
@@ -29,7 +30,7 @@ rtdb-index.workspace = true
 rtdb-logkeeper.workspace = true
 rtdb-maintenance.workspace = true
 ordered-logkeeper.workspace = true
-rtdb-node.workspace = true
+rtdb-node = { workspace = true, features = ["multi"] }
 rtdb-plan.workspace = true
 rtdb-query.workspace = true
 rtdb-pgwire.workspace = true

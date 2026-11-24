@@ -217,11 +217,32 @@ An installed destination stays in the original family fanout after the export ha
 An installed original reader also attaches the contributing family markers to the existing plaintext delivery scope.
 Use it around opening and at the final held delivery barrier with the original payload capability and response hold.
 
-The vault contract runs on the existing Local and S3 conditional record interface.
-The installed provider still needs an authenticated census of legacy family and derived carriers at the exact v1 pinned cut, a trusted destination installer that retains and proves the reciprocal binding, and the transfer-aware pin release and reader calls.
-Governed Root derivatives without their own family capability also need the authenticated dependent erasure projection and settlement before their inherited views can open.
-`FamilyFence.transfers` exposes the exact forward roster to that trusted projection, while the installed Flight fence reply retains its existing shape.
-The generic protected export and restore guards and the hosted governed fork refusal stay closed until those components share the same binding and drain.
+`ManagedFamilyTransfer` implements the host-only `rtdb_node::ManagedCheckpointProvider` on the existing independent Local or S3 family vault.
+The source obtains a non-expiring `RTEX2` pin through `MultiServing::pin_managed_checkpoint` after the managed catalog reserves the destination.
+Its sealed manifest commits the pin UUID, native source cut, private destination incarnation and stable catalog request digest.
+The catalog must bind the exact manifest while the destination is `TransferPending` and retain the resulting control-row Basis as `ManagedCheckpointReservation.reserved_at` across retries and readiness.
+Construct `ManagedCheckpointReservation` from the pinned identity, reserved destination incarnation and request digest, and that bound control Basis.
+The trusted host supplies the authenticated source's `OriginalAssertionFamilyReader`, original custody incarnation and independent vault to `ManagedFamilyTransfer::new`.
+The original reader must resolve the same installed deployment as the native source Basis incarnation and report its hosted installation, owner namespace and writer.
+The managed pin and provider are internal host interfaces with no customer codec or unconditional feature advertisement.
 
-Qualify `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
-At the installed boundary, lose replies on both sides of the publication, reopen from trimmed history, fence either contributing family while copying, and verify that neither changed ciphertext nor a reinterpreted destination can open.
+The provider claims one durable copy worker before inspecting the retained export.
+It traverses every retained image, including historical and shadowed images, and authenticates each enrolled main-world `BJWC1` original and registered `BJWP1` derivative against its exact original capability, occurrence and row slot.
+It hashes the entire opaque carrier, preserves all family contributors, and seals the exact census in the destination reverse record before enrolling all original forward entries.
+The source and destination copy drains attest the same applied destination restore terminal and retained-image commitment.
+The sole copy worker finishes reading the source before appending that terminal, which allows `recover_installation` to reconstruct a missing reverse terminal after restart or a lost append reply.
+Call installation or recovery before marking the destination ready, and call `release_source` on the source writer only after both drains are retained.
+Without an applied restore terminal, an interrupted or abandoned claim stays private and pinned until an authenticated copy abandonment or writer-fenced resumption is implemented.
+
+Protected readers call `ManagedCheckpointProvider::require_read` with the selected destination generation, exact branch, table, row ID and outer ciphertext inside a `PlaintextView` delivery scope.
+It authenticates the physical slot and original capability, checks the complete vault agreement, and attaches all original contributor fences and the selected destination generation to the final delivery checks.
+The consumer still owns protected opening and the existing ordered response admission and durable release for the output.
+Peer/admin dispatch, private-to-ready activation and the mounted consumer are integration work.
+Generic v1 row-custody groups, uncatalogued owned payloads, rewritten world members, external checkpoint files, and governed Root carriers remain closed.
+Root-derived rows need an authenticated dependent erasure projection and settlement before inherited reads can open.
+`FamilyFence.transfers` exposes the exact forward roster to that projection, while the installed Flight fence reply retains its existing shape.
+
+Qualify `managed_checkpoint_pin_is_exclusive_and_restores_after_a_lost_reply`, `census_accepts_only_exact_world_original_and_derived_carrier_forms`, `retained_frames_require_their_own_live_stage`, `checkpoint_transfer_replays_exact_custody_and_keeps_every_family_in_the_fence`, `checkpoint_transfer_refuses_unknown_or_partial_bindings_and_recovers_discard`, and `exact_export_pins_the_selected_branch_ancestry_after_trim`.
+At the installed boundary, lose replies after the source pin, destination append, reverse-vault terminal and source unpin, and recover the same terminal from trimmed history.
+Exercise multiple original families and ranked derivatives, an unknown group or missing source carrier, a substituted row slot, wrong source and destination incarnations, a changed reservation Basis, and a concurrent fence of each contributing family.
+Rotate the destination generation between protected opening and delivery, and verify that late replies cannot admit a send, that settled send evidence survives restart, and that ordinary export and unpin cannot bypass the managed fence.

@@ -2,9 +2,11 @@
 
 mod release;
 mod root_landing;
+mod managed;
 mod transfer;
 
 pub use release::{CarrierJournalIdentity, FamilyReleaseAuthority, FamilyReleaseInput, FamilyReleaseObservation, FamilyReleaseRegistration, FamilyResponsePart};
+pub use managed::ManagedFamilyTransfer;
 pub use transfer::{FamilyTransfer, FamilyTransferArtifact, FamilyTransferAuthority, FamilyTransferContributor, FamilyTransferDestination,
     FamilyTransferDestinationObservation, FamilyTransferDestinationState, FamilyTransferFanout, FamilyTransferSource,
     FamilyTransferRead, FamilyTransferSourceDrain, FamilyTransferSourceObservation};
@@ -386,12 +388,13 @@ pub(in crate::keys) enum AssertionVaultRecord {
     Issuer(AssertionIssuerScope),
     ReleaseTerminal { family: Uuid, attempt: [u8; 32] },
     CheckpointTransfer([u8; 32]),
+    ManagedCheckpointTransfer([u8; 16]),
 }
 
 impl AssertionVaultRecord {
     fn local_prefix(self) -> &'static str {
         match self {
-            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. } | Self::CheckpointTransfer(_) => LOCAL_PREFIX,
+            Self::Family(_) | Self::Denial(_) | Self::ReleaseTerminal { .. } | Self::CheckpointTransfer(_) | Self::ManagedCheckpointTransfer(_) => LOCAL_PREFIX,
             Self::Issuer(_) => LOCAL_ISSUER_PREFIX,
         }
     }
@@ -409,6 +412,7 @@ impl fmt::Display for AssertionVaultRecord {
             Self::ReleaseTerminal { family, attempt } =>
                 write!(formatter, "release-{family}-{}", URL_SAFE_NO_PAD.encode(attempt)),
             Self::CheckpointTransfer(address) => write!(formatter, "checkpoint-transfer-{}", URL_SAFE_NO_PAD.encode(address)),
+            Self::ManagedCheckpointTransfer(destination) => write!(formatter, "managed-transfer-{}", URL_SAFE_NO_PAD.encode(destination)),
         }
     }
 }

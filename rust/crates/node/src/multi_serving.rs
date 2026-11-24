@@ -2,15 +2,15 @@ use std::{collections::BTreeSet, net::IpAddr, sync::{Arc, Weak}, time::Duration}
 
 use async_trait::async_trait;
 use rtdb_crypt::tokens::TokenAuthority;
-use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
+use rtdb_db::{ChangeHistory, MultiDatabase, PinnedExport, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite};
 use rtdb_tx::transact::{
     COUNT_RANGE_CONSTRAINT, CustodyGroupId, CustodyWriterFence, GROUPED_COUNT_CONSTRAINT, LINEARIZABLE, PHYSICAL_ERASURE, RELATIVE_VALID_TIME,
     ROW_CUSTODY, Receipt, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TrustedCustodyCommand,
 };
 use rtdb_types::{
-    Anomaly, AnomalyCategory, MemoryBudget, Result, TableRef, Timestamp,
-    rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer},
+    Anomaly, AnomalyCategory, EntityId, MemoryBudget, Result, TableRef, Timestamp,
+    rtdb_v1::{At, Basis, ClaimEvidence, ClaimScope, Layer, ManagedCheckpointReservation, ManagedCheckpointTarget, PinnedCheckpointIdentity},
 };
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -48,6 +48,23 @@ pub struct MultiServing {
     route: Option<Arc<dyn MultiWriteRoute>>,
 }
 
+pub struct ManagedCheckpointRead<'a> {
+    pub generation: u64,
+    pub branch: &'a str,
+    pub table: &'a TableRef,
+    pub id: &'a EntityId,
+    pub carrier: &'a [u8],
+}
+
+/// A trusted host binds each provider to one private catalog reservation.
+#[async_trait::async_trait]
+pub trait ManagedCheckpointProvider: Send + Sync {
+    async fn install(&self, export: &PinnedExport, destination: &MultiServing) -> Result<Basis>;
+    async fn recover_installation(&self, destination: &MultiServing) -> Result<Basis>;
+    async fn require_read(&self, destination: &Arc<MultiServing>, read: ManagedCheckpointRead<'_>) -> Result<()>;
+    async fn release_source(&self, source: &MultiServing) -> Result<()>;
+}
+
 /// The host can route an already authorized write to the node appointed for this incarnation.
 #[async_trait]
 pub trait MultiWriteRoute: Send + Sync {
@@ -64,6 +81,30 @@ pub enum MultiWriteAdmission<'a> {
 impl MultiServing {
     pub async fn restored_checkpoint_basis(&self, manifest_digest: [u8; 32]) -> Result<Option<Basis>> {
         self.database.lock().await.restored_checkpoint_basis(manifest_digest).await
+    }
+
+    pub async fn pin_managed_checkpoint(&self, pin: uuid::Uuid, basis: Basis, target: ManagedCheckpointTarget) -> Result<PinnedCheckpointIdentity> {
+        self.database.lock().await.pin_managed_checkpoint(pin, basis, target).await
+    }
+
+    pub async fn open_managed_checkpoint(&self, reservation: ManagedCheckpointReservation) -> Result<PinnedExport> {
+        self.database.lock().await.open_managed_checkpoint(reservation).await
+    }
+
+    pub async fn prepare_managed_checkpoint(&self, reservation: ManagedCheckpointReservation) -> Result<()> {
+        self.database.lock().await.require_managed_checkpoint_destination(reservation).await
+    }
+
+    pub async fn restore_managed_checkpoint(&self, export: &PinnedExport, reservation: ManagedCheckpointReservation) -> Result<BranchCut> {
+        self.database.lock().await.restore_managed_checkpoint(export, reservation).await
+    }
+
+    pub async fn managed_checkpoint_view(&self, reservation: ManagedCheckpointReservation) -> Result<(Basis, BranchIndex, u64)> {
+        self.database.lock().await.require_managed_checkpoint_restore(reservation).await
+    }
+
+    pub async fn release_managed_checkpoint(&self, reservation: ManagedCheckpointReservation) -> Result<()> {
+        self.database.lock().await.release_managed_checkpoint(reservation).await
     }
 
     pub fn new(database: MultiDatabase, memory: Arc<MemoryBudget>) -> Self {

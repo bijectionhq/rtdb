@@ -5184,6 +5184,7 @@ dependencies = [
  "ring",
  "rtdb-affinity",
  "rtdb-columnar",
+ "rtdb-db",
  "rtdb-directory",
  "rtdb-flight-sql",
  "rtdb-format",

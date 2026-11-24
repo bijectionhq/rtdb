@@ -199,6 +199,8 @@ pub enum AssertionFenceStatus {
 }
 
 impl OriginalAssertionFamilyReader {
+    pub fn owner(&self) -> &str { &self.owner }
+
     pub fn history_fingerprint(&self) -> [u8; 32] {
         self.scope.history_fingerprint()
     }
