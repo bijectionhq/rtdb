@@ -442,6 +442,7 @@ impl ClassicObjectKeys {
         if offset < first_retained { return Err(Error::UnavailableLogRange { requested: offset, first_retained }); }
         Ok(())
     }
+}
 
 fn kafka_publication(frame: &[u8]) -> crate::Result<Uuid> {
     frame.first_chunk::<16>()
