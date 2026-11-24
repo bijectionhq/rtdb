@@ -110,6 +110,17 @@ impl CleanRecoverySlots {
     }
 }
 
+/// The authenticated switch's complete drain, read back from custody media.
+pub struct JoinedCustody {
+    closed_at_ms: u64,
+    joined: Vec<DrainedWork>,
+}
+
+impl JoinedCustody {
+    pub fn closed_at_ms(&self) -> u64 { self.closed_at_ms }
+    pub fn observations(&self) -> &[DrainedWork] { &self.joined }
+}
+
 #[async_trait]
 pub trait ErasureCustody: Send + Sync {
     /// Reserve an enforceable deadline for this exact attempt before any
@@ -139,7 +150,11 @@ pub trait ErasureCustody: Send + Sync {
 
     /// Read back the original owner's physical disposition after the custody
     /// drain. A pending or ambiguous provider result has no completion evidence.
-    async fn destruction(&self, _commit: ErasureCommit) -> Result<Option<DestructionEvidence>> {
+    async fn destruction(
+        &self,
+        _commit: ErasureCommit,
+        _drained: &JoinedCustody,
+    ) -> Result<Option<DestructionEvidence>> {
         Err(Anomaly::unsupported(
             "rtdb.multi/erasure-evidence",
             "This custody profile supplies no authenticated destruction evidence",
@@ -285,7 +300,11 @@ impl<'a> ErasureCoordinator<'a> {
         closed_at_ms: u64,
         roster: Vec<DrainRegistration>,
     ) -> Result<ErasureDrainJournal<'_>> {
+        self.require_incumbent(ready.prepared().erasure)?;
         validate_commit(ready.prepared(), commit, Some(ready.binding()), self.authority.as_ref())?;
+        if ready.deadline().is_some_and(|reservation| !matches_reservation(reservation, commit)) {
+            return Err(invalid("The durable drain differs from the reserved custody roster"));
+        }
         ErasureDrainJournal::close(self.provider, commit, closed_at_ms, roster).await
     }
 
@@ -310,11 +329,12 @@ impl<'a> ErasureCoordinator<'a> {
             .ok_or_else(evidence::authority_unavailable)?;
         let Some(journal) = self.resume_drain(commit).await? else { return Ok(None); };
         let Some(joined) = journal.joined().await? else { return Ok(None); };
-        let Some(receipt) = custody.destruction(commit).await? else {
+        let drained = JoinedCustody { closed_at_ms: journal.closed_at_ms(), joined };
+        let Some(receipt) = custody.destruction(commit, &drained).await? else {
             return Ok(None);
         };
         authority.verify_destruction(commit, &receipt)?;
-        if receipt.drain.closed_at_ms != journal.closed_at_ms() || receipt.drain.joined != joined {
+        if receipt.drain.closed_at_ms != drained.closed_at_ms || receipt.drain.joined != drained.joined {
             return Err(invalid("The destruction receipt differs from the durable drain observations"));
         }
         Ok(Some(receipt))
@@ -469,11 +489,7 @@ async fn coordinate(
     let ready = require_clean_slots(prepared, successor, decision, deadline)?;
     let binding = ready.binding();
     let commit = custody.commit_and_arm(ready).await?;
-    if deadline.is_some_and(|reserved| {
-        reserved.by_ms != commit.deadline.at_ms()
-            || reserved.retiring_inventory != commit.retiring_inventory
-            || reserved.draining_inventory != commit.draining_inventory
-    }) {
+    if deadline.is_some_and(|reserved| !matches_reservation(reserved, commit)) {
         return Err(invalid("Custody armed a different reservation"));
     }
     validate_commit(prepared, commit, Some(binding), authority)
@@ -541,6 +557,12 @@ fn require_clean_slots(
         binding,
         deadline,
     })
+}
+
+fn matches_reservation(reserved: DeadlineReservation, commit: ErasureCommit) -> bool {
+    reserved.by_ms == commit.deadline.at_ms()
+        && reserved.retiring_inventory == commit.retiring_inventory
+        && reserved.draining_inventory == commit.draining_inventory
 }
 
 fn validate_commit(
