@@ -8,8 +8,8 @@ pub(crate) mod search;
 use std::{collections::{HashMap, HashSet}, ops::Range, sync::Arc};
 
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, PrimitiveArray, StructArray, UnionArray,
-    builder::{Float32Builder, Float64Builder, Int64Builder}, types::ArrowPrimitiveType,
+    Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, NullArray, StructArray, UnionArray,
+    builder::{BooleanBuilder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder},
 };
 use arrow_schema::{DataType, Field as ArrowField};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, copy_selected_cells, read_execution_value, read_execution_value_as};
@@ -2789,7 +2789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fixed_numeric_cases_preserve_bits_nulls_and_branch_demand() {
+    async fn fixed_width_cases_preserve_bits_nulls_and_branch_demand() {
         let len = 192;
         let memory = MemoryBudget::new(1 << 24);
         let catalog = crate::CatalogSnapshot::new("xtdb", [("xtdb".into(), crate::DatabaseSnapshot {
@@ -2903,7 +2903,52 @@ mod tests {
         drop(cursor);
         assert_eq!(memory.used_bytes(), baseline);
 
-        for (scalar, zero) in [(ScalarType::I64, Value::I64(0)), (ScalarType::F32, Value::F32(0.0))] {
+        for (scalar, first, text, second, physical) in [
+            (ScalarType::Bool, Value::Bool(false), "true", Value::Bool(true), DataType::Boolean),
+            (ScalarType::I8, Value::I8(i8::MIN), "127", Value::I8(i8::MAX), DataType::Int8),
+            (ScalarType::I16, Value::I16(i16::MIN), "32767", Value::I16(i16::MAX), DataType::Int16),
+            (ScalarType::I32, Value::I32(i32::MIN), "2147483647", Value::I32(i32::MAX), DataType::Int32),
+        ] {
+            let expression = case(vec![
+                (0, Expr::Literal(first.clone())),
+                (1, cast(text, scalar.clone())),
+                (1, cast("unreached cast", scalar.clone())),
+            ], Expr::Literal(Value::Null));
+            let ty = LogicalType::Scalar(scalar.clone()).maybe();
+            assert!(matches!(
+                ProjectionValues::new(&expression, &ty, len),
+                ProjectionValues::Bool(_) | ProjectionValues::I8(_) | ProjectionValues::I16(_) | ProjectionValues::I32(_),
+            ));
+            let nulls = case(vec![(3, cast("unreached cast", scalar))], Expr::Literal(Value::Null));
+            let mut cursor = BatchExpressions::new(input(len), schema.clone(), vec![expression, nulls], execution.clone());
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            let [
+                values @ Column::Arrow { array, field, logical: Some(logical) },
+                Column::Arrow { array: nulls, logical: Some(LogicalType::Null), .. },
+            ] = page.columns.as_slice() else { panic!("Expected a fixed-width column and a null column"); };
+            assert_eq!(*logical, ty);
+            assert_eq!(array.data_type(), &physical);
+            assert!(field.is_nullable());
+            assert_eq!(nulls.data_type(), &DataType::Null);
+            assert_eq!(nulls.len(), len);
+            for row in 0..len {
+                let expected = match row % 3 { 0 => &first, 1 => &second, _ => &Value::Null };
+                assert_eq!(&values.value(row).unwrap(), expected);
+            }
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let mismatched = case(vec![(0, Expr::Literal(Value::Bool(true)))], Expr::Literal(Value::I32(1)));
+        assert!(matches!(
+            ProjectionValues::new(&mismatched, &LogicalType::Scalar(ScalarType::Bool), len),
+            ProjectionValues::Dynamic(_),
+        ));
+
+        for (scalar, zero) in [
+            (ScalarType::I32, Value::I32(0)),
+            (ScalarType::I64, Value::I64(0)),
+            (ScalarType::F32, Value::F32(0.0)),
+        ] {
             let later_row = case(vec![
                 (1, cast("first projection, second row", scalar.clone())),
                 (2, cast("first projection, third row", scalar)),
@@ -3668,6 +3713,10 @@ impl BatchCursor for BatchExpressions {
 
 enum ProjectionValues {
     Dynamic(Vec<Value>),
+    Bool(BooleanBuilder),
+    I8(Int8Builder),
+    I16(Int16Builder),
+    I32(Int32Builder),
     I64(Int64Builder),
     F32(Float32Builder),
     F64(Float64Builder),
@@ -3676,11 +3725,19 @@ enum ProjectionValues {
 impl ProjectionValues {
     fn new(expression: &Expr, output: &LogicalType, len: usize) -> Self {
         let fixed = plain_scalar(output).filter(|scalar| {
-            matches!(scalar, ScalarType::I64 | ScalarType::F32 | ScalarType::F64)
+            matches!(
+                scalar,
+                ScalarType::Bool | ScalarType::I8 | ScalarType::I16 | ScalarType::I32
+                    | ScalarType::I64 | ScalarType::F32 | ScalarType::F64
+            )
                 && matches!(expression, Expr::Case { .. } | Expr::SimpleCase { .. })
                 && fixed_case_result(expression, scalar)
         });
         match fixed {
+            Some(ScalarType::Bool) => Self::Bool(BooleanBuilder::with_capacity(len)),
+            Some(ScalarType::I8) => Self::I8(Int8Builder::with_capacity(len)),
+            Some(ScalarType::I16) => Self::I16(Int16Builder::with_capacity(len)),
+            Some(ScalarType::I32) => Self::I32(Int32Builder::with_capacity(len)),
             Some(ScalarType::I64) => Self::I64(Int64Builder::with_capacity(len)),
             Some(ScalarType::F32) => Self::F32(Float32Builder::with_capacity(len)),
             Some(ScalarType::F64) => Self::F64(Float64Builder::with_capacity(len)),
@@ -3691,6 +3748,14 @@ impl ProjectionValues {
     fn push(&mut self, value: Value) -> Result<()> {
         match (self, value) {
             (Self::Dynamic(values), value) => values.push(value),
+            (Self::Bool(values), Value::Bool(value)) => values.append_value(value),
+            (Self::Bool(values), Value::Null) => values.append_null(),
+            (Self::I8(values), Value::I8(value)) => values.append_value(value),
+            (Self::I8(values), Value::Null) => values.append_null(),
+            (Self::I16(values), Value::I16(value)) => values.append_value(value),
+            (Self::I16(values), Value::Null) => values.append_null(),
+            (Self::I32(values), Value::I32(value)) => values.append_value(value),
+            (Self::I32(values), Value::Null) => values.append_null(),
             (Self::I64(values), Value::I64(value)) => values.append_value(value),
             (Self::I64(values), Value::Null) => values.append_null(),
             (Self::F32(values), Value::F32(value)) => values.append_value(value),
@@ -3705,9 +3770,13 @@ impl ProjectionValues {
     fn finish(self) -> Result<Column> {
         match self {
             Self::Dynamic(values) => Ok(Column::Values(values)),
-            Self::I64(mut values) => primitive_column(values.finish()),
-            Self::F32(mut values) => primitive_column(values.finish()),
-            Self::F64(mut values) => primitive_column(values.finish()),
+            Self::Bool(mut values) => fixed_width_column(values.finish()),
+            Self::I8(mut values) => fixed_width_column(values.finish()),
+            Self::I16(mut values) => fixed_width_column(values.finish()),
+            Self::I32(mut values) => fixed_width_column(values.finish()),
+            Self::I64(mut values) => fixed_width_column(values.finish()),
+            Self::F32(mut values) => fixed_width_column(values.finish()),
+            Self::F64(mut values) => fixed_width_column(values.finish()),
         }
     }
 }
@@ -3720,6 +3789,10 @@ fn fixed_case_result(expression: &Expr, scalar: &ScalarType) -> bool {
             })
         }
         Expr::Literal(Value::Null) => true,
+        Expr::Literal(Value::Bool(_)) => *scalar == ScalarType::Bool,
+        Expr::Literal(Value::I8(_)) => *scalar == ScalarType::I8,
+        Expr::Literal(Value::I16(_)) => *scalar == ScalarType::I16,
+        Expr::Literal(Value::I32(_)) => *scalar == ScalarType::I32,
         Expr::Literal(Value::I64(_)) => *scalar == ScalarType::I64,
         Expr::Literal(Value::F32(_)) => *scalar == ScalarType::F32,
         Expr::Literal(Value::F64(_)) => *scalar == ScalarType::F64,
@@ -3753,12 +3826,12 @@ async fn evaluate_score_column(
         scope.reset()?;
     }
 
-    let column = primitive_column(scores.finish())?;
+    let column = fixed_width_column(scores.finish())?;
     settle_primitive_column(&column, lease, retained)?;
     Ok(Some(column))
 }
 
-fn primitive_column<T: ArrowPrimitiveType>(values: PrimitiveArray<T>) -> Result<Column> {
+fn fixed_width_column(values: impl Array + 'static) -> Result<Column> {
     let len = values.len();
     let nulls = values.null_count();
     let (array, nullable): (ArrayRef, bool) = if nulls == len {

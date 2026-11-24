@@ -319,6 +319,8 @@ impl Parameters {
                                 | DataType::Int16
                                 | DataType::Int32
                                 | DataType::Int64
+                                | DataType::Float32
+                                | DataType::Float64
                         )
                         && column.is_valid(0)
                 })
@@ -371,18 +373,30 @@ async fn open_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, UInt64Array};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float32Array, Float64Array, Int64Array, RecordBatch, UInt64Array,
+    };
+    use arrow_schema::{Field, Schema};
 
     #[test]
-    fn arrow_execution_requires_present_plain_booleans_and_signed_integers() {
+    fn arrow_execution_requires_present_unannotated_supported_scalars() {
         let memory = MemoryBudget::new(1 << 20);
         let signed = Arc::new(Int64Array::from(vec![Some(42)])) as ArrayRef;
-        for (other, expected) in [
-            (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, true),
-            (Arc::new(Int64Array::from(vec![None])) as ArrayRef, false),
-            (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, false),
+        for (other, annotated, expected) in [
+            (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, false, true),
+            (Arc::new(Float32Array::from(vec![-0.0])) as ArrayRef, false, true),
+            (Arc::new(Float64Array::from(vec![f64::NAN])) as ArrayRef, false, true),
+            (Arc::new(Float64Array::from(vec![1.0])) as ArrayRef, true, false),
+            (Arc::new(Float32Array::from(vec![None])) as ArrayRef, false, false),
+            (Arc::new(Int64Array::from(vec![None])) as ArrayRef, false, false),
+            (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, false, false),
         ] {
-            let batch = RecordBatch::try_from_iter([("a", signed.clone()), ("b", other)]).unwrap();
+            let mut field = Field::new("b", other.data_type().clone(), true);
+            if annotated {
+                field = field.with_metadata([("tag".into(), "parameter".into())].into());
+            }
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false), field]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::clone(&signed), other]).unwrap();
             let ipc = rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch))
                 .unwrap();
             let parameters = Parameters::read(Buffer::from_vec(ipc), &memory).unwrap();

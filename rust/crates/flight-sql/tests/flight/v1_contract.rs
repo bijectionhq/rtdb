@@ -122,7 +122,7 @@ async fn query_parameters_require_one_row_and_continuations_bind_the_exact_ipc()
 
 #[tokio::test]
 async fn query_parameter_binding_preserves_result_types_and_errors() {
-    use arrow_array::{ArrayRef, BooleanArray, Int32Array, UInt64Array};
+    use arrow_array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, UInt64Array};
     use rtdb_types::Value;
 
     fn parameter(values: ArrayRef) -> Vec<u8> {
@@ -132,9 +132,16 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
 
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
+    let single_nan = f32::from_bits(0x7fc0_0042);
+    let double_nan = f64::from_bits(0x7ff8_0000_0000_0042);
     for (values, data_type, expected) in [
         (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, DataType::Boolean, Value::Bool(true)),
         (Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef, DataType::Int32, Value::I32(i32::MIN)),
+        (Arc::new(Float32Array::from(vec![single_nan])) as ArrayRef, DataType::Float32, Value::F32(single_nan)),
+        (Arc::new(Float32Array::from(vec![-0.0])) as ArrayRef, DataType::Float32, Value::F32(-0.0)),
+        (Arc::new(Float64Array::from(vec![double_nan])) as ArrayRef, DataType::Float64, Value::F64(double_nan)),
+        (Arc::new(Float64Array::from(vec![-0.0])) as ArrayRef, DataType::Float64, Value::F64(-0.0)),
+        (Arc::new(Float32Array::from(vec![None])) as ArrayRef, DataType::Float32, Value::Null),
         (Arc::new(Int64Array::from(vec![None])) as ArrayRef, DataType::Int64, Value::Null),
         (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, DataType::Int64, Value::I64(-1)),
     ] {
@@ -144,17 +151,24 @@ async fn query_parameter_binding_preserves_result_types_and_errors() {
         let batch = &batches[0];
         let field = batch.schema_ref().field(0);
         assert_eq!(field.data_type(), &data_type);
-        assert_eq!(
-            rtdb_columnar::read_value(field, batch.column(0).as_ref(), 0).unwrap(),
-            expected,
-        );
+        let actual = rtdb_columnar::read_value(field, batch.column(0).as_ref(), 0).unwrap();
+        match (actual, expected) {
+            (Value::F32(actual), Value::F32(expected)) => assert_eq!(actual.to_bits(), expected.to_bits()),
+            (Value::F64(actual), Value::F64(expected)) => assert_eq!(actual.to_bits(), expected.to_bits()),
+            (actual, expected) => assert_eq!(actual, expected),
+        }
     }
 
-    let mut request = input("SELECT 10::BIGINT / $1 AS n");
-    request.params_ipc = Some(parameter(Arc::new(Int64Array::from(vec![0]))));
-    let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
-    let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
-    assert_eq!(detail.message, "data exception - division by zero");
+    for values in [
+        Arc::new(Int64Array::from(vec![0])) as ArrayRef,
+        Arc::new(Float64Array::from(vec![-0.0])) as ArrayRef,
+    ] {
+        let mut request = input("SELECT 10::BIGINT / $1 AS n");
+        request.params_ipc = Some(parameter(values));
+        let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
+        let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+        assert_eq!(detail.message, "data exception - division by zero");
+    }
     running.stop().await;
 }
 

@@ -2143,7 +2143,9 @@ surface QueryAccess {
         -- Its columnar result is split to the transport row limit after the operators have processed the complete page.
         -- Scalar evaluation in columnar projections, filters, aggregate filters, and evaluated UNNEST can borrow the cells demanded by the expression.
         -- A CASE projection with cosine scores, double literals or null as its only results can write Arrow values and validity as each row's selected branch is evaluated.
-        -- A CASE projection with fixed single-precision results can write them directly to Arrow while evaluating branches in scalar order.
+        -- A CASE projection with provably fixed Boolean, signed integer, Float32 or Float64 results can write them directly to Arrow while evaluating branches in scalar order.
+        -- The result uses observed nullability and a NULL vector when every selected result is null.
+        -- Scalar-evaluated CASE results that lack a compatible fixed writer use the generic packing path.
         -- Columnar text search reads compatible Arrow text and bound corpus statistics from their selected cells.
         -- Equality against a compatible ID array compares borrowed candidate cells in order and stops at the first match.
         -- With no match, a reached null comparison gives an unknown result.
