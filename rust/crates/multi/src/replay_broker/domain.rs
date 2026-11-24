@@ -225,6 +225,8 @@ impl State {
             generation: self.generation,
             operation: self.operation,
             next_sql: self.sql_intents.values().copied().next(),
+            ready_to_complete: self.operation.is_some() && self.destruction.len() == self.roots.len(),
+            sole_root: self.roots.first_key_value().filter(|_| self.roots.len() == 1).map(|(root, _)| *root),
             membership,
             roster,
             drained,
@@ -300,6 +302,18 @@ impl State {
                 } else {
                     self.sql_intents.insert(root, *intent);
                 }
+            }
+            Action::BeginSingleRootSql { operation, intent, verification_key } => {
+                if operation.target != intent.target()? || operation.domain != self.domain
+                    || self.sql_intents.get(&intent.placement.deployment) != Some(intent)
+                    || self.roots.len() != 1 || self.roots.get(&intent.placement.deployment)
+                        .is_none_or(|root| root.verification_key != *verification_key)
+                {
+                    return Err(conflict("The committed SQL erase has a different source or dependent roots"));
+                }
+                self.apply(&Action::Begin {
+                    operation: operation.erase, target: operation.target, generation: operation.generation,
+                })?;
             }
             Action::Begin {
                 operation,
@@ -553,6 +567,11 @@ pub enum Action {
         intent: SqlIntent,
         signature: Vec<u8>,
     },
+    BeginSingleRootSql {
+        operation: Operation,
+        intent: SqlIntent,
+        verification_key: [u8; 32],
+    },
     Begin {
         operation: Uuid,
         target: [u8; 32],
@@ -596,6 +615,7 @@ impl Action {
             Self::AuthorizeRoot { .. }
                 | Self::Enroll { .. }
                 | Self::Begin { .. }
+                | Self::BeginSingleRootSql { .. }
                 | Self::Admit { .. }
                 | Self::RootDrain { .. }
                 | Self::RootDestruction { .. }
@@ -610,6 +630,8 @@ pub struct View {
     pub generation: u64,
     pub operation: Option<Operation>,
     pub next_sql: Option<SqlIntent>,
+    pub ready_to_complete: bool,
+    pub sole_root: Option<Uuid>,
     pub membership: [u8; 32],
     pub roster: [u8; 32],
     pub drained: Option<[u8; 32]>,

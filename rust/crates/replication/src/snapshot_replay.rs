@@ -110,16 +110,19 @@ impl RecoveredPartition {
             .ok_or_else(missing_erasure)?;
         let cut = replay.cut;
         let checkpoint = replay.checkpoint;
-        let mut selected = None;
+        let mut selected = false;
+        let mut targets = Vec::new();
         let memory = logs.memory();
         let custody = self.replay_snapshot_suffix_with(logs, replay, cancellation, |original, write, committed| {
+            let marker = if committed { erasure_targets(write, memory)? } else { Vec::new() };
             if original == position {
-                if !committed || write.tx_key() != transaction { return Err(missing_erasure()); }
-                selected = Some(erasure_targets(write, memory)?);
+                if marker.is_empty() || write.tx_key() != transaction { return Err(missing_erasure()); }
+                selected = true;
             }
+            targets.extend(marker);
             Ok(())
         }, true).await?.ok_or_else(missing_erasure)?;
-        let targets = selected.filter(|targets| !targets.is_empty()).ok_or_else(missing_erasure)?;
+        if !selected { return Err(missing_erasure()); }
         Ok(SqlErasureSource {
             authenticated_head, cut, checkpoint, source_position: self.progress.source_position, transaction,
             targets, custody, snapshot: self.partition.snapshot(),

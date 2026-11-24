@@ -931,7 +931,10 @@ impl Log for JournalLog {
             range.held = Some(Arc::clone(&held));
             range.from = Some(scope.start);
             range.snapshot = Some(Arc::clone(&files));
-            rtdb_storage::log::ProtectedLogRange { range: Box::new(range), hold: held }
+            let authenticated_head = super::head_identity(self.reads.journal.placement(), scope.through);
+            rtdb_storage::log::ProtectedLogRange {
+                authenticated_head: Some(authenticated_head), range: Box::new(range), hold: held,
+            }
         });
         Ok(rtdb_storage::log::ProtectedLogSnapshot { suffix, provider: Some(files) })
     }

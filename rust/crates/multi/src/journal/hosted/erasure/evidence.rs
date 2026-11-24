@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{ErasureCommit, PreparedErasure, invalid};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ErasureTiming {
     OperationalTarget,
     Fixed { before_ms: u64 },

@@ -165,3 +165,7 @@ Runtime provider qualification and the protocol for outstanding same-domain prov
 The installed writer discovers the first erase during certified transaction apply.
 The root admission signer records the exact transaction and replica position in the broker generation.
 Ordinary checkpoint publication preserves the replay suffix that contains that marker.
+The installed operational adapter binds an independent PKCS#8 signer to the enrolled root.
+A sole enrolled root can advance its committed marker to the certified switch automatically.
+The provider retains the chosen rotation and the authenticated root and physical disposition records.
+The installed provider uses a 120-second operational target and the existing custody profile offers no fixed physical-destruction deadline.

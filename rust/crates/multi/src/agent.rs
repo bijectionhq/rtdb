@@ -1798,6 +1798,15 @@ impl NodeAgent {
                     Ok(false) => {},
                     Err(error) => tracing::warn!(code = %error.code, "SQL erasure initiation awaits its custody broker"),
                 }
+                if status.first_erasure.is_some() && let Some(broker) = self.replay_broker() {
+                    let cancellation = CancellationToken::new();
+                    let _cancel = cancellation.clone().drop_guard();
+                    let start = placement.start_committed_erasure(&self.node, &database, admission, broker,
+                        &self.keys, &cancellation);
+                    if let Ok(Err(error)) = tokio::time::timeout(self.options.activation_timeout, start).await {
+                        tracing::warn!(code = %error.code, "Committed SQL erasure awaits successor staging");
+                    }
+                }
                 continue;
             }
             let turn = self.turn(&name);
@@ -1813,6 +1822,12 @@ impl NodeAgent {
 
         // The custodian can maintain retention even with no grant or running database.
         for (name, placement) in self.ordered.custody_placements() {
+            if let Some(broker) = self.replay_broker()
+                && let Ok(Err(error)) = tokio::time::timeout(self.options.activation_timeout,
+                    placement.advance_installed_erasure(broker, &self.keys)).await
+            {
+                tracing::warn!(code = %error.code, "Installed erasure awaits custody evidence");
+            }
             let _ = placement.dispose_withdrawn_workers().await;
             let _ = placement.retain_selected().await;
             let publish = placement.publish_checkpoint(&self.keys, offered.remove(name),

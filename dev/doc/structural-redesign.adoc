@@ -293,7 +293,10 @@ An enrolled installed worker registers signed plaintext and egress duties with i
 The process signs the join after the last retained view, delivery, or provider operation releases the duty.
 Installed database attachments also retain signed plaintext duties through their serving store and replica log.
 The SQL submission entry checks broker admission before accepting new work.
-Production processing still needs dependent-root survivor staging, complete runtime enrollment, and an installed adapter that signs and submits root and provider evidence.
+An installation with a configured custody signer automatically stages and rotates a sole enrolled root from its committed SQL marker.
+Its custodian resumes the staged operation on restart and contributes signed root and provider dispositions after the joined drain.
+A source rewrite covers every authorized erase effect in its selected replica suffix.
+Dependent-root survivor staging and mandatory fork enrollment remain open.
 
 |8
 |Transaction metadata retention.

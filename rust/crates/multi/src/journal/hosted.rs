@@ -49,6 +49,7 @@ struct Definition {
     worker: InstalledRoute,
     custody: Option<InstalledRoute>,
     custody_work: Option<custody_work::Installation>,
+    erasure_signing_key: Option<std::path::PathBuf>,
     archive: crate::deployment::CellStorage,
     archive_prefix: String,
     journal_window_bytes: Option<u64>,
@@ -73,6 +74,7 @@ pub(crate) struct Placement {
     pub worker: Arc<InstalledJournal>,
     pub custodian: Option<Arc<InstalledJournal>>,
     custody_work: Option<custody_work::WorkOwner>,
+    erasure_signer: Option<erasure::installed::Signer>,
     archive: crate::deployment::CellStorage,
     archive_prefix: ObjectKey,
     journal_window_bytes: Option<u64>,
@@ -245,6 +247,10 @@ impl Routes {
                 let broker = broker.cloned().ok_or_else(|| invalid("The installed custody domain needs its broker route"))?;
                 custody_work::WorkOwner::open(installation, broker, worker.placement())
             }).transpose()?;
+            let erasure_signer = entry.erasure_signing_key.as_deref().map(erasure::installed::Signer::open).transpose()?;
+            if erasure_signer.is_some() && (custodian.is_none() || custody_work.is_none()) {
+                return Err(invalid("The installed erasure signer needs a custodian and an enrolled custody domain"));
+            }
             let placement = Arc::new(Placement {
                 record: entry.deployment,
                 worker,
@@ -253,6 +259,7 @@ impl Routes {
                 archive_prefix: ObjectKey::new(entry.archive_prefix)?,
                 journal_window_bytes: entry.journal_window_bytes,
                 custody_work,
+                erasure_signer,
                 nomination: Default::default(),
                 worker_disposal: Default::default(),
                 reader_opening: Default::default(),
@@ -386,20 +393,103 @@ impl Placement {
         Ok(candidate.is_none_or(|candidate| candidate.boundary < marker.position.after_offset(self.worker.log_epoch())))
     }
 
+    pub(crate) async fn start_committed_erasure(
+        &self, node: &rtdb_node::Node, database: &rtdb_node::Database, admission: WriterAdmission,
+        broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>, cancellation: &CancellationToken,
+    ) -> Result<()> {
+        use crate::replay_broker::domain::{Action, Operation};
+
+        let (Some(owner), Some(signer), Some(custodian)) =
+            (&self.custody_work, &self.erasure_signer, &self.custodian)
+        else { return Ok(()); };
+        let domain = owner.domain();
+        let view = broker.custody_domain(domain, Action::Status).await?;
+        let Some(intent) = view.next_sql.filter(|intent| intent.placement == custodian.placement()) else { return Ok(()); };
+        if view.sole_root != Some(intent.placement.deployment) { return Ok(()); }
+        let status = database.status();
+        if !status.first_erasure.is_some_and(|marker|
+            marker.transaction == intent.transaction && marker.position == intent.position)
+        {
+            return Ok(());
+        }
+        let target = intent.target()?;
+        let operation = Operation {
+            domain, generation: view.generation, target,
+            erase: uuid::Builder::from_random_bytes(target[..16].try_into().expect("operation identity width")).into_uuid(),
+        };
+        if view.operation.is_some_and(|closing| closing != operation) { return Ok(()); }
+        let route = custodian.route().await?;
+        if route.writer.grant != Some(admission.grant) || route.preparing.is_some_and(|entry| !entry.erasure) {
+            return Ok(());
+        }
+        let revision = route.checkpoint.custody.revision.checked_add(1)
+            .ok_or_else(|| invalid("The checkpoint custody revision space is exhausted"))?;
+        if !self.checkpoint_reservations.contains_key(&revision) {
+            return Err(invalid("The next erasure checkpoint allocation is unfunded"));
+        }
+        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        if erasure::installed::Installed::load(&provider, signer, route.placement, operation).await?.is_some() {
+            return Ok(());
+        }
+        broker.custody_domain(domain, Action::BeginSingleRootSql {
+            operation, intent, verification_key: signer.public_key(),
+        }).await?;
+        self.stage_selected_erasure(node, database, admission, broker, keys, intent, operation, None, cancellation).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn advance_installed_erasure(
+        &self, broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>,
+    ) -> Result<()> {
+        use crate::replay_broker::domain::Action;
+
+        let (Some(owner), Some(signer), Some(custodian)) =
+            (&self.custody_work, &self.erasure_signer, &self.custodian)
+        else { return Ok(()); };
+        let view = broker.custody_domain(owner.domain(), Action::Status).await?;
+        let Some(operation) = view.operation else { return Ok(()); };
+        let _publication = self.publication.lock().await;
+        let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        let Some(installed) = erasure::installed::Installed::load(&provider, signer, custodian.placement(), operation).await?
+            else { return Ok(()); };
+        let coordinator = erasure::ErasureCoordinator::new(&self.worker, custodian, &provider, keys.as_ref(), broker, operation)?
+            .with_custody_verification_key(signer.public_key())?;
+        let commit = coordinator.commit(&installed, installed.staged.prepared.erasure).await?;
+        if coordinator.confirm_destruction(&installed, commit).await?.is_some() {
+            let view = broker.custody_domain(owner.domain(), Action::Status).await?;
+            if view.operation == Some(operation) && view.ready_to_complete {
+                broker.custody_domain(owner.domain(), Action::Complete { operation }).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn stage_sql_erasure(
         &self, node: &rtdb_node::Node, database: &rtdb_node::Database, admission: WriterAdmission,
         broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>, request: erasure::SqlErasureRequest,
         cancellation: &CancellationToken,
     ) -> Result<Checkpoint> {
+        let intent = crate::replay_broker::domain::SqlIntent {
+            placement: self.worker.placement(), transaction: request.transaction, position: request.position,
+        };
+        self.stage_selected_erasure(node, database, admission, broker, keys, intent,
+            request.operation, Some(request.rotation), cancellation).await
+    }
+
+    async fn stage_selected_erasure(
+        &self, node: &rtdb_node::Node, database: &rtdb_node::Database, admission: WriterAdmission,
+        broker: &crate::replay_broker::Client, keys: &Arc<dyn KeyService>,
+        intent: crate::replay_broker::domain::SqlIntent, operation: crate::replay_broker::domain::Operation,
+        rotation: Option<ordered_logkeeper::ordered::RequestId>, cancellation: &CancellationToken,
+    ) -> Result<Checkpoint> {
         use crate::replay_broker::domain;
 
         let custodian = self.custodian.as_ref().ok_or_else(|| invalid("This placement has no erasure custodian"))?;
         let placement = custodian.placement();
-        let operation = request.operation;
         if self.custody_work.as_ref().map(custody_work::WorkOwner::domain) != Some(operation.domain) {
             return Err(invalid("The selected SQL writer is outside the installed custody domain"));
         }
-        if domain::sql_target(placement, request.transaction, request.position)? != operation.target {
+        if intent.placement != placement || intent.target()? != operation.target {
             return Err(invalid("The SQL erasure marker differs from the broker's target"));
         }
         broker.custody_domain(operation.domain, domain::Action::AuthorizeRoot {
@@ -418,6 +508,26 @@ impl Placement {
         let reservation = self.checkpoint_reservations.get(&revision).copied()
             .ok_or_else(|| invalid("The next erasure checkpoint allocation is unfunded"))?;
         let provider = self.checkpoint_custody(IoRegion::new(), Arc::clone(keys)).await?;
+        let records = provider.erasure_records(placement, operation.erase)?;
+        let rotation = match (records.get("installed-rotation").await?, rotation) {
+            (Some(bytes), requested) => {
+                let chosen = serde_json::from_slice(&bytes).map_err(|error| invalid(&error.to_string()))?;
+                if requested.is_some_and(|requested| requested != chosen) {
+                    return Err(invalid("A different rotation is already assigned to the committed erasure"));
+                }
+                chosen
+            }
+            (None, requested) => {
+                let chosen = match requested {
+                    Some(chosen) => chosen,
+                    None => ordered_logkeeper::ordered::RequestId::fresh(route.position, route.retry_positions)
+                        .map_err(super::refused)?,
+                };
+                let bytes = serde_json::to_vec(&chosen).map_err(|error| invalid(&error.to_string()))?;
+                records.put("installed-rotation", bytes.into()).await?;
+                chosen
+            }
+        };
         let epoch = self.worker.log_epoch();
         let position = |next: u64| {
             let offset = i64::try_from(next).ok().and_then(|next| next.checked_sub(1))
@@ -441,12 +551,17 @@ impl Placement {
             through: position(route.head.next_lsn)?,
         };
         let selection = node.sql_erasure_source(database, cut, checkpoint,
-            request.transaction, request.position, cancellation).await?;
+            intent.transaction, intent.position, cancellation).await?;
         let coordinator = erasure::ErasureCoordinator::new(&self.worker, custodian, &provider, keys.as_ref(), broker, operation)?;
         let staged = coordinator.stage_survivor(erasure::Erasure {
             placement, operation: operation.erase, custody_domain: operation.domain,
             incumbent: admission.grant, timing: erasure::ErasureTiming::OperationalTarget,
-        }, request.rotation, reservation, &selection, cancellation).await?;
+        }, rotation, reservation, &selection, cancellation).await?;
+        if self.erasure_signer.is_some() {
+            erasure::installed::Installed::remember(&provider, erasure::installed::Staged {
+                prepared: staged, base: route.checkpoint,
+            }).await?;
+        }
         Ok(staged.checkpoint)
     }
 

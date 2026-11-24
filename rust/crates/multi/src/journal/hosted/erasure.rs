@@ -21,6 +21,7 @@ use crate::replay_broker::{Client as CustodyBroker, domain};
 
 mod drain;
 mod evidence;
+pub(super) mod installed;
 pub use drain::{DrainRegistration, ErasureDrainJournal, SignedDrainJoin};
 pub(super) use drain::{
     record_checkpoint_disposition, record_serving_disposition, retirement_admitted,
@@ -43,7 +44,8 @@ pub struct SqlErasureRequest {
     pub rotation: RequestId,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Erasure {
     pub placement: Placement,
     pub operation: Uuid,
@@ -52,7 +54,8 @@ pub struct Erasure {
     pub timing: ErasureTiming,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedErasure {
     pub erasure: Erasure,
     pub checkpoint: Checkpoint,
@@ -332,12 +335,20 @@ impl<'a> ErasureCoordinator<'a> {
     }
 
     fn require_incumbent(&self, erasure: Erasure) -> Result<()> {
-        if erasure.placement != self.worker.placement() || erasure.operation != self.operation.erase
-            || erasure.custody_domain != self.operation.domain || !matches!(self.worker.authority(), Authority::Worker { enrollment } if enrollment == erasure.incumbent.enrollment)
-        {
+        self.require_placement(erasure)?;
+        if !matches!(self.worker.authority(), Authority::Worker { enrollment } if enrollment == erasure.incumbent.enrollment) {
             return Err(invalid(
                 "Erasure must address the installed credential of the incumbent",
             ));
+        }
+        Ok(())
+    }
+
+    fn require_placement(&self, erasure: Erasure) -> Result<()> {
+        if erasure.placement != self.custodian.placement() || erasure.operation != self.operation.erase
+            || erasure.custody_domain != self.operation.domain
+        {
+            return Err(invalid("Erasure must address this installed custodian and operation"));
         }
         if erasure.operation.is_nil()
             || erasure.custody_domain.is_nil()
@@ -358,7 +369,7 @@ impl<'a> ErasureCoordinator<'a> {
         custody: &dyn ErasureCustody,
         erasure: Erasure,
     ) -> Result<ErasureCommit> {
-        self.require_incumbent(erasure)?;
+        self.require_placement(erasure)?;
         self.authorize_root().await?;
         coordinate(self, self.keys, custody, erasure, self.authority.as_ref()).await
     }
@@ -380,7 +391,7 @@ impl<'a> ErasureCoordinator<'a> {
 
     /// Returns the immutable custody census for the certified decision.
     pub async fn registered_drain_roster(&self, ready: &CleanRecoverySlots) -> Result<Vec<DrainRegistration>> {
-        self.require_incumbent(ready.prepared().erasure)?;
+        self.require_placement(ready.prepared().erasure)?;
         drain::freeze(self.provider, ready).await
     }
 
@@ -393,7 +404,7 @@ impl<'a> ErasureCoordinator<'a> {
         commit: ErasureCommit,
         closed_at_ms: u64,
     ) -> Result<ErasureDrainJournal<'_>> {
-        self.require_incumbent(ready.prepared().erasure)?;
+        self.require_placement(ready.prepared().erasure)?;
         validate_commit(ready.prepared(), commit, Some(ready.binding()), self.authority.as_ref())?;
         if ready.deadline().is_some_and(|reservation| !matches_reservation(reservation, commit)) {
             return Err(invalid("The durable drain differs from the reserved custody roster"));
@@ -412,7 +423,7 @@ impl<'a> ErasureCoordinator<'a> {
         custody: &dyn ErasureCustody,
         commit: ErasureCommit,
     ) -> Result<Option<DestructionEvidence>> {
-        self.require_incumbent(commit.prepared.erasure)?;
+        self.require_placement(commit.prepared.erasure)?;
         let authority = self
             .authority
             .as_ref()
@@ -704,9 +715,13 @@ fn require_clean_slots(
     // The installed Logkeeper client authenticates the decision and exact
     // readback in this signature before returning it to custody.
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    digest.update(b"rtdb.multi/erasure-logkeeper-switch/v1\0");
-    digest.update(&slots.signature.issuer);
-    digest.update(&slots.signature.proof);
+    digest.update(b"rtdb.multi/erasure-logkeeper-switch/v2\0");
+    digest.update(&binding(prepared.erasure, prepared.rotation).descriptor()?);
+    digest.update(&prepared.checkpoint.root);
+    digest.update(&prepared.checkpoint.manifest);
+    digest.update(&prepared.checkpoint.cut.history);
+    digest.update(&prepared.checkpoint.cut.next_lsn.to_be_bytes());
+    digest.update(&successor.grant.key_generation.to_be_bytes());
     digest.update(&decision.receipt.position.to_be_bytes());
     let binding = digest.finish().as_ref().try_into().expect("SHA-256 width");
     Ok(CleanRecoverySlots {
