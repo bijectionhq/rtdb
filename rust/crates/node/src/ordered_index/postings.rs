@@ -466,7 +466,7 @@ fn select_array(
 
 fn compact_slice(array: &dyn Array, start: usize, len: usize) -> Result<Option<ArrayRef>> {
     let data = array.to_data();
-    // Arrow reports zero capacity for external owners, including a view into an entire source file.
+    // Callers have already established index-owned backing. Arrow may report only a custom view's extent.
     if data.buffers().iter().any(|buffer| buffer.capacity() == 0)
         || data.nulls().is_some_and(|nulls| nulls.buffer().capacity() == 0)
     {
@@ -723,28 +723,6 @@ impl SelectedColumn<'_> {
         }
     }
 
-    fn retain(&self, start: usize, len: usize) -> Result<Option<(Layout, ArrayRef)>> {
-        let Self::Typed(kind, Some(array), _) = *self else {
-            return Ok(None);
-        };
-        if !matches!(
-            kind,
-            Kind::Bool | Kind::Text | Kind::Binary | Kind::Uuid | Kind::InstantMicros
-        ) {
-            return Ok(None);
-        }
-        let Some(slice) = compact_slice(array, start, len)? else {
-            return Ok(None);
-        };
-        let values: ArrayRef = if kind == Kind::InstantMicros {
-            let times = arrow::<TimestampMicrosecondArray>(slice.as_ref())?;
-            Arc::new(Int64Array::new(times.values().clone(), None))
-        } else {
-            slice
-        };
-        Ok(Some((Layout(kind.bit()), values)))
-    }
-
     fn build(self, slot: usize, rows: &arrow_array::UInt32Array) -> Result<(Layout, ArrayRef)> {
         let bytes = self.payload();
         if bytes > i32::MAX as usize { return Err(invalid()); }
@@ -992,29 +970,16 @@ impl KeyBatch {
         if columns.is_empty() || rows.is_empty() {
             return Err(invalid());
         }
-        let start = rows[0] as usize;
-        let contiguous = rows
-            .iter()
-            .enumerate()
-            .all(|(offset, &row)| (row as usize).checked_sub(start) == Some(offset));
         let rows = arrow_array::UInt32Array::from(rows);
         let mut layouts = Vec::with_capacity(columns.len());
         let mut arrays = Vec::with_capacity(columns.len());
-        let mut retained_source = false;
         for (slot, column) in columns.into_iter().enumerate() {
-            let (layout, array) =
-                if contiguous && let Some(slice) = column.retain(start, rows.len())? {
-                    retained_source = true;
-                    slice
-                } else {
-                    column.build(slot, &rows)?
-                };
+            let (layout, array) = column.build(slot, &rows)?;
             layouts.push(layout);
             arrays.push(array);
         }
         let batch = RecordBatch::try_new(schema(BatchKind::Keys, &layouts)?, arrays).map_err(format_error)?;
-        // Page gathers copy keys that still borrow source buffers.
-        Self::new(layouts, batch, 0, !retained_source)
+        Self::new(layouts, batch, 0, true)
     }
 
     pub fn build(tuples: &[Tuple<'_>], kind: BatchKind, mut arrays: Vec<ArrayRef>) -> Result<Self> {
@@ -1500,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn source_projection_retains_compatible_spans_and_serializes_canonical_keys() {
+    fn source_projection_copies_contiguous_scalars_and_preserves_wire_bytes() {
         let text = StringArray::from([["skip"; 8], ["word"; 8]].concat());
         let binary = BinaryArray::from([[&b"skip"[..]; 8], [&b"data"[..]; 8]].concat());
         let uuid = FixedSizeBinaryArray::try_from_iter(
@@ -1531,7 +1496,7 @@ mod tests {
                     .buffers()
                     .iter()
                     .zip(output_data.buffers())
-                    .all(|(source, output)| { source.data_ptr() == output.data_ptr() })
+                    .all(|(source, output)| { source.data_ptr() != output.data_ptr() })
             );
         }
         let canonical = [
@@ -1557,6 +1522,39 @@ mod tests {
             rebuilt.encode(b"", b"").unwrap(),
             copied.encode(b"", b"").unwrap()
         );
+    }
+
+    #[test]
+    fn source_projection_releases_a_nonempty_custom_view_owner() -> Result<()> {
+        use arrow_buffer::OffsetBuffer;
+        use rtdb_columnar::MemoryBudget;
+
+        struct Source {
+            bytes: Vec<u8>,
+            _allocation: Arc<MemoryReservation>,
+        }
+
+        impl AsRef<[u8]> for Source {
+            fn as_ref(&self) -> &[u8] { &self.bytes[..3] }
+        }
+
+        let memory = MemoryBudget::new(4 << 20);
+        let size = 1 << 20;
+        let allocation = memory.reserve(size)?;
+        let mut bytes = vec![0; size];
+        bytes[..3].copy_from_slice(b"key");
+        let source = Buffer::from(Bytes::from_owner(Source { bytes, _allocation: allocation }));
+        assert_eq!(source.capacity(), 3);
+        let strings = StringArray::new(OffsetBuffer::new(vec![0, 3].into()), source, None);
+        let field = Field::new("key", DataType::Utf8, false);
+        let rows = vec![0];
+        let column = KeyColumn::new(Some((&field, &strings))).select(&rows)?;
+        let projected = KeyBatch::project(vec![column], rows)?;
+        assert_eq!(memory.used_bytes(), size);
+        drop(strings);
+        assert_eq!(memory.used_bytes(), 0);
+        assert!(matches!(Tuple::Arrow(&projected, 0).cell(0), AtomRef::Text("key")));
+        Ok(())
     }
 
     #[test]
