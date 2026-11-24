@@ -7,7 +7,7 @@ use arrow_array::{
     make_array, new_empty_array,
 };
 use arrow_buffer::{NullBufferBuilder, ScalarBuffer};
-use arrow_schema::{DataType, Field, UnionMode};
+use arrow_schema::{DataType, Field, UnionFields, UnionMode};
 use rtdb_columnar::{
     ArrowCell, MemoryBudget, MemoryReservation, copy_nullable_cells, estimate_copy_cell_bytes,
     estimate_null_copy_cell_bytes, from_field, leg_name,
@@ -328,51 +328,43 @@ pub(crate) fn relayout(
     else {
         return Ok(None);
     };
-    let generic_sequence = has_generic_sequence(field);
     let padding = estimate_null_copy_cell_bytes(field)?.checked_mul(4).ok_or_else(size_error)?;
-    let buffers = rows.iter().try_fold(0usize, |size, row| {
-        let bytes = match row {
-            OutputRow::Vector(vector, _) => {
-                let per_component = if generic_sequence { 512 } else { 32 };
-                vector.range.len().checked_mul(per_component).ok_or_else(size_error)?
-            }
-            OutputRow::Null | OutputRow::Padding => padding,
-            OutputRow::Scalar(cell, _) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
-                .checked_mul(4)
-                .ok_or_else(size_error)?,
-            OutputRow::Nested(cell, _) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
-                .checked_mul(4).and_then(|bytes| bytes.checked_add(padding)).ok_or_else(size_error)?,
-        };
-        size.checked_add(bytes).ok_or_else(size_error)
-    })?;
+    let Some(gather) = OutputGather::route(field, rows)? else { return Ok(None); };
+    let buffers = gather.buffer_bytes(padding)?;
     if charge.grow_to(charge.bytes().checked_add(buffers).ok_or_else(size_error)?).is_err() {
         return Ok(None);
     }
-    let Some(array) = gather(field, &rows)? else {
-        return Ok(None);
-    };
-    drop(rows);
+    let Some(array) = gather.finish()? else { return Ok(None); };
     charge.shrink_to(array.get_array_memory_size())?;
     Ok(Some((array, scratch)))
 }
 
-fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
-    if rows.is_empty() {
-        return Ok(Some(new_empty_array(field.data_type())));
-    }
-    if field.data_type() == &DataType::Null {
-        return Ok(rows.iter().all(|row| matches!(row, OutputRow::Padding) || field.is_nullable() && matches!(row, OutputRow::Null))
-            .then(|| Arc::new(NullArray::new(rows.len())) as ArrayRef));
-    }
-    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+enum OutputGather<'a, 'f> {
+    Plain {
+        field: &'f Field,
+        rows: Vec<OutputRow<'a>>,
+    },
+    Union {
+        fields: &'f UnionFields,
+        ids: Vec<i8>,
+        offsets: Vec<i32>,
+        legs: Vec<Vec<OutputRow<'a>>>,
+    },
+}
+
+impl<'a, 'f> OutputGather<'a, 'f> {
+    fn route(field: &'f Field, rows: Vec<OutputRow<'a>>) -> Result<Option<Self>> {
+        let DataType::Union(fields, UnionMode::Dense) = field.data_type() else {
+            return Ok(Some(Self::Plain { field, rows }));
+        };
+        if rows.is_empty() {
+            return Ok(Some(Self::Plain { field, rows }));
+        }
         let mut ids = Vec::with_capacity(rows.len());
         let mut offsets = Vec::with_capacity(rows.len());
-        let mut legs = fields
-            .iter()
-            .map(|(_, field)| (field, Vec::new()))
-            .collect::<Vec<_>>();
+        let mut legs = fields.iter().map(|_| Vec::new()).collect::<Vec<_>>();
         for row in rows {
-            let leg = fields.iter().enumerate().find(|(position, (_, field))| match row {
+            let leg = fields.iter().enumerate().find(|(position, (_, field))| match &row {
                 OutputRow::Vector(vector, _) => list_width(field) == Some(vector.width),
                 OutputRow::Null => field.data_type() == &DataType::Null && field.is_nullable(),
                 OutputRow::Padding => *position == 0,
@@ -384,16 +376,31 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
                         _ => false,
                     }),
             });
-            let Some((index, (id, _))) = leg else {
-                return Ok(None);
-            };
+            let Some((index, (id, _))) = leg else { return Ok(None); };
             ids.push(id);
-            offsets.push(i32::try_from(legs[index].1.len()).map_err(|_| size_error())?);
-            legs[index].1.push(row.clone());
+            offsets.push(i32::try_from(legs[index].len()).map_err(|_| size_error())?);
+            legs[index].push(row);
         }
-        let children = legs
-            .iter()
-            .map(|(field, rows)| {
+        Ok(Some(Self::Union { fields, ids, offsets, legs }))
+    }
+
+    fn buffer_bytes(&self, padding: usize) -> Result<usize> {
+        match self {
+            Self::Plain { field, rows } => gather_buffer_bytes(field, rows, padding),
+            Self::Union { fields, legs, .. } => fields.iter().zip(legs)
+                .try_fold(0usize, |size, ((_, field), rows)| {
+                    size.checked_add(gather_buffer_bytes(field, rows, padding)?).ok_or_else(size_error)
+                }),
+        }
+    }
+
+    fn finish(self) -> Result<Option<ArrayRef>> {
+        let (fields, ids, offsets, legs) = match self {
+            Self::Plain { field, rows } => return gather_plain(field, &rows),
+            Self::Union { fields, ids, offsets, legs } => (fields, ids, offsets, legs),
+        };
+        let children = fields.iter().zip(legs)
+            .map(|((_, field), rows)| {
                 if field.data_type() == &DataType::Null {
                     Ok(Some(Arc::new(NullArray::new(rows.len())) as ArrayRef))
                 } else {
@@ -401,14 +408,41 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
                 }
             })
             .collect::<Result<Option<Vec<ArrayRef>>>>()?;
-        let Some(children) = children else {
-            return Ok(None);
+        let Some(children) = children else { return Ok(None); };
+        Ok(UnionArray::try_new(fields.clone(), ids.into(), Some(offsets.into()), children)
+            .ok()
+            .map(|array| Arc::new(array) as ArrayRef))
+    }
+}
+
+fn gather_buffer_bytes(field: &Field, rows: &[OutputRow<'_>], padding: usize) -> Result<usize> {
+    let per_component = if uses_native_vectors(field, rows) { 32 } else { 512 };
+    rows.iter().try_fold(0usize, |size, row| {
+        let bytes = match row {
+            OutputRow::Vector(vector, _) => vector.range.len().checked_mul(per_component).ok_or_else(size_error)?,
+            OutputRow::Null | OutputRow::Padding => padding,
+            OutputRow::Scalar(cell, _) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
+                .checked_mul(4)
+                .ok_or_else(size_error)?,
+            OutputRow::Nested(cell, _) => estimate_copy_cell_bytes(cell.field, cell.array, cell.row)?
+                .checked_mul(4).and_then(|bytes| bytes.checked_add(padding)).ok_or_else(size_error)?,
         };
-        return Ok(
-            UnionArray::try_new(fields.clone(), ids.into(), Some(offsets.into()), children)
-                .ok()
-                .map(|array| Arc::new(array) as ArrayRef),
-        );
+        size.checked_add(bytes).ok_or_else(size_error)
+    })
+}
+
+fn gather(field: &Field, rows: Vec<OutputRow<'_>>) -> Result<Option<ArrayRef>> {
+    let Some(gather) = OutputGather::route(field, rows)? else { return Ok(None); };
+    gather.finish()
+}
+
+fn gather_plain(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
+    if rows.is_empty() {
+        return Ok(Some(new_empty_array(field.data_type())));
+    }
+    if field.data_type() == &DataType::Null {
+        return Ok(rows.iter().all(|row| matches!(row, OutputRow::Padding) || field.is_nullable() && matches!(row, OutputRow::Null))
+            .then(|| Arc::new(NullArray::new(rows.len())) as ArrayRef));
     }
     if super::scalar_layout(field.data_type()) {
         let mut converted = Vec::with_capacity(rows.len());
@@ -447,10 +481,10 @@ fn gather(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
     if let DataType::Struct(fields) = field.data_type() {
         return gather_struct(field, fields, rows);
     }
-    if vector_width(field).is_none() || rows.iter().any(|row| matches!(row, OutputRow::Nested(..))) {
-        return gather_sequence(field, rows);
+    if uses_native_vectors(field, rows) {
+        return gather_vectors(field, rows);
     }
-    gather_vectors(field, rows)
+    gather_sequence(field, rows)
 }
 
 fn gather_struct(field: &Field, fields: &arrow_schema::Fields, rows: &[OutputRow<'_>]) -> Result<Option<ArrayRef>> {
@@ -478,7 +512,7 @@ fn gather_struct(field: &Field, fields: &arrow_schema::Fields, rows: &[OutputRow
             child_row(child, types.get(field.name())?)
         }).collect::<Option<Vec<_>>>();
         let Some(rows) = rows else { return Ok(None); };
-        let Some(array) = gather(field, &rows)? else { return Ok(None); };
+        let Some(array) = gather(field, rows)? else { return Ok(None); };
         arrays.push(array);
     }
     Ok(rtdb_columnar::build_struct_array(fields.clone(), &arrays, rows.len(), valid.finish()).ok())
@@ -531,7 +565,7 @@ fn gather_sequence(field: &Field, rows: &[OutputRow<'_>]) -> Result<Option<Array
             offsets.push(offset);
         }
     }
-    let Some(values) = gather(child, &selections)? else { return Ok(None); };
+    let Some(values) = gather(child, selections)? else { return Ok(None); };
     if matches!(field.data_type(), DataType::Map(_, _))
         && (values.null_count() != 0 || values.as_struct().column(0).logical_null_count() != 0)
     {
@@ -627,11 +661,8 @@ fn scalar_leg(field: &Field, scalar: &ScalarType) -> bool {
     from_field(field).is_ok_and(|logical| nonnull(&logical) == &LogicalType::Scalar(scalar.clone()))
 }
 
-fn has_generic_sequence(field: &Field) -> bool {
-    match field.data_type() {
-        DataType::Union(fields, UnionMode::Dense) => fields.iter().any(|(_, field)| has_generic_sequence(field)),
-        _ => list_width(field).is_some() && vector_width(field).is_none(),
-    }
+fn uses_native_vectors(field: &Field, rows: &[OutputRow<'_>]) -> bool {
+    vector_width(field).is_some() && !rows.iter().any(|row| matches!(row, OutputRow::Nested(..)))
 }
 
 fn gather_components(
