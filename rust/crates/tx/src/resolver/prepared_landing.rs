@@ -1,6 +1,6 @@
-use rtdb_types::{BlockIndex, CatalogCut, OwnedWorld};
+use rtdb_types::{BlockIndex, CatalogCut, OwnedWorld, PlacedAttemptScope};
 
-use super::prepared_landing_basis::{LandingBasis, generation_matches};
+use super::prepared_landing_basis::{LandingBasis, prepared_authority_matches, select_generation};
 use super::*;
 
 const MAX_GENERATION_BYTES: usize = 16 << 20;
@@ -9,6 +9,7 @@ pub(crate) struct PreparedLanding {
     catalog: CatalogCut,
     writes: StagedWrite,
     slot: crate::OwnedClockSlot,
+    scope: PlacedAttemptScope,
     refused: bool,
 }
 
@@ -115,7 +116,7 @@ impl SourceTransaction {
             let batch = write.batch().ok_or_else(invalid)?;
             remaining = remaining.checked_sub(batch.arrow().get_array_memory_size()).ok_or_else(too_large)?;
         }
-        self.prepared_landing = Some(PreparedLanding { catalog, writes, slot, refused });
+        self.prepared_landing = Some(PreparedLanding { catalog, writes, slot, scope, refused });
         Ok(())
     }
 }
@@ -149,10 +150,10 @@ impl PreparedLanding {
     pub(super) fn choose(
         self, base: &Snapshot, assigned: TransactionKey, slot: Option<crate::OwnedClockSlot>,
         primary: &[Operation], refusal: &[Operation],
-        scope: Option<rtdb_types::PlacedAttemptScope>, context: &ResolveContext,
+        scope: Option<PlacedAttemptScope>, context: &ResolveContext,
     ) -> Result<(StagedWrite, bool)> {
         require_landing(primary, refusal)?;
-        if slot != Some(self.slot) || scope.is_none() || scope != context.owned_witness_scope {
+        if !prepared_authority_matches(self.slot, self.scope, slot, scope, context.owned_witness_scope) {
             return Err(OwnedWorld::unavailable());
         }
         let prepared = landing_basis(
@@ -162,13 +163,11 @@ impl PreparedLanding {
             base.tx_basis().ok_or_else(stale)?, base.block_index(), base.catalog_cut().ok_or_else(stale)?,
         );
         let staged_key = self.writes.tx_key();
-        if !generation_matches(
+        select_generation(
             prepared, installed,
             (staged_key.tx_id.0, staged_key.system_time.0),
             (assigned.tx_id.0, assigned.system_time.0),
-        ) {
-            return Err(stale());
-        }
-        Ok((self.writes, self.refused))
+            self.writes, self.refused,
+        ).ok_or_else(stale)
     }
 }
