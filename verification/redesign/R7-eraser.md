@@ -120,6 +120,8 @@ It binds the verified provider disposition to the same drain when reporting root
 The broker checks installed query and copy registration signatures against each root's admission key.
 The originating process uses a separate signer for each work owner's terminal evidence.
 Query and transport custody follows the held catalog, and checkpoint copy custody follows the retained provider owner.
+The mounted serving store and journal each retain a working-plaintext duty through their I/O regions.
+The SQL submission entry registers before accepting a new transaction.
 A missing join remains pending, including after loss of its process.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
 The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring key inventory, custody work roster and latest destruction time.

@@ -68,6 +68,7 @@ pub struct NodeServices {
 pub trait ReadFence: Send + Sync {
     async fn confirm(&self, database: &str) -> Result<()>;
     fn hold_active_call(&self, _database: &Database) -> Option<Box<dyn Send + Sync>> { None }
+    async fn hold_transaction_custody(&self, _database: &Database) -> Result<Option<Arc<dyn Send + Sync>>> { Ok(None) }
     async fn confirm_hosted(&self, _database: &Database) -> Result<String> {
         Err(hosted_source_unavailable())
     }
@@ -733,6 +734,10 @@ impl Node {
             return Err(owned_relations_disabled());
         }
         let database = self.attached_database(database, placement)?;
+        let _custody = match &self.read_fence {
+            Some(fence) => fence.hold_transaction_custody(&database).await?,
+            None => None,
+        };
         let admission = if self.catalog.is_placed() {
             Some(cancellation.run_until_cancelled(database.admit_transaction()).await.ok_or_else(cancelled)??)
         } else { None };

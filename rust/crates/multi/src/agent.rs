@@ -1617,6 +1617,13 @@ impl NodeAgent {
         }
     }
 
+    pub(crate) async fn hold_transaction_custody(&self, database: &Database) -> Result<Option<Arc<dyn Send + Sync>>> {
+        match self.ordered.by_name(database.name()) {
+            Some(placement) => placement.hold_worker_custody(&self.ordered_releases).await,
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn hold_active_call(self: &Arc<Self>, database: &Database) -> Option<Box<dyn Send + Sync>> {
         let mut holdings = self.holdings.lock();
         let holding = holdings.get_mut(database.name()).filter(|holding| std::ptr::eq(holding.database.as_ptr(), database))?;

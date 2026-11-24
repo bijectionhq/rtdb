@@ -278,6 +278,11 @@ impl rtdb_node::ReadFence for FenceSlot {
         self.agent.get()?.upgrade()?.hold_active_call(database)
     }
 
+    async fn hold_transaction_custody(&self, database: &rtdb_node::Database) -> Result<Option<Arc<dyn Send + Sync>>> {
+        let agent = self.agent.get().and_then(std::sync::Weak::upgrade).ok_or_else(stopped_agent)?;
+        agent.hold_transaction_custody(database).await
+    }
+
     async fn confirm(&self, database: &str) -> Result<()> {
         match self.agent.get() {
             Some(agent) => agent.upgrade().ok_or_else(stopped_agent)?.confirm_read(database).await,

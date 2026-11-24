@@ -438,6 +438,13 @@ impl Placement {
         Ok(staged.checkpoint)
     }
 
+    pub(crate) async fn hold_worker_custody(&self, tasks: &TaskTracker) -> Result<Option<Arc<dyn Send + Sync>>> {
+        match &self.custody_work {
+            Some(owner) => owner.hold(erasure::CustodyWork::Plaintext, tasks).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn hold_query_custody(&self, tasks: &TaskTracker) -> Result<Option<Arc<dyn Send + Sync>>> {
         let Some(owner) = &self.custody_work else { return Ok(None); };
         let plaintext = owner.hold(erasure::CustodyWork::Plaintext, tasks).await?;
@@ -1013,13 +1020,14 @@ impl LogFactory for Logs {
         cancellation: CancellationToken,
     ) -> Result<OpenedLogs> {
         let (placement, attachment) = self.routes.resolve(configuration)?;
+        let custody = placement.hold_worker_custody(&self.releases).await?;
         let material = material(self.keys.as_ref(), &placement.record).await?;
         let max_frame = crate::process::MAXIMUM_LOG_MESSAGE_BYTES;
         let admission = match attachment.admission {
             AttachmentAdmission::Writer { admission } if access == LogAccess::ReadWrite => admission,
             AttachmentAdmission::Reader { epoch, hold, .. } if access == LogAccess::ReadOnly => {
                 let replica = JournalLog::open_reader(Arc::clone(&placement.worker), Arc::clone(&self.keys),
-                    epoch, placement.retained_reader(hold)?, max_frame, self.releases.clone()).await?;
+                    epoch, placement.retained_reader(hold)?, max_frame, self.releases.clone(), custody).await?;
                 return crate::logs::ordered_reader_opened(replica, &material, &placement.record, epoch,
                     attachment.base.checkpoint, max_frame);
             }
@@ -1037,6 +1045,7 @@ impl LogFactory for Logs {
             max_frame,
             placement.journal_window_bytes,
             self.releases.clone(),
+            custody,
         )
         .await?;
         crate::logs::ordered_opened(

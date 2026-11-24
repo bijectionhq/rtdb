@@ -137,6 +137,8 @@ impl RemoteStorageFactory for StoreFactory {
     ) -> Result<OpenedRecoveryStore> {
         use rtdb_s3::WriteAuthorization;
         let (placement, attachment) = self.routes.resolve(configuration)?;
+        let custody = placement.hold_worker_custody(&self.releases).await?;
+        let io = io.child_holding(custody);
         let (grant, hold) = match attachment.admission {
             AttachmentAdmission::Writer { admission } => (admission.grant, admission.recovery),
             AttachmentAdmission::Reader { epoch, hold, .. } => {

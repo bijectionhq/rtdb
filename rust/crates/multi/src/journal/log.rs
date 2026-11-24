@@ -199,6 +199,7 @@ impl JournalLog {
         maximum_message_bytes: usize,
         configured_window: Option<u64>,
         tasks: TaskTracker,
+        custody: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<Self>> {
         let current = journal.route().await.map_err(storage)?;
         if current.writer.grant != Some(admission.grant)
@@ -218,7 +219,7 @@ impl JournalLog {
         let reads = Arc::new(Reads {
             journal,
             keys,
-            io: IoRegion::new(),
+            io: IoRegion::new().child_holding(custody),
             tip: AtomicI64::new(latest(current.head).map_err(storage)?.0),
             tasks,
             maximum: maximum_message_bytes,
@@ -247,9 +248,10 @@ impl JournalLog {
         recovery: Arc<Held>,
         maximum: usize,
         tasks: TaskTracker,
+        custody: Option<Arc<dyn Send + Sync>>,
     ) -> Result<Arc<Self>> {
         let reads = Arc::new(Reads {
-            journal, keys, io: IoRegion::new(), maximum, tasks,
+            journal, keys, io: IoRegion::new().child_holding(custody), maximum, tasks,
             tip: AtomicI64::new(latest(recovery.scope().through).map_err(storage)?.0),
             unsettled: Mutex::new(Vec::new()), reader_epoch: Some(epoch),
         });

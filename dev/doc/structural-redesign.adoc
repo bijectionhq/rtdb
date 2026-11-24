@@ -276,6 +276,8 @@ Logkeeper fences appends and normal grants while that erasure preparation owns t
 The coordinator requires the broker's signed domain drain before enabling provider retirement.
 An enrolled installed worker registers signed plaintext and egress duties with its catalog hold and registers checkpoint copies before reading.
 The process signs the join after the last retained view, delivery, or provider operation releases the duty.
+Installed database attachments also retain signed plaintext duties through their serving store and replica log.
+The SQL submission entry checks broker admission before accepting new work.
 Production processing still needs dependent-root survivor staging, complete runtime enrollment, and an installed adapter that signs and submits root and provider evidence.
 
 |8
