@@ -29,6 +29,29 @@ pub(crate) struct WorldArchive {
 
 #[async_trait::async_trait]
 impl rtdb_node::WorldConstraintArchive for WorldArchive {
+    async fn claim_assertion_family_fence(&self, claim: rtdb_node::AssertionFenceClaim<'_>) -> Result<()> {
+        let unavailable = OwnedWorld::unavailable;
+        let installed = self.directory.deployment_by_name(claim.database).await?.ok_or_else(unavailable)?;
+        let deployment = Uuid::parse_str(&installed.id).map_err(|_| unavailable())?;
+        let expected = PlacedAttemptScope::new(&installed.stream("replica"), installed.epoch)?;
+        if claim.attempt.scope() != expected || installed.writer_pool().is_none() {
+            return Err(unavailable());
+        }
+        let selected_line = claim.retirement_world.map_or_else(
+            || crate::keys::assertion_root_line(deployment, installed.log_epoch),
+            |world| world.0,
+        );
+        if claim.marker.selected.line_generation != selected_line {
+            return Err(rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Conflict,
+                "rtdb.owned/assertion-family-fence-marker", "The retirement and selected assertion belong to different lines"));
+        }
+        let client_family = Uuid::from_bytes(claim.family);
+        let family = crate::keys::family_vault_address(deployment, client_family);
+        let region = rtdb_storage::IoRegion::new();
+        let families = self.keys.assertion_families(region).ok_or_else(unavailable)?;
+        families.claim_fence(family, client_family, claim.marker, claim.attempt, claim.durable_predecessor, claim.root_erases).await
+    }
+
     async fn check(&self, check: rtdb_node::ArchivedWorldConstraints<'_>) -> Result<()> {
         let unavailable = OwnedWorld::unavailable;
         let installed = self.directory.deployment_by_name(check.database).await?.ok_or_else(unavailable)?;
@@ -1208,9 +1231,10 @@ impl HeldCheckpointWorld {
         } else {
             None
         };
-        let historical = parent_at.is_some();
+        let historical = earlier.is_some() || parent_at.is_some();
+        let query = if historical { query.exact() } else { query };
         let writable = self.clock_mode().is_writable();
-        let use_overlay = writable && !historical
+        let use_overlay = writable && parent_at.is_none()
             && !earlier.is_some_and(|(system, parent_only)| parent_only || self.uses_frozen_overlay(Some(system)));
         let overlay = if use_overlay {
             let shadows = match staged {
@@ -1223,7 +1247,7 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Nearest {
-            partitions, frontiers, query, overlay, historical: earlier.is_some() || historical,
+            partitions, frontiers, query, overlay, historical,
             ancestor_schemas, ancestor_system, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await

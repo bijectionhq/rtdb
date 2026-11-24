@@ -932,6 +932,10 @@ impl HostedControlWrite {
             && matches!(self.id(), EntityId::String(id) if landing_receipt_slot(id).is_some_and(|(slot, _)| slot == 0))
     }
 
+    pub fn is_assertion_family_marker(&self) -> bool {
+        self.name() == rtdb_types::ASSERTION_FAMILY_FENCES && !self.is_check()
+    }
+
     pub fn is_check(&self) -> bool {
         self.check_only
     }
@@ -2103,7 +2107,7 @@ pub(crate) fn root_partition_frontiers_match(operations: &[crate::source::Operat
             return Some(relation.name());
         }
         match op {
-            Operation::Public(TxOp::OwnedDelete { relation, .. }) if relation.is_root_data() => Some(relation.name()),
+            Operation::Public(TxOp::OwnedDelete { relation, .. } | TxOp::OwnedErase { relation, .. }) if relation.is_root_data() => Some(relation.name()),
             _ => None,
         }
     }).collect::<std::collections::BTreeSet<_>>();

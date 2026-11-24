@@ -554,6 +554,9 @@ contract LogService {
 
     @invariant OriginalAssertionFamilyCustody
         -- The original operation vault keeps current assertion family records outside data archives.
+        -- The retiring source publication orders the immutable logical family fence together with the exact derived Root erasures.
+        -- A pending vault claim freezes the enrolled inventory until the original source confirms its marker or a durable abort horizon.
+        -- Ordinary and archive releases resolve pending claims against current original custody.
         -- A landing enrolls its destination and separate private link stages in a live family before provisioning either capability.
         -- A fenced family denies activation and current admission for every enrolled occurrence.
         -- Either the Proposal original or an active landed occurrence can close the same family.

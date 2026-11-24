@@ -133,6 +133,7 @@ enum CommitEffects {
     Facts,
     HostedRoot,
     HostedCatalog,
+    FamilyFence,
     Replay,
 }
 
@@ -140,6 +141,8 @@ impl CommitEffects {
     fn hosted(replay: bool, conditional: bool, controls: &[rtdb_tx::HostedControlWrite]) -> Self {
         if replay {
             Self::Replay
+        } else if controls.iter().any(rtdb_tx::HostedControlWrite::is_assertion_family_marker) {
+            Self::FamilyFence
         } else if !conditional && !controls.is_empty() {
             Self::HostedRoot
         } else if controls.iter().any(rtdb_tx::HostedControlWrite::replaces_root_catalog) {
@@ -1992,7 +1995,7 @@ impl Service {
                 }
                 replay_residue(relation, own_id()?, archive_origin, valid_from, valid_to)?
             }
-            "erase" if matches!(effects, CommitEffects::Replay) => {
+            "erase" if relation.is_root_data() && matches!(effects, CommitEffects::Replay | CommitEffects::FamilyFence) => {
                 if valid_from.is_some() || valid_to.is_some() || has_payload()? {
                     return Err(invalid("Owned erase requires only a typed identity and optional observation"));
                 }
@@ -2079,7 +2082,7 @@ impl Service {
                     }
                     replay_residue(relation, id, archive_origin.as_deref(), valid_from, valid_to)?
                 }
-                "erase" if matches!(effects, CommitEffects::Replay) => {
+                "erase" if relation.is_root_data() && matches!(effects, CommitEffects::Replay | CommitEffects::FamilyFence) => {
                     if valid_from.is_some() || valid_to.is_some() || has_payload(&row) {
                         return Err(invalid("Owned erase requires only a typed identity and optional observation"));
                     }
@@ -5479,7 +5482,7 @@ impl Service {
         let _root_framing = call.reserve(ordered_group_count(root)? * 512)?;
         let mut root_ops = Vec::new();
         let _root_groups = self.decode_owned_commit_groups(
-            call, envelope, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, CommitEffects::Facts,
+            call, envelope, owned_groups(root, false, true)?, &mut root_ops, &mut rows_left, CommitEffects::FamilyFence,
         )?;
         let mut root = rtdb_node::OwnedRootSection { checks: counts, ..Default::default() };
         let mut root_writes = Vec::new();
@@ -5490,6 +5493,8 @@ impl Service {
                 _ if root_attempt.is_some() && (rtdb_tx::is_root_partition_frontier(&operation) || rtdb_tx::is_public_root_version_marker(&operation)) =>
                     root_writes.push(operation),
                 _ if proposal_land && rtdb_tx::is_proposal_landing_frontier(&operation) =>
+                    root_writes.push(operation),
+                TxOp::OwnedErase { relation, .. } if *root_kind == 2 && relation.is_root_data() =>
                     root_writes.push(operation),
                 TxOp::OwnedInsertDocs { relation, .. } | TxOp::OwnedReplaceDocs { relation, .. }
                 | TxOp::OwnedArrowDocs { relation, .. } | TxOp::OwnedRelativePeriod { relation, .. } | TxOp::OwnedDelete { relation, .. }
@@ -5539,7 +5544,9 @@ impl Service {
         let controls = owned_groups(body, true, false)?;
         hosted_control::admit_control_targets(policy, controls.iter().map(|(relation, _)| relation))?;
         let scope = self.hosted_control_scope(call).await?;
-        let (mut controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left, !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
+        let family_fence = controls.iter().any(|(relation, _)| relation.name() == rtdb_types::ASSERTION_FAMILY_FENCES);
+        let (mut controls, _charges) = self.decode_hosted_control_groups(call, controls, scope, &mut rows_left,
+            !family_fence && !release && !delete_root && !proposal_overlay && !proposal_land && !proposal_close)?;
         rtdb_tx::bind_installed_authority(&mut controls, authority).map_err(status)?;
         let _refusal_charge = if !refusal.is_empty() {
             hosted_control::admit_control_targets(policy, refusal.iter().map(|(relation, _)| relation))?;

@@ -1187,7 +1187,7 @@ The placed Root fork form with clock selector 11 takes a public marker's origina
 
 === Assertion-family custody
 
-The placed writer keeps per-copy custody of protected rows through the `rtdb.owned` family actions: `AssertionFamilyScope.v1`, `EnrollAssertionFamily.v1`, `EnrollFamilyWorldRow.v1`, `RegisterAssertionFamily.v1`, `ReserveFamilyLanding.v1`, `ActivateFamilyLanding.v2`, `SealFamilyLandingLink.v2`, `SealFamilyLandingPayload.v1`, `OpenFamilyLandingPayload.v1`, `RequireLiveFamilyOccurrence.v1`, `RequireFamilyPositionOpen.v1`, `RegisterFamilyDerived.v1`, `SealWorldOverlayRow.v1`, `OpenWorldOverlayRow.v1`, `FenceAssertionFamily.v1` and `SettleAssertionFamily.v1`.
+The placed writer keeps per-copy custody of protected rows through the `rtdb.owned` family actions: `AssertionFamilyScope.v1`, `EnrollAssertionFamily.v1`, `EnrollFamilyWorldRow.v1`, `RegisterAssertionFamily.v1`, `ReserveFamilyLanding.v1`, `ActivateFamilyLanding.v2`, `SealFamilyLandingLink.v2`, `SealFamilyLandingPayload.v1`, `OpenFamilyLandingPayload.v1`, `ResolveFamilyMember.v1`, `RequireLiveFamilyOccurrence.v1`, `RequireFamilyPositionOpen.v1`, `RegisterFamilyDerived.v1`, `SealWorldOverlayRow.v1`, `OpenWorldOverlayRow.v1`, `FenceAssertionFamily.v1` and `SettleAssertionFamily.v1`.
 They require owned native actions and the placed world host.
 Families are addressed within the attached deployment, and every capability must name that deployment's current incarnation.
 link:../../../dev/doc/rtdb-assertion-families.md[The assertion-family wire contract] defines the frames, the derived search inventory and the fence across dependent forks.

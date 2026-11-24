@@ -1942,6 +1942,8 @@ impl<'a> OpenTransaction<'a> {
         }
         if let Some(replay) = &replay {
             self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
+        } else if proposal_land.is_none() && !publications.is_empty() {
+            self.buffer.retain_world_carrier_positions()?;
         }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
@@ -2327,6 +2329,8 @@ impl<'a> OpenTransaction<'a> {
             if !crate::hosted_control::root_partition_frontiers_match(operations) {
                 return Err(unavailable());
             }
+            let family_fence = operations.iter().any(|operation| matches!(operation,
+                Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker()));
             for (index, operation) in operations.iter().enumerate() {
                 let size = match operation {
                     _ if root_publication.is_some() && crate::hosted_control::source_public_root_version_marker(operation) => 1,
@@ -2340,6 +2344,11 @@ impl<'a> OpenTransaction<'a> {
                     }
                     Operation::Public(TxOp::OwnedDelete { relation, .. })
                         if root_publication.is_some() && relation.is_root_data() => {
+                        root_rows += 1;
+                        1
+                    }
+                    Operation::Public(TxOp::OwnedErase { relation, .. })
+                        if family_fence && root_publication.is_some() && relation.is_root_data() => {
                         root_rows += 1;
                         1
                     }
@@ -2367,7 +2376,7 @@ impl<'a> OpenTransaction<'a> {
                         counts.entry(world).or_default().1 += 1;
                         1
                     }
-                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() || proposal_overlay.is_some() => {
+                    Operation::Public(TxOp::HostedControl(control)) if control.is_check() || control.is_assertion_family_marker() || proposal_overlay.is_some() => {
                         hosted = true;
                         1
                     }

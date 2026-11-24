@@ -1049,6 +1049,7 @@ struct WritePosition { events: usize, batches: usize }
 
 enum OwnedCommitPositions {
     Landing(u32),
+    WorldCarriers(u32),
     Archive {
         remaining: std::collections::BTreeSet<u32>,
         direct: Option<DirectArchiveEffect>,
@@ -1081,6 +1082,16 @@ impl TransactionBuffer {
     pub fn retain_owned_positions(&mut self) -> Result<()> {
         self.select_owned_positions(OwnedCommitPositions::Landing(0))
     }
+    pub fn retain_world_carrier_positions(&mut self) -> Result<()> {
+        self.select_owned_positions(OwnedCommitPositions::WorldCarriers(0))
+    }
+
+    fn positions_world_carrier(table: &TableRef) -> bool {
+        table.owned_world_root_table().and_then(|root| {
+            root.owned_storage_name().map(|name| name == "fact_unit_column_payloads")
+        }) == Some(true)
+    }
+
     pub fn retain_archived_owned_positions(&mut self, positions: Vec<u32>) -> Result<()> {
         if positions.first().is_some_and(|first| *first == 0)
             || !positions.windows(2).all(|pair| pair[0] < pair[1])
@@ -1121,7 +1132,9 @@ impl TransactionBuffer {
         self.owned_positions = Some(positions);
         Ok(())
     }
-    pub fn retains_owned_positions(&self) -> bool { self.owned_positions.is_some() }
+    pub fn retains_owned_positions(&self) -> bool {
+        matches!(self.owned_positions, Some(OwnedCommitPositions::Landing(_) | OwnedCommitPositions::Archive { .. }))
+    }
     pub fn require_archived_positions_consumed(&self) -> Result<()> {
         if matches!(&self.owned_positions, Some(OwnedCommitPositions::Archive { remaining, direct, .. }) if !remaining.is_empty() || direct.is_some()) {
             return Err(invalid("The archived transaction omitted positioned effects"));
@@ -1284,6 +1297,10 @@ impl TransactionBuffer {
                 Some(OwnedCommitPositions::Landing(previous)) => {
                     Some(next_landing_position(*previous).ok_or_else(|| invalid("Owned commit position overflow"))?)
                 },
+                Some(OwnedCommitPositions::WorldCarriers(previous)) if Self::positions_world_carrier(table) => {
+                    Some(next_landing_position(*previous).ok_or_else(|| invalid("Owned commit position overflow"))?)
+                },
+                Some(OwnedCommitPositions::WorldCarriers(_)) => None,
                 Some(OwnedCommitPositions::Archive { direct, .. }) => {
                     let effect = direct.as_ref().filter(|effect| &effect.table == table && !effect.staged)
                         .ok_or_else(|| invalid("An owned event differs from its direct archive effect"))?;
@@ -1298,7 +1315,7 @@ impl TransactionBuffer {
 
     fn consume_owned_position(&mut self, position: u32) {
         match &mut self.owned_positions {
-            Some(OwnedCommitPositions::Landing(previous)) => *previous = position,
+            Some(OwnedCommitPositions::Landing(previous) | OwnedCommitPositions::WorldCarriers(previous)) => *previous = position,
             Some(OwnedCommitPositions::Archive { remaining, direct, .. }) => {
                 if let Some(effect) = direct {
                     effect.staged = true;
@@ -1340,7 +1357,10 @@ impl TransactionBuffer {
     fn append_unpositioned_batch(
         &mut self, table: &TableRef, batch: OwnedBatch, assembled_declarations: Option<&StructFields<LogicalType>>,
     ) -> Result<()> {
-        if self.retains_owned_positions() && table.is_owned_event_data() {
+        if table.is_owned_event_data() && (self.retains_owned_positions()
+            || matches!(self.owned_positions, Some(OwnedCommitPositions::WorldCarriers(_)))
+                && Self::positions_world_carrier(table))
+        {
             return Err(invalid("An ordered landing stages governed events in assertion order"));
         }
         self.append_batch_inner(table, batch, assembled_declarations)

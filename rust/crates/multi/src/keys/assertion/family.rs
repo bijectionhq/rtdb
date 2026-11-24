@@ -125,6 +125,16 @@ pub struct WorldRowSlot<'a> {
     pub key: &'a [u8],
 }
 
+pub(crate) fn assertion_root_line(deployment: Uuid, log_epoch: i32) -> [u8; 16] {
+    let mut line = Context::new(&SHA256);
+    line.update(b"rtdb.owned/assertion-line/v1\0");
+    line.update(deployment.as_bytes());
+    line.update(&log_epoch.to_be_bytes());
+    let mut root_line = [0; 16];
+    root_line.copy_from_slice(&line.finish().as_ref()[..16]);
+    root_line
+}
+
 pub(crate) fn family_vault_address(deployment: Uuid, family: Uuid) -> Uuid {
     let mut address = Context::new(&SHA256);
     address.update(b"rtdb.owned/assertion-family/v1\0");
@@ -496,6 +506,23 @@ impl<'a> AssertionFamilies<'a> {
         }).await
     }
 
+    /// Locate the admitted member of a reviewed world rewrite.
+    pub async fn resolve_member(&self, family: Uuid, assertion: AssertionId) -> Result<FamilyOccurrence> {
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
+        record.require_live()?;
+        let occurrence = if record.original.assertion == assertion {
+            let position = record.original_position.ok_or_else(conflict)?.0;
+            FamilyOccurrence { position, assertion, capability: record.original.capability }
+        } else {
+            let landing = record.landings.iter().find(|landing| landing.reservation.destination == assertion)
+                .ok_or_else(conflict)?;
+            let position = landing.accepted.as_ref().ok_or_else(conflict)?.position;
+            FamilyOccurrence { position, assertion, capability: landing.reservation.capability }
+        };
+        self.require_position_open(occurrence.position).await?;
+        Ok(occurrence)
+    }
+
     /// Current check for the exact occurrence already admitted for release.
     /// The caller owns the final release fence and draining previously admitted work.
     pub async fn require_live_occurrence(&self, family: Uuid, occurrence: FamilyOccurrence) -> Result<()> {
@@ -524,7 +551,7 @@ impl<'a> AssertionFamilies<'a> {
             record.require_live()?;
             let mut changed = false;
             for row in rows {
-                if !row.well_formed() || !record.has_member(row.member) {
+                if !row.well_formed() || !row.relation.ends_with("_search") || !record.has_member(row.member) {
                     return Err(conflict());
                 }
                 if record.derived.contains(row) {
@@ -593,7 +620,7 @@ impl<'a> AssertionFamilies<'a> {
 
     pub async fn claim_fence(
         &self, family: Uuid, client_family: Uuid, marker: AssertionFamilyFenceMarker, attempt: PlacedAttempt,
-        root_erases: &BTreeSet<(&OwnedRelation, &EntityId)>,
+        source_predecessor: Option<rtdb_types::TransactionKey>, root_erases: &BTreeSet<(&OwnedRelation, &EntityId)>,
     ) -> Result<()> {
         let pending = PendingFence {
             client_family, attempt: attempt.encode().to_vec(), marker: marker.to_bytes().to_vec(),
@@ -601,10 +628,17 @@ impl<'a> AssertionFamilies<'a> {
         for _ in 0..ATTEMPTS {
             let (mut record, etag) = self.read(family).await?.ok_or_else(conflict)?;
             record.require_live()?;
-            if record.pending_fence.as_ref() == Some(&pending) {
-                return Ok(());
+            if let Some(prior) = &record.pending_fence {
+                if prior == &pending { return Ok(()); }
+                let previous = PlacedAttempt::decode(&prior.attempt).map_err(|_| malformed())?;
+                if !attempt.scope().same_history(previous.scope())
+                    || previous.position() >= attempt.position()
+                    || source_predecessor.is_none_or(|predecessor| predecessor.tx_id.0 < previous.position().0)
+                {
+                    record.require_unclaimed()?;
+                }
+                // The resolver checked the insert's absence at this durable predecessor.
             }
-            record.require_unclaimed()?;
             if !record.contains(marker.selected) {
                 return Err(conflict());
             }
@@ -919,12 +953,15 @@ mod tests {
             families.enroll_original(family, enrolment(original)).await?;
             families.register(family, original).await?;
             families.reserve_landing(family, first).await?;
+            assert_eq!(families.resolve_member(family, original.assertion).await?, original);
+            assert!(families.resolve_member(family, copy.assertion).await.is_err());
             assert!(families.require_live_occurrence(family, copy).await.is_err());
             families.activate_ordered_landing(family, binding, first).await?;
             families.activate_ordered_landing(family, binding, first).await?;
             let changed = PlacementBinding { address_extent_commitment: [9; 32], ..binding };
             assert!(families.activate_ordered_landing(family, changed, first).await.is_err());
             families.require_live_occurrence(family, copy).await?;
+            assert_eq!(families.resolve_member(family, copy.assertion).await?, copy);
             families.reserve_landing(family, pending).await?;
 
             let closed = if close_from_copy { copy.position } else { original.position };
@@ -1036,10 +1073,10 @@ mod tests {
         let attempt = PlacedAttemptScope::new("assertion-fence", 1)?.issue().identify(SourcePosition(2), Some("owner"))?;
         let roots = BTreeSet::new();
         let stale = AssertionFamilyFenceMarker { inventory: [0; 32], ..marker };
-        assert!(families.claim_fence(family, family, stale, attempt, &roots).await.is_err());
+        assert!(families.claim_fence(family, family, stale, attempt, None, &roots).await.is_err());
         families.require_live_occurrence(family, original).await?;
-        families.claim_fence(family, family, marker, attempt, &roots).await?;
-        families.claim_fence(family, family, marker, attempt, &roots).await?;
+        families.claim_fence(family, family, marker, attempt, None, &roots).await?;
+        families.claim_fence(family, family, marker, attempt, None, &roots).await?;
         assert!(families.require_live_occurrence(family, original).await.is_err());
         assert!(families.fence(family, original.position, order).await.is_err());
         Ok(())

@@ -16,42 +16,102 @@ fn funded_booking_missing() -> Anomaly {
         "The ordered mutation seat differs from the original funded booking")
 }
 
+fn family_retirement(operation: &Operation, digest: Option<&[u8; 32]>) -> Result<Option<Option<Iid>>> {
+    let relation = match operation.owned_relation() {
+        Some(relation) if relation.root_relation().as_ref().unwrap_or(relation).name() == "fact_unit_fences" => relation,
+        _ => return Ok(None),
+    };
+    let inventory_matches = |inventory: &[u8]| inventory.len() == 32
+        && digest.is_none_or(|digest| inventory == digest.as_slice());
+    let values_match = |rows: &crate::Documents| rows.rows().iter().filter(|row| {
+        matches!(row.get("unit_phase"), Some(Value::Binary(phase)) if phase == b"BFU1\x01")
+            && matches!(row.get("assertion_vault_inventory"), Some(Value::Binary(inventory)) if inventory_matches(inventory))
+    }).count();
+    let arrow_matches = |rows: &crate::ArrowDocuments| {
+        let mut matches = 0;
+        for row in 0..rows.row_count() {
+            let cell = |name: &str| {
+                if rows.legacy_owned_presence().is_some() {
+                    return rows.legacy_owned_cell(name, row);
+                }
+                let array = rows.array();
+                Ok(array.fields().iter().zip(array.columns())
+                    .find(|(field, _)| field.name() == name)
+                    .map(|(field, array)| rtdb_columnar::ArrowCell { field, array: array.as_ref(), row }))
+            };
+            if cell("unit_phase")?.and_then(|cell| cell.binary()) == Some(b"BFU1\x01".as_slice())
+                && cell("assertion_vault_inventory")?.and_then(|cell| cell.binary()).is_some_and(inventory_matches)
+            {
+                matches += 1;
+            }
+        }
+        Ok::<_, Anomaly>(matches)
+    };
+    let count = match operation {
+        Operation::Public(TxOp::OwnedInsertDocs { documents, .. } | TxOp::OwnedReplaceDocs { documents, .. })
+        | Operation::OwnedWriteIids { documents, .. } => values_match(documents),
+        Operation::Public(TxOp::OwnedArrowDocs { documents, .. })
+        | Operation::OwnedArrowIids { documents, .. } => arrow_matches(documents)?,
+        _ => 0,
+    };
+    match count {
+        0 => Ok(None),
+        1 => Ok(Some(relation.world())),
+        _ => Err(Anomaly::incorrect("rtdb.owned/assertion-family-fence-marker", "A family fence requires one digest-bound retirement")),
+    }
+}
+
 impl OpenTransaction<'_> {
     pub(super) async fn claim_assertion_family_fences(
         &self, operations: &[Operation], replay: bool,
     ) -> Result<()> {
-        use rtdb_types::{ASSERTION_FAMILY_FENCES, AssertionFamilyFenceMarker};
+        use rtdb_types::AssertionFamilyFenceMarker;
 
         let mut controls = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::HostedControl(control)) if control.name() == ASSERTION_FAMILY_FENCES =>
+            Operation::Public(TxOp::HostedControl(control)) if control.is_assertion_family_marker() =>
                 Some(control),
             _ => None,
-        }).peekable();
-        if controls.peek().is_none() { return Ok(()); }
-
+        });
         let invalid = || Anomaly::incorrect("rtdb.owned/assertion-family-fence-marker", "Invalid ordered family fence marker");
+        let Some(control) = controls.next() else {
+            if !replay {
+                for operation in operations {
+                    if family_retirement(operation, None)?.is_some() { return Err(invalid()); }
+                }
+            }
+            return Ok(());
+        };
         let attempt = self.placed_attempt.filter(|attempt| Some(attempt.scope()) == self.context.owned_witness_scope)
             .ok_or_else(invalid)?;
-        if replay { return Err(invalid()); }
+        if replay || controls.next().is_some() { return Err(invalid()); }
         let archive = self.context.world_constraints.as_ref().ok_or_else(invalid)?;
-        let root_erases = operations.iter().filter_map(|operation| match operation {
-            Operation::Public(TxOp::OwnedErase { relation, id }) if relation.is_root_data() => Some((relation, id)),
-            _ => None,
-        }).collect::<BTreeSet<_>>();
-        for control in controls {
-            let EntityId::String(id) = control.id() else { return Err(invalid()); };
-            let family = AssertionFamilyFenceMarker::family_id(id).map_err(|_| invalid())?;
-            let row = control.replacement().filter(|row| row.len() == 2).ok_or_else(invalid)?;
-            let Some(Value::Binary(body)) = row.get("body") else { return Err(invalid()); };
-            if control.expected().is_some() {
+        let mut root_erases = BTreeSet::new();
+        for operation in operations {
+            if let Operation::Public(TxOp::OwnedErase { relation, id }) = operation
+                && (!relation.is_root_data() || !relation.name().ends_with("_search") || !root_erases.insert((relation, id)))
+            {
                 return Err(invalid());
             }
-            let marker = AssertionFamilyFenceMarker::decode(body).map_err(|_| invalid())?;
-            archive.claim_assertion_family_fence(super::AssertionFenceClaim {
-                database: &self.context.database, attempt, family, marker, root_erases: &root_erases,
-            }).await?;
         }
-        Ok(())
+        let EntityId::String(id) = control.id() else { return Err(invalid()); };
+        let family = AssertionFamilyFenceMarker::family_id(id).map_err(|_| invalid())?;
+        let row = control.replacement().filter(|row| row.len() == 2).ok_or_else(invalid)?;
+        let Some(Value::Binary(body)) = row.get("body") else { return Err(invalid()); };
+        if control.expected().is_some() {
+            return Err(invalid());
+        }
+        let marker = AssertionFamilyFenceMarker::decode(body).map_err(|_| invalid())?;
+        let mut retirement = None;
+        for operation in operations {
+            if let Some(line) = family_retirement(operation, Some(&marker.inventory))? {
+                if retirement.replace(line).is_some() { return Err(invalid()); }
+            }
+        }
+        let retirement_world = retirement.ok_or_else(invalid)?;
+        archive.claim_assertion_family_fence(super::AssertionFenceClaim {
+            database: &self.context.database, attempt, durable_predecessor: self.buffer.base_snapshot().tx_basis(),
+            family, marker, retirement_world, root_erases: &root_erases,
+        }).await
     }
 
     pub(super) async fn check_hosted_controls(
@@ -64,6 +124,7 @@ impl OpenTransaction<'_> {
             Operation::Public(TxOp::HostedControl(control)) => Some(control),
             _ => None,
         });
+        let family_fence = controls.clone().any(HostedControlWrite::is_assertion_family_marker);
         if controls.clone().next().is_none() {
             if operations.iter().any(|operation| matches!(operation,
                 Operation::Public(TxOp::OwnedForkWorld { .. } | TxOp::OwnedPublishRoot { .. } | TxOp::OwnedPublishWorld { .. })
@@ -125,7 +186,8 @@ impl OpenTransaction<'_> {
                         | TxOp::OwnedDelete { .. }
                         | TxOp::HostedControl(_)
                 ) | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
-            ) || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedErase { .. } | TxOp::OwnedReplayResidue { .. })))
+            ) || ((family_fence || replay.is_some()) && matches!(operation, Operation::Public(TxOp::OwnedErase { .. })))
+                || (replay.is_some() && matches!(operation, Operation::Public(TxOp::OwnedReplayResidue { .. })))
         };
         if !operations
             .iter()
@@ -170,7 +232,7 @@ impl OpenTransaction<'_> {
         let proposal_land = crate::hosted_control::hosted_proposal_land(operations).is_some();
         if validating_world && (
             (!retained_release && !proposal_overlay && !proposal_land && !hosted_world_reads
-                && controls.clone().any(|control| !control.is_check()))
+                && controls.clone().any(|control| !control.is_check() && !control.is_assertion_family_marker()))
             || !operations.iter().any(|operation| matches!(operation, Operation::Public(TxOp::OwnedCheckWorldScope { .. })))
         ) {
             return Err(unavailable());
@@ -187,6 +249,8 @@ impl OpenTransaction<'_> {
                         Operation::Public(TxOp::OwnedPublishWorld { .. } | TxOp::OwnedPublishRoot { .. }
                             | TxOp::OwnedInsertDocs { .. } | TxOp::OwnedReplaceDocs { .. } | TxOp::OwnedArrowDocs { .. } | TxOp::OwnedDelete { .. })
                             | Operation::OwnedWriteIids { .. } | Operation::OwnedArrowIids { .. }
+                    )) && !(family_fence && publishing_world && matches!(operation,
+                        Operation::Public(TxOp::OwnedErase { .. })
                     )) {
                         return Err(unavailable());
                     }

@@ -125,6 +125,15 @@ The reservation must be enrolled in the live family.
 The link body binds the intent, the source position, the destination position, the vault family identity and the review slot.
 Retiring the link capability later leaves the destination row readable.
 
+### `rtdb.owned.ResolveFamilyMember.v1`
+
+Hosted protocol 219 adds this action.
+
+Request: family `uuid`, member `assertion`.
+Reply: the exact admitted member `occurrence` in the live family.
+A reviewed rewrite supplies its member assertion to recover the reservation coordinate while retaining its own authenticated winning position for the sealed link.
+An unpositioned original and a pending destination refuse.
+
 ### `rtdb.owned.RequireLiveFamilyOccurrence.v1`
 
 Request: family `uuid`, `occurrence`.
@@ -178,7 +187,7 @@ Request: family `uuid`, selected `position`, erasure order `uuid`.
 
 Hosted protocol 217 exposes a read-only plan.
 The selected position must be a bound member.
-The reply has the same order, inventory digest and counted sections as `FenceAssertionFamily.v1`.
+The reply has the order, inventory digest and counted sections specified below.
 If the vault already fenced the family, the reply preserves its first order.
 The plan leaves the vault and source unchanged.
 The retiring transaction must take a claim over this inventory before it can order an immutable marker.
@@ -186,12 +195,16 @@ The claim freezes the family record under its vault compare-and-swap and binds t
 The checked insert targets `bj_fact_assertion_family_fences` with the family UUID as 32 lowercase hexadecimal characters and a null expectation.
 Its binary `body` is version 1 (u8), selected `position`, order `uuid` and inventory digest (32).
 Each Root inventory entry requires an erase of its named relation and exact UTF-8 row key in the same transaction.
-The erasure obligation binds the same digest.
-The marker route refuses until current original-authority reads guard both regular and archive release.
+The same transaction carries a `fact_unit_fences` row on the selected line with `unit_phase` set to the erasing state and `assertion_vault_inventory` set to the same digest.
+At most one family fence can order in a transaction.
+The source resolver validates the installed authority, the marker's absence, the retirement obligation, and the exact Root selectors before claiming the unchanged inventory.
+Original-authority marker reads use a current source barrier for both ordinary and archive release.
+A pending claim with no ordered marker leaves already-enrolled stages open under that current admission.
+The vault finalizes the first ordered marker and can replace an aborted claim only once the original source's durable history covers the failed attempt.
 
-### `rtdb.owned.FenceAssertionFamily.v1`
+### Fence plan reply
 
-Request: family `uuid`, selected `position`, erasure order `uuid`.
+Protocol 217 retires the former immediate fence action.
 
 Reply: order `uuid`, vault inventory digest (32), then four counted sections, each a u32 count followed by its items: member `position`s, assertion `stage`s, link `stage`s and `derived` entries.
 
@@ -263,6 +276,7 @@ Ranking takes the authoring world, relation and row key from the winning overlay
 The opened body is the JSON pair of text paths and vector paths, used only as transient ranking input.
 In current ranking, a fenced or retired derived winner continues to shadow a parent row and contributes no ranking input.
 At an exact earlier cut, a fenced or retired winner refuses with `rtdb/erased-under-view` before text, nearest or hybrid ranking can return an altered corpus.
+Historical nearest ranks the exact corpus.
 Protected-row payload carriers retain their `BJWC1` framing.
 Current and accepted-cut point reads can return the opaque carrier with the resolver's authoring line and ordinal.
 Resolution uses that original authoring line for a winner inherited from a parent world.
@@ -286,7 +300,9 @@ Bijection owns the equivalent audience check before probing a protected source.
 
 ## Fence semantics across dependent forks
 
-A fence takes effect in the vault, not in any one world, so it closes every world at once.
+An ordered family fence takes effect at the original source publication and closes every world at once.
+While the claim is pending, release checks that source before opening a capability.
+The vault records the first order after reading the accepted marker.
 From the fence commit:
 
 * `RequireLiveFamilyOccurrence.v1`, `OpenWorldOverlayRow.v1`, `SealWorldOverlayRow.v1` and every registration refuse for the family;

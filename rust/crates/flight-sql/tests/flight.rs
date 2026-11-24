@@ -2761,9 +2761,9 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.EnrollFamilyWorldRow.v1", "rtdb.owned.RegisterAssertionFamily.v1", "rtdb.owned.ReserveFamilyLanding.v1",
         "rtdb.owned.ActivateFamilyLanding.v2", "rtdb.owned.SealFamilyLandingLink.v2",
         "rtdb.owned.SealFamilyLandingPayload.v1", "rtdb.owned.OpenFamilyLandingPayload.v1",
-        "rtdb.owned.RequireLiveFamilyOccurrence.v1", "rtdb.owned.RequireFamilyPositionOpen.v1",
+        "rtdb.owned.ResolveFamilyMember.v1", "rtdb.owned.RequireLiveFamilyOccurrence.v1", "rtdb.owned.RequireFamilyPositionOpen.v1",
         "rtdb.owned.RegisterFamilyDerived.v1", "rtdb.owned.SealWorldOverlayRow.v1",
-        "rtdb.owned.OpenWorldOverlayRow.v1", "rtdb.owned.FenceAssertionFamily.v1",
+        "rtdb.owned.OpenWorldOverlayRow.v1",
         "rtdb.owned.PlanAssertionFamilyFence.v1", "rtdb.owned.SettleAssertionFamily.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
