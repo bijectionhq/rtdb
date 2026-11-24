@@ -84,6 +84,7 @@ pub(crate) struct Committed {
     pub(crate) generation: u64,
     pub(crate) lease: Option<(Epoch, i64)>,
     pub(crate) released: Option<Epoch>,
+    pub(crate) retired: Option<(Lsn, i64)>,
     pub(crate) records: Vec<Record>,
     pub(crate) effects: Vec<AppliedEffects>,
     pub(crate) rotation: Option<Rotation>,
@@ -100,6 +101,7 @@ impl Committed {
             generation: 1,
             lease: None,
             released: None,
+            retired: None,
             records: Vec::new(),
             effects: Vec::new(),
             rotation: None,
@@ -197,6 +199,9 @@ impl Committed {
         if self.released == Some(entry.epoch) {
             return Err(invalid("A released writer epoch cannot append again"));
         }
+        if self.retired.is_some() {
+            return Err(invalid("A retired deployment cannot append again"));
+        }
         if let Some(rotation) = self.rotation
             && !rotation.committed
             && lsn > rotation.cut
@@ -265,6 +270,19 @@ impl Committed {
                 }
                 self.lease = None;
                 self.released = Some(entry.epoch);
+                self.generation
+            }
+            Record::DeploymentRetirement { lease_until } => {
+                if self.lease != Some((entry.epoch, *lease_until))
+                    || self.transactions.recover_pending().is_some()
+                    || self.transactions.pending_erasure().is_some()
+                    || self.rotation.is_some_and(|rotation| !rotation.retirement_armed)
+                    || self.transactions.index().has_custody_groups()
+                {
+                    return Err(invalid("Deployment retirement requires a settled writer and custody closure"));
+                }
+                self.lease = None;
+                self.retired = Some((lsn, *lease_until));
                 self.generation
             }
             Record::Checkpoint(checkpoint) => {

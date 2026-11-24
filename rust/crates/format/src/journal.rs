@@ -148,6 +148,10 @@ pub enum Record {
     WriterRelease {
         lease_until: i64,
     },
+    /// Permanently closes the stream's RTDB admission under its current writer.
+    DeploymentRetirement {
+        lease_until: i64,
+    },
 }
 
 impl Record {

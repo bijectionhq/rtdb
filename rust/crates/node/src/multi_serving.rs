@@ -46,6 +46,14 @@ impl MultiServing {
     pub async fn tick(&self, live_nodes: &BTreeSet<IpAddr>) -> Result<Role> {
         self.writes.tick(live_nodes.clone()).await
     }
+
+    pub async fn retire_deployment(&self) -> Result<rtdb_db::DeploymentRetirement> {
+        self.writes.retire_deployment().await
+    }
+
+    pub async fn deployment_retirement(&self) -> Result<Option<rtdb_db::DeploymentRetirement>> {
+        self.database.lock().await.deployment_retirement().await
+    }
 }
 
 #[async_trait]

@@ -22,11 +22,13 @@ use crate::{
 mod pin;
 mod pipeline;
 mod rotation;
+mod retirement;
 pub use pin::PinnedExport;
 pub use pipeline::WritePipeline;
 use pipeline::{Append, AttemptError, Planned, receipt_for};
 use rotation::ArmedRotation;
 pub use rotation::RotationReceipt;
+pub use retirement::DeploymentRetirement;
 
 pub struct MultiOptions {
     pub database: Uuid,
@@ -155,6 +157,7 @@ impl MultiDatabase {
             }
             return Err(error);
         }
+        if self.state().retired.is_some() { return Ok(Role::Follower); }
         if let Some(writer) = &self.writer {
             let lease = writer.lease;
             self.refuse_pending(lease).await?;
@@ -311,6 +314,7 @@ impl MultiDatabase {
         scope: Option<ScopedTransact<'_>>,
     ) -> Result<Receipt> {
         self.refresh().await?;
+        self.require_active()?;
         if request.uses_erasure() {
             self.finish_pending_erasure().await?;
             if self.rotation_destroyed() && self.check_erase_storage(self.authority()?).await.is_ok() {
@@ -366,6 +370,7 @@ impl MultiDatabase {
         scope: Option<ScopedTransact<'_>>,
     ) -> Result<Receipt> {
         self.refresh().await?;
+        self.require_active()?;
         let writer = self.writer.as_ref().filter(|writer| !writer.recovering);
         let receipt = match (writer, scope) {
             (Some(writer), Some(scope)) => writer.pipeline.tx_status_scoped(key, scope),
@@ -394,11 +399,13 @@ impl MultiDatabase {
 
     pub async fn fresh_index(&mut self) -> Result<&BranchIndex> {
         self.refresh().await?;
+        self.require_active()?;
         Ok(self.durable_transactions().index())
     }
 
     pub async fn fresh_view(&mut self) -> Result<(BranchIndex, u64)> {
         self.refresh().await?;
+        self.require_active()?;
         let state = self.state();
         Ok((
             self.durable_transactions().index().clone(),
@@ -408,6 +415,7 @@ impl MultiDatabase {
 
     pub async fn fresh_history(&mut self) -> Result<ChangeHistory<'_>> {
         self.refresh().await?;
+        self.require_active()?;
         let state = self.state();
         let after_floor = state.coordinates.position(Lsn(state.floor.0 - 1))?
             .max(state.coordinates.origin.map_or(0, |origin| origin.through));
@@ -707,7 +715,7 @@ impl MultiDatabase {
         let end = self.stream.head().await?;
         self.catch_up(end).await?;
         if self.writer.as_ref().is_some_and(|writer| {
-            self.state().epoch > writer.lease.epoch || self.state().released == Some(writer.lease.epoch)
+            self.state().retired.is_some() || self.state().epoch > writer.lease.epoch || self.state().released == Some(writer.lease.epoch)
                 || !self.before(writer.lease.until)
         }) {
             self.withdraw_writer();
@@ -738,11 +746,19 @@ impl MultiDatabase {
     }
 
     fn authority(&self) -> Result<Lease> {
+        self.require_active()?;
         self.writer
             .as_ref()
             .filter(|writer| !writer.recovering && self.before(writer.lease.until))
             .map(|writer| writer.lease)
             .ok_or_else(no_writer)
+    }
+
+    fn require_active(&self) -> Result<()> {
+        if self.committed.as_ref().is_some_and(|state| state.retired.is_some()) {
+            return Err(Anomaly::new(AnomalyCategory::NotFound, "rtdb/deployment-retired", "The deployment has permanently closed admission"));
+        }
+        Ok(())
     }
 
     fn require_authority(&mut self, lease: Lease) -> Result<()> {

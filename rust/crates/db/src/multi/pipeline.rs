@@ -36,6 +36,7 @@ enum Command {
     Export { pin: Uuid, basis: Basis, until: Option<Timestamp>, reply: Reply<Vec<u8>> },
     OpenExport { ticket: Vec<u8>, reply: Reply<PinnedExport> },
     Restore { export: PinnedExport, reply: Reply<BranchCut> },
+    Retire(Reply<super::DeploymentRetirement>),
 }
 
 struct Scope {
@@ -145,6 +146,10 @@ impl WritePipeline {
 
     pub async fn restore(&self, export: PinnedExport) -> Result<BranchCut> {
         self.request(|reply| Command::Restore { export, reply }).await
+    }
+
+    pub async fn retire_deployment(&self) -> Result<super::DeploymentRetirement> {
+        self.request(Command::Retire).await
     }
 
     async fn request<T>(&self, command: impl FnOnce(Reply<T>) -> Command) -> Result<T> {
@@ -270,6 +275,10 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
             }
             Command::Restore { export, reply } => {
                 let result = database.lock().await.restore_export(&export).await;
+                let _ = reply.send(result);
+            }
+            Command::Retire(reply) => {
+                let result = database.lock().await.retire_deployment().await;
                 let _ = reply.send(result);
             }
         }

@@ -46,6 +46,7 @@ fn record_kinds_round_trip_with_fixed_tags() {
             armed: true,
         },
         Record::WriterRelease { lease_until: i64::MAX },
+        Record::DeploymentRetirement { lease_until: i64::MAX },
     ];
     for (i, record) in records.into_iter().enumerate() {
         let encoded = record.encode().unwrap();

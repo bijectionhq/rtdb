@@ -423,6 +423,28 @@ async fn multi_driver_hands_off_a_settled_writer_after_a_lost_release_reply() {
 }
 
 #[tokio::test]
+async fn deployment_retirement_closes_admission_after_a_lost_reply() {
+    let journal = MemoryJournal::default();
+    let cluster = Cluster::new();
+    let faults = Arc::new(FaultJournal::new(Arc::new(journal.handle(NODE_1_IDENTITY))));
+    let mut writer = cluster.node(1, faults.clone());
+    writer.create().await.unwrap();
+    writer.tick(&live(1)).await.unwrap();
+    writer.transact(&put(1, 1, "before retirement")).await.unwrap();
+    faults.inject(Fault::DropAppendReply);
+    assert_eq!(writer.retire_deployment().await.unwrap_err().category, AnomalyCategory::Interrupted);
+
+    let mut follower = cluster.node(2, Arc::new(journal.handle(NODE_2_IDENTITY)));
+    let terminal = follower.deployment_retirement().await.unwrap().unwrap();
+    assert_eq!(terminal.incarnation, DATABASE);
+    assert_eq!(terminal.generation, 1);
+    assert_eq!(follower.retire_deployment().await.unwrap(), terminal);
+    assert_eq!(follower.tick(&live(2)).await.unwrap(), Role::Follower);
+    assert_eq!(follower.fresh_view().await.unwrap_err().code, "rtdb/deployment-retired");
+    assert_eq!(writer.transact(&put(2, 2, "after retirement")).await.unwrap_err().code, "rtdb/deployment-retired");
+}
+
+#[tokio::test]
 async fn multi_driver_abandoned_seal_allows_one_replacement_after_its_grace_period() {
     let journal = MemoryJournal::default();
     let cluster = Cluster::new();
