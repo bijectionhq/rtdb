@@ -654,7 +654,8 @@ async fn replay(
                 let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
                 repair.partition.retire_tables(tables, Timestamp(message.as_of_micros.unwrap_or_default()));
             }
-            ReplicaBody::NoOp(_) | ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_)
+            ReplicaBody::NoOp(message) => crate::serving::require_physical_replay_support(message)?,
+            ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_)
             | ReplicaBody::TriesDeleted(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
             ReplicaBody::OversizedMessage(_) => return Err(invalid("The source journal has an unresolved oversized record")),
         }

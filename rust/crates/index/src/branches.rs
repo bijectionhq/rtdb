@@ -6,8 +6,8 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 type Map<K, V> = imbl::OrdMap<K, V>;
 
 use rtdb_types::{
-    Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
-    Timestamp, Value,
+    Anomaly, AnomalyCategory, EntityId, Iid, Interval, LogicalType, Result, StructFields, TableRef,
+    Timestamp, TxId, Value,
     rtdb_v1::{At, Basis, Branch, ClaimEvidence, ClaimRegion, LabelScope, Layer, MAIN_BRANCH},
 };
 use serde::{Deserialize, Serialize};
@@ -108,9 +108,34 @@ pub struct BranchEvent {
     pub valid: Interval,
     pub cut: BranchCut,
     pub image: Option<Arc<RowImage>>,
+    #[serde(default, skip_serializing_if = "WrittenVersion::is_branch")]
+    pub written: WrittenVersion,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WrittenVersion {
+    #[default]
+    Branch,
+    Classic(TxId),
+    Unpositioned,
+}
+
+impl WrittenVersion {
+    fn is_branch(&self) -> bool { *self == Self::Branch }
+}
+
+const CLASSIC_WRITTEN_BIT: u64 = 1 << 63;
+
 impl BranchEvent {
+    pub fn written_basis(&self) -> Option<Basis> {
+        match self.written {
+            WrittenVersion::Branch => Some(self.cut.basis),
+            WrittenVersion::Classic(transaction) => u64::try_from(transaction.0).ok()
+                .map(|position| Basis::new(self.cut.basis.incarnation(), CLASSIC_WRITTEN_BIT | position)),
+            WrittenVersion::Unpositioned => None,
+        }
+    }
+
     pub fn image_at(&self, valid_at: Timestamp) -> Option<&RowImage> {
         self.image.as_deref().filter(|image| image.expires_at.is_none_or(|until| valid_at < until))
     }
@@ -189,9 +214,13 @@ impl BranchData {
 pub struct BranchIndex {
     head: BranchCut,
     times: Map<u64, Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    classic_checkpoint: Option<Basis>,
     branches: Map<Branch, Arc<BranchData>>,
     #[serde(with = "entries")]
     catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
+    #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
+    classic_iids: Map<(TableRef, EntityId), Iid>,
     #[serde(default, with = "entries", skip_serializing_if = "Map::is_empty")]
     custody: Map<CustodyGroupId, Arc<custody::CustodyGroup>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,9 +248,9 @@ impl BranchIndex {
             expiries: vec![(basis, None)], changed: None, tables: Map::new(),
         };
         Self {
-            head, times: Map::unit(0, head.system_time),
+            head, times: Map::unit(0, head.system_time), classic_checkpoint: None,
             branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
-            catalog: Map::new(), custody: Map::new(), latest_custody_revocation: None,
+            catalog: Map::new(), classic_iids: Map::new(), custody: Map::new(), latest_custody_revocation: None,
             changed_catalog: None, erased: None, writes: Arc::default(),
             visibility_projection: false, used_custody_placements: imbl::OrdSet::new(),
         }
@@ -326,6 +355,9 @@ impl BranchIndex {
                 Ok(self.head)
             }
             At::AsOf(time) => {
+                if let Some(checkpoint) = self.classic_checkpoint && time < self.exact(checkpoint)?.system_time {
+                    return Err(classic_cut_expired());
+                }
                 let (&position, &system_time) = self.times.iter().rev().find(|(_, at)| **at <= time)
                     .ok_or_else(|| Anomaly::fault("rtdb/basis", "The initial branch cut is missing"))?;
                 Ok(BranchCut { basis: Basis::new(self.head.basis.incarnation(), position), system_time })
@@ -335,10 +367,19 @@ impl BranchIndex {
 
     pub fn exact(&self, basis: Basis) -> Result<BranchCut> {
         self.require_incarnation(basis)?;
+        if self.classic_checkpoint.is_some_and(|checkpoint| basis < checkpoint) { return Err(classic_cut_expired()); }
         let system_time = self.times.get(&basis.position()).copied().ok_or_else(|| {
             Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-basis", "The database has no transaction at this basis")
         })?;
         Ok(BranchCut { basis, system_time })
+    }
+
+    pub fn seal_classic_checkpoint(&mut self) { self.classic_checkpoint = Some(self.head.basis); }
+
+    pub fn validate_written_basis(&self, basis: Basis) -> Result<()> {
+        self.require_incarnation(basis)?;
+        if basis.position() & CLASSIC_WRITTEN_BIT == 0 || self.classic_iids.is_empty() { self.exact(basis)?; }
+        Ok(())
     }
 
     fn require_incarnation(&self, basis: Basis) -> Result<()> {
@@ -500,14 +541,70 @@ impl BranchIndex {
     }
 
     pub fn advance(&mut self, cut: BranchCut) -> Result<()> {
+        if cut.system_time == self.head.system_time {
+            return Err(Anomaly::fault("rtdb/transaction-order", "The applied transaction cut must advance system time"));
+        }
+        self.advance_classic(cut)
+    }
+
+    pub fn advance_classic(&mut self, cut: BranchCut) -> Result<()> {
         self.require_incarnation(cut.basis)?;
-        if cut.basis <= self.head.basis || cut.system_time <= self.head.system_time {
+        if cut.basis <= self.head.basis || cut.system_time < self.head.system_time {
             return Err(Anomaly::fault("rtdb/transaction-order", "The applied transaction cut must advance position and system time"));
         }
         self.head = cut;
         Arc::make_mut(&mut self.writes).clear();
         self.times.insert(cut.basis.position(), cut.system_time);
         Ok(())
+    }
+
+    pub fn physical_iid(&self, table: &TableRef, id: &EntityId) -> Iid {
+        self.classic_iids.get(&(table.clone(), id.clone())).copied().unwrap_or_else(|| id.iid())
+    }
+
+    pub fn apply_classic_event(&mut self, table: &TableRef, event: rtdb_format::data::StoredEvent, classic_transaction: Option<TxId>) -> Result<()> {
+        use rtdb_format::data::StoredOperation;
+
+        let cut = self.head;
+        let iid = event.iid;
+        let written = classic_transaction.map_or(WrittenVersion::Unpositioned, WrittenVersion::Classic);
+        match event.operation {
+            StoredOperation::Put(cells) => {
+                let id = cells.get("_id").ok_or_else(classic_identity)?.entity_id().map_err(|_| classic_identity())?;
+                let address = (table.clone(), id.clone());
+                if self.classic_iids.get(&address).is_some_and(|known| *known != iid) {
+                    return Err(classic_identity());
+                }
+                self.classic_iids.insert(address, iid);
+                if let Some(definition) = self.definition(table, cut.basis).filter(|definition| definition.dropped) {
+                    let generation = definition.generation;
+                    self.apply(BranchEffect::Declare { table: table.clone(), definition: BranchTable { generation, ..Default::default() } })?;
+                }
+                let image = Some(Arc::new(RowImage { cells, expires_at: None, custody_group: None, custody_payload: None }));
+                self.apply(BranchEffect::Write { branch: MAIN_BRANCH.into(), table: table.clone(), event: BranchEvent {
+                    id, valid: event.valid_time, cut, image, written,
+                } })
+            }
+            operation @ (StoredOperation::Delete | StoredOperation::Erase) => {
+                let erase = matches!(operation, StoredOperation::Erase);
+                let ids = self.branches[MAIN_BRANCH].tables.get(table).into_iter()
+                    .flat_map(|rows| rows.events.keys()).filter(|id| self.physical_iid(table, id) == iid)
+                    .cloned().collect::<Vec<_>>();
+                for id in ids {
+                    let effect = if erase {
+                        BranchEffect::Erase { branch: Some(MAIN_BRANCH.into()), table: table.clone(), id }
+                    } else {
+                        BranchEffect::Write { branch: MAIN_BRANCH.into(), table: table.clone(), event: BranchEvent {
+                            id, valid: event.valid_time, cut, image: None, written,
+                        } }
+                    };
+                    self.apply(effect)?;
+                }
+                if erase { self.erased = Some(cut.basis); }
+                Ok(())
+            }
+            StoredOperation::Redacted => Err(Anomaly::unsupported("rtdb/classic-redacted-history", "The retained Classic history includes a redacted event")),
+        }
     }
 
     pub fn apply(&mut self, effect: BranchEffect) -> Result<()> {
@@ -562,6 +659,9 @@ impl BranchIndex {
                 self.changed_catalog = Some(basis);
             }
             BranchEffect::Erase { branch, table, id } => {
+                if branch.as_deref().is_none_or(|branch| branch == MAIN_BRANCH) {
+                    self.classic_iids.remove(&(table.clone(), id.clone()));
+                }
                 let names = self.branches.keys()
                     .filter(|name| branch.as_ref().is_none_or(|branch| branch == *name))
                     .cloned().collect::<Vec<_>>();
@@ -644,6 +744,7 @@ impl<'a> BranchView<'a> {
     pub fn cut(&self) -> BranchCut { self.cut }
     pub fn branch(&self) -> &str { self.branch }
     pub fn layer(&self) -> Layer { self.layer }
+    pub fn physical_iid(&self, table: &TableRef, id: &EntityId) -> Iid { self.index.physical_iid(table, id) }
     pub fn base(&self) -> Option<&(Branch, Basis)> { self.data.base.as_ref() }
     pub fn lineage(&self) -> Vec<BranchLineage> { self.index.lineage(self.cut.basis) }
     pub fn custody_inventories(&self) -> impl Iterator<Item = CustodyInventory> + '_ {
@@ -802,6 +903,14 @@ pub fn index_key(value: &Value) -> Option<&[u8]> {
         Value::Utf8(key) => Some(key.as_bytes()),
         _ => None,
     }
+}
+
+fn classic_identity() -> Anomaly {
+    Anomaly::unsupported("rtdb/classic-identity", "The stored Classic identity cannot be represented by one branch row")
+}
+
+fn classic_cut_expired() -> Anomaly {
+    Anomaly::new(AnomalyCategory::NotFound, "rtdb/cursor-expired", "The requested cut predates the retained Classic checkpoint")
 }
 
 fn unknown_branch(branch: &str) -> Anomaly {

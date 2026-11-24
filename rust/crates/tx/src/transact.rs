@@ -461,6 +461,7 @@ pub(crate) struct View<'a> {
     pub(crate) durable_index: &'a BranchIndex,
     pub(crate) receipts: &'a Receipts,
     pub(crate) pending: bool,
+    pub(crate) time_floor: Option<Timestamp>,
 }
 
 /// State folded from a single stream. A caller resolves at its fresh committed prefix.
@@ -478,6 +479,20 @@ impl TransactState {
     }
 
     pub fn index(&self) -> &BranchIndex { &self.index }
+
+    pub fn replace_applied_index(&mut self, index: BranchIndex) -> Result<()> {
+        if self.pending.is_some() || index.head().basis.incarnation() != self.index.head().basis.incarnation()
+            || index.head().basis < self.index.head().basis
+        {
+            return Err(invalid_record());
+        }
+        self.index = index;
+        Ok(())
+    }
+
+    pub fn pending_effects(&self) -> Option<&[BranchEffect]> {
+        self.pending.as_ref().map(|pending| pending.tx.effects())
+    }
 
     /// A checkpoint can replace the settled prefix once the mode installs its manifest.
     pub fn encode_checkpoint(&self) -> Result<Bytes> {
@@ -619,6 +634,7 @@ impl TransactState {
             durable_index: &self.index,
             receipts: &self.receipts,
             pending: self.pending.is_some(),
+            time_floor: None,
         };
         Self::resolve_in(view, request, position, now, features, claims, authority).map(|(resolution, _)| resolution)
     }
@@ -685,7 +701,7 @@ impl TransactState {
             };
             BranchCut {
                 basis: Basis::new(head.basis.incarnation(), receipt_position),
-                system_time: now.max(head.system_time.next()?),
+                system_time: now.max(head.system_time.next()?).max(view.time_floor.unwrap_or(Timestamp::MIN)),
             }
         };
         let mut base = view.index.clone();
@@ -921,13 +937,16 @@ impl Guard {
                     }
                     (expect, _) => expect,
                 };
-                if let Version::Written(basis) = expect { index.exact(basis)?; }
+                if let Version::Written(basis) = expect { index.validate_written_basis(basis)?; }
                 let at = valid_at.unwrap_or(time);
                 let row = view(branch)?.row(table, id, at);
                 Ok(match expect {
                     Version::Absent => row.is_none(),
                     Version::Present => row.is_some(),
-                    Version::Written(basis) => row.is_some_and(|event| event.cut.basis == basis),
+                    Version::Written(basis) => row.is_some_and(|event| {
+                        if visible.is_some() { event.written_basis().is_some() && event.cut.basis == basis }
+                        else { event.written_basis() == Some(basis) }
+                    }),
                 })
             }
             Self::CountAtMost { branch, range, .. } => view(branch)?.count_at_most(range, time),

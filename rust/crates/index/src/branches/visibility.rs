@@ -21,6 +21,7 @@ pub struct VisibleChange {
     pub before: Option<Arc<RowImage>>,
     pub after: Option<Arc<RowImage>>,
     pub erased_written_basis: Option<Basis>,
+    unpositioned: bool,
 }
 
 #[derive(Default)]
@@ -153,6 +154,7 @@ impl BranchIndex {
                         id: row.id.clone(),
                         valid: row.valid,
                         image: row.after.clone(),
+                        written: if row.unpositioned { WrittenVersion::Unpositioned } else { WrittenVersion::Branch },
                     },
                 })?;
             }
@@ -164,7 +166,7 @@ impl BranchIndex {
                     })?;
                     rows.push(VisibleChange {
                         table: notice.table, id: notice.id, valid, before: None, after: None,
-                        erased_written_basis: notice.erased_written_basis,
+                        erased_written_basis: notice.erased_written_basis, unpositioned: false,
                     });
                 }
             }
@@ -302,6 +304,7 @@ fn visible_changes(
                 before: prior.map(project),
                 after: next.map(project),
                 erased_written_basis: None,
+                unpositioned: next.is_some_and(|(event, _)| event.written_basis().is_none()),
             });
         }
         last_pair = (prior, next);

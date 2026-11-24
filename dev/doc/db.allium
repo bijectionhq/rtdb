@@ -10,14 +10,21 @@
 --
 -- Source and replica are always separate logs — an invariant, not a convention.
 -- The default source and replica logs share the `SharedLog` port for ordered append, latest position, and replay from a prior position.
--- A default attachment with a stable branch authority can use the applied-position serving route for an independent branch fold.
+-- A default attachment with a stable branch authority shares main-branch relation effects between the physical partition and the v1 transaction fold.
 -- Default development and the bundled default cluster configuration enable this route for the primary database.
 -- Replicas use the incarnation published in that database's object store.
 -- The Classic partition continues to install transactions from its source log.
 -- Classic transaction bookkeeping and role membership stay in the physical catalog and do not close the branch intake path.
--- An attachment with Classic business effects and an empty branch fold serves unscoped merged-main queries from the installed physical catalog.
--- Each such query names the exact published replica cut, including its physical IIDs and any Classic data restored from its checkpoint.
--- Classic table effects await a common write projection before they can participate in branch guards and writes.
+-- Classic read-back projects resolved user table effects into the v1 fold at the admitted replica cut, using physical IIDs for deletes and erases.
+-- Ordered canonical v1 read-back installs main effects in the physical partition under the source transaction coordinate and the receipt's system time.
+-- A Classic resolution that follows a v1 decision waits for that decision's physical effects to install.
+-- A v1 resolution that follows a Classic transaction waits for its resolved effects to enter the shared fold.
+-- A Classic checkpoint predating v1 can seed the shared fold from its selected live tries.
+-- The checkpoint's retained event positions identify earlier written versions.
+-- Historical events without original transaction provenance carry no written-basis value.
+-- A shared checkpoint records that its physical partition and branch fold cover the same prefix.
+-- An attachment without a shared write projection can serve an empty branch fold from the exact published Classic catalog.
+-- Dedicated retained suffix replay requires a shared fold when its suffix includes shared decisions.
 -- Branch Transact submissions with operations append the canonical request and its authenticated admission context to the source log.
 -- The admission context preserves the receipt namespace, label scope, verified claims and any sealed custody request digest.
 -- Nodes that submit or resolve branch requests share the database's source admission key through its private object store.

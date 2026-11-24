@@ -148,7 +148,7 @@ mod tests {
             let cells = StructFields::from([("label".into(), Value::Binary(vec![label]))]);
             index.apply(BranchEffect::Write {
                 branch: MAIN_BRANCH.into(), table: table.clone(),
-                event: BranchEvent { cut, id, valid: Interval::ALL, image: Some(Arc::new(RowImage { cells, expires_at: None, custody_group: None, custody_payload: None })) },
+                event: BranchEvent { cut, id, valid: Interval::ALL, written: Default::default(), image: Some(Arc::new(RowImage { cells, expires_at: None, custody_group: None, custody_payload: None })) },
             }).unwrap();
         };
         let first = advance(&mut index, 1);
