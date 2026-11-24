@@ -60,7 +60,7 @@ def counted_commit(key):
     return b"\0\1" + bound + b"\0\0" + DEADLINE + b"\0\1" + mutation(key)
 
 
-def hosted_commit(claim, key, staged):
+def hosted_commit(claim, key, staged, fact=None):
     proof = struct.pack(">q", claim) + INSTALLATION.bytes + WRITER
     authority = group(b"bj_installation", ipc(
         _id=pa.array(["authority"]),
@@ -72,7 +72,7 @@ def hosted_commit(claim, key, staged):
         _expected_micros=pa.array([None], type=pa.int64()),
         value=pa.array([key ^ 0x5A5A], type=pa.int64()),
     ))
-    facts = sized(b"\0\1" + mutation(key), "I")
+    facts = sized(b"\0\1" + (mutation(key) if fact is None else fact), "I")
     if staged:
         deadline = time.time_ns() // 1000 + 5_000_000
         cutoff = struct.pack(">qq", deadline, deadline + 100_000)
@@ -184,16 +184,6 @@ flightSql:
 
 
 def prepare(pg, port, workload):
-    if workload == "commit-v7":
-        client, options, _ = connect(port)
-        try:
-            declaration = ipc(column=pa.array(["bucket"]), prefix_bytes=pa.array([1]),
-                              cap=pa.array([(1 << 63) - 1]), when=pa.array([b""]))
-            action(client, options, "rtdb.owned.DeclareCapacity.v2", sized(RELATION) + declaration)
-        finally:
-            client.close()
-        return "rtdb.owned.Commit.v7", counted_commit
-
     with sql_connection(pg) as conn:
         conn.execute(f"""INSERT INTO bj_installation RECORDS {{_id: 'authority', kind: 'hosted',
             incarnation: X'{INSTALLATION.hex}', writer: '{WRITER.hex()}',
@@ -202,6 +192,17 @@ def prepare(pg, port, workload):
             _valid_from: TIMESTAMP '1970-01-01Z'}""")
         (revision,) = conn.execute("SELECT _system_from FROM bj_installation WHERE _id = 'authority'").fetchone()
     claim = epoch_micros(revision)
+    if workload == "commit-v7":
+        declaration = group(RELATION, ipc(
+            _id=pa.array(["bucket"]), _op=pa.array(["declare-capacity"]), column=pa.array(["bucket"]),
+            prefix_bytes=pa.array([1]), cap=pa.array([(1 << 63) - 1]), when=pa.array([b""]),
+        ))
+        client, options, _ = connect(port)
+        try:
+            action(client, options, "rtdb.owned.DecideHosted.v4", hosted_commit(claim, 0, False, declaration))
+        finally:
+            client.close()
+        return "rtdb.owned.Commit.v7", counted_commit
     return "rtdb.owned.DecideHosted.v4", lambda key: hosted_commit(claim, key, workload == "hosted-staged")
 
 
@@ -214,10 +215,13 @@ def verify(port, acknowledged):
             for first in range(0, len(acknowledged), 64):
                 keys = acknowledged[first:first + 64]
                 requests = [handle + sized(RELATION) + ipc(_id=pa.array([key]), valid_micros=valid) for key in keys]
-                frame = struct.pack(">H", len(requests)) + b"".join(b"\0" + sized(request, "I") for request in requests)
-                replies = client.do_action(flight.Action("rtdb.owned.ReadPoints.v1", frame), options)
+                if len(requests) == 1:
+                    replies = [action(client, options, "rtdb.owned.ReadHeldPoint.v2", requests[0])]
+                else:
+                    frame = struct.pack(">H", len(requests)) + b"".join(b"\0" + sized(request, "I") for request in requests)
+                    replies = (result.body for result in client.do_action(flight.Action("rtdb.owned.ReadPoints.v1", frame), options))
                 for key, reply in zip(keys, replies, strict=True):
-                    rows = pa.ipc.open_stream(reply.body).read_all().to_pylist()
+                    rows = pa.ipc.open_stream(reply).read_all().to_pylist()
                     if len(rows) != 1 or rows[0]["_id"] != key or rows[0]["value"] != key ^ 0x5A5A:
                         raise AssertionError(f"Incorrect readback for {key}: {rows}")
         finally:
