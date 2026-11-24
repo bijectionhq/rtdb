@@ -41,5 +41,9 @@ stable_deref_trait.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+object_store = { workspace = true, features = ["aws", "azure", "gcp"] }
+rtdb-storage = { workspace = true, features = ["remote"] }
+
 [lints]
 workspace = true

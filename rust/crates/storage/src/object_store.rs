@@ -244,8 +244,12 @@ pub trait ObjectStore: Send + Sync {
         self.delete(key).await?;
         Ok(())
     }
-    /// The writer registration that owns a staged search run in this residence.
-    async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> { Ok(None) }
+    /// Returns the writer registration that owns a staged search run in this residence.
+    /// `Ok(None)` is reserved for volatile storage whose runs disappear with the store.
+    /// Stores without a staging owner or volatile lifetime return `Unsupported`.
+    async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
+        Err(unsupported_search_staging())
+    }
     /// Checks that the staged writer was superseded and its provider work drained.
     async fn search_staging_drained(&self, _owner: rtdb_format::search_manifest::SearchStagingOwner)
         -> rtdb_types::Result<bool> { Ok(false) }
@@ -396,6 +400,11 @@ pub(crate) fn wrong_size(key: &ObjectKey, length: usize) -> Error {
     Error::Task(format!("Immutable object {key} has a different length from {length}"))
 }
 
+/// Returns the unsupported anomaly for a store attachment with no recoverable search staging owner.
+pub fn unsupported_search_staging() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::unsupported("rtdb.storage/search-staging-unsupported", "This store has no recoverable search staging owner")
+}
+
 #[derive(Default)]
 pub struct MemoryStore {
     objects: RwLock<BTreeMap<ObjectKey, Bytes>>,
@@ -413,6 +422,7 @@ fn checked_range(key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Rang
 #[async_trait]
 impl ObjectStore for MemoryStore {
     fn permits_shared_read_cache(&self) -> bool { true }
+    async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> { Ok(None) }
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let objects = self.objects.read();
         let bytes = objects.get(key).ok_or_else(|| Error::MissingObject(key.to_string()))?;
@@ -693,7 +703,7 @@ impl ObjectStore for LocalStore {
 
     async fn search_staging_owner(&self) -> rtdb_types::Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
         use rtdb_format::search_manifest::SearchStagingOwner;
-        let Some(ledger) = self.catalog.clone() else { return Ok(None); };
+        let ledger = self.catalog.clone().ok_or_else(unsupported_search_staging)?;
         let attachment = self.io.read(ledger, (), |ledger, _| ledger.search_attachment()).await?;
         Ok(Some(SearchStagingOwner::Local { attachment }))
     }

@@ -153,7 +153,7 @@ impl ArtefactBuilder for SearchBuilder {
             if definition.id.ends_with("f16w") {
                 let public = logical::LogicalIndex::from_history(&definition);
                 match self.seal_logical(&public, snapshot, trie, file, size, cancellation).await {
-                    Ok(record) => records.push(record),
+                    Ok(record) => records.extend(record),
                     Err(error) if is_search_gap(&error, cancellation) => self.runtime.record_serving_gap(),
                     Err(error) => return Err(error),
                 }

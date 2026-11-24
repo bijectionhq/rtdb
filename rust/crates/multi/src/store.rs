@@ -1646,7 +1646,8 @@ impl ObjectStore for GarbageStore {
         Ok(allowed.into_iter().all(|allowed| allowed))
     }
     async fn search_staging_owner(&self) -> Result<Option<rtdb_format::search_manifest::SearchStagingOwner>> {
-        Ok(self.catalog_readers.as_ref().and_then(CatalogReaders::search_staging_owner))
+        self.catalog_readers.as_ref().and_then(CatalogReaders::search_staging_owner).map(Some)
+            .ok_or_else(rtdb_storage::object_store::unsupported_search_staging)
     }
     async fn search_staging_drained(&self, owner: rtdb_format::search_manifest::SearchStagingOwner) -> Result<bool> {
         let Some(readers) = &self.catalog_readers else { return Ok(false); };
@@ -3750,6 +3751,48 @@ mod tests {
         check_root(&store, "two", true).await.unwrap();
         assert_eq!(check_root(&store, "one", false).await.unwrap_err().code, "rtdb.multi/foreign-root");
         check_root(&store, "two", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hosted_search_staging_is_reserved_for_the_holder() {
+        use crate::deployment::{Role, database_config};
+        use rtdb_format::{database::proto::database_config::Storage, keys::CURRENT_STORAGE_VERSION,
+            search_manifest::SearchStagingOwner};
+        use rtdb_types::StorageEpoch;
+
+        let directory = rtdb_directory::MemoryDirectory::new();
+        let mut record = DeploymentRecord::new("shop", "acme", vec![], 0);
+        record.epoch = 5;
+        record.holder = Some(MemberId::fresh());
+        let record = directory.create_deployment(record).await.unwrap();
+        let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0)).unwrap().key();
+        let scope = format!("{}/{root}", record.storage_prefix());
+        let cell = CellStorage::Local { root: PathBuf::new() };
+        let namespaces = rtdb_directory::StorageNamespaces { objects: Uuid::new_v4(), keys: [0; 32] };
+        let bucket = Arc::new(MemoryStore::default());
+        for role in [Role::Compactor, Role::Holder] {
+            let config = database_config(&record, vec![], &cell, role);
+            let Some(Storage::RemoteStorage(storage)) = config.storage else { panic!("missing cell storage"); };
+            let config: CellStoreConfig = serde_json::from_slice(&storage.object_store.unwrap().value).unwrap();
+            let region = Uuid::new_v4();
+            let mut store = open_deployment_store(bucket.clone(), &scope, crate::packing::PackDiscovery::List, wall_clock()).await.unwrap();
+            Arc::get_mut(&mut store).unwrap().catalog_readers = Some(CatalogReaders::new(
+                directory.clone(), TaskTracker::new(), &record, root.clone(), namespaces, region, config.writer_epoch,
+            ));
+            let owner = store.search_staging_owner().await;
+            if config.compactor {
+                assert_eq!(owner.unwrap_err().code, "rtdb.storage/search-staging-unsupported");
+                let fenced = FencedStore { inner: bucket.clone(), directory: directory.clone(),
+                    deployment: record.id.clone(), prefix: record.storage_prefix(), fence: Fence::from(&config),
+                    local_publications: None, _release: None };
+                for path in ["search-pending", "search-runs"] {
+                    let key = key(&format!("tables/public$docs/{path}/run.f16.arrow"));
+                    assert!(matches!(fenced.put(&key, Bytes::new()).await, Err(Error::ReadOnlyLog(_))));
+                }
+            } else {
+                assert_eq!(owner.unwrap(), Some(SearchStagingOwner::Directory { region, writer_epoch: record.epoch }));
+            }
+        }
     }
 
     #[tokio::test]

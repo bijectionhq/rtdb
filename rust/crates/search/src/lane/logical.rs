@@ -161,6 +161,14 @@ struct RecoveredRun {
 }
 
 impl SearchBuilder {
+    async fn can_stage_logical(&self) -> Result<bool> {
+        match self.store.search_staging_owner().await {
+            Ok(_) => Ok(true),
+            Err(error) if error.category == AnomalyCategory::Unsupported => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn hold_logical_input(&self, snapshot: &Snapshot) -> Result<Arc<HeldView>> {
         let cut = snapshot.catalog_cut();
         let paths = cut.and_then(|_| snapshot.catalog_file_paths());
@@ -168,7 +176,8 @@ impl SearchBuilder {
     }
 
     pub(super) async fn seal_logical(&self, index: &LogicalIndex, snapshot: &Arc<PartitionValue>, trie: &TrieKey, path: &Path, size: u64,
-        cancellation: &CancellationToken) -> Result<ArtefactRecord> {
+        cancellation: &CancellationToken) -> Result<Option<ArtefactRecord>> {
+        if !self.can_stage_logical().await? { return Ok(None); }
         let view = snapshot.snapshot();
         let seal = view.iter_segments(&index.table).next().cloned().map(|segment| (view.clone(), segment));
         let history_id = format!("{}w", index.id);
@@ -176,7 +185,7 @@ impl SearchBuilder {
             .ok_or_else(|| fault("Logical search definition has no fields"))?;
         let run = self.build_logical(index, &columns, &view, trie.block_index(), File::open(path).map_err(fault)?,
             size.min(i64::MAX as u64) as i64, seal, cancellation).await?;
-        SearchRunChange { run: Some(run.run), ..Default::default() }.to_artefact()
+        SearchRunChange { run: Some(run.run), ..Default::default() }.to_artefact().map(Some)
     }
 
     async fn recover_from_history(&self, index: &LogicalIndex, columns: &[String], snapshot: &Snapshot,
@@ -430,7 +439,10 @@ impl SearchBuilder {
     pub(super) async fn refresh_logical(&self, snapshots: &dyn SnapshotSource, publisher: &dyn ArtefactPublisher,
         storage: (StorageVersion, StorageEpoch), cancellation: &CancellationToken) -> Result<()> {
         let definitions = self.search_definitions(&snapshots.snapshot(), cancellation).await?;
-        self.repair_logical(snapshots, publisher, storage, &definitions, cancellation).await?;
+        let can_stage = definitions.iter().any(LogicalIndex::supports) && self.can_stage_logical().await?;
+        if can_stage {
+            self.repair_logical(snapshots, publisher, storage, &definitions, cancellation).await?;
+        }
         let snapshot = snapshots.snapshot().snapshot();
         for table in snapshot.trie_catalog().tables() {
             for run in snapshot.trie_catalog().search_runs(table) {
@@ -444,6 +456,7 @@ impl SearchBuilder {
                 }).await?;
             }
         }
+        if !can_stage { return Ok(()); }
         for definition in definitions.iter().filter(|definition| LogicalIndex::supports(definition)) {
             let index = LogicalIndex::of(definition);
             let snapshot = snapshots.snapshot().snapshot();
@@ -884,6 +897,91 @@ mod tests {
         trie.artefacts.push(record);
         let catalog = rtdb_index::TrieCatalog::default().with_tries(index.table.clone(), [trie], Timestamp(1)).unwrap();
         assert_eq!(catalog.search_runs(&index.table).next(), Some(&run));
+    }
+
+    use object_store::{ClientOptions, StaticCredentialProvider, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
+        client::{HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService},
+        gcp::{GcpCredential, GoogleCloudStorageBuilder}};
+    use rtdb_format::search_manifest::{SearchStagingOwner, StagedSearchRun};
+    use rtdb_storage::{disk_cache::DiskCache, remote::RemoteStore};
+
+    #[derive(Clone, Copy, Debug)]
+    struct NoProviderRequests;
+
+    impl HttpConnector for NoProviderRequests {
+        fn connect(&self, _: &ClientOptions) -> object_store::Result<HttpClient> { Ok(HttpClient::new(*self)) }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpService for NoProviderRequests {
+        async fn call(&self, request: HttpRequest) -> std::result::Result<HttpResponse, HttpError> {
+            panic!("Unsupported search staging sent a provider request: {}", request.method());
+        }
+    }
+
+    fn builder(store: Arc<dyn ObjectStore>) -> SearchBuilder {
+        let budget = rtdb_types::MemoryBudget::new(64 << 20);
+        SearchBuilder::new("xtdb".into(), store.clone(), Arc::new(BufferPool::new(store, 1 << 20)), budget,
+            Arc::new(|| Timestamp(0).into()), crate::SearchRuntime::with_logical_search(1 << 20))
+    }
+
+    async fn write_run(builder: &SearchBuilder, slug: &TableSlug) -> Result<SearchRun> {
+        let index = LogicalIndex { table: TableRef::new("public", "docs"), id: "docsf16".into(), version: 1 };
+        let document = LogicalDocument { iid: Iid([1; 16]), field: 0, revision: text_revision("test"),
+            sql_id: Some(1), tokens: rtdb_text::analyze("test"), position: (Timestamp(1), None, 1) };
+        let contents = RunContents { documents: vec![document], ..Default::default() };
+        builder.store_documents(&index, &["body".into()], slug, vec![0], 0, 1, contents,
+            builder.memory.reserve(indexing_allowance(0))?, &CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn logical_search_staging_refuses_classic_cloud_stores_before_provider_io() {
+        let provider = NoProviderRequests;
+        let clients: [(&str, Arc<dyn object_store::ObjectStore>); 3] = [
+            ("S3", Arc::new(AmazonS3Builder::new().with_bucket_name("search-fixture").with_region("us-east-1")
+                .with_skip_signature(true).with_http_connector(provider).build().unwrap())),
+            ("GCS", Arc::new(GoogleCloudStorageBuilder::new().with_bucket_name("search-fixture")
+                .with_credentials(Arc::new(StaticCredentialProvider::new(GcpCredential { bearer: String::new() })))
+                .with_http_connector(provider).build().unwrap())),
+            ("Azure", Arc::new(MicrosoftAzureBuilder::new().with_account("searchfixture").with_container_name("search-fixture")
+                .with_skip_signature(true).with_http_connector(provider).build().unwrap())),
+        ];
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = DiskCache::open(cache_dir.path(), 1 << 20, rtdb_types::MemoryBudget::new(1 << 20)).unwrap();
+        let slug = TableSlug::recorded("public$docs").unwrap();
+        for (backend, client) in clients {
+            let prefix = ObjectKey::new("v06").unwrap();
+            let remote = RemoteStore::new_in(client, Some(prefix), IoRegion::new()).with_catalog_ledger().unwrap();
+            let store = cache.scope(ObjectKey::new(backend).unwrap(), Arc::new(remote)).unwrap();
+            let builder = builder(store);
+            assert!(!builder.can_stage_logical().await.unwrap(), "{backend}");
+            assert_eq!(write_run(&builder, &slug).await.unwrap_err().code, "rtdb.storage/search-staging-unsupported", "{backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn logical_search_staging_retains_local_and_volatile_writers() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = LocalStore::open(directory.path()).unwrap();
+        assert!(!builder(Arc::new(local)).can_stage_logical().await.unwrap());
+        let local = LocalStore::open(directory.path()).unwrap().with_catalog_ledger(StorageEpoch(0));
+        let local = builder(Arc::new(local));
+        let memory = builder(Arc::new(MemoryStore::default()));
+        let slug = TableSlug::recorded("public$docs").unwrap();
+        for (builder, durable) in [(local, true), (memory, false)] {
+            assert!(builder.can_stage_logical().await.unwrap());
+            let run = write_run(&builder, &slug).await.unwrap();
+            let marker = ObjectKey::new(run.pending_key(&slug).unwrap()).unwrap();
+            let staged = StagedSearchRun::decode(&builder.store.get(&marker).await.unwrap()).unwrap();
+            if durable {
+                let Some(owner @ SearchStagingOwner::Local { .. }) = staged.owner else { panic!("missing local witness"); };
+                assert!(!builder.store.search_staging_drained(owner).await.unwrap());
+            } else {
+                assert_eq!(staged.owner, None);
+            }
+            let body = ObjectKey::new(run.object_key(&slug).unwrap()).unwrap();
+            assert_eq!(builder.store.head(&body).await.unwrap().size, run.file_size() as u64);
+        }
     }
 
     #[test]

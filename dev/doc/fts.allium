@@ -121,6 +121,9 @@ config {
     -- See: server config `search: {enabled, threads, writeFormat}` and NodeOptions.
     -- The configured format determines which files new jobs write.
     -- Format 16 gives each public history-enabled definition a manifest of logical posting runs.
+    -- Durable logical runs build where the writer can register a staging owner with a recoverable drain witness.
+    -- Hosted compactor attachments build primary compaction outputs and leave logical posting builds to the directory holder.
+    -- Queries cover missing logical runs through the existing search gap paths.
     write_format: Integer = 11
     -- Off stops the lane and the accelerator together; MATCH is then answered by scanning.
     enabled: Boolean = true

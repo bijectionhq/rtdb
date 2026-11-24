@@ -195,14 +195,21 @@ Hosted installed search runs with exact publication evidence use the same bounde
 A hosted checkpoint subscription renews the exact catalog scope through a fresh storage-ledger admission. Prior readers retain independent claims through provider and delivery drain.
 Owned relations past their declared retention can enter installed retirement once no selectable older world names them. Expired worlds close new admission. Already admitted scopes retain their dependencies through drain.
 Live FactStore compaction waits for the installed predecessor. The receiver exhausts the selected primary routes and checks that each original transaction and operation position still has the same effect, entity, valid interval and historical route in the successor. The census covers original winners, masks and every event that an open predicate can name. Exact duplicate occurrences can collapse. Distinct logical events stay in custody without exact exclusion evidence. Replaced files enter the installed retirement path under the same grant rules.
-Directory-managed search staging binds the upload to its writer epoch and storage region. A successor waits for both writer turnover and provider drain before ordering abandonment.
-Classic local search staging binds the upload to a durable filesystem writer witness. The collector requires positive owner drain on both routes. A staging record without a drain witness cannot authorize abandonment.
+Directory-managed search staging binds the holder's upload to its writer epoch and storage region.
+A successor waits for writer turnover and removal of the drained region from the directory before ordering abandonment.
+Hosted compactor attachments build primary compaction outputs and leave logical posting builds to the holder.
+Coordinated Classic local search staging binds the upload to a durable filesystem writer witness.
+The collector requires the witness to exist and its exclusive lock to be available before ordering abandonment.
+Classic S3, GCS and Azure decline logical search staging because their writer attachments lack provider drain evidence.
+Queries cover missing logical runs through the existing search gap paths.
+An unadopted staging record without a verifiable owner stays in custody.
 Governed worlds share the selected root and frozen ancestor inventory between admission and retirement. Each retained capture binds its manifest and each suffix also binds its original transaction key.
 Classic remote catalog holds under the original key vault can settle an abandoned reader when the same locked filesystem proves the attachment has ended. Missing witnesses keep the remote hold.
 Allocated Classic S3 search runs with exact version evidence use the same catalog and physical settlement grant as compacted primaries.
 Hosted maintenance can withdraw an inherited loose edge or enclosing pack edge when the fork already has a byte-identical copy with a fresh immutable provider witness. A path release naming a pack member has to match the installed pack index. The lineage remains pinned while it checks both publications and withdraws the exact manifest edge. The replacement copy needs its own deletion grant. Other path-only references stay in custody.
 Directory-managed local maintenance no longer uses raw-path grace. Path-only releases stay retained without an exact grant. Covered local packs still use the archived replay closure and the local lineage reservation.
-Unsealed and foreign-vault remote holds stay in custody without a verifiable drain witness. Renewal across other entry points, full recovery-root integration, remote Classic staging, legacy search seal retirement, and uncoordinated timers remain open.
+Unsealed and foreign-vault remote holds stay in custody without a verifiable drain witness.
+Renewal across other entry points, full recovery-root integration, provider drain evidence for Classic remote writers, legacy search seal retirement, and uncoordinated timers remain open.
 
 |5
 |Recovery roots as holds; collectable L0; reset from a root.

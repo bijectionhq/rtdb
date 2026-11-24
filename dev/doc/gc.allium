@@ -100,11 +100,13 @@
 --
 -- Each cycle first retires the tables of owned relations whose retention has passed (rule RetireDueTables).
 -- Their tries then become garbage like any superseded trie, and the deletion rules below collect them unchanged.
--- Directory-managed logical search staging records its writer epoch and provider region before uploading.
--- Hosted collection proves drain when the writer epoch has advanced and the originating storage region is absent from the deployment.
--- A logical search intent on a native local store carries the writer attachment whose flock witness is held for the writer's lifetime.
--- Native collection proves drain by acquiring that attachment's released witness lock.
--- The installed search retirement still needs the immutable provider publication and its catalog grant.
+-- Durable logical search staging requires a recoverable writer registration before uploading.
+-- A directory-managed holder records its writer epoch and provider region before uploading.
+-- A replacement holder can order abandonment once the writer epoch has advanced and the originating region has drained and left the directory record.
+-- A coordinated Classic local writer records a durable filesystem witness before uploading.
+-- The collector requires the witness to exist and its exclusive lock to be available before taking over an abandoned upload.
+-- Classic remote storage declines logical search staging until it can supply recoverable writer drain evidence.
+-- Hosted retirement of an installed search run requires its immutable provider publication and catalog grant.
 --
 -- Block-file GC lives in block-gc.allium — block files are consumed only at
 -- startup/catch-up, so they don't need replica-log coordination.
