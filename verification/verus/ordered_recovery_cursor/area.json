@@ -1,0 +1,37 @@
+{
+  "summary": "The shipped ordered writer open checks the certified checkpoint and head coordinates, replay delivers the exact next held record and preserves renewed cursor identity, and an unrecognized prefix prevents promotion.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 9,
+  "controls": {
+    "substitute_checkpoint_root": {
+      "defect": "The opened catalog may come from another checkpoint at the same offset.",
+      "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "Some(boundary) => !genesis && exact_root && boundary as i128", "replace": "Some(boundary) => !genesis && boundary as i128" }],
+      "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "recovery_coordinates_match", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "skip_next_lsn": {
+      "defect": "Replay accepts a later record and skips an original transaction.",
+      "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "from.checked_add(1) == Some(offered)", "replace": "from < offered" }],
+      "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "next_in_hold", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "substitute_renewed_history": {
+      "defect": "Renewal accepts a cut in another history at the same offset.",
+      "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "    start == next && (!resuming || exact_previous_cut)", "replace": "    start == next" }],
+      "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "starts_at", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "substitute_page_checkpoint": {
+      "defect": "A prepared record can come from a page with a different checkpoint.",
+      "mutate": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "find": "    if exact_checkpoint && exact_through && exact_record_cut", "replace": "    if exact_through && exact_record_cut" }],
+      "expect": [{ "file": "rust/crates/multi/src/journal/replay_cursor.rs", "function": "select_record", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    },
+    "promote_after_unknown_frame": {
+      "defect": "A grant holder promotes after encountering an unrecognized replica frame.",
+      "mutate": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "find": "    recognized_prefix && may_lead && !already_leading && holds_grant", "replace": "    may_lead && !already_leading && holds_grant" }],
+      "expect": [{ "file": "rust/crates/replication/src/recovery_promotion.rs", "function": "may_promote", "category": "postcondition not satisfied" }],
+      "min_verified_functions": 8
+    }
+  }
+}

@@ -1,7 +1,7 @@
 //! RTDB storage-log projection of the installed journal's ordered grants
 //! and exact replay intervals.
 
-use super::{InstalledJournal, ReadFailure, WriterAdmission, latest};
+use super::{InstalledJournal, ReadFailure, WriterAdmission, latest, replay_cursor};
 use crate::{cipher::SEALED_OVERHEAD, keys::{JournalKey, KeyService}};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -590,6 +590,11 @@ impl Cursor {
                     return Err(error);
                 }
             };
+            if !replay_cursor::starts_at(
+                self.next, held.hold.start.next_lsn, self.from.is_some(), self.from == Some(held.hold.start),
+            ) {
+                return Err(Error::Closed("The ordered replay hold starts at a different cut".into()));
+            }
             self.from = Some(held.hold.start);
             self.held = Some(held);
         }
@@ -622,6 +627,12 @@ impl Cursor {
                         maximum: self.reads.maximum,
                     });
                 }
+                if !replay_cursor::next_in_hold(
+                    from.next_lsn, item.next.next_lsn, held.hold.through.next_lsn,
+                    item.next == held.hold.through,
+                ) {
+                    return Err(Error::Closed("The ordered replay head is outside its exact successor cut".into()));
+                }
                 let offset = latest(item.next).map_err(storage)?;
                 let metadata = ReplayHead {
                     metadata: LogMetadata {
@@ -641,7 +652,6 @@ impl Cursor {
                 return Ok(Some(metadata));
             }
             self.held = None;
-            self.from = None;
             if self.end == Some(self.next) {
                 return Ok(None);
             }
@@ -693,14 +703,19 @@ impl Cursor {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Task("No record in the protected interval".into()))?;
-        if first.result.cut != prepared.end
-            || first.timestamp != head.metadata.timestamp.0
-            || first.payload.len() != head.payload_len + SEALED_OVERHEAD
-        {
-            return Err(Error::Task(
-                "The ordered record differs from the prepared head".into(),
-            ));
-        }
+        let exact_record_cut = first.result.cut == prepared.end;
+        let observed_time = first.timestamp;
+        let observed_bytes = first.payload.len();
+        let first = replay_cursor::select_record(
+            first,
+            page.checkpoint == held.hold.checkpoint,
+            page.through == held.hold.through,
+            exact_record_cut,
+            observed_time,
+            head.metadata.timestamp.0,
+            observed_bytes,
+            head.payload_len + SEALED_OVERHEAD,
+        ).ok_or_else(|| Error::Closed("The ordered replay record differs from its prepared head or hold".into()))?;
         let placement = self.reads.journal.placement();
         let scope = ReplicaObjectScope {
             deployment: placement.deployment,
@@ -710,10 +725,6 @@ impl Cursor {
             writer_epoch: first.grant.epoch,
         };
         if let Some(snapshot) = &self.snapshot {
-            let scope = snapshot.held.scope();
-            if page.checkpoint != scope.checkpoint || page.through != scope.through {
-                return Err(Error::Closed("The ordered replay changed its snapshot checkpoint or cut".into()));
-            }
             snapshot.delivered(head.metadata.offset, first.grant.epoch, first.references.unwrap_or_default())?;
         }
         let key = JournalKey::new(placement, first.grant.key_generation);
@@ -872,7 +883,7 @@ impl Log for JournalLog {
         let Some(held) = self.recovery.lock().await.take() else {
             return self.tail(after).await.map(Some);
         };
-        if next != held.hold.start.next_lsn {
+        if !replay_cursor::starts_at(next, held.hold.start.next_lsn, false, false) {
             return Err(Error::UnavailableLogRange {
                 requested: next as i64,
                 first_retained: held.hold.start.next_lsn as i64,

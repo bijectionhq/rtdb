@@ -12,6 +12,7 @@ mod fact_history;
 mod logs;
 mod progress;
 mod readback_identity;
+mod recovery_promotion;
 mod replay_closure;
 mod repair;
 mod repair_decision;

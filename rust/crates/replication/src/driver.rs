@@ -782,7 +782,10 @@ impl ReplicationDriver {
             return Ok(());
         }
         if !self.logs.fences_writer_terms() { return self.start_claim(); }
-        if !self.config.may_lead || self.leader.is_some() || !self.logs.holds_writer_grant().await? { return Ok(()); }
+        let holds_grant = self.config.may_lead && self.leader.is_none() && self.logs.holds_writer_grant().await?;
+        if !crate::recovery_promotion::may_promote(
+            self.recognized_prefix, self.config.may_lead, self.leader.is_some(), holds_grant,
+        ) { return Ok(()); }
         let term = self.fence.claim_term()?;
         if let Err(error) = self.promote_term(term).await {
             self.promotion_failed(error).await?;
