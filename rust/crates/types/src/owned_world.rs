@@ -795,7 +795,7 @@ mod tests {
         assert!(!limit.admits(&descendant, Timestamp(150)));
         assert_eq!(descendant.ancestors, child.ancestors);
         let selection = descendant.ancestors.last_mut().unwrap();
-        selection.system = Timestamp(190);
+        selection.publication = TransactionKey { tx_id: TxId(19), system_time: Timestamp(190) };
         selection.logical = Timestamp(149);
         assert!(child.can_retain_overlay(&descendant));
         descendant.fork_lineage = child.retained_child_lineage(&descendant, Timestamp(225))?;
