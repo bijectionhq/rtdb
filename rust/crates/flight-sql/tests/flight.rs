@@ -2193,8 +2193,12 @@ async fn catalog_actions_publish_exact_position_and_wake_a_separate_session() {
 
     let publication = CatalogPublication {
         before: vec![CatalogStatement {
-            sql: "ASSERT $1 = 'guard'".into(),
-            args: catalog_ipc(&["_0"], vec![Arc::new(StringArray::from(vec!["guard"]))]),
+            sql: "ASSERT $1 = 'guard' AND SUBSTRING(CAST($2 AS TEXT) FROM 3) = '00ff'".into(),
+            args: catalog_ipc(
+                &["_0", "_1"],
+                vec![Arc::new(StringArray::from(vec!["guard"])),
+                    Arc::new(arrow_array::BinaryArray::from_vec(vec![&[0, 0xff]]))],
+            ),
         }],
         rows: catalog_writes(), marker: Some(marker()),
     };
