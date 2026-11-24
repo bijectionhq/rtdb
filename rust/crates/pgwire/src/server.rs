@@ -149,13 +149,13 @@ impl ServerDriver {
 /// Serve one read-only session on an established TLS stream. The caller
 /// authorizes entry into the stream. PgWire also applies its node authenticator.
 pub async fn serve_read_only_tls(
-    stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    stream: tokio_rustls::server::TlsStream<rtdb_query::DeliveryIo<tokio::net::TcpStream>>,
     node: Node,
     auth: Arc<Authenticator>,
     parameters: BTreeMap<String, String>,
     cancellation: CancellationToken,
 ) -> Result<()> {
-    let address = stream.get_ref().0.peer_addr().map_err(network)?;
+    let address = stream.get_ref().0.get_ref().peer_addr().map_err(network)?;
     let mut config = ServerConfig { read_only: true, require_tls: true, ..Default::default() };
     config.parameters.extend(parameters);
     let registry = Arc::new(CancellationRegistry {

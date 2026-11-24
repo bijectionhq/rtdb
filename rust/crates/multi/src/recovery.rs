@@ -7,6 +7,7 @@ use rtdb_directory::{
     CheckpointCaptureRetirement, CheckpointStageIntent, CheckpointSuffixCustody, DeploymentRecord, Directory, DisposalReceipt, HostedTask,
     ServingInventory,
 };
+use rtdb_storage::sealing::DeliveryIo;
 use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget, Result};
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -887,7 +888,7 @@ impl RecoveryService {
         &self,
         directory: Arc<dyn Directory>,
         request: Request,
-        mut socket: TlsStream<TcpStream>,
+        mut socket: TlsStream<DeliveryIo<TcpStream>>,
         stop: CancellationToken,
     ) -> Result<()> {
         let authorized = self.authorize(directory.as_ref(), &request).await?;
@@ -1026,8 +1027,8 @@ pub async fn serve(
 async fn read_request(
     socket: TcpStream,
     acceptor: TlsAcceptor,
-) -> std::io::Result<(TlsStream<TcpStream>, String)> {
-    let mut socket = acceptor.accept(socket).await?;
+) -> std::io::Result<(TlsStream<DeliveryIo<TcpStream>>, String)> {
+    let mut socket = acceptor.accept(DeliveryIo::new(socket)).await?;
     // The caller waits for the acknowledgement before it starts PgWire.
     // Reject trailing bytes so the line reader cannot swallow its first frame.
     let mut line = String::new();

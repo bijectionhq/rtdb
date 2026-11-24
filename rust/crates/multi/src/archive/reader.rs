@@ -16,6 +16,7 @@ use rtdb_node::{Database, LogAccess, LogFactory, OpenedLogs, ReadFence, RemoteSt
 use rtdb_replication::BlockDiscovery;
 use rtdb_server::{PlacedOptions, ServerDriver, config::NodeConfiguration};
 use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
+use rtdb_storage::sealing::DeliveryIo;
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch};
 use serde::Serialize;
 use tokio::{io::AsyncWriteExt, net::TcpStream};
@@ -86,7 +87,7 @@ enum Transport {
         tls: Arc<ServerConfig>,
         ready_file: PathBuf,
     },
-    Tunnel(TlsStream<TcpStream>),
+    Tunnel(TlsStream<DeliveryIo<TcpStream>>),
 }
 
 /// Opens only the held stage on an isolated loopback TLS listener. The reader
@@ -138,7 +139,7 @@ pub(crate) async fn tunnel_staged_checkpoint(
     selector: StageSelector,
     hosted_task: Option<HostedTask>,
     stop: CancellationToken,
-    stream: TlsStream<TcpStream>,
+    stream: TlsStream<DeliveryIo<TcpStream>>,
 ) -> Result<()> {
     serve_stage(
         directory,
