@@ -99,7 +99,7 @@ async fn read_history(request: &ScanRequest<'_>, keys: &BTreeSet<Iid>) -> Result
                     if request.cancellation.is_cancelled() { return Err(cancelled()); }
                     let bytes = file.read(range.range()).await?;
                     let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
-                    let page = range.read(bytes.as_slice())?;
+                    let page = range.read(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)))?;
                     for row in page.rows(keys) {
                         let (header, origin) = page.event(row)?;
                         visit(LocatedHistoryEvent { header, origin, witness: None,

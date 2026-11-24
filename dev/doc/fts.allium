@@ -201,6 +201,7 @@ rule SearchJobRuns {
     -- The per-trie point path checks recorded entity keys in history files, primary pages, and live segments.
     -- Histories with different entity keys under one IID resolve through the scan.
     -- A forward witness identifies an event and a digest of the ordered analyzer token sequence for one field.
+    -- Readers authenticate the selected forward-witness range and decode Arrow from its retained bytes.
     -- A resolved event must identify itself before a forward witness can certify its score.
     -- The writer stores a search-pending intent with its staging owner before uploading the immutable body.
     -- A successful upload supplies the immutable publication for ordered adoption when the provider exposes it.

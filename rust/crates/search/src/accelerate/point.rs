@@ -180,7 +180,7 @@ impl PackedVisibility {
             if selected.is_empty() { continue; }
             let bytes = file.read(range.range()).await?;
             let _decoded = request.memory.reserve(bytes.as_slice().len().saturating_mul(4).saturating_add(4096))?;
-            let page = range.read_forward(bytes.as_slice(), definition.columns.len())?;
+            let page = range.read_forward(arrow_buffer::Buffer::from(bytes::Bytes::from_owner(bytes)), definition.columns.len())?;
             for (row, index) in selected {
                 let iid = row.version.iid;
                 if let Some(revision) = page.revision(index as usize, iid, row.origin.expect("stable forward event"), self.column)? {

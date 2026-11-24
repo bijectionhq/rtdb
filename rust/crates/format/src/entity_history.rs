@@ -1,7 +1,9 @@
-use std::{collections::BTreeSet, io::{Cursor, Write}, ops::Range, sync::{Arc, LazyLock}};
+use std::{collections::BTreeSet, io::Write, ops::Range, sync::{Arc, LazyLock}};
 
 use arrow_array::{Array, FixedSizeBinaryArray, Int64Array, RecordBatch, UInt8Array, UInt32Array,
     builder::{BinaryBuilder, FixedSizeBinaryBuilder}, cast::AsArray, types::{Int64Type, UInt8Type, UInt32Type}};
+use arrow_buffer::Buffer;
+use arrow_ipc::reader::{FileDecoder, read_footer_length};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, EventHeader, EventOp, EventOrigin, EventPosition, Iid, Interval, Result, Timestamp};
@@ -85,7 +87,7 @@ pub struct HistoryRange {
 impl HistoryRange {
     pub fn range(self) -> Range<u64> { self.offset..self.offset + u64::from(self.length) }
 
-    pub fn read(self, bytes: &[u8]) -> Result<HistoryPage> {
+    pub fn read(self, bytes: Buffer) -> Result<HistoryPage> {
         let batch = self.read_batch(bytes, schema())?;
         if batch.columns()[..6].iter().any(|array| array.null_count() != 0) {
             return Err(invalid("Entity history contains a null header"));
@@ -93,17 +95,35 @@ impl HistoryRange {
         Ok(HistoryPage(batch))
     }
 
-    pub fn read_forward(self, bytes: &[u8], columns: usize) -> Result<ForwardPage> {
+    pub fn read_forward(self, bytes: Buffer, columns: usize) -> Result<ForwardPage> {
         self.read_batch(bytes, &forward_schema(columns)).map(ForwardPage)
     }
 
-    fn read_batch(self, bytes: &[u8], schema: &SchemaRef) -> Result<RecordBatch> {
-        verify(bytes, self.length, self.digest)?;
-        let mut reader = arrow_ipc::reader::FileReader::try_new(Cursor::new(bytes), None).map_err(invalid)?;
-        if reader.schema() != *schema || reader.num_batches() != 1 {
+    fn read_batch(self, bytes: Buffer, schema: &SchemaRef) -> Result<RecordBatch> {
+        verify(&bytes, self.length, self.digest)?;
+        let footer_end = bytes.len().checked_sub(10).ok_or_else(|| invalid("Arrow file is shorter than its footer"))?;
+        let footer_length = read_footer_length(bytes[footer_end..].try_into().expect("Arrow footer tail width")).map_err(invalid)?;
+        let footer_start = footer_end.checked_sub(footer_length).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
+        let footer = arrow_ipc::root_as_footer(&bytes[footer_start..footer_end])
+            .map_err(|error| invalid(format!("Unable to get root as footer: {error:?}")))?;
+        let blocks = footer.recordBatches().ok_or_else(|| invalid("Unable to get record batches from IPC Footer"))?;
+        let stored = footer.schema().ok_or_else(|| invalid("Arrow footer has no schema"))?;
+        if !stored.endianness().equals_to_target_endianness() {
+            return Err(invalid("the endianness of the source system does not match the endianness of the target system."));
+        }
+        let stored = Arc::new(arrow_ipc::convert::fb_to_schema(stored));
+        let mut decoder = FileDecoder::new(Arc::clone(&stored), footer.version());
+        if let Some(dictionaries) = footer.dictionaries() {
+            for block in dictionaries {
+                decoder.read_dictionary(block, &block_slice(&bytes, block)?).map_err(invalid)?;
+            }
+        }
+        if stored != *schema || blocks.len() != 1 {
             return Err(invalid("History range has the wrong Arrow layout"));
         }
-        let batch = reader.next().ok_or_else(|| invalid("History range has no batch"))?.map_err(invalid)?;
+        let block = blocks.get(0);
+        let batch = decoder.read_record_batch(block, &block_slice(&bytes, block)?).map_err(invalid)?
+            .ok_or_else(|| invalid("History range has no batch"))?;
         if batch.num_rows() != self.rows as usize || batch.column(0).null_count() != 0 {
             return Err(invalid("History range does not account for every row"));
         }
@@ -114,6 +134,19 @@ impl HistoryRange {
         }
         Ok(batch)
     }
+}
+
+fn block_slice(bytes: &Buffer, block: &arrow_ipc::Block) -> Result<Buffer> {
+    let start = usize::try_from(block.offset()).map_err(invalid)?;
+    let metadata = usize::try_from(block.metaDataLength()).map_err(invalid)?;
+    let body = usize::try_from(block.bodyLength()).map_err(invalid)?;
+    let length = metadata.checked_add(body).filter(|length| {
+        start.checked_add(*length).is_some_and(|end| end <= bytes.len())
+    }).ok_or_else(|| invalid("Arrow block exceeds its file"))?;
+    if length < 4 || (length < 8 && bytes[start..start + 4] == [0xff; 4]) {
+        return Err(invalid("Arrow block has a truncated prefix"));
+    }
+    Ok(bytes.slice_with_length(start, length))
 }
 
 fn forward_schema(columns: usize) -> SchemaRef {
@@ -361,3 +394,33 @@ fn verify(bytes: &[u8], length: u32, digest: [u8; 32]) -> Result<()> {
 fn u32_at(bytes: &[u8], first: usize) -> u32 { u32::from_le_bytes(bytes[first..first + 4].try_into().expect("validated history layout")) }
 fn u64_at(bytes: &[u8], first: usize) -> u64 { u64::from_le_bytes(bytes[first..first + 8].try_into().expect("validated history layout")) }
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::fault("rtdb.format/entity-history", error.to_string()) }
+
+#[test]
+fn history_range_reuses_authenticated_arrow_buffers() {
+    let iid = Iid([3; 16]);
+    let event = crate::data::StoredEvent {
+        position: None, origin: None, commit_position: 0, entity_key: None, recency: None,
+        iid, system_from: Timestamp(4), valid_time: Interval::ALL,
+        operation: crate::data::StoredOperation::Delete,
+    };
+    let source = EventBatch::new(crate::data::build_event_batch(&[event], None, None).unwrap()).unwrap();
+    let owner = [42; 32];
+    let mut writer = HistoryWriter::new(Vec::new(), owner, &MemoryBudget::new(1 << 20)).unwrap();
+    writer.append(0, &source).unwrap();
+    let (bytes, root) = writer.finish().unwrap();
+    let encoded = Buffer::from_vec(bytes);
+    let range = ranges(&encoded[root.offset as usize..], root, owner, None).unwrap()[0];
+    let file = encoded.slice_with_length(range.offset as usize, range.length as usize);
+    let reference_bytes = file.to_vec();
+    let reference = arrow_ipc::reader::FileReader::try_new(std::io::Cursor::new(&reference_bytes), None)
+        .unwrap().next().unwrap().unwrap();
+    let inside = file.as_ptr() as usize..file.as_ptr() as usize + file.len();
+
+    let decoded = range.read(file).unwrap();
+    drop(encoded);
+    assert!(inside.contains(&(decoded.iids().value(0).as_ptr() as usize)));
+    assert_eq!(decoded.0, reference);
+    let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), decoded.0.schema_ref()).unwrap();
+    writer.write(&decoded.0).unwrap();
+    assert_eq!(writer.into_inner().unwrap(), reference_bytes);
+}

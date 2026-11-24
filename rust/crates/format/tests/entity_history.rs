@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use arrow_buffer::Buffer;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{
     data::{EventBatch, StoredEvent, StoredOperation, build_event_batch_with_recency, copy_encoded_batch_with_recency},
@@ -32,12 +33,12 @@ fn history_ranges_keep_mixed_event_identities_and_reject_unbound_bytes() {
     assert_eq!(selected.len(), 1);
     let range = selected[0];
     let raw = &bytes[range.range().start as usize..range.range().end as usize];
-    let table = range.read(raw).unwrap();
+    let table = range.read(Buffer::from(raw)).unwrap();
     assert_eq!(table.rows(&keys).collect::<Vec<_>>(), [1]);
     assert_eq!(table.event(1).unwrap(), (events[1].header(), Some(stable)));
     let mut corrupt = raw.to_vec();
     corrupt[0] ^= 1;
-    assert!(range.read(&corrupt).is_err());
+    assert!(range.read(Buffer::from(corrupt)).is_err());
 }
 
 #[test]
@@ -53,7 +54,7 @@ fn forward_witness_requires_the_same_logical_event() {
     writer.append_forward(0, &table, &["body".into()], |_| Ok(Some([25; 32]))).unwrap();
     let (bytes, root) = writer.finish().unwrap();
     let range = ranges(&bytes[root.range().start as usize..], root, [42; 32], None).unwrap()[0];
-    let witness = range.read_forward(&bytes[..range.range().end as usize], 1).unwrap();
+    let witness = range.read_forward(Buffer::from(&bytes[..range.range().end as usize]), 1).unwrap();
     assert_eq!(witness.revision(0, iid, origin, 0).unwrap(), Some([25; 32]));
     assert!(witness.revision(0, iid, EventOrigin::at([3; 16], 12, BlockIndex(8)), 0).is_err());
 }

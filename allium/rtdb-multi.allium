@@ -3147,6 +3147,7 @@ rule HostedCheckpointCapture {
     -- A plan without complete version evidence retains the lineage preparation.
     -- Unrelated provider versions remain eligible for retirement during the copy.
     -- A serving read supplied by an archive carries the archive's physical identity.
+    -- A legacy archive range is sliced from the bytes resealed for the serving key.
     -- The capture region retains its destination and its serving archive source independently.
     -- A local source copy holds the cell maintenance witness through admitted I/O.
     -- A cell transfer that materializes repair data retains the archive in its original directory and custody.

@@ -633,7 +633,7 @@ impl ObjectStore for CheckpointStore {
             let length = usize::try_from(length).map_err(|_| Error::ConflictingObject(key.to_string()))?;
             let observed = self.observe_fresh_exact(key, length).await?;
             Ok(ObjectObservation {
-                value: Bytes::copy_from_slice(&observed.value[range.start as usize..range.end as usize]),
+                value: observed.value.slice(range.start as usize..range.end as usize),
                 version: observed.version,
             })
         }
@@ -703,7 +703,7 @@ impl ObjectStore for CheckpointStore {
             });
         }
         let bytes = self.archive.archived_envelope(key, object).await?;
-        Ok(Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]))
+        Ok(bytes.slice(range.start as usize..range.end as usize))
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> rtdb_storage::Result<Vec<StoredObject>> {
@@ -3332,6 +3332,41 @@ mod tests {
 
         let refused = ArchivedCheckpoint::load(&record, &keys, region, IoRegion::new(), true).await;
         assert!(refused.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_legacy_archive_range_observation_carries_its_authenticated_version() -> Result<()> {
+        let name = key("tables/t/data/l00-rc-b00.arrow")?;
+        let provider = Arc::new(crate::packing::tests::VersionedPacks::default());
+        let files = PrefixedStore::new(provider, "capture/objects");
+        let material = [3; crate::keys::KEY_BYTES];
+        let original = Cipher::new(&material)?.seal_deterministic(name.as_str(), b"retained rows")?;
+        files.put(&name, original.clone()).await?;
+        let version = files.observe_head(&name).await?.version.unwrap();
+        let expected = PublicationSealing::archived(original.clone());
+        let vault = tempfile::tempdir().unwrap();
+        let keys = crate::keys::LocalKeyService::new(vault.path())?;
+        let record = DeploymentRecord::new("serving", "acme", vec![], 0);
+        let serving_cipher = crate::store::directory_publications(&keys, &record, IoRegion::new())?;
+        let archive = ArchivedCheckpoint {
+            files, audience_transport: false, archive_cipher: crate::keys::legacy_archive_key(&material)?,
+            serving_cipher, objects: BTreeMap::from([(name.clone(), ArchivedObject {
+                name: name.to_string(), bytes: original.len() as u64, sha256: digest(&original), frame_header_sha256: None,
+            })]),
+        };
+        let serving = archive.with_serving(Arc::new(rtdb_storage::MemoryStore::default()));
+        assert!(!serving.supports_scan_ranges(&name) && !serving.supports_observed_scan_ranges(&name));
+        let end = expected.len() as u64;
+        for range in [0..8, 3..end, end..end] {
+            let observed = serving.observe_range(&name, range.clone()).await?;
+            assert_eq!(observed.version, Some(version.clone()));
+            let expected_range = &expected[range.start as usize..range.end as usize];
+            assert_eq!(observed.value.as_ref(), expected_range);
+            assert_eq!(serving.get_range(&name, range).await?.as_ref(), expected_range);
+        }
+        assert!(matches!(serving.get_range(&name, end..end + 1).await, Err(Error::InvalidRange { .. })));
+        assert!(matches!(serving.observe_range(&name, end..end + 1).await, Err(Error::InvalidRange { .. })));
         Ok(())
     }
 
