@@ -590,11 +590,11 @@ impl ReplicationDriver {
             None => None,
         };
         let store = Arc::clone(self.resolve.storage.object_store());
-        let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_deref(), collect_checkpoints)?;
+        let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_ref(), collect_checkpoints)?;
         serving.recover_classic(self.partition.snapshot(), block.as_ref().and_then(|block| block.boundary_replica_position()),
             &self.resolve.storage, &self.resolve.memory, &self.cancellation,
             self.resolve.owned_witness_scope.is_none() && !self.config.external_source,
-            checkpoint.as_deref().is_some_and(NativeServing::is_shared_checkpoint),
+            checkpoint.as_ref().is_some_and(|image| NativeServing::is_shared_checkpoint(image.bytes())),
         ).await?;
         let source_authority = Arc::clone(&serving.source_authority);
         let source_replies = Arc::clone(&serving.source_replies);
