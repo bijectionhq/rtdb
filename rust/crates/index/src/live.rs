@@ -14,6 +14,7 @@ use rtdb_format::data::{EventBatch, EventRef, StoredEvent, StoredOperation, owne
 use rtdb_trie::{Bucketer, EventRow, IidReader, MemoryHashTrie, TrieConfig, TrieNode};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, EventPosition, Iid, Interval, LogicalType, Result, RowVersion, TableRef, Timestamp, TransactionKey, Value};
 
+use crate::prepared_order::{next_landing_position, same_stage_order, shift_metadata_position};
 use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
 
 #[derive(Debug)]
@@ -826,9 +827,11 @@ impl StagedWrite {
     /// Attach sealed application tables to the order-assigned transaction metadata.
     /// Both stages belong to the same assigned source transaction and durable predecessor.
     pub fn install_prepared_generation(&mut self, prepared: Self, memory: &Arc<MemoryBudget>) -> Result<()> {
-        if prepared.predecessor != self.predecessor || prepared.block_index != self.block_index
-            || prepared.tx_key != self.tx_key
-            || prepared.tables.keys().any(|table| self.tables.contains_key(table))
+        let coordinates = |key: TransactionKey| (key.tx_id.0, key.system_time.0);
+        if !same_stage_order(
+            self.predecessor.map(coordinates), prepared.predecessor.map(coordinates),
+            self.block_index.0, prepared.block_index.0, coordinates(self.tx_key), coordinates(prepared.tx_key),
+        ) || prepared.tables.keys().any(|table| self.tables.contains_key(table))
         {
             return Err(invalid("Prepared generation differs from the ordered transaction"));
         }
@@ -846,10 +849,10 @@ impl StagedWrite {
             if batch.is_empty() { continue; }
             let _positions = memory.reserve(batch.len().checked_mul(32).ok_or_else(|| invalid("Event positions exceed memory"))?)?;
             let positions = batch.headers.0.iter().map(|header| {
-                let position = header.position.filter(|position| position.transaction == original)
-                    .ok_or_else(|| invalid("Prepared event has another original order"))?;
-                let ordinal = position.ordinal.checked_add(shift).ok_or_else(|| invalid("Event ordinal exhausted"))?;
-                Ok(EventPosition { transaction: original, ordinal })
+                let event = header.position.map(|position| (position.transaction.0, position.ordinal));
+                let (transaction, ordinal) = shift_metadata_position(event, original.0, shift)
+                    .ok_or_else(|| invalid("Prepared event has another original order or exhausted its ordinal"))?;
+                Ok(EventPosition { transaction: rtdb_types::TxId(transaction), ordinal })
             }).collect::<Result<Vec<_>>>()?;
             let rebound = rtdb_format::data::append_event_positions(&batch.owned, positions, memory)?;
             write.batch = Some(IndexBatch::from_owned(rebound)?);
@@ -1279,7 +1282,7 @@ impl TransactionBuffer {
         Ok(if table.is_owned_event_data() {
             match &self.owned_positions {
                 Some(OwnedCommitPositions::Landing(previous)) => {
-                    Some(previous.checked_add(1).ok_or_else(|| invalid("Owned commit position overflow"))?)
+                    Some(next_landing_position(*previous).ok_or_else(|| invalid("Owned commit position overflow"))?)
                 },
                 Some(OwnedCommitPositions::Archive { direct, .. }) => {
                     let effect = direct.as_ref().filter(|effect| &effect.table == table && !effect.staged)

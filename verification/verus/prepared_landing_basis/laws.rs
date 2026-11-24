@@ -1,3 +1,4 @@
+use crate::prepared_order::{next_landing_position, same_stage_order, shift_metadata_position};
 use crate::prepared_landing_basis::{generation_matches, prepared_authority_matches, select_generation, LandingBasis};
 use vstd::{laws_eq::obeys_concrete_eq, prelude::*};
 
@@ -49,6 +50,16 @@ pub(crate) fn select_original_staged_landing<Clock: Eq, Scope: Eq, Writes>(
         return None;
     }
     select_generation(prepared, installed, prepared_key, assigned, writes, refused)
+}
+
+pub(crate) fn apply_one_landing_order() -> (reachable: bool)
+    ensures reachable,
+{
+    let basis = Some((4, 20));
+    same_stage_order(basis, basis, 3, 3, (5, 21), (5, 21))
+        && next_landing_position(0) == Some(1) && next_landing_position(1) == Some(2)
+        && shift_metadata_position(Some((5, 0)), 5, 2) == Some((5, 2))
+        && shift_metadata_position(Some((5, 1)), 5, 2) == Some((5, 3))
 }
 
 }

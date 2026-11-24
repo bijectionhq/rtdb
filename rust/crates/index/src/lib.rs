@@ -2,6 +2,7 @@ mod catalog;
 pub mod branches;
 mod event_revision;
 mod live;
+mod prepared_order;
 mod partition;
 mod reader_retention;
 mod row_address;

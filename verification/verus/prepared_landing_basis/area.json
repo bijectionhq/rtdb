@@ -1,39 +1,193 @@
 {
-  "summary": "The shipped prepared Proposal switch preserves the original staged writes and disposition and requires the original clock slot and witness scope, complete predecessor and physical catalog, assigned source transaction and assigned system time.",
-  "flags": ["--no-external-by-default"],
-  "min_verified_functions": 2,
+  "summary": "The shipped prepared Proposal switch preserves the original staged writes and disposition and requires the original clock slot and witness scope, complete predecessor and physical catalog, assigned source transaction and assigned system time. The live index checks the attachment uses the same transaction and predecessor, keeps the original physical transaction on shifted metadata positions, and assigns consecutive landing assertion positions.",
+  "flags": [
+    "--no-external-by-default"
+  ],
+  "min_verified_functions": 11,
   "controls": {
     "substitute-predecessor": {
       "defect": "A prepared generation can switch after another source transaction advances its predecessor.",
-      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "    prepared.predecessor_id == installed.predecessor_id\n        && prepared.predecessor_time", "replace": "    prepared.predecessor_time"}],
-      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "find": "    prepared.predecessor_id == installed.predecessor_id\n        && prepared.predecessor_time",
+          "replace": "    prepared.predecessor_time"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "function": "generation_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 1
     },
     "substitute-replica-epoch": {
       "defect": "A prepared generation can cross an unrelated replica epoch with numerically equal coordinates.",
-      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared.replica_epoch == installed.replica_epoch\n", "replace": ""}],
-      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "find": "        && prepared.replica_epoch == installed.replica_epoch\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "function": "generation_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 1
     },
     "substitute-assigned-position": {
       "defect": "A prepared generation can switch with an assigned source position different from the source position that owns its effects.",
-      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_key.0 == assigned_key.0\n", "replace": ""}],
-      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "find": "        && prepared_key.0 == assigned_key.0\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "function": "generation_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 1
     },
     "substitute-installed-witness-scope": {
       "defect": "A prepared generation can publish after the installed witness scope changes.",
       "mutate": [
-        {"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "            && receiver == Some(prepared_scope)\n", "replace": ""},
-        {"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "\n        && matches!(receiver, Some(scope) if Scope::eq(&scope, &prepared_scope))", "replace": ""}
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "find": "            && receiver == Some(prepared_scope)\n",
+          "replace": ""
+        },
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "find": "\n        && matches!(receiver, Some(scope) if Scope::eq(&scope, &prepared_scope))",
+          "replace": ""
+        }
       ],
-      "expect": [{"file": "verification/verus/prepared_landing_basis/laws.rs", "function": "select_original_staged_landing", "category": "postcondition not satisfied"}],
+      "expect": [
+        {
+          "file": "verification/verus/prepared_landing_basis/laws.rs",
+          "function": "select_original_staged_landing",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 1
     },
     "substitute-assigned-time": {
       "defect": "A prepared generation can switch with a different history timestamp at the same source transaction.",
-      "mutate": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "find": "        && prepared_key.1 == assigned_key.1\n", "replace": ""}],
-      "expect": [{"file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs", "function": "generation_matches", "category": "postcondition not satisfied"}],
+      "mutate": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "find": "        && prepared_key.1 == assigned_key.1\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/tx/src/resolver/prepared_landing_basis.rs",
+          "function": "generation_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "attach-other-block": {
+      "defect": "A private generation can attach to another block.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "find": "\n    base == prepared_base && block == prepared_block && assigned == prepared\n}",
+          "replace": "\n    base == prepared_base && assigned == prepared\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "function": "same_stage_order",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "attach-other-revision": {
+      "defect": "A private generation can attach to an order with a different assigned revision.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "find": "\n    base == prepared_base && block == prepared_block && assigned == prepared\n}",
+          "replace": "\n    base == prepared_base && block == prepared_block && assigned.0 == prepared.0\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "function": "same_stage_order",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "shift-foreign-metadata": {
+      "defect": "A physical event from another transaction can join the selected order.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "find": "    if transaction != assigned {\n        return None;\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "function": "shift_metadata_position",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "overlap-metadata-with-application": {
+      "defect": "The first metadata event can reuse an application event ordinal.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "find": "    Some((transaction, ordinal.checked_add(application_rows)?))",
+          "replace": "    Some((transaction, ordinal))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "function": "shift_metadata_position",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "reuse-landing-assertion-position": {
+      "defect": "Two authored assertions can share the same commit position.",
+      "mutate": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "find": "    prior.checked_add(1)",
+          "replace": "    Some(prior)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "rust/crates/index/src/prepared_order.rs",
+          "function": "next_landing_position",
+          "category": "postcondition not satisfied"
+        }
+      ],
       "min_verified_functions": 1
     }
   }
