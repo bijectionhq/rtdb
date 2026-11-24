@@ -267,6 +267,7 @@ Ranking takes the authoring world, relation and row key from the winning overlay
 The opened body is the JSON pair of text paths and vector paths, used only as transient ranking input.
 In current ranking, a fenced or retired derived winner continues to shadow a parent row and contributes no ranking input.
 At an exact earlier cut, a fenced or retired winner refuses with `rtdb/erased-under-view` before text, nearest or hybrid ranking can return an altered corpus.
+Historical nearest ranks the exact corpus.
 Protected-row payload carriers retain their `BJWC1` framing.
 Current and accepted-cut point reads can return the opaque carrier with the resolver's authoring line and ordinal.
 Resolution uses that original authoring line for a winner inherited from a parent world.

@@ -60,6 +60,7 @@ impl NearestQuery {
 
     /// Opts into the approximate route for partitions with a published vector path (vector.allium: ApproximateRead).
     pub fn approximate(mut self) -> Self { self.approximate = true; self }
+    pub fn exact(mut self) -> Self { self.approximate = false; self }
 
     pub fn dimensions(&self) -> usize { self.probe.len() }
     pub fn filter_count(&self) -> usize { self.filters.len() }

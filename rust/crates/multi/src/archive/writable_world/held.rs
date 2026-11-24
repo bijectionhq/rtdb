@@ -1231,9 +1231,10 @@ impl HeldCheckpointWorld {
         } else {
             None
         };
-        let historical = parent_at.is_some();
+        let historical = earlier.is_some() || parent_at.is_some();
+        let query = if historical { query.exact() } else { query };
         let writable = self.clock_mode().is_writable();
-        let use_overlay = writable && !historical
+        let use_overlay = writable && parent_at.is_none()
             && !earlier.is_some_and(|(system, parent_only)| parent_only || self.uses_frozen_overlay(Some(system)));
         let overlay = if use_overlay {
             let shadows = match staged {
@@ -1246,7 +1247,7 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Nearest {
-            partitions, frontiers, query, overlay, historical: earlier.is_some() || historical,
+            partitions, frontiers, query, overlay, historical,
             ancestor_schemas, ancestor_system, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
