@@ -1,5 +1,10 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
+/// Persistent ordered map: cloning is O(1) and an insert through a shared clone copies only
+/// the path to the changed leaf, so a decision's copy-on-write costs O(log n) instead of
+/// copying the whole map. Internal to this module; no signature exposes it.
+type Map<K, V> = imbl::OrdMap<K, V>;
+
 use rtdb_types::{
     Anomaly, AnomalyCategory, EntityId, Interval, LogicalType, Result, StructFields, TableRef,
     Timestamp, Value,
@@ -117,15 +122,15 @@ struct BranchData {
     expiries: Vec<(Basis, Option<Timestamp>)>,
     changed: Option<Basis>,
     #[serde(with = "entries")]
-    tables: BTreeMap<TableRef, Arc<BranchRows>>,
+    tables: Map<TableRef, Arc<BranchRows>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct BranchRows {
     #[serde(with = "entries")]
-    events: BTreeMap<EntityId, Arc<Vec<(u64, BranchEvent)>>>,
+    events: Map<EntityId, Arc<Vec<(u64, BranchEvent)>>>,
     #[serde(with = "entries")]
-    erased: BTreeMap<EntityId, Basis>,
+    erased: Map<EntityId, Basis>,
 }
 
 impl BranchData {
@@ -144,10 +149,10 @@ impl BranchData {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BranchIndex {
     head: BranchCut,
-    times: Arc<BTreeMap<u64, Timestamp>>,
-    branches: Arc<BTreeMap<Branch, Arc<BranchData>>>,
-    #[serde(serialize_with = "entries::serialize", deserialize_with = "entries::deserialize_shared")]
-    catalog: Arc<BTreeMap<TableRef, Arc<Vec<(Basis, BranchTable)>>>>,
+    times: Map<u64, Timestamp>,
+    branches: Map<Branch, Arc<BranchData>>,
+    #[serde(with = "entries")]
+    catalog: Map<TableRef, Arc<Vec<(Basis, BranchTable)>>>,
     changed_catalog: Option<Basis>,
     erased: Option<Basis>,
     #[serde(skip)]
@@ -164,12 +169,12 @@ impl BranchIndex {
         let head = BranchCut { basis, system_time };
         let main = BranchData {
             base: None, created: basis, writable: true, dropped: None,
-            expiries: vec![(basis, None)], changed: None, tables: BTreeMap::new(),
+            expiries: vec![(basis, None)], changed: None, tables: Map::new(),
         };
         Self {
-            head, times: Arc::new(BTreeMap::from([(0, head.system_time)])),
-            branches: Arc::new(BTreeMap::from([(MAIN_BRANCH.into(), Arc::new(main))])),
-            catalog: Arc::default(), changed_catalog: None, erased: None, writes: Arc::default(),
+            head, times: Map::unit(0, head.system_time),
+            branches: Map::unit(MAIN_BRANCH.into(), Arc::new(main)),
+            catalog: Map::new(), changed_catalog: None, erased: None, writes: Arc::default(),
         }
     }
 
@@ -378,7 +383,7 @@ impl BranchIndex {
         }
         self.head = cut;
         Arc::make_mut(&mut self.writes).clear();
-        Arc::make_mut(&mut self.times).insert(cut.basis.position(), cut.system_time);
+        self.times.insert(cut.basis.position(), cut.system_time);
         Ok(())
     }
 
@@ -389,7 +394,7 @@ impl BranchIndex {
                 if event.cut != self.head {
                     return Err(Anomaly::fault("rtdb/event-cut", "Resolved event differs from the transaction cut"));
                 }
-                let catalog = Arc::make_mut(&mut self.catalog);
+                let catalog = &mut self.catalog;
                 let definitions = catalog.entry(table.clone()).or_default();
                 if definitions.is_empty() {
                     Arc::make_mut(definitions).push((basis, BranchTable::default()));
@@ -407,9 +412,9 @@ impl BranchIndex {
                     return Err(Anomaly::fault("rtdb/branch-fold", "Invalid resolved fork"));
                 }
                 self.changed_catalog = Some(basis);
-                Arc::make_mut(&mut self.branches).insert(child, Arc::new(BranchData {
+                self.branches.insert(child, Arc::new(BranchData {
                     base: Some(from), created: basis, writable, dropped: None,
-                    expiries: vec![(basis, expires_at)], changed: Some(basis), tables: BTreeMap::new(),
+                    expiries: vec![(basis, expires_at)], changed: Some(basis), tables: Map::new(),
                 }));
             }
             BranchEffect::Renew { branch, expires_at } => {
@@ -421,14 +426,15 @@ impl BranchIndex {
                 self.changed_catalog = Some(basis);
             }
             BranchEffect::Declare { table, definition } => {
-                Arc::make_mut(Arc::make_mut(&mut self.catalog).entry(table).or_default()).push((basis, definition));
+                Arc::make_mut(self.catalog.entry(table).or_default()).push((basis, definition));
                 self.changed_catalog = Some(basis);
             }
             BranchEffect::Erase { branch, table, id } => {
-                let branches = Arc::make_mut(&mut self.branches);
-                for (name, data) in branches {
-                    if branch.as_ref().is_some_and(|branch| branch != name) { continue; }
-                    let data = Arc::make_mut(data);
+                let names = self.branches.keys()
+                    .filter(|name| branch.as_ref().is_none_or(|branch| branch == *name))
+                    .cloned().collect::<Vec<_>>();
+                for name in names {
+                    let data = Arc::make_mut(self.branches.get_mut(&name).expect("listed branch"));
                     let rows = Arc::make_mut(data.tables.entry(table.clone()).or_default());
                     rows.events.remove(&id);
                     rows.erased.insert(id.clone(), basis);
@@ -442,7 +448,7 @@ impl BranchIndex {
 
     fn changed_branch(&mut self, branch: &str) -> Result<&mut BranchData> {
         let basis = self.head.basis;
-        let data = Arc::make_mut(Arc::make_mut(&mut self.branches).get_mut(branch)
+        let data = Arc::make_mut(self.branches.get_mut(branch)
             .ok_or_else(|| Anomaly::fault("rtdb/branch-fold", "Resolved write names an unknown branch"))?);
         data.changed = Some(basis);
         Ok(data)
@@ -563,38 +569,31 @@ fn unknown_branch(branch: &str) -> Anomaly {
     Anomaly::new(AnomalyCategory::NotFound, "rtdb/unknown-branch", format!("Unknown or expired branch {branch}"))
 }
 
+/// Maps serialize as a sequence of `(key, value)` pairs, the checkpoint shape these fields
+/// had as `BTreeMap`s; the representation change does not change the encoding.
 mod entries {
-    use std::{collections::BTreeMap, sync::Arc};
-
     use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 
-    pub fn serialize<K: Serialize, V: Serialize, S: Serializer>(
-        map: &BTreeMap<K, V>, serializer: S,
+    use super::Map;
+
+    pub fn serialize<K: Serialize + Ord + Clone, V: Serialize + Clone, S: Serializer>(
+        map: &Map<K, V>, serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        serializer.collect_seq(map)
+        serializer.collect_seq(map.iter())
     }
 
-    pub fn deserialize<'de, K, V, D>(deserializer: D) -> std::result::Result<BTreeMap<K, V>, D::Error>
+    pub fn deserialize<'de, K, V, D>(deserializer: D) -> std::result::Result<Map<K, V>, D::Error>
     where
-        K: Deserialize<'de> + Ord,
-        V: Deserialize<'de>,
+        K: Deserialize<'de> + Ord + Clone,
+        V: Deserialize<'de> + Clone,
         D: Deserializer<'de>,
     {
-        let mut map = BTreeMap::new();
+        let mut map = Map::new();
         for (key, value) in Vec::<(K, V)>::deserialize(deserializer)? {
             if map.insert(key, value).is_some() {
                 return Err(D::Error::custom("duplicate checkpoint entry"));
             }
         }
         Ok(map)
-    }
-
-    pub fn deserialize_shared<'de, K, V, D>(deserializer: D) -> std::result::Result<Arc<BTreeMap<K, V>>, D::Error>
-    where
-        K: Deserialize<'de> + Ord,
-        V: Deserialize<'de>,
-        D: Deserializer<'de>,
-    {
-        deserialize(deserializer).map(Arc::new)
     }
 }
