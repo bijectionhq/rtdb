@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
-use rtdb_index::branches::{BranchCut, BranchView, BranchWrite};
+use rtdb_index::branches::{BranchView, BranchWrite};
 use rtdb_replication::{NATIVE_READ_FEATURES, NATIVE_WRITE_FEATURES, NativeServingHandle, NativeServingView};
 use rtdb_tx::transact::Receipt;
 use rtdb_types::{Anomaly, AnomalyCategory, Interval, Result, Timestamp, rtdb_v1::{At, Basis, Layer}};

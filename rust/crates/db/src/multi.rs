@@ -10,10 +10,7 @@ use rtdb_store::{
 use rtdb_tx::transact::{
     Op, Receipt, ScopedTransact, Transact, TransactPipeline, TransactState, TransactionRecord,
 };
-use rtdb_types::{
-    Anomaly, AnomalyCategory, Result, Timestamp,
-    rtdb_v1::Basis,
-};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp};
 use uuid::Uuid;
 
 use crate::{

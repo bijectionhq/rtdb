@@ -62,7 +62,7 @@ fn pipeline_commit_cost_as_the_table_grows() {
     let claims = ClaimSealer::new(INCARNATION, [3; 32]);
     let mut pipeline = TransactPipeline::new(TransactState::new(INCARNATION), 1, GROUP as usize).unwrap();
     let mut committed = 0u64;
-    let mut commit_group = |pipeline: &mut TransactPipeline, from: u64| {
+    let commit_group = |pipeline: &mut TransactPipeline, from: u64| {
         let requests = (from..from + GROUP).map(put).collect::<Vec<_>>();
         let decisions = pipeline.decide_batch(&requests, Timestamp(from as i64 * 10), &[LINEARIZABLE], &claims);
         assert!(decisions.iter().all(|decision| matches!(decision, Ok(Decision::Append { .. }))));
