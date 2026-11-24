@@ -73,6 +73,28 @@ fn multi_is_explicit_in_development_and_cluster_startup() {
 }
 
 #[test]
+fn multi_development_tls_requires_an_exact_incarnation_and_explicit_local_data() {
+    let id = "01234567-89ab-4def-8000-000000000001";
+    let Command::Dev(options) = parse(&[
+        "dev", "--multi", "--data", "fresh", "--multi-tls-dir", "tls",
+        "--incarnation", id, "--flight-sql-port", "0",
+    ]) else { panic!("expected Multi development startup") };
+    assert_eq!(options.multi_tls.unwrap().incarnation.to_string(), id);
+
+    let invalid: &[&[&str]] = &[
+        &["dev", "--data", "fresh", "--multi-tls-dir", "tls", "--incarnation", id],
+        &["dev", "--multi", "--multi-tls-dir", "tls", "--incarnation", id],
+        &["dev", "--multi", "--data", "fresh", "--multi-tls-dir", "tls"],
+        &["dev", "--multi", "--data", "fresh", "--incarnation", id],
+        &["dev", "--multi", "--data", "fresh", "--multi-tls-dir", "tls", "--incarnation", "00000000-0000-0000-0000-000000000000"],
+        &["dev", "--multi", "--data", "fresh", "--multi-tls-dir", "tls", "--incarnation", id, "--flight-sql-port", "-1"],
+    ];
+    for arguments in invalid {
+        assert!(cli::parse(arguments.iter().copied().map(str::to_owned), &|_| None).is_err(), "{arguments:?}");
+    }
+}
+
+#[test]
 fn configuration_environment_is_an_explicit_multi_only_source() {
     let Command::StartMulti { options, config_env, .. } =
         parse(&["node", "--config-env", "MULTI_NODE_YAML", "--multi"])

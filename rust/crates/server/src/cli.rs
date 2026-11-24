@@ -14,7 +14,7 @@ pub use admin::AdminOptions;
 
 pub const ADMIN_HELP: &str = "Usage: rtdb admin create NAME [--incarnation UUID]\n       rtdb admin delete NAME\n       rtdb admin export NAME BASIS_HEX PIN_UUID\n       rtdb admin fork NAME SOURCE BASIS_HEX PIN_UUID\n       rtdb admin restore NAME SOURCE CHECKPOINT_HEX\n\nUse --endpoint URL and --authorization-file PATH, or set RTDB_ADMIN_ENDPOINT and RTDB_ADMIN_AUTHORIZATION_FILE. Export and fork also accept --retain-until-micros TIME.\n";
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb dev [--multi] [--data PATH] [--port PORT] [--flight-sql-port PORT] [--memory-limit BYTES]\n       rtdb dev --multi --data PATH --multi-tls-dir DIR --incarnation UUID [--flight-sql-port PORT]\n       rtdb initialize-standalone --state STAGE --name NAME --id UUID\n       rtdb standalone --state PATH --name NAME --id UUID --certificate PEM --private-key PEM\n                       --password-file FILE --ready-file FILE --parent-stdin [--custody-provider-config FILE]\n       rtdb admin --help\n       rtdb node --multi [-f FILE | --config-env NAME] [--native-follower FILE] [--memory-limit BYTES]\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb reset-compactor DATABASE --retained-base PATH [-f FILE] [--dry-run]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT BASE@SHA256 THROUGH@SHA256 [--base-storage PATH] [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb repair-checkpoint STORAGE REPLICA_LOG OUTPUT_PARENT THROUGH@SHA256 --retained-base --base-storage PATH [--checkpoint-key-vault PATH] [--memory-limit BYTES]\n       rtdb retain-repair-base STORAGE REPLICA_LOG EXPORTED_STORAGE BASE@SHA256 [--reclaim-receipts] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nDev stores data in .rtdb by default and binds to loopback.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
@@ -25,9 +25,16 @@ pub struct DevOptions {
     pub data: PathBuf,
     pub multi: bool,
     pub allocation_limit_bytes: usize,
+    pub multi_tls: Option<MultiDevTls>,
     pgwire_port: i32,
     flight_sql_port: i32,
     object_sort: rtdb_types::ObjectSort,
+}
+
+#[derive(Clone, Debug)]
+pub struct MultiDevTls {
+    pub incarnation: uuid::Uuid,
+    directory: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -193,11 +200,15 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             data: ".rtdb".into(),
             multi: false,
             allocation_limit_bytes: environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1 << 30),
+            multi_tls: None,
             pgwire_port: 5432,
             flight_sql_port: 3000,
             object_sort,
         };
         let mut pgwire_requested = false;
+        let mut data_requested = false;
+        let mut tls_directory = None;
+        let mut incarnation = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "-h" | "--help" => return Ok(Command::Help),
@@ -205,8 +216,20 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                     let path = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
                         .ok_or_else(|| invalid("--data requires a path"))?;
                     options.data = path.into();
+                    data_requested = true;
                 }
                 "--multi" => options.multi = true,
+                "--multi-tls-dir" if tls_directory.is_none() => {
+                    let directory = arguments.next().filter(|path| !path.is_empty() && !path.starts_with('-'))
+                        .ok_or_else(|| invalid("--multi-tls-dir requires a directory"))?;
+                    tls_directory = Some(PathBuf::from(directory));
+                }
+                "--incarnation" if incarnation.is_none() => {
+                    let raw = arguments.next().ok_or_else(|| invalid("--incarnation requires a UUID"))?;
+                    incarnation = Some(uuid::Uuid::parse_str(&raw).ok()
+                        .filter(|id| !id.is_nil() && id.to_string() == raw)
+                        .ok_or_else(|| invalid("--incarnation must be a canonical, nonzero UUID"))?);
+                }
                 "--port" => {
                     pgwire_requested = true;
                     options.pgwire_port = port(arguments.next())?;
@@ -218,6 +241,13 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             }
         }
         if options.multi && pgwire_requested { return Err(invalid("Multi development serves Flight SQL; use --flight-sql-port")); }
+        options.multi_tls = match (tls_directory, incarnation) {
+            (None, None) => None,
+            (Some(directory), Some(incarnation)) if options.multi && data_requested && options.flight_sql_port >= 0 => {
+                Some(MultiDevTls { directory, incarnation })
+            }
+            _ => return Err(invalid("--multi-tls-dir and --incarnation require --multi, explicit --data and an enabled Flight SQL listener")),
+        };
         return Ok(Command::Dev(options));
     }
     let mode = match arguments.peek().map(String::as_str) {
@@ -330,10 +360,51 @@ impl DevOptions {
         config.primary.log = Some(Log::LocalLog(LocalLog { path: Some(path(log)?), epoch: Some(0) }));
         config.primary.storage = Some(Storage::LocalStorage(LocalStorage { path: Some(path(storage)?), epoch: Some(0) }));
         config.default_v1_serving = !self.multi;
-        config.auth = rtdb_auth::AuthConfig::SingleRootUser { password: None };
+        config.auth = rtdb_auth::AuthConfig::SingleRootUser {
+            password: self.multi_tls.as_ref().map(MultiDevTls::password).transpose()?,
+        };
         config.server = Some(PgwireSettings { port: self.pgwire_port, ..Default::default() });
         config.flight_sql = Some(FlightSettings { port: self.flight_sql_port, ..Default::default() });
         Ok(parsed.with_object_sort(self.object_sort))
+    }
+}
+
+impl MultiDevTls {
+    pub fn server_tls(&self) -> Result<tokio_rustls::rustls::ServerConfig> {
+        let certificate = self.read("certificate.pem", 64 * 1024)?;
+        let key = Zeroizing::new(self.read("key.pem", 64 * 1024)?);
+        crate::tls::from_pem_identity(&certificate, &key)
+    }
+
+    fn password(&self) -> Result<Secret> {
+        let bytes = Zeroizing::new(self.read("password", 64)?);
+        if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid("Multi development password must contain 64 hexadecimal digits"));
+        }
+        Ok(Secret::new(std::str::from_utf8(&bytes).expect("validated ASCII")))
+    }
+
+    fn read(&self, name: &str, limit: usize) -> Result<Vec<u8>> {
+        let path = self.directory.join(name);
+        let io_error = |error| invalid(format!("Inspect Multi development TLS input {name}: {error}"));
+        let metadata = std::fs::symlink_metadata(&path).map_err(io_error)?;
+        if !metadata.is_file() {
+            return Err(invalid(format!("Multi development TLS input {name} must be a regular file")));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(invalid(format!("Multi development TLS input {name} must be private")));
+            }
+        }
+        let mut bytes = Vec::new();
+        File::open(&path).map_err(io_error)?.take(limit as u64 + 1)
+            .read_to_end(&mut bytes).map_err(io_error)?;
+        if bytes.len() > limit {
+            return Err(invalid(format!("Multi development TLS input {name} exceeds its size limit")));
+        }
+        Ok(bytes)
     }
 }
 

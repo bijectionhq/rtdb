@@ -94,7 +94,7 @@ async fn run() -> Result<()> {
                 }
                 let (mut config, memory, _configuration) = parsed.into_execution(limit)?;
                 let multi = rtdb_server::multi::MultiRuntime::production(&mut config, memory.clone()).await?;
-                serve_multi(config, limit, memory, multi).await
+                serve_multi(config, limit, memory, multi, None).await
             }
             #[cfg(not(all(feature = "multi", feature = "s3")))]
             {
@@ -109,8 +109,12 @@ async fn run() -> Result<()> {
                 #[cfg(feature = "multi")]
                 {
                     let mut config = config;
-                    let multi = rtdb_server::multi::MultiRuntime::development(&options.data, &mut config, memory.clone()).await?;
-                    return serve_multi(config, limit, memory, multi).await;
+                    let qualification = options.multi_tls.as_ref().map(|options| {
+                        options.server_tls().map(|tls| (options.incarnation, tls))
+                    }).transpose()?;
+                    let expected = qualification.as_ref().map(|(incarnation, _)| *incarnation);
+                    let multi = rtdb_server::multi::MultiRuntime::development_with_incarnation(&options.data, &mut config, memory.clone(), expected).await?;
+                    return serve_multi(config, limit, memory, multi, qualification).await;
                 }
                 #[cfg(not(feature = "multi"))]
                 return Err(Anomaly::unsupported("rtdb.multi/backend", "Multi development requires the multi feature"));
@@ -152,9 +156,11 @@ async fn serve_multi(
     limit: usize,
     memory: std::sync::Arc<rtdb_columnar::MemoryBudget>,
     multi: rtdb_server::multi::MultiRuntime,
+    qualification: Option<(uuid::Uuid, tokio_rustls::rustls::ServerConfig)>,
 ) -> Result<()> {
     let result = async {
-        let (handle, driver) = ServerDriver::open_with_multi(config, limit, memory, &multi).await?;
+        let (expected, tls) = qualification.unzip();
+        let (handle, driver) = ServerDriver::open_with_multi_tls(config, limit, memory, &multi, tls).await?;
         let announced = write_report(std::io::stderr().lock(), |output| writeln!(output, "RTDB listeners bound: {:?}", handle.addresses()));
         if let Err(error) = announced { return close_unstarted(driver, Err(error)).await; }
         let stop = tokio_util::sync::CancellationToken::new();
@@ -162,6 +168,21 @@ async fn serve_multi(
             tokio::select! {
                 result = shutdown_signal() => result,
                 result = multi.drive(handle.node(), &stop) => result,
+                result = async {
+                    let Some(incarnation) = expected else { return std::future::pending().await; };
+                    let writer_epoch = multi.await_development_writer(handle.node(), incarnation).await?;
+                    let endpoint = handle.addresses().flight_sql.ok_or_else(|| {
+                        Anomaly::fault("rtdb.multi/development-flight", "Multi development Flight listener is missing")
+                    })?;
+                    let ready = serde_json::json!({
+                        "database": rtdb_server::multi::DEVELOPMENT_DATABASE,
+                        "incarnation": incarnation,
+                        "native_flight_url": format!("https://{endpoint}"),
+                        "writer_epoch": writer_epoch,
+                    });
+                    write_report(std::io::stdout().lock(), |output| writeln!(output, "{ready}"))?;
+                    std::future::pending().await
+                } => result,
             }
         }).await
     }.await;

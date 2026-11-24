@@ -44,6 +44,7 @@ use catalog::{Status, TransferExport};
 
 const WRITER_LEASE_MICROS: i64 = 5_000_000;
 const CLOCK_DRIFT_MICROS: i64 = 250_000;
+pub const DEVELOPMENT_DATABASE: &str = "xtdb";
 
 type ServingDatabases = Arc<RwLock<BTreeMap<String, Arc<MultiServing>>>>;
 
@@ -86,11 +87,26 @@ impl MultiRuntime {
         config: &mut NodeConfiguration,
         memory: Arc<MemoryBudget>,
     ) -> Result<Self> {
+        Self::development_with_incarnation(path, config, memory, None).await
+    }
+
+    pub async fn development_with_incarnation(
+        path: &Path,
+        config: &mut NodeConfiguration,
+        memory: Arc<MemoryBudget>,
+        expected: Option<Uuid>,
+    ) -> Result<Self> {
+        if expected.is_some_and(|id| id.is_nil()) {
+            return Err(invalid("Multi development requires a nonzero incarnation"));
+        }
         fs::create_dir_all(path).map_err(io_error)?;
         let vault = path.join("keys");
         let database = Uuid::from_bytes(load_or_create(&path.join("database-id"), || {
-            *Uuid::new_v4().as_bytes()
+            *expected.unwrap_or_else(Uuid::new_v4).as_bytes()
         })?);
+        if expected.is_some_and(|expected| database != expected) {
+            return Err(invalid("Multi development data belongs to another incarnation"));
+        }
         let journal =
             FileJournal::open(path.join("journal"), Limits::default()).map_err(io_error)?;
         let identity = Identity::from(format!("urn:rtdb:dev:{}", Uuid::new_v4()));
@@ -120,11 +136,47 @@ impl MultiRuntime {
         Self::open(
             config,
             memory,
-            BTreeMap::from([("xtdb".into(), database)]),
+            BTreeMap::from([(DEVELOPMENT_DATABASE.into(), database)]),
             backends,
             None,
         )
         .await
+    }
+
+    pub async fn await_development_writer(&self, node: &Node, incarnation: Uuid) -> Result<u64> {
+        if self.bootstrap.get(DEVELOPMENT_DATABASE) != Some(&incarnation)
+            || self.backends.peers.is_some()
+        {
+            return Err(invalid(
+                "Multi development readiness requires the exact local bootstrap incarnation",
+            ));
+        }
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match self.ready_driver(DEVELOPMENT_DATABASE, incarnation).await {
+                    Ok(driver) => {
+                        if let Some(epoch) = driver.local_writer_epoch().await {
+                            let attachment = node.catalog().database(DEVELOPMENT_DATABASE)?;
+                            if attachment.wire_incarnation().await? != incarnation {
+                                return Err(invalid("Multi development listener attached another incarnation"));
+                            }
+                            return Ok(epoch);
+                        }
+                    }
+                    Err(error) if error.code == "rtdb/unknown-deployment" || retryable(&error) => (),
+                    Err(error) => return Err(error),
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            Anomaly::new(
+                AnomalyCategory::Unavailable,
+                "rtdb.multi/development-writer",
+                "Multi development writer did not become ready",
+            )
+        })?
     }
 
     #[cfg(feature = "s3")]
@@ -1503,6 +1555,64 @@ mod tests {
         assert_eq!(result.err().unwrap().code, "rtdb/follower-unavailable");
         assert!(matches!(backends.journal.head(stream).await, Err(JournalError::NotFound)));
         assert!(!backends.vault.join(format!("bootstrap-{incarnation}.lock")).exists());
+    }
+
+    #[test]
+    fn multi_dev_readiness_waits_for_the_exact_ordered_writer() {
+        std::thread::Builder::new()
+            .stack_size(rtdb_node::WORKER_STACK_BYTES)
+            .spawn(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .thread_stack_size(rtdb_node::WORKER_STACK_BYTES)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(exact_development_writer());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn exact_development_writer() {
+        let data = tempfile::tempdir().unwrap();
+        let limit = 256 << 20;
+        let mut config = NodeConfiguration::from_yaml_with_environment("", &|_| None, false).unwrap();
+        config.flight_sql = None;
+        let memory = MemoryBudget::new(config.node_options(limit).unwrap().execution_memory_bytes);
+        let incarnation = Uuid::from_u128(1);
+        let wrong = Uuid::from_u128(2);
+        let runtime = MultiRuntime::development_with_incarnation(
+            data.path(), &mut config, memory.clone(), Some(incarnation),
+        ).await.unwrap();
+        let (handle, driver) = crate::ServerDriver::open_with_multi(
+            config, limit, memory.clone(), &runtime,
+        ).await.unwrap();
+        assert!(runtime.await_development_writer(handle.node(), wrong).await.is_err());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(25), runtime.await_development_writer(handle.node(), incarnation),
+        ).await.is_err());
+
+        let server = tokio::spawn(driver.run());
+        let stop = CancellationToken::new();
+        let epoch = tokio::select! {
+            result = runtime.await_development_writer(handle.node(), incarnation) => result.unwrap(),
+            result = runtime.drive(handle.node(), &stop) => panic!("Multi stopped before readiness: {result:?}"),
+        };
+        assert!(epoch > 0);
+        let identity = data.path().join("database-id");
+        assert_eq!(fs::read(&identity).unwrap().as_slice(), incarnation.as_bytes());
+        handle.shutdown();
+        server.await.unwrap().unwrap();
+        drop(handle);
+        runtime.close().await;
+
+        let mut config = NodeConfiguration::from_yaml_with_environment("", &|_| None, false).unwrap();
+        let rejected = MultiRuntime::development_with_incarnation(
+            data.path(), &mut config, memory, Some(wrong),
+        ).await;
+        assert!(rejected.is_err());
+        assert_eq!(fs::read(&identity).unwrap().as_slice(), incarnation.as_bytes());
     }
 
     #[test]

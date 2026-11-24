@@ -50,6 +50,8 @@ Multi binds Flight SQL to loopback on port 3000 and accepts writes through `rtdb
 The selected directory holds the FileJournal, filesystem objects, database identity and generation keys.
 Reuse that directory to recover the same Multi database on restart.
 
+For the loopback TLS profile and Bijection HTTP startup, see link:../dev/doc/rtdb-multi-local-qualification.md[Local Multi qualification].
+
 == Ownership
 
 Semantic types, event headers, temporal ceilings, schemas, immutable tries, metadata, and wire codecs are passive objects.

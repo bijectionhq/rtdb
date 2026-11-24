@@ -80,7 +80,7 @@ type ResourceOverride = Box<dyn FnOnce(NativeResources) -> Arc<dyn ResourceFacto
 type Tls = Arc<tokio_rustls::rustls::ServerConfig>;
 
 enum Backend {
-    Configured(Option<ResourceOverride>),
+    Configured(Option<ResourceOverride>, Option<Tls>),
     Installed { resources: Box<NativeResources>, tls: Option<Tls> },
 }
 
@@ -105,18 +105,18 @@ impl ServerDriver {
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, Backend::Configured(None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, None, Backend::Configured(None, None)).await
     }
 
     /// Opens a node whose databases an outside placement authority attaches and detaches, with no primary database.
     /// Its holders claim as soon as they reach the tip and append nothing while idle.
     pub async fn open_placed(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, placed: PlacedOptions) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), Backend::Configured(None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None, Some(placed), Backend::Configured(None, None)).await
     }
 
     /// Uses a host clock for transactions appended to in-memory and local source logs.
     pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, Backend::Configured(None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock), None, Backend::Configured(None, None)).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -132,12 +132,17 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, Backend::Configured(None)).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None, None, Backend::Configured(None, None)).await
     }
 
     #[cfg(feature = "multi")]
     pub async fn open_with_multi(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, limit, memory, false, None, None, Backend::Configured(Some(multi.resource_override()))).await
+        Self::open_with_multi_tls(config, limit, memory, multi, None).await
+    }
+
+    #[cfg(feature = "multi")]
+    pub async fn open_with_multi_tls(config: NodeConfiguration, limit: usize, memory: Arc<MemoryBudget>, multi: &crate::multi::MultiRuntime, tls: Option<tokio_rustls::rustls::ServerConfig>) -> Result<(ServerHandle, Self)> {
+        Self::open_mode(config, limit, memory, false, None, None, Backend::Configured(Some(multi.resource_override()), tls.map(Arc::new))).await
     }
 
     #[cfg(all(feature = "multi", feature = "s3"))]
@@ -210,9 +215,9 @@ impl ServerDriver {
             None => auth.clone(),
         };
         let (resources, external_sources, mut registrations, override_resources, installed_tls) = match backend {
-            Backend::Configured(install) => {
+            Backend::Configured(install, tls) => {
                 let (resources, sources, registrations) = crate::resources::open(&config, &memory, &metrics)?;
-                (resources, sources, registrations, install, None)
+                (resources, sources, registrations, install, tls)
             }
             Backend::Installed { resources, tls } => {
                 options.compaction_threads = config.compactor.threads;

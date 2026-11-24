@@ -317,6 +317,13 @@ impl MultiServing {
         self.writes.tick(live_nodes.clone()).await
     }
 
+    pub async fn local_writer_epoch(&self) -> Option<u64> {
+        match self.database.lock().await.role() {
+            Role::Follower => None,
+            Role::Writer(epoch) => Some(epoch.0),
+        }
+    }
+
     pub async fn retire_deployment(&self) -> Result<rtdb_db::DeploymentRetirement> {
         self.writes.retire_deployment().await
     }
