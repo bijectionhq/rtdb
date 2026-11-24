@@ -742,10 +742,10 @@ impl ScanCursor {
     /// With an `order`, each partition's rows leave in that order of their IIDs, and the partition is read here rather than split into fragments.
     async fn over(scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
         database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>) -> Result<Self> {
-        Self::over_with_queries(scan, execution, pushdowns, database_partitions, storage, accelerate, order, &SearchQueries::default()).await
+        Self::over_with_queries(scan, execution, pushdowns, database_partitions, storage, accelerate, order, &SearchQueries::default(), None).await
     }
 
-    async fn over_with_queries(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>, search_queries: &SearchQueries) -> Result<Self> {
+    async fn over_with_queries(mut scan: Scan, execution: Execution, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>, database_partitions: &[Snapshot], storage: &Arc<BufferPool>, accelerate: bool, order: Option<IidOrder>, search_queries: &SearchQueries, restricted_iids: Option<&crate::CandidateIids>) -> Result<Self> {
         if !execution.context.catalog.permits_table(&scan.table.name) {
             return Err(Anomaly::incorrect("rtdb.owned/scan-scope", "The relation is outside the admitted scan scope"));
         }
@@ -765,7 +765,7 @@ impl ScanCursor {
             let metadata = scan.columns.iter().find(|field| field.name == "user_metadata").map(|field| field.id);
             scan.predicates.retain(|predicate| metadata.is_none_or(|id| !predicate.referenced_columns().contains(&id)));
         }
-        let fixed_iids = scan.iids.is_some();
+        let fixed_iids = scan.iids.is_some() || restricted_iids.is_some();
         let accelerate = accelerate && !execution.context.catalog.uses_owned_event_cut();
         if !fixed_iids { scan.iids = id_selection(&scan, execution.parameters.evaluator()); }
         let interval = if !stores_uuid_ids(&scan.table.name.table, database_partitions) { None } else {
@@ -776,7 +776,7 @@ impl ScanCursor {
         };
         let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
         let reservation = execution.context.memory.reserve(bytes)?;
-        let canonical_entity_iids = scan.iids.is_none()
+        let canonical_entity_iids = scan.iids.is_none() && restricted_iids.is_none()
             && pushdowns.as_ref().is_some_and(|filters| filters.needs_entity_iid_proof(&scan.columns))
             && database_partitions.iter().all(|snapshot| snapshot.has_canonical_entity_iids(&scan.table.name.table));
         if let (Some(analysis), Some(pushdowns)) = (&execution.analysis, &pushdowns) {
@@ -848,7 +848,8 @@ impl ScanCursor {
                 let mut parts = VecDeque::new();
                 let bounds = bounds(scan, snapshot, execution).await?;
                 let mut ranking = ranking.clone();
-                let mut candidate_iids = None;
+                // An unsatisfiable SQL interval leaves an explicit empty scan.
+                let mut candidate_iids = restricted_iids.filter(|_| scan.iids.is_none()).cloned();
                 let mut verified = None;
                 if let Some(winners) = winners {
                     let request = crate::ScanRequest { database: name, scan, candidate_iids: None, snapshot, storage, bounds, memory: &execution.context.memory,
@@ -1440,8 +1441,9 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         self.verify_ranked_rows(rows, column, ascending_id, scorer).await
     }
 
-    async fn retain_visible(&self, mut iids: BTreeSet<Iid>) -> Result<Option<BTreeSet<Iid>>> {
-        iids.retain(|&iid| self.within_pushdowns(iid));
+    async fn retain_visible(&self, iids: &crate::CandidateIids) -> Result<Option<crate::CandidateIids>> {
+        let memory = &self.execution.context.memory;
+        let iids = iids.clone().retain(|iid| self.within_pushdowns(iid), memory)?;
         if iids.is_empty() { return Ok(Some(iids)); }
         let mut scan = self.scan.clone();
         let required: BTreeSet<_> = scan.predicates.iter().flat_map(Expr::referenced_columns).collect();
@@ -1452,26 +1454,29 @@ impl crate::CandidateVerifier for ScanVerifier<'_> {
         let iid_at = include_iid(&mut scan)?;
         let schema = Schema::new(scan.columns.clone())?;
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
-        scan.iids = Some(iids);
+        scan.iids = None;
         let mut cursor = Box::pin(ScanCursor::over_with_queries(scan, self.execution.clone(), self.pushdowns.clone(),
-            std::slice::from_ref(self.partition), self.storage, false, None, self.constants.search_queries)).await?;
-        let mut visible = BTreeSet::new();
+            std::slice::from_ref(self.partition), self.storage, false, None, self.constants.search_queries, Some(&iids))).await?;
+        let _visibility = memory.reserve(256usize.saturating_add(iids.len()))?;
+        let mut visible = vec![false; iids.len()];
         while let Some(batch) = cursor.next_batch().await? {
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
                 return Err(invalid("verifier-iid", "Verified scan returned no IID array"));
             };
-            let iids = rtdb_columnar::IidView::new(array.as_ref())?;
+            let resolved = rtdb_columnar::IidView::new(array.as_ref())?;
             let mask = match &predicate {
                 Some(predicate) => Some(crate::columnar::predicate_mask(&batch, predicate, &schema, self.execution).await?),
                 None => None,
             };
             for row in 0..batch.len {
                 if mask.as_ref().is_some_and(|mask| !mask[row]) { continue; }
-                visible.insert(iids.get(row)?);
+                let position = iids.position(resolved.get(row)?).ok_or_else(|| invalid("verifier-iid", "Verified scan returned an IID outside its candidate selection"))?;
+                visible[position] = true;
             }
         }
         if let Some(counts) = cursor.scan_counts() { self.counts.lock().add(counts); }
-        Ok(Some(visible))
+        drop(cursor);
+        Ok(Some(iids.select_visible(&visible, memory)?))
     }
 
     async fn gather_ranked(&self, rows: Vec<crate::ResolvedSearchRow>) -> Result<BTreeMap<Iid, crate::SnapshotRow>> {
@@ -1601,7 +1606,7 @@ impl ScanVerifier<'_> {
         let predicate = scan.predicates.iter().cloned().reduce(|left, right| Expr::binary(rtdb_plan::BinaryOp::And, left, right));
         scan.iids = Some(iids);
         let mut cursor = Box::pin(ScanCursor::over_with_queries(scan, self.execution.clone(), self.pushdowns.clone(),
-            std::slice::from_ref(self.partition), self.storage, false, None, self.constants.search_queries)).await?;
+            std::slice::from_ref(self.partition), self.storage, false, None, self.constants.search_queries, None)).await?;
         let mut selected_rows = 0usize;
         while let Some(batch) = cursor.next_batch().await? {
             let crate::columnar::Column::Arrow { array, .. } = &batch.columns[iid_at] else {
@@ -2650,6 +2655,26 @@ mod tests {
         assert_eq!(page.len, 1);
         assert_eq!(page.columns[0].value(0).unwrap(), Value::I64(2));
         assert!(cursor.next_batch().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn arrow_visibility_uses_the_candidate_cut_and_sql_predicate() {
+        use crate::{CandidateIids, CandidateVerifier};
+
+        let (state, table, events) = live_table();
+        let snapshot = state.value().snapshot();
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let (mut scan, execution, memory) = descriptor_scan(snapshot.clone(), table, Arc::clone(&storage));
+        scan.predicates.push(Expr::binary(rtdb_plan::BinaryOp::Gt, scan.columns[0].expression(), Expr::Literal(Value::I64(1))));
+        let search_queries = SearchQueries::default();
+        let constants = ExecutionConstants { execution: &execution, search_queries: &search_queries };
+        let verifier = ScanVerifier { scan: &scan, execution: &execution, constants: &constants, pushdowns: None,
+            partition: &snapshot, storage: &storage, canonical_entity_iids: false, counts: Default::default() };
+        let unavailable = Iid([0xc0; 16]);
+        let candidates = CandidateIids::from_sorted(&[events[0].iid, events[1].iid, unavailable], &memory).unwrap();
+        let visible = verifier.retain_visible(&candidates).await.unwrap().unwrap();
+        assert_eq!(visible.iter().collect::<Vec<_>>(), [events[1].iid]);
+        assert_eq!(candidates.iter().collect::<Vec<_>>(), [events[0].iid, events[1].iid, unavailable]);
     }
 
     #[test]
