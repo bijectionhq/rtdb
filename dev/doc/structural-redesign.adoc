@@ -247,7 +247,9 @@ Directory-managed ordered-index pages use per-page slots in their admitted gener
 Directory-managed serving objects carry their original publication slot through packing and same-domain forks. Independent forks, cell moves and stage activation open authenticated source publications and reseal every serving member into a destination slot. Archive overlays use the admitted archive slots.
 The retirement owner withdraws the original publication scopes after disposing the last co-custodied residence and after fencing an unpublished transfer generation or a rejected fork. The scope census includes interrupted key registration. Enrolled terminal S3 exact retirement authenticates the loose compacted trie, search run or receipt slot, checks the lineage for relocated copies, and commits last-reference withdrawal with the provider tombstone decision. Local exact retirement authenticates eligible loose files and members of obsolete packs while the volume and lineage are held.
 The retirement owner checks descendant references and physical loose and packed aliases before withdrawing each last slot.
-Hosted pack members, versioned live-lineage withdrawal, and orphan slots in an open origin remain open.
+Versioned S3 examines exact loose publications and every data version at their aliases, including noncurrent versions.
+The directory fence excludes provider publications while their exact retirement executes.
+Hosted pack members and orphan slots in an open origin remain open.
 
 |7
 |History collection and custody-scoped erasure with readable successors and `erased-under-view`.

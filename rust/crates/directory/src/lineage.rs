@@ -99,6 +99,7 @@ pub enum RetirementWork {
         release: String,
         version: PhysicalObjectVersion,
         release_version: PhysicalObjectVersion,
+        slot_origin: Option<[u8; 32]>,
     },
     Tombstones {
         deployment: String,

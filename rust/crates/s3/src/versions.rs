@@ -172,6 +172,71 @@ impl VersionedInventory {
         }).await
     }
 
+    /// All readable data versions at this exact path, including versions hidden by markers.
+    pub async fn data_versions(&self, key: &ObjectKey) -> Result<Vec<PhysicalObjectVersion>> {
+        self.inspect(key.clone(), |owner, key| async move { owner.inspect_data_versions(&key).await }).await
+    }
+
+    async fn inspect_data_versions(&self, key: &ObjectKey) -> Result<Vec<PhysicalObjectVersion>> {
+        let path = Path::from(format!("{}/{key}", self.root));
+        let mut cursor: (Option<String>, Option<String>) = (None, None);
+        let mut visited = BTreeSet::new();
+        let mut versions = Vec::new();
+        loop {
+            let page = self.client.list_object_versions().bucket(&self.namespace.bucket).prefix(path.as_ref())
+                .max_keys(1000).set_key_marker(cursor.0.clone()).set_version_id_marker(cursor.1.clone())
+                .set_request_payer(self.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Reading exact S3 path versions failed: {error}")))?;
+            for entry in page.versions() {
+                let listed = entry.key().filter(|listed| listed.starts_with(path.as_ref()))
+                    .ok_or_else(|| unavailable("S3 listed a version outside the requested path prefix"))?;
+                if listed != path.as_ref() { continue; }
+                let version = entry.version_id().filter(|version| valid_object_version(version.as_bytes()))
+                    .ok_or_else(|| unavailable("The path has no exact version identity"))?;
+                versions.push(PhysicalObjectVersion { namespace: self.namespace.clone(), key: listed.to_owned(), version: version.to_owned() });
+            }
+            match page.is_truncated() {
+                Some(false) => return Ok(versions),
+                Some(true) => (),
+                None => return Err(unavailable("S3 omitted the exact version pagination state")),
+            }
+            let next = page.next_key_marker().filter(|next| next.starts_with(path.as_ref()))
+                .ok_or_else(|| unavailable("S3 omitted the exact version key marker"))?;
+            // After the requested key, the remaining results only share its prefix.
+            if next != path.as_ref() { return Ok(versions); }
+            cursor = (Some(next.to_owned()), Some(page.next_version_id_marker().filter(|id| !id.is_empty())
+                .ok_or_else(|| unavailable("S3 omitted the exact version cursor"))?.to_owned()));
+            if !visited.insert(cursor.clone()) { return Err(unavailable("S3 repeated the exact version cursor")); }
+        }
+    }
+
+    pub async fn read_version_prefix(&self, key: &ObjectKey, version: &PhysicalObjectVersion, length: u64) -> Result<Bytes> {
+        if !(1..=4096).contains(&length) { return Err(unavailable("The version prefix exceeds its header bound")); }
+        let path = self.observed_path(key, version)?;
+        self.inspect((path.to_string(), version.version.clone()), move |owner, (path, version)| async move {
+            let last = length - 1;
+            let mut result = owner.client.get_object().bucket(&owner.namespace.bucket).key(path).version_id(&version)
+                .range(format!("bytes=0-{last}")).set_request_payer(owner.request_payer.clone()).send().await
+                .map_err(|error| unavailable(format!("Reading the S3 version prefix failed: {error}")))?;
+            let prefix = format!("bytes 0-{last}/");
+            if result.version_id() != Some(version.as_str()) || result.delete_marker().unwrap_or(false)
+                || result.content_length() != Some(length as i64)
+                || !result.content_range().and_then(|range| range.strip_prefix(&prefix))
+                    .and_then(|size| size.parse::<u64>().ok()).is_some_and(|size| size >= length)
+            {
+                return Err(unavailable("S3 returned a different version or byte range"));
+            }
+            let mut bytes = Vec::with_capacity(length as usize);
+            while let Some(chunk) = result.body.next().await {
+                let chunk = chunk.map_err(|error| unavailable(format!("Reading the version body failed: {error}")))?;
+                if chunk.len() > length as usize - bytes.len() { return Err(unavailable("S3 returned a longer version prefix")); }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.len() != length as usize { return Err(unavailable("S3 returned an incomplete version prefix")); }
+            Ok(Bytes::from(bytes))
+        }).await
+    }
+
     pub async fn exact_retirement_available(&self, key: &ObjectKey, observed: &PhysicalObjectVersion) -> Result<bool> {
         let path = self.observed_path(key, observed)?;
         Ok(self.version_status(path.as_ref(), &observed.version).await? != VersionStatus::WouldExposeOlderData)

@@ -76,6 +76,8 @@ Provider verification includes ranged reads, object naming, lost create replies,
 Independent forks and directory cell moves open authenticated loose objects and pack members under their original slots and reseal each member into a destination slot. A pack rewrite preserves its predecessor list and publication time. An admitted archive overlay exposes the original archive ciphertext and opens it through the capture key authority. The directory retirement owner withdraws original publication scopes after the last co-custodied residence is disposed. It also withdraws the scopes of closed unpublished transfer generations and rejected forks. Scope retirement includes orphan registrations. Enrolled terminal S3 authenticates eligible loose publications, checks relocated copies and withdraws their last slots under the exact retirement grant.
 Local retirement checks descendant references and physical loose and packed copies under the volume and lineage reservation.
 It withdraws slots for eligible loose publications and members of obsolete packs before removing their last ciphertext.
-Hosted pack and versioned retirement, and orphan slots in an open origin, still need a complete publication census.
+Versioned S3 reads exact version prefixes and checks all data versions of every loose alias before withdrawing a slot.
+The exact directory grant carries the original slot through ciphertext removal and retry.
+Hosted packs and orphan slots in an open origin still need a complete publication census.
 
 [Current cipher](../../rust/crates/storage/src/sealing/cipher.rs) · [Key service](../../rust/crates/multi/src/keys.rs) · [Fork references](../../rust/crates/multi/src/reference.rs) · [R7](R7-eraser.md)
