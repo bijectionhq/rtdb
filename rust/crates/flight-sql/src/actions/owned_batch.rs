@@ -16,7 +16,7 @@ use tonic::{Response, Status, metadata::MetadataValue};
 use crate::{
     config::{AUDIENCE_READ_LIMITS, AUDIENCE_REPLY_BYTES, AUDIENCE_REQUEST_BYTES},
     error::{arrow, cancelled, invalid, status},
-    owned_actions::{HELD_OWNED_POINT_V2, HeldRangeFormat, PointTime, ValidHistoryMode, WorldOrder},
+    owned_actions::{HELD_OWNED_POINT_V2, HeldRangeFormat, OwnedReplyFormat, PointTime, ValidHistoryMode, WorldOrder},
     service::{Call, Output, Service},
     wire,
 };
@@ -159,7 +159,8 @@ impl Service {
                         audience_work::decode_bytes(original.encoded_len())
                             .map_err(|error| Status::resource_exhausted(error.to_string()))?;
                         self.confirm_audience_observation(call).await?;
-                        self.held_owned_point(call, request, PointTime::Optional, false, Some(selection)).await
+                        self.held_owned_point(call, request, PointTime::Optional, false, OwnedReplyFormat::Selection(selection))
+                            .await.map(OwnedIpcReply::into_unary)
                     };
                     let reply = IoRegion::retaining(owner, audience_work::within_turn(
                         Some(AUDIENCE_READ_LIMITS), Some(turn), work,
@@ -193,17 +194,18 @@ impl Service {
                 if call.session.fresh_replica && matches!(selector, 4..=6) {
                     return Err(Status::permission_denied("The fresh Flight route only admits Root point reads"));
                 }
+                let format = if compact { OwnedReplyFormat::Selection(selection) } else { OwnedReplyFormat::Unary };
                 match selector {
-                    0 => self.held_owned_point(call, request, PointTime::Optional, compact, compact.then_some(selection)).await,
-                    1 => self.held_owned_point(call, request, PointTime::Required, compact, compact.then_some(selection)).await,
-                    2 => self.held_owned_historical_point(call, request, compact.then_some(selection)).await,
-                    3 => self.held_owned_position_point(call, request, compact.then_some(selection)).await,
-                    4 => self.held_world_point(call, request, compact.then_some(selection)).await,
-                    5 => self.held_world_point_at(call, request, false, compact.then_some(selection)).await,
-                    6 => self.held_world_point_at(call, request, true, compact.then_some(selection)).await,
-                    7 if !compact => self.held_root_cut_point_action(call, request).await,
+                    0 => self.held_owned_point(call, request, PointTime::Optional, compact, format).await,
+                    1 => self.held_owned_point(call, request, PointTime::Required, compact, format).await,
+                    2 => self.held_owned_historical_point(call, request, format).await,
+                    3 => self.held_owned_position_point(call, request, format).await,
+                    4 => self.held_world_point(call, request, format).await,
+                    5 => self.held_world_point_at(call, request, false, format).await,
+                    6 => self.held_world_point_at(call, request, true, format).await,
+                    7 if !compact => self.held_root_cut_point_action(call, request, format).await,
                     _ => Err(invalid("Unsupported held selection entry")),
-                }
+                }.map(OwnedIpcReply::into_unary)
             }
             BatchKind::Range => {
                 if selector <= 3 {
@@ -346,6 +348,73 @@ impl Iterator for IpcFrames {
     }
 }
 
+pub(crate) enum OwnedIpcReply {
+    Unary(ActionResult),
+    Frames(Vec<ActionResult>),
+}
+
+impl OwnedIpcReply {
+    pub(crate) fn into_unary(self) -> ActionResult {
+        match self {
+            Self::Unary(reply) => reply,
+            Self::Frames(_) => unreachable!("unary reply encoding was requested"),
+        }
+    }
+}
+
+pub(crate) fn encode_ipc_frames(schema: &Schema, batches: &[RecordBatch]) -> Result<Vec<Bytes>, Status> {
+    let options = IpcWriteOptions::default();
+    let schema_frame = rtdb_format::ipc::write_schema_message_with_options(schema, &options).map_err(status)?;
+    let message = arrow_ipc::root_as_message(&schema_frame[8..]).map_err(arrow)?;
+    let header = message.header_as_schema().ok_or_else(|| invalid("Missing owned IPC schema"))?;
+    let mut tracker = DictionaryTracker::new(false);
+    if let Some(fields) = header.fields() {
+        for field in fields {
+            register_dictionaries(field, &mut tracker);
+        }
+    }
+
+    let mut frames = vec![schema_frame.into()];
+    let generator = IpcDataGenerator::default();
+    let mut compression = CompressionContext::default();
+    for batch in batches {
+        let (dictionaries, record) = generator.encode(batch, &mut tracker, &options, &mut compression).map_err(arrow)?;
+        for message in dictionaries.into_iter().chain(std::iter::once(record)) {
+            let mut frame = Vec::new();
+            write_message(&mut frame, message, &options).map_err(arrow)?;
+            frames.push(frame.into());
+        }
+    }
+    frames.push(Bytes::from_static(&IPC_EOS));
+    Ok(frames)
+}
+
+fn register_dictionaries(field: arrow_ipc::Field<'_>, tracker: &mut DictionaryTracker) {
+    if let Some(children) = field.children() {
+        for child in children {
+            register_dictionaries(child, tracker);
+        }
+    }
+    if field.dictionary().is_some() {
+        tracker.next_dict_id();
+    }
+}
+
+pub(crate) fn retain_ipc_frames(
+    memory: &Arc<MemoryBudget>, frames: Vec<Bytes>, maximum: usize,
+) -> Result<OwnedIpcReply, Status> {
+    let bytes = frames.iter().try_fold(0, |size, frame| wire::add(size, frame.len()))?;
+    // The original cap includes one protobuf tag and length prefix for the complete stream.
+    let encoded_len = wire::add(bytes, 1 + prost::length_delimiter_len(bytes))?;
+    if encoded_len > maximum {
+        return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
+    }
+    let retained = memory.reserve(bytes).map_err(status)?;
+    Ok(OwnedIpcReply::Frames(frames.into_iter().map(|frame| ActionResult {
+        body: wire::retain(frame, Arc::clone(&retained)),
+    }).collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +478,63 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[1].body.as_ref(), IPC_EOS);
         assert_eq!([frames[0].body.as_ref(), frames[1].body.as_ref()].concat(), input);
+    }
+
+    #[test]
+    fn detached_ipc_matches_sliced_stream_for_nested_dictionaries_and_full_width_decimals() {
+        use arrow_array::{Array, ArrayRef, Decimal128Array, StructArray, builder::StringDictionaryBuilder, types::Int32Type};
+        use arrow_schema::Field;
+        use rtdb_columnar::{DecimalParameters, with_decimal_parameters};
+
+        let dictionary = |value| -> ArrayRef {
+            let mut builder = StringDictionaryBuilder::<Int32Type>::new();
+            builder.append(value).unwrap();
+            Arc::new(builder.finish())
+        };
+        let label = dictionary("nested");
+        let nested = StructArray::from(vec![
+            (Arc::new(Field::new("label", label.data_type().clone(), false)), label),
+        ]);
+        let kind = dictionary("outer");
+        let amount = Decimal128Array::from(vec![123]).with_precision_and_scale(20, 1).unwrap();
+        let amount_field = with_decimal_parameters(
+            Field::new("amount", amount.data_type().clone(), false),
+            DecimalParameters { precision: 20, scale: 200, bit_width: 128 },
+        ).unwrap();
+        let schema = Arc::new(Schema::new_with_metadata(vec![
+            Field::new("nested", nested.data_type().clone(), false),
+            Field::new("kind", kind.data_type().clone(), false),
+            amount_field,
+        ], [("decision".into(), "held".into())].into()));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(nested), kind, Arc::new(amount)]).unwrap();
+        for batches in [&[][..], std::slice::from_ref(&batch)] {
+            let expected = rtdb_format::ipc::write_arrow_stream(&schema, batches, IpcWriteOptions::default()).unwrap();
+            let expected = IpcFrames(expected.into()).map(|reply| reply.unwrap().body).collect::<Vec<_>>();
+            assert_eq!(encode_ipc_frames(&schema, batches).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn detached_ipc_charges_the_original_aggregate_until_the_last_frame_is_dropped() {
+        let frames = encode_ipc_frames(&Schema::empty(), &[]).unwrap();
+        let original = ActionResult { body: frames.concat().into() };
+        let cap = original.encoded_len();
+        assert!(frames.iter().all(|body| ActionResult { body: body.clone() }.encoded_len() < cap - 1));
+        let memory = MemoryBudget::new(original.body.len());
+        let Err(error) = retain_ipc_frames(&memory, frames.clone(), cap - 1) else {
+            panic!("aggregate reply exceeded the original message cap");
+        };
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let OwnedIpcReply::Frames(mut replies) = retain_ipc_frames(&memory, frames, cap).unwrap() else {
+            panic!("expected detached IPC messages");
+        };
+        let held = replies.pop().unwrap().body.clone();
+        drop(replies);
+        assert_eq!(held.as_ref(), IPC_EOS);
+        assert_eq!(memory.used_bytes(), original.body.len());
+        drop(held);
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

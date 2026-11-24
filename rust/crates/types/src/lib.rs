@@ -41,7 +41,7 @@ mod owned_schema;
 mod owned_world;
 mod owned_changes;
 mod assertion;
-pub use assertion::{
+pub use assertion::{ASSERTION_FAMILY_FENCES, AssertionFamilyFenceMarker,
     AssertionId, AssertionWireError, AudienceCut, AudienceFrontier, ExactEraseSelector, PlacedId,
     PlacementBinding, Position, RootLandingBinding, RootLandingTarget, ShadowBound, ShadowV1,
 };

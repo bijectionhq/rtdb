@@ -1,4 +1,3 @@
-use rtdb_types::StructFields;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
@@ -7,9 +6,9 @@ use std::path::Path;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::{data::{EventBatch, PageEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
-use rtdb_types::{Iid, LogicalType, Result, RunEndWidth, Timestamp};
+use rtdb_types::{Iid, Result, Timestamp};
 use tokio_util::sync::CancellationToken;
-use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, limit_writer, open_input, read_page, row_bytes};
+use super::{MergeConfig, MergeOutput, MergePages, OutputSchema, check_disk, create_file, disk_remaining, limit_writer, open_input, read_page, row_bytes};
 use super::planner::bucket;
 
 #[derive(Clone, Debug)]
@@ -38,7 +37,7 @@ pub fn cell_width(rows: usize, minimum: Timestamp, maximum: Timestamp, page_size
 struct FinalWriter<'a> {
     data: ArrowFileWriter,
     metadata: MetadataBuilder,
-    schema: OutputSchema,
+    schema: &'a OutputSchema,
     arrow_schema: arrow_schema::SchemaRef,
     memory: &'a Arc<MemoryBudget>,
     metadata_charges: Vec<Arc<MemoryReservation>>,
@@ -263,46 +262,30 @@ impl StreamingTrie {
     }
 }
 
-pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>,
+pub(super) fn normalize(input: &MergeOutput, config: &MergeConfig, memory: &Arc<MemoryBudget>,
     data_path: &Path, meta_path: &Path, cancellation: &CancellationToken) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
-    let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
-    let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency, keyed: input.keyed, topology: input.topology, include_origins: input.include_origins, include_positions: input.include_positions, redacted_leg: input.redacted_leg };
+    match &input.pages {
+        MergePages::Retained(batch) => normalize_to_files(&input.schema, config, memory, data_path, meta_path, cancellation, |output| {
+            output.page(batch.batch())?;
+            Ok(())
+        }),
+        MergePages::Spilled => {
+            let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
+            normalize_to_files(&input.schema, config, memory, data_path, meta_path, cancellation, |output| {
+                normalize_spill(output, &mut reader, input, config.page_size)
+            })
+        }
+        _ => Err(crate::invalid("Merge pages are not ready for normalization")),
+    }
+}
+
+fn normalize_to_files(schema: &OutputSchema, config: &MergeConfig, memory: &Arc<MemoryBudget>, data_path: &Path,
+    meta_path: &Path, cancellation: &CancellationToken, pages: impl FnOnce(&mut FinalWriter<'_>) -> Result<()>,
+) -> Result<(u64, rtdb_format::log::proto::TrieMetadata)> {
     let directory = data_path.parent().ok_or_else(|| crate::invalid("Output path has no parent"))?;
     let arrow_schema = schema.schema()?;
-    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, &arrow_schema, disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, arrow_schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
-    if !input.carries_recency {
-        output.tree(&mut reader, &input.leaves, 0, config.page_size)?;
-    } else if input.leaves.is_empty() { output.metadata.write_nil()?; }
-    else {
-        let minimum = input.leaves.iter().filter_map(|leaf| leaf.min_recency).min().ok_or_else(|| crate::invalid("Historical spill has no recency range"))?;
-        let maximum = input.leaves.iter().filter_map(|leaf| leaf.max_recency).max().ok_or_else(|| crate::invalid("Historical spill has no recency range"))?;
-        let rows = input.leaves.iter().try_fold(0usize, |rows, leaf| rows.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Historical row count overflow")))?;
-        let width = cell_width(rows, minimum, maximum, config.page_size)?;
-        let part = input.part.as_slice();
-        if let Some(width) = width {
-            let mut cells: BTreeMap<Timestamp, StreamingTrie> = BTreeMap::new();
-            for leaf in &input.leaves {
-                let (events, _charge) = read_events(&mut reader, leaf, memory)?;
-                for event in events {
-                    let boundary = cell_boundary(event.recency.ok_or_else(|| crate::invalid("Historical row has no recency"))?, width)?;
-                    cells.entry(boundary).or_insert_with(|| StreamingTrie::new(part.len(), config.page_size)).add(event, &mut output)?;
-                }
-            }
-            let children = cells.into_iter().map(|(boundary, trie)| Ok((boundary, trie.finish(&mut output)?))).collect::<Result<_>>()?;
-            let mut child = output.metadata.write_recency_branch(children)?;
-            for bucket in part.iter().rev() {
-                let mut children = [None; 4]; children[usize::from(*bucket)] = Some(child);
-                child = output.metadata.write_iid_branch(children)?;
-            }
-        } else {
-            let mut trie = StreamingTrie::new(0, config.page_size);
-            for leaf in &input.leaves {
-                let (events, _charge) = read_events(&mut reader, leaf, memory)?;
-                for event in events { trie.add(event, &mut output)?; }
-            }
-            trie.finish(&mut output)?;
-        }
-    }
+    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, &arrow_schema, disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(schema.recency, true), schema, arrow_schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
+    pages(&mut output)?;
     limit_writer(&mut output.data, directory, config.temporary_byte_limit)?;
     let data = output.data.finish()?;
     let size = data.metadata().map_err(crate::invalid)?.len();
@@ -312,4 +295,41 @@ pub(super) fn normalize(input: &MergeFile, put: &Option<StructFields<LogicalType
     check_disk(directory, config.temporary_byte_limit, encoded.len() as u64)?;
     create_file(meta_path)?.write_all(&encoded).map_err(crate::invalid)?;
     Ok((size, details))
+}
+
+fn normalize_spill(output: &mut FinalWriter<'_>, reader: &mut ArrowFile, input: &MergeOutput, page_size: usize) -> Result<()> {
+    if !input.schema.recency {
+        output.tree(reader, &input.leaves, 0, page_size)?;
+    } else if input.leaves.is_empty() { output.metadata.write_nil()?; }
+    else {
+        let minimum = input.leaves.iter().filter_map(|leaf| leaf.min_recency).min().ok_or_else(|| crate::invalid("Historical spill has no recency range"))?;
+        let maximum = input.leaves.iter().filter_map(|leaf| leaf.max_recency).max().ok_or_else(|| crate::invalid("Historical spill has no recency range"))?;
+        let rows = input.leaves.iter().try_fold(0usize, |rows, leaf| rows.checked_add(leaf.rows).ok_or_else(|| crate::invalid("Historical row count overflow")))?;
+        let width = cell_width(rows, minimum, maximum, page_size)?;
+        let part = input.part.as_slice();
+        if let Some(width) = width {
+            let mut cells: BTreeMap<Timestamp, StreamingTrie> = BTreeMap::new();
+            for leaf in &input.leaves {
+                let (events, _charge) = read_events(reader, leaf, output.memory)?;
+                for event in events {
+                    let boundary = cell_boundary(event.recency.ok_or_else(|| crate::invalid("Historical row has no recency"))?, width)?;
+                    cells.entry(boundary).or_insert_with(|| StreamingTrie::new(part.len(), page_size)).add(event, output)?;
+                }
+            }
+            let children = cells.into_iter().map(|(boundary, trie)| Ok((boundary, trie.finish(output)?))).collect::<Result<_>>()?;
+            let mut child = output.metadata.write_recency_branch(children)?;
+            for bucket in part.iter().rev() {
+                let mut children = [None; 4]; children[usize::from(*bucket)] = Some(child);
+                child = output.metadata.write_iid_branch(children)?;
+            }
+        } else {
+            let mut trie = StreamingTrie::new(0, page_size);
+            for leaf in &input.leaves {
+                let (events, _charge) = read_events(reader, leaf, output.memory)?;
+                for event in events { trie.add(event, output)?; }
+            }
+            trie.finish(output)?;
+        }
+    }
+    Ok(())
 }

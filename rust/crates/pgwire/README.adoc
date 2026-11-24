@@ -18,7 +18,7 @@ Shutdown closes admission, drains connections through the configured deadline, t
 The server and each connection are Active Objects.
 Each authenticated connection owns one bounded reader child that detects peer termination while query execution is suspended.
 The connection cancels and joins that reader before releasing the socket and session.
-Its passive protocol transient owns prepared registrations, portals, the implicit-transaction marker, protocol mode, and optional COPY file.
+Its passive protocol transient owns prepared registrations, portals, the implicit-transaction marker, protocol mode, and optional COPY input.
 Each portal owns its query cursor, current Arrow batch, row offset, cumulative row count, argument reservations, and cancellation token.
 Prepared statements are immutable shared values; named registrations own their name/map charge.
 The cancellation registry contains weak capabilities to connection-owned cancellation slots.
@@ -96,8 +96,11 @@ The preimage concatenates `bijection.native-root-catalog.v1`, the big-endian 64-
 The owner bounds each dictionary to 4,096 entries, 4,096 bytes per spelling and 1 MiB of distinct spelling bytes.
 Dictionary rows use the same query basis and delivery grants as ordinary COPY.
 
-COPY input is written into a bounded temporary file owned by the protocol state.
-CopyFail, disconnect, shutdown, and completion release that file.
+The protocol state opens a temporary file at COPY admission and checks the configured disk-byte limit on every input frame.
+Arrow streams up to 8 KiB can remain in the existing COPY scratch reservation with an empty temporary file.
+If retention is unavailable or the stream grows past 8 KiB, COPY writes the retained prefix to the temporary file and spools the rest there.
+Arrow files and Transit inputs use the temporary file throughout, and Arrow files seek to the footer during preflight.
+CopyFail, disconnect, shutdown, and completion release the COPY input and its temporary file.
 Transit JSON and MessagePack accept multiple top-level documents, resetting the Transit cache for each value.
 Transit COPY commits one batch when no transaction is open.
 Arrow file and stream COPY preserve record-batch boundaries and commit one transaction per batch outside an explicit transaction.
@@ -126,7 +129,11 @@ A borrowed syntax reservation ends when preparation consumes the tree.
 A retained syntax reservation follows its registered wrappers and bound portals.
 Each statement resolves its parameters, embedded XTQL and control expressions against the context reached during execution.
 A reached planning or execution error is reported in statement order, with subsequent statements subject to normal transaction status.
-Arrow COPY inspects metadata and compressed buffer lengths before loading payloads, then holds a reservation through the reader and each selected-value conversion.
+After CopyDone, Arrow COPY completes framing and allocation preflight before the first batch submission.
+It checks metadata and compressed buffer lengths and holds the decoding reservation through the reader and each selected-value conversion.
+In autocommit, the retained-stream reader borrows message metadata and suitably aligned bodies from the admitted bytes.
+Unaligned bodies and explicit transactions on the retained path use independent body buffers.
+The large-stream reader reuses bounded cached framing and reads the rest from the spool.
 Transit COPY reserves the bounded file's decoding allowance before reading it into memory.
 Temporary-file reads and writes run synchronously on the owning future; cancellation is observed between those operations and during asynchronous transaction work.
 TLS internals, compiler scratch, and worst-case nested codec amplification still need complete retained-allocation qualification.

@@ -3,7 +3,7 @@
 This is the Flight contract a placed writer's client uses to keep per-copy custody of a protected row.
 The vault owner is `AssertionFamilies` in `rust/crates/multi/src/keys/assertion/family.rs`.
 The Flight decoding lives in `rust/crates/flight-sql/src/owned_family.rs` and the placed host in `rust/crates/multi/src/process/owned_worlds/assertion_families.rs`.
-Hosted protocol 215 adds the scope and enrolment actions and position admission.
+Hosted protocol 215 adds the scope and enrolment actions, position admission, and ranking of sealed world projections.
 
 ## Model
 
@@ -172,6 +172,23 @@ The family must be live and the stage enrolled exactly as for sealing.
 The plaintext is transient resolution input and does not authorize a history read.
 A fenced or settled family, or a retired capability, refuses with `rtdb/erased-under-view`.
 
+### `rtdb.owned.PlanAssertionFamilyFence.v1`
+
+Request: family `uuid`, selected `position`, erasure order `uuid`.
+
+Hosted protocol 217 exposes a read-only plan.
+The selected position must be a bound member.
+The reply has the same order, inventory digest and counted sections as `FenceAssertionFamily.v1`.
+If the vault already fenced the family, the reply preserves its first order.
+The plan leaves the vault and source unchanged.
+The retiring transaction must take a claim over this inventory before it can order an immutable marker.
+The claim freezes the family record under its vault compare-and-swap and binds the exact placed source attempt.
+The checked insert targets `bj_fact_assertion_family_fences` with the family UUID as 32 lowercase hexadecimal characters and a null expectation.
+Its binary `body` is version 1 (u8), selected `position`, order `uuid` and inventory digest (32).
+Each Root inventory entry requires an erase of its named relation and exact UTF-8 row key in the same transaction.
+The erasure obligation binds the same digest.
+The marker route refuses until current original-authority reads guard both regular and archive release.
+
 ### `rtdb.owned.FenceAssertionFamily.v1`
 
 Request: family `uuid`, selected `position`, erasure order `uuid`.
@@ -236,6 +253,36 @@ Its authoring scope binds the private family identity and the Root target.
 * `rtdb.owned.OpenFamilyLandingPayload.v1` takes family, destination `stage`, `root-binding`, then the destination envelope. It verifies the active binding and exact envelope digest and returns the inner carrier. Opening requires the current family both before and after the broker unwrap.
 * `rtdb.owned.SealFamilyLandingLink.v2` takes a binding-kind byte. Kind 0 is followed by the placed request fields above. Kind 1 is followed by family, reservation, `root-target`, the reviewed source `position`, then the destination envelope digest. It returns the separately sealed link envelope.
 * `rtdb.owned.ActivateFamilyLanding.v2` takes a binding-kind byte. Kind 0 is followed by the placed request fields above. Kind 1 is followed by family, `root-binding`, reservation, then the link envelope. The vault authenticates the exact link before first activation, and accepts an exact activation retry independently of link retirement.
+
+## World search
+
+A derived overlay row stores its projection in the declared opaque binary field `sealed_world_projection`.
+The carrier is ASCII `BJWP1`, family `uuid`, `stage`, `assertion`, member `assertion`, disclosure scope (32), and the `RTAS` envelope.
+The codec is the u32 representation of ASCII `BJWR`.
+Ranking takes the authoring world, relation and row key from the winning overlay layer and performs the current family and stage check before opening the envelope.
+The opened body is the JSON pair of text paths and vector paths, used only as transient ranking input.
+In current ranking, a fenced or retired derived winner continues to shadow a parent row and contributes no ranking input.
+At an exact earlier cut, a fenced or retired winner refuses with `rtdb/erased-under-view` before text, nearest or hybrid ranking can return an altered corpus.
+Protected-row payload carriers retain their `BJWC1` framing.
+Current and accepted-cut point reads can return the opaque carrier with the resolver's authoring line and ordinal.
+Resolution uses that original authoring line for a winner inherited from a parent world.
+
+## World overlay admission
+
+Writable world overlays admit the installed custody controls `fact_unit_fences`, `fact_unit_column_payloads`, `fact_row_probe_floors`, `fact_row_legal_holds`, `fact_row_publications` and `fact_sealed_search_erasures` at the full valid interval.
+An insert still requires original absence for its identity.
+A checked Proposal settlement requires the matching point witness for each effect, and the existing bounded-period rules apply to ordinary facts.
+The resolver checks each payload against the world’s installed schema.
+A sealed derived projection is an opaque binary field on its declared search relation, carried as binary through source and resolved archive replay.
+
+### Protected prepared receipt placement
+
+Hosted protocol 218 admits a matched protected receipt and proof under `root_proposal_private_landing:` and `root_proposal_private_landing_proof:` in the existing hosted admission relation.
+Only the original placed writer can read those controls.
+The prepared audience has no access, and the protected switch cannot advance public publication frontiers or emit public task intents.
+The switch retains the applied receipt and proof with the destination at one order.
+The constraint-refusal pair keeps the same request, cleared activation and empty candidate roots.
+Bijection owns the equivalent audience check before probing a protected source.
 
 ## Fence semantics across dependent forks
 

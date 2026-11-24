@@ -8,10 +8,11 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::writer::{
-    CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions, StreamWriter,
-    write_message,
+    CompressionContext, DictionaryTracker, EncodedData, IpcDataGenerator, IpcWriteOptions,
+    StreamWriter, write_message,
 };
-use arrow_schema::{DataType, Schema, SchemaRef, UnionMode};
+use arrow_schema::{ArrowError, DataType, Schema, SchemaRef, UnionMode};
+use bytes::Bytes;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_types::{Anomaly, Result};
 
@@ -504,8 +505,40 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
     Ok(layout)
 }
 
+enum StreamInput<R> {
+    Reader(R),
+    Retained { bytes: Bytes, position: usize },
+}
+
+impl<R: Read> StreamInput<R> {
+    fn next_message(&mut self) -> Result<Option<(Cow<'_, [u8]>, Buffer)>> {
+        match self {
+            Self::Reader(reader) => Ok(read_message(reader)?.map(|(metadata, body)| {
+                let body = if body.is_empty() { Buffer::default() } else { Buffer::from(body) };
+                (Cow::Owned(metadata), body)
+            })),
+            Self::Retained { bytes, position } => {
+                if *position == bytes.len() { return Ok(None); }
+                let Some((metadata, body)) = stream_message(bytes, position)? else { return Ok(None); };
+                let body = if body.is_empty() {
+                    Buffer::default()
+                } else {
+                    let body = bytes.slice(body);
+                    // Arrow's per-array alignment copies can change the batch's later memory charge.
+                    if body.as_ptr().align_offset(std::mem::align_of::<u128>()) == 0 {
+                        Buffer::from(body)
+                    } else {
+                        Buffer::from(body.to_vec())
+                    }
+                };
+                Ok(Some((Cow::Borrowed(metadata), body)))
+            }
+        }
+    }
+}
+
 pub struct ArrowStream<R = Cursor<Arc<[u8]>>> {
-    reader: R,
+    input: StreamInput<R>,
     schema: SchemaRef,
     projected: SchemaRef,
     projection: Option<Vec<usize>>,
@@ -517,22 +550,32 @@ impl ArrowStream<Cursor<Arc<[u8]>>> {
     pub fn open(bytes: Arc<[u8]>, projection: Option<Vec<usize>>) -> Result<Self> {
         Self::from_reader(Cursor::new(bytes), projection)
     }
+    /// Decodes one batch at a time from admitted IPC bytes that own their allocation charge.
+    /// Decoded buffers may retain the input bytes after the iterator is dropped.
+    /// The caller retains the decoder reservation as in [`Self::from_reader`].
+    pub fn from_bytes(bytes: Bytes, projection: Option<Vec<usize>>) -> Result<Self> {
+        Self::from_input(StreamInput::Retained { bytes, position: 0 }, projection)
+    }
 }
 impl<R: Read> ArrowStream<R> {
     /// The caller reserves schema, dictionaries and the largest decoded message before opening the reader.
     /// Returned buffers and schemas may outlive the reader; retain their reservation until they are released.
-    pub fn from_reader(mut reader: R, projection: Option<Vec<usize>>) -> Result<Self> {
-        let (metadata, body) = read_message(&mut reader)?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
-        if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
-        let schema = decoded_schema::adapt(&Arc::new(read_schema_header(&metadata)?))?;
+    pub fn from_reader(reader: R, projection: Option<Vec<usize>>) -> Result<Self> {
+        Self::from_input(StreamInput::Reader(reader), projection)
+    }
+    fn from_input(mut input: StreamInput<R>, projection: Option<Vec<usize>>) -> Result<Self> {
+        let schema = {
+            let (metadata, body) = input.next_message()?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
+            if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
+            decoded_schema::adapt(&Arc::new(read_schema_header(&metadata)?))?
+        };
         let projected = if let Some(projection) = &projection { Arc::new(schema.project(projection).map_err(invalid)?) } else { Arc::clone(&schema) };
-        Ok(Self { reader, schema, projected, projection, dictionaries: HashMap::new(), finished: false })
+        Ok(Self { input, schema, projected, projection, dictionaries: HashMap::new(), finished: false })
     }
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.projected) }
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        while let Some((metadata, body)) = read_message(&mut self.reader)? {
-            let body = if body.is_empty() { Buffer::default() } else { Buffer::from(body) };
-            if let Some(batch) = decode_stream_batch(Cow::Owned(metadata), align_ipc_body(body), &self.schema, &mut self.dictionaries, self.projection.as_deref())? { return Ok(Some(batch)); }
+        while let Some((metadata, body)) = self.input.next_message()? {
+            if let Some(batch) = decode_stream_batch(metadata, align_ipc_body(body), &self.schema, &mut self.dictionaries, self.projection.as_deref())? { return Ok(Some(batch)); }
         }
         Ok(None)
     }
@@ -1080,6 +1123,32 @@ pub struct RowStreamEncoder {
     options: IpcWriteOptions,
 }
 
+/// Detached dictionary and record messages for one row of a V5 stream with 8-byte alignment.
+pub struct PreparedStreamRow {
+    dictionaries: Box<[EncodedData]>,
+    record: EncodedData,
+    framed_len: usize,
+}
+
+impl PreparedStreamRow {
+    pub fn framed_len(&self) -> usize {
+        self.framed_len
+    }
+
+    /// Appends the messages without allocating an intermediate framed copy of their bodies.
+    pub fn append_to(&self, bytes: &mut Vec<u8>) {
+        for message in self.dictionaries.iter().chain(std::iter::once(&self.record)) {
+            let metadata_len = message.ipc_message.len().next_multiple_of(STREAM_ALIGNMENT);
+            bytes.extend_from_slice(&[0xff; 4]);
+            bytes.extend_from_slice(&(metadata_len as i32).to_le_bytes());
+            bytes.extend_from_slice(&message.ipc_message);
+            let padding = metadata_len - message.ipc_message.len();
+            bytes.extend_from_slice(&[0; STREAM_ALIGNMENT][..padding]);
+            bytes.extend_from_slice(&message.arrow_data);
+        }
+    }
+}
+
 impl RowStreamEncoder {
     pub fn new(schema: &SchemaRef) -> Result<Self> {
         let options = write_options()?;
@@ -1111,6 +1180,36 @@ impl RowStreamEncoder {
 
     /// Encodes a row's dictionary and record frames. A complete stream also needs its schema and end marker.
     pub fn encode(&self, row: &RecordBatch) -> Result<Vec<u8>> {
+        let (dictionaries, record) = self.messages(row)?;
+        let mut bytes = Vec::new();
+        for message in dictionaries.into_iter().chain(std::iter::once(record)) {
+            write_message(&mut bytes, message, &self.options).map_err(invalid)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Validates framing and measures the exact wire length while encoding the candidate row.
+    pub fn prepare(&self, row: &RecordBatch) -> Result<PreparedStreamRow> {
+        let (dictionaries, record) = self.messages(row)?;
+        let framed_len = dictionaries
+            .iter()
+            .chain(std::iter::once(&record))
+            .try_fold(0, |len, message| {
+                if !message.arrow_data.len().is_multiple_of(STREAM_ALIGNMENT) {
+                    return Err(invalid(ArrowError::MemoryError("Arrow data not aligned".into())));
+                }
+                let metadata_len = message.ipc_message.len().next_multiple_of(STREAM_ALIGNMENT);
+                let framed_metadata = allocation_add(8, metadata_len)?;
+                allocation_add(len, allocation_add(framed_metadata, message.arrow_data.len())?)
+            })?;
+        Ok(PreparedStreamRow {
+            dictionaries: dictionaries.into_boxed_slice(),
+            record,
+            framed_len,
+        })
+    }
+
+    fn messages(&self, row: &RecordBatch) -> Result<(Vec<EncodedData>, EncodedData)> {
         if row.num_rows() != 1 || row.schema_ref() != &self.schema {
             return Err(invalid("Arrow row differs from its declared stream schema or row count"));
         }
@@ -1118,14 +1217,9 @@ impl RowStreamEncoder {
         for _ in 0..self.dictionaries {
             tracker.next_dict_id();
         }
-        let (dictionaries, record) = IpcDataGenerator::default()
+        IpcDataGenerator::default()
             .encode(row, &mut tracker, &self.options, &mut CompressionContext::default())
-            .map_err(invalid)?;
-        let mut bytes = Vec::new();
-        for message in dictionaries.into_iter().chain(std::iter::once(record)) {
-            write_message(&mut bytes, message, &self.options).map_err(invalid)?;
-        }
-        Ok(bytes)
+            .map_err(invalid)
     }
 }
 
@@ -1263,8 +1357,10 @@ impl<W: Write> Write for FirstSchemaWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
+const STREAM_ALIGNMENT: usize = 8;
+
 fn write_options() -> Result<IpcWriteOptions> {
-    IpcWriteOptions::try_new(8, false, arrow_ipc::MetadataVersion::V5).map_err(invalid)
+    IpcWriteOptions::try_new(STREAM_ALIGNMENT, false, arrow_ipc::MetadataVersion::V5).map_err(invalid)
 }
 
 fn jvm_end_marker(bytes: &mut Vec<u8>, end: usize) -> Result<()> {
@@ -1281,6 +1377,44 @@ fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-arrow", error.to_string())
 }
 
+
+#[test]
+fn stream_reader_borrows_aligned_bodies_with_the_same_batch_memory_size() {
+    use arrow_array::Int64Array;
+
+    struct AdmittedBytes {
+        bytes: Buffer,
+        _charge: Arc<MemoryReservation>,
+    }
+    impl AsRef<[u8]> for AdmittedBytes {
+        fn as_ref(&self) -> &[u8] { self.bytes.as_slice() }
+    }
+
+    let page = RecordBatch::try_from_iter([("n", Arc::new(Int64Array::from(vec![3, -5, 7])) as ArrayRef)]).unwrap();
+    let options = IpcWriteOptions::try_new(64, false, arrow_ipc::MetadataVersion::V5).unwrap();
+    let stream = write_arrow_stream(page.schema_ref(), std::slice::from_ref(&page), options).unwrap();
+    let reference = ArrowStream::from_reader(stream.as_slice(), None).unwrap().next().unwrap().unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    for offset in [0, 1] {
+        let mut envelope = vec![0; offset];
+        envelope.extend_from_slice(&stream);
+        let charge = memory.reserve(envelope.len()).unwrap();
+        let bytes = Bytes::from_owner(AdmittedBytes { bytes: Buffer::from_slice_ref(&envelope), _charge: charge }).slice(offset..);
+        let source = bytes.as_ptr() as usize;
+        let length = bytes.len();
+        let mut reader = ArrowStream::from_bytes(bytes, None).unwrap();
+        let decoded = reader.next().unwrap().unwrap();
+        let values = decoded.column(0).as_any().downcast_ref::<Int64Array>().unwrap().values();
+        assert_eq!((source..source + length).contains(&(values.as_ptr() as usize)), offset == 0);
+        assert_eq!(decoded.get_array_memory_size(), reference.get_array_memory_size());
+        assert!(reader.next().is_none());
+        drop(reader);
+        assert_eq!(memory.used_bytes(), if offset == 0 { length } else { 0 });
+        assert_eq!(decoded, reference);
+        drop(decoded);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
 
 #[test]
 fn ordered_index_uncompressed_reader_borrows_retained_ipc_body() {

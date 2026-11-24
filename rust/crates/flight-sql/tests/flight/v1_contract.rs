@@ -121,6 +121,44 @@ async fn query_parameters_require_one_row_and_continuations_bind_the_exact_ipc()
 }
 
 #[tokio::test]
+async fn query_parameter_binding_preserves_result_types_and_errors() {
+    use arrow_array::{ArrayRef, BooleanArray, Int32Array, UInt64Array};
+    use rtdb_types::Value;
+
+    fn parameter(values: ArrayRef) -> Vec<u8> {
+        let batch = RecordBatch::try_from_iter([("argument", values)]).unwrap();
+        rtdb_format::ipc::write_stream(batch.schema_ref(), std::slice::from_ref(&batch)).unwrap()
+    }
+
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (values, data_type, expected) in [
+        (Arc::new(BooleanArray::from(vec![true])) as ArrayRef, DataType::Boolean, Value::Bool(true)),
+        (Arc::new(Int32Array::from(vec![i32::MIN])) as ArrayRef, DataType::Int32, Value::I32(i32::MIN)),
+        (Arc::new(Int64Array::from(vec![None])) as ArrayRef, DataType::Int64, Value::Null),
+        (Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef, DataType::Int64, Value::I64(-1)),
+    ] {
+        let mut request = input("SELECT $1 AS n");
+        request.params_ipc = Some(parameter(values));
+        let (batches, _) = query(&mut client, request).await;
+        let batch = &batches[0];
+        let field = batch.schema_ref().field(0);
+        assert_eq!(field.data_type(), &data_type);
+        assert_eq!(
+            rtdb_columnar::read_value(field, batch.column(0).as_ref(), 0).unwrap(),
+            expected,
+        );
+    }
+
+    let mut request = input("SELECT 10::BIGINT / $1 AS n");
+    request.params_ipc = Some(parameter(Arc::new(Int64Array::from(vec![0]))));
+    let status = get::<_, v1::QueryTrailer>(&mut client, request).await.unwrap_err();
+    let detail = error(status, v1::AnomalyCategory::Incorrect, "rtdb/invalid-request");
+    assert_eq!(detail.message, "data exception - division by zero");
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn rtdb_v1_capabilities_paging_and_stable_errors() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;

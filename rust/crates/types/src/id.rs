@@ -245,6 +245,22 @@ impl OwnedRelation {
             && !matches!(self.name(), OWNED_ATTEMPT_RELATION | OWNED_ROOT_PUBLICATION_RELATION | OWNED_PUBLIC_ROOT_VERSIONS_RELATION)
     }
 
+    pub fn is_world_custody_control(&self) -> bool {
+        let name = self.0.strip_prefix(OWNED_WORLD_PREFIX)
+            .and_then(|scoped| scoped.split_once('.')).map_or(self.name(), |(_, relation)| relation);
+        matches!(name,
+            "fact_unit_fences" | "fact_unit_column_payloads" | "fact_row_probe_floors"
+            | "fact_row_legal_holds" | "fact_row_publications" | "fact_sealed_search_erasures")
+    }
+
+    pub fn admits_world_ciphertext_points(&self, schema: &crate::OwnedSchema) -> bool {
+        match self.name() {
+            "fact_unit_column_payloads" => schema.has_only_opaque_column("sealed_payload"),
+            relation if relation.ends_with("_search") => schema.has_only_opaque_column("sealed_world_projection"),
+            _ => false,
+        }
+    }
+
     pub fn table(&self, owner: &str) -> TableRef { owned_table(owner, &self.0) }
 
     /// Names the obsolete owner-wide marker only to reject pre-cutover history.

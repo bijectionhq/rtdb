@@ -130,9 +130,10 @@ config {
 -- The meta file aligns page statistics to the trie's joined Arrow schema and retains their persisted branch order and Bloom bytes.
 --
 -- Writing the data file has two stages.
--- Intermediate results are written to disk between stages to bound memory usage.
+-- Intermediate results spill to disk between stages to bound memory usage.
+-- Native compaction can retain a single already-sized page for a job with one merge task and one output under the shared memory budget and a fixed retention ceiling.
 --
--- == Stage 1: Merge pages to disk ==
+-- == Stage 1: Merge pages ==
 --
 -- Input data and metadata files may use Arrow LZ4-frame or Zstandard buffer compression.
 -- Decompression preserves the rows and metadata supplied to the merge.
@@ -166,13 +167,14 @@ config {
 --     With `within_file_recency_branching` on, a historical output carries `_recency` through only when every input file carries it; otherwise it carries none.
 --   With `within_file_recency_branching` off, no output file carries `_recency`.
 --
--- At the end of each merge task (i.e. for each IID path prefix), accumulated rows are flushed to a temporary file on disk.
+-- At the end of each merge task (i.e. for each IID path prefix), accumulated rows for a spilled output are flushed to a temporary file on disk.
 -- This bounds the memory usage of the compactor.
 --
 -- == Stage 2: Normalise page sizes ==
 --
--- We read the temporary files and write the final output files, normalising page sizes along the way.
--- The input is a tree structure representing the pages written during stage 1, along with their row counts.
+-- The final writer reads the spill files or an admitted retained page and writes the resulting data and metadata files.
+-- A retained page follows the same final write and page statistics rules as a spill leaf that already fits the page size.
+-- For spilled outputs, the input is a tree structure representing the pages written during stage 1, along with their row counts.
 --
 -- For each node in the tree:
 --   If a leaf has more rows than the page size: split by re-partitioning rows by IID.

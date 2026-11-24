@@ -1,6 +1,6 @@
 mod historical_owned_read;
 mod hosted_control;
-pub use hosted_control::RootCatalogRead;
+pub use hosted_control::{AssertionFenceStatus, CurrentAssertionFamilyRead, OriginalAssertionFamilyReader, RootCatalogRead};
 mod hosted_observation;
 mod transaction_evidence;
 mod funded_mutation_clock;
@@ -2045,7 +2045,8 @@ impl OwnedReadSession {
         self.admit_read().await?;
         if !(1..=32).contains(&relations.len()) || !world.mode.is_writable() || world.dropped
             || relations.iter().any(|relation| !relation.is_root_data() || world.schemas.relation(relation)
-                .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+                .is_none_or(|schema| schema.lifetime_micros().is_some()
+                    || (schema.has_opaque_columns() && !relation.admits_world_ciphertext_points(schema))))
             || system < world.inherited_system() || system > self.present.system_time
         {
             return Err(unavailable());
@@ -3981,7 +3982,8 @@ impl NativeSession {
         &self, ops: &mut Vec<TxOp>, world: rtdb_types::Iid, writes: Vec<OwnedWorldWrite>,
     ) -> Result<()> {
         for OwnedWorldWrite { relation, id, shadow, valid, create_only, ordered_keys } in writes {
-            if create_only && (valid.is_some()
+            if create_only && (valid.is_some_and(|valid| valid != rtdb_types::Interval::ALL
+                || !relation.is_world_custody_control())
                 || !matches!(&shadow, rtdb_types::WorldShadow::Present(_)))
             {
                 return Err(rtdb_types::OwnedWorld::unavailable());

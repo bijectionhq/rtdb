@@ -1110,6 +1110,7 @@ fn admit_world_media(
 }
 
 struct OpenWorld {
+    incarnation: u64,
     retained: CheckpointWorldRetention,
     snapshot: OwnedReadSession,
     record: OwnedWorld,
@@ -1159,6 +1160,7 @@ async fn open_world(
         return Err(OwnedWorld::unavailable());
     }
     Ok(OpenWorld {
+        incarnation: installation.incarnation,
         retained: retained.clone(),
         snapshot,
         record: world,

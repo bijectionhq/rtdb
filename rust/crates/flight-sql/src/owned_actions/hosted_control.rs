@@ -16,7 +16,8 @@ pub(super) fn require_audience_control(
 
 fn audience_control_admitted(relation: &str, id: &str) -> bool {
     // Provider discovery belongs to the ordinary authentication path.
-    (relation, id) != ("bj_fact_root_admission", "provider_issuers")
+    relation != "bj_fact_root_admission"
+        || (id != "provider_issuers" && !rtdb_tx::protected_proposal_landing_control(id))
 }
 
 impl Service {
@@ -239,5 +240,7 @@ mod audience_tests {
     fn provider_discovery_is_outside_audience_control_admission() {
         assert!(!audience_control_admitted("bj_fact_root_admission", "provider_issuers"));
         assert!(audience_control_admitted("bj_fact_root_admission", "application"));
+        assert!(!audience_control_admitted("bj_fact_root_admission", "root_proposal_private_landing:key"));
+        assert!(!audience_control_admitted("bj_fact_root_admission", "root_proposal_private_landing_proof:key"));
     }
 }

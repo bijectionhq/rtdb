@@ -43,7 +43,7 @@ impl AssertionFamilies<'_> {
         }
         self.require_position_open(binding.position).await?;
         let binding_digest = root_binding_digest(binding);
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         let landing = reserved(&record, reservation)?;
         if let Some(prior) = &landing.accepted {
             return require_binding(prior, binding.position, binding_digest);
@@ -98,7 +98,7 @@ impl AssertionFamilies<'_> {
         &self, family: Uuid, stage: AssertionStage, binding: RootLandingBinding,
     ) -> Result<()> {
         self.require_position_open(binding.position).await?;
-        let (record, _) = self.read(family).await?.ok_or_else(conflict)?;
+        let (record, _) = self.read_current(family, true).await?.ok_or_else(conflict)?;
         record.require_live()?;
         let accepted = record.landings.iter().find(|entry| {
             entry.reservation.destination == binding.assertion && entry.reservation.capability == stage

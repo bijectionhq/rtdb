@@ -15,6 +15,19 @@ use super::{
 #[async_trait]
 pub trait WorldConstraintArchive: Send + Sync {
     async fn check(&self, check: ArchivedWorldConstraints<'_>) -> Result<()>;
+
+    async fn claim_assertion_family_fence(&self, _claim: AssertionFenceClaim<'_>) -> Result<()> {
+        Err(Anomaly::unsupported("rtdb.owned/assertion-family-fence-unavailable",
+            "The original assertion authority does not admit ordered family fences"))
+    }
+}
+
+pub struct AssertionFenceClaim<'a> {
+    pub database: &'a str,
+    pub attempt: rtdb_types::PlacedAttempt,
+    pub family: [u8; 16],
+    pub marker: rtdb_types::AssertionFamilyFenceMarker,
+    pub root_erases: &'a BTreeSet<(&'a OwnedRelation, &'a EntityId)>,
 }
 
 pub struct ArchivedWorldConstraints<'a> {

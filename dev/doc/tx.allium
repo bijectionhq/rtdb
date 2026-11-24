@@ -20,6 +20,7 @@
 -- Embedded JVM ADBC owns an independent copy of bound Arrow buffers before it lends them to the native statement.
 -- Its result reader imports the stream schema once and reuses it for each Arrow array.
 -- Prepared Flight SQL and embedded ADBC queries can bind an Arrow batch row by position.
+-- A v1 Query whose parameter row contains only present plain Boolean and signed integer cells binds the admitted batch by position during prepared execution.
 -- Embedded Clojure SQL plans bind compatible positional arguments as one C Data row with their native widths and nulls.
 -- Flight SQL uploads retain the message body as backing storage for compatible record and dictionary buffers.
 -- Scalar evaluation reads a bound parameter from its Arrow column when the expression reaches it.

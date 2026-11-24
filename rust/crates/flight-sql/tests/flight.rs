@@ -2072,6 +2072,16 @@ async fn check_held_root_rank_flight() {
         (3, 1, vec![]),
     ] {
         let reply = client.action(search, request(offset, limit)).await.unwrap();
+        let mut input = client.request(Action { r#type: search.into(), body: request(offset, limit) });
+        input.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
+        let streamed = client.client.do_action(input).await.unwrap();
+        assert_eq!(streamed.metadata().get("x-rtdb-owned-ipc").unwrap(), "stream-v1");
+        let frames: Vec<_> = streamed.into_inner().try_collect().await.unwrap();
+        assert_eq!(frames.len(), if expected.is_empty() { 2 } else { 3 });
+        assert_eq!(frames.last().unwrap().body.as_ref(), &[255, 255, 255, 255, 0, 0, 0, 0]);
+        let encoded = frames.iter().flat_map(|frame| frame.body.iter().copied()).collect::<Vec<_>>();
+        assert_eq!(encoded.as_slice(), reply[0].body.as_ref());
+
         let mut stream = StreamReader::try_new(reply[0].body.as_ref(), None).unwrap();
         let schema = stream.schema();
         let metadata = schema.metadata();
@@ -2099,7 +2109,12 @@ async fn check_held_root_rank_flight() {
         assert!(stream.next().is_none());
     }
     client.action("rtdb.owned.CloseRead.v1", handle).await.unwrap();
-    assert_eq!(client.action(search, request(0, 1)).await.unwrap_err().code(), tonic::Code::NotFound);
+    let unary = client.action(search, request(0, 1)).await.unwrap_err();
+    assert_eq!(unary.code(), tonic::Code::NotFound);
+    let mut input = client.request(Action { r#type: search.into(), body: request(0, 1) });
+    input.metadata_mut().insert("x-rtdb-owned-ipc", "stream-v1".parse().unwrap());
+    let streamed = client.client.do_action(input).await.unwrap_err();
+    assert_eq!((streamed.code(), streamed.message()), (unary.code(), unary.message()));
     running.stop().await;
 }
 
@@ -2749,7 +2764,7 @@ async fn world_flight_actions_require_a_placed_world_host() {
         "rtdb.owned.RequireLiveFamilyOccurrence.v1", "rtdb.owned.RequireFamilyPositionOpen.v1",
         "rtdb.owned.RegisterFamilyDerived.v1", "rtdb.owned.SealWorldOverlayRow.v1",
         "rtdb.owned.OpenWorldOverlayRow.v1", "rtdb.owned.FenceAssertionFamily.v1",
-        "rtdb.owned.SettleAssertionFamily.v1",
+        "rtdb.owned.PlanAssertionFamilyFence.v1", "rtdb.owned.SettleAssertionFamily.v1",
     ] {
         let refused = client.action(action, Bytes::from_static(&[0; 16])).await.unwrap_err();
         assert_eq!(refused.code(), tonic::Code::Unimplemented, "{action}");

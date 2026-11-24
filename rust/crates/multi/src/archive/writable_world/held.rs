@@ -11,6 +11,10 @@ use super::*;
 
 #[path = "held_overlay_merge.rs"]
 mod overlay_merge;
+#[path = "held_projection.rs"]
+mod projection;
+
+use projection::WorldProjectionCustody;
 
 use crate::archive::read_world::{ArchiveLifetimeRead, CheckpointPoint, read_checkpoint_point_in_context, require_relation_purge_history, with_checkpoint_context};
 
@@ -122,6 +126,7 @@ where
 
 pub(crate) struct HeldCheckpointWorld {
     open: OpenWorld,
+    projections: Arc<WorldProjectionCustody>,
     memory: Arc<MemoryBudget>,
     requests: mpsc::Sender<ArchiveRequest>,
     cancellation: CancellationToken,
@@ -226,6 +231,7 @@ enum ArchiveRead {
         frontiers: Vec<i64>,
         query: String,
         overlay: Option<rtdb_node::HeldTextCorpus>,
+        historical: bool,
         ancestor_schemas: Option<Vec<rtdb_types::OwnedSchema>>,
         ancestor_system: Option<Timestamp>,
         offset: usize,
@@ -240,6 +246,7 @@ enum ArchiveRead {
         frontiers: Vec<i64>,
         query: rtdb_node::nearest::NearestQuery,
         overlay: Option<rtdb_node::nearest::HeldVectorOverlay>,
+        historical: bool,
         ancestor_schemas: Option<Vec<rtdb_types::OwnedSchema>>,
         ancestor_system: Option<Timestamp>,
         valid: Timestamp,
@@ -643,7 +650,7 @@ impl HeldCheckpointWorld {
         let guard = self.open.snapshot.relation_release_guard(relations)?;
         let mut schemas = Vec::with_capacity(relations.len());
         for relation in relations {
-            schemas.push((relation.clone(), self.historical_parent_schema(relation)?.clone()));
+            schemas.push((relation.clone(), self.world_point_schema(relation)?.clone()));
             let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
             if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         }
@@ -806,10 +813,7 @@ impl HeldCheckpointWorld {
             return Ok((fact, shadowed));
         }
         self.check_relation(relation)?;
-        let schema = self.open.record.schemas.relation(relation).ok_or_else(OwnedWorld::unavailable)?;
-        if schema.has_opaque_columns() || schema.lifetime_micros().is_some() {
-            return Err(OwnedWorld::unavailable());
-        }
+        let schema = self.world_point_schema(relation)?;
         let cut = self.open.snapshot.certify_world_accepted_cut(&self.open.record, relation, system).await?;
         let guard = self.open.snapshot.relation_release_guard([relation])?;
         self.require_archive_coverage(vec![(relation.clone(), 0)], guard).await?;
@@ -847,7 +851,11 @@ impl HeldCheckpointWorld {
         &self, relation: &OwnedRelation, read: AncestorRead, selected: Option<Timestamp>,
     ) -> Result<(AncestorResult, OwnedWorldWitness)> {
         self.check_relation(relation)?;
-        let schema = self.historical_parent_schema(relation)?.clone();
+        let schema = if matches!(&read, AncestorRead::Point { .. } | AncestorRead::Clock(_) | AncestorRead::SelectClock(_)) {
+            self.world_point_schema(relation)?
+        } else {
+            self.historical_parent_schema(relation)?
+        }.clone();
         let witness = self.open.snapshot.world_parent_witness(self.open.record.id, relation).await?;
         if witness.purge_frontier() != 0 { return Err(OwnedWorld::unavailable()); }
         let guard = match &read {
@@ -1004,8 +1012,7 @@ impl HeldCheckpointWorld {
         if let Some((system, parent_only)) = earlier {
             if (parent_only && system != self.parent_basis().system_time)
                 || (!parent_only && !self.clock_mode().is_writable() && self.ancestor().is_none())
-                || partitions.iter().any(|(relation, _)| self.open.record.schemas.relation(relation)
-                    .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+                || partitions.iter().any(|(relation, _)| self.world_point_schema(relation).is_err())
             {
                 return Err(OwnedWorld::unavailable());
             }
@@ -1030,7 +1037,7 @@ impl HeldCheckpointWorld {
                 return Err(OwnedWorld::unavailable());
             }
             let schemas = partitions.iter().map(|(relation, _)| {
-                Ok((relation.clone(), self.historical_parent_schema(relation)?.clone()))
+                Ok((relation.clone(), self.world_point_schema(relation)?.clone()))
             }).collect::<Result<Vec<_>>>()?;
             Some((system, schemas))
         } else { None };
@@ -1042,7 +1049,7 @@ impl HeldCheckpointWorld {
                 return Err(OwnedWorld::unavailable());
             }
             Some(partitions.iter().map(|(relation, _)| {
-                self.historical_parent_schema(relation).cloned()
+                self.world_point_schema(relation).cloned()
             }).collect::<Result<Vec<_>>>()?)
         } else {
             None
@@ -1066,7 +1073,7 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Search {
-            partitions, frontiers, query, overlay,
+            partitions, frontiers, query, overlay, historical: earlier.is_some() || historical,
             ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
@@ -1100,25 +1107,16 @@ impl HeldCheckpointWorld {
                         self.open.record.id, relation, valid, after.as_deref(), 128,
                     ).await?
                 };
-                if cut.is_some() {
+                if cut.is_some() || self.open.record.schemas.relation(relation)
+                    .is_some_and(|schema| relation.admits_world_ciphertext_points(schema))
+                {
                     remaining = remaining.checked_sub(candidates.keys.len()).ok_or_else(OwnedWorld::unavailable)?;
                 }
                 for key in &candidates.keys {
                     let id = EntityId::String(key.clone());
                     if corpus.contains_shadow(partition, &id) { continue; }
-                    if let Some(cut) = &cut {
-                        let shadow = cut.shadow(&id, valid).await?;
-                        let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?
-                            .ok_or_else(OwnedWorld::unavailable)?;
-                        let row = fact.into_shadow(self.open.record.id)?;
-                        let text = row.as_ref().map(|fact| search_text(fact, column)).transpose()?.flatten();
-                        corpus.shadow(partition, id, text)?;
-                    } else {
-                        let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
-                        let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
-                        let text = shadow.as_ref().map(|fact| search_text(fact, column)).transpose()?.flatten();
-                        corpus.shadow(partition, id, text)?;
-                    }
+                    let fact = self.search_shadow(relation, &id, valid, cut.as_ref()).await?;
+                    self.projections.shadow_text(relation, column, fact.as_ref(), id, partition, &mut corpus, &self.memory, system.is_some()).await?;
                 }
                 if candidates.keys.len() < 128 { break; }
                 after = Some(candidates.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
@@ -1172,8 +1170,7 @@ impl HeldCheckpointWorld {
         if let Some((system, parent_only)) = earlier {
             if (parent_only && system != self.parent_basis().system_time)
                 || (!parent_only && !self.clock_mode().is_writable() && self.ancestor().is_none())
-                || relations.iter().any(|relation| self.open.record.schemas.relation(relation)
-                    .is_none_or(|schema| schema.has_opaque_columns() || schema.lifetime_micros().is_some()))
+                || relations.iter().any(|relation| self.world_point_schema(relation).is_err())
             {
                 return Err(OwnedWorld::unavailable());
             }
@@ -1195,7 +1192,7 @@ impl HeldCheckpointWorld {
                 return Err(OwnedWorld::unavailable());
             }
             let schemas = relations.iter().map(|relation| {
-                Ok((relation.clone(), self.historical_parent_schema(relation)?.clone()))
+                Ok((relation.clone(), self.world_point_schema(relation)?.clone()))
             }).collect::<Result<Vec<_>>>()?;
             Some((system, schemas))
         } else { None };
@@ -1206,7 +1203,7 @@ impl HeldCheckpointWorld {
             if frontiers.iter().any(|frontier| *frontier != 0) {
                 return Err(OwnedWorld::unavailable());
             }
-            Some(relations.iter().map(|relation| self.historical_parent_schema(relation).cloned())
+            Some(relations.iter().map(|relation| self.world_point_schema(relation).cloned())
                 .collect::<Result<Vec<_>>>()?)
         } else {
             None
@@ -1226,7 +1223,7 @@ impl HeldCheckpointWorld {
         };
         let (reply, result) = oneshot::channel();
         self.cancellation.run_until_cancelled(self.send_archive(ArchiveRead::Nearest {
-            partitions, frontiers, query, overlay,
+            partitions, frontiers, query, overlay, historical: earlier.is_some() || historical,
             ancestor_schemas, ancestor_system, valid, parent_at, guard: Arc::clone(&guard), reply,
         })).await.ok_or_else(OwnedWorld::unavailable)?.map_err(|_| OwnedWorld::unavailable())?;
         let page = self.cancellation.run_until_cancelled(result).await
@@ -1261,23 +1258,16 @@ impl HeldCheckpointWorld {
                         self.open.record.id, relation, valid, after.as_deref(), 128,
                     ).await?
                 };
-                if cut.is_some() {
+                if cut.is_some() || self.open.record.schemas.relation(relation)
+                    .is_some_and(|schema| relation.admits_world_ciphertext_points(schema))
+                {
                     remaining = remaining.checked_sub(candidates.keys.len()).ok_or_else(OwnedWorld::unavailable)?;
                 }
                 for key in &candidates.keys {
                     let id = EntityId::String(key.clone());
                     if shadows.contains_shadow(partition, &id) { continue; }
-                    if let Some(cut) = &cut {
-                        let shadow = cut.shadow(&id, valid).await?;
-                        let fact = decode_point(shadow.row.into_iter().collect(), &id, &self.memory, None)?
-                            .ok_or_else(OwnedWorld::unavailable)?;
-                        let row = fact.into_shadow(self.open.record.id)?;
-                        shadows.shadow_row(partition, selected, id, row.as_ref().map(|fact| &fact.row), query)?;
-                    } else {
-                        let (shadow, _) = self.open.read_local(relation, &id, valid, &self.memory, false).await?;
-                        let shadow = shadow.ok_or_else(OwnedWorld::unavailable)?;
-                        shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row), query)?;
-                    }
+                    let fact = self.search_shadow(relation, &id, valid, cut.as_ref()).await?;
+                    self.projections.shadow_nearest(selected, query, fact.as_ref(), id, partition, &mut shadows, &self.memory, system.is_some()).await?;
                 }
                 if candidates.keys.len() < 128 { break; }
                 after = Some(candidates.keys.last().cloned().ok_or_else(OwnedWorld::unavailable)?);
@@ -1285,6 +1275,27 @@ impl HeldCheckpointWorld {
         }
         guard()?;
         Ok(shadows)
+    }
+
+    async fn search_shadow(
+        &self, relation: &OwnedRelation, id: &EntityId, valid: Timestamp, cut: Option<&rtdb_node::OwnedWorldAcceptedCut<'_>>,
+    ) -> Result<Option<WorldFact>> {
+        if let Some(cut) = cut {
+            let shadow = cut.shadow(id, valid).await?;
+            let fact = decode_point(shadow.row.into_iter().collect(), id, &self.memory, None)?
+                .ok_or_else(OwnedWorld::unavailable)?;
+            fact.into_shadow(self.open.record.id)
+        } else {
+            let (shadow, _) = self.open.read_local(relation, id, valid, &self.memory, false).await?;
+            shadow.ok_or_else(OwnedWorld::unavailable)
+        }
+    }
+
+    fn world_point_schema(&self, relation: &OwnedRelation) -> Result<&rtdb_types::OwnedSchema> {
+        self.open.record.schemas.relation(relation)
+            .filter(|schema| relation.is_root_data() && schema.lifetime_micros().is_none()
+                && (!schema.has_opaque_columns() || relation.admits_world_ciphertext_points(schema)))
+            .ok_or_else(OwnedWorld::unavailable)
     }
 
     async fn search_columns(
@@ -2252,6 +2263,7 @@ impl<'a> InheritedRelation<'a> {
     async fn search_shadows(
         &self, path: &OwnedRelation, partition: usize, valid: Timestamp,
         corpus: &mut rtdb_node::HeldTextCorpus, remaining: &mut usize,
+        projections: &WorldProjectionCustody, historical: bool,
     ) -> Result<()> {
         let unavailable = OwnedWorld::unavailable;
         let column = rtdb_node::owned_text_column(
@@ -2275,8 +2287,7 @@ impl<'a> InheritedRelation<'a> {
                 let id = EntityId::String(key.clone());
                 if corpus.contains_shadow(partition, &id) { continue; }
                 let shadow = self.resolve_shadow(&id, instant).await?.ok_or_else(unavailable)?;
-                let text = shadow.as_ref().map(|row| search_text(row, &column)).transpose()?.flatten();
-                corpus.shadow(partition, id, text)?;
+                projections.shadow_text(self.relation, &column, shadow.as_ref(), id, partition, corpus, self.memory, historical).await?;
             }
             if !page.more { return Ok(()); }
             let key = page.keys.last().ok_or_else(unavailable)?;
@@ -2287,6 +2298,7 @@ impl<'a> InheritedRelation<'a> {
     async fn nearest_shadows(
         &self, selected: &rtdb_node::nearest::NearestPartition, query: &rtdb_node::nearest::NearestQuery, partition: usize, valid: Timestamp,
         shadows: &mut rtdb_node::nearest::HeldVectorOverlay, remaining: &mut usize,
+        projections: &WorldProjectionCustody, historical: bool,
     ) -> Result<()> {
         let unavailable = OwnedWorld::unavailable;
         let instant = Interval::at(valid)?;
@@ -2299,7 +2311,7 @@ impl<'a> InheritedRelation<'a> {
                 let id = EntityId::String(key.clone());
                 if shadows.contains_shadow(partition, &id) { continue; }
                 let shadow = self.resolve_shadow(&id, instant).await?.ok_or_else(unavailable)?;
-                shadows.shadow_row(partition, selected, id, shadow.as_ref().map(|fact| &fact.row), query)?;
+                projections.shadow_nearest(selected, query, shadow.as_ref(), id, partition, shadows, self.memory, historical).await?;
             }
             if !page.more { return Ok(()); }
             let key = page.keys.last().ok_or_else(unavailable)?;
@@ -2554,6 +2566,10 @@ pub(crate) async fn open_held_checkpoint_world(
     let cancellation = session.state().cancellation().child_token();
     // On RPC cancellation the worker still completes the storage-region drain.
     let opening = cancellation.clone().drop_guard();
+    let projections = Arc::new(WorldProjectionCustody::new(
+        Arc::clone(&archive.keys), deployment, open.incarnation, session.assertion_family_reader()?, cancellation.clone(),
+    ));
+    let archive_projections = Arc::clone(&projections);
     let worker = cancellation.clone();
     let backing_memory = Arc::clone(&memory);
     let (requests, mut pending) = mpsc::channel::<ArchiveRequest>(1);
@@ -2566,6 +2582,7 @@ pub(crate) async fn open_held_checkpoint_world(
             }
         };
         let serve = async {
+            let projections = archive_projections.as_ref();
             let ancestor_cache = Arc::clone(&cache);
             let archive = &archive;
             let mut ready = Some(ready);
@@ -2967,7 +2984,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     send_archive_answer(&plaintext, reply, response).await;
                                 }
-                                ArchiveRead::Search { partitions, frontiers, query, overlay, ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard, mut reply } => {
+                                ArchiveRead::Search { partitions, frontiers, query, overlay, historical, ancestor_schemas, ancestor_system, offset, limit, valid, parent_at, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
@@ -3002,7 +3019,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             let inherited = InheritedRelation::open(
                                                                 Arc::clone(root), archived.clone(), owner, relation, ancestors, &schema, memory,
                                                             ).await?.at(ancestor_system).await?;
-                                                            inherited.search_shadows(path, index, valid, &mut corpus, &mut remaining).await?;
+                                                            inherited.search_shadows(path, index, valid, &mut corpus, &mut remaining, projections, historical).await?;
                                                         }
                                                         Ok(corpus)
                                                     }
@@ -3023,7 +3040,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                     };
                                     send_archive_answer(&plaintext, reply, response).await;
                                 }
-                                ArchiveRead::Nearest { partitions, frontiers, query, overlay, ancestor_schemas, ancestor_system, valid, parent_at, guard, mut reply } => {
+                                ArchiveRead::Nearest { partitions, frontiers, query, overlay, historical, ancestor_schemas, ancestor_system, valid, parent_at, guard, mut reply } => {
                                     let read = async {
                                         guard()?;
                                         check_archive_coverage(&context, &owner,
@@ -3054,7 +3071,7 @@ pub(crate) async fn open_held_checkpoint_world(
                                                             let inherited = InheritedRelation::open(
                                                                 Arc::clone(root), archived.clone(), owner, &selected.relation, ancestors, &schema, memory,
                                                             ).await?.at(ancestor_system).await?;
-                                                            inherited.nearest_shadows(selected, query, index, valid, &mut shadows, &mut remaining).await?;
+                                                            inherited.nearest_shadows(selected, query, index, valid, &mut shadows, &mut remaining, projections, historical).await?;
                                                         }
                                                         Ok(shadows)
                                                     }
@@ -3196,7 +3213,7 @@ pub(crate) async fn open_held_checkpoint_world(
         tokio::join!(expire, serve);
     });
     opened.await.map_err(|_| OwnedWorld::unavailable())??;
-    let held = HeldCheckpointWorld { open, memory, requests, cancellation };
+    let held = HeldCheckpointWorld { open, projections, memory, requests, cancellation };
     held.check()?;
     let _ = opening.disarm();
     Ok(held)

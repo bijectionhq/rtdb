@@ -25,6 +25,7 @@ pub(crate) const REQUIRE_FAMILY_POSITION_OPEN_V1: &str = "rtdb.owned.RequireFami
 pub(crate) const REGISTER_FAMILY_DERIVED_V1: &str = "rtdb.owned.RegisterFamilyDerived.v1";
 pub(crate) const SEAL_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.SealWorldOverlayRow.v1";
 pub(crate) const OPEN_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.OpenWorldOverlayRow.v1";
+pub(crate) const PLAN_ASSERTION_FAMILY_FENCE_V1: &str = "rtdb.owned.PlanAssertionFamilyFence.v1";
 pub(crate) const FENCE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.FenceAssertionFamily.v1";
 pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionFamily.v1";
 
@@ -34,7 +35,7 @@ pub(crate) fn is_family_action(action: &str) -> bool {
         | SEAL_FAMILY_LANDING_LINK_V2 | SEAL_FAMILY_LANDING_PAYLOAD_V1 | OPEN_FAMILY_LANDING_PAYLOAD_V1
         | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
-        | FENCE_ASSERTION_FAMILY_V1 | SETTLE_ASSERTION_FAMILY_V1)
+        | PLAN_ASSERTION_FAMILY_FENCE_V1 | FENCE_ASSERTION_FAMILY_V1 | SETTLE_ASSERTION_FAMILY_V1)
 }
 
 const MAX_DERIVED_PER_REQUEST: usize = 256;
@@ -121,6 +122,7 @@ pub enum FamilyRequest {
     RegisterDerived { family: Uuid, rows: Vec<FamilyDerivedRow> },
     SealWorldRow { row: WorldRowAuthoring, plaintext: Bytes },
     OpenWorldRow { row: WorldRowAuthoring, envelope: Bytes },
+    PlanFence { family: Uuid, selected: Position, order: Uuid },
     Fence { family: Uuid, selected: Position, order: Uuid },
     Settle { family: Uuid },
 }
@@ -341,6 +343,9 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
                 FamilyRequest::OpenWorldRow { row, envelope: rest }
             }
         }
+        PLAN_ASSERTION_FAMILY_FENCE_V1 => FamilyRequest::PlanFence {
+            family: frame.uuid("family")?, selected: frame.position()?, order: frame.uuid("order")?,
+        },
         FENCE_ASSERTION_FAMILY_V1 => FamilyRequest::Fence { family: frame.uuid("family")?, selected: frame.position()?, order: frame.uuid("order")? },
         SETTLE_ASSERTION_FAMILY_V1 => FamilyRequest::Settle { family: frame.uuid("family")? },
         _ => return Err(unsupported()),
