@@ -27,7 +27,7 @@ pub(crate) const REGISTER_FAMILY_DERIVED_V1: &str = "rtdb.owned.RegisterFamilyDe
 pub(crate) const SEAL_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.SealWorldOverlayRow.v1";
 pub(crate) const OPEN_WORLD_OVERLAY_ROW_V1: &str = "rtdb.owned.OpenWorldOverlayRow.v1";
 pub(crate) const PLAN_ASSERTION_FAMILY_FENCE_V1: &str = "rtdb.owned.PlanAssertionFamilyFence.v1";
-pub(crate) const FAMILY_RESPONSE_RELEASE_V1: &str = "rtdb.owned.FamilyResponseRelease.v1";
+pub(crate) const FAMILY_RESPONSE_RELEASE_V2: &str = "rtdb.owned.FamilyResponseRelease.v2";
 pub(crate) const SETTLE_ASSERTION_FAMILY_V1: &str = "rtdb.owned.SettleAssertionFamily.v1";
 
 pub(crate) fn is_family_action(action: &str) -> bool {
@@ -36,7 +36,7 @@ pub(crate) fn is_family_action(action: &str) -> bool {
         | SEAL_FAMILY_LANDING_LINK_V2 | SEAL_FAMILY_LANDING_PAYLOAD_V1 | OPEN_FAMILY_LANDING_PAYLOAD_V1
         | RESOLVE_FAMILY_MEMBER_V1 | REQUIRE_LIVE_FAMILY_OCCURRENCE_V1 | REQUIRE_FAMILY_POSITION_OPEN_V1
         | REGISTER_FAMILY_DERIVED_V1 | SEAL_WORLD_OVERLAY_ROW_V1 | OPEN_WORLD_OVERLAY_ROW_V1
-        | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1 | FAMILY_RESPONSE_RELEASE_V1)
+        | PLAN_ASSERTION_FAMILY_FENCE_V1 | SETTLE_ASSERTION_FAMILY_V1 | FAMILY_RESPONSE_RELEASE_V2)
 }
 
 const MAX_DERIVED_PER_REQUEST: usize = 256;
@@ -97,6 +97,8 @@ pub struct WorldRowAuthoring {
 pub enum FamilyReleaseInputWire {
     Member(FamilyOccurrenceWire),
     World { member: FamilyOccurrenceWire, winner: Position, row: WorldRowAuthoring },
+    WorldDerived { member: FamilyOccurrenceWire, stage: FamilyStage, world: Uuid, relation: String, key: Vec<u8> },
+    RootDerived { member: FamilyOccurrenceWire, relation: String, key: Vec<u8> },
 }
 
 pub struct FamilyReleaseRegistrationWire {
@@ -281,6 +283,13 @@ impl<'a> Frame<'a> {
         match tag {
             0 => Ok(FamilyReleaseInputWire::Member(member)),
             1 => Ok(FamilyReleaseInputWire::World { member, winner: self.position()?, row: self.world_row()? }),
+            2 => Ok(FamilyReleaseInputWire::WorldDerived {
+                member, stage: self.stage()?, world: self.uuid("derived world")?,
+                relation: self.text("derived relation")?, key: self.key()?,
+            }),
+            3 => Ok(FamilyReleaseInputWire::RootDerived {
+                member, relation: self.text("derived relation")?, key: self.key()?,
+            }),
             _ => Err(invalid("Invalid family release input kind")),
         }
     }
@@ -389,7 +398,7 @@ fn decode(action: &str, body: &Bytes) -> Result<FamilyRequest, Status> {
         PLAN_ASSERTION_FAMILY_FENCE_V1 => FamilyRequest::PlanFence {
             family: frame.uuid("family")?, selected: frame.position()?, order: frame.uuid("order")?,
         },
-        FAMILY_RESPONSE_RELEASE_V1 => FamilyRequest::Release(match frame.u8("release operation")? {
+        FAMILY_RESPONSE_RELEASE_V2 => FamilyRequest::Release(match frame.u8("release operation")? {
             0 => FamilyReleaseRequest::Prepare {
                 family: frame.uuid("family")?, part: frame.take("response part")?,
                 cutoff: frame.u64("release cutoff")?, input: frame.release_input()?,
@@ -457,7 +466,7 @@ impl Service {
     pub(crate) async fn assertion_family_action(&self, call: &Call, action: &str, body: &Bytes) -> Result<ActionResult, Status> {
         if !self.0.config.owned_native_actions || call.session.audience_source().is_some() { return Err(unsupported()); }
         let host = self.0.config.owned_world_host.as_ref().ok_or_else(unsupported)?;
-        if action == FAMILY_RESPONSE_RELEASE_V1 && !self.supports_hosted_upload(call) {
+        if action == FAMILY_RESPONSE_RELEASE_V2 && !self.supports_hosted_upload(call) {
             return Err(unsupported());
         }
         let request = decode(action, body)?;

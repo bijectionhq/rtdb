@@ -298,7 +298,7 @@ pub(crate) const HELD_WORLD_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldValidDu
 pub(crate) const HELD_WORLD_VALID_V2: &str = "rtdb.owned.ReadHeldWorldValidDuring.v2";
 pub(crate) const HELD_WORLD_PARENT_IDENTITIES_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentIdentityPageAt.v1";
 pub(crate) const HELD_WORLD_PARENT_VALID_AT_V1: &str = "rtdb.owned.ReadHeldWorldParentValidDuringAt.v1";
-pub(crate) const SEARCH_HELD_WORLD_PARENT_AT_V1: &str = "rtdb.owned.SearchHeldWorldParentAt.v1";
+pub(crate) const SEARCH_HELD_WORLD_PARENT_AT_V2: &str = "rtdb.owned.SearchHeldWorldParentAt.v2";
 
 pub(crate) enum WorldHistoricalRead { Current, EarlierEffective, EarlierParent }
 
@@ -352,19 +352,19 @@ pub(crate) const HELD_WORLD_OVERLAY_RANGE_AT_V1: &str = "rtdb.owned.ReadHeldWorl
 pub(crate) const HELD_WORLD_OVERLAY_RANGE_V1: &str = "rtdb.owned.ReadHeldWorldOverlayRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum WorldOrder { ParentRange, ParentCount, ParentMeasure, OverlayRange, OverlayRangeAt, ParentRangeAt, ParentCountAt }
-pub(crate) const SEARCH_HELD_WORLD_AT_V1: &str = "rtdb.owned.SearchHeldWorldAt.v1";
-pub(crate) const SEARCH_HELD_WORLD_V2: &str = "rtdb.owned.SearchHeldWorld.v2";
-pub(crate) const SEARCH_HELD_OWNED_V5: &str = "rtdb.owned.SearchHeld.v5";
-pub(crate) const NEAREST_HELD_OWNED_V2: &str = "rtdb.owned.NearestHeld.v2";
+pub(crate) const SEARCH_HELD_WORLD_AT_V2: &str = "rtdb.owned.SearchHeldWorldAt.v2";
+pub(crate) const SEARCH_HELD_WORLD_V3: &str = "rtdb.owned.SearchHeldWorld.v3";
+pub(crate) const SEARCH_HELD_OWNED_V6: &str = "rtdb.owned.SearchHeld.v6";
+pub(crate) const NEAREST_HELD_OWNED_V3: &str = "rtdb.owned.NearestHeld.v3";
 pub(crate) const OWNED_NEAREST_APPROXIMATE: &str = "rtdb.owned.nearest_approximate";
 pub(crate) const DECLARE_OWNED_VECTOR_PATH_V1: &str = "rtdb.owned.DeclareVectorPath.v1";
-pub(crate) const HYBRID_HELD_OWNED_V2: &str = "rtdb.owned.HybridHeld.v2";
-pub(crate) const HYBRID_HELD_WORLD_V1: &str = "rtdb.owned.HybridHeldWorld.v1";
-pub(crate) const HYBRID_HELD_WORLD_AT_V1: &str = "rtdb.owned.HybridHeldWorldAt.v1";
-pub(crate) const HYBRID_HELD_WORLD_PARENT_AT_V1: &str = "rtdb.owned.HybridHeldWorldParentAt.v1";
-pub(crate) const NEAREST_HELD_WORLD_V1: &str = "rtdb.owned.NearestHeldWorld.v1";
-pub(crate) const NEAREST_HELD_WORLD_AT_V1: &str = "rtdb.owned.NearestHeldWorldAt.v1";
-pub(crate) const NEAREST_HELD_WORLD_PARENT_AT_V1: &str = "rtdb.owned.NearestHeldWorldParentAt.v1";
+pub(crate) const HYBRID_HELD_OWNED_V3: &str = "rtdb.owned.HybridHeld.v3";
+pub(crate) const HYBRID_HELD_WORLD_V2: &str = "rtdb.owned.HybridHeldWorld.v2";
+pub(crate) const HYBRID_HELD_WORLD_AT_V2: &str = "rtdb.owned.HybridHeldWorldAt.v2";
+pub(crate) const HYBRID_HELD_WORLD_PARENT_AT_V2: &str = "rtdb.owned.HybridHeldWorldParentAt.v2";
+pub(crate) const NEAREST_HELD_WORLD_V2: &str = "rtdb.owned.NearestHeldWorld.v2";
+pub(crate) const NEAREST_HELD_WORLD_AT_V2: &str = "rtdb.owned.NearestHeldWorldAt.v2";
+pub(crate) const NEAREST_HELD_WORLD_PARENT_AT_V2: &str = "rtdb.owned.NearestHeldWorldParentAt.v2";
 pub(crate) const HELD_OWNED_RANGE_V1: &str = "rtdb.owned.ReadHeldRange.v1";
 #[derive(Clone, Copy)]
 pub(crate) enum HeldRangeFormat { Leading, Full, FixedValid, Historical }
@@ -3650,6 +3650,7 @@ impl Service {
     }
 
     pub(crate) async fn search_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3736,6 +3737,7 @@ impl Service {
     }
 
     pub(crate) async fn nearest_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held nearest has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3795,6 +3797,7 @@ impl Service {
 
     /// Fuses a held text ranking and a held nearest ranking of the same relations at the held cut by reciprocal rank fusion.
     pub(crate) async fn hybrid_held_owned_action(&self, call: &Call, body: &[u8], reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Owned held hybrid search has no handle"))?;
         let handle = Bytes::copy_from_slice(handle);
@@ -3852,6 +3855,7 @@ impl Service {
 
     /// The world hybrid family: HybridHeldWorld (with staged overlays), HybridHeldWorldAt and HybridHeldWorldParentAt.
     pub(crate) async fn hybrid_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world hybrid handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -3969,9 +3973,10 @@ impl Service {
         Ok(overlay)
     }
 
-    /// `NearestHeldWorld.v1`, `NearestHeldWorldAt.v1` and `NearestHeldWorldParentAt.v1`:
-    /// the SearchHeldWorld prefixes followed by the NearestHeld.v2 frame.
+    /// `NearestHeldWorld.v2`, `NearestHeldWorldAt.v2` and `NearestHeldWorldParentAt.v2`:
+    /// the SearchHeldWorld prefixes followed by the NearestHeld.v3 frame.
     pub(crate) async fn nearest_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world nearest handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4049,6 +4054,7 @@ impl Service {
     }
 
     pub(crate) async fn search_held_world_action(&self, call: &Call, body: &[u8], mode: WorldHistoricalRead, reply_format: OwnedReplyFormat<'_>) -> Result<OwnedIpcReply, Status> {
+        rtdb_storage::sealing::PlaintextView::begin_rank_inventory().map_err(status)?;
         if !self.0.config.owned_native_actions || self.0.config.owned_world_host.is_none() { return Err(unsupported()); }
         let (handle, request) = body.split_first_chunk::<16>().ok_or_else(|| invalid("Missing held world search handle"))?;
         let (earlier, request) = if matches!(mode, WorldHistoricalRead::EarlierEffective) {
@@ -4133,9 +4139,17 @@ impl Service {
         &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
         present: Timestamp, valid: Timestamp, reply_format: OwnedReplyFormat<'_>, extra: [(&str, &str); N],
     ) -> Result<OwnedIpcReply, Status> {
+        let (family_inventory, _family_charge) = rtdb_storage::sealing::PlaintextView::rank_inventory().map_err(status)?;
+        if family_inventory.len() > 2 && !self.supports_hosted_upload(call) {
+            return Err(unsupported());
+        }
         let hits = page.hits.batch();
         let mut metadata = hits.schema_ref().metadata().clone();
         for (key, value) in extra { metadata.insert(key.into(), value.into()); }
+        let mut inventory = String::with_capacity(family_inventory.len() * 2);
+        use std::fmt::Write as _;
+        for byte in family_inventory { write!(&mut inventory, "{byte:02x}").expect("writing to a string"); }
+        metadata.insert("rtdb.owned.rank_families".into(), inventory);
         metadata.insert(OWNED_SEARCH_TOTAL.into(), page.total.to_string());
         metadata.insert(OWNED_SEARCH_SCOPE.into(), scope);
         if !witnesses.is_empty() {

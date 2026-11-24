@@ -49,9 +49,9 @@ fn fresh_replica_action(action: &str) -> bool {
         | SPATIAL_HELD_OWNED_V1
         | SPATIAL_HELD_OWNED_V2
         | SPATIAL_HELD_OWNED_V3
-        | SEARCH_HELD_OWNED_V5
-        | NEAREST_HELD_OWNED_V2
-        | HYBRID_HELD_OWNED_V2
+        | SEARCH_HELD_OWNED_V6
+        | NEAREST_HELD_OWNED_V3
+        | HYBRID_HELD_OWNED_V3
         | HELD_OWNED_RANGE_V1
         | HELD_OWNED_RANGE_V2
         | HELD_OWNED_RANGE_V3
@@ -253,29 +253,29 @@ impl Service {
                 }
                 PREPARE_APPLIED_READ_V3 => Ok(vec![Ok(self.prepare_applied_read_action(&call, &action.body).await?)]),
                 crate::owned_actions::OPEN_APPLIED_OWNED_READ_V5 => Ok(vec![Ok(self.open_applied_owned_read_action(&call, &action.body).await?)]),
-                crate::owned_actions::SEARCH_HELD_OWNED_V5 =>
+                crate::owned_actions::SEARCH_HELD_OWNED_V6 =>
                     return self.search_held_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::NEAREST_HELD_OWNED_V2 =>
+                crate::owned_actions::NEAREST_HELD_OWNED_V3 =>
                     return self.nearest_held_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HYBRID_HELD_OWNED_V2 =>
+                crate::owned_actions::HYBRID_HELD_OWNED_V3 =>
                     return self.hybrid_held_owned_action(&call, &action.body, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HYBRID_HELD_WORLD_V1 =>
+                crate::owned_actions::HYBRID_HELD_WORLD_V2 =>
                     return self.hybrid_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HYBRID_HELD_WORLD_AT_V1 =>
+                crate::owned_actions::HYBRID_HELD_WORLD_AT_V2 =>
                     return self.hybrid_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::HYBRID_HELD_WORLD_PARENT_AT_V1 =>
+                crate::owned_actions::HYBRID_HELD_WORLD_PARENT_AT_V2 =>
                     return self.hybrid_held_world_action(&call, &action.body, EarlierParent, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V1 =>
+                crate::owned_actions::SEARCH_HELD_WORLD_PARENT_AT_V2 =>
                     return self.search_held_world_action(&call, &action.body, EarlierParent, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::SEARCH_HELD_WORLD_AT_V1 =>
+                crate::owned_actions::SEARCH_HELD_WORLD_AT_V2 =>
                     return self.search_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::SEARCH_HELD_WORLD_V2 =>
+                crate::owned_actions::SEARCH_HELD_WORLD_V3 =>
                     return self.search_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::NEAREST_HELD_WORLD_PARENT_AT_V1 =>
+                crate::owned_actions::NEAREST_HELD_WORLD_PARENT_AT_V2 =>
                     return self.nearest_held_world_action(&call, &action.body, EarlierParent, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::NEAREST_HELD_WORLD_AT_V1 =>
+                crate::owned_actions::NEAREST_HELD_WORLD_AT_V2 =>
                     return self.nearest_held_world_action(&call, &action.body, EarlierEffective, reply_format).await.map(ActionReplies::Owned),
-                crate::owned_actions::NEAREST_HELD_WORLD_V1 =>
+                crate::owned_actions::NEAREST_HELD_WORLD_V2 =>
                     return self.nearest_held_world_action(&call, &action.body, Current, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_WORLD_PARENT_RANGE_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentRangeAt).await?)]),
                 crate::owned_actions::HELD_WORLD_PARENT_COUNT_AT_V1 => Ok(vec![Ok(self.held_world_ordered_action(&call, &action.body, crate::owned_actions::WorldOrder::ParentCountAt).await?)]),

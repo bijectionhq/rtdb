@@ -12,7 +12,7 @@ use rtdb_flight_sql::{
 use rtdb_directory::DeploymentRecord;
 use rtdb_node::NativeSession;
 use rtdb_storage::IoRegion;
-use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, PlacedAttemptScope, Result};
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, OwnedWorld, PlacedAttemptScope, Result, WorldClockMode};
 use uuid::Uuid;
 
 use crate::keys::{
@@ -35,6 +35,20 @@ impl Scope {
     }
 
     async fn admit_lines(&self, session: &mut NativeSession, request: &FamilyRequest) -> Result<()> {
+        if let FamilyRequest::RegisterDerived { rows, .. } = request {
+            let mut replay_worlds = rows.iter().filter(|row| row.relation == DerivedRow::PROPOSAL_REPLAY_RELATION);
+            if let Some(first) = replay_worlds.next() {
+                let current = session.current_assertion_family_read(self.deployment).await?;
+                for row in std::iter::once(first).chain(replay_worlds) {
+                    let world = row.world.ok_or_else(|| scope_mismatch("Proposal replay has no authoring world"))?;
+                    if current.world_registration(Iid(*world.as_bytes())).await?.is_none_or(|record|
+                        record.dropped || !matches!(record.mode, WorldClockMode::Proposal))
+                    {
+                        return Err(scope_mismatch("Proposal replay requires its live authoring world"));
+                    }
+                }
+            }
+        }
         let mut positions = [None; 2];
         let world = match request {
             FamilyRequest::Register { original, .. } => {

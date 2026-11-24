@@ -183,6 +183,7 @@ impl HeldTextCorpus {
         partition: usize,
         valid: Timestamp,
     ) -> Result<()> {
+        let sealed = crate::rank_family::needs_rank_family(context, owner, relation).await?;
         let column = owned_text_column(Arc::clone(context), owner, relation, path).await?;
         let database = context.catalog.database(context.catalog.default_database())?;
         let [snapshot] = database.partitions.as_slice() else { return Err(corpus_limit()); };
@@ -216,6 +217,11 @@ impl HeldTextCorpus {
                     rtdb_columnar::TextCell::Missing => None,
                     rtdb_columnar::TextCell::Other => return Err(corpus_limit()),
                 };
+                if sealed && value.is_some() {
+                    crate::rank_family::root_contributor(
+                        context, owner, relation, rtdb_columnar::EntityIdRef::from(&id), valid,
+                    ).await?;
+                }
                 self.shadow(partition, id, value)?;
             }
         }

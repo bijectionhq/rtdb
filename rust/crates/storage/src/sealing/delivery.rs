@@ -106,6 +106,13 @@ pub struct PlaintextView {
     certified_reads: Mutex<BTreeMap<[u8; 16], (Arc<CertifiedRead>, Arc<MemoryReservation>)>>,
     protected_cuts: Mutex<Vec<ProtectedCut>>,
     release_checks: Mutex<BTreeMap<[u8; 32], Arc<CheckedRelease>>>,
+    rank: Mutex<Option<RankInventory>>,
+}
+
+#[derive(Default)]
+struct RankInventory {
+    entries: BTreeMap<Vec<u8>, Arc<MemoryReservation>>,
+    carrier_reads: usize,
 }
 
 struct CheckedRelease {
@@ -128,6 +135,7 @@ impl PlaintextView {
             certified_reads: Mutex::new(BTreeMap::new()),
             protected_cuts: Mutex::new(Vec::new()),
             release_checks: Mutex::new(BTreeMap::new()),
+            rank: Mutex::new(None),
         })
     }
 
@@ -150,6 +158,60 @@ impl PlaintextView {
                 None => work.await,
             }
         }
+    }
+
+    pub fn begin_rank_inventory() -> rtdb_types::Result<()> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            let owner = views.last().ok_or_else(rank_unavailable)?;
+            *owner.rank.lock() = Some(RankInventory::default());
+            Ok(())
+        }).map_err(|_| rank_unavailable())?
+    }
+
+    pub fn tracks_rank_inventory() -> bool {
+        PLAINTEXT_VIEWS.try_with(|views| views.iter().any(|view| view.rank.lock().is_some())).unwrap_or(false)
+    }
+
+    pub fn charge_rank_carrier() -> rtdb_types::Result<()> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            for view in views.iter() {
+                let mut rank = view.rank.lock();
+                let Some(rank) = rank.as_mut() else { continue; };
+                if rank.carrier_reads == 512 { return Err(rank_unavailable()); }
+                rank.carrier_reads += 1;
+            }
+            Ok(())
+        }).unwrap_or(Ok(()))
+    }
+
+    pub fn track_rank_contributor(entry: &[u8]) -> rtdb_types::Result<()> {
+        if entry.is_empty() || entry.len() > 1024 { return Err(rank_unavailable()); }
+        PLAINTEXT_VIEWS.try_with(|views| {
+            for view in views.iter() {
+                let mut rank = view.rank.lock();
+                let Some(rank) = rank.as_mut() else { continue; };
+                let entries = &mut rank.entries;
+                if entries.contains_key(entry) { continue; }
+                if entries.len() == 512 { return Err(rank_unavailable()); }
+                let charge = view.memory.reserve(entry.len() + 256)?;
+                entries.insert(entry.to_vec(), charge);
+            }
+            Ok(())
+        }).unwrap_or(Ok(()))
+    }
+
+    pub fn rank_inventory() -> rtdb_types::Result<(Vec<u8>, Arc<MemoryReservation>)> {
+        PLAINTEXT_VIEWS.try_with(|views| {
+            let owner = views.last().ok_or_else(rank_unavailable)?;
+            let rank = owner.rank.lock();
+            let entries = &rank.as_ref().ok_or_else(rank_unavailable)?.entries;
+            let size = 2 + entries.keys().map(Vec::len).sum::<usize>();
+            let charge = owner.memory.reserve(size.saturating_mul(4))?;
+            let mut bytes = Vec::with_capacity(size);
+            bytes.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+            for entry in entries.keys() { bytes.extend_from_slice(entry); }
+            Ok((bytes, charge))
+        }).map_err(|_| rank_unavailable())?
     }
 
     /// Preserve the first cutoff for this subject through response handoff.
@@ -351,6 +413,11 @@ impl PlaintextDependencies {
         }
         Ok(())
     }
+}
+
+fn rank_unavailable() -> rtdb_types::Anomaly {
+    rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.owned/rank-custody",
+        "The held rank cannot establish its complete bounded family inventory")
 }
 
 fn expired() -> rtdb_types::Anomaly {

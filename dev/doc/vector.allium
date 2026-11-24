@@ -70,6 +70,6 @@ entity ProbePlan {
 --
 -- The held route
 --
--- `rtdb.owned.NearestHeld.v2` with the approximate route ranks, for each partition with an approximate vector path, the rows of its shortlist resolved at the held cut.
+-- `rtdb.owned.NearestHeld.v3` with the approximate route ranks, for each partition with an approximate vector path, the rows of its shortlist resolved at the held cut.
 -- Each round projects only the shortlisted identities, applies the request's filters and computes exact distances; fewer than k passing rows widen the shortlist.
 -- A partition without a path, or whose shortlist exceeds its budget, ranks exactly; the reply states whether any partition ranked a shortlist.
