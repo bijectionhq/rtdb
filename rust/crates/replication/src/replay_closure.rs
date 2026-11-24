@@ -35,12 +35,19 @@ impl ReplayDependencySources for BlockStore {
 
 /// Every object that replaying onto this checkpoint can read: its root, its table blocks, and the trie files and artefacts they name.
 pub fn checkpoint_dependencies(catalog: &BlockCatalog, tables: &BTreeMap<TableRef, TableBlock>) -> Result<BTreeSet<ObjectKey>> {
+    checkpoint_files(catalog, tables, CheckpointContents::Replay)
+}
+
+/// Enumerates the physical files admitted by the specified checkpoint route.
+pub(crate) fn checkpoint_files(
+    catalog: &BlockCatalog, tables: &BTreeMap<TableRef, TableBlock>, contents: CheckpointContents,
+) -> Result<BTreeSet<ObjectKey>> {
     let block = catalog.block_index();
     let mut keys = BTreeSet::from([ObjectKey::new(block_key(block)?)?]);
     for entry in catalog.table_entries()? {
         let table = tables.get(&entry.table).ok_or_else(|| invalid("A checkpoint table has no table block"))?;
         keys.insert(ObjectKey::new(entry.slug.block_key(block)?)?);
-        for file in table.checkpoint_trie_files(&entry, CheckpointContents::Replay)? {
+        for file in table.checkpoint_trie_files(&entry, contents)? {
             keys.insert(ObjectKey::new(file)?);
         }
     }

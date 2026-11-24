@@ -115,7 +115,7 @@ Coordinated native local startup holds a shared filesystem recovery gate while i
 Trie deletion grants and collection of old local checkpoint files or detached payloads require exclusive use of the gate through provider completion.
 The startup gate protects the selection interval.
 Native startup checks the data and metadata files named by live and nascent primary tries, including each recorded data length, before accepting the root.
-Compactor reset uses the same inventory check.
+Installed compactor reset authenticates the root and table manifests under a selection hold, narrows to the primary files it can read, and keeps those dependencies through provider drain. The full replay route includes artefacts and retained replay inputs that the primary reset does not open.
 Long-lived holds for complete recovery closures remain a separate obligation.
 
 ## Retirement after an adopted compactor reset
@@ -134,7 +134,7 @@ Snapshot export verifies the retained primary inventory under a catalog hold. Th
 ## Retained checkpoint reset
 
 Native local maintenance can replay from a detached retained anchor to its adopted checkpoint and install the resulting primary catalog in place.
-It uses the maintenance writer's existing journal authority and synchronizes its rebuilt file pairs before requesting the catalog replacement.
+It holds the source recovery gate through the selected journal interval and every detached payload read. Replay applies ordered relation retirements before publishing staged checkpoints. It uses the maintenance writer's existing journal authority and synchronizes its rebuilt file pairs before requesting the catalog replacement.
 The term refuses the replacement if the catalog or transaction head moved during preparation.
 Compacted pairs from the rebuilt base use a name derived from the successor block in a range reserved for recovery.
 The runtime preserves original L0 source descriptors for ordered replay and reconstructs absent pairs in the journal suffix.

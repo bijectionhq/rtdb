@@ -643,6 +643,7 @@ impl ObjectStore for LocalStore {
     fn releases_receipt_l0(&self) -> bool { self.catalog.is_some() }
 
     async fn advance_catalog_floor(&self, installed: rtdb_types::CatalogCut) -> rtdb_types::Result<bool> {
+        if self.catalog.is_none() { return Ok(true); }
         Ok(self.close_classic_trie_admission(installed, &[None]).await?[0])
     }
 

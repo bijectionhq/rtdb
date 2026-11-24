@@ -221,7 +221,7 @@ Installed upload, trie, artefact and detached-body appends resolve their depende
 Search replay references name the published run's physical key. A retirement-only search change adds no replay member.
 Unidentified provider addresses or unknown record types keep the journal fence closed.
 Ordered checkpoint transfer can seed its bounded replica pages and their detached payloads under independently verified target custody.
-The default compactor reset verifies the adopted checkpoint's primary inventory and relocates its compacted pairs before publishing a new naming epoch.
+The default compactor reset verifies the adopted checkpoint's primary inventory, retains the projected dependency set through file relocation, and publishes a new naming epoch. Retained-base reset keeps source recovery custody through replay of the selected interval and applies ordered table retirements.
 The retained-base reset can reconstruct the cut from a detached root and its journal suffix.
 Checkpoint-metadata packs in an enrolled terminal allocation require a release for every indexed member of the same publication and a successor root that matches the published checkpoint digest.
 For parked installations an independently sealed replay archive can cover mixed packs on local and S3 storage, including enrolled terminal S3. Each carried member must match the archive's authenticated plaintext or have the existing receipt L0 coverage. Hosted S3 can also retire a pack while it has serving readers that were admitted through the same archive. In that case the archive must cover every payload member, including receipt L0. This route uses the replay fence and drain evidence.

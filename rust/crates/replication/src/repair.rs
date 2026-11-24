@@ -9,7 +9,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{
-    catalog::{BlockCatalog, CheckpointContents, publication_digest, same_publication_digest},
+    catalog::{BlockCatalog, CheckpointContents, legacy_table_ref, publication_digest, same_publication_digest},
     envelope::ReplicaBody,
     keys::{CURRENT_STORAGE_VERSION, StorageRoot, block_key},
 };
@@ -217,8 +217,9 @@ impl PrimaryReset {
     ) -> Result<Self> {
         let target = installed.latest_completed_tx().ok_or_else(no_reset_transactions)?;
         let store = Arc::clone(source.storage());
-        // The repair opens every primary referenced by the installed manifest, including superseded files.
-        let hold = HeldView::catalog(store.as_ref(), Arc::new(installed.clone()), cut, None).await?;
+        // Open the authenticated root under a conservative claim, then narrow
+        // custody to the immutable files this reset can open.
+        let selection = HeldView::catalog(store.as_ref(), Arc::new(installed.clone()), cut, None).await?;
         let load = async {
             let blocks = source.recovery_block_store(file_size_target)?;
             let (root, tables) = blocks.load(installed.block_index()).await?;
@@ -228,7 +229,11 @@ impl PrimaryReset {
             if root.table_entries()?.iter().any(|entry| root.table_block_digest(entry.oid).is_none()) {
                 return Err(reset_inventory("The checkpoint has no bound table manifest"));
             }
-            cancellation.run_until_cancelled(blocks.verify_primary_inventory(&root, &tables))
+            let paths: Arc<[String]> = crate::replay_closure::checkpoint_files(&root, &tables, CheckpointContents::Primary)?
+                .into_iter().filter(|key| rtdb_format::keys::is_catalog_retirement_file(key.as_str()))
+                .map(|key| key.to_string()).collect();
+            let hold = HeldView::catalog(store.as_ref(), Arc::new(root.clone()), cut, Some(paths)).await?;
+            IoRegion::reading(Arc::clone(&hold), cancellation.run_until_cancelled(blocks.verify_primary_inventory(&root, &tables)))
                 .await.ok_or_else(crate::progress::cancelled)?
                 .map_err(|error| match error.code.as_str() {
                     "rtdb.storage/missing-object" | "rtdb.replication/checkpoint-primary-extent" =>
@@ -238,9 +243,9 @@ impl PrimaryReset {
             let table_catalog = TableCatalog::load(Some(root), &tables)?;
             let primary = tables.into_iter().map(|(table, block)| (table, block.for_primary_repair())).collect();
             let catalog = TrieCatalog::load(&primary, file_size_target, target.system_time)?;
-            Ok((Arc::new(table_catalog), Arc::new(catalog)))
+            Ok((Arc::new(table_catalog), Arc::new(catalog), hold))
         };
-        let (tables, catalog) = IoRegion::reading(Arc::clone(&hold), load).await?;
+        let (tables, catalog, hold) = IoRegion::reading(selection, load).await?;
         Ok(Self { source, staged: None, store, hold, catalog, tables, target })
     }
 
@@ -256,6 +261,7 @@ impl PrimaryReset {
         let memory = source.memory();
         let _cache_charge = memory.reserve(CACHE_BYTES)?;
         let cache = CacheBudget::new(CACHE_BYTES);
+        let recovery = HeldView::recovery(local.hold_recovery_open().await?);
         let anchor = local.retained_repair_anchor().await?.ok_or_else(|| invalid("The source storage has no retained repair base"))?;
         let root = StorageRoot::new(CURRENT_STORAGE_VERSION, StorageEpoch(0))?.key();
         let export = fs::canonicalize(export.join(root)).map_err(io)?;
@@ -265,8 +271,7 @@ impl PrimaryReset {
             .ok_or_else(|| invalid("The adopted checkpoint has no publication digest"))? };
         require_advancing_cut(base_receipt, target_receipt)?;
         let current = source.recovery_block_store(file_size_target)?;
-        let recovery = HeldView::recovery(local.hold_recovery_open().await?);
-        let target = IoRegion::reading(recovery, current.load_fresh_catalog(target_receipt.block)).await?;
+        let target = IoRegion::reading(Arc::clone(&recovery), current.load_fresh_catalog(target_receipt.block)).await?;
         require_root(&target, target_receipt)?;
         require_offline_lifetime_admission(&target)?;
         let target_tx = target.latest_completed_tx().ok_or_else(|| invalid("The target has no completed transaction"))?;
@@ -289,7 +294,8 @@ impl PrimaryReset {
         stage_primary_base(&archive, &staged, &base, tables, memory, cancellation).await?;
         let staged_blocks = BlockStore::new(staged.clone(), pool(staged.clone(), &cache, memory), Arc::clone(memory), file_size_target)?;
         let mut rebuilt = staged_blocks.recover(Default::default(), source.source_floor()?, Timestamp(0), BlockDiscovery::At(base.block_index())).await?;
-        replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation).await?;
+        IoRegion::reading(recovery,
+            replay(&source, &staged_blocks, &staged, &mut rebuilt, &base, &target, memory, cancellation)).await?;
         let value = rebuilt.partition.value();
         let catalog = Arc::clone(value.trie_catalog());
         let tables = Arc::clone(value.table_catalog());
@@ -552,8 +558,12 @@ async fn replay(
                 previous = stored;
                 if position == through { return Ok(digest); }
             }
+            ReplicaBody::TablesRetired(message) => {
+                let tables = message.table_names.iter().map(|name| legacy_table_ref(name)).collect::<Result<Vec<_>>>()?;
+                repair.partition.retire_tables(tables, Timestamp(message.as_of_micros.unwrap_or_default()));
+            }
             ReplicaBody::NoOp(_) | ReplicaBody::BlockUploaded(_) | ReplicaBody::TriesAdded(_)
-            | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
+            | ReplicaBody::TriesDeleted(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
             ReplicaBody::OversizedMessage(_) => return Err(invalid("The source journal has an unresolved oversized record")),
         }
     }
