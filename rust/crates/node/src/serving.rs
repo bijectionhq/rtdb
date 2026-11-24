@@ -28,6 +28,11 @@ pub struct QuerySource {
     pub layer: Layer,
 }
 
+pub struct WorkloadReadCut {
+    pub basis: Basis,
+    pub binding: [u8; 32],
+}
+
 pub struct QueryView {
     pub snapshot: Snapshot,
     pub cut: BranchCut,
@@ -52,6 +57,7 @@ pub enum ChangeImages {
     Both,
 }
 
+#[derive(Clone)]
 pub struct Changes {
     pub branch: Branch,
     pub tables: BTreeSet<TableRef>,
@@ -230,10 +236,15 @@ pub trait ServingDriver: Send + Sync {
     }
 
     async fn query_workload_root(
-        &self, _source: QuerySource, _now: Timestamp, _cancellation: &CancellationToken,
+        &self, _source: QuerySource, _cut: Basis, _now: Timestamp, _cancellation: &CancellationToken,
     ) -> Result<QueryView> {
-        Err(rtdb_types::Anomaly::unsupported("rtdb/managed-workload-read-root",
-            "The attachment has no clear managed Root read authority"))
+        Err(workload::denied())
+    }
+
+    async fn changes_workload_root(
+        &self, _request: Changes, _cut: Basis, _cancellation: &CancellationToken,
+    ) -> Result<ChangePage> {
+        Err(workload::denied())
     }
 
     async fn transact_scoped(&self, _request: Transact, _scope: ServingScope,

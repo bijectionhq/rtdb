@@ -556,20 +556,34 @@ impl ServingDriver for MultiServing {
     }
 
     async fn query_workload_root(
-        &self, source: QuerySource, now: Timestamp, cancellation: &CancellationToken,
+        &self, source: QuerySource, cut: Basis, now: Timestamp, cancellation: &CancellationToken,
     ) -> Result<QueryView> {
         cancellation.run_until_cancelled(async {
             let (index, generation) = self.database.lock().await.fresh_view().await?;
             index.require_local_custody()?;
             if source.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || source.layer != Layer::Merged
-                || index.has_custody_groups() || index.has_visibility_history()
+                || index.has_visibility_history() || cut.incarnation() != self.incarnation
             {
-                return Err(Anomaly::unsupported("rtdb/managed-workload-read-root",
-                    "The managed Root read requires a plain main database"));
+                return Err(workload::denied());
             }
-            let at = if source.at == At::Linearizable { At::Latest } else { source.at };
-            let view = index.view(&source.branch, at, source.layer, now)?;
-            let snapshot = rtdb_query::branch_snapshot(&view, &self.memory)?;
+            let basis = match source.at {
+                At::Exactly(basis) if basis.incarnation() == self.incarnation && basis <= cut => basis,
+                At::AtLeast(basis) if basis.incarnation() == self.incarnation && basis <= cut => cut,
+                At::Linearizable => cut,
+                _ => return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/basis-ahead",
+                    "The requested basis is outside the admitted writer cut")),
+            };
+            let view = index.view(&source.branch, At::Exactly(basis), source.layer, now)?;
+            let snapshot = if index.has_custody_groups() {
+                let tables = view.tables().filter_map(|(table, _)| {
+                    (!view.ids(table).into_iter().any(|id| view.history(table, id).iter().any(|event| {
+                        event.image.as_ref().is_some_and(|image| image.custody_group.is_some() || image.custody_payload.is_some())
+                    }))).then(|| table.clone())
+                }).collect();
+                rtdb_query::branch_primary_snapshot(&view, &self.memory, &tables)?
+            } else {
+                rtdb_query::branch_snapshot(&view, &self.memory)?
+            };
             self.database.lock().await.check_generation(generation).await?;
             Ok(QueryView {
                 snapshot,
@@ -579,6 +593,31 @@ impl ServingDriver for MultiServing {
                 custody_contributors: Some(BTreeSet::new()),
                 key_generation: Some(generation),
             })
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn changes_workload_root(
+        &self, mut request: Changes, cut: Basis, cancellation: &CancellationToken,
+    ) -> Result<ChangePage> {
+        cancellation.run_until_cancelled(async {
+            let mut database = self.database.lock().await;
+            let history = database.fresh_history().await?;
+            history.index.require_local_custody()?;
+            if request.branch != rtdb_types::rtdb_v1::MAIN_BRANCH || history.index.has_visibility_history()
+                || history.index.has_custody_groups() || cut.incarnation() != self.incarnation
+            {
+                return Err(workload::denied());
+            }
+            if request.after.is_some_and(|after| after.position() > cut.position()) {
+                return Err(Anomaly::new(AnomalyCategory::Unavailable, "rtdb/change-basis-ahead",
+                    "The changes cursor is beyond the admitted writer cut"));
+            }
+            let until = request.until;
+            request.until = Some(until.map_or(cut, |until| until.min(cut)));
+            let mut page = changes_page(&history, &request, self.incarnation)?;
+            if until.is_some_and(|until| until > cut) { page.complete = false; }
+            page.key_generation = Some(history.generation);
+            Ok(page)
         }).await.ok_or_else(interrupted)?
     }
 

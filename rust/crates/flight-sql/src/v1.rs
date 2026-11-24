@@ -79,9 +79,9 @@ impl Service {
                 decode::<proto::CapabilitiesRequest>(action.body)?;
                 let database = self.require_workload_root_read(&call).await?;
                 let driver = database.serving_driver().ok_or_else(|| error::unsupported("managed-workload.read-root"))?;
-                let mut features = vec!["managed-workload.read-root", "query", "query.linearizable"];
+                let mut features = vec!["managed-workload.read-root", "query", "query.linearizable", "changes", changes::PROGRESS_ONLY];
                 if driver.supports_query_tokens() && database.wire_tokens_supported() {
-                    features.extend(["query.track", "query.page", RECEIVER_CLOCK, APPLIED_POSITION]);
+                    features.extend(["query.track", "query.page", RECEIVER_CLOCK, APPLIED_POSITION, changes::APPLIED_POSITIONS]);
                 }
                 if driver.features().contains(&rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS) {
                     features.push(rtdb_types::rtdb_v1::QUERY_WRITTEN_BASIS);
@@ -91,7 +91,7 @@ impl Service {
                     features: features.into_iter().map(str::to_owned).collect(),
                     limits: Some(proto::Limits {
                         max_page_rows: MAX_PAGE_ROWS,
-                        max_change_groups: 0,
+                        max_change_groups: MAX_CHANGE_GROUPS,
                         max_wait_millis: MAX_WAIT.as_millis() as u64,
                         min_key_bytes: 16,
                         max_key_bytes: 64,

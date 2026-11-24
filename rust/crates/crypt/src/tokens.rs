@@ -165,12 +165,13 @@ enum Purpose {
     DeploymentErasure = 6,
     PeerRequest = 7,
     PeerReply = 8,
+    WorkloadClaim = 9,
 }
 
 impl Purpose {
     fn invalid(self) -> Anomaly {
         match self {
-            Self::Claim => Anomaly::incorrect("rtdb/invalid-claim", "Invalid query claim"),
+            Self::Claim | Self::WorkloadClaim => Anomaly::incorrect("rtdb/invalid-claim", "Invalid query claim"),
             Self::Page => Anomaly::new(
                 AnomalyCategory::NotFound,
                 "rtdb/cursor-expired",
@@ -191,6 +192,7 @@ impl Purpose {
     fn max_payload(self) -> usize {
         match self {
             Self::Claim => MAX_CLAIM_PAYLOAD_BYTES,
+            Self::WorkloadClaim => 32 + MAX_CLAIM_PAYLOAD_BYTES,
             Self::Page => PAGE_BYTES,
             Self::Export => EXPORT_BYTES,
             Self::ReceiverClock => OBSERVATION_BYTES,
@@ -274,6 +276,32 @@ impl TokenAuthority {
             }
         }
         VerifiedClaims(verified)
+    }
+
+    pub async fn verify_workload_claims<'a>(
+        &self, claims: impl IntoIterator<Item = &'a Claim>, binding: [u8; 32],
+    ) -> VerifiedClaims {
+        let mut verified = Vec::new();
+        for claim in claims {
+            if !verified.iter().any(|(known, _)| known == claim) {
+                let result = self.open_workload_claim(claim, binding).await;
+                verified.push((claim.clone(), result));
+            }
+        }
+        VerifiedClaims(verified)
+    }
+
+    async fn open_workload_claim(&self, claim: &Claim, binding: [u8; 32]) -> Result<ClaimEvidence> {
+        let purpose = Purpose::WorkloadClaim;
+        let (payload, _) = self.open(purpose, claim.as_bytes()).await?;
+        let (claimed, bytes) = payload.split_first_chunk::<32>().ok_or_else(|| purpose.invalid())?;
+        let evidence: ClaimEvidence = serde_json::from_slice(bytes).map_err(|_| purpose.invalid())?;
+        if *claimed != binding || evidence.scope.basis.incarnation() != *self.incarnation.as_bytes()
+            || evidence.scope.branch != MAIN_BRANCH || evidence.scope.layer != Layer::Merged
+        {
+            return Err(purpose.invalid());
+        }
+        Ok(evidence)
     }
 
     pub async fn open_scoped_claim(&self, claim: &Claim, scope: &LabelScope) -> Result<ClaimEvidence> {
@@ -573,6 +601,18 @@ impl TokenIssuer {
         self.seal_page_in(page, None).await
     }
 
+    pub async fn seal_workload_claim(&self, evidence: &ClaimEvidence, binding: [u8; 32]) -> Result<Claim> {
+        let purpose = Purpose::WorkloadClaim;
+        if evidence.scope.basis.incarnation() != *self.authority.incarnation.as_bytes()
+            || evidence.scope.branch != MAIN_BRANCH || evidence.scope.layer != Layer::Merged
+        {
+            return Err(purpose.invalid());
+        }
+        let mut bytes = Zeroizing::new(binding.to_vec());
+        serde_json::to_writer(&mut *bytes, evidence).map_err(|_| purpose.invalid())?;
+        Ok(Claim::from_bytes(self.authority.seal(&self.key, purpose, &bytes).await?))
+    }
+
     pub async fn seal_scoped_claim(&self, basis: Basis, scope: &LabelScope) -> Result<Claim> {
         let incarnation = *self.authority.incarnation.as_bytes();
         if basis.incarnation() != incarnation { return Err(Purpose::Claim.invalid()); }
@@ -695,6 +735,23 @@ mod tests {
         assert!(authority.open_peer_reply(&request).await.is_err());
         let foreign = TokenAuthority::new(Uuid::from_u128(62), kms, Arc::new(Keys(vec![metadata])));
         assert!(foreign.open_peer_request(&request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn workload_claims_are_redeemable_only_under_the_exact_assignment() {
+        let database = Uuid::from_u128(42);
+        let kms: Arc<dyn Kms> = Arc::new(crate::LocalKms::new(|| 0));
+        let metadata = TokenKey::create(kms.as_ref(), Generation { database, number: 0 })
+            .await.unwrap().encode();
+        let authority = TokenAuthority::new(database, kms, Arc::new(Keys(vec![metadata])));
+        let evidence = ClaimEvidence {
+            scope: ClaimScope { basis: Basis::new(*database.as_bytes(), 9), branch: MAIN_BRANCH.into(), layer: Layer::Merged },
+            footprint: ClaimFootprint::default(),
+        };
+        let claim = authority.issuer().await.unwrap().seal_workload_claim(&evidence, [1; 32]).await.unwrap();
+        assert_eq!(authority.verify_workload_claims([&claim], [1; 32]).await.verify(&claim).unwrap(), evidence);
+        assert!(authority.verify_workload_claims([&claim], [2; 32]).await.verify(&claim).is_err());
+        assert!(authority.open_claim(&claim).await.is_err());
     }
 
     #[tokio::test]

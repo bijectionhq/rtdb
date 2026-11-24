@@ -48,7 +48,17 @@ impl Service {
         grant
             .assignment(&call.database, driver.incarnation(), self.0.node.now())
             .map_err(error::anomaly)?;
-        Ok(database)
+        let binding = authority
+            .assignment_binding()
+            .map_err(error::anomaly)?
+            .ok_or_else(denied)?;
+        Ok((
+            database,
+            rtdb_node::serving::WorkloadReadCut {
+                basis: cut.basis,
+                binding,
+            },
+        ))
     }
 
     pub(super) async fn managed_workload_action(
@@ -81,7 +91,7 @@ impl Service {
         grant
             .assignment(&call.database, driver.incarnation(), self.0.node.now())
             .map_err(error::anomaly)?;
-        Ok(response(reply, namespace).encode_to_vec())
+        Ok(response(reply, namespace)?.encode_to_vec())
     }
 
     pub(super) async fn managed_workload_status(
@@ -388,9 +398,13 @@ fn evidence(value: Evidence) -> proto::WorkloadEvidence {
     }
 }
 
-fn response(reply: workload::Reply, namespace: [u8; 32]) -> proto::ManagedWorkloadResponse {
+fn response(
+    reply: workload::Reply,
+    namespace: [u8; 32],
+) -> Result<proto::ManagedWorkloadResponse, Status> {
     use proto::managed_workload_response::Result as Wire;
     let (result, receipt_namespace) = match reply {
+        workload::Reply::ReadCut(_) => return Err(denied()),
         workload::Reply::Receipt(receipt) => (
             Wire::Receipt(transact::receipt(receipt)),
             namespace.to_vec(),
@@ -412,10 +426,10 @@ fn response(reply: workload::Reply, namespace: [u8; 32]) -> proto::ManagedWorklo
             )
         }
     };
-    proto::ManagedWorkloadResponse {
+    Ok(proto::ManagedWorkloadResponse {
         result: Some(result),
         receipt_namespace,
-    }
+    })
 }
 
 fn attempt_digest(body: &[u8]) -> [u8; 32] {

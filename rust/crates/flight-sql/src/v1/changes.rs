@@ -37,7 +37,6 @@ use crate::{
 
 use super::{
     MAX_CHANGE_GROUPS, MAX_WAIT, error, head, proto,
-    query::check_read_delivery,
     tokens::{self, cursor_expired},
     trailer,
 };
@@ -967,7 +966,30 @@ impl Service {
                         limit: request.limit as usize,
                         wait,
             };
-            let (page, context) = if let Some(scope) = &visibility {
+            let (page, context) = if call.session.caller.principal.workload_grant().is_some() {
+                let started = tokio::time::Instant::now();
+                let (page, basis) = loop {
+                    let (admitted, cut) = self.workload_root_cut(&call).await?;
+                    if !Arc::ptr_eq(&admitted, &database) { return Err(error::unavailable("The Original attachment changed")); }
+                    let page = driver.changes_workload_root(change.clone(), cut.basis, &call.cancellation)
+                        .await.map_err(error::anomaly)?;
+                    let remaining = wait.saturating_sub(started.elapsed());
+                    if !page.groups.is_empty() || until.is_some() && page.complete || remaining.is_zero() {
+                        break (page, cut.basis);
+                    }
+                    call.cancellation.run_until_cancelled(tokio::time::sleep(remaining.min(Duration::from_millis(50))))
+                        .await.ok_or_else(crate::error::cancelled).map_err(error::map_status)?;
+                };
+                let now = self.0.node.now();
+                let source = rtdb_node::serving::QuerySource {
+                    branch: rtdb_types::rtdb_v1::MAIN_BRANCH.into(),
+                    at: rtdb_types::rtdb_v1::At::Exactly(basis), layer: rtdb_types::rtdb_v1::Layer::Merged,
+                };
+                let view = driver.query_workload_root(source, basis, now, &call.cancellation)
+                    .await.map_err(error::anomaly)?;
+                let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
+                (page, self.scoped_wire_context(&call, snapshot, now)?.with_plaintext())
+            } else if let Some(scope) = &visibility {
                 let now = self.0.node.now();
                 let page = driver.changes_scoped(change, scope, &call.cancellation).await.map_err(error::anomaly)?;
                 let source = rtdb_node::serving::QuerySource {
@@ -1009,7 +1031,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let mut encoder = wire::Encoder::new(&schema, &memory).map_err(error::map_status)?;
             let schema_frame = wire::schema_data(&schema, &memory).map_err(error::map_status)?;
-            check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
+            service.check_query_delivery(&call, &database, page.through, page.key_generation, &page.custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(initial, cutoff).map_err(error::map_status)?;
             yield schema_frame;
@@ -1048,7 +1070,7 @@ impl Service {
                         .map_err(|error| error::map_status(Status::internal(error.to_string())))?;
                     for frame in encoder.batch(&batch, &memory).map_err(error::map_status)? {
                         let grant = context.delivery_grant().await.map_err(error::anomaly)?;
-                        check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
+                        service.check_query_delivery(&call, &database, page.through, page.key_generation, &page.custody_groups).await?;
                         service.check_attachment(&call, &database)?;
                         call.handoff(grant, cutoff).map_err(error::map_status)?;
                         yield frame;
@@ -1056,7 +1078,7 @@ impl Service {
                 }
             }
             let grant = context.delivery_grant().await.map_err(error::anomaly)?;
-            check_read_delivery(&call, &database, page.key_generation, &page.custody_groups).await?;
+            service.check_query_delivery(&call, &database, page.through, page.key_generation, &page.custody_groups).await?;
             service.check_attachment(&call, &database)?;
             call.handoff(grant, cutoff).map_err(error::map_status)?;
             yield trailer(proto::ChangesTrailer { through: Some(page.through.into()), complete: page.complete });

@@ -196,6 +196,18 @@ impl Authority {
         }
     }
 
+    pub fn assignment_binding(&self) -> Result<Option<[u8; 32]>> {
+        let (fence, writer) = match self {
+            Self::ReadRoot { fence, writer } | Self::Write { fence, writer } => (fence, writer),
+            _ => return Ok(None),
+        };
+        let bytes = serde_json::to_vec(&(fence, writer)).map_err(|_| denied())?;
+        let mut hash = Sha256::new();
+        hash.update(b"rtdb.v1/managed-assignment-claim\0");
+        hash.update(bytes);
+        Ok(Some(hash.finalize().into()))
+    }
+
     pub fn family(&self) -> Option<Family> {
         Some(match self {
             Self::AdvancePlacement { .. } => Family::AdvancePlacement,
@@ -281,6 +293,7 @@ pub enum Reply {
     Receipt(Receipt),
     Placement(Evidence),
     Predecessor(Box<PredecessorEvidence>),
+    ReadCut(BranchCut),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -332,8 +345,7 @@ impl Request {
                     return Err(denied());
                 }
                 self.point.check_current(state, now, &authority)?;
-                let evidence = self.point.writer(state, fence, writer, now)?;
-                Ok(Prepared::Answer(Reply::Placement(evidence)))
+                Ok(Prepared::Answer(Reply::ReadCut(state.index.head())))
             }
             Operation::Observe(fence) => {
                 let evidence = self.point.fence(state, fence, now)?;

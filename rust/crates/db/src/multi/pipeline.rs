@@ -648,8 +648,10 @@ impl MultiDatabase {
         self.require_active()?;
         let lease = self.authority()?;
         let claims = match &request.operation {
-            workload::Operation::Submit { transaction: Some(transaction), .. } =>
-                self.tokens.verify_claims_in(transaction.claims(), None).await,
+            workload::Operation::Submit { authority, transaction: Some(transaction), .. } => {
+                let binding = authority.assignment_binding()?.ok_or_else(workload::denied)?;
+                self.tokens.verify_workload_claims(transaction.claims(), binding).await
+            }
             _ => self.tokens.verify_claims_in(std::iter::empty(), None).await,
         };
         let now = (self.clock)();

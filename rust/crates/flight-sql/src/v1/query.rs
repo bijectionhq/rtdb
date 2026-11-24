@@ -142,7 +142,8 @@ impl Service {
             return Ok((view, follower_progress(route, progress)));
         }
         if call.session.caller.principal.workload_grant().is_some() {
-            let view = driver.query_workload_root(source, now, &call.cancellation).await.map_err(error::anomaly)?;
+            let (_, cut) = self.workload_root_cut(call).await?;
+            let view = driver.query_workload_root(source, cut.basis, now, &call.cancellation).await.map_err(error::anomaly)?;
             return Ok((view, None));
         }
         let view = match visibility {
@@ -239,15 +240,17 @@ impl Service {
         Ok(response)
     }
 
-    async fn check_query_delivery(&self, call: &Call, database: &Database, _basis: Basis, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
+    pub(super) async fn check_query_delivery(&self, call: &Call, database: &Database, _basis: Basis, generation: Option<u64>, groups: &BTreeSet<CustodyGroupId>) -> Result<(), Status> {
         #[cfg(feature = "multi")]
         if let Some(route) = self.follower() {
             let generation = generation.ok_or_else(|| error::unavailable("The follower cut has no readable generation"))?;
             return route.reader.check_delivery(_basis, generation, self.0.node.now(), &call.cancellation).await.map_err(error::follower);
         }
         if call.session.caller.principal.workload_grant().is_some() {
-            let admitted = self.require_workload_root_read(call).await?;
-            if !std::ptr::eq(admitted.as_ref(), database) || !groups.is_empty() {
+            let (admitted, cut) = self.workload_root_cut(call).await?;
+            if !std::ptr::eq(admitted.as_ref(), database) || !groups.is_empty()
+                || _basis.incarnation() != cut.basis.incarnation() || _basis > cut.basis
+            {
                 return Err(error::unsupported("managed-workload.read-root"));
             }
         }
@@ -506,7 +509,13 @@ impl Service {
                 scope: ClaimScope { branch: source.branch.clone(), basis: page.basis, layer: claim_layer },
                 footprint,
             };
-            let value = issuer.seal_claim(&evidence).await.map_err(error::anomaly)?.into_bytes();
+            let claim = if workload.is_some() {
+                let (_, cut) = self.workload_root_cut(call).await?;
+                issuer.seal_workload_claim(&evidence, cut.binding).await
+            } else {
+                issuer.seal_claim(&evidence).await
+            }.map_err(error::anomaly)?;
+            let value = claim.into_bytes();
             Some(proto::Claim { value })
         } else { None };
         let receiver_clock = if request.observe_receiver_clock && continuation.is_none() {

@@ -71,7 +71,7 @@ impl CallKind {
     }
 
     fn allows_workload_root_read(self) -> bool {
-        matches!(self, Self::Handshake | Self::V1Query | Self::V1Capabilities)
+        matches!(self, Self::Handshake | Self::V1Query | Self::V1Changes | Self::V1Capabilities)
     }
 
     fn allows_workload_grant(self) -> bool {
@@ -788,11 +788,11 @@ mod tests {
 
     #[test]
     fn workload_root_reader_has_a_read_only_allowlist() {
-        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Capabilities] {
+        for kind in [CallKind::Handshake, CallKind::V1Query, CallKind::V1Changes, CallKind::V1Capabilities] {
             assert!(kind.allows_workload_root_read());
         }
         for kind in [CallKind::Ordinary, CallKind::Action, CallKind::AudienceCleanup,
-            CallKind::V1Changes, CallKind::V1Action, CallKind::ManagedWorkload,
+            CallKind::V1Action, CallKind::ManagedWorkload,
             CallKind::ManagedCreate, CallKind::TxStatus] {
             assert!(!kind.allows_workload_root_read());
         }
