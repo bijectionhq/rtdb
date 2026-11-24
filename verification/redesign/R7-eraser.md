@@ -94,7 +94,12 @@ Retained plaintext delivery grants inherit the original object read lease, inclu
 The provider operation cutoff and the catalog cutoff keep their own clock coordinates. The effective view and its delivery grants must satisfy both.
 Query computation holding a catalog lease stops on cancellation or its local lease cutoff. Provider tasks retain their original I/O owner until they join.
 A fixed SQL deadline requires an enforcing custody authority, a complete survivor rewrite and retirement census, custody-wide working plaintext drain, and evidenced destruction.
-The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring inventory and latest destruction time. The fixed commitment binds the same inventory and deadline to the authenticated switch. The original authority reports destruction with separate signed evidence of the completed drain and provider disposition. A late disposition is recorded as a missed fixed deadline. A pending provider result does not furnish a disposition.
+The coordinator requires a signed fixed reservation before issuing the switch. The reservation binds the prepared successor, exact retiring key inventory, custody work roster and latest destruction time.
+The fixed commitment binds both inventories and the deadline to the authenticated switch.
+The original authority signs the drain of the same roster, with an observation for every working plaintext, egress and copy participant after admission closes.
+Separate destruction evidence binds that drain to the provider disposition.
+A late disposition is recorded as a missed fixed deadline. A pending provider result does not furnish a disposition.
+The coordinator verifies this evidence. A production custody adapter still owns the durable cross-worker roster and the observations that establish drain.
 The [installed journal operator documentation](../../dev/doc/rtdb-multi-installed-journal.md#clean-checkpoint-and-erasure-commit-interface) describes the inputs and result of that coordinator.
 
 ## Verification

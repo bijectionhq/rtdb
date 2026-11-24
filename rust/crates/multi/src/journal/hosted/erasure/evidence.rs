@@ -1,7 +1,7 @@
 //! Evidence issued by the original custody authority for one ordered switch.
 
 use ring::{
-    digest::{SHA256, digest},
+    digest::{Context, SHA256, digest},
     signature::{ED25519, UnparsedPublicKey},
 };
 use rtdb_types::{Anomaly, Result};
@@ -29,9 +29,9 @@ impl ErasureDeadline {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DestructionEvidence {
-    pub drain_observed_at_ms: u64,
+    pub drain: CustodyDrain,
     pub destroyed_at_ms: u64,
     pub disposition: [u8; 32],
     pub signature: [u8; 64],
@@ -41,7 +41,71 @@ pub struct DestructionEvidence {
 pub struct DeadlineReservation {
     pub by_ms: u64,
     pub retiring_inventory: [u8; 32],
+    pub draining_inventory: [u8; 32],
     pub signature: [u8; 64],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(u8)]
+pub enum CustodyWork {
+    Plaintext = 1,
+    Egress = 2,
+    Copy = 3,
+}
+
+/// An authority registered one custody obligation under this identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DrainParticipant {
+    pub kind: CustodyWork,
+    pub identity: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DrainedWork {
+    pub participant: DrainParticipant,
+    pub observed_at_ms: u64,
+    pub observation: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustodyDrain {
+    pub closed_at_ms: u64,
+    pub joined: Vec<DrainedWork>,
+    pub signature: [u8; 64],
+}
+
+/// Commits the custody roster in strict participant order. The empty roster
+/// has its own digest and still requires a signed admission closure.
+pub fn drain_inventory(
+    participants: impl IntoIterator<Item = DrainParticipant>,
+) -> Result<[u8; 32]> {
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"rtdb.multi/custody-drain-inventory/v1\0");
+    let mut previous = None;
+    for participant in participants {
+        if participant.identity == [0; 32] || previous.is_some_and(|prior| prior >= participant) {
+            return Err(invalid("The drain roster is not an exact ordered set"));
+        }
+        hash.update(&[participant.kind as u8]);
+        hash.update(&participant.identity);
+        previous = Some(participant);
+    }
+    Ok(hash.finish().as_ref().try_into().expect("SHA-256 width"))
+}
+
+impl CustodyDrain {
+    pub fn signing_bytes(&self, commit: &ErasureCommit) -> Vec<u8> {
+        let mut bytes = b"rtdb.multi/custody-drained/v1\0".to_vec();
+        bytes.extend_from_slice(digest(&SHA256, &commit.signing_bytes()).as_ref());
+        bytes.extend_from_slice(&self.closed_at_ms.to_be_bytes());
+        for work in &self.joined {
+            bytes.push(work.participant.kind as u8);
+            bytes.extend_from_slice(&work.participant.identity);
+            bytes.extend_from_slice(&work.observed_at_ms.to_be_bytes());
+            bytes.extend_from_slice(&work.observation);
+        }
+        bytes
+    }
 }
 
 fn append_preparation(bytes: &mut Vec<u8>, prepared: PreparedErasure) {
@@ -89,10 +153,11 @@ fn append_preparation(bytes: &mut Vec<u8>, prepared: PreparedErasure) {
 
 impl DeadlineReservation {
     pub fn signing_bytes(&self, prepared: PreparedErasure) -> Vec<u8> {
-        let mut bytes = b"rtdb.multi/erasure-reservation/v1\0".to_vec();
+        let mut bytes = b"rtdb.multi/erasure-reservation/v2\0".to_vec();
         append_preparation(&mut bytes, prepared);
         bytes.extend_from_slice(&self.by_ms.to_be_bytes());
         bytes.extend_from_slice(&self.retiring_inventory);
+        bytes.extend_from_slice(&self.draining_inventory);
         bytes
     }
 }
@@ -101,7 +166,7 @@ impl ErasureCommit {
     /// The authority signs after irrevocably arming the reserved fixed policy
     /// for the authenticated ordered switch.
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"rtdb.multi/erasure-commit/v1\0".to_vec();
+        let mut bytes = b"rtdb.multi/erasure-commit/v2\0".to_vec();
         append_preparation(&mut bytes, self.prepared);
         bytes.extend_from_slice(&self.committed_at_ms.to_be_bytes());
         bytes.extend_from_slice(&self.deadline.at_ms().to_be_bytes());
@@ -110,6 +175,7 @@ impl ErasureCommit {
             ErasureDeadline::Enforced { .. }
         )));
         bytes.extend_from_slice(&self.retiring_inventory);
+        bytes.extend_from_slice(&self.draining_inventory);
         bytes.extend_from_slice(&self.switch_evidence);
         bytes
     }
@@ -117,9 +183,10 @@ impl ErasureCommit {
 
 impl DestructionEvidence {
     pub fn signing_bytes(&self, commit: &ErasureCommit) -> Vec<u8> {
-        let mut bytes = b"rtdb.multi/erasure-destruction/v1\0".to_vec();
+        let mut bytes = b"rtdb.multi/erasure-destruction/v2\0".to_vec();
         bytes.extend_from_slice(digest(&SHA256, &commit.signing_bytes()).as_ref());
-        bytes.extend_from_slice(&self.drain_observed_at_ms.to_be_bytes());
+        bytes.extend_from_slice(digest(&SHA256, &self.drain.signing_bytes(commit)).as_ref());
+        bytes.extend_from_slice(&self.drain.signature);
         bytes.extend_from_slice(&self.destroyed_at_ms.to_be_bytes());
         bytes.extend_from_slice(&self.disposition);
         bytes
@@ -153,8 +220,10 @@ impl CustodyEvidence {
         prepared: PreparedErasure,
         reservation: DeadlineReservation,
     ) -> Result<()> {
-        if reservation.retiring_inventory == [0; 32] {
-            return Err(invalid("The deadline requires an exact retiring inventory"));
+        if reservation.retiring_inventory == [0; 32] || reservation.draining_inventory == [0; 32] {
+            return Err(invalid(
+                "The deadline requires exact retiring-key and custody-work inventories",
+            ));
         }
         self.verify(&reservation.signing_bytes(prepared), &reservation.signature)
     }
@@ -164,14 +233,23 @@ impl CustodyEvidence {
         commit: ErasureCommit,
         receipt: &DestructionEvidence,
     ) -> Result<()> {
-        if receipt.drain_observed_at_ms < commit.committed_at_ms
-            || receipt.destroyed_at_ms < receipt.drain_observed_at_ms
+        let drain = &receipt.drain;
+        if drain.closed_at_ms < commit.committed_at_ms
+            || receipt.destroyed_at_ms < drain.closed_at_ms
             || receipt.disposition == [0; 32]
+            || drain.joined.iter().any(|work| {
+                work.observed_at_ms < drain.closed_at_ms
+                    || work.observed_at_ms > receipt.destroyed_at_ms
+                    || work.observation == [0; 32]
+            })
+            || drain_inventory(drain.joined.iter().map(|work| work.participant))?
+                != commit.draining_inventory
         {
             return Err(invalid(
                 "Provider destruction lacks ordered drain and disposition evidence",
             ));
         }
+        self.verify(&drain.signing_bytes(&commit), &drain.signature)?;
         self.verify(&receipt.signing_bytes(&commit), &receipt.signature)
     }
 

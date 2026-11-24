@@ -12,6 +12,20 @@ use super::*;
 use crate::keys::LocalKeyService;
 
 const RETRY_POSITIONS: u64 = 64;
+const CUSTODY_ROSTER: [DrainParticipant; 3] = [
+    DrainParticipant {
+        kind: CustodyWork::Plaintext,
+        identity: [1; 32],
+    },
+    DrainParticipant {
+        kind: CustodyWork::Egress,
+        identity: [2; 32],
+    },
+    DrainParticipant {
+        kind: CustodyWork::Copy,
+        identity: [3; 32],
+    },
+];
 
 struct Journal {
     state: State,
@@ -383,6 +397,7 @@ impl ErasureCustody for CustodyFixture {
             committed_at_ms: now as u64,
             deadline: ErasureDeadline::Target { at_ms: due as u64 },
             retiring_inventory: [10; 32],
+            draining_inventory: drain_inventory(CUSTODY_ROSTER)?,
             switch_evidence: ready.binding(),
         };
         *self.attempt.lock().unwrap() = Some(ErasureProgress::Committed(commit));
@@ -622,6 +637,7 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
     let mut reservation = DeadlineReservation {
         by_ms,
         retiring_inventory: commit.retiring_inventory,
+        draining_inventory: commit.draining_inventory,
         signature: [0; 64],
     };
     reservation.signature = sign(&reservation.signing_bytes(commit.prepared));
@@ -658,13 +674,29 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
     };
     assert!(validate_commit(other_switch.prepared, other_switch, None, Some(&authority)).is_err());
 
+    let drain = CustodyDrain {
+        closed_at_ms: committed + 1,
+        joined: CUSTODY_ROSTER
+            .into_iter()
+            .map(|participant| DrainedWork {
+                participant,
+                observed_at_ms: committed + 2,
+                observation: [16; 32],
+            })
+            .collect(),
+        signature: [0; 64],
+    };
     let mut destruction = DestructionEvidence {
-        drain_observed_at_ms: committed + 1,
+        drain,
         destroyed_at_ms: by_ms + 1,
         disposition: [12; 32],
         signature: [0; 64],
     };
-    destruction.signature = sign(&destruction.signing_bytes(&commit));
+    let sign_drain = |receipt: &mut DestructionEvidence| {
+        receipt.drain.signature = sign(&receipt.drain.signing_bytes(&commit));
+        receipt.signature = sign(&receipt.signing_bytes(&commit));
+    };
+    sign_drain(&mut destruction);
     authority.verify_destruction(commit, &destruction)?;
     assert_eq!(destruction.fixed_deadline_met(&commit), Some(false));
     assert!(
@@ -672,8 +704,13 @@ async fn custody_evidence_binds_the_inventory_switch_and_destruction_order() -> 
             .verify_destruction(other_switch, &destruction)
             .is_err()
     );
-    destruction.drain_observed_at_ms = destruction.destroyed_at_ms + 1;
-    destruction.signature = sign(&destruction.signing_bytes(&commit));
+    let mut incomplete = destruction.clone();
+    incomplete.drain.joined.pop();
+    sign_drain(&mut incomplete);
+    assert!(authority.verify_destruction(commit, &incomplete).is_err());
+
+    destruction.drain.joined[0].observed_at_ms = destruction.destroyed_at_ms + 1;
+    sign_drain(&mut destruction);
     assert!(authority.verify_destruction(commit, &destruction).is_err());
 
     let journal = fixture.custody.journal.get_mut().unwrap();

@@ -19,7 +19,10 @@ use crate::keys::{JournalKey, KeyService};
 
 mod evidence;
 use evidence::CustodyEvidence;
-pub use evidence::{DeadlineReservation, DestructionEvidence, ErasureDeadline, ErasureTiming};
+pub use evidence::{
+    CustodyDrain, CustodyWork, DeadlineReservation, DestructionEvidence, DrainParticipant,
+    DrainedWork, ErasureDeadline, ErasureTiming, drain_inventory,
+};
 
 const OPERATIONAL_TARGET_MS: u64 = 120_000;
 
@@ -58,6 +61,8 @@ pub struct ErasureCommit {
     pub deadline: ErasureDeadline,
     /// Attests the exact retiring key inventory selected by the custody owner.
     pub retiring_inventory: [u8; 32],
+    /// Commits the plaintext, egress and copy participants of the closing custody domain.
+    pub draining_inventory: [u8; 32],
     /// Authenticated Logkeeper response used to bind the ordered switch.
     pub switch_evidence: [u8; 32],
 }
@@ -442,6 +447,7 @@ async fn coordinate(
     if deadline.is_some_and(|reserved| {
         reserved.by_ms != commit.deadline.at_ms()
             || reserved.retiring_inventory != commit.retiring_inventory
+            || reserved.draining_inventory != commit.draining_inventory
     }) {
         return Err(invalid("Custody armed a different reservation"));
     }
@@ -521,6 +527,7 @@ fn validate_commit(
     if commit.prepared != prepared
         || commit.committed_at_ms == 0
         || commit.retiring_inventory == [0; 32]
+        || commit.draining_inventory == [0; 32]
         || commit.switch_evidence == [0; 32]
         || switch.is_some_and(|binding| binding != commit.switch_evidence)
     {
