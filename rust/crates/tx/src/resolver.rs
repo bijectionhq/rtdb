@@ -1942,6 +1942,8 @@ impl<'a> OpenTransaction<'a> {
         }
         if let Some(replay) = &replay {
             self.buffer.retain_archived_owned_positions(replay.commit_positions().to_vec())?;
+        } else if proposal_land.is_none() && !publications.is_empty() {
+            self.buffer.retain_world_carrier_positions()?;
         }
         admitted.extend(proposal_land.map(|landing| landing.world));
         if proposal_land.is_none() && operations.iter().any(|op| matches!(op,
