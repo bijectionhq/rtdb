@@ -351,7 +351,7 @@ async fn run(arguments: Vec<String>) -> Result<()> {
         #[derive(serde::Serialize)]
         struct HostedCapabilities {
             api: &'static str,
-            features: [&'static str; 2],
+            features: [&'static str; 3],
         }
         #[derive(serde::Serialize)]
         struct MultiBuildInfo {
@@ -372,7 +372,11 @@ async fn run(arguments: Vec<String>) -> Result<()> {
             hosted_protocol: if cfg!(feature = "s3-key-vault") { 227 } else { 56 },
             capabilities: cfg!(feature = "s3-key-vault").then_some(HostedCapabilities {
                 api: "rtdb.v1",
-                features: [rtdb_flight_sql::OWNED_HOSTED_FEATURE, rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_FEATURE],
+                features: [
+                    rtdb_flight_sql::OWNED_HOSTED_FEATURE,
+                    rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_FEATURE,
+                    rtdb_flight_sql::RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE,
+                ],
             }),
             pgwire_arrow_copy_out: true,
             placed_receipt_retirement: true,

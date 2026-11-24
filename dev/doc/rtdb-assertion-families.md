@@ -318,6 +318,11 @@ The controller uses operation 4 to plan the exact order and operation 3 to submi
 The ordered decision also requires the Original's authenticated hosted-control owner on the current attachment.
 The resolver matches the same current paired enrollment and closed Original authority before the existing ordered predicates authenticate the selected carrier and retirement inventory.
 The custody decision admits the Original Root fence and its bounded erasure and acknowledgement effects.
+The `owned.retired-original-family-recovery` feature gives the Original controller terminal acknowledgement for a disposition on the same Root landing whose registration predates the archive fence.
+Operation 5 takes the exact pre-fence transaction as signed big-endian i64 ID and i64 system microseconds, followed by the 324-byte Original registration.
+Its caller authenticates as the current Original hosted-control owner and signs with the enrolled Original controller key.
+The holder verifies the exact address and historical creator at that transaction, then confirms the same address and creator in a positively disposed current Original registry row.
+An acknowledgement retry uses the same registration and returns byte 1.
 
 ### Ranked response contributor inventory
 

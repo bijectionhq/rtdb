@@ -142,7 +142,7 @@ impl RetiredOriginalFamilyRead {
     }
 
     /// Authenticates a pre-fence carrier registration's creator from its exact ordered row and installation.
-    pub async fn carrier_creator_commitment_at(&self, key: &str, registered: TransactionKey) -> Result<[u8; 32]> {
+    pub async fn carrier_creator_commitment_at(&self, key: &str, registered: TransactionKey, address: &[u8]) -> Result<[u8; 32]> {
         let unavailable = hosted_source_unavailable;
         if registered.system_time.0 <= 0 || registered == self.fence || !registered.at_or_before(self.fence) {
             return Err(unavailable());
@@ -156,6 +156,7 @@ impl RetiredOriginalFamilyRead {
         let (registration, revision) = row(&registration)?;
         if revision != registered.system_time
             || owned_row_event_position(registration.batch(), 0)?.transaction != registered.tx_id
+            || ArrowCell::named(registration.batch(), "address", 0).and_then(ArrowCell::binary) != Some(address)
         {
             return Err(unavailable());
         }

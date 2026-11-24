@@ -5,7 +5,7 @@ use std::num::NonZeroU64;
 
 use arrow_flight::Result as ActionResult;
 use bytes::{Bytes, BytesMut};
-use rtdb_types::{AssertionId, PlacementBinding, Position, RootLandingBinding, RootLandingTarget};
+use rtdb_types::{AssertionId, PlacementBinding, Position, RootLandingBinding, RootLandingTarget, Timestamp, TransactionKey, TxId};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -131,6 +131,7 @@ pub enum RetiredFamilyOperation {
     Release(FamilyReleaseRequest),
     Open { registration: FamilyReleaseRegistrationWire, envelope: Bytes },
     PlanFence(Uuid),
+    RecoverPreFence { registered: TransactionKey, registration: FamilyReleaseRegistrationWire },
 }
 
 impl RetiredFamilyRequest {
@@ -144,6 +145,15 @@ impl RetiredFamilyRequest {
                 envelope: frame.tail(&self.signed_body, MAX_ROW_BYTES)?,
             },
             4 => RetiredFamilyOperation::PlanFence(frame.uuid("retired family order")?),
+            5 => {
+                let tx_id = i64::from_be_bytes(frame.take("historical registration transaction")?);
+                let micros = i64::from_be_bytes(frame.take("historical registration time")?);
+                if tx_id < 0 || micros <= 0 { return Err(invalid("Invalid historical registration transaction")); }
+                RetiredFamilyOperation::RecoverPreFence {
+                    registered: TransactionKey { tx_id: TxId(tx_id), system_time: Timestamp(micros) },
+                    registration: frame.release_registration()?,
+                }
+            }
             _ => return Err(invalid("Invalid retired family operation")),
         };
         frame.finish()?;
@@ -528,13 +538,18 @@ impl Service {
             return Err(unsupported());
         }
         let request = decode(action, body)?;
+        if let FamilyRequest::Retired(request) = &request
+            && matches!(request.signed_body.first(), Some(3 | 5))
+            && !self.supports_hosted_upload(call)
+        {
+            return Err(unsupported());
+        }
         let (_, attachment) = call.session.resolve_database(Some(&call.database), &self.0.node)?;
         let attachment = attachment.ok_or_else(unsupported)?;
         let connection = self.connection(call, &call.database).await?;
         let mut session = connection.borrow().await?;
         crate::owned_actions::require_idle(&session)?;
         if let FamilyRequest::Retired(request) = &request && request.signed_body.first() == Some(&3) {
-            if !self.supports_hosted_upload(call) { return Err(unsupported()); }
             let enrollment = host.retired_family_fence(
                 crate::WorldCall { node: &self.0.node, attachment: &attachment, session: &mut session, cancellation: &call.cancellation },
                 request,
@@ -603,6 +618,24 @@ mod tests {
         let decoded = decode(RETIRED_ORIGINAL_FAMILY_V1, &Bytes::from(body)).unwrap();
         let FamilyRequest::Retired(request) = decoded else { panic!("a retired family frame") };
         assert!(request.operation().is_err());
+    }
+
+    #[test]
+    fn historical_recovery_requires_the_pre_fence_transaction_and_exact_registration_frame() {
+        let mut body = vec![5];
+        body.extend_from_slice(&12_i64.to_be_bytes());
+        body.extend_from_slice(&34_i64.to_be_bytes());
+        body.extend_from_slice(&[6; 324]);
+        let request = |body: &[u8]| RetiredFamilyRequest {
+            grant: [1; 32], signature: [2; 64], signed_body: Bytes::copy_from_slice(body),
+        };
+        let RetiredFamilyOperation::RecoverPreFence { registered, registration } = request(&body).operation().unwrap()
+            else { panic!("a historical disposition request") };
+        assert_eq!(registered, TransactionKey { tx_id: TxId(12), system_time: Timestamp(34) });
+        assert_eq!(registration.address, [6; 188]);
+        assert!(request(&body[..body.len() - 1]).operation().is_err());
+        body[9..17].fill(0);
+        assert!(request(&body).operation().is_err());
     }
 
     #[test]

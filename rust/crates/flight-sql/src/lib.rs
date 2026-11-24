@@ -31,7 +31,7 @@ pub use owned_world::{FrozenWorldWinner, OwnedWorldHost, OwnedWorldRead, Prepare
 pub const GATEWAY_ANSWER_DEADLINE_HEADER: &str = "x-rtdb-answer-deadline";
 
 mod v1;
-pub use v1::{OWNED_HOSTED_FEATURE, RETIRED_ORIGINAL_FAMILY_FEATURE};
+pub use v1::{OWNED_HOSTED_FEATURE, RETIRED_ORIGINAL_FAMILY_FEATURE, RETIRED_ORIGINAL_FAMILY_RECOVERY_FEATURE};
 
 pub mod rtdb {
     pub mod v1 {
