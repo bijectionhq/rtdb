@@ -24,6 +24,8 @@ pub(super) struct PlacedWorldHost {
     pub(super) keys: Arc<dyn KeyService>,
     pub(super) hosted_task: Option<HostedTask>,
     pub(super) options: NodeOptions,
+    pub(super) cell_secret: Option<Arc<crate::capability::CellSecret>>,
+    pub(super) family_vault_namespace: [u8; 32],
 }
 
 impl fmt::Debug for PlacedWorldHost {
@@ -44,6 +46,13 @@ impl PlacedWorldHost {
             return Err(OwnedWorld::unavailable());
         }
         Uuid::parse_str(&storage.deployment).map_err(|_| OwnedWorld::unavailable())
+    }
+
+    fn family_custody_secret(&self, record: &rtdb_directory::DeploymentRecord) -> Result<&crate::capability::CellSecret> {
+        if record.storage_namespaces.as_ref().map(|namespaces| namespaces.keys) != Some(self.family_vault_namespace) {
+            return Err(OwnedWorld::unavailable());
+        }
+        self.cell_secret.as_deref().ok_or_else(OwnedWorld::unavailable)
     }
 }
 
@@ -172,7 +181,22 @@ impl OwnedWorldHost for PlacedWorldHost {
             let deployment = self.deployment(&call)?;
             let record = self.directory.deployment(&deployment.to_string()).await?
                 .ok_or_else(OwnedWorld::unavailable)?;
+            if let rtdb_flight_sql::FamilyRequest::Retired(request) = request {
+                let secret = self.family_custody_secret(&record)?;
+                return assertion_families::serve_retired(Arc::clone(&self.keys), secret, call.session, &record, request).await;
+            }
             assertion_families::serve(self.keys.as_ref(), call.session, deployment, &record, request).await
+        })
+    }
+
+    fn retired_family_fence<'a>(
+        &'a self, call: WorldCall<'a>, request: &'a rtdb_flight_sql::RetiredFamilyRequest,
+    ) -> BoxFuture<'a, Result<bytes::Bytes>> {
+        Box::pin(async move {
+            let deployment = self.deployment(&call)?;
+            let record = self.directory.deployment(&deployment.to_string()).await?.ok_or_else(OwnedWorld::unavailable)?;
+            let secret = self.family_custody_secret(&record)?;
+            assertion_families::authorize_retired_fence(secret, call.session, &record, request).await
         })
     }
 }

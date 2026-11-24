@@ -142,6 +142,12 @@ impl AssertionFamilies<'_> {
         Ok(())
     }
 
+    pub(crate) async fn require_root_landing_activation(
+        &self, family: Uuid, stage: AssertionStage, binding: RootLandingBinding,
+    ) -> Result<()> {
+        self.require_live_root_landing(family, stage, binding).await.map(|_| ())
+    }
+
     async fn require_live_root_landing(
         &self, family: Uuid, stage: AssertionStage, binding: RootLandingBinding,
     ) -> Result<Family> {

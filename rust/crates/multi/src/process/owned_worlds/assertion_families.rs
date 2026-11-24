@@ -21,6 +21,8 @@ use crate::keys::{
 };
 
 mod release;
+mod retired;
+pub(super) use retired::{serve as serve_retired, authorize_fence as authorize_retired_fence};
 
 struct Scope {
     deployment: Uuid,
@@ -92,6 +94,7 @@ impl Scope {
             FamilyRequest::EnrollOriginal(row) | FamilyRequest::EnrollWorldRow { row, .. } => Some((row.world, true)),
             FamilyRequest::Scope | FamilyRequest::RegisterDerived { .. } | FamilyRequest::SealWorldRow { .. }
             | FamilyRequest::Release(_) | FamilyRequest::ResolveMember { .. } | FamilyRequest::OpenWorldRow { .. } | FamilyRequest::Settle { .. } => None,
+            FamilyRequest::Retired(_) => return Err(OwnedWorld::unavailable()),
         };
         let mut worlds = positions.into_iter().flatten()
             .filter(|position| position.line_generation != self.root_line)
@@ -303,6 +306,7 @@ pub(super) async fn serve(
         FamilyRequest::Release(request) => return release::serve(
             &scope, &original, session.state().cancellation(), families, request,
         ).await,
+        FamilyRequest::Retired(_) => return Err(OwnedWorld::unavailable()),
         FamilyRequest::Settle { .. } => return Err(Anomaly::unsupported(
             "rtdb.owned/assertion-profile-uninstalled",
             "Family settlement requires the fixed assertion profile, which this cell does not install",

@@ -571,6 +571,7 @@ impl FlightService for Service {
             crate::owned_actions::DECIDE_HELD_WORLDS_V3,
             crate::owned_family::RESOLVE_FAMILY_MEMBER_V1,
             crate::owned_family::FAMILY_RESPONSE_RELEASE_V2,
+            crate::owned_family::RETIRED_ORIGINAL_FAMILY_V1,
             crate::owned_actions::HELD_WORLD_SHARED_COLUMN_CENSUS_V1,
             crate::owned_actions::HELD_WORLD_POINT_AT_V2,
         ];

@@ -171,6 +171,15 @@ impl CurrentAssertionFamilyRead {
         self.carrier_point("bj_external_key_recovery", key).await
     }
 
+    pub async fn retired_family_custody_enrollment(&self, key: &str) -> Result<HostedControlPoint> {
+        let id = key.strip_prefix("fenced-family-custody/")
+            .or_else(|| key.strip_prefix("fenced-family-replay/")).ok_or_else(hosted_source_unavailable)?;
+        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+            return Err(hosted_source_unavailable());
+        }
+        self.carrier_point(RESTORE, key).await
+    }
+
     async fn carrier_point(&self, relation: &str, key: &str) -> Result<HostedControlPoint> {
         read_carrier_point(&self.context, relation, key).await
     }

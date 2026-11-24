@@ -157,6 +157,8 @@ pub async fn start_node(directory: Arc<dyn Directory>, mut settings: NodeSetting
                 keys: Arc::clone(&settings.keys),
                 hosted_task: settings.hosted_task.clone(),
                 options: owned_archive.options.clone(),
+                cell_secret: settings.capabilities.clone(),
+                family_vault_namespace: storage_namespaces.keys,
             }) as Arc<dyn rtdb_flight_sql::OwnedWorldHost>
         });
     let storage = Arc::new(crate::store::CellStoreFactory {
