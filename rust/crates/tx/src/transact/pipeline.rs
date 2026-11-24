@@ -138,7 +138,7 @@ impl TransactPipeline {
     pub fn decide(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
     ) -> Result<Decision> {
-        self.decide_with(request, now, features, claims, None)
+        self.decide_after(request, now, features, claims, None, None)
     }
 
     /// Decide one request in an admitted scope (see [`TransactState::resolve_scoped`]).
@@ -146,12 +146,12 @@ impl TransactPipeline {
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
         authority: ScopedTransact<'_>,
     ) -> Result<Decision> {
-        self.decide_with(request, now, features, claims, Some(authority))
+        self.decide_after(request, now, features, claims, Some(authority), None)
     }
 
-    fn decide_with(
+    pub fn decide_after(
         &mut self, request: &Transact, now: Timestamp, features: &[&str], claims: &dyn ClaimVerifier,
-        authority: Option<ScopedTransact<'_>>,
+        authority: Option<ScopedTransact<'_>>, time_floor: Option<Timestamp>,
     ) -> Result<Decision> {
         let identity = TxKey { namespace: authority.map(|authority| authority.receipt_namespace), key: request.key.clone() };
         if self.deciding.contains_key(&identity) { return Err(pending_error()); }
@@ -162,6 +162,7 @@ impl TransactPipeline {
                 durable_index: &self.durable.index,
                 receipts: &self.durable.receipts,
                 pending: false,
+                time_floor,
             };
             let position = self.durable.index.head().basis.position();
             return match TransactState::resolve_in(view, request, position, now, features, claims, authority)?.0 {
@@ -179,6 +180,7 @@ impl TransactPipeline {
             durable_index: &self.durable.index,
             receipts: &self.durable.receipts,
             pending: false,
+            time_floor,
         };
         let (resolution, after) = TransactState::resolve_in(view, request, position, now, features, claims, authority)?;
         let prepared = match resolution {

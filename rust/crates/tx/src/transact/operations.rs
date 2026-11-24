@@ -171,7 +171,7 @@ impl Candidate<'_> {
     fn write(&mut self, branch: &str, table: &TableRef, id: EntityId, valid: Interval, image: Option<Arc<RowImage>>) -> Result<()> {
         self.push(BranchEffect::Write {
             branch: branch.into(), table: table.clone(),
-            event: BranchEvent { cut: self.index.head(), id, valid, image },
+            event: BranchEvent { cut: self.index.head(), id, valid, image, written: Default::default() },
         })?;
         self.touched.insert(branch.into());
         Ok(())
@@ -421,7 +421,7 @@ fn effective_valid(valid: Option<ValidTime>, time: Timestamp) -> Result<Interval
 }
 
 fn validate_table(table: &TableRef) -> Result<()> {
-    if table.schema == "xt" || table.schema == "information_schema" || table.schema == "pg_catalog" {
+    if crate::source::is_reserved_write_schema(&table.schema) {
         return Err(Anomaly::new(AnomalyCategory::Forbidden, "rtdb/system-table", "System tables cannot be written by Transact"));
     }
     if table.schema.is_empty() || table.table.is_empty() {

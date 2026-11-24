@@ -1116,8 +1116,11 @@ async fn classic_transaction_bookkeeping_keeps_default_v1_writes_available() {
 }
 
 #[tokio::test]
-async fn classic_only_v1_read_capture_uses_the_installed_replica_catalog_and_original_iid() {
-    use rtdb_types::{EntityId, rtdb_v1::At};
+async fn classic_and_v1_writes_share_the_root_and_compare_exact_written_bases() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_index::StoredOperation;
+    use rtdb_tx::transact::{Guard, Op, Outcome, Version};
+    use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};
 
     let mut fixture = fixture(ReplicationConfig { idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
     let authority = NativeServingAuthority { incarnation: [7; 16], checkpoints: None };
@@ -1125,37 +1128,94 @@ async fn classic_only_v1_read_capture_uses_the_installed_replica_catalog_and_ori
     let driver = tokio::spawn(fixture.driver.run());
     let cancellation = CancellationToken::new();
     tokio::time::timeout(Duration::from_secs(5), async {
+        let table = TableRef::new("public", "docs");
+        let id = EntityId::Integer(27);
+        let iid = id.iid();
         let source = submit_recovery_row(&fixture.handle, &fixture.memory, 27, 100).await;
         fixture.handle.await_source(source, &cancellation).await.unwrap();
-        let (snapshot, cut) = serving.classic_read(At::Linearizable, &cancellation).await.unwrap();
-        let replica = snapshot.catalog_cut().unwrap().through;
-        assert_eq!(cut.basis.position(), u64::try_from(replica.0).unwrap() + 1);
-        assert_eq!(cut.system_time, snapshot.tx_basis().unwrap().system_time);
-        let table = TableRef::new("public", "docs");
-        let iid = EntityId::Integer(27).iid();
-        let events = snapshot.iter_segments(&table).next().unwrap().iid_headers(iid).unwrap().collect::<Vec<_>>();
-        assert_eq!(events[0].iid, iid);
-        assert!(serving.classic_read(At::Exactly(cut.basis), &cancellation).await.is_ok());
-        let delete = SourceTransaction::new(vec![TxOp::DeleteDocs {
-            table: table.clone(),
-            ids: rtdb_tx::EntityIds::new(vec![EntityId::Integer(27)], &fixture.memory).unwrap(),
-            valid_from: Some(Timestamp(0)), valid_to: None,
-        }], SubmitOptions::default(), &fixture.memory).unwrap();
-        let next = fixture.handle.submit_source_encoded(delete.encode().unwrap().into_bytes(), Timestamp(101)).await.unwrap();
-        fixture.handle.await_source(next, &cancellation).await.unwrap();
-        let (snapshot, later) = serving.classic_read(At::Linearizable, &cancellation).await.unwrap();
-        assert!(later.basis > cut.basis);
-        assert!(snapshot.iter_segments(&table).next().unwrap().iid_headers(iid).unwrap()
-            .any(|event| event.iid == iid && event.op == rtdb_types::EventOp::Delete));
-        assert!(matches!(serving.classic_read(At::Exactly(cut.basis), &cancellation).await, Err(error) if error.code == "rtdb/cursor-expired"));
+        let first = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        let first_cut = first.head();
+        let classic = first.view(MAIN_BRANCH, At::Latest, Layer::Merged, first_cut.system_time).unwrap();
+        let first_version = classic.row(&table, &id, Timestamp(0)).unwrap().written_basis().unwrap();
+        assert_eq!(first_version.incarnation(), first_cut.basis.incarnation());
+        let physical = fixture.handle.serving_partition().unwrap();
+        assert_eq!(first_cut.basis.position(), u64::try_from(physical.catalog_cut().unwrap().through.0).unwrap() + 1);
+
+        let mut request = serving_source_put(1);
+        let Op::Put { table: target, rows, .. } = &mut request.ops[0] else { unreachable!() };
+        *target = table.clone();
+        rows[0].id = id.clone();
+        rows[0].valid = Some(Interval::ALL.into());
+        request.requires.push(Guard::Version { branch: MAIN_BRANCH.into(), table: table.clone(), id: id.clone(),
+            valid_at: Some(Timestamp(0)), expect: Version::Written(first_version) });
+        let reply = serving.transact(request, VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        assert_eq!(reply.outcome, Outcome::Then);
+        let second = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        let v1 = second.view(MAIN_BRANCH, At::Latest, Layer::Merged, reply.system_time).unwrap();
+        assert_eq!(v1.row(&table, &id, Timestamp(0)).unwrap().written_basis(), Some(reply.basis));
+        let physical = fixture.handle.serving_partition().unwrap();
+        assert!(physical.iter_segments(&table).next().unwrap().iid_sources(iid, &fixture.memory).unwrap().any(|event| {
+            let (_, row) = event.unwrap();
+            matches!(row.event().unwrap().operation, StoredOperation::Put(cells) if cells.get("value") == Some(&Value::I64(1)))
+        }));
+
+        for operation in [
+            TxOp::DeleteDocs { table: table.clone(), ids: rtdb_tx::EntityIds::new(vec![id.clone()], &fixture.memory).unwrap(),
+                valid_from: Some(Timestamp(0)), valid_to: None },
+            TxOp::EraseDocs { table: table.clone(), ids: rtdb_tx::EntityIds::new(vec![id.clone()], &fixture.memory).unwrap() },
+        ] {
+            let command = SourceTransaction::new(vec![operation], SubmitOptions::default(), &fixture.memory).unwrap();
+            let source = fixture.handle.submit_source_encoded(command.encode().unwrap().into_bytes(), Timestamp(101)).await.unwrap();
+            fixture.handle.await_source(source, &cancellation).await.unwrap();
+            let index = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+            let root = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+            assert!(root.row(&table, &id, Timestamp(0)).is_none());
+        }
+        let index = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        assert!(matches!(index.view(MAIN_BRANCH, At::Exactly(first_cut.basis), Layer::Merged, index.head().system_time),
+            Err(error) if error.code == "rtdb/erased-under-view"));
     }).await.unwrap();
     fixture.handle.shutdown();
     driver.await.unwrap().unwrap();
 }
 
 #[tokio::test]
-async fn default_v1_reads_a_classic_checkpoint_that_predates_the_attachment() {
-    use rtdb_types::rtdb_v1::At;
+async fn queued_classic_sql_resolves_against_the_preceding_v1_write() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};
+
+    let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), NativeServingAuthority {
+        incarnation: [7; 16], checkpoints: None,
+    }, false).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let first = serving.transact(serving_source_put(1), VerifiedClaims::default(), None, &cancellation);
+    tokio::pin!(first);
+    assert!(futures::poll!(&mut first).is_pending());
+    assert_eq!(fixture.logs.latest_source_position().unwrap(), SourcePosition(0));
+    let update = SourceTransaction::new(vec![TxOp::Sql {
+        sql: "UPDATE intake SET \"value\" = 2 WHERE _id = 1".into(), args: None,
+    }], SubmitOptions::default(), &fixture.memory).unwrap();
+    let source = fixture.handle.submit_source_encoded(update.encode().unwrap().into_bytes(), Timestamp(500)).await.unwrap();
+    let driver = tokio::spawn(fixture.driver.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let written = first.await.unwrap();
+        fixture.handle.await_source(source, &cancellation).await.unwrap();
+        let index = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        let root = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+        let row = root.row(&TableRef::new("public", "intake"), &EntityId::Integer(1), index.head().system_time).unwrap();
+        assert_eq!(row.image.as_ref().unwrap().cells.get("value"), Some(&Value::I64(2)));
+        assert_ne!(row.written_basis(), Some(written.basis));
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn default_v1_uses_positioned_classic_rows_from_a_preexisting_checkpoint() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_tx::transact::{Guard, Op, Outcome, Version};
+    use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};
 
     let interval = Duration::from_millis(5);
     let fixture = fixture(ReplicationConfig { assertion_interval: interval, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
@@ -1170,18 +1230,72 @@ async fn default_v1_reads_a_classic_checkpoint_that_predates_the_attachment() {
     fixture.handle.shutdown();
     running.await.unwrap().unwrap();
 
-    let (handle, mut driver) = local_recovery_driver(fixture.source, fixture.replica, fixture.store, false, interval).await;
+    let (handle, mut driver) = local_recovery_driver(fixture.source, fixture.replica, fixture.store, true, interval).await;
     let serving = driver.attach_native_serving(handle.clone(), NativeServingAuthority {
         incarnation: [7; 16], checkpoints: None,
     }, false).await.unwrap();
-    assert!(serving.has_classic_read());
+    assert!(serving.is_compatible());
     let running = tokio::spawn(driver.run());
-    let (snapshot, cut) = tokio::time::timeout(Duration::from_secs(5), serving.classic_read(At::Linearizable, &cancellation))
-        .await.unwrap().unwrap();
-    let replica = snapshot.catalog_cut().unwrap().through;
-    assert!(replica >= snapshot.catalog_checkpoint().unwrap().unwrap().boundary);
-    assert_eq!(cut.basis.position(), u64::try_from(replica.0).unwrap() + 1);
-    assert!(snapshot.trie_catalog().has_current_tries(&TableRef::new("public", "docs")));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let table = TableRef::new("public", "docs");
+        let id = EntityId::Integer(41);
+        let index = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        let root = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+        let written = root.row(&table, &id, Timestamp(0)).unwrap().written_basis().unwrap();
+        let earlier = rtdb_types::rtdb_v1::Basis::new(index.head().basis.incarnation(), index.head().basis.position() - 1);
+        assert_eq!(index.exact(earlier).unwrap_err().code, "rtdb/cursor-expired");
+        let mut request = serving_source_put(1);
+        let Op::Put { table: target, rows, .. } = &mut request.ops[0] else { unreachable!() };
+        *target = table.clone();
+        rows[0].id = id.clone();
+        request.requires.push(Guard::Version { branch: MAIN_BRANCH.into(), table, id,
+            valid_at: Some(Timestamp(0)), expect: Version::Written(written) });
+        let reply = serving.transact(request, VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        assert_eq!(reply.outcome, Outcome::Then);
+    }).await.unwrap();
+    handle.shutdown();
+    running.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn default_recovers_a_shared_checkpoint_and_a_mixed_replica_suffix() {
+    use rtdb_crypt::tokens::VerifiedClaims;
+    use rtdb_types::{EntityId, rtdb_v1::{At, Layer, MAIN_BRANCH}};
+
+    let interval = Duration::from_millis(5);
+    let mut fixture = fixture(ReplicationConfig { assertion_interval: interval, idle_heartbeat: false, ..Default::default() }, 1 << 27).await;
+    let authority = || NativeServingAuthority { incarnation: [7; 16], checkpoints: None };
+    let serving = fixture.driver.attach_native_serving(fixture.handle.clone(), authority(), false).await.unwrap();
+    let running = tokio::spawn(fixture.driver.run());
+    let cancellation = CancellationToken::new();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        let first = serving.transact(serving_source_put(1), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        let flush = fixture.handle.flush().await.unwrap();
+        fixture.handle.await_source(flush, &cancellation).await.unwrap();
+        let classic = submit_recovery_row(&fixture.handle, &fixture.memory, 41, 100).await;
+        fixture.handle.await_source(classic, &cancellation).await.unwrap();
+        let second = serving.transact(serving_source_put(2), VerifiedClaims::default(), None, &cancellation).await.unwrap();
+        (first, second)
+    }).await.unwrap();
+    fixture.handle.shutdown();
+    running.await.unwrap().unwrap();
+
+    let (handle, mut driver) = local_recovery_driver(fixture.source, fixture.replica, fixture.store, false, interval).await;
+    let serving = driver.attach_native_serving(handle.clone(), authority(), false).await.unwrap();
+    let running = tokio::spawn(driver.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let index = serving.view(At::Linearizable, &cancellation).await.unwrap().index;
+        let root = index.view(MAIN_BRANCH, At::Latest, Layer::Merged, index.head().system_time).unwrap();
+        let table = TableRef::new("public", "intake");
+        for (id, receipt) in [(1, first), (2, second)] {
+            let row = root.row(&table, &EntityId::Integer(id), index.head().system_time).unwrap();
+            assert_eq!(row.written_basis(), Some(receipt.basis));
+        }
+        let physical = handle.serving_partition().unwrap();
+        assert_eq!(physical.catalog_cut().unwrap().through, handle.watch_status().borrow().installed.unwrap().replica);
+        assert!(physical.iter_segments(&table).next().is_some());
+        assert!(root.row(&TableRef::new("public", "docs"), &EntityId::Integer(41), Timestamp(0)).is_some());
+    }).await.unwrap();
     handle.shutdown();
     running.await.unwrap().unwrap();
 }

@@ -125,7 +125,8 @@ impl<'a> RetainedTableReplay<'a> {
                         self.awaiting_upload = None;
                     }
                 }
-                ReplicaBody::NoOp(_) | ReplicaBody::TriesAdded(_)
+                ReplicaBody::NoOp(message) => crate::serving::require_physical_replay_support(message)?,
+                ReplicaBody::TriesAdded(_)
                 | ReplicaBody::TriesDeleted(_) | ReplicaBody::TablesRetired(_) | ReplicaBody::ArtefactsAdded(_) | ReplicaBody::ArtefactsRemoved(_) => (),
                 ReplicaBody::OversizedMessage(_) => return Err(invalid("An oversized replica record was not resolved")),
             }

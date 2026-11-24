@@ -259,6 +259,16 @@ impl TxResolver {
         self.source_position = position;
         Ok(())
     }
+    pub fn observe_applied_serving(&mut self, key: TransactionKey) -> Result<()> {
+        if !self.queue.is_empty() || self.resolved_head().is_some_and(|previous| {
+            previous.tx_id >= key.tx_id || previous.system_time > key.system_time
+        }) {
+            return Err(Anomaly::fault("rtdb.tx/serving-predecessor", "The serving transaction does not extend the physical prefix"));
+        }
+        self.resolved_head = Some(ResolvedHead { key, receipt_time: self.latest_receipt_time() });
+        self.advance_source(self.source_position.max(SourcePosition(key.tx_id.0)))
+    }
+
     /// Transfers the oldest staged value before the read-back caller validates and applies it.
     pub fn take_head(&mut self) -> Option<Arc<ResolvedTx>> { self.queue.pop_front() }
     pub fn discard_staged(&mut self) { self.queue.clear(); }

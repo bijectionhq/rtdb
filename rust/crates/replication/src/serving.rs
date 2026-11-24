@@ -1,14 +1,15 @@
 use std::{collections::{BTreeMap, VecDeque}, sync::Arc};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_crypt::{Kms, tokens::VerifiedClaims};
 use rtdb_format::journal::ObjectId;
 use rtdb_format::{envelope::{SourceBody, SourceMessage}, log::proto};
-use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchIndex, BranchWrite}};
+use rtdb_index::{Snapshot, StagedWrite, branches::{BranchCut, BranchEffect, BranchIndex, BranchWrite}};
 use rtdb_tx::transact::{Decision, LINEARIZABLE, RELATIVE_VALID_TIME, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, TRANSACT_REQUIRES, Transact, TransactPipeline, TransactState, TransactionRecord};
 use rtdb_storage::ObjectStore;
 use rtdb_store::{Reachability, WriterObjects};
-use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, TableRef, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
+use rtdb_types::{Anomaly, AnomalyCategory, ReplicaPosition, Result, SourcePosition, Term, Timestamp, rtdb_v1::{At, Basis, LabelScope, QUERY_WRITTEN_BASIS}};
 use parking_lot::Mutex as ReplyLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot, watch};
@@ -17,6 +18,7 @@ use uuid::Uuid;
 
 use crate::ReplicationHandle;
 
+pub(crate) mod classic;
 mod source;
 use source::SourceAuthority;
 pub(crate) use source::SourceRequest;
@@ -24,8 +26,10 @@ pub(crate) use source::SourceRequest;
 const MAX_IN_FLIGHT: usize = 64;
 const MAX_CHANGE_GROUPS: usize = 4096;
 const FRAME_VERSION: u8 = 2;
+const SHARED_CHECKPOINT: u8 = b'S';
 const SOURCE_DECISION_FRAME: u8 = 3;
 const SOURCE_REPLY_FRAME: u8 = 4;
+const SHARED_DECISION_FRAME: u8 = 5;
 const SOURCE_DECISION_HEADER_BYTES: usize = FRAME_HEADER_BYTES + 8;
 const MAX_SOURCE_REPLIES: usize = 4096;
 const FRAME_HEADER_BYTES: usize = 9;
@@ -133,7 +137,7 @@ impl NativeServingHandle {
                 let snapshot = self.replication.serving_partition().ok_or_else(unavailable)?;
                 let through = snapshot.catalog_cut().ok_or_else(unavailable)?.through;
                 if through >= classic {
-                    let position = u64::try_from(through.0).ok().and_then(|offset| offset.checked_add(1)).ok_or_else(invalid)?;
+                    let position = replica_basis_position(through)?;
                     let basis = Basis::new(self.authority.incarnation, position);
                     let system_time = snapshot.tx_basis().ok_or_else(invalid)?.system_time;
                     let ready = match at {
@@ -248,6 +252,8 @@ pub(crate) struct NativeServing {
     pending: BTreeMap<u64, proto::NoOp>,
     timed_source: Option<SourcePosition>,
     pending_replies: usize,
+    shares_main: bool,
+    classic_charges: Vec<Arc<MemoryReservation>>,
     view: watch::Sender<NativeServingView>,
     pub(crate) source_authority: Arc<SourceAuthority>,
     pub(crate) source_replies: Arc<SourceReplies>,
@@ -298,7 +304,7 @@ impl ServingCheckpoint {
 
 impl NativeServing {
     pub(crate) fn open(authority: NativeServingAuthority, store: Arc<dyn ObjectStore>, checkpoint: Option<&[u8]>, collect_checkpoints: bool) -> Result<(Self, watch::Receiver<NativeServingView>)> {
-        let (fold, position) = match checkpoint {
+        let (fold, position, shared_checkpoint) = match checkpoint {
             Some(checkpoint) => {
                 let mut bytes = checkpoint;
                 let Some((cut_bytes, state)) = bytes.split_at_checked(40) else { return Err(invalid()); };
@@ -308,9 +314,11 @@ impl NativeServing {
                 bytes.advance(24);
                 let cut = BranchCut { basis, system_time: Timestamp(bytes.get_i64()) };
                 if basis.incarnation() != authority.incarnation || position < basis.position() { return Err(invalid()); }
-                (TransactState::decode_checkpoint(state, cut)?, position)
+                let shared = state.first() == Some(&SHARED_CHECKPOINT);
+                let state = if shared { &state[1..] } else { state };
+                (TransactState::decode_checkpoint(state, cut)?, position, shared)
             }
-            None => (TransactState::new(authority.incarnation), 0),
+            None => (TransactState::new(authority.incarnation), 0, false),
         };
         let (view, receiver) = watch::channel(NativeServingView {
             index: fold.index().clone(),
@@ -321,7 +329,9 @@ impl NativeServing {
         Ok((Self {
             authority, fold: Some(fold), position, pipeline: None,
             collect_checkpoints, writer: None, pending: BTreeMap::new(),
-            timed_source: None, pending_replies: 0, view, source_authority, source_replies: Arc::default(),
+            timed_source: None, pending_replies: 0,
+            shares_main: shared_checkpoint || position == 0, classic_charges: Vec::new(),
+            view, source_authority, source_replies: Arc::default(),
         }, receiver))
     }
 
@@ -329,10 +339,11 @@ impl NativeServing {
         let fold = self.durable();
         let cut = fold.index().head();
         let checkpoint = fold.encode_checkpoint()?;
-        let mut frame = BytesMut::with_capacity(40 + checkpoint.len());
+        let mut frame = BytesMut::with_capacity(41 + checkpoint.len());
         frame.put_u64(self.position);
         frame.extend_from_slice(&cut.basis.to_bytes());
         frame.put_i64(cut.system_time.0);
+        if self.shares_main { frame.put_u8(SHARED_CHECKPOINT); }
         frame.extend_from_slice(&checkpoint);
         let writer = if let Some(authority) = &self.authority.checkpoints {
             let epoch = u64::try_from(term.0).map_err(|_| invalid())?;
@@ -356,7 +367,7 @@ impl NativeServing {
         })
     }
 
-    pub(crate) fn decide_source(&mut self, source: SourcePosition, now: Timestamp, request: Result<SourceRequest>) -> Result<proto::NoOp> {
+    pub(crate) fn decide_source(&mut self, source: SourcePosition, now: Timestamp, time_floor: Option<Timestamp>, request: Result<SourceRequest>) -> Result<proto::NoOp> {
         if !self.source_ready() { return Err(invalid()); }
         let request = match request {
             Ok(_) if !self.view.borrow().compatible => return self.source_reply(source, Err(incompatible())),
@@ -372,17 +383,16 @@ impl NativeServing {
             self.pipeline = Some(TransactPipeline::new(fold, next, MAX_IN_FLIGHT)?);
         }
         let pipeline = self.pipeline.as_mut().expect("initialized serving pipeline");
-        let decision = match &request.scope {
-            Some(scope) => pipeline.decide_scoped(&request.transaction, now, SCOPED_FEATURES, &request.claims, scope.authority()),
-            None => pipeline.decide(&request.transaction, now, NATIVE_WRITE_FEATURES, &request.claims),
-        };
+        let scope = request.scope.as_ref().map(NativeServingScope::authority);
+        let features = if scope.is_some() { SCOPED_FEATURES } else { NATIVE_WRITE_FEATURES };
+        let decision = pipeline.decide_after(&request.transaction, now, features, &request.claims, scope, time_floor);
         match decision {
             Ok(Decision::Answer(receipt)) => self.source_reply(source, Ok(receipt)),
             Err(error) if error.is_caller_error() => self.source_reply(source, Err(error)),
             Err(error) => Err(error),
             Ok(Decision::Append { position, record }) => {
                 let installs_source = request.transaction.window.before.is_none();
-                let message = decision_message(position, &record, Some(source), installs_source);
+                let message = decision_message(position, &record, Some(source), installs_source, self.shares_main);
                 self.pending.insert(position, message.clone());
                 Ok(message)
             }
@@ -429,12 +439,14 @@ impl NativeServing {
             }
             None => refusal.encode()?,
         };
-        let message = decision_message(position, &record, self.timed_source, true);
+        let message = decision_message(position, &record, self.timed_source, true, self.shares_main);
         self.pending.insert(position, message.clone());
         Ok(Some(message))
     }
 
-    pub(crate) fn apply(&mut self, message: &proto::NoOp, own: bool) -> Result<Option<(SourcePosition, Result<Receipt>)>> {
+    pub(crate) fn apply(&mut self, message: &proto::NoOp, own: bool,
+        apply_main: impl FnOnce(SourcePosition, &Receipt, &BranchIndex, &[BranchEffect]) -> Result<()>,
+    ) -> Result<Option<(SourcePosition, Result<Receipt>)>> {
         let frame = message.serving_record.as_deref().ok_or_else(invalid)?;
         let installed = message.src_msg_id.map(SourcePosition);
         if frame.first() == Some(&SOURCE_REPLY_FRAME) {
@@ -451,6 +463,18 @@ impl NativeServing {
         }
         let terminal = self.durable().recover_pending().is_some();
         if terminal && source != self.timed_source { return Err(invalid()); }
+        let shared = frame.first() == Some(&SHARED_DECISION_FRAME);
+        if !shared && !terminal { self.shares_main = false; }
+        if shared != self.shares_main { return Err(invalid()); }
+        let projection = if self.shares_main && installed.is_some() {
+            let record = TransactionRecord::decode(bytes)?;
+            let effects = match record {
+                TransactionRecord::Tx(tx) => tx.effects().to_vec(),
+                TransactionRecord::Settle { .. } => self.durable().pending_effects().ok_or_else(invalid)?.to_vec(),
+                TransactionRecord::Refuse { .. } => Vec::new(),
+            };
+            Some((self.durable().index().clone(), effects))
+        } else { None };
         let receipts = match &mut self.pipeline {
             Some(pipeline) if own => pipeline.acknowledge(position)?,
             Some(pipeline) => pipeline.recover(position, bytes)?.into_iter().collect(),
@@ -466,6 +490,14 @@ impl NativeServing {
         };
         self.timed_source = None;
         if installed != source || receipts.next().is_some() || receipt.basis.position() != position { return Err(invalid()); }
+        if let Some((prior, effects)) = projection {
+            apply_main(installed.ok_or_else(invalid)?, &receipt, &prior, &effects)?;
+        }
+        self.publish_index();
+        Ok(source.map(|source| (source, Ok(receipt))))
+    }
+
+    fn publish_index(&self) {
         let index = self.durable().index();
         let cut = index.head();
         let changes = index.writes_at(cut.basis);
@@ -478,7 +510,6 @@ impl NativeServing {
             }
             retained.push_back((cut, changes));
         });
-        Ok(source.map(|source| (source, Ok(receipt))))
     }
 
     pub(crate) fn status(&self, key: &[u8], scope: Option<&NativeServingScope>) -> Result<Receipt> {
@@ -511,20 +542,69 @@ impl NativeServing {
         }
     }
 
-    pub(crate) fn recover_classic(&self, snapshot: &Snapshot, replica: Option<ReplicaPosition>) {
-        if snapshot.tx_basis().is_some() && snapshot.table_names().any(classic_data_table) {
-            self.observe_classic_data(replica);
+    pub(crate) async fn recover_classic(&mut self, snapshot: Snapshot, replica: Option<ReplicaPosition>,
+        storage: &Arc<rtdb_storage::cache::BufferPool>, memory: &Arc<MemoryBudget>, cancellation: &CancellationToken,
+        eligible: bool, projected: bool,
+    ) -> Result<()> {
+        self.shares_main &= eligible;
+        if snapshot.tx_basis().is_none() || !snapshot.table_names().any(classic::data_table) { return Ok(()); }
+        if self.shares_main && projected { return Ok(()); }
+        if self.shares_main && self.position == 0 && let Some(replica) = replica {
+            let mut index = self.durable().index().clone();
+            if let Ok(charges) = classic::recover(&mut index, snapshot, storage, memory, cancellation).await {
+                let current = index.head();
+                let covered = replica_basis_position(replica)?;
+                if covered >= current.basis.position() {
+                    if covered > current.basis.position() {
+                        index.advance_classic(BranchCut { basis: Basis::new(current.basis.incarnation(), covered), system_time: current.system_time })?;
+                    }
+                    index.seal_classic_checkpoint();
+                    self.install_classic_index(index, charges)?;
+                    let floor = self.durable().index().head().basis;
+                    self.view.send_modify(|view| {
+                        view.floor = floor;
+                        view.changes = Arc::default();
+                    });
+                    return Ok(());
+                }
+            }
         }
+        self.observe_unprojected_classic(replica);
+        Ok(())
     }
 
-    pub(crate) fn observe_classic(&self, write: &StagedWrite, replica: ReplicaPosition) {
-        let touches_data = write.tables().iter().any(|(table, write)| {
-            classic_data_table(table) && (write.batch().is_some_and(|batch| !batch.is_empty()) || !write.declared_columns().is_empty())
-        });
-        if touches_data { self.observe_classic_data(Some(replica)); }
+    pub(crate) fn shares_main(&self) -> bool { self.shares_main }
+
+    pub(crate) fn main_write_pending(&self) -> bool { self.shares_main && !self.pending.is_empty() }
+
+    pub(crate) fn is_shared_checkpoint(bytes: &[u8]) -> bool { bytes.get(40) == Some(&SHARED_CHECKPOINT) }
+
+    pub(crate) fn observe_classic(&mut self, write: &StagedWrite, replica: ReplicaPosition, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if !classic::touches_data(write) { return Ok(()); }
+        if self.shares_main {
+            if self.main_write_pending() || self.holds_checkpoint() { return Err(invalid()); }
+            let mut index = self.durable().index().clone();
+            let mut charges = Vec::new();
+            let position = self.next_position()?.max(replica_basis_position(replica)?);
+            if classic::apply_live(&mut index, position, write, memory, &mut charges).is_ok() {
+                return self.install_classic_index(index, charges);
+            }
+        }
+        self.observe_unprojected_classic(Some(replica));
+        Ok(())
     }
 
-    fn observe_classic_data(&self, replica: Option<ReplicaPosition>) {
+    fn install_classic_index(&mut self, index: BranchIndex, charges: Vec<Arc<MemoryReservation>>) -> Result<()> {
+        if let Some(pipeline) = self.pipeline.take() { self.fold = Some(pipeline.into_durable()); }
+        self.position = index.head().basis.position();
+        self.fold.as_mut().ok_or_else(invalid)?.replace_applied_index(index)?;
+        self.classic_charges.extend(charges);
+        self.publish_index();
+        Ok(())
+    }
+
+    fn observe_unprojected_classic(&mut self, replica: Option<ReplicaPosition>) {
+        self.shares_main = false;
         self.view.send_modify(|view| {
             view.compatible = false;
             view.classic_head = replica;
@@ -532,12 +612,16 @@ impl NativeServing {
     }
 }
 
-impl Drop for NativeServing {
-    fn drop(&mut self) { self.withdraw(); }
+pub(crate) fn require_physical_replay_support(message: &proto::NoOp) -> Result<()> {
+    if message.serving_record.as_deref().and_then(|frame| frame.first()) == Some(&SHARED_DECISION_FRAME) {
+        return Err(Anomaly::unsupported("rtdb/shared-suffix-replay", "This replay path requires the shared transaction fold"));
+    }
+    Ok(())
 }
 
-fn classic_data_table(table: &TableRef) -> bool {
-    !(table.stores_expiring_transaction_metadata() || table.schema == "xt" && matches!(table.table.as_str(), "txs" | "role_membership"))
+fn replica_basis_position(replica: ReplicaPosition) -> Result<u64> {
+    let position = replica.0.checked_add(1).ok_or_else(invalid)?;
+    u64::try_from(position).map_err(|_| invalid())
 }
 
 fn project_receipt(index: &BranchIndex, mut receipt: Receipt, scope: Option<&NativeServingScope>) -> Result<Receipt> {
@@ -549,9 +633,14 @@ fn project_receipt(index: &BranchIndex, mut receipt: Receipt, scope: Option<&Nat
     Ok(receipt)
 }
 
-fn decision_message(position: u64, record: &[u8], source: Option<SourcePosition>, installs_source: bool) -> proto::NoOp {
+fn decision_message(position: u64, record: &[u8], source: Option<SourcePosition>, installs_source: bool, shared: bool) -> proto::NoOp {
     let mut frame = BytesMut::with_capacity(SOURCE_DECISION_HEADER_BYTES + record.len());
-    frame.put_u8(if source.is_some() { SOURCE_DECISION_FRAME } else { FRAME_VERSION });
+    let version = match (source, shared) {
+        (Some(_), true) => SHARED_DECISION_FRAME,
+        (Some(_), false) => SOURCE_DECISION_FRAME,
+        (None, _) => FRAME_VERSION,
+    };
+    frame.put_u8(version);
     frame.put_u64(position);
     if let Some(source) = source { frame.put_i64(source.0); }
     frame.extend_from_slice(record);
@@ -572,7 +661,7 @@ fn invalid_source_request() -> Anomaly {
 
 fn decode(frame: &[u8]) -> Result<(u64, Option<SourcePosition>, &[u8])> {
     let header_len = match frame.first().copied() {
-        Some(SOURCE_DECISION_FRAME) => SOURCE_DECISION_HEADER_BYTES,
+        Some(SOURCE_DECISION_FRAME | SHARED_DECISION_FRAME) => SOURCE_DECISION_HEADER_BYTES,
         Some(FRAME_VERSION) => FRAME_HEADER_BYTES,
         Some(1) => LEGACY_FRAME_HEADER_BYTES,
         _ => return Err(invalid()),
@@ -651,19 +740,19 @@ mod tests {
             let mut request = put(1);
             request.window.before = Some(Timestamp(80));
             let source = SourcePosition(8);
-            let original = leader.decide_source(source, Timestamp(50), Ok(unscoped(request))).unwrap();
+            let original = leader.decide_source(source, Timestamp(50), None, Ok(unscoped(request))).unwrap();
             assert_eq!(original.src_msg_id, None);
             assert!(!leader.source_ready());
-            assert!(leader.apply(&original, true).unwrap().is_none());
-            assert!(follower.apply(&original, false).unwrap().is_none());
+            assert!(leader.apply(&original, true, |_, _, _, _| Ok(())).unwrap().is_none());
+            assert!(follower.apply(&original, false, |_, _, _, _| Ok(())).unwrap().is_none());
             assert_eq!(view.borrow().index.head().basis.position(), 0);
             assert_eq!(leader.status(&[1; 16], None).unwrap_err().code, "rtdb/transaction-pending");
 
             let terminal = leader.progress_timed(upper).unwrap().unwrap();
             assert!(!leader.source_ready());
-            let (applied, result) = leader.apply(&terminal, true).unwrap().unwrap();
+            let (applied, result) = leader.apply(&terminal, true, |_, _, _, _| Ok(())).unwrap().unwrap();
             assert_eq!(applied, source);
-            assert_eq!(follower.apply(&terminal, false).unwrap(), Some((applied, result.clone())));
+            assert_eq!(follower.apply(&terminal, false, |_, _, _, _| Ok(())).unwrap(), Some((applied, result.clone())));
             let receipt = result.unwrap();
             assert_eq!(receipt.basis.position(), 2);
             assert_eq!(matches!(receipt.outcome, rtdb_tx::transact::Outcome::Then), settled);
@@ -677,19 +766,19 @@ mod tests {
         let mut request = put(1);
         request.window.before = Some(Timestamp(80));
         let source = SourcePosition(9);
-        let message = original.decide_source(source, Timestamp(50), Ok(unscoped(request.clone()))).unwrap();
+        let message = original.decide_source(source, Timestamp(50), None, Ok(unscoped(request.clone()))).unwrap();
         let (mut successor, _) = open(None);
-        assert!(successor.apply(&message, false).unwrap().is_none());
+        assert!(successor.apply(&message, false, |_, _, _, _| Ok(())).unwrap().is_none());
         successor.withdraw();
         let terminal = successor.progress_timed(Timestamp(52)).unwrap().unwrap();
-        let (completed, receipt) = successor.apply(&terminal, true).unwrap().unwrap();
+        let (completed, receipt) = successor.apply(&terminal, true, |_, _, _, _| Ok(())).unwrap().unwrap();
         assert_eq!(completed, source);
         let receipt = receipt.unwrap();
         assert!(matches!(&receipt.outcome,
             rtdb_tx::transact::Outcome::Refused { error } if error.code == "rtdb/timed-transaction-refused"));
         let next = SourcePosition(10);
-        let retry = successor.decide_source(next, Timestamp(53), Ok(unscoped(request))).unwrap();
-        let (retried_at, retry) = successor.apply(&retry, true).unwrap().unwrap();
+        let retry = successor.decide_source(next, Timestamp(53), None, Ok(unscoped(request))).unwrap();
+        let (retried_at, retry) = successor.apply(&retry, true, |_, _, _, _| Ok(())).unwrap().unwrap();
         assert_eq!(retried_at, next);
         assert!(retry.as_ref().unwrap().replayed);
         assert_eq!(retry.unwrap().basis, receipt.basis);
@@ -698,8 +787,8 @@ mod tests {
     #[test]
     fn serving_source_takes_over_from_the_read_back_prefix() {
         let (mut serving, view) = open(None);
-        let first = serving.decide_source(SourcePosition(2), Timestamp(41), Ok(unscoped(put(1)))).unwrap();
-        let excluded = serving.decide_source(SourcePosition(3), Timestamp(41), Ok(unscoped(put(2)))).unwrap();
+        let first = serving.decide_source(SourcePosition(2), Timestamp(41), None, Ok(unscoped(put(1)))).unwrap();
+        let excluded = serving.decide_source(SourcePosition(3), Timestamp(41), None, Ok(unscoped(put(2)))).unwrap();
         let (position, source, bytes) = decode(first.serving_record.as_deref().unwrap()).unwrap();
         let TransactionRecord::Tx(record) = TransactionRecord::decode(bytes).unwrap() else { panic!() };
         assert_eq!((position, source), (1, Some(SourcePosition(2))));
@@ -710,12 +799,12 @@ mod tests {
         assert_eq!(view.borrow().index.head().basis.position(), 0);
 
         serving.withdraw();
-        assert_eq!(serving.apply(&first, false).unwrap().unwrap().0, SourcePosition(2));
+        assert_eq!(serving.apply(&first, false, |_, _, _, _| Ok(())).unwrap().unwrap().0, SourcePosition(2));
         assert!(serving.status(&[1; 16], None).unwrap().replayed);
         assert_eq!(serving.status(&[2; 16], None).unwrap_err().code, "rtdb/unknown-transaction");
-        let reread = serving.decide_source(SourcePosition(3), Timestamp(42), Ok(unscoped(put(2)))).unwrap();
-        assert!(serving.apply(&excluded, true).is_err());
-        assert_eq!(serving.apply(&reread, true).unwrap().unwrap().1.unwrap().basis.position(), 2);
+        let reread = serving.decide_source(SourcePosition(3), Timestamp(42), None, Ok(unscoped(put(2)))).unwrap();
+        assert!(serving.apply(&excluded, true, |_, _, _, _| Ok(())).is_err());
+        assert_eq!(serving.apply(&reread, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap().basis.position(), 2);
 
         let image = serving.checkpoint(Term(2), true).unwrap().image;
         let (recovered, _) = open(Some(&image));
@@ -729,12 +818,12 @@ mod tests {
             let (mut follower, _) = open(None);
             for batch in (1..=24).collect::<Vec<u8>>().chunks(batch_size) {
                 let messages = batch.iter().map(|&key| {
-                    leader.decide_source(SourcePosition(i64::from(key) * 2), Timestamp(50), Ok(unscoped(put(key)))).unwrap()
+                    leader.decide_source(SourcePosition(i64::from(key) * 2), Timestamp(50), None, Ok(unscoped(put(key)))).unwrap()
                 }).collect::<Vec<_>>();
                 for (&key, message) in batch.iter().zip(messages) {
-                    let (position, reply) = leader.apply(&message, true).unwrap().unwrap();
+                    let (position, reply) = leader.apply(&message, true, |_, _, _, _| Ok(())).unwrap().unwrap();
                     assert_eq!(position, SourcePosition(i64::from(key) * 2));
-                    assert_eq!(follower.apply(&message, false).unwrap(), Some((position, reply.clone())));
+                    assert_eq!(follower.apply(&message, false, |_, _, _, _| Ok(())).unwrap(), Some((position, reply.clone())));
                     assert_eq!(reply.unwrap().basis.position(), u64::from(key));
                 }
             }
@@ -752,8 +841,8 @@ mod tests {
             table: TableRef::new("public", "items"),
             change: Declaration::Visibility(Visibility { column: "label".into() }),
         }];
-        let declared = serving.decide_source(SourcePosition(1), Timestamp(40), Ok(unscoped(declaration))).unwrap();
-        assert_eq!(serving.apply(&declared, true).unwrap().unwrap().1.unwrap().outcome, Outcome::Then);
+        let declared = serving.decide_source(SourcePosition(1), Timestamp(40), None, Ok(unscoped(declaration))).unwrap();
+        assert_eq!(serving.apply(&declared, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap().outcome, Outcome::Then);
 
         let scope = NativeServingScope {
             labels: LabelScope { read: [vec![7]].into_iter().collect(), write: [vec![7]].into_iter().collect() },
@@ -764,8 +853,8 @@ mod tests {
         rows[0].valid = Some(rtdb_types::Interval::ALL.into());
         rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![7])));
         let request = NativeRequest { transaction: submission, claims: source::SourceClaims::default(), scope: Some(scope.clone()) };
-        let message = serving.decide_source(SourcePosition(2), Timestamp(41), Ok(request)).unwrap();
-        let receipt = serving.apply(&message, true).unwrap().unwrap().1.unwrap();
+        let message = serving.decide_source(SourcePosition(2), Timestamp(41), None, Ok(request)).unwrap();
+        let receipt = serving.apply(&message, true, |_, _, _, _| Ok(())).unwrap().unwrap().1.unwrap();
         let receipt = project_receipt(serving.durable().index(), receipt, Some(&scope)).unwrap();
         assert_eq!(receipt.outcome, Outcome::Then);
         assert_eq!(receipt.basis.incarnation(), scope.labels.main_read_incarnation(INCARNATION));

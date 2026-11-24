@@ -39,7 +39,7 @@ pub fn branch_snapshot_with(
                 if let Some(image) = &event.image
                     && put_until > event.valid.lower()
                 {
-                    target.push((table, id, Interval::new(event.valid.lower(), put_until)?, event.cut, Some(image.as_ref())));
+                    target.push((table, id, Interval::new(event.valid.lower(), put_until)?, event.cut, Some((image.as_ref(), event.written_basis()))));
                 }
                 if put_until < event.valid.upper() {
                     target.push((table, id, Interval::new(put_until, event.valid.upper())?, event.cut, None));
@@ -55,13 +55,13 @@ pub fn branch_snapshot_with(
         let system_time = events.first().map_or(head.system_time, |(_, _, _, cut, _)| cut.system_time);
         let mut buffer = TransactionBuffer::new(before, tx_key(BranchCut { basis, system_time })?, Arc::clone(memory))?;
         for (table, id, valid_time, _, image) in events {
-            let operation = if let Some(image) = image {
+            let operation = if let Some((image, written)) = image {
                 let mut cells = open_image(image)?;
-                cells.insert(WRITTEN_BASIS_COLUMN.into(), basis_value(basis));
+                cells.insert(WRITTEN_BASIS_COLUMN.into(), written.map_or(Value::Null, basis_value));
                 StoredOperation::Put(cells)
             } else { StoredOperation::Delete };
             buffer.append(table.clone(), StoredEvent {
-                position: None, origin: None, commit_position: 0, entity_key: None, iid: id.iid(),
+                position: None, origin: None, commit_position: 0, entity_key: None, iid: view.physical_iid(table, id),
                 system_from: system_time, valid_time, operation, recency: None,
             })?;
         }

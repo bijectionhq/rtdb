@@ -25,7 +25,7 @@ use crate::progress::{AppliedTransaction, DriverRestart, stopped, term_ended};
 use crate::readback_identity::{TransactionEvent, matching_present_integer, own_readback_term, readback_matches_transaction, transaction_completion};
 use crate::state::fail_pending;
 use crate::serving::{self, NativeRequest, NativeServing, NativeServingAuthority, NativeServingHandle, NativeServingScope, SourceRequest};
-use rtdb_tx::transact::Receipt as ServingReceipt;
+use rtdb_tx::transact::{Outcome as ServingOutcome, Receipt as ServingReceipt};
 
 #[async_trait]
 pub trait DatabaseEffects: Send + Sync {
@@ -95,6 +95,18 @@ pub struct InstalledPrefix {
 pub struct CommittedErasure {
     pub transaction: TransactionKey,
     pub position: ReplicaPosition,
+}
+
+fn first_write_erasure(position: ReplicaPosition, write: &StagedWrite) -> Result<Option<CommittedErasure>> {
+    for table in write.tables().values() {
+        let Some(batch) = table.batch() else { continue; };
+        for row in 0..batch.len() {
+            if batch.header(row)?.op == EventOp::Erase {
+                return Ok(Some(CommittedErasure { transaction: write.tx_key(), position }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Debug)]
@@ -433,6 +445,7 @@ struct SourceInput {
 enum StrictSource {
     Transaction(SourceInput),
     Serving { position: SourcePosition, request: SourceRequest },
+    Physical { record: LogRecord, decode: Arc<MemoryReservation> },
     Compaction {
         position: SourcePosition,
         log_time: Timestamp,
@@ -577,10 +590,12 @@ impl ReplicationDriver {
             None => None,
         };
         let store = Arc::clone(self.resolve.storage.object_store());
-        let (serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_deref(), collect_checkpoints)?;
-        if let Some(block) = block.as_ref() {
-            serving.recover_classic(&self.partition.snapshot(), block.boundary_replica_position());
-        }
+        let (mut serving, view) = NativeServing::open(authority.clone(), store, checkpoint.as_deref(), collect_checkpoints)?;
+        serving.recover_classic(self.partition.snapshot(), block.as_ref().and_then(|block| block.boundary_replica_position()),
+            &self.resolve.storage, &self.resolve.memory, &self.cancellation,
+            self.resolve.owned_witness_scope.is_none() && !self.config.external_source,
+            checkpoint.as_deref().is_some_and(NativeServing::is_shared_checkpoint),
+        ).await?;
         let source_authority = Arc::clone(&serving.source_authority);
         let source_replies = Arc::clone(&serving.source_replies);
         self.serving = Some(serving);
@@ -589,7 +604,7 @@ impl ReplicationDriver {
 
     async fn apply_transaction(&mut self, write: &StagedWrite, search_delta: Option<SearchDelta>, replica: ReplicaPosition) -> Result<()> {
         self.install_classic_transaction(write, search_delta).await?;
-        if let Some(serving) = &self.serving { serving.observe_classic(write, replica); }
+        if let Some(serving) = &mut self.serving { serving.observe_classic(write, replica, &self.resolve.memory)?; }
         Ok(())
     }
 
@@ -1031,15 +1046,8 @@ impl ReplicationDriver {
             open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
     }
     fn observe_erasure(&mut self, position: ReplicaPosition, write: &StagedWrite) -> Result<()> {
-        if !self.track_catalog_cut || self.first_erasure.is_some() { return Ok(()); }
-        for (_, table) in write.tables() {
-            let Some(batch) = table.batch() else { continue; };
-            for row in 0..batch.len() {
-                if batch.header(row)?.op == EventOp::Erase {
-                    self.first_erasure = Some(CommittedErasure { transaction: write.tx_key(), position });
-                    return Ok(());
-                }
-            }
+        if self.track_catalog_cut && self.first_erasure.is_none() {
+            self.first_erasure = first_write_erasure(position, write)?;
         }
         Ok(())
     }
@@ -1488,11 +1496,32 @@ impl ReplicationDriver {
                         if message.src_msg_id.is_some_and(|source| SourcePosition(source) <= self.progress.source_position()) {
                             return Err(invalid("A serving result did not advance the source prefix"));
                         }
+                        let partition = &self.partition;
+                        let memory = &self.resolve.memory;
                         let serving = self.serving.as_mut().ok_or_else(serving::unavailable)?;
                         let held = serving.holds_checkpoint();
-                        if let Some((source, reply)) = serving.apply(message, own)? {
+                        let mut physical = None;
+                        let mut first_erasure = None;
+                        let ready = serving.apply(message, own, |source, receipt, prior, effects| {
+                            let key = TransactionKey { tx_id: TxId(source.0), system_time: receipt.system_time };
+                            let write = serving::classic::stage_main(partition.snapshot(), prior, key, effects, memory)?;
+                            let result = match &receipt.outcome {
+                                ServingOutcome::Refused { error } => TransactionResult::Aborted { tx_key: key,
+                                    error: Some(rtdb_tx::RetainedAnomaly::new(error.clone(), memory)?) },
+                                _ => TransactionResult::Committed { tx_key: key },
+                            };
+                            first_erasure = first_write_erasure(record.metadata.position, &write)?;
+                            partition.apply(&write)?;
+                            physical = Some(Arc::new(result));
+                            Ok(())
+                        })?;
+                        if self.track_catalog_cut && self.first_erasure.is_none() { self.first_erasure = first_erasure; }
+                        if let Some((source, reply)) = ready {
+                            if let Some(result) = &physical && let Some(leader) = &mut self.leader {
+                                leader.resolver_mut()?.observe_applied_serving(result.tx_key())?;
+                            }
                             serving.source_replies.publish(source, reply);
-                            self.progress.applied(Some(source), None, None)?;
+                            self.progress.applied(Some(source), physical.map(|result| AppliedTransaction::new(result, None)), None)?;
                         }
                         released_checkpoint = held && !serving.holds_checkpoint();
                         if released_checkpoint {
@@ -1669,17 +1698,19 @@ impl ReplicationDriver {
     }
     async fn resolve_next_source(&mut self) -> Result<()> {
         let Some(leader) = &mut self.leader else { return Ok(()); };
-        if leader.waiting_strict_source.is_some() {
+        let deferred = if leader.waiting_strict_source.is_some() {
             if !leader.ready_source() { return Ok(()); }
             let source = leader.waiting_strict_source.take().expect("checked for a waiting strict source");
-            return match source {
-                StrictSource::Transaction(source) => self.admit_source(source),
-                StrictSource::Serving { position, request } => self.admit_serving_source(position, Ok(request)).await,
+            match source {
+                StrictSource::Physical { record, decode } => Some((record, Some(decode))),
+                StrictSource::Transaction(source) => return self.admit_source(source),
+                StrictSource::Serving { position, request } => return self.admit_serving_source(position, Ok(request)).await,
                 StrictSource::Compaction { position, log_time, message, _decode_charge } =>
-                    self.admit_fact_compaction(position, log_time, message).await,
-            };
-        }
-        let (LogRecord { metadata, payload, .. }, decode_reservation) = if let Some(head) = leader.source_head {
+                    return self.admit_fact_compaction(position, log_time, message).await,
+            }
+        } else { None };
+        let (record, decode_reservation) = if let Some(deferred) = deferred { deferred }
+        else if let Some(head) = leader.source_head {
             let tail = leader.source_tail.as_mut().ok_or_else(|| invalid("Prepared source head has no tail"))?;
             let Some(record) = read_replay_head(tail, head, &self.resolve.memory, source_decode_bound, &self.cancellation).await? else { return Ok(()); };
             leader.source_head = None;
@@ -1688,12 +1719,22 @@ impl ReplicationDriver {
             let Some(record) = leader.source_batch.pop_front() else { return Ok(()); };
             (record, None)
         };
+        let metadata = record.metadata;
         let position = self.logs.source_position(metadata)?;
         let decode_charge = match decode_reservation {
             Some(reservation) => reservation,
-            None => self.resolve.memory.reserve(source_decode_bound(payload.len())?)?,
+            None => self.resolve.memory.reserve(source_decode_bound(record.payload.len())?)?,
         };
-        let message = SourceMessage::decode_bytes(payload.clone())?;
+        let message = SourceMessage::decode_bytes(record.payload.clone())?;
+        if self.serving.as_ref().is_some_and(NativeServing::main_write_pending)
+            && matches!(&message, Some(SourceMessage::LegacyTransaction(_) | SourceMessage::Protobuf(
+                SourceBody::Tx(_) | SourceBody::AttachDatabase(_) | SourceBody::DetachDatabase(_)
+            )))
+        {
+            leader.waiting_strict_source = Some(StrictSource::Physical { record, decode: decode_charge });
+            return Ok(());
+        }
+        let payload = record.payload;
         let durable = self.partition.snapshot();
         let leader = self.leader.as_mut().ok_or_else(term_ended)?;
         if position <= leader.resolver()?.source_position() { return Err(invalid("Source reader did not advance")); }
@@ -1809,7 +1850,9 @@ impl ReplicationDriver {
             }
             request => request,
         };
-        let message = serving.decide_source(position, (self.clock)(), request)?;
+        let time_floor = serving.shares_main().then(|| leader.resolver().map(|resolver| resolver.resolved_head()))
+            .transpose()?.flatten().map(|key| key.system_time);
+        let message = serving.decide_source(position, (self.clock)(), time_floor, request)?;
         let block = self.partition.value().live().block_index();
         leader.cycle.resolved(1)?;
         leader.enqueue(WriteBody::Message(ReplicaBody::NoOp(message)), block, None, &self.resolve.memory)?;

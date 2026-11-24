@@ -20,7 +20,7 @@ surface StatelessDatabase {
     @guarantee CapabilityDiscovery
         -- A caller learns which operations and optional features the selected route can serve.
         -- An unavailable optional feature returns its name for comparison with Capabilities.
-        -- A default attachment with Classic data and an empty branch fold advertises queries on merged main at its published replica cut.
+        -- A default attachment can serve guarded v1 writes over Classic effects covered by the shared main-branch fold.
 
     @guarantee CapturedRead
         -- Each successful query reports the basis of the database cut used for its rows.
@@ -69,6 +69,8 @@ surface StatelessDatabase {
     @guarantee WrittenBasis
         -- Where advertised, a caller can explicitly select _rtdb_written_basis for a visible row version.
         -- It names the row version rather than the selected query cut and can be supplied to a Version guard.
+        -- A Classic written basis keeps the transaction identity preserved by the resolved record or the retained event position.
+        -- An imported legacy row without transaction provenance returns a null written basis.
         -- For a scoped query, the returned basis uses the reader's projection domain.
 
     @guarantee TokenAuthority
