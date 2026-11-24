@@ -5926,16 +5926,7 @@ impl Service {
     }
 
     fn owned_point_reply(&self, schema: &Schema, batch: Option<&RecordBatch>, present: Timestamp, valid: Timestamp, revision: Option<Timestamp>) -> Result<ActionResult, Status> {
-        self.owned_point_reply_in(self.memory(), schema, batch, present, valid, revision, None, None)
-    }
-
-    fn owned_point_reply_in(
-        &self, memory: &Arc<MemoryBudget>, schema: &Schema, batch: Option<&RecordBatch>,
-        present: Timestamp, valid: Timestamp, revision: Option<Timestamp>, until: Option<Timestamp>,
-        selection: Option<&mut SelectionEncoder>,
-    ) -> Result<ActionResult, Status> {
-        let format = selection.map_or(OwnedReplyFormat::Unary, OwnedReplyFormat::Selection);
-        self.encode_owned_point_reply(memory, schema, batch, present, valid, revision, until, format)
+        self.encode_owned_point_reply(self.memory(), schema, batch, present, valid, revision, None, OwnedReplyFormat::Unary)
             .map(OwnedIpcReply::into_unary)
     }
 
@@ -5990,14 +5981,6 @@ impl Service {
             OwnedReplyFormat::StreamV1 => true,
         };
         self.encode_owned_stream_reply(memory, &schema, batch.as_ref().map(std::slice::from_ref).unwrap_or_default(), stream)
-    }
-
-    fn owned_stream_reply(&self, schema: &Schema, pages: &[RecordBatch]) -> Result<ActionResult, Status> {
-        self.owned_stream_reply_in(self.memory(), schema, pages)
-    }
-
-    fn owned_stream_reply_in(&self, memory: &Arc<MemoryBudget>, schema: &Schema, pages: &[RecordBatch]) -> Result<ActionResult, Status> {
-        self.encode_owned_stream_reply(memory, schema, pages, false).map(OwnedIpcReply::into_unary)
     }
 
     fn encode_owned_stream_reply(

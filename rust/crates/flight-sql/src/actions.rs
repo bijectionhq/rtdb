@@ -231,10 +231,14 @@ impl Service {
                     return self.create_owned_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::OBSERVE_HELD_HOSTED_V1 => Ok(vec![Ok(self.observe_held_hosted_action(&call, &action.body).await?)]),
                 crate::owned_actions::CONFIRM_APPLIED_HOSTED_V6 => Ok(vec![Ok(self.confirm_applied_hosted_action(&call, &action.body).await?)]),
-                crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 => Ok(vec![Ok(Box::pin(self.confirm_hosted_source_action(&call, &action.body)).await?)]),
-                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V3 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body, false).await?)]),
-                crate::owned_actions::READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1 => Ok(vec![Ok(self.read_held_hosted_control_action(&call, &action.body, true).await?)]),
-                crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 => Ok(vec![Ok(Box::pin(self.read_held_root_catalog_action(&call, &action.body)).await?)]),
+                crate::owned_actions::CONFIRM_HOSTED_SOURCE_V1 =>
+                    return Box::pin(self.confirm_hosted_source_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
+                crate::owned_actions::READ_HELD_HOSTED_CONTROL_V3 | crate::owned_actions::READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1 => {
+                    let positioned = action_type == crate::owned_actions::READ_HELD_HOSTED_CONTROL_AT_PUBLICATION_V1;
+                    return self.read_held_hosted_control_action(&call, &action.body, positioned, reply_format).await.map(ActionReplies::Owned);
+                }
+                crate::owned_actions::READ_HELD_ROOT_CATALOG_V1 =>
+                    return Box::pin(self.read_held_root_catalog_action(&call, &action.body, ipc_stream)).await.map(ActionReplies::Owned),
                 crate::owned_actions::OFFER_FUNDED_MUTATION_CLOCK_V1 => Ok(vec![Ok(self.offer_funded_mutation_clock_action(&call, &action.body).await?)]),
                 crate::owned_actions::OFFER_CLOCK_SLOT_V2 => Ok(vec![Ok(self.offer_clock_slot_action(&call, &action.body).await?)]),
                 COMMIT_OWNED_V1 | COMMIT_OWNED_V2 => {
@@ -341,7 +345,8 @@ impl Service {
                 crate::owned_actions::HELD_OWNED_CHANGES_V3 =>
                     return self.held_owned_changes_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::READ_HELD_UNIQUE_V1 => Ok(vec![Ok(self.held_owned_unique_action(&call, &action.body).await?)]),
-                crate::owned_actions::READ_HELD_UNIQUE_WINDOW_V1 => Ok(vec![Ok(self.held_owned_unique_window_action(&call, &action.body).await?)]),
+                crate::owned_actions::READ_HELD_UNIQUE_WINDOW_V1 =>
+                    return self.held_owned_unique_window_action(&call, &action.body, ipc_stream).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POINT_V1 =>
                     return self.held_owned_point(&call, &action.body, PointTime::Default, false, reply_format).await.map(ActionReplies::Owned),
                 crate::owned_actions::HELD_OWNED_POINT_V2 =>

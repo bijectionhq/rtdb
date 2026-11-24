@@ -73,7 +73,8 @@ fn applied_point(body: &[u8]) -> Result<(Option<AppliedOwnedPoint>, &[u8]), Stat
 }
 
 impl Service {
-    pub(crate) async fn confirm_hosted_source_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
+    pub(crate) async fn confirm_hosted_source_action(&self, call: &Call, body: &[u8], stream: bool)
+        -> Result<OwnedIpcReply, Status> {
         self.hosted_control_policy(call)?;
         let (history, suffix) = body.split_first_chunk::<16>()
             .ok_or_else(|| invalid("The hosted source confirmation requires a history"))?;
@@ -93,7 +94,7 @@ impl Service {
             ("tx_id", Arc::new(Int64Array::from(vec![applied.map(|key| key.tx_id.0)])) as ArrayRef, true),
             ("system_time_micros", Arc::new(Int64Array::from(vec![applied.map(|key| key.system_time.0)])), true),
         ]).map_err(arrow)?;
-        self.owned_stream_reply_in(call.memory(), rows.schema_ref(), std::slice::from_ref(&rows))
+        self.encode_owned_stream_reply(call.memory(), rows.schema_ref(), std::slice::from_ref(&rows), stream)
     }
 
     pub(crate) async fn prepare_applied_read_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {

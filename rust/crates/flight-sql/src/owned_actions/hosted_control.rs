@@ -25,7 +25,8 @@ impl Service {
         &self,
         call: &Call,
         body: &[u8],
-    ) -> Result<ActionResult, Status> {
+        stream: bool,
+    ) -> Result<OwnedIpcReply, Status> {
         if !self.0.config.owned_native_actions { return Err(unsupported()); }
         if call.session.audience_source().is_some()
             || call.session.caller.principal.user_id().is_none()
@@ -74,7 +75,7 @@ impl Service {
         let pages = retained.iter().map(|page| {
             RecordBatch::try_new(Arc::clone(&schema), page.batch().columns().to_vec())
         }).collect::<Result<Vec<_>, _>>().map_err(arrow)?;
-        let reply = self.owned_stream_reply_in(call.memory(), &schema, &pages)?;
+        let reply = self.encode_owned_stream_reply(call.memory(), &schema, &pages, stream)?;
         held.snapshot.check().map_err(status)?;
         Ok(reply)
     }
@@ -118,7 +119,8 @@ impl Service {
         call: &Call,
         envelope: &Bytes,
         positioned: bool,
-    ) -> Result<ActionResult, Status> {
+        reply_format: OwnedReplyFormat<'_>,
+    ) -> Result<OwnedIpcReply, Status> {
         let policy = self.hosted_control_policy(call)?;
         let (handle, body) = envelope
             .split_first_chunk::<16>()
@@ -195,7 +197,7 @@ impl Service {
                     metadata.insert("rtdb.owned.receipt_tx_id".into(), tx_id.to_string());
                     schema = schema.with_metadata(metadata);
                 }
-                self.owned_point_reply_in(
+                self.encode_owned_point_reply(
                     call.memory(),
                     &schema,
                     Some(&row),
@@ -203,13 +205,13 @@ impl Service {
                     Timestamp(0),
                     Some(revision),
                     None,
-                    None,
+                    reply_format,
                 )?
             }
             None => {
                 let schema = wire::plan_schema(point.schema.schema(), call.memory())?;
                 let schema = schema.project(&fields(&schema)).map_err(arrow)?;
-                self.owned_point_reply_in(call.memory(), &schema, None, present, Timestamp(0), None, None, None)?
+                self.encode_owned_point_reply(call.memory(), &schema, None, present, Timestamp(0), None, None, reply_format)?
             }
         };
         held.snapshot.check().map_err(status)?;
