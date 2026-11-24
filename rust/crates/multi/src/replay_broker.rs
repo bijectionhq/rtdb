@@ -169,6 +169,14 @@ impl Client {
         Ok(Self(Arc::new(ClientRoute::Standalone { service, tasks })))
     }
 
+    pub(crate) async fn settle_local_closed_generation(&self, deployment: &str, generation: Uuid) -> Result<()> {
+        let ClientRoute::Standalone { service, tasks } = self.0.as_ref() else { return Err(refused()); };
+        let service = Arc::clone(service);
+        let deployment = deployment.to_owned();
+        tasks.spawn(async move { service.settle_local_closed_generation(&deployment, generation).await })
+            .await.map_err(transport)?
+    }
+
     /// Send a custody-domain command through the original broker's route.
     pub async fn custody_domain(&self, domain: Uuid, command: domain::Action) -> Result<domain::View> {
         let ClientRoute::Remote(remote) = self.0.as_ref() else { return Err(refused()); };
@@ -675,13 +683,13 @@ impl Service {
         let reference = decode_reference(frame)?;
         let region = Uuid::new_v4();
         let local = match self.custody {
-            ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
+            ReplayCustody::Local => Some(Arc::new(self.keys.hold_local_storage_region(region)?.ok_or_else(refused)?)),
             ReplayCustody::Hosted { .. } => None,
         };
         let mut attempted = false;
         let result = async {
             let record = Arc::new(self.admit_read(history, ticket, position, region, &mut attempted).await?);
-            let io = IoRegion::new();
+            let io = IoRegion::new().child_holding(local.as_ref().map(|witness| witness.clone() as Arc<dyn Send + Sync>));
             let held = HeldView::recovery(Arc::new((record.clone(), region, position)));
             let read = IoRegion::reading(held, async {
                 let plaintext = PlaintextView::new(memory.clone());
@@ -740,9 +748,12 @@ impl Service {
                 return Ok(Some(version));
             }
         }
+        let transfer_namespace = if matches!(route, PublishRoute::CellTransfer { .. }) {
+            Some(self.transfer_namespace().await?)
+        } else { None };
         let region = Uuid::new_v4();
         let local = match self.custody {
-            ReplayCustody::Local => self.keys.hold_local_storage_region(region)?,
+            ReplayCustody::Local => Some(Arc::new(self.keys.hold_local_storage_region(region)?.ok_or_else(refused)?)),
             ReplayCustody::Hosted { owner: Some(_) } => None,
             ReplayCustody::Hosted { owner: None } => return Err(refused()),
         };
@@ -758,11 +769,11 @@ impl Service {
                     return Err(refused());
                 }
                 let versioned = matches!(self.storage, CellStorage::S3 { .. });
-                if versioned && matches!(route, PublishRoute::CellTransfer { .. }) {
-                    if record.transfer_replay_namespace.is_some_and(|namespace| self.namespace != namespace) {
+                if let Some(transfer_namespace) = transfer_namespace {
+                    if record.transfer_replay_namespace.is_some_and(|namespace| namespace != transfer_namespace) {
                         return Err(refused());
                     }
-                    record.transfer_replay_namespace = Some(self.namespace);
+                    record.transfer_replay_namespace = Some(transfer_namespace);
                 }
                 let draft = versioned.then(|| staging::reserve_body(record, key, route, body_sha256)).transpose()?;
                 record.storage_regions.insert(region, StorageRegion::ReplicaPublication {
@@ -771,7 +782,9 @@ impl Service {
                 Ok(())
             }).await?;
             let mut io = IoRegion::new();
-            if matches!(self.storage, CellStorage::S3 { .. }) {
+            if let Some(witness) = &local {
+                io = io.child_holding(Some(witness.clone()));
+            } else if matches!(self.storage, CellStorage::S3 { .. }) {
                 Arc::get_mut(&mut io).expect("the publication region is private").track_publications(Arc::new(BrokerUpload {
                     directory: Arc::clone(&self.directory), history, route, region,
                     logical: key.clone(), physical: ObjectKey::new(format!("{}/{key}", residence(&record)))?,
@@ -993,7 +1006,7 @@ pub(crate) fn admits_position(record: &DeploymentRecord, hold: &StorageRegion, p
     })
 }
 
-fn payload_log_epoch(record: &DeploymentRecord) -> i32 {
+pub(crate) fn payload_log_epoch(record: &DeploymentRecord) -> i32 {
     record.checkpoint_stage.as_ref().filter(|stage| stage.transfer_only)
         .map_or(record.log_epoch, |stage| stage.source_log_epoch)
 }

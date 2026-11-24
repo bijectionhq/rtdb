@@ -57,7 +57,7 @@ async fn close(to: &CellHandle<'_>, source: &DeploymentRecord, staged: &Deployme
             first_empty_at_ms: None,
             disposition: None,
             detached_replay: record.transfer_replay_namespace.map(|namespace| AbandonedReplicaResidence {
-                namespace, log_epoch: record.log_epoch, settled: false,
+                namespace, log_epoch: crate::replay_broker::payload_log_epoch(record), settled: false,
             }),
         });
         Ok(())
@@ -141,10 +141,27 @@ pub(super) async fn install_selected(to: &CellHandle<'_>, closed: &DeploymentRec
 /// are accounted for, and moves both records to a fresh generation.
 pub(super) async fn replace(from: &CellHandle<'_>, to: &CellHandle<'_>, source: &DeploymentRecord, staged: &DeploymentRecord) -> Result<(DeploymentRecord, DeploymentRecord)> {
     let closed = close(to, source, staged).await?;
+    let generation = closed.storage_generation.ok_or_else(|| attempt_changed(&closed.name))?;
+    let local_broker = if matches!(to.storage, CellStorage::Local { .. })
+        && closed.abandoned_generations.get(&generation).is_some_and(|entry| entry.detached_replay.is_some())
+    {
+        Some(to.broker.ok_or_else(|| pending_disposal(&closed.name))?)
+    } else { None };
+    if let Some(broker) = local_broker {
+        broker.settle_local_closed_generation(&closed.id, generation).await?;
+    }
     super::await_storage_drain(to.directory.as_ref(), to.storage, to.keys, &closed).await?;
+    if let Some(broker) = local_broker {
+        broker.settle_local_closed_generation(&closed.id, generation).await?;
+    }
     let closed = to.directory.deployment(&closed.id).await?
         .filter(|record| record.version >= closed.version && record.cell_transfer == closed.cell_transfer)
         .ok_or_else(|| attempt_changed(&closed.name))?;
+    if local_broker.is_some() && closed.abandoned_generations.get(&generation)
+        .and_then(|entry| entry.detached_replay.as_ref()).is_none_or(|replay| !replay.settled)
+    {
+        return Err(pending_disposal(&closed.name));
+    }
     let source = select_next(from, source, &closed).await?;
     let staged = install_selected(to, &closed, &source).await?;
     Ok((source, staged))
@@ -153,6 +170,16 @@ pub(super) async fn replace(from: &CellHandle<'_>, to: &CellHandle<'_>, source: 
 /// Empties each closed generation that neither record can still select.
 /// Erasure stays exact to the recorded prefix and provider namespace.
 pub async fn dispose_abandoned(handle: &CellHandle<'_>, id: &str) -> Result<Option<DeploymentRecord>> {
+    if matches!(handle.storage, CellStorage::Local { .. })
+        && let Some(broker) = handle.broker
+        && let Some(record) = handle.directory.deployment(id).await?
+    {
+        for (&generation, entry) in &record.abandoned_generations {
+            if entry.detached_replay.as_ref().is_some_and(|replay| !replay.settled) {
+                broker.settle_local_closed_generation(id, generation).await?;
+            }
+        }
+    }
     dispose_generations(handle.directory.as_ref(), handle.storage, handle.keys, id).await
 }
 

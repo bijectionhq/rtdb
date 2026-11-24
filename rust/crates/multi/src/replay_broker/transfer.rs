@@ -1,6 +1,6 @@
 //! Custody of a detached publication prepared for one destination position.
 
-use rtdb_directory::AbandonedCellGeneration;
+use rtdb_directory::{AbandonedCellGeneration, DetachedReplayNamespace};
 use rtdb_s3::{CreateAttemptPublication, VersionedInventory};
 
 use super::*;
@@ -32,15 +32,18 @@ pub(super) fn transfer_excluded(record: &DeploymentRecord, route: PublishRoute) 
                 && record.checkpoint_transfer_activation.is_none()
         }
         PublishRoute::CellTransfer { generation, .. } => {
-            record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
-                && record.storage_generation == Some(generation)
-                && record.abandoned_generations.get(&generation).is_some_and(|closed| {
-                    closed.prefix == record.storage_prefix()
-                        && record.storage_namespaces == Some(closed.namespaces)
-                })
+            cell_transfer_closed(record, generation)
         }
         PublishRoute::Writer { .. } => false,
     }
+}
+
+fn cell_transfer_closed(record: &DeploymentRecord, generation: Uuid) -> bool {
+    record.lifecycle == Lifecycle::Moving && record.move_from.is_some()
+        && record.storage_generation == Some(generation)
+        && record.abandoned_generations.get(&generation).is_some_and(|closed| {
+            closed.prefix == record.storage_prefix() && record.storage_namespaces == Some(closed.namespaces)
+        })
 }
 
 fn closed_generation_drained(record: &DeploymentRecord, generation: Uuid, entry: &AbandonedCellGeneration) -> bool {
@@ -57,14 +60,58 @@ fn closed_generation_drained(record: &DeploymentRecord, generation: Uuid, entry:
 }
 
 impl Service {
+    pub(super) async fn transfer_namespace(&self) -> Result<DetachedReplayNamespace> {
+        Ok(DetachedReplayNamespace { objects: self.namespace, keys: self.keys.namespace_id().await? })
+    }
+
+    pub(super) async fn settle_local_closed_generation(&self, deployment: &str, generation: Uuid) -> Result<()> {
+        if !matches!(self.storage, CellStorage::Local { .. }) { return Err(refused()); }
+        let record = self.directory.deployment(deployment).await?.ok_or_else(refused)?;
+        let entry = record.abandoned_generations.get(&generation).ok_or_else(refused)?;
+        let Some(replay) = entry.detached_replay.as_ref().filter(|replay| !replay.settled) else { return Ok(()); };
+        if replay.namespace != self.transfer_namespace().await? { return Err(refused()); }
+
+        if cell_transfer_closed(&record, generation) {
+            for (&id, region) in &record.storage_regions {
+                if !matches!(region,
+                    StorageRegion::ReplicaPublication { custody: ReplayCustody::Local, draft: None, .. }
+                    | StorageRegion::ReplicaReplay { custody: ReplayCustody::Local, .. })
+                    || !self.keys.local_storage_region_drained(id)?
+                {
+                    continue;
+                }
+                crate::admin::update_installation(self.directory.as_ref(), deployment, |current| {
+                    if current.storage_generation == Some(generation) && current.abandoned_generations.get(&generation) == Some(entry)
+                        && current.storage_regions.get(&id) == Some(region)
+                    {
+                        current.storage_regions.remove(&id);
+                    }
+                    Ok(())
+                }).await?;
+                self.keys.forget_local_storage_region(id)?;
+            }
+        }
+        let record = self.directory.deployment(deployment).await?.ok_or_else(refused)?;
+        let entry = record.abandoned_generations.get(&generation).ok_or_else(refused)?;
+        self.settle_generation(None, &record, generation, entry).await
+    }
+
     /// A closed and drained generation excludes every pointer into this exact
     /// broker residence, including bodies already adopted by its old journal.
     pub(super) async fn settle_closed_generation(
         &self, inventory: &VersionedInventory, record: &DeploymentRecord, generation: Uuid,
         entry: &AbandonedCellGeneration,
     ) -> Result<()> {
+        self.settle_generation(Some(inventory), record, generation, entry).await
+    }
+
+    async fn settle_generation(
+        &self, inventory: Option<&VersionedInventory>, record: &DeploymentRecord, generation: Uuid,
+        entry: &AbandonedCellGeneration,
+    ) -> Result<()> {
         let Some(replay) = entry.detached_replay.as_ref().filter(|replay| !replay.settled) else { return Ok(()); };
-        if replay.namespace != self.namespace || !closed_generation_drained(record, generation, entry)
+        if replay.namespace.objects != self.namespace || !closed_generation_drained(record, generation, entry)
+            || replay.namespace != self.transfer_namespace().await?
         {
             return Ok(());
         }
@@ -72,13 +119,24 @@ impl Service {
         let target = ObjectKey::new(&residence)?;
         // Draining precedes withdrawal, including reserved slots for uploads
         // that received a provider result but lost their directory response.
-        inventory.drain_uploads(&target).await?;
         let io = IoRegion::new();
-        let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, replay.log_epoch), Arc::clone(&io));
-        let withdrawn = ledger.withdraw_scope().await;
+        let settled = async {
+            if let Some(inventory) = inventory { inventory.drain_uploads(&target).await?; }
+            let ledger = UnitLedger::new(Arc::clone(&self.keys), UnitScope::replay_objects(self.namespace, &residence, replay.log_epoch), Arc::clone(&io));
+            ledger.withdraw_scope().await?;
+            if let Some(inventory) = inventory {
+                inventory.purge(&target).await?;
+            } else {
+                let bucket = self.storage.bucket(Arc::clone(&io)).await?;
+                for object in bucket.list(Some(&target)).await? {
+                    bucket.delete(&object.key).await?;
+                }
+                if !bucket.list(Some(&target)).await?.is_empty() { return Err(refused()); }
+            }
+            Ok::<_, Anomaly>(())
+        }.await;
         io.close_and_wait().await;
-        withdrawn?;
-        inventory.purge(&target).await?;
+        settled?;
         crate::admin::update_installation(self.directory.as_ref(), &record.id, |current| {
             if !closed_generation_drained(current, generation, entry) { return Ok(()); }
             if let Some(replay) = current.abandoned_generations.get_mut(&generation).and_then(|entry| entry.detached_replay.as_mut()) {
@@ -97,6 +155,12 @@ impl Service {
     ) -> Result<Option<PhysicalObjectVersion>> {
         let record = self.current(history).await?;
         require_publication(history, route, &record, key)?;
+        if matches!(route, PublishRoute::CellTransfer { .. })
+            && let Some(namespace) = record.transfer_replay_namespace
+            && namespace != self.transfer_namespace().await?
+        {
+            return Err(refused());
+        }
         let physical = ObjectKey::new(format!("{}/{key}", residence(&record)))?;
         if let Some((&id, region)) = record.storage_regions.iter().find(|(_, region)|
             matches!(region, StorageRegion::ReplicaPublication { key: prepared, .. } if prepared == key.as_str()))
@@ -139,6 +203,11 @@ impl Service {
         if !matches!(self.storage, CellStorage::S3 { .. }) { return Ok(()); }
         let record = self.current(history).await?;
         require_publication(history, route, &record, key)?;
+        if matches!(route, PublishRoute::CellTransfer { .. })
+            && record.transfer_replay_namespace != Some(self.transfer_namespace().await?)
+        {
+            return Err(refused());
+        }
         let Some((&id, region)) = record.storage_regions.iter().find(|(_, region)|
             matches!(region, StorageRegion::ReplicaPublication { key: prepared, .. } if prepared == key.as_str()))
             else { return Ok(()); };

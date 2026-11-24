@@ -315,7 +315,7 @@ pub struct DeploymentRecord {
     pub storage_generation: Option<uuid::Uuid>,
     /// Broker namespace enrolled by the current incoming cell-transfer generation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transfer_replay_namespace: Option<[u8; 32]>,
+    pub transfer_replay_namespace: Option<DetachedReplayNamespace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_namespaces: Option<StorageNamespaces>,
     /// The last time a previously issued S3 write session may still be usable.
@@ -910,9 +910,16 @@ pub struct AbandonedCellGeneration {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbandonedReplicaResidence {
-    pub namespace: [u8; 32],
+    pub namespace: DetachedReplayNamespace,
     pub log_epoch: i32,
     pub settled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetachedReplayNamespace {
+    pub objects: [u8; 32],
+    pub keys: [u8; 32],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
