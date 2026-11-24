@@ -252,7 +252,7 @@ Flight and archive rank outputs also carry a bounded current marker check throug
 
 ### Ranked response contributor inventory
 
-Protocol 222 includes a complete bounded family inventory in each held text and nearest reply, including replies with no hits.
+Ranked held text, nearest and hybrid replies include a complete bounded family inventory, including replies with no hits.
 The inventory comes from the admitted corpus before result slicing. It covers non-hit text statistics and vector candidates, and includes protected world shadows that affect the inherited corpus.
 The Root search and vector paths use exact corpus admission when the installed relation has the sealed projection field.
 Protected partitions require the installed original rank owner before corpus or scoring work.
@@ -266,7 +266,11 @@ For a landed carrier, it also reads `row-position/row/<AddressRef>` from the ins
 The journal and carrier must share their publication, the derivative must have ordered at or after that publication, and the vault must authenticate the exact accepted binding, the registered physical selector, and the current original fence.
 The Root contributor uses the journal assertion ordinal.
 Undecorated family-linked projections and multiple visible physical selectors for an unshadowed canonical address refuse.
-The inventory is `rtdb.owned.rank_families` in the authenticated Arrow schema, as lowercase hex of a big-endian u16 entry count and canonical sorted entries.
+Ranked replies require the `x-rtdb-owned-ipc: stream-v1` request header.
+The first Flight action result body carries the binary inventory as a big-endian u16 entry count followed by entries in strictly increasing byte order.
+Even a zero count has its own result body.
+The Arrow IPC schema, any hit batch frames and the end marker follow in the same reply stream.
+The reply admits the combined encoded Flight result sizes under the existing message limit before sending any frame.
 An entry has a one-byte kind, family UUID (16), member assertion (32), stage (40), Root protected journal publication and ordinal (two u64s) or authored world UUID (16), then two u16-length-prefixed relation and key fields.
 The bounds are 512 entries of at most 1024 bytes, at most 512 Root carrier probes per rank, and one journal probe per decorated Root selector.
 Missing custody evidence, unsupported carrier shapes, and excess inventory refuse.

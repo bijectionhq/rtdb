@@ -37,7 +37,7 @@ use uuid::Uuid;
 use crate::owned_landing_wire::{self, ControlCommand};
 use self::ordered_controls::OrderedControls;
 use crate::{
-    actions::{OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames},
+    actions::{IpcFrames, OwnedIpcReply, SelectionEncoder, encode_ipc_frames, retain_ipc_frames},
     error::{arrow, invalid, status, unsupported},
     lease::Leased,
     service::{Call, Service, found},
@@ -4159,17 +4159,16 @@ impl Service {
         &self, call: &Call, page: rtdb_node::OwnedSearchBatch, scope: String, witnesses: Vec<Uuid>,
         present: Timestamp, valid: Timestamp, reply_format: OwnedReplyFormat<'_>, extra: [(&str, &str); N],
     ) -> Result<OwnedIpcReply, Status> {
-        let (family_inventory, _family_charge) = rtdb_storage::sealing::PlaintextView::rank_inventory().map_err(status)?;
+        let (family_inventory, family_charge) = rtdb_storage::sealing::PlaintextView::rank_inventory().map_err(status)?;
         if family_inventory.len() > 2 && !self.supports_hosted_upload(call) {
+            return Err(unsupported());
+        }
+        if !matches!(reply_format, OwnedReplyFormat::StreamV1) {
             return Err(unsupported());
         }
         let hits = page.hits.batch();
         let mut metadata = hits.schema_ref().metadata().clone();
         for (key, value) in extra { metadata.insert(key.into(), value.into()); }
-        let mut inventory = String::with_capacity(family_inventory.len() * 2);
-        use std::fmt::Write as _;
-        for byte in family_inventory { write!(&mut inventory, "{byte:02x}").expect("writing to a string"); }
-        metadata.insert("rtdb.owned.rank_families".into(), inventory);
         metadata.insert(OWNED_SEARCH_TOTAL.into(), page.total.to_string());
         metadata.insert(OWNED_SEARCH_SCOPE.into(), scope);
         if !witnesses.is_empty() {
@@ -4186,8 +4185,21 @@ impl Service {
             wire::add(bytes, wire::mul(size, 4)?)
         })?;
         let _reply_charge = call.reserve(charge)?;
-        self.owned_point_reply_in(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
-            present, valid, None, None, reply_format)
+        let reply = self.owned_point_reply_in(self.memory(), &schema, (hits.num_rows() != 0).then_some(hits),
+            present, valid, None, None, reply_format)?;
+        let mut frames = match reply {
+            OwnedIpcReply::Frames(frames) => frames,
+            OwnedIpcReply::Unary(reply) => IpcFrames(reply.body).collect::<Result<Vec<_>, _>>()?,
+        };
+        let inventory = ActionResult { body: wire::retain(family_inventory, family_charge) };
+        let encoded = frames.iter().try_fold(inventory.encoded_len(), |bytes, frame| {
+            wire::add(bytes, frame.encoded_len())
+        })?;
+        if encoded > self.0.config.maximum_message_bytes {
+            return Err(Status::resource_exhausted("Owned action response exceeds the Flight message limit"));
+        }
+        frames.insert(0, inventory);
+        Ok(OwnedIpcReply::Frames(frames))
     }
 
     pub(crate) async fn held_expiry_candidates_action(&self, call: &Call, body: &[u8]) -> Result<ActionResult, Status> {
