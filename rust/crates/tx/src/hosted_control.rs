@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+mod direct_plan;
+
 use rtdb_types::{
     Anomaly, EntityId, Interval, OwnedRangeEvidence, OwnedRelation, PlacedAttemptScope, Result, StructFields, TableRef,
     TimeUnit, Timestamp, Value,
@@ -293,19 +295,7 @@ pub fn hosted_replay_controls<'a>(
 }
 
 fn decode_direct_effects(body: &[u8], inventory: &[u32]) -> Result<VecDeque<u32>> {
-    let (ordinals, trailing) = body.as_chunks::<4>();
-    if !trailing.is_empty() {
-        return Err(replay_invalid());
-    }
-    let positions = ordinals.iter().copied().map(u32::from_be_bytes).collect::<VecDeque<_>>();
-    let mut previous = 0;
-    for position in positions.iter().copied().filter(|position| *position != 0) {
-        if position <= previous || inventory.binary_search(&position).is_err() {
-            return Err(replay_invalid());
-        }
-        previous = position;
-    }
-    Ok(positions)
+    direct_plan::decode(body, inventory).map(VecDeque::from).ok_or_else(replay_invalid)
 }
 
 fn replay_constraint_mismatch() -> Anomaly {

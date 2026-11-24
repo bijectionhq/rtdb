@@ -1,0 +1,21 @@
+{
+  "summary": "Accepted held direct replay plans keep every big-endian word, including positionless effects. Positive positions come from the original inventory in strictly increasing order.",
+  "flags": ["--no-external-by-default"],
+  "min_verified_functions": 5,
+  "controls": {
+    "drop_a_positionless_effect": {
+      "defect": "Discard a trailing generated effect after decoding the offered plan.",
+      "mutate": [{
+        "file": "rust/crates/tx/src/hosted_control/direct_plan.rs",
+        "find": "    Some(positions)",
+        "replace": "    if positions.len() > 0 && positions[positions.len() - 1] == 0 {\n        let _ = positions.pop();\n    }\n    Some(positions)"
+      }],
+      "expect": [{
+        "file": "rust/crates/tx/src/hosted_control/direct_plan.rs",
+        "function": "decode",
+        "category": "postcondition not satisfied"
+      }],
+      "min_verified_functions": 4
+    }
+  }
+}
