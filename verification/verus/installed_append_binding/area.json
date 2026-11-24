@@ -102,6 +102,11 @@
         },
         {
           "file": "rust/crates/format/src/envelope/detached.rs",
+          "find": "        ensures out is Ok ==> (self.message matches ReplicaBody::OversizedMessage(reference)\n            && (reference.payload_sha256 matches Some(expected) ==> expected@ == sha256(bytes@))),",
+          "replace": "        ensures out is Ok ==> self.message is OversizedMessage,"
+        },
+        {
+          "file": "rust/crates/format/src/envelope/detached.rs",
           "find": "        if let Some(expected) = &reference.payload_sha256 {\n            if !digest_matches(expected.as_slice(), bytes) {\n                return Err(Anomaly::fault(\"rtdb.format/oversized-payload-mismatch\", \"Oversized payload bytes differ from their replica reference\"));\n            }\n        }\n",
           "replace": ""
         }
@@ -122,6 +127,11 @@
           "file": "rust/crates/format/src/envelope/detached.rs",
           "find": "        && payload.term_sequence == proxy.term_sequence\n",
           "replace": ""
+        },
+        {
+          "file": "rust/crates/format/src/envelope/detached.rs",
+          "find": "        ensures out is Ok ==> payload.term == self.term && payload.term_sequence == self.term_sequence",
+          "replace": "        ensures out is Ok ==> payload.term == self.term"
         },
         {
           "file": "rust/crates/format/src/envelope/detached.rs",
@@ -153,6 +163,11 @@
         }
       ],
       "expect": [
+        {
+          "file": "rust/crates/multi/src/journal/replay_cursor.rs",
+          "function": "select",
+          "category": "postcondition not satisfied"
+        },
         {
           "file": "verification/verus/installed_append_binding/laws.rs",
           "function": "retains_the_exact_ciphertext",

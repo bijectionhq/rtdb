@@ -86,6 +86,7 @@ RTDBRecovery|RTDBRecoveryEarlyTrim|12|Invariant TrimFollowsPublication is violat
 RTDBRecovery|RTDBRecoveryLostQuorum|12|Invariant AcknowledgedWritesSurvive is violated
 RTDBRecovery|RTDBRecoveryPartialSync|12|Invariant SyncedHistoryIsComplete is violated
 RTDBRecovery|RTDBRecoveryRepeatedRestart|0|No error has been found
+RTDBRecovery|RTDBRecoveryTwoReplacements|0|No error has been found
 RTDBRecovery|RTDBRecoveryWitness|12|Invariant NoPostRestartReadAndWrite is violated
 RTDBRecoveryIdentity|RTDBRecoveryIdentity|0|No error has been found
 RTDBRecoveryIdentity|RTDBRecoveryIdentityReuse|12|Invariant RecoveredHistoryPreservesAcknowledgedWrite is violated

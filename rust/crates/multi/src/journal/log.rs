@@ -98,10 +98,9 @@ struct DeliveredReferences {
 }
 
 impl SnapshotFiles {
-    fn delivered(&self, position: LogOffset, epoch: u64, names: Vec<ObjectName>) -> Result<()> {
+    fn reserve_delivered(&self, position: LogOffset, epoch: u64, names: Vec<ObjectName>) -> Result<DeliveredReferences> {
         let charge = self.budget.reserve(256 + names.len() * 96).map_err(storage)?;
-        self.files.lock().pending = Some(DeliveredReferences { position, epoch, names, charge });
-        Ok(())
+        Ok(DeliveredReferences { position, epoch, names, charge })
     }
 
     fn admit(&self, position: LogOffset) -> Result<()> {
@@ -531,16 +530,14 @@ impl Reads {
 
 struct Prepared {
     metadata: ReplayHead,
-    end: Cut,
-    record_bytes: u64,
+    read: replay_cursor::PreparedHead<Cut>,
 }
 
 struct Cursor {
     reads: Arc<Reads>,
-    next: u64,
+    position: replay_cursor::ReplayCursor<Cut>,
     end: Option<u64>,
     held: Option<Arc<Held>>,
-    from: Option<Cut>,
     prepared: Option<Prepared>,
     snapshot: Option<Arc<SnapshotFiles>>,
 }
@@ -549,49 +546,55 @@ impl Cursor {
     fn new(reads: Arc<Reads>, next: u64, end: Option<u64>) -> Self {
         Self {
             reads,
-            next,
+            position: replay_cursor::new_replay_cursor(next),
             end,
             held: None,
-            from: None,
             prepared: None,
             snapshot: None,
         }
     }
 
     async fn bind(&mut self, view: Route) -> Result<()> {
-        if self.end == Some(self.next) {
+        let next = self.position.next();
+        if self.end == Some(next) {
             return Ok(());
         }
-        if self.next < view.erasure_floor {
+        if next < view.erasure_floor {
             return Err(Error::ErasedUnderView);
         }
-        if self.next < view.floor.next_lsn {
+        if next < view.floor.next_lsn {
             return Err(Error::UnavailableLogRange {
-                requested: i64::try_from(self.next).unwrap_or(i64::MAX),
+                requested: i64::try_from(next).unwrap_or(i64::MAX),
                 first_retained: i64::try_from(view.floor.next_lsn).unwrap_or(i64::MAX),
             });
         }
         let through = self
             .end
             .map_or(view.head.next_lsn, |end| end.min(view.head.next_lsn));
-        if self.next < through {
-            let held = match self.reads.acquire(&view, self.next, through).await {
+        if next < through {
+            let held = match self.reads.acquire(&view, next, through).await {
                 Ok(held) => held,
                 Err(error) => {
-                    if self.next < self.reads.route().await?.erasure_floor {
+                    if next < self.reads.route().await?.erasure_floor {
                         return Err(Error::ErasedUnderView);
                     }
                     return Err(error);
                 }
             };
-            if !replay_cursor::starts_at(
-                self.next, held.hold.start.next_lsn, self.from.is_some(), self.from == Some(held.hold.start),
-            ) {
-                return Err(Error::Closed("The ordered replay hold starts at a different cut".into()));
-            }
-            self.from = Some(held.hold.start);
-            self.held = Some(held);
+            self.attach(held, through)?;
         }
+        Ok(())
+    }
+
+    fn attach(&mut self, held: Arc<Held>, through: u64) -> Result<()> {
+        let start = held.hold.start;
+        if !self.position.bind(
+            start, start.next_lsn, held.hold.through.next_lsn, through,
+            self.position.from() == Some(start),
+        ) {
+            return Err(Error::Closed("The ordered replay hold differs from the requested interval".into()));
+        }
+        self.held = Some(held);
         Ok(())
     }
 
@@ -601,7 +604,7 @@ impl Cursor {
         }
         let deadline = tokio::time::Instant::now() + wait;
         loop {
-            if let (Some(held), Some(from)) = (&self.held, self.from)
+            if let (Some(held), Some(from)) = (&self.held, self.position.from())
                 && from.next_lsn < held.hold.through.next_lsn
             {
                 let item = self
@@ -621,12 +624,10 @@ impl Cursor {
                         maximum: self.reads.maximum,
                     });
                 }
-                if !replay_cursor::next_in_hold(
-                    from.next_lsn, item.next.next_lsn, held.hold.through.next_lsn,
-                    item.next == held.hold.through,
-                ) {
-                    return Err(Error::Closed("The ordered replay head is outside its exact successor cut".into()));
-                }
+                let read = self.position.prepare(
+                    item.next, item.next.next_lsn, held.hold.through, held.hold.through.next_lsn,
+                    item.next == held.hold.through, item.timestamp, payload_len, item.record_bytes,
+                ).ok_or_else(|| Error::Closed("The ordered replay head is outside its exact successor cut".into()))?;
                 let offset = latest(item.next).map_err(storage)?;
                 let metadata = ReplayHead {
                     metadata: LogMetadata {
@@ -638,15 +639,11 @@ impl Cursor {
                     allocation_bound: payload_len.saturating_add(DELIVERED_RECORD_OVERHEAD)
                         .max(usize::try_from(item.record_bytes).map_err(|_| Error::Task("The ordered record is too large".into()))?),
                 };
-                self.prepared = Some(Prepared {
-                    metadata,
-                    end: item.next,
-                    record_bytes: item.record_bytes,
-                });
+                self.prepared = Some(Prepared { metadata, read });
                 return Ok(Some(metadata));
             }
             self.held = None;
-            if self.end == Some(self.next) {
+            if self.end == Some(self.position.next()) {
                 return Ok(None);
             }
             let current = self.reads.route().await?;
@@ -683,13 +680,10 @@ impl Cursor {
             .held
             .as_ref()
             .ok_or_else(|| Error::Task("No ordered replay hold".into()))?;
-        let from = self
-            .from
-            .ok_or_else(|| Error::Task("No ordered replay position".into()))?;
         let page = self
             .reads
             .journal
-            .replay(held.hold, from, prepared.record_bytes)
+            .replay(held.hold, prepared.read.from(), prepared.read.record_bytes)
             .await
             .map_err(storage)?;
         let first = page
@@ -697,57 +691,62 @@ impl Cursor {
             .into_iter()
             .next()
             .ok_or_else(|| Error::Task("No record in the protected interval".into()))?;
-        let exact_record_cut = first.result.cut == prepared.end;
+        let exact_record_cut = first.result.cut == prepared.read.end();
         let observed_time = first.timestamp;
         let observed_bytes = first.payload.len();
-        let first = replay_cursor::select_record(
+        let (cut, first) = prepared.read.select(
             first,
             page.checkpoint == held.hold.checkpoint,
-            page.through == held.hold.through,
+            page.through == prepared.read.through(),
             exact_record_cut,
             observed_time,
-            head.metadata.timestamp.0,
             observed_bytes,
-            head.payload_len + SEALED_OVERHEAD,
         ).ok_or_else(|| Error::Closed("The ordered replay record differs from its prepared head or hold".into()))?;
-        let placement = self.reads.journal.placement();
-        let scope = ReplicaObjectScope {
-            deployment: placement.deployment,
-            incarnation: placement.incarnation,
-            group: placement.group,
-            generation: placement.generation,
-            writer_epoch: first.grant.epoch,
-        };
-        if let Some(snapshot) = &self.snapshot {
-            snapshot.delivered(head.metadata.offset, first.grant.epoch, first.references.unwrap_or_default())?;
+        let delivered: Result<_> = async {
+            let placement = self.reads.journal.placement();
+            let scope = ReplicaObjectScope {
+                deployment: placement.deployment,
+                incarnation: placement.incarnation,
+                group: placement.group,
+                generation: placement.generation,
+                writer_epoch: first.grant.epoch,
+            };
+            let snapshot_references = self.snapshot.as_ref().map(|snapshot| {
+                snapshot.reserve_delivered(head.metadata.offset, first.grant.epoch, first.references.unwrap_or_default())
+            }).transpose()?;
+            let key = JournalKey::for_grant(placement, first.grant);
+            let open = IoRegion::retaining(
+                Arc::clone(held) as Arc<dyn Send + Sync>,
+                key.open(self.reads.keys.as_ref(), &self.reads.io, first.payload),
+            );
+            let payload = match &reservation {
+                Some(reservation) => reservation.retaining_io(open).await?,
+                None => open.await?,
+            };
+            let replica_objects = ReplicaObjectCustody::from_delivery(
+                scope, head.metadata.offset, &payload, rtdb_format::keys::CURRENT_STORAGE_VERSION,
+                rtdb_types::StorageEpoch(0), Arc::clone(held) as Arc<dyn Send + Sync>,
+            )?;
+            let record = LogRecord {
+                metadata: head.metadata,
+                replica_objects,
+                payload: Bytes::from_owner(Delivery {
+                    bytes: payload,
+                    _held: Arc::clone(held),
+                }),
+            };
+            let record = match reservation {
+                Some(reservation) => record.retain(reservation)?,
+                None => record,
+            };
+            Ok((record, snapshot_references))
+        }.await;
+        let same_predecessor = self.position.from() == Some(cut.from());
+        let (record, references) = self.position.finish(cut, same_predecessor, delivered)?
+            .ok_or_else(|| Error::Task("The selected replay record lost its predecessor".into()))?;
+        if let (Some(snapshot), Some(references)) = (&self.snapshot, references) {
+            snapshot.files.lock().pending = Some(references);
         }
-        let key = JournalKey::for_grant(placement, first.grant);
-        let open = IoRegion::retaining(
-            Arc::clone(held) as Arc<dyn Send + Sync>,
-            key.open(self.reads.keys.as_ref(), &self.reads.io, first.payload),
-        );
-        let payload = match &reservation {
-            Some(reservation) => reservation.retaining_io(open).await?,
-            None => open.await?,
-        };
-        let replica_objects = ReplicaObjectCustody::from_delivery(
-            scope, head.metadata.offset, &payload, rtdb_format::keys::CURRENT_STORAGE_VERSION,
-            rtdb_types::StorageEpoch(0), Arc::clone(held) as Arc<dyn Send + Sync>,
-        )?;
-        let record = LogRecord {
-            metadata: head.metadata,
-            replica_objects,
-            payload: Bytes::from_owner(Delivery {
-                bytes: payload,
-                _held: Arc::clone(held),
-            }),
-        };
-        let record = match reservation {
-            Some(reservation) => record.retain(reservation)?,
-            None => record,
-        };
-        self.next = first.result.cut.next_lsn;
-        self.from = Some(first.result.cut);
         self.prepared = None;
         Ok(record)
     }
@@ -884,8 +883,8 @@ impl Log for JournalLog {
             });
         }
         let mut cursor = Cursor::new(Arc::clone(&self.reads), next, None);
-        cursor.from = Some(held.hold.start);
-        cursor.held = Some(held);
+        let through = held.hold.through.next_lsn;
+        cursor.attach(held, through)?;
         Ok(Some(Box::new(cursor)))
     }
 
@@ -931,16 +930,17 @@ impl Log for JournalLog {
             budget: Arc::clone(&source.source.memory),
             files: parking_lot::Mutex::default(),
         });
-        let suffix = (start < end).then(|| {
+        let suffix = if start < end {
             let mut range = Cursor::new(Arc::clone(&self.reads), start, Some(end));
-            range.held = Some(Arc::clone(&held));
-            range.from = Some(scope.start);
+            range.attach(Arc::clone(&held), end)?;
             range.snapshot = Some(Arc::clone(&files));
             let authenticated_head = super::head_identity(self.reads.journal.placement(), scope.through);
-            rtdb_storage::log::ProtectedLogRange {
+            Some(rtdb_storage::log::ProtectedLogRange {
                 authenticated_head: Some(authenticated_head), range: Box::new(range), hold: held,
-            }
-        });
+            })
+        } else {
+            None
+        };
         Ok(rtdb_storage::log::ProtectedLogSnapshot { suffix, provider: Some(files) })
     }
 
