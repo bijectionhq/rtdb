@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, net::IpAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use rtdb_db::{ChangeHistory, MultiDatabase, Role, WritePipeline};
 use rtdb_index::branches::{BranchCut, BranchEffect, BranchEvent, BranchView};
-use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT, Transact};
+use rtdb_tx::transact::{LINEARIZABLE, Receipt, TIMED_TRANSACT};
 use rtdb_types::{
     Anomaly, AnomalyCategory, Interval, MemoryBudget, Result, TableRef, Timestamp,
     rtdb_v1::{At, Basis, Layer},
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serving::{
     ChangeGroup, ChangeImages, ChangeKind, ChangeOrder, ChangePage, ChangeRow, Changes,
-    QuerySource, QueryView, ServingDriver,
+    QuerySource, QueryView, ROW_VISIBILITY, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission,
 };
 
 pub struct MultiServing {
@@ -48,7 +48,55 @@ impl ServingDriver for MultiServing {
     }
 
     fn features(&self) -> &[&str] {
-        &[LINEARIZABLE, TIMED_TRANSACT]
+        &[LINEARIZABLE, TIMED_TRANSACT, ROW_VISIBILITY, "query", "query.track", "query.page",
+          "query.linearizable", "changes", "changes.progress-only", "transact", "tx-status", "sql.history"]
+    }
+
+    fn supports_row_visibility(&self) -> bool { true }
+
+    async fn query_scoped(&self, source: QuerySource, track: bool, now: Timestamp,
+                          scope: &ServingScope, cancellation: &CancellationToken) -> Result<QueryView> {
+        cancellation.run_until_cancelled(async {
+            let (index, generation, claims) = {
+                let mut database = self.database.lock().await;
+                let (index, generation) = database.fresh_view().await?;
+                (index, generation, database.claim_sealer())
+            };
+            let view = scope.query(&index, source, track, now, &self.memory, &claims)?;
+            self.database.lock().await.check_generation(generation).await?;
+            Ok(view)
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn transact_scoped(&self, request: ScopedSubmission, scope: ServingScope,
+                             cancellation: &CancellationToken) -> Result<Receipt> {
+        cancellation.run_until_cancelled(self.writes.transact_scoped(
+            request.transaction, scope.labels, scope.receipt_namespace,
+        )).await.ok_or_else(interrupted)?
+    }
+
+    async fn tx_status_scoped(&self, key: &[u8], scope: &ServingScope,
+                              cancellation: &CancellationToken) -> Result<Receipt> {
+        cancellation.run_until_cancelled(async {
+            self.database.lock().await.tx_status_scoped(key, scope.transaction_scope()).await
+        }).await.ok_or_else(interrupted)?
+    }
+
+    async fn changes_scoped(&self, request: Changes, scope: &ServingScope,
+                            cancellation: &CancellationToken) -> Result<ChangePage> {
+        cancellation.run_until_cancelled(async {
+            let start = Instant::now();
+            loop {
+                let (index, generation) = self.database.lock().await.fresh_view().await?;
+                let page = scope.changes(&index, &request)?;
+                let remaining = request.wait.saturating_sub(start.elapsed());
+                if !page.groups.is_empty() || request.until.is_some() && page.complete || remaining.is_zero() {
+                    self.database.lock().await.check_generation(generation).await?;
+                    return Ok(page);
+                }
+                tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+            }
+        }).await.ok_or_else(interrupted)?
     }
 
     async fn query(
@@ -95,11 +143,11 @@ impl ServingDriver for MultiServing {
 
     async fn transact(
         &self,
-        request: Transact,
+        request: TransactSubmission,
         cancellation: &CancellationToken,
     ) -> Result<Receipt> {
         cancellation
-            .run_until_cancelled(self.writes.transact(request))
+            .run_until_cancelled(self.writes.transact(request.transaction))
             .await
             .ok_or_else(interrupted)?
     }
@@ -334,7 +382,7 @@ mod tests {
     };
     use rtdb_storage::cache::BufferPool;
     use rtdb_store::MemoryStore;
-    use rtdb_tx::transact::{Cell, Op, Outcome, Row, Window};
+    use rtdb_tx::transact::{Cell, Op, Outcome, Row, Transact, Window};
     use rtdb_types::{
         EntityId, StructFields, Value,
         rtdb_v1::{ClaimSealer, MAIN_BRANCH},
@@ -343,8 +391,8 @@ mod tests {
 
     use super::*;
 
-    fn write(key: u8, title: &str, before: Option<Timestamp>) -> Transact {
-        Transact {
+    fn write(key: u8, title: &str, before: Option<Timestamp>) -> TransactSubmission {
+        let transaction = Transact {
             key: vec![key; 16],
             require: vec![],
             window: Window {
@@ -366,7 +414,8 @@ mod tests {
                 if_absent: false,
             }],
             otherwise: vec![],
-        }
+        };
+        TransactSubmission { transaction, attempt: Uuid::new_v4(), submitted_at: Timestamp(10), source: Default::default() }
     }
 
     #[tokio::test]
@@ -495,5 +544,61 @@ mod tests {
             .unwrap();
         let error = driver.changes(changes(), &cancel).await.err().unwrap();
         assert_eq!(error.code, "rtdb/cursor-expired");
+    }
+
+    #[tokio::test]
+    async fn multi_serving_scoped_query_changes_and_status_share_projected_coordinates() {
+        use rtdb_tx::transact::{Declaration, Visibility};
+        use rtdb_types::rtdb_v1::LabelScope;
+
+        let journal = MemoryJournal::default();
+        let id = Uuid::from_u128(1);
+        let node = IpAddr::from([127, 0, 0, 1]);
+        let database = MultiDatabase::new(
+            MultiOptions { database: id, node, lease_micros: 100, drift_micros: 1 },
+            Arc::new(journal.handle(Identity(1))), Arc::new(MemoryStore::default()),
+            Arc::new(LocalKms::new(|| 10)), Arc::new(|| Timestamp(10)),
+            Arc::new(ClaimSealer::new(*id.as_bytes(), [8; 32])),
+        ).unwrap();
+        database.create().await.unwrap();
+        let driver = MultiServing::new(database, MemoryBudget::new(64 * 1024 * 1024));
+        driver.tick(&BTreeSet::from([node])).await.unwrap();
+        let cancel = CancellationToken::new();
+        let mut declared = write(1, "declaration", None);
+        declared.transaction.ops = vec![Op::Declare {
+            table: TableRef::new("public", "notes"), change: Declaration::Visibility(Visibility { column: "label".into() }),
+        }];
+        assert_eq!(driver.transact(declared, &cancel).await.unwrap().outcome, Outcome::Then);
+        let labelled = |key, label, id| {
+            let mut submission = write(key, "row", None);
+            let Op::Put { rows, .. } = &mut submission.transaction.ops[0] else { unreachable!() };
+            rows[0].id = EntityId::Integer(id);
+            rows[0].valid = Some(Interval::ALL);
+            rows[0].cells.insert("label".into(), Cell::Value(Value::Binary(vec![label])));
+            submission
+        };
+        let scope = ServingScope {
+            labels: LabelScope { read: BTreeSet::from([vec![1]]), write: BTreeSet::from([vec![1]]) },
+            receipt_namespace: [7; 32],
+        };
+        let TransactSubmission { transaction, attempt, submitted_at, source } = labelled(2, 1, 1);
+        let receipt = driver.transact_scoped(ScopedSubmission { transaction, attempt, submitted_at, source }, scope.clone(), &cancel).await.unwrap();
+        assert_eq!(receipt.outcome, Outcome::Then);
+        let raw = driver.transact(labelled(3, 2, 2), &cancel).await.unwrap();
+        let source = QuerySource { branch: MAIN_BRANCH.into(), at: At::Linearizable, layer: Layer::Merged };
+        let view = driver.query_scoped(source, true, Timestamp(11), &scope, &cancel).await.unwrap();
+        assert_eq!(view.cut.basis, receipt.basis);
+        assert_ne!(view.cut.basis.incarnation(), raw.basis.incarnation());
+        assert!(view.claim.is_some());
+        let page = driver.changes_scoped(Changes {
+            branch: MAIN_BRANCH.into(), tables: BTreeSet::new(), after: Some(receipt.basis), until: None,
+            order: ChangeOrder::Ascending, images: ChangeImages::Both, limit: 1, wait: Duration::ZERO,
+        }, &scope, &cancel).await.unwrap();
+        assert_eq!(page.through, receipt.basis);
+        assert!(page.groups.is_empty());
+        let status = driver.tx_status_scoped(&[2; 16], &scope, &cancel).await.unwrap();
+        assert_eq!(status.basis, receipt.basis);
+        assert!(status.replayed);
+        assert!(driver.tx_status(&[2; 16], &cancel).await.is_err());
     }
 }

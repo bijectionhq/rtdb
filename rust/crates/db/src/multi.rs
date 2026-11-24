@@ -8,7 +8,7 @@ use rtdb_store::{
     ObjectKey, ObjectStore, Reachability, VerifiedManifest, WriterObjects, read_manifest,
 };
 use rtdb_tx::transact::{
-    LINEARIZABLE, Op, Receipt, Resolution, TIMED_TRANSACT, Transact, TransactionRecord,
+    LINEARIZABLE, Op, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, Transact, TransactionRecord,
 };
 use rtdb_types::{
     Anomaly, AnomalyCategory, Result, Timestamp,
@@ -226,6 +226,15 @@ impl MultiDatabase {
     }
 
     pub async fn transact(&mut self, request: &Transact) -> Result<Receipt> {
+        self.transact_in(request, None).await
+    }
+
+    pub async fn transact_scoped(&mut self, request: &Transact, scope: ScopedTransact<'_>) -> Result<Receipt> {
+        let receipt = self.transact_in(request, Some(scope)).await?;
+        self.state().transactions.project_receipt(receipt, scope.labels)
+    }
+
+    async fn transact_in(&mut self, request: &Transact, scope: Option<ScopedTransact<'_>>) -> Result<Receipt> {
         self.refresh().await?;
         let validation = request.ops.is_empty() && request.otherwise.is_empty();
         let authority = if validation {
@@ -239,14 +248,13 @@ impl MultiDatabase {
         reject_erasure(request)?;
         let position = next(self.state().head)?;
         let now = (self.clock)();
-        let features = [LINEARIZABLE, TIMED_TRANSACT];
-        let prepared = match self.state().transactions.resolve(
-            request,
-            position.0,
-            now,
-            &features,
-            &self.claims,
-        )? {
+        let features = [LINEARIZABLE, TIMED_TRANSACT, "row-visibility"];
+        let state = &self.state().transactions;
+        let resolution = match scope {
+            Some(scope) => state.resolve_scoped(request, position.0, now, &features, &self.claims, scope),
+            None => state.resolve(request, position.0, now, &features, &self.claims),
+        }?;
+        let prepared = match resolution {
             Resolution::Answer(receipt) => return Ok(receipt),
             Resolution::Append(prepared) => prepared,
         };
@@ -270,6 +278,12 @@ impl MultiDatabase {
         self.state().transactions.tx_status(key)
     }
 
+    pub async fn tx_status_scoped(&mut self, key: &[u8], scope: ScopedTransact<'_>) -> Result<Receipt> {
+        self.refresh().await?;
+        let state = &self.state().transactions;
+        state.project_receipt(state.tx_status_scoped(key, scope)?, scope.labels)
+    }
+
     pub async fn fresh_index(&mut self) -> Result<&BranchIndex> {
         self.refresh().await?;
         Ok(self.state().transactions.index())
@@ -288,6 +302,8 @@ impl MultiDatabase {
             layer,
         })
     }
+
+    pub fn claim_sealer(&self) -> Arc<ClaimSealer> { Arc::clone(&self.claims) }
 
     pub async fn fresh_history(&mut self) -> Result<ChangeHistory<'_>> {
         self.refresh().await?;

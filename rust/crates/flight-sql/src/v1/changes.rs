@@ -221,11 +221,15 @@ impl Service {
         let progress_only = request.progress_only;
         let (page, images, context, initial, headers, cutoff) = async {
             let driver = database.serving_driver().expect("checked serving driver");
+            let visibility = self.serving_scope(&call, driver)?;
+            let incarnation = visibility.as_ref().map_or_else(|| driver.incarnation(), |scope| {
+                scope.labels.main_read_incarnation(driver.incarnation())
+            });
             let tables = tables(&request.tables)?;
             let read_basis = |basis: proto::Basis| {
                 Basis::from_bytes(&basis.value)
                     .ok()
-                    .filter(|basis| basis.incarnation() == driver.incarnation())
+                    .filter(|basis| basis.incarnation() == incarnation)
                     .ok_or_else(cursor_expired)
             };
             let after = request.after.map(read_basis).transpose()?;
@@ -255,13 +259,7 @@ impl Service {
             if progress_only && images != ChangeImages::None {
                 return Err(error::incorrect("Progress-only Changes requires IMAGES_NONE"));
             }
-            let context = self
-                .wire_context(&call, &database, false)
-                .await?
-                .with_plaintext();
-            let page = context
-                .reading(driver.changes(
-                    Changes {
+            let change = Changes {
                         branch: request.branch,
                         tables,
                         after,
@@ -270,11 +268,22 @@ impl Service {
                         images,
                         limit: request.limit as usize,
                         wait,
-                    },
-                    &call.cancellation,
-                ))
-                .await
-                .map_err(error::anomaly)?;
+            };
+            let (page, context) = if let Some(scope) = &visibility {
+                let now = self.0.node.now();
+                let page = driver.changes_scoped(change, scope, &call.cancellation).await.map_err(error::anomaly)?;
+                let source = rtdb_node::serving::QuerySource {
+                    branch: rtdb_types::rtdb_v1::MAIN_BRANCH.into(), at: rtdb_types::rtdb_v1::At::Latest,
+                    layer: rtdb_types::rtdb_v1::Layer::Merged,
+                };
+                let view = driver.query_scoped(source, false, now, scope, &call.cancellation).await.map_err(error::anomaly)?;
+                let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
+                (page, self.scoped_wire_context(&call, snapshot, now)?.with_plaintext())
+            } else {
+                let context = self.wire_context(&call, &database, false).await?.with_plaintext();
+                let page = context.reading(driver.changes(change, &call.cancellation)).await.map_err(error::anomaly)?;
+                (page, context)
+            };
             self.check_attachment(&call, &database)?;
             let initial = context.delivery_grant().await.map_err(error::anomaly)?;
             let (headers, cutoff) = call

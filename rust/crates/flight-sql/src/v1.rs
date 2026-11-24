@@ -3,9 +3,9 @@ use std::{sync::Arc, time::Duration};
 use arrow_flight::{self as flight, FlightData, sql::Any};
 use bytes::Bytes;
 use prost::{Message, Name};
-use rtdb_node::serving::TransactSubmission;
+use rtdb_node::serving::{ROW_VISIBILITY, ScopedSubmission, ServingDriver, ServingScope, TransactSubmission};
 use rtdb_node::{Database, DatabaseAccess, SessionIdentity};
-use rtdb_query::QueryContext;
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 use rtdb_types::Timestamp;
 use tonic::{Response, Status};
 
@@ -90,10 +90,21 @@ impl Service {
                                 .iter()
                                 .map(|feature| (*feature).to_owned())
                                 .collect();
+                            if driver.supports_row_visibility() && !features.iter().any(|feature| feature == ROW_VISIBILITY) {
+                                features.push(ROW_VISIBILITY.into());
+                            }
                         } else if database.wire_linearizable_reads() {
                             features.push("query.linearizable".into());
                         }
                     }
+                }
+                let scoped = call.session.caller.principal.label_scope().is_some();
+                if scoped {
+                    let admitted = self.0.node.catalog().database(&call.database).is_ok_and(|database| {
+                        database.serving_driver().is_some_and(|driver| self.serving_scope(&call, driver).is_ok())
+                    });
+                    features.retain(|feature| admitted && matches!(feature.as_str(), ROW_VISIBILITY | "query" |
+                        "query.track" | "query.page" | "query.linearizable" | "changes" | "transact" | "tx-status" | "sql.history"));
                 }
                 proto::CapabilitiesResponse {
                     api: API.into(),
@@ -105,7 +116,7 @@ impl Service {
                         min_key_bytes: 16,
                         max_key_bytes: 64,
                     }),
-                    server_time_micros: self.0.node.now().0,
+                    server_time_micros: if scoped { 0 } else { self.0.node.now().0 },
                 }
                 .encode_to_vec()
             }),
@@ -143,16 +154,12 @@ impl Service {
             error::unsupported(request.require.first().map_or("transact", String::as_str))
         })?;
         let transaction = transact::request(request, call.memory())?;
-        let request = TransactSubmission {
-            transaction,
-            attempt: uuid::Uuid::new_v4(),
-            submitted_at,
-            source: call.retain_request(source),
-        };
-        let receipt = driver
-            .transact(request, &call.cancellation)
-            .await
-            .map_err(error::anomaly)?;
+        let attempt = uuid::Uuid::new_v4();
+        let source = call.retain_request(source);
+        let receipt = match self.serving_scope(call, driver)? {
+            Some(scope) => driver.transact_scoped(ScopedSubmission { transaction, attempt, submitted_at, source }, scope, &call.cancellation).await,
+            None => driver.transact(TransactSubmission { transaction, attempt, submitted_at, source }, &call.cancellation).await,
+        }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         Ok(transact::receipt(receipt).encode_to_vec())
     }
@@ -167,10 +174,10 @@ impl Service {
         let driver = database
             .serving_driver()
             .ok_or_else(|| error::unsupported("tx-status"))?;
-        let receipt = driver
-            .tx_status(&request.key, &call.cancellation)
-            .await
-            .map_err(error::anomaly)?;
+        let receipt = match self.serving_scope(call, driver)? {
+            Some(scope) => driver.tx_status_scoped(&request.key, &scope, &call.cancellation).await,
+            None => driver.tx_status(&request.key, &call.cancellation).await,
+        }.map_err(error::anomaly)?;
         self.check_attachment(call, &database)?;
         Ok(transact::receipt(receipt).encode_to_vec())
     }
@@ -221,18 +228,34 @@ impl Service {
         if call.session.audience_source().is_some() || call.session.fresh_replica {
             return Err(error::unsupported("rtdb.v1.route"));
         }
-        call.session
-            .caller
-            .principal
-            .authorize_database(&call.database, access)
-            .map_err(error::anomaly)?;
+        let scoped = call.session.caller.principal.label_scope().is_some();
+        if !scoped {
+            call.session.caller.principal.authorize_database(&call.database, access).map_err(error::anomaly)?;
+        }
         self.admit_database(&call.database)
             .await
             .map_err(error::map_status)?;
-        self.0
-            .node
-            .catalog()
-            .database(&call.database)
+        let database = self.0.node.catalog().database(&call.database).map_err(error::anomaly)?;
+        if scoped {
+            let driver = database.serving_driver().ok_or_else(|| error::unsupported(ROW_VISIBILITY))?;
+            self.serving_scope(call, driver)?;
+        }
+        Ok(database)
+    }
+
+    fn serving_scope(&self, call: &Call, driver: &dyn ServingDriver) -> Result<Option<ServingScope>, Status> {
+        let Some(scope) = call.session.caller.principal.label_scope() else { return Ok(None); };
+        scope.admit(&call.database, driver.incarnation()).map_err(error::anomaly)?;
+        scope.revalidate(self.0.node.now()).map_err(error::anomaly)?;
+        if !driver.supports_row_visibility() { return Err(error::unsupported(ROW_VISIBILITY)); }
+        Ok(Some(ServingScope { labels: scope.labels().clone(), receipt_namespace: scope.receipt_namespace() }))
+    }
+
+    fn scoped_wire_context(&self, call: &Call, snapshot: DatabaseSnapshot, clock: Timestamp) -> Result<Arc<QueryContext>, Status> {
+        let name = call.database.clone();
+        let catalog = CatalogSnapshot::new(name.clone(), std::collections::BTreeMap::from([(name, snapshot)]), false)
+            .map_err(error::anomaly)?;
+        QueryContext::new(catalog, Arc::clone(call.memory()), clock, "UTC", QueryOptions::default(), &call.cancellation)
             .map_err(error::anomaly)
     }
 
@@ -242,6 +265,7 @@ impl Service {
         database: &Arc<Database>,
         linearizable: bool,
     ) -> Result<Arc<QueryContext>, Status> {
+        if call.session.caller.principal.label_scope().is_some() { return Err(error::unsupported(ROW_VISIBILITY)); }
         if linearizable && !database.wire_linearizable_reads() {
             return Err(error::unsupported("query.linearizable"));
         }
@@ -262,6 +286,9 @@ impl Service {
     }
 
     fn check_attachment(&self, call: &Call, database: &Arc<Database>) -> Result<(), Status> {
+        if let Some(scope) = call.session.caller.principal.label_scope() {
+            scope.revalidate(self.0.node.now()).map_err(error::anomaly)?;
+        }
         if call.cancellation.is_cancelled() {
             return Err(error::map_status(crate::error::cancelled()));
         }

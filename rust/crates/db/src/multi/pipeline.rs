@@ -7,9 +7,9 @@ use std::{
 use journal_contract::{JournalError, Lsn};
 use rtdb_format::journal::Record;
 use rtdb_tx::transact::{
-    LINEARIZABLE, Receipt, Resolution, TIMED_TRANSACT, Transact, TransactState,
+    LINEARIZABLE, Receipt, Resolution, ScopedTransact, TIMED_TRANSACT, Transact, TransactState,
 };
-use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::ClaimSealer};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, Timestamp, rtdb_v1::{ClaimSealer, LabelScope}};
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
@@ -24,6 +24,7 @@ type Reply<T> = oneshot::Sender<Result<T>>;
 
 enum Command {
     Transact(Transact, Reply<Receipt>),
+    ScopedTransact(Transact, LabelScope, [u8; 32], Reply<Receipt>),
     Tick(BTreeSet<IpAddr>, Reply<Role>),
 }
 
@@ -45,6 +46,13 @@ impl WritePipeline {
             .send(Command::Transact(request, reply))
             .await
             .map_err(|_| pipeline_closed())?;
+        result.await.map_err(|_| pipeline_closed())?
+    }
+
+    pub async fn transact_scoped(&self, request: Transact, labels: LabelScope, receipt_namespace: [u8; 32]) -> Result<Receipt> {
+        let (reply, result) = oneshot::channel();
+        self.input.send(Command::ScopedTransact(request, labels, receipt_namespace, reply))
+            .await.map_err(|_| pipeline_closed())?;
         result.await.map_err(|_| pipeline_closed())?
     }
 
@@ -163,6 +171,13 @@ async fn run(database: Arc<Mutex<MultiDatabase>>, mut input: mpsc::Receiver<Comm
                 if database.role() == Role::Follower {
                     cached_overlay = None;
                 }
+                let _ = reply.send(result);
+            }
+            Command::ScopedTransact(request, labels, receipt_namespace, reply) => {
+                let mut database = database.lock().await;
+                let scope = ScopedTransact { labels: &labels, receipt_namespace };
+                let result = database.transact_scoped(&request, scope).await;
+                cached_overlay = None;
                 let _ = reply.send(result);
             }
             Command::Tick(live, reply) => {
@@ -295,7 +310,7 @@ impl Overlay {
             request,
             at.0,
             (authority.clock)(),
-            &[LINEARIZABLE, TIMED_TRANSACT],
+            &[LINEARIZABLE, TIMED_TRANSACT, "row-visibility"],
             &self.claims,
         )?;
         let prepared = match resolution {

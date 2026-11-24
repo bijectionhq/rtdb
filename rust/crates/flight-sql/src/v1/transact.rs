@@ -214,6 +214,8 @@ fn declaration(
             Change::Ttl(ttl) => Declaration::Ttl(ttl.duration_micros),
             Change::Constraint(_) => return Err(error::unsupported("declare.constraint")),
             Change::Drop(_) => Declaration::Drop,
+            Change::Visibility(value) => Declaration::Visibility(rtdb_tx::transact::Visibility { column: value.column }),
+            Change::SingleLabelPerTx(_) => Declaration::SingleLabelPerTx,
         },
     )
 }
@@ -221,13 +223,23 @@ fn declaration(
 fn decode_row(row: proto::Row, memory: &Arc<MemoryBudget>) -> Result<Row, Status> {
     let mut fields = row.cells.into_iter().collect::<BTreeMap<_, _>>();
     let id = entity(fields.remove("_id"), memory)?;
+    let from = fields.remove("_valid_from");
+    let to = fields.remove("_valid_to");
+    let valid = if from.is_some() || to.is_some() {
+        let bound = |field: Option<proto::Cell>, default| match field.map(|field| cell(field, memory)).transpose()? {
+            None => Ok(default),
+            Some(Cell::Value(Value::I64(micros))) => Ok(Timestamp(micros)),
+            _ => Err(error::incorrect("Valid-time bounds require literal signed microseconds")),
+        };
+        Some(Interval::new(bound(from, Timestamp::MIN)?, bound(to, Timestamp::MAX)?).map_err(error::anomaly)?)
+    } else { None };
     let cells = fields
         .into_iter()
         .map(|(name, field)| Ok((name, cell(field, memory)?)))
         .collect::<Result<_, Status>>()?;
     Ok(Row {
         id,
-        valid: None,
+        valid,
         cells,
     })
 }

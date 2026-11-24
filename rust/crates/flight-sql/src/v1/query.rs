@@ -172,9 +172,12 @@ impl Service {
         let database = self.wire_database(call, &source.branch, layer).await?;
         let tokens = &self.0.v1.tokens;
         let driver = database.serving_driver();
+        let visibility = driver.map(|driver| self.serving_scope(call, driver)).transpose()?.flatten();
         let scope = driver.map_or_else(
             || database.wire_incarnation(),
-            |driver| uuid::Uuid::from_bytes(driver.incarnation()),
+            |driver| uuid::Uuid::from_bytes(visibility.as_ref().map_or_else(
+                || driver.incarnation(), |scope| scope.labels.main_read_incarnation(driver.incarnation()),
+            )),
         );
         let request_hash = fingerprint(&request);
         let (limit, after) = match &request.page {
@@ -204,16 +207,24 @@ impl Service {
             let exact = continuation.is_none() && matches!(selection, Some(Selection::Exactly(_)));
             let (source, clock, offset) =
                 applied_source(source, layer, selection, continuation, now)?;
-            let view = driver
-                .query(source, request.track, now, &call.cancellation)
-                .await
-                .map_err(error::anomaly)?;
-            let context = self.wire_context(call, &database, false).await?;
+            let scoped = visibility.as_ref();
+            let view = match scoped {
+                Some(scope) => driver.query_scoped(source, request.track, now, scope, &call.cancellation).await,
+                None => driver.query(source, request.track, now, &call.cancellation).await,
+            }.map_err(error::anomaly)?;
             let time = view.cut.system_time;
-            let clock = if exact { time } else { clock };
-            let context = context
-                .with_wire_snapshot(view.snapshot, time, clock.into())
-                .map_err(error::anomaly)?;
+            let (context, clock) = if scoped.is_some() {
+                let clock = continuation.map_or(now, |page| page.clock);
+                let snapshot = rtdb_query::DatabaseSnapshot { partitions: vec![view.snapshot], storage: Arc::clone(database.storage()) };
+                let context = self.scoped_wire_context(call, snapshot, clock)?
+                    .with_wire_cut(time, clock.into()).map_err(error::anomaly)?;
+                (context, clock)
+            } else {
+                let clock = if exact { time } else { clock };
+                let context = self.wire_context(call, &database, false).await?
+                    .with_wire_snapshot(view.snapshot, time, clock.into()).map_err(error::anomaly)?;
+                (context, clock)
+            };
             (
                 context,
                 Continuation {

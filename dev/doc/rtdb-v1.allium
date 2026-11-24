@@ -73,4 +73,6 @@ surface StatelessDatabase {
         -- A route without an applied scoped projection omits row-visibility from Capabilities.
         -- An OIDC label scope binds its credential to the verified database name and incarnation.
         -- A scoped credential requires a route that enforces that scope for every admitted operation.
+        -- The initial scoped serving path selects merged main and uses a logical system-time coordinate.
+        -- Put rows can supply literal signed-microsecond valid-time bounds in _valid_from and _valid_to.
 }

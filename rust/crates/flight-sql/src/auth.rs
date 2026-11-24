@@ -55,9 +55,6 @@ impl Authentication {
                 if self.authenticator.method_for(principal.user(), peer) != Some(Method::ClientCredentials) { return Err(unauthenticated("client credentials authentication failed")); } principal
             }
         };
-        if principal.label_scope().is_some() {
-            return Err(Status::permission_denied("This Flight route does not serve scoped credentials"));
-        }
         let owner = if matches!(credentials, Credentials::None) { Owner::Anonymous } else { Owner::Authenticated(Uuid::new_v4()) };
         Ok(Arc::new(Caller { owner, principal, mac: credentials.raw().map(|raw| self.mac(raw)) }))
     }
@@ -70,7 +67,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn label_scope_cannot_authenticate_on_an_unrestricted_flight_route() {
+    async fn label_scope_survives_flight_credential_authentication() {
         use rtdb_auth::{AuthConfig, HttpRequest, HttpResponse, HttpTransport, MethodRule, OidcConfig, Secret};
         use rtdb_columnar::MemoryBudget;
         use serde_json::json;
@@ -107,8 +104,9 @@ mod tests {
         let mut request = Request::new(());
         request.metadata_mut().insert("authorization", "Client Y2xpZW50OnNlY3JldA==".parse().unwrap());
         let credentials = Credentials::parse(&request).unwrap();
-        let error = Authentication::new(authenticator).authenticate(&credentials, None).await.err().unwrap();
-        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let caller = Authentication::new(authenticator).authenticate(&credentials, None).await.unwrap();
+        assert!(caller.principal.label_scope().is_some());
+        assert!(caller.principal.authorize_database("main", rtdb_node::DatabaseAccess::Read).is_err());
     }
 
     #[test]

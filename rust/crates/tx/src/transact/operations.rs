@@ -8,6 +8,7 @@ impl Candidate<'_> {
         for op in ops {
             match op {
                 Op::Put { branch, table, rows, if_absent } => {
+                    self.require_write_branch(branch)?;
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
                     for row in rows {
@@ -38,6 +39,7 @@ impl Candidate<'_> {
                     }
                 }
                 Op::Delete { branch, table, ids, valid } => {
+                    self.require_write_branch(branch)?;
                     self.index.writable(branch)?;
                     let definition = self.write_definition(table)?;
                     if definition.visibility.is_some() && valid.is_none() {
@@ -135,6 +137,13 @@ impl Candidate<'_> {
 
     fn require_unrestricted(&self) -> Result<()> {
         if self.scope.is_some() { return Err(write_scope_error()); }
+        Ok(())
+    }
+
+    fn require_write_branch(&self, branch: &str) -> Result<()> {
+        if self.scope.is_some() && branch != MAIN_BRANCH {
+            return Err(Anomaly::unsupported("rtdb/scoped-branch", "Scoped row writes select the main branch"));
+        }
         Ok(())
     }
 

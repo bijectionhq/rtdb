@@ -80,13 +80,19 @@ impl VerifiedLabelScope {
     }
 
     pub fn admit(&self, database: &str, incarnation: [u8; 16]) -> Result<()> {
-        if database != self.database || incarnation != self.incarnation {
+        self.admit_database_name(database)?;
+        if incarnation != self.incarnation {
             return Err(invalid_scope());
         }
         Ok(())
     }
 
-    pub(super) fn revalidate(&self, now: Timestamp) -> Result<()> {
+    pub fn admit_database_name(&self, database: &str) -> Result<()> {
+        if database != self.database { return Err(invalid_scope()); }
+        Ok(())
+    }
+
+    pub fn revalidate(&self, now: Timestamp) -> Result<()> {
         if now >= self.expires_at {
             return Err(invalid_scope());
         }
